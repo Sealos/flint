@@ -155,9 +155,10 @@ format, for example `feat(mcp): …` or `fix(core): …`.
 
 1. Every push to `master` updates an open **release PR** with the next version and the `CHANGELOG.md` entries.
    Below 1.0, `feat` bumps the minor version and `fix` bumps the patch.
-2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release.
+2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release as a draft. Releases are immutable once
+   published, so the draft stage is when files can still be attached.
 3. The same workflow then builds `flint` for Apple Silicon and Intel, combines them into a universal binary, and
-   attaches `flint-vX.Y.Z-macos-universal.tar.gz` and its SHA-256 checksum to the release.
+   attaches `flint-vX.Y.Z-macos-universal.tar.gz` and its SHA-256 checksum, then publishes the release.
 
 Until M6, release binaries are **unsigned** and marked as pre-release. macOS will warn when you first run them.
 
