@@ -365,6 +365,10 @@ impl WorkloadFeed {
                 container: c.name.clone(),
             };
             if let Some(entry) = self.streams.iter_mut().find(|e| e.key == key) {
+                // Still draining after the pod left the pod set, and now it matches again: keep
+                // following it. (A gone stream that ended was dropped at once, so a pod that
+                // comes back later gets a new stream below.)
+                entry.stream.pod_back();
                 let was = before
                     .as_ref()
                     .and_then(|p| p.containers.iter().find(|o| o.name == c.name));
@@ -611,7 +615,7 @@ mod tests {
     use super::*;
     use crate::logs::session::{LogSnapshot, run};
     use crate::logs::source::{AfterEnd, LogRequest, RawLine, RawLines};
-    use crate::logs::stream::Backoff;
+    use crate::logs::stream::{Backoff, GONE_GRACE};
     use crate::logs::{LogLine, WorkloadKind};
     use futures::channel::mpsc;
     use std::collections::HashMap;
@@ -1289,6 +1293,30 @@ mod tests {
         run.logs.send("web-a/app", "back");
         let s = run.until(|s| s.lines.len() == 1).await;
         assert_eq!(texts(&s), ["[web-a/app] back"]);
+    }
+
+    // covers UP-45
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_that_matches_again_while_draining_is_still_followed() {
+        let mut run = start(32);
+        run.list(vec![pod("web-a", "a", &[("app", true)])]);
+        run.opened("web-a/app").await;
+        // Its labels change: the watch reports it gone, and its stream drains. Before the grace
+        // period is over the labels change back: the same pod (same uid) matches again.
+        run.event(PodEvent::Delete(pod("web-a", "a", &[])));
+        run.until(|s| pods_of(s).pods == 0).await;
+        run.event(PodEvent::Apply(pod("web-a", "a", &[("app", true)])));
+        run.until(|s| pods_of(s).pods == 1).await;
+
+        // Past the grace period the stream still reads, on the same request.
+        tokio::time::sleep(GONE_GRACE + Duration::from_secs(1)).await;
+        let s = run.rx.borrow().clone();
+        assert_eq!(labels(&pods_of(&s)), ["web-a/app"]);
+        assert_eq!(pods_of(&s).live(), 1, "{:?}", pods_of(&s));
+        run.logs.send("web-a/app", "still matching");
+        let s = run.until(|s| s.lines.len() == 1).await;
+        assert_eq!(texts(&s), ["[web-a/app] still matching"]);
+        assert_eq!(run.logs.opened(), ["web-a/app"]);
     }
 
     // covers UP-45

@@ -248,8 +248,9 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   ReplicaSet or Job (its `spec.selector`, read once), or a label selector. One session watches the matching pods
   (a pod watch, not polling) and runs one stream per pod container: every regular container and native sidecar, or
   the one named container. Streams start when a container has started, reopen at once when the watch sees it
-  restart (a stream that had ended reads on from where it stopped), and stop when the pod is deleted (after reading
-  what the server still sends, for at most 10 s). Pods are told apart by uid, so a pod recreated under the same
+  restart (a stream that had ended reads on from where it stopped), and stop when the pod is deleted or stops
+  matching (after reading what the server still sends, for at most 10 s; a pod that matches again while its stream
+  still reads keeps that stream). Pods are told apart by uid, so a pod recreated under the same
   name gets a new stream and the old one never reads it: every open checks the pod by that name is still the
   stream's uid. Restarted streams queue for a slot like new ones. To resume without repeats, a stream remembers
   fingerprints of its newest lines, not their text, so ended streams hold no lines outside the budget. Each stream is a state machine polled by the session's one
