@@ -1,0 +1,230 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "type determines how the Service is exposed. Defaults to ClusterIP. Valid options are ExternalName, ClusterIP, NodePort, and LoadBalancer. \"ClusterIP\" allocates a cluster-internal IP address for load-balancing to endpoints. Endpoints are determined by the selector or if that is not specified, by manual construction of an Endpoints object or EndpointSlice objects. If clusterIP is \"None\", no virtual IP is allocated and the endpoints are published as a set of endpoints rather than a virtual IP. \"NodePort\" builds on ClusterIP and allocates a port on every node which routes to the same endpoints as the clusterIP. \"LoadBalancer\" builds on NodePort and creates an external load-balancer (if supported in the current cloud) which routes to the same endpoints as the clusterIP. \"ExternalName\" aliases this service to the specified externalName. Several other fields do not apply to ExternalName services. More info: https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types",
+      "format": "",
+      "name": "Type",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "clusterIP is the IP address of the service and is usually assigned randomly. If an address is specified manually, is in-range (as per system configuration), and is not in use, it will be allocated to the service; otherwise creation of the service will fail. This field may not be changed through updates unless the type field is also being changed to ExternalName (which requires this field to be blank) or the type field is being changed from ExternalName (in which case this field may optionally be specified, as describe above).  Valid values are \"None\", empty string (\"\"), or a valid IP address. Setting this to \"None\" makes a \"headless service\" (no virtual IP), which is useful when direct endpoint connections are preferred and proxying is not required.  Only applies to types ClusterIP, NodePort, and LoadBalancer. If this field is specified when creating a Service of type ExternalName, creation will fail. This field will be wiped when updating a Service to type ExternalName. More info: https://kubernetes.io/docs/concepts/services-networking/service/#virtual-ips-and-service-proxies",
+      "format": "",
+      "name": "Cluster-IP",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "externalIPs is a list of IP addresses for which nodes in the cluster will also accept traffic for this service.  These IPs are not managed by Kubernetes.  The user is responsible for ensuring that traffic arrives at a node with this IP.  A common example is external load-balancers that are not part of the Kubernetes system.",
+      "format": "",
+      "name": "External-IP",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The list of ports that are exposed by this service. More info: https://kubernetes.io/docs/concepts/services-networking/service/#virtual-ips-and-service-proxies",
+      "format": "",
+      "name": "Port(s)",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Route service traffic to pods with label keys and values matching this selector. If empty or not present, the service is assumed to have an external process managing its endpoints, which Kubernetes will not modify. Only applies to types ClusterIP, NodePort, and LoadBalancer. Ignored if type is ExternalName. More info: https://kubernetes.io/docs/concepts/services-networking/service/",
+      "format": "",
+      "name": "Selector",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "kubernetes",
+        "ClusterIP",
+        "10.96.0.1",
+        "<none>",
+        "443/TCP",
+        "1d",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "component": "apiserver",
+            "provider": "kubernetes"
+          },
+          "name": "kubernetes",
+          "namespace": "default",
+          "resourceVersion": "1",
+          "uid": "c7004cb3-972c-4eba-2937-d1d9f456fc54"
+        }
+      }
+    },
+    {
+      "cells": [
+        "fixture-db",
+        "ClusterIP",
+        "None",
+        "<none>",
+        "5432/TCP",
+        "1d",
+        "app=fixture-db"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"clusterIP\":\"None\",\"ports\":[{\"port\":5432}],\"selector\":{\"app\":\"fixture-db\"}}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "a5cb9a7b-fb30-aca3-40f9-ff850ce53f09"
+        }
+      }
+    },
+    {
+      "cells": [
+        "podinfo",
+        "ClusterIP",
+        "10.96.46.117",
+        "<none>",
+        "9898/TCP,9999/TCP",
+        "1d",
+        "app.kubernetes.io/name=podinfo"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "meta.helm.sh/release-name": "podinfo",
+            "meta.helm.sh/release-namespace": "demo"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "app.kubernetes.io/managed-by": "Helm",
+            "app.kubernetes.io/name": "podinfo",
+            "app.kubernetes.io/version": "6.17.0",
+            "helm.sh/chart": "podinfo-6.17.0"
+          },
+          "name": "podinfo",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "3b6dc04e-dd25-d199-49c0-2b477b0b45d4"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web",
+        "ClusterIP",
+        "10.96.135.99",
+        "<none>",
+        "80/TCP",
+        "1d",
+        "app=web"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"web\"},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"ports\":[{\"port\":80,\"protocol\":\"TCP\",\"targetPort\":80}],\"selector\":{\"app\":\"web\"}},\"status\":{\"loadBalancer\":{}}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "app": "web"
+          },
+          "name": "web",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "5a1bbd4f-e9bc-731c-bae4-80e2c4390d73"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-dns",
+        "ClusterIP",
+        "10.96.0.10",
+        "<none>",
+        "53/UDP,53/TCP,9153/TCP",
+        "1d",
+        "k8s-app=kube-dns"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "prometheus.io/port": "9153",
+            "prometheus.io/scrape": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "k8s-app": "kube-dns",
+            "kubernetes.io/cluster-service": "true",
+            "kubernetes.io/name": "CoreDNS"
+          },
+          "name": "kube-dns",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "025eaa21-f3c7-c52f-8252-a57023fb4816"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server",
+        "ClusterIP",
+        "10.96.56.213",
+        "<none>",
+        "443/TCP",
+        "1d",
+        "k8s-app=metrics-server"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"metrics-server\",\"namespace\":\"kube-system\"},\"spec\":{\"ports\":[{\"appProtocol\":\"https\",\"name\":\"https\",\"port\":443,\"protocol\":\"TCP\",\"targetPort\":\"https\"}],\"selector\":{\"k8s-app\":\"metrics-server\"}}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "k8s-app": "metrics-server"
+          },
+          "name": "metrics-server",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "83191316-554f-d13a-f87f-167c9e0c7af0"
+        }
+      }
+    }
+  ]
+}

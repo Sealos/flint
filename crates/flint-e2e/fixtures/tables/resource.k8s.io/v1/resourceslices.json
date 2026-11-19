@@ -1,0 +1,45 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "NodeName identifies the node which provides the resources in this pool. A field selector can be used to list only ResourceSlice objects belonging to a certain node.\n\nThis field can be used to limit access from nodes to ResourceSlices with the same node name. It also indicates to autoscalers that adding new nodes of the same type as some old node might also make new resources available.\n\nExactly one of NodeName, NodeSelector, AllNodes, and PerDeviceNodeSelection must be set. This field is immutable.",
+      "format": "",
+      "name": "Node",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Driver identifies the DRA driver providing the capacity information. A field selector can be used to list only ResourceSlice objects with a certain driver name.\n\nMust be a DNS subdomain and should end with a DNS domain owned by the vendor of the driver. It should use only lower case characters. This field is immutable.",
+      "format": "",
+      "name": "Driver",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Name is used to identify the pool. For node-local devices, this is often the node name, but this is not required. A field selector can be used to list only ResourceSlice objects belonging to a certain pool.\n\nIt must not be longer than 253 characters and must consist of one or more DNS sub-domains separated by slashes. This field is immutable.",
+      "format": "",
+      "name": "Pool",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": []
+}

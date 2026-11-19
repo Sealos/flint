@@ -78,6 +78,8 @@ crates/
                 Its `flint-mcp` binary is the same server without GPUI, for Linux CI only; not shipped.
   flint-app/    The `flint` binary: windows, views, the terminal widget, settings UI, the bridge to core.
                 `flint mcp` runs flint-mcp instead of starting the UI.
+  flint-e2e/    Tests only (not published): the fake API server replaying fixtures recorded from kind, and
+                the e2e harness. See TESTING.md.
 ```
 
 Keeping `flint-core` free of GPUI has three benefits. The core can be tested without a window. It can be reused by a

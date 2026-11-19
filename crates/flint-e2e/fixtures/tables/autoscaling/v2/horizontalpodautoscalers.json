@@ -1,0 +1,59 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "scaleTargetRef points to the target resource to scale, and is used to the pods for which metrics should be collected, as well as to actually change the replica count.",
+      "format": "",
+      "name": "Reference",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "metrics contains the specifications for which to use to calculate the desired replica count (the maximum replica count across all metrics will be used).  The desired replica count is calculated multiplying the ratio between the target value and the current value by the current number of pods.  Ergo, metrics used must decrease as the pod count is increased, and vice-versa.  See the individual metric source types for more information about how each type of metric must respond. If not set, the default metric will be set to 80% average CPU utilization.",
+      "format": "",
+      "name": "Targets",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "minReplicas is the lower limit for the number of replicas to which the autoscaler can scale down.  It defaults to 1 pod.  minReplicas is allowed to be 0 if the alpha feature gate HPAScaleToZero is enabled and at least one Object or External metric is configured.  Scaling is active as long as at least one metric value is available.",
+      "format": "",
+      "name": "MinPods",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "maxReplicas is the upper limit for the number of replicas to which the autoscaler can scale up. It cannot be less that minReplicas.",
+      "format": "",
+      "name": "MaxPods",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "currentReplicas is current number of replicas of pods managed by this autoscaler, as last seen by the autoscaler.",
+      "format": "",
+      "name": "Replicas",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": []
+}

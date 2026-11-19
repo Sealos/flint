@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Install what Flint's cluster tests expect on a fresh kind cluster: metrics-server, the demo
-# namespace (Deployment and Service `web`, Helm release `podinfo`), and old resourceVersions
-# expired, as on a long-lived cluster (etcd compacted, API server restarted). Used by
-# scripts/dev-cluster.sh and by the cluster-e2e CI job, so local runs and CI test the same cluster.
+# namespace (Deployment and Service `web`, Helm release `podinfo`, and the variety listed below),
+# and old resourceVersions expired, as on a long-lived cluster (etcd compacted, API server
+# restarted). Used by scripts/dev-cluster.sh and by the cluster-e2e CI job, so local runs and CI
+# test the same cluster.
 #
 #   KUBECONFIG=<kind kubeconfig> scripts/cluster-fixtures.sh
 #
@@ -54,6 +55,139 @@ k -n demo create deployment web --image=nginx:1.27 --replicas=2 --dry-run=client
 k -n demo expose deployment web --port=80 --dry-run=client -o yaml | k apply -f -
 helm --kube-context "$context" upgrade --install podinfo oci://ghcr.io/stefanprodan/charts/podinfo \
   --version "$PODINFO_CHART_VERSION" -n demo --wait --timeout 3m
+
+# Variety for the views and the fake API server's recorded fixtures (crates/flint-e2e/fixtures):
+# failing pods (ImagePullBackOff, CrashLoopBackOff, and the Warning events they cause), a Job and
+# a CronJob, a StatefulSet with a PVC, an Ingress, and a CRD with printer columns and one
+# instance. All light (10m CPU, 16Mi), none labelled app=web, and the CRD's group
+# (fixtures.flint.dev) is never used by tests, which create and delete their own.
+k apply -f - <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gadgets.fixtures.flint.dev
+spec:
+  group: fixtures.flint.dev
+  scope: Namespaced
+  names: {plural: gadgets, singular: gadget, kind: Gadget, shortNames: [gdg]}
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size: {type: integer}
+                color: {type: string}
+      additionalPrinterColumns:
+        - {name: Size, type: integer, jsonPath: .spec.size}
+        - {name: Color, type: string, jsonPath: .spec.color, priority: 1}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+YAML
+k wait --for=condition=Established crd/gadgets.fixtures.flint.dev --timeout=60s
+k apply -f - <<'YAML'
+apiVersion: fixtures.flint.dev/v1
+kind: Gadget
+metadata: {name: gadget-1, namespace: demo}
+spec: {size: 3, color: teal}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: broken-image, namespace: demo, labels: {app: broken-image}}
+spec:
+  containers:
+    - name: app
+      image: registry.invalid/flint/missing:1.0
+      resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: crash-loop, namespace: demo, labels: {app: crash-loop}}
+spec:
+  containers:
+    - name: app
+      image: busybox:1.37.0
+      command: [sh, -c, "echo starting; sleep 2; echo giving up >&2; exit 1"]
+      resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: fixture-job, namespace: demo}
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: job
+          image: busybox:1.37.0
+          command: [sh, -c, "echo done"]
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: fixture-cron, namespace: demo}
+spec:
+  schedule: "17 3 * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: busybox:1.37.0
+              command: [sh, -c, "echo nightly"]
+              resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: fixture-db, namespace: demo}
+spec:
+  clusterIP: None
+  selector: {app: fixture-db}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: fixture-db, namespace: demo}
+spec:
+  serviceName: fixture-db
+  replicas: 1
+  selector: {matchLabels: {app: fixture-db}}
+  template:
+    metadata: {labels: {app: fixture-db}}
+    spec:
+      containers:
+        - name: db
+          image: busybox:1.37.0
+          command: [sh, -c, "while true; do sleep 3600; done"]
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+          volumeMounts: [{name: data, mountPath: /data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 16Mi}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: web, namespace: demo}
+spec:
+  rules:
+    - host: web.demo.flint.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: web, port: {number: 80}}}
+YAML
 
 k -n kube-system rollout status deployment/metrics-server --timeout=3m
 k -n demo rollout status deployment/web --timeout=3m

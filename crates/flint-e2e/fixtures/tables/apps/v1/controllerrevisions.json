@@ -1,0 +1,149 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Controller of the object",
+      "format": "",
+      "name": "Controller",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Revision indicates the revision of the state represented by Data.",
+      "format": "",
+      "name": "Revision",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "fixture-db-7969d685c4",
+        "statefulset.apps/fixture-db",
+        1,
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"StatefulSet\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"fixture-db\"}},\"serviceName\":\"fixture-db\",\"template\":{\"metadata\":{\"labels\":{\"app\":\"fixture-db\"}},\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"while true; do sleep 3600; done\"],\"image\":\"busybox:1.37.0\",\"name\":\"db\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}},\"volumeMounts\":[{\"mountPath\":\"/data\",\"name\":\"data\"}]}]}},\"volumeClaimTemplates\":[{\"metadata\":{\"name\":\"data\"},\"spec\":{\"accessModes\":[\"ReadWriteOnce\"],\"resources\":{\"requests\":{\"storage\":\"16Mi\"}}}}]}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "app": "fixture-db",
+            "controller.kubernetes.io/hash": "7969d685c4"
+          },
+          "name": "fixture-db-7969d685c4",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "StatefulSet",
+              "name": "fixture-db",
+              "uid": "3b367991-95a0-3e83-123c-352c48089ced"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "0e7a6500-0a8c-8140-7a0a-706ca3fe1e2d"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kindnet-85d795cbd4",
+        "daemonset.apps/kindnet",
+        1,
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deprecated.daemonset.template.generation": "1"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "app": "kindnet",
+            "controller-revision-hash": "85d795cbd4",
+            "k8s-app": "kindnet",
+            "tier": "node"
+          },
+          "name": "kindnet-85d795cbd4",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "DaemonSet",
+              "name": "kindnet",
+              "uid": "6095326d-76e1-c753-0445-55d0fb47e995"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "8770ba3f-e61e-32c4-8a6e-5ba2c9862924"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-proxy-6f6bf99bf5",
+        "daemonset.apps/kube-proxy",
+        1,
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deprecated.daemonset.template.generation": "1"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "controller-revision-hash": "6f6bf99bf5",
+            "k8s-app": "kube-proxy"
+          },
+          "name": "kube-proxy-6f6bf99bf5",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "DaemonSet",
+              "name": "kube-proxy",
+              "uid": "a2125fcf-b653-c10e-0cf4-070643b7f6be"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "2c511d53-3773-6c8f-dab6-79bf6adcf2d1"
+        }
+      }
+    }
+  ]
+}

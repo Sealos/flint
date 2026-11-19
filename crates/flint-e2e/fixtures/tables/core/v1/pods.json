@@ -1,0 +1,774 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The aggregate readiness state of this pod for accepting traffic.",
+      "format": "",
+      "name": "Ready",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The aggregate status of the containers in this pod.",
+      "format": "",
+      "name": "Status",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The number of times the containers in this pod have been restarted and when the last container in this pod has restarted.",
+      "format": "",
+      "name": "Restarts",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "podIP address allocated to the pod. Routable at least within the cluster. Empty if not yet allocated.",
+      "format": "",
+      "name": "IP",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "NodeName indicates in which node this pod is scheduled. If empty, this pod is a candidate for scheduling by the scheduler defined in schedulerName. Once this field is set, the kubelet for this node becomes responsible for the lifecycle of this pod. This field should not be used to express a desire for the pod to be scheduled on a specific node. https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodename",
+      "format": "",
+      "name": "Node",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "nominatedNodeName is set only when this pod preempts other pods on the node, but it cannot be scheduled right away as preemption victims receive their graceful termination periods. This field does not guarantee that the pod will be scheduled on this node. Scheduler may decide to place the pod elsewhere if other nodes become available sooner. Scheduler may also decide to give the resources on this node to a higher priority pod that is created after preemption. As a result, this field may be different than PodSpec.nodeName when the pod is scheduled.",
+      "format": "",
+      "name": "Nominated Node",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "If specified, all readiness gates will be evaluated for pod readiness. A pod is ready when all its containers are ready AND all conditions specified in the readiness gates have status equal to \"True\" More info: https://git.k8s.io/enhancements/keps/sig-network/580-pod-readiness-gates",
+      "format": "",
+      "name": "Readiness Gates",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "broken-image",
+        "0/1",
+        "ImagePullBackOff",
+        "0",
+        "1d",
+        "10.244.0.10",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"broken-image\"},\"name\":\"broken-image\",\"namespace\":\"demo\"},\"spec\":{\"containers\":[{\"image\":\"registry.invalid/flint/missing:1.0\",\"name\":\"app\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}}}]}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "app": "broken-image"
+          },
+          "name": "broken-image",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "f2422d98-a662-1ed6-16ae-284eabbb01ae"
+        }
+      }
+    },
+    {
+      "cells": [
+        "crash-loop",
+        "0/1",
+        "CrashLoopBackOff",
+        "5 (3m ago)",
+        "1d",
+        "10.244.0.11",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"crash-loop\"},\"name\":\"crash-loop\",\"namespace\":\"demo\"},\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"echo starting; sleep 2; echo giving up \\u003e\\u00262; exit 1\"],\"image\":\"busybox:1.37.0\",\"name\":\"app\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}}}]}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "app": "crash-loop"
+          },
+          "name": "crash-loop",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "6693fb2f-5611-ec9b-08fd-7e18595ff74a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "fixture-db-0",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.14",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "fixture-db-",
+          "generation": 1,
+          "labels": {
+            "app": "fixture-db",
+            "apps.kubernetes.io/pod-index": "0",
+            "controller-revision-hash": "fixture-db-7969d685c4",
+            "statefulset.kubernetes.io/pod-name": "fixture-db-0"
+          },
+          "name": "fixture-db-0",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "StatefulSet",
+              "name": "fixture-db",
+              "uid": "3b367991-95a0-3e83-123c-352c48089ced"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "81815473-f6b5-a029-9f4e-f42984c2a973"
+        }
+      }
+    },
+    {
+      "cells": [
+        "fixture-job-qd9jf",
+        "0/1",
+        "Completed",
+        "0",
+        "1d",
+        "10.244.0.12",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "conditions": [
+        {
+          "message": "The pod has completed successfully.",
+          "reason": "Succeeded",
+          "status": "True",
+          "type": "Completed"
+        }
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "fixture-job-",
+          "generation": 1,
+          "labels": {
+            "batch.kubernetes.io/controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+            "batch.kubernetes.io/job-name": "fixture-job",
+            "controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+            "job-name": "fixture-job"
+          },
+          "name": "fixture-job-qd9jf",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "batch/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Job",
+              "name": "fixture-job",
+              "uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "45d751f5-6753-76c4-a004-7bb7f306537e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "podinfo-c6497595d-b8chj",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.9",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "prometheus.io/port": "9898",
+            "prometheus.io/scrape": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "podinfo-c6497595d-",
+          "generation": 1,
+          "labels": {
+            "app.kubernetes.io/name": "podinfo",
+            "pod-template-hash": "c6497595d"
+          },
+          "name": "podinfo-c6497595d-b8chj",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "podinfo-c6497595d",
+              "uid": "0fdd95a9-f381-794a-bd56-9973a3b183ce"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "c3b27c86-4272-8a51-8580-4dbdb249fffc"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web-69c6f74b8b-qv4xv",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.8",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "web-69c6f74b8b-",
+          "generation": 1,
+          "labels": {
+            "app": "web",
+            "pod-template-hash": "69c6f74b8b"
+          },
+          "name": "web-69c6f74b8b-qv4xv",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "web-69c6f74b8b",
+              "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "e6c7fb26-842c-b861-8154-46419a35eb4a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web-69c6f74b8b-x4gss",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.7",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "web-69c6f74b8b-",
+          "generation": 1,
+          "labels": {
+            "app": "web",
+            "pod-template-hash": "69c6f74b8b"
+          },
+          "name": "web-69c6f74b8b-x4gss",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "web-69c6f74b8b",
+              "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "05229db0-0345-b5f2-389f-ec561c1358b8"
+        }
+      }
+    },
+    {
+      "cells": [
+        "coredns-559f6c778d-ft8sx",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "coredns-559f6c778d-",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "kube-dns",
+            "pod-template-hash": "559f6c778d"
+          },
+          "name": "coredns-559f6c778d-ft8sx",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "coredns-559f6c778d",
+              "uid": "99595964-4243-ddd9-dc82-722763f2029f"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "6663f33d-67cf-9a3f-980c-3238934e06b2"
+        }
+      }
+    },
+    {
+      "cells": [
+        "coredns-559f6c778d-lcszv",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.3",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "coredns-559f6c778d-",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "kube-dns",
+            "pod-template-hash": "559f6c778d"
+          },
+          "name": "coredns-559f6c778d-lcszv",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "coredns-559f6c778d",
+              "uid": "99595964-4243-ddd9-dc82-722763f2029f"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "7e0b0842-efd1-b85a-28e2-57a0fb608272"
+        }
+      }
+    },
+    {
+      "cells": [
+        "etcd-flint-dev-control-plane",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "172.18.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubeadm.kubernetes.io/etcd.advertise-client-urls": "https://172.18.0.2:2379",
+            "kubernetes.io/config.hash": "7ea7e53fd0dbc227fd6a8d1d5b0c0e07",
+            "kubernetes.io/config.mirror": "7ea7e53fd0dbc227fd6a8d1d5b0c0e07",
+            "kubernetes.io/config.seen": "2025-12-31T23:54:00.000000000Z",
+            "kubernetes.io/config.source": "file"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "component": "etcd",
+            "tier": "control-plane"
+          },
+          "name": "etcd-flint-dev-control-plane",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "controller": true,
+              "kind": "Node",
+              "name": "flint-dev-control-plane",
+              "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "c43cbf00-a479-58cc-b7c6-00f9733b2db8"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kindnet-dxn5d",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "172.18.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "kindnet-",
+          "generation": 1,
+          "labels": {
+            "app": "kindnet",
+            "controller-revision-hash": "85d795cbd4",
+            "k8s-app": "kindnet",
+            "pod-template-generation": "1",
+            "tier": "node"
+          },
+          "name": "kindnet-dxn5d",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "DaemonSet",
+              "name": "kindnet",
+              "uid": "6095326d-76e1-c753-0445-55d0fb47e995"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "4b83c902-3663-d34e-ebb1-bd65790c8655"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-apiserver-flint-dev-control-plane",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "172.18.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubeadm.kubernetes.io/kube-apiserver.advertise-address.endpoint": "172.18.0.2:6443",
+            "kubernetes.io/config.hash": "21397f6c73eafbd13227714526e8dbe2",
+            "kubernetes.io/config.mirror": "21397f6c73eafbd13227714526e8dbe2",
+            "kubernetes.io/config.seen": "2025-12-31T23:54:00.000000000Z",
+            "kubernetes.io/config.source": "file"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "component": "kube-apiserver",
+            "tier": "control-plane"
+          },
+          "name": "kube-apiserver-flint-dev-control-plane",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "controller": true,
+              "kind": "Node",
+              "name": "flint-dev-control-plane",
+              "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "c8452d70-9edc-f3c4-0dbd-bf4bf5e5e451"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-controller-manager-flint-dev-control-plane",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "172.18.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubernetes.io/config.hash": "4566956ea63323de8b5c49fcdeef4b05",
+            "kubernetes.io/config.mirror": "4566956ea63323de8b5c49fcdeef4b05",
+            "kubernetes.io/config.seen": "2025-12-31T23:54:00.000000000Z",
+            "kubernetes.io/config.source": "file"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "component": "kube-controller-manager",
+            "tier": "control-plane"
+          },
+          "name": "kube-controller-manager-flint-dev-control-plane",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "controller": true,
+              "kind": "Node",
+              "name": "flint-dev-control-plane",
+              "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "c635754b-26fe-9f66-5019-55658dfdd6ae"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-proxy-jf65x",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "172.18.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "kube-proxy-",
+          "generation": 1,
+          "labels": {
+            "controller-revision-hash": "6f6bf99bf5",
+            "k8s-app": "kube-proxy",
+            "pod-template-generation": "1"
+          },
+          "name": "kube-proxy-jf65x",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "DaemonSet",
+              "name": "kube-proxy",
+              "uid": "a2125fcf-b653-c10e-0cf4-070643b7f6be"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "412f8d09-261c-9ff7-e8f9-51e6e2bb13f9"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-scheduler-flint-dev-control-plane",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "172.18.0.2",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubernetes.io/config.hash": "dfb92822dd3e8e26e7b6a603dd033175",
+            "kubernetes.io/config.mirror": "dfb92822dd3e8e26e7b6a603dd033175",
+            "kubernetes.io/config.seen": "2025-12-31T23:54:00.000000000Z",
+            "kubernetes.io/config.source": "file"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "component": "kube-scheduler",
+            "tier": "control-plane"
+          },
+          "name": "kube-scheduler-flint-dev-control-plane",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "controller": true,
+              "kind": "Node",
+              "name": "flint-dev-control-plane",
+              "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "67cc7771-6e2e-4fd3-a18f-73083d4072b5"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server-76558b4bb9-qt9lh",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.6",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "metrics-server-76558b4bb9-",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "metrics-server",
+            "pod-template-hash": "76558b4bb9"
+          },
+          "name": "metrics-server-76558b4bb9-qt9lh",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "metrics-server-76558b4bb9",
+              "uid": "6487bf59-20da-0b74-ce84-7fe9fbf76677"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "beb135a1-63de-c737-f5a4-06d48b5605e4"
+        }
+      }
+    },
+    {
+      "cells": [
+        "local-path-provisioner-75f7fc7dc5-x624n",
+        "1/1",
+        "Running",
+        "0",
+        "1d",
+        "10.244.0.4",
+        "flint-dev-control-plane",
+        "<none>",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "local-path-provisioner-75f7fc7dc5-",
+          "generation": 1,
+          "labels": {
+            "app": "local-path-provisioner",
+            "pod-template-hash": "75f7fc7dc5"
+          },
+          "name": "local-path-provisioner-75f7fc7dc5-x624n",
+          "namespace": "local-path-storage",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "ReplicaSet",
+              "name": "local-path-provisioner-75f7fc7dc5",
+              "uid": "7774e21b-2e5e-8ddc-95ba-faeac1bbe22d"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "efbaa3d7-b2ac-7cbd-f632-d2f26e74c1ab"
+        }
+      }
+    }
+  ]
+}

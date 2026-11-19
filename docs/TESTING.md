@@ -56,7 +56,8 @@ A test-only control socket lets e2e tests and agents drive the real app.
 
 ### E2E harness: `crates/flint-e2e`
 
-A Rust crate of integration tests and helpers:
+A Rust crate of integration tests and helpers. The fake API server (below) is there today; `App` and `Mcp` follow
+in [Sealos/flint#40](https://github.com/Sealos/flint/issues/40).
 
 - **`App`:** starts `flint` (built with `--features automation`) with a scratch `FLINT_CONFIG_DIR` and the given
   `KUBECONFIG`. It connects to the socket and exposes typed calls such as `app.open_view("pods")`,
@@ -68,21 +69,97 @@ A Rust crate of integration tests and helpers:
 
 ### Fake API server
 
-GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API server instead of kind.
+GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API server instead of kind. It lives in
+`flint_e2e::fake_api`, and its tests run in plain `cargo test` (no cluster, on Linux in CI).
 
-- **Recording:** `scripts/record-fixtures.sh` captures real responses from the kind dev cluster into
-  `crates/flint-e2e/fixtures/`: discovery, OpenAPI, Table lists, objects and events. Secrets are scrubbed and uids and
-  timestamps are normalized. Re-record whenever the supported Kubernetes version changes.
-- **Replay:** a small Rust HTTPS server in `flint-e2e` serves those fixtures. It also serves scripted watch streams
-  (ADDED, MODIFIED, DELETED, BOOKMARK, and an ERROR 410) and can inject failures (a 403, a slow response, a dropped
-  connection), so reconnect and permission paths are testable without a real cluster.
-- **Wiring:** the test writes a kubeconfig that points at the fake server's address and its self-signed CA.
+A test, start to finish:
+
+```rust
+let server = FakeApiServer::start().await?;
+server.write_kubeconfig(&dir.join("kubeconfig"), Some("demo"))?; // context "flint-e2e-fake"
+let core = /* CoreHandle on that kubeconfig, WatchTiming shortened */;
+let configmaps = server.gvr("configmaps");
+let mut sub = core.subscribe(CONTEXT, &KindId::new("", "configmaps"));
+server.wait_for_watches(&configmaps, 1, WAIT).await?;          // the list is live
+let fresh = server.new_row(&configmaps, Some("demo"), "fresh", &[("Data", "1")]);
+server.send_watch(&configmaps, WatchStep::Added(fresh));        // ADDED to every open watch
+until(&mut sub, |s| s.rows.iter().any(|r| &*r.name == "fresh")).await;
+server.inject(Fault::forbidden().on(&server.gvr("secrets")).verb(Verb::List).cluster_wide());
+server.send_watch(&configmaps, WatchStep::Expired);            // 410: the core lists again
+```
+
+`crates/flint-e2e/tests/core.rs` has complete versions of these.
+
+**What's in the fixtures** (`crates/flint-e2e/fixtures/`, recorded from the kind dev cluster):
+
+| File | Holds |
+|---|---|
+| `version.json` | `GET /version` |
+| `discovery/api.json`, `discovery/apis.json` | Aggregated discovery (`apidiscovery.k8s.io/v2`). Legacy discovery is not recorded. |
+| `openapi/v3.json`, `openapi/v3/apis/apps/v1.json` | The OpenAPI v3 index and one document, descriptions dropped, one line |
+| `tables/<group>/<version>/<resource>.json` | The Table list (`includeObject=Metadata`) of every listable kind at its preferred version, all namespaces, row `managedFields` dropped |
+| `objects/<group>/<version>/<resource>.json` | Full objects: namespace `demo`, namespaces, nodes, and core events in `default` and `demo` (Table events are limited the same way) |
+
+The `demo` namespace (`scripts/cluster-fixtures.sh`) gives the views variety: running, ImagePullBackOff,
+CrashLoopBackOff and Completed pods with their Warning events, Deployments, a ReplicaSet history, a Job and a CronJob, a
+StatefulSet with a PVC, Services, an Ingress, the podinfo Helm release Secrets, and the CRD `gadgets.fixtures.flint.dev`
+(printer columns Size, Color, Age) with one instance. Objects that are listed but not recorded (a kube-system pod) are
+served as a minimal object built from the row.
+
+**Recording:** `KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh`. It refuses to run unless `KUBECONFIG` names
+exactly one file whose current context is `kind-flint-dev` on an `https://` server at 127.0.0.1, localhost or ::1,
+with no proxy. The new set is written next to the old one and swapped in only when it is complete, loads, and holds
+no credentials, so a failed run changes nothing.
+
+- Secrets are masked with `flint_core::redact::mask_secret` (values become base64 of `redacted`, keys stay), and
+  Secret Table cells outside the safe columns are hidden. ConfigMaps labelled `owner=helm` (Helm's ConfigMap storage)
+  are masked the same way. Other ConfigMaps are kept: their content is useful to tests, and strings shaped like a
+  certificate, key, token or gzip blob are replaced everywhere.
+- Uids are derived from each object's group, resource, namespace and name. Resource versions, machine ids and
+  container ids are fixed.
+- Timestamps are stored as their age at recording time before `2026-01-01T00:00:00Z` ("fixture now"), rounded (10 s
+  under a minute, then minutes, hours, days), so re-recording an unchanged cluster gives no diff. The server shifts
+  them to its start (`Options::now`) and renders `Age` cells from them, so ages look the same every day. Other
+  server-rendered ages (`Last Seen`) are fixed.
+- `tests/fixtures.rs` checks the committed fixtures for credentials, local paths and Secret values.
+
+**Re-recording** (after bumping `NODE_IMAGE`, see "Pinned versions" below, or changing `scripts/cluster-fixtures.sh`):
+recreate the dev cluster (`scripts/dev-cluster.sh down` then `up`), wait until `crash-loop` is in CrashLoopBackOff
+with a few restarts, `broken-image` in ImagePullBackOff and `fixture-job` complete, re-record, then run
+`cargo test -p flint-e2e`. Review the fixture diff: new columns or kinds are expected; Secret values, local paths and
+namespaces left by other tests are not.
+
+**Replay:** `FakeApiServer::start()` (or `start_blocking` without a runtime) serves the fixtures over HTTPS on
+`127.0.0.1` with a CA generated per server.
+
+- Aggregated discovery, Table or plain lists (by `Accept`), single objects, pod logs (`set_log`), field and label
+  selectors, `limit`/`continue`. Writes get 405: the server is read-only. Table lists refuse field selectors other
+  than `metadata.name` and `metadata.namespace` with 400.
+- Watches, like a real server: without a resource version they start with the current state as `ADDED`; from a
+  version they replay the changes since (a short log), or send a 410 if it is older; streaming lists
+  (`sendInitialEvents`, which needs `resourceVersionMatch=NotOlderThan`) send the state and, with bookmarks allowed,
+  the end marker. Only the first event carries `columnDefinitions`, bookmarks have a fake row, and an expired watch
+  is an `ERROR` 410 inside HTTP 200. A `MODIFIED` that leaves a watch's selector arrives as `DELETED`.
+- Quirks: metrics.k8s.io lists have no resource version, ignore `limit`, and cannot be watched (405).
+  `Options::plain_only` answers chosen resources without Tables (UP-28). `Options::streaming_lists: false` rejects
+  streaming lists so clients fall back to list and watch.
+- `script_watch` / `script_watch_in` queue steps (`Added`, `Modified`, `Deleted`, `Bookmark`, `Expired`, `Wait`,
+  `End`, `Drop`) for the next watch. `send_watch` sends a step to every open watch. `set_row`, `remove_row`,
+  `set_object` and `remove_object` change data silently, so only a relist shows it. Objects follow their rows.
+- `inject(Fault)` refuses (403 with the real RBAC message, or any status), delays, or drops the connection of
+  matching requests (by resource, verb, namespace scope, and count).
+- Methods that take a `Gvr` panic on one the fixtures don't serve, with a suggestion. `server.gvr("deployments")`
+  looks one up by plural.
+- `requests()` records every request, for asserting relists and retries.
+- **Wiring:** `write_kubeconfig(path, namespace)` writes a kubeconfig that trusts the server's CA.
+  `write_kubeconfigs` puts several servers in one file under their own context names (UP-01, UP-06, UP-24).
+- **Timing:** `CoreConfig::watch_timing` shortens the core's retry waits; e2e tests use 10–50 ms.
 
 ### Where things run in CI
 
 | Job | Runner | Runs |
 |---|---|---|
-| `test (<crate>)` | Linux | Unit tests for `flint-core` and `flint-mcp`, one job per crate |
+| `test (<crate>)` | Linux | Unit tests for `flint-core`, `flint-mcp` and `flint-e2e` (the fake API server and its tests), one job per crate |
 | `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display). Flint ships for macOS only; this is a cheap second check |
 | `macos (flint-app)` | macOS | The app's clippy, view tests and docs, and a release build. The only CI job that needs macOS |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |

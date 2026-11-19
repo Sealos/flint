@@ -1,0 +1,86 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "value represents the integer value of this priority class. This is the actual priority that pods receive when they have the name of this class in their pod spec.",
+      "format": "",
+      "name": "Value",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "globalDefault specifies whether this PriorityClass should be considered as the default priority for pods that do not have any priority class. Only one PriorityClass can be marked as `globalDefault`. However, if more than one PriorityClasses exists with their `globalDefault` field set to true, the smallest value of such global default PriorityClasses will be used as the default priority.",
+      "format": "",
+      "name": "Global-Default",
+      "priority": 0,
+      "type": "boolean"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "preemptionPolicy is the Policy for preempting pods with lower priority. One of Never, PreemptLowerPriority. Defaults to PreemptLowerPriority if unset.",
+      "format": "",
+      "name": "PreemptionPolicy",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "system-cluster-critical",
+        2000000000,
+        false,
+        "1d",
+        "PreemptLowerPriority"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "system-cluster-critical",
+          "resourceVersion": "1",
+          "uid": "543b06c3-8166-77db-7045-301bbb61b97b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system-node-critical",
+        2000001000,
+        false,
+        "1d",
+        "PreemptLowerPriority"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "system-node-critical",
+          "resourceVersion": "1",
+          "uid": "abaa91dc-2466-bfd2-fb40-b62571b442c7"
+        }
+      }
+    }
+  ]
+}

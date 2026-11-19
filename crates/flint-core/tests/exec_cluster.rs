@@ -107,6 +107,7 @@ impl Core {
             kubeconfig_base: vec![kubeconfig],
             home: None,
             watch_files: false,
+            watch_timing: Default::default(),
         })
         .unwrap();
         let events = handle.events();

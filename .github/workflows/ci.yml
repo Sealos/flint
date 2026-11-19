@@ -31,7 +31,8 @@ jobs:
       - run: cargo fmt --all --check
 
   # macOS runners cost about ten times as much as Linux ones, so only the app, which is a
-  # macOS GPUI app, runs on macOS. flint-core and flint-mcp build and test on Linux.
+  # macOS GPUI app, runs on macOS. flint-core, flint-mcp and flint-e2e (the fake API server,
+  # no GPUI) build and test on Linux.
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -43,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux
-      - run: cargo clippy -p flint-core -p flint-mcp --all-targets --locked -- -D warnings
+      - run: cargo clippy -p flint-core -p flint-mcp -p flint-e2e --all-targets --locked -- -D warnings
 
   # One job per crate, so a failure points at the module that broke. flint-app's tests run in
   # the macOS job below.
@@ -54,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [flint-core, flint-mcp]
+        crate: [flint-core, flint-mcp, flint-e2e]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -76,7 +77,7 @@ jobs:
         with:
           shared-key: linux
           save-if: false
-      - run: cargo doc -p flint-core -p flint-mcp --no-deps --document-private-items --locked
+      - run: cargo doc -p flint-core -p flint-mcp -p flint-e2e --no-deps --document-private-items --locked
 
   # The app on Linux: GPUI builds there (X11/Wayland), and the headless view tests use GPUI's
   # test platform, so they run without a display. Flint ships for macOS only; this job catches

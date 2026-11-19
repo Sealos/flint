@@ -1,0 +1,337 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name of the resource",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "",
+      "format": "quantity",
+      "name": "cpu",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "",
+      "format": "quantity",
+      "name": "memory",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "",
+      "format": "duration",
+      "name": "Window",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {},
+  "rows": [
+    {
+      "cells": [
+        "fixture-db-0",
+        "0",
+        "552Ki",
+        "14.209s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "app": "fixture-db",
+            "apps.kubernetes.io/pod-index": "0",
+            "controller-revision-hash": "fixture-db-7969d685c4",
+            "statefulset.kubernetes.io/pod-name": "fixture-db-0"
+          },
+          "name": "fixture-db-0",
+          "namespace": "demo"
+        }
+      }
+    },
+    {
+      "cells": [
+        "podinfo-c6497595d-b8chj",
+        "5528727n",
+        "14676Ki",
+        "17.44s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "app.kubernetes.io/name": "podinfo",
+            "pod-template-hash": "c6497595d"
+          },
+          "name": "podinfo-c6497595d-b8chj",
+          "namespace": "demo"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web-69c6f74b8b-qv4xv",
+        "0",
+        "2956Ki",
+        "11.547s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "app": "web",
+            "pod-template-hash": "69c6f74b8b"
+          },
+          "name": "web-69c6f74b8b-qv4xv",
+          "namespace": "demo"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web-69c6f74b8b-x4gss",
+        "0",
+        "3596Ki",
+        "15.196s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "app": "web",
+            "pod-template-hash": "69c6f74b8b"
+          },
+          "name": "web-69c6f74b8b-x4gss",
+          "namespace": "demo"
+        }
+      }
+    },
+    {
+      "cells": [
+        "coredns-559f6c778d-ft8sx",
+        "1696508n",
+        "12196Ki",
+        "15.124s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "k8s-app": "kube-dns",
+            "pod-template-hash": "559f6c778d"
+          },
+          "name": "coredns-559f6c778d-ft8sx",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "coredns-559f6c778d-lcszv",
+        "1320096n",
+        "12300Ki",
+        "13.221s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "k8s-app": "kube-dns",
+            "pod-template-hash": "559f6c778d"
+          },
+          "name": "coredns-559f6c778d-lcszv",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "etcd-flint-dev-control-plane",
+        "14915137n",
+        "50764Ki",
+        "16.674s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "component": "etcd",
+            "tier": "control-plane"
+          },
+          "name": "etcd-flint-dev-control-plane",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kindnet-dxn5d",
+        "89580n",
+        "9744Ki",
+        "14.914s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "app": "kindnet",
+            "controller-revision-hash": "85d795cbd4",
+            "k8s-app": "kindnet",
+            "pod-template-generation": "1",
+            "tier": "node"
+          },
+          "name": "kindnet-dxn5d",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-apiserver-flint-dev-control-plane",
+        "29831904n",
+        "274916Ki",
+        "16.794s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "component": "kube-apiserver",
+            "tier": "control-plane"
+          },
+          "name": "kube-apiserver-flint-dev-control-plane",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-controller-manager-flint-dev-control-plane",
+        "9287753n",
+        "52552Ki",
+        "15.555s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "component": "kube-controller-manager",
+            "tier": "control-plane"
+          },
+          "name": "kube-controller-manager-flint-dev-control-plane",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-proxy-jf65x",
+        "101042n",
+        "13968Ki",
+        "10.936s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "controller-revision-hash": "6f6bf99bf5",
+            "k8s-app": "kube-proxy",
+            "pod-template-generation": "1"
+          },
+          "name": "kube-proxy-jf65x",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-scheduler-flint-dev-control-plane",
+        "5169919n",
+        "22676Ki",
+        "19.268s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "component": "kube-scheduler",
+            "tier": "control-plane"
+          },
+          "name": "kube-scheduler-flint-dev-control-plane",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server-76558b4bb9-qt9lh",
+        "3303952n",
+        "16876Ki",
+        "15.407s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "k8s-app": "metrics-server",
+            "pod-template-hash": "76558b4bb9"
+          },
+          "name": "metrics-server-76558b4bb9-qt9lh",
+          "namespace": "kube-system"
+        }
+      }
+    },
+    {
+      "cells": [
+        "local-path-provisioner-75f7fc7dc5-x624n",
+        "186884n",
+        "8996Ki",
+        "16.256s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "app": "local-path-provisioner",
+            "pod-template-hash": "75f7fc7dc5"
+          },
+          "name": "local-path-provisioner-75f7fc7dc5-x624n",
+          "namespace": "local-path-storage"
+        }
+      }
+    }
+  ]
+}

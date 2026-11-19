@@ -1,0 +1,329 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Replicas is the number of desired pods. This is a pointer to distinguish between explicit zero and unspecified. Defaults to 1. More info: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset",
+      "format": "",
+      "name": "Desired",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "Replicas is the most recently observed number of non-terminating pods. More info: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset",
+      "format": "",
+      "name": "Current",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "The number of non-terminating pods targeted by this ReplicaSet with a Ready Condition.",
+      "format": "",
+      "name": "Ready",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Names of each container in the template.",
+      "format": "",
+      "name": "Containers",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Images referenced by each container in the template.",
+      "format": "",
+      "name": "Images",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Selector is a label query over pods that should match the replica count. Label keys and values that must match in order to be controlled by this replica set. It must match the pod template's labels. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors",
+      "format": "",
+      "name": "Selector",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "podinfo-c6497595d",
+        1,
+        1,
+        1,
+        "1d",
+        "podinfo",
+        "ghcr.io/stefanprodan/podinfo:6.17.0",
+        "app.kubernetes.io/name=podinfo,pod-template-hash=c6497595d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/desired-replicas": "1",
+            "deployment.kubernetes.io/max-replicas": "2",
+            "deployment.kubernetes.io/revision": "1",
+            "meta.helm.sh/release-name": "podinfo",
+            "meta.helm.sh/release-namespace": "demo"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "app.kubernetes.io/name": "podinfo",
+            "pod-template-hash": "c6497595d"
+          },
+          "name": "podinfo-c6497595d",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Deployment",
+              "name": "podinfo",
+              "uid": "58d4b8b8-e472-5cde-bf83-d09a1d2f2d01"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "0fdd95a9-f381-794a-bd56-9973a3b183ce"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web-69c6f74b8b",
+        2,
+        2,
+        2,
+        "1d",
+        "nginx",
+        "nginx:1.27",
+        "app=web,pod-template-hash=69c6f74b8b"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/desired-replicas": "2",
+            "deployment.kubernetes.io/max-replicas": "3",
+            "deployment.kubernetes.io/revision": "1"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "app": "web",
+            "pod-template-hash": "69c6f74b8b"
+          },
+          "name": "web-69c6f74b8b",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Deployment",
+              "name": "web",
+              "uid": "71da68b1-4e9c-ce37-f6f1-476535be4b4a"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+        }
+      }
+    },
+    {
+      "cells": [
+        "coredns-559f6c778d",
+        2,
+        2,
+        2,
+        "1d",
+        "coredns",
+        "registry.k8s.io/coredns/coredns:v1.14.6",
+        "k8s-app=kube-dns,pod-template-hash=559f6c778d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/desired-replicas": "2",
+            "deployment.kubernetes.io/max-replicas": "3",
+            "deployment.kubernetes.io/revision": "1"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "kube-dns",
+            "pod-template-hash": "559f6c778d"
+          },
+          "name": "coredns-559f6c778d",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Deployment",
+              "name": "coredns",
+              "uid": "76212d88-b80a-4538-5853-0ac613b22a7d"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "99595964-4243-ddd9-dc82-722763f2029f"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server-6694d85c44",
+        0,
+        0,
+        0,
+        "1d",
+        "metrics-server",
+        "registry.k8s.io/metrics-server/metrics-server:v0.9.1",
+        "k8s-app=metrics-server,pod-template-hash=6694d85c44"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/desired-replicas": "1",
+            "deployment.kubernetes.io/max-replicas": "2",
+            "deployment.kubernetes.io/revision": "3",
+            "deployment.kubernetes.io/revision-history": "1"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 4,
+          "labels": {
+            "k8s-app": "metrics-server",
+            "pod-template-hash": "6694d85c44"
+          },
+          "name": "metrics-server-6694d85c44",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Deployment",
+              "name": "metrics-server",
+              "uid": "88c2c74a-fb79-090c-d5e0-53bb4c4aced3"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "7e478508-235f-dfb6-847a-a8c7a635f208"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server-76558b4bb9",
+        1,
+        1,
+        1,
+        "1d",
+        "metrics-server",
+        "registry.k8s.io/metrics-server/metrics-server:v0.9.1",
+        "k8s-app=metrics-server,pod-template-hash=76558b4bb9"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/desired-replicas": "1",
+            "deployment.kubernetes.io/max-replicas": "2",
+            "deployment.kubernetes.io/revision": "4",
+            "deployment.kubernetes.io/revision-history": "2"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "metrics-server",
+            "pod-template-hash": "76558b4bb9"
+          },
+          "name": "metrics-server-76558b4bb9",
+          "namespace": "kube-system",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Deployment",
+              "name": "metrics-server",
+              "uid": "88c2c74a-fb79-090c-d5e0-53bb4c4aced3"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "6487bf59-20da-0b74-ce84-7fe9fbf76677"
+        }
+      }
+    },
+    {
+      "cells": [
+        "local-path-provisioner-75f7fc7dc5",
+        1,
+        1,
+        1,
+        "1d",
+        "local-path-provisioner",
+        "docker.io/kindest/local-path-provisioner:v20260820-69b56db7",
+        "app=local-path-provisioner,pod-template-hash=75f7fc7dc5"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/desired-replicas": "1",
+            "deployment.kubernetes.io/max-replicas": "2",
+            "deployment.kubernetes.io/revision": "1"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "app": "local-path-provisioner",
+            "pod-template-hash": "75f7fc7dc5"
+          },
+          "name": "local-path-provisioner-75f7fc7dc5",
+          "namespace": "local-path-storage",
+          "ownerReferences": [
+            {
+              "apiVersion": "apps/v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Deployment",
+              "name": "local-path-provisioner",
+              "uid": "2b8d9d38-98f6-28d8-b523-6a38b5c2490e"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "7774e21b-2e5e-8ddc-95ba-faeac1bbe22d"
+        }
+      }
+    }
+  ]
+}

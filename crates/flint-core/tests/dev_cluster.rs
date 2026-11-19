@@ -31,6 +31,7 @@ async fn core_handle_connects_and_reads_version() {
         kubeconfig_base: vec![path],
         home: None,
         watch_files: false,
+        watch_timing: Default::default(),
     })
     .unwrap();
     let events = core.events();

@@ -1,0 +1,128 @@
+{
+  "apiVersion": "batch/v1",
+  "items": [
+    {
+      "metadata": {
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"batch/v1\",\"kind\":\"CronJob\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-cron\",\"namespace\":\"demo\"},\"spec\":{\"failedJobsHistoryLimit\":1,\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"echo nightly\"],\"image\":\"busybox:1.37.0\",\"name\":\"job\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}}}],\"restartPolicy\":\"Never\"}}}},\"schedule\":\"17 3 * * *\",\"successfulJobsHistoryLimit\":1}}\n"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generation": 1,
+        "managedFields": [
+          {
+            "apiVersion": "batch/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:kubectl.kubernetes.io/last-applied-configuration": {}
+                }
+              },
+              "f:spec": {
+                "f:concurrencyPolicy": {},
+                "f:failedJobsHistoryLimit": {},
+                "f:jobTemplate": {
+                  "f:spec": {
+                    "f:template": {
+                      "f:spec": {
+                        "f:containers": {
+                          "k:{\"name\":\"job\"}": {
+                            ".": {},
+                            "f:command": {},
+                            "f:image": {},
+                            "f:imagePullPolicy": {},
+                            "f:name": {},
+                            "f:resources": {
+                              ".": {},
+                              "f:limits": {
+                                ".": {},
+                                "f:memory": {}
+                              },
+                              "f:requests": {
+                                ".": {},
+                                "f:cpu": {},
+                                "f:memory": {}
+                              }
+                            },
+                            "f:terminationMessagePath": {},
+                            "f:terminationMessagePolicy": {}
+                          }
+                        },
+                        "f:dnsPolicy": {},
+                        "f:restartPolicy": {},
+                        "f:schedulerName": {},
+                        "f:securityContext": {},
+                        "f:terminationGracePeriodSeconds": {}
+                      }
+                    }
+                  }
+                },
+                "f:schedule": {},
+                "f:successfulJobsHistoryLimit": {},
+                "f:suspend": {}
+              }
+            },
+            "manager": "kubectl-client-side-apply",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "fixture-cron",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6a5169ed-38cd-6163-817b-74d7e9bafd8c"
+      },
+      "spec": {
+        "concurrencyPolicy": "Allow",
+        "failedJobsHistoryLimit": 1,
+        "jobTemplate": {
+          "metadata": {},
+          "spec": {
+            "template": {
+              "metadata": {},
+              "spec": {
+                "containers": [
+                  {
+                    "command": [
+                      "sh",
+                      "-c",
+                      "echo nightly"
+                    ],
+                    "image": "busybox:1.37.0",
+                    "imagePullPolicy": "IfNotPresent",
+                    "name": "job",
+                    "resources": {
+                      "limits": {
+                        "memory": "32Mi"
+                      },
+                      "requests": {
+                        "cpu": "10m",
+                        "memory": "16Mi"
+                      }
+                    },
+                    "terminationMessagePath": "/dev/termination-log",
+                    "terminationMessagePolicy": "File"
+                  }
+                ],
+                "dnsPolicy": "ClusterFirst",
+                "restartPolicy": "Never",
+                "schedulerName": "default-scheduler",
+                "securityContext": {},
+                "terminationGracePeriodSeconds": 30
+              }
+            }
+          }
+        },
+        "schedule": "17 3 * * *",
+        "successfulJobsHistoryLimit": 1,
+        "suspend": false
+      },
+      "status": {}
+    }
+  ],
+  "kind": "CronJobList",
+  "metadata": {
+    "resourceVersion": "1"
+  }
+}

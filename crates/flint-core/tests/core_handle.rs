@@ -42,6 +42,7 @@ fn start(dir: &Path, watch: bool) -> CoreHandle {
         kubeconfig_base: vec![dir.join("kubeconfig")],
         home: None,
         watch_files: watch,
+        watch_timing: Default::default(),
     })
     .unwrap()
 }
@@ -275,6 +276,7 @@ async fn commands_never_write_kubeconfig_files() {
         kubeconfig_base: vec![kube_dir.join("config")],
         home: None,
         watch_files: true,
+        watch_timing: Default::default(),
     })
     .unwrap();
     let events = core.events();

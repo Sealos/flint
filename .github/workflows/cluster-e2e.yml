@@ -77,7 +77,8 @@ jobs:
         if: ${{ !cancelled() && steps.kind.outcome == 'success' }}
         run: |
           leftovers="$(
-            kubectl get ns,crd -o name | grep -E 'm1fix|flint' || true
+            # gadgets.fixtures.flint.dev is a permanent fixture (scripts/cluster-fixtures.sh).
+            kubectl get ns,crd -o name | grep -E 'm1fix|flint' | grep -v 'gadgets.fixtures.flint.dev' || true
             kubectl -n demo get secret -o name | grep flint-test || true
           )"
           if [ -n "$leftovers" ]; then

@@ -1,0 +1,142 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "metadata": {
+        "annotations": {
+          "pv.kubernetes.io/bind-completed": "yes",
+          "pv.kubernetes.io/bound-by-controller": "yes",
+          "volume.beta.kubernetes.io/storage-provisioner": "rancher.io/local-path",
+          "volume.kubernetes.io/selected-node": "flint-dev-control-plane",
+          "volume.kubernetes.io/storage-provisioner": "rancher.io/local-path"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "finalizers": [
+          "kubernetes.io/pvc-protection"
+        ],
+        "labels": {
+          "app": "fixture-db"
+        },
+        "managedFields": [
+          {
+            "apiVersion": "v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:volume.kubernetes.io/selected-node": {}
+                }
+              }
+            },
+            "manager": "kube-scheduler",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          },
+          {
+            "apiVersion": "v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  "f:pv.kubernetes.io/bind-completed": {},
+                  "f:pv.kubernetes.io/bound-by-controller": {},
+                  "f:volume.beta.kubernetes.io/storage-provisioner": {},
+                  "f:volume.kubernetes.io/storage-provisioner": {}
+                },
+                "f:labels": {
+                  ".": {},
+                  "f:app": {}
+                }
+              },
+              "f:spec": {
+                "f:accessModes": {},
+                "f:resources": {
+                  "f:requests": {
+                    ".": {},
+                    "f:storage": {}
+                  }
+                },
+                "f:volumeMode": {},
+                "f:volumeName": {}
+              }
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          },
+          {
+            "apiVersion": "v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:status": {
+                "f:accessModes": {},
+                "f:capacity": {
+                  ".": {},
+                  "f:storage": {}
+                },
+                "f:conditions": {
+                  ".": {},
+                  "k:{\"type\":\"Unused\"}": {
+                    ".": {},
+                    "f:lastProbeTime": {},
+                    "f:lastTransitionTime": {},
+                    "f:message": {},
+                    "f:reason": {},
+                    "f:status": {},
+                    "f:type": {}
+                  }
+                },
+                "f:phase": {}
+              }
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "subresource": "status",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "data-fixture-db-0",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "09aae925-1931-cdcf-d093-3f7dbc8458c2"
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "resources": {
+          "requests": {
+            "storage": "16Mi"
+          }
+        },
+        "storageClassName": "standard",
+        "volumeMode": "Filesystem",
+        "volumeName": "pvc-09aae925-1931-cdcf-d093-3f7dbc8458c2"
+      },
+      "status": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "capacity": {
+          "storage": "16Mi"
+        },
+        "conditions": [
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
+            "message": "A pod is currently referencing this PVC",
+            "reason": "PodUsingPVC",
+            "status": "False",
+            "type": "Unused"
+          }
+        ],
+        "phase": "Bound"
+      }
+    }
+  ],
+  "kind": "PersistentVolumeClaimList",
+  "metadata": {
+    "resourceVersion": "1"
+  }
+}

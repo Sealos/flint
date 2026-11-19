@@ -1,0 +1,1712 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "roleRef can only reference a ClusterRole in the global namespace. If the RoleRef cannot be resolved, the Authorizer must return an error.",
+      "format": "",
+      "name": "Role",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Users in the clusterRoleBinding",
+      "format": "",
+      "name": "Users",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Groups in the clusterRoleBinding",
+      "format": "",
+      "name": "Groups",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "ServiceAccounts in the clusterRoleBinding",
+      "format": "",
+      "name": "ServiceAccounts",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "cluster-admin",
+        "ClusterRole/cluster-admin",
+        "1d",
+        "",
+        "system:masters",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "cluster-admin",
+          "resourceVersion": "1",
+          "uid": "de3829b8-2f01-994e-0e39-d11f3784354a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kindnet",
+        "ClusterRole/kindnet",
+        "1d",
+        "",
+        "",
+        "kube-system/kindnet"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kindnet",
+          "resourceVersion": "1",
+          "uid": "2ec4d54c-55ef-c3c8-8e30-179018473f15"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:apiserver-kubelet-client",
+        "ClusterRole/system:kubelet-api-admin",
+        "1d",
+        "kube-apiserver-kubelet-client",
+        "",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:apiserver-kubelet-client",
+          "resourceVersion": "1",
+          "uid": "78473717-6a6d-b848-35e3-eb28960b78e7"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:cluster-admins",
+        "ClusterRole/cluster-admin",
+        "1d",
+        "",
+        "kubeadm:cluster-admins",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:cluster-admins",
+          "resourceVersion": "1",
+          "uid": "e618aaad-0aa6-a97a-2383-d4996d3df84d"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:get-nodes",
+        "ClusterRole/kubeadm:get-nodes",
+        "1d",
+        "",
+        "system:bootstrappers:kubeadm:default-node-token",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:get-nodes",
+          "resourceVersion": "1",
+          "uid": "5368e4dc-0a33-e9f5-b440-4f2f2626b2e9"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:kubelet-bootstrap",
+        "ClusterRole/system:node-bootstrapper",
+        "1d",
+        "",
+        "system:bootstrappers:kubeadm:default-node-token",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:kubelet-bootstrap",
+          "resourceVersion": "1",
+          "uid": "50b93b77-a112-b172-251d-52e14f110fa9"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:node-autoapprove-bootstrap",
+        "ClusterRole/system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+        "1d",
+        "",
+        "system:bootstrappers:kubeadm:default-node-token",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:node-autoapprove-bootstrap",
+          "resourceVersion": "1",
+          "uid": "872f8da8-bcd9-7715-47df-3a8223080cc7"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:node-autoapprove-certificate-rotation",
+        "ClusterRole/system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+        "1d",
+        "",
+        "system:nodes",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:node-autoapprove-certificate-rotation",
+          "resourceVersion": "1",
+          "uid": "c835bd6b-c2e7-1d2f-a30d-b23160ae291f"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kubeadm:node-proxier",
+        "ClusterRole/system:node-proxier",
+        "1d",
+        "",
+        "",
+        "kube-system/kube-proxy"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubeadm:node-proxier",
+          "resourceVersion": "1",
+          "uid": "0400444d-493b-e941-3cd2-c938ac376b70"
+        }
+      }
+    },
+    {
+      "cells": [
+        "local-path-provisioner-bind",
+        "ClusterRole/local-path-provisioner-role",
+        "1d",
+        "",
+        "",
+        "local-path-storage/local-path-provisioner-service-account"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"annotations\":{},\"name\":\"local-path-provisioner-bind\"},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"local-path-provisioner-role\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"local-path-provisioner-service-account\",\"namespace\":\"local-path-storage\"}]}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "local-path-provisioner-bind",
+          "resourceVersion": "1",
+          "uid": "bc8e568a-12e8-d213-05cd-35b5da14877a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server:system:auth-delegator",
+        "ClusterRole/system:auth-delegator",
+        "1d",
+        "",
+        "",
+        "kube-system/metrics-server"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"metrics-server:system:auth-delegator\"},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"system:auth-delegator\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"metrics-server\",\"namespace\":\"kube-system\"}]}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "k8s-app": "metrics-server"
+          },
+          "name": "metrics-server:system:auth-delegator",
+          "resourceVersion": "1",
+          "uid": "c8a86c0f-97ff-080f-05fd-9c155f471c07"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:basic-user",
+        "ClusterRole/system:basic-user",
+        "1d",
+        "",
+        "system:authenticated",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:basic-user",
+          "resourceVersion": "1",
+          "uid": "2ab89257-7a27-18cd-6051-a58b8cf20844"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:cluster-trust-bundle-discovery",
+        "ClusterRole/system:cluster-trust-bundle-discovery",
+        "1d",
+        "",
+        "system:serviceaccounts",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:cluster-trust-bundle-discovery",
+          "resourceVersion": "1",
+          "uid": "fd08fad5-613b-7da8-b550-67f1874fe44e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:attachdetach-controller",
+        "ClusterRole/system:controller:attachdetach-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/attachdetach-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:attachdetach-controller",
+          "resourceVersion": "1",
+          "uid": "02294def-2675-4c4a-0353-f1557d470c2e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:certificate-controller",
+        "ClusterRole/system:controller:certificate-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/certificate-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:certificate-controller",
+          "resourceVersion": "1",
+          "uid": "d4560a12-049a-85d6-b58c-c335ace1e250"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:clusterrole-aggregation-controller",
+        "ClusterRole/system:controller:clusterrole-aggregation-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/clusterrole-aggregation-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:clusterrole-aggregation-controller",
+          "resourceVersion": "1",
+          "uid": "cb13365b-08dc-ceb2-1e76-da4c4e32e9ef"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:cronjob-controller",
+        "ClusterRole/system:controller:cronjob-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/cronjob-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:cronjob-controller",
+          "resourceVersion": "1",
+          "uid": "ccce8aa1-4e84-9cb1-3df7-75b03bd69782"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:daemon-set-controller",
+        "ClusterRole/system:controller:daemon-set-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/daemon-set-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:daemon-set-controller",
+          "resourceVersion": "1",
+          "uid": "df6c060a-2b87-1a7e-db27-2349072d3e92"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:deployment-controller",
+        "ClusterRole/system:controller:deployment-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/deployment-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:deployment-controller",
+          "resourceVersion": "1",
+          "uid": "f5611cb1-9917-6b7c-79ae-c6ecb3f4cfee"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:device-taint-eviction-controller",
+        "ClusterRole/system:controller:device-taint-eviction-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/device-taint-eviction-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:device-taint-eviction-controller",
+          "resourceVersion": "1",
+          "uid": "b578767f-c31a-89b2-f3bc-a74044407047"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:disruption-controller",
+        "ClusterRole/system:controller:disruption-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/disruption-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:disruption-controller",
+          "resourceVersion": "1",
+          "uid": "09d3c600-169c-f8a8-0f47-10f60a67000e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:endpoint-controller",
+        "ClusterRole/system:controller:endpoint-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/endpoint-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:endpoint-controller",
+          "resourceVersion": "1",
+          "uid": "85b5d11d-254a-9557-18b4-450dbc4f23c0"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:endpointslice-controller",
+        "ClusterRole/system:controller:endpointslice-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/endpointslice-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:endpointslice-controller",
+          "resourceVersion": "1",
+          "uid": "9d26c71b-0ef8-ac43-b23c-3842596fea09"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:endpointslicemirroring-controller",
+        "ClusterRole/system:controller:endpointslicemirroring-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/endpointslicemirroring-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:endpointslicemirroring-controller",
+          "resourceVersion": "1",
+          "uid": "0438d955-b8e1-246e-955f-f39256adc82b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:ephemeral-volume-controller",
+        "ClusterRole/system:controller:ephemeral-volume-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/ephemeral-volume-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:ephemeral-volume-controller",
+          "resourceVersion": "1",
+          "uid": "bdde65d5-c860-8abd-be94-11bd6f92d66e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:expand-controller",
+        "ClusterRole/system:controller:expand-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/expand-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:expand-controller",
+          "resourceVersion": "1",
+          "uid": "56ee6462-b28e-86e8-76f8-8dfa0ae926f4"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:generic-garbage-collector",
+        "ClusterRole/system:controller:generic-garbage-collector",
+        "1d",
+        "",
+        "",
+        "kube-system/generic-garbage-collector"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:generic-garbage-collector",
+          "resourceVersion": "1",
+          "uid": "dea7a183-1e20-75d5-36e3-743c2236aafd"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:horizontal-pod-autoscaler",
+        "ClusterRole/system:controller:horizontal-pod-autoscaler",
+        "1d",
+        "",
+        "",
+        "kube-system/horizontal-pod-autoscaler"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:horizontal-pod-autoscaler",
+          "resourceVersion": "1",
+          "uid": "cc9412cf-828a-d0b5-6315-55c4d8c6b148"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:job-controller",
+        "ClusterRole/system:controller:job-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/job-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:job-controller",
+          "resourceVersion": "1",
+          "uid": "fda9598a-4e5f-52fd-6903-e4461dbb57eb"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
+        "ClusterRole/system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
+        "1d",
+        "",
+        "",
+        "kube-system/kube-apiserver-serving-clustertrustbundle-publisher"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
+          "resourceVersion": "1",
+          "uid": "3912fd6a-b0eb-bea6-0cc0-2ef897584736"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:legacy-service-account-token-cleaner",
+        "ClusterRole/system:controller:legacy-service-account-token-cleaner",
+        "1d",
+        "",
+        "",
+        "kube-system/legacy-service-account-token-cleaner"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:legacy-service-account-token-cleaner",
+          "resourceVersion": "1",
+          "uid": "217b470d-bda7-e330-1dc6-f90e1af9c028"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:namespace-controller",
+        "ClusterRole/system:controller:namespace-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/namespace-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:namespace-controller",
+          "resourceVersion": "1",
+          "uid": "71bad9a7-2552-8aec-b00c-33855733ee92"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:node-controller",
+        "ClusterRole/system:controller:node-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/node-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:node-controller",
+          "resourceVersion": "1",
+          "uid": "c9682ce9-88b1-f4c8-2215-9f498a3dba9b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:persistent-volume-binder",
+        "ClusterRole/system:controller:persistent-volume-binder",
+        "1d",
+        "",
+        "",
+        "kube-system/persistent-volume-binder"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:persistent-volume-binder",
+          "resourceVersion": "1",
+          "uid": "804a0e37-e851-9c03-40ad-946c1d292fdb"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:pod-garbage-collector",
+        "ClusterRole/system:controller:pod-garbage-collector",
+        "1d",
+        "",
+        "",
+        "kube-system/pod-garbage-collector"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:pod-garbage-collector",
+          "resourceVersion": "1",
+          "uid": "9f68319a-a142-cd68-7fcf-28b1da636275"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:podcertificaterequestcleaner",
+        "ClusterRole/system:controller:podcertificaterequestcleaner",
+        "1d",
+        "",
+        "",
+        "kube-system/podcertificaterequestcleaner"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:podcertificaterequestcleaner",
+          "resourceVersion": "1",
+          "uid": "c198662f-efd5-391b-0e72-ca3123572248"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:pv-protection-controller",
+        "ClusterRole/system:controller:pv-protection-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/pv-protection-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:pv-protection-controller",
+          "resourceVersion": "1",
+          "uid": "f0954f2d-b3a5-a668-5455-cc52d8249bbb"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:pvc-protection-controller",
+        "ClusterRole/system:controller:pvc-protection-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/pvc-protection-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:pvc-protection-controller",
+          "resourceVersion": "1",
+          "uid": "63b5d0e8-43b2-3811-4f33-7612a0c0d86e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:replicaset-controller",
+        "ClusterRole/system:controller:replicaset-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/replicaset-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:replicaset-controller",
+          "resourceVersion": "1",
+          "uid": "6d6f225b-22ad-c4d9-20b7-b2a58d560c9c"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:replication-controller",
+        "ClusterRole/system:controller:replication-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/replication-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:replication-controller",
+          "resourceVersion": "1",
+          "uid": "502c1cfb-449c-6c43-764a-3b13445d7e3a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:resource-claim-controller",
+        "ClusterRole/system:controller:resource-claim-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/resource-claim-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:resource-claim-controller",
+          "resourceVersion": "1",
+          "uid": "d20581a9-87be-a4e2-8208-2206be376c7b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:resourcequota-controller",
+        "ClusterRole/system:controller:resourcequota-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/resourcequota-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:resourcequota-controller",
+          "resourceVersion": "1",
+          "uid": "d3fe420f-82ce-7194-9532-c9d826bdfce0"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:root-ca-cert-publisher",
+        "ClusterRole/system:controller:root-ca-cert-publisher",
+        "1d",
+        "",
+        "",
+        "kube-system/root-ca-cert-publisher"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:root-ca-cert-publisher",
+          "resourceVersion": "1",
+          "uid": "88e5e338-381a-5cec-1ab2-8cfa64cf1321"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:route-controller",
+        "ClusterRole/system:controller:route-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/route-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:route-controller",
+          "resourceVersion": "1",
+          "uid": "678c6048-701f-1e92-6865-394a7262b40d"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:selinux-warning-controller",
+        "ClusterRole/system:controller:selinux-warning-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/selinux-warning-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:selinux-warning-controller",
+          "resourceVersion": "1",
+          "uid": "ca085479-3bfd-7fdb-8a48-2c7ec71a3491"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:service-account-controller",
+        "ClusterRole/system:controller:service-account-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/service-account-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:service-account-controller",
+          "resourceVersion": "1",
+          "uid": "84367bfe-f91e-7360-8807-61c64d5e16bb"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:service-cidrs-controller",
+        "ClusterRole/system:controller:service-cidrs-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/service-cidrs-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:service-cidrs-controller",
+          "resourceVersion": "1",
+          "uid": "256fc042-b364-0458-184f-444d0238c7ab"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:service-controller",
+        "ClusterRole/system:controller:service-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/service-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:service-controller",
+          "resourceVersion": "1",
+          "uid": "b3595b5f-f859-99ff-7e7d-dce58630d1dc"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:statefulset-controller",
+        "ClusterRole/system:controller:statefulset-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/statefulset-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:statefulset-controller",
+          "resourceVersion": "1",
+          "uid": "62aa77b3-7977-cd7d-8269-246a56ef0851"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:storage-version-migrator-controller",
+        "ClusterRole/system:controller:storage-version-migrator-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/storage-version-migrator-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:storage-version-migrator-controller",
+          "resourceVersion": "1",
+          "uid": "0258390a-3e7f-5466-a667-5c2fd3b07251"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:ttl-after-finished-controller",
+        "ClusterRole/system:controller:ttl-after-finished-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/ttl-after-finished-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:ttl-after-finished-controller",
+          "resourceVersion": "1",
+          "uid": "4cf0a18b-1af5-23b2-f2ae-25c1a103ccd9"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:ttl-controller",
+        "ClusterRole/system:controller:ttl-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/ttl-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:ttl-controller",
+          "resourceVersion": "1",
+          "uid": "d0d16473-f6bc-2fd1-d1f3-16cf00da34f1"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:validatingadmissionpolicy-status-controller",
+        "ClusterRole/system:controller:validatingadmissionpolicy-status-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/validatingadmissionpolicy-status-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:validatingadmissionpolicy-status-controller",
+          "resourceVersion": "1",
+          "uid": "78ebad15-d6de-8bae-5733-2cddba1971d2"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:controller:volumeattributesclass-protection-controller",
+        "ClusterRole/system:controller:volumeattributesclass-protection-controller",
+        "1d",
+        "",
+        "",
+        "kube-system/volumeattributesclass-protection-controller"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:controller:volumeattributesclass-protection-controller",
+          "resourceVersion": "1",
+          "uid": "aee40e7d-f04d-f6e0-be8e-f877bda1a4dd"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:coredns",
+        "ClusterRole/system:coredns",
+        "1d",
+        "",
+        "",
+        "kube-system/coredns"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "system:coredns",
+          "resourceVersion": "1",
+          "uid": "06f5ed28-6e60-16a6-b999-a250c07eab92"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:discovery",
+        "ClusterRole/system:discovery",
+        "1d",
+        "",
+        "system:authenticated",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:discovery",
+          "resourceVersion": "1",
+          "uid": "75380fd3-5477-95ee-13e8-d5d98cd72480"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:kube-controller-manager",
+        "ClusterRole/system:kube-controller-manager",
+        "1d",
+        "system:kube-controller-manager",
+        "",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:kube-controller-manager",
+          "resourceVersion": "1",
+          "uid": "8f35aaf7-7632-789f-e866-434cb83fac9c"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:kube-dns",
+        "ClusterRole/system:kube-dns",
+        "1d",
+        "",
+        "",
+        "kube-system/kube-dns"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:kube-dns",
+          "resourceVersion": "1",
+          "uid": "37b8975c-bd7f-ef90-1386-af0982d52b63"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:kube-scheduler",
+        "ClusterRole/system:kube-scheduler",
+        "1d",
+        "system:kube-scheduler",
+        "",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:kube-scheduler",
+          "resourceVersion": "1",
+          "uid": "d97d2aa1-bc47-ecef-6653-05c2fde18ead"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:metrics-server",
+        "ClusterRole/system:metrics-server",
+        "1d",
+        "",
+        "",
+        "kube-system/metrics-server"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"system:metrics-server\"},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"system:metrics-server\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"metrics-server\",\"namespace\":\"kube-system\"}]}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "k8s-app": "metrics-server"
+          },
+          "name": "system:metrics-server",
+          "resourceVersion": "1",
+          "uid": "ff9f8fbd-ca7e-53a3-ac15-02d84a0e55ce"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:monitoring",
+        "ClusterRole/system:monitoring",
+        "1d",
+        "",
+        "system:monitoring",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:monitoring",
+          "resourceVersion": "1",
+          "uid": "ea537878-7651-2053-a3b0-55d2317c10f0"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:node",
+        "ClusterRole/system:node",
+        "1d",
+        "",
+        "",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:node",
+          "resourceVersion": "1",
+          "uid": "ee96ec6e-0255-0a4d-6dc1-64e5628962a0"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:node-proxier",
+        "ClusterRole/system:node-proxier",
+        "1d",
+        "system:kube-proxy",
+        "",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:node-proxier",
+          "resourceVersion": "1",
+          "uid": "771941a9-81eb-4d8c-b7c6-bf993631b7e5"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:public-info-viewer",
+        "ClusterRole/system:public-info-viewer",
+        "1d",
+        "",
+        "system:authenticated, system:unauthenticated",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:public-info-viewer",
+          "resourceVersion": "1",
+          "uid": "a243b5e2-cf36-64a2-37e0-88b8beff438c"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:service-account-issuer-discovery",
+        "ClusterRole/system:service-account-issuer-discovery",
+        "1d",
+        "",
+        "system:serviceaccounts",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:service-account-issuer-discovery",
+          "resourceVersion": "1",
+          "uid": "84f6cda9-46ff-56f6-c524-814f1b2e359e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system:volume-scheduler",
+        "ClusterRole/system:volume-scheduler",
+        "1d",
+        "system:kube-scheduler",
+        "",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "rbac.authorization.kubernetes.io/autoupdate": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "kubernetes.io/bootstrapping": "rbac-defaults"
+          },
+          "name": "system:volume-scheduler",
+          "resourceVersion": "1",
+          "uid": "c5a888c6-b99a-548a-5f8b-961a94ec415e"
+        }
+      }
+    }
+  ]
+}

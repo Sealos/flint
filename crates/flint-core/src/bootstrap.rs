@@ -31,6 +31,7 @@ impl Bootstrap {
             kubeconfig_base: self.kubeconfig_base.clone(),
             home: self.home.clone(),
             watch_files: true,
+            watch_timing: Default::default(),
         }
     }
 

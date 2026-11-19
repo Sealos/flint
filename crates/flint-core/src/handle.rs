@@ -9,6 +9,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{oneshot, watch};
 
@@ -40,6 +41,29 @@ pub struct CoreConfig {
     pub home: Option<PathBuf>,
     /// Watch the kubeconfig files and `settings.toml`, and reload on change.
     pub watch_files: bool,
+    /// Retry timings of the watch engine. Leave at the default; tests against a fake API
+    /// server shorten them.
+    pub watch_timing: WatchTiming,
+}
+
+/// How long the watch engine waits before retrying. The defaults suit real API servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchTiming {
+    /// First wait after a broken watch or failed list; doubles up to `backoff_max`.
+    pub backoff_min: Duration,
+    pub backoff_max: Duration,
+    /// First wait after a 403 or 404, which is retried a few times before it is believed.
+    pub denied_backoff_min: Duration,
+}
+
+impl Default for WatchTiming {
+    fn default() -> Self {
+        WatchTiming {
+            backoff_min: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            denied_backoff_min: Duration::from_millis(500),
+        }
+    }
 }
 
 /// Requests from the front end.
@@ -593,6 +617,7 @@ mod tests {
             kubeconfig_base: Vec::new(),
             home: None,
             watch_files: false,
+            watch_timing: Default::default(),
         })
         .unwrap()
     }

@@ -1,0 +1,3 @@
+[files]
+# Recorded API responses: generated names and hashes, not prose.
+extend-exclude = ["crates/flint-e2e/fixtures/"]

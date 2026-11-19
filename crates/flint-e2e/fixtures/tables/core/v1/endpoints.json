@@ -1,0 +1,180 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The set of all endpoints is the union of all subsets. Addresses are placed into subsets according to the IPs they share. A single address with multiple ports, some of which are ready and some of which are not (because they come from different containers) will result in the address being displayed in different subsets for the different ports. No address will appear in both Addresses and NotReadyAddresses in the same subset. Sets of addresses and ports that comprise a service.",
+      "format": "",
+      "name": "Endpoints",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "kubernetes",
+        "172.18.0.2:6443",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "endpointslice.kubernetes.io/skip-mirror": "true"
+          },
+          "name": "kubernetes",
+          "namespace": "default",
+          "resourceVersion": "1",
+          "uid": "f81c312b-a1ca-d1cb-34c6-eed5facf5240"
+        }
+      }
+    },
+    {
+      "cells": [
+        "fixture-db",
+        "10.244.0.14:5432",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "endpoints.kubernetes.io/managed-by": "endpoint-controller",
+            "service.kubernetes.io/headless": ""
+          },
+          "name": "fixture-db",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "e9a569aa-1947-7211-d700-57bec2e68931"
+        }
+      }
+    },
+    {
+      "cells": [
+        "podinfo",
+        "10.244.0.9:9999,10.244.0.9:9898",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "app.kubernetes.io/managed-by": "Helm",
+            "app.kubernetes.io/name": "podinfo",
+            "app.kubernetes.io/version": "6.17.0",
+            "endpoints.kubernetes.io/managed-by": "endpoint-controller",
+            "helm.sh/chart": "podinfo-6.17.0"
+          },
+          "name": "podinfo",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "9309422c-da27-9d96-f026-a0715d658d9b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web",
+        "10.244.0.7:80,10.244.0.8:80",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "app": "web",
+            "endpoints.kubernetes.io/managed-by": "endpoint-controller"
+          },
+          "name": "web",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "6eb3f5a8-fc06-a0f4-38df-7d19d52b84cd"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-dns",
+        "10.244.0.2:9153,10.244.0.3:9153,10.244.0.2:53 + 3 more...",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "endpoints.kubernetes.io/managed-by": "endpoint-controller",
+            "k8s-app": "kube-dns",
+            "kubernetes.io/cluster-service": "true",
+            "kubernetes.io/name": "CoreDNS"
+          },
+          "name": "kube-dns",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "618b15bf-1555-11e8-f48e-b8f9c6c02096"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server",
+        "10.244.0.6:10250",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "endpoints.kubernetes.io/managed-by": "endpoint-controller",
+            "k8s-app": "metrics-server"
+          },
+          "name": "metrics-server",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "f1e98ebf-2b9d-5981-3f24-6fb052528de9"
+        }
+      }
+    }
+  ]
+}

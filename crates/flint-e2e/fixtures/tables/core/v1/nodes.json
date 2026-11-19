@@ -1,0 +1,117 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The status of the node",
+      "format": "",
+      "name": "Status",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The roles of the node",
+      "format": "",
+      "name": "Roles",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Kubelet Version reported by the node.",
+      "format": "",
+      "name": "Version",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "List of addresses reachable to the node. Queried from cloud provider, if available. More info: https://kubernetes.io/docs/reference/node/node-status/#addresses Note: This field is declared as mergeable, but the merge key is not sufficiently unique, which can cause data corruption when it is merged. Callers should instead use a full-replacement patch. See https://pr.k8s.io/79391 for an example. Consumers should assume that addresses can change during the lifetime of a Node. However, there are some exceptions where this may not be possible, such as Pods that inherit a Node's address in its own status or consumers of the downward API (status.hostIP).",
+      "format": "",
+      "name": "Internal-IP",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "List of addresses reachable to the node. Queried from cloud provider, if available. More info: https://kubernetes.io/docs/reference/node/node-status/#addresses Note: This field is declared as mergeable, but the merge key is not sufficiently unique, which can cause data corruption when it is merged. Callers should instead use a full-replacement patch. See https://pr.k8s.io/79391 for an example. Consumers should assume that addresses can change during the lifetime of a Node. However, there are some exceptions where this may not be possible, such as Pods that inherit a Node's address in its own status or consumers of the downward API (status.hostIP).",
+      "format": "",
+      "name": "External-IP",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "OS Image reported by the node from /etc/os-release (e.g. Debian GNU/Linux 7 (wheezy)).",
+      "format": "",
+      "name": "OS-Image",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Kernel Version reported by the node from 'uname -r' (e.g. 3.16.0-0.bpo.4-amd64).",
+      "format": "",
+      "name": "Kernel-Version",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "ContainerRuntime Version reported by the node through runtime remote API (e.g. containerd://1.4.2).",
+      "format": "",
+      "name": "Container-Runtime",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "flint-dev-control-plane",
+        "Ready",
+        "control-plane",
+        "1d",
+        "v1.37.0",
+        "172.18.0.2",
+        "<none>",
+        "Debian GNU/Linux 13 (trixie)",
+        "6.8.0-117-generic (arm64)",
+        "containerd://2.3.4"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "node.alpha.kubernetes.io/ttl": "0",
+            "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "beta.kubernetes.io/arch": "arm64",
+            "beta.kubernetes.io/os": "linux",
+            "kubernetes.io/arch": "arm64",
+            "kubernetes.io/hostname": "flint-dev-control-plane",
+            "kubernetes.io/os": "linux",
+            "node-role.kubernetes.io/control-plane": ""
+          },
+          "name": "flint-dev-control-plane",
+          "resourceVersion": "1",
+          "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+        }
+      }
+    }
+  ]
+}

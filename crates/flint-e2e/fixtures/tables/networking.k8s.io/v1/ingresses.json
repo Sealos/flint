@@ -1,0 +1,78 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The name of the IngressClass resource that should be used for additional configuration",
+      "format": "",
+      "name": "Class",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Hosts that incoming requests are matched against before the ingress rule",
+      "format": "",
+      "name": "Hosts",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Address is a list containing ingress points for the load-balancer",
+      "format": "",
+      "name": "Address",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Ports of TLS configurations that open",
+      "format": "",
+      "name": "Ports",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "web",
+        "<none>",
+        "web.demo.flint.test",
+        "",
+        "80",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"networking.k8s.io/v1\",\"kind\":\"Ingress\",\"metadata\":{\"annotations\":{},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"rules\":[{\"host\":\"web.demo.flint.test\",\"http\":{\"paths\":[{\"backend\":{\"service\":{\"name\":\"web\",\"port\":{\"number\":80}}},\"path\":\"/\",\"pathType\":\"Prefix\"}]}}]}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "web",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "27717356-29c4-313c-1f1a-f170c1219d7a"
+        }
+      }
+    }
+  ]
+}
