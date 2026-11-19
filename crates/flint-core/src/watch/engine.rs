@@ -101,15 +101,46 @@ impl Backoff {
     fn next(&mut self) -> Duration {
         let base = self.next;
         self.next = (self.next * 2).min(self.max);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        base + base.mul_f64(f64::from(nanos % 250) / 1000.0)
+        jittered(base)
     }
 
     fn reset(&mut self) {
         self.next = self.min;
     }
+}
+
+/// `delay` plus up to 25% jitter, so the kinds of a cluster do not retry in lockstep after a
+/// network drop or an API-server restart. Every retry and poll delay goes through this.
+fn jittered(delay: Duration) -> Duration {
+    delay + delay.mul_f64(jitter_fraction(jitter_entropy()))
+}
+
+/// Fresh bits for one jitter: the clock, hashed with a per-call random key.
+fn jitter_entropy() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    keyed(nanos)
+}
+
+/// `value` hashed with a new random key, so two kinds that read the same clock value still get
+/// different jitter.
+fn keyed(value: u128) -> u64 {
+    use std::hash::BuildHasher as _;
+    std::collections::hash_map::RandomState::new().hash_one(value)
+}
+
+/// A jitter between 0 and 25%, spread evenly whichever bits of `entropy` vary. (A raw clock
+/// reading is not enough: macOS clocks tick in microseconds, so the low digits of the
+/// nanoseconds are always zero there.)
+fn jitter_fraction(entropy: u64) -> f64 {
+    // splitmix64's finalizer: every input bit affects every output bit.
+    let mut z = entropy.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    // `% 1000` keeps the value exact as an f64.
+    (z % 1000) as f64 / 4000.0
 }
 
 enum StreamEnd {
@@ -344,7 +375,7 @@ impl Engine {
                         error: Some(m.clone()),
                     });
                     let n = self.denials.saturating_sub(1).min(8);
-                    self.config.denied_backoff_min * 2u32.pow(n)
+                    jittered(self.config.denied_backoff_min * 2u32.pow(n))
                 }
             }
             other => {
@@ -367,7 +398,7 @@ impl Engine {
                 error: Some(error.to_string()),
             });
             let n = self.watch_denials.saturating_sub(1).min(8);
-            self.pause(self.config.denied_backoff_min * 2u32.pow(n))
+            self.pause(jittered(self.config.denied_backoff_min * 2u32.pow(n)))
                 .await;
             return Some(None);
         }
@@ -701,7 +732,7 @@ impl Engine {
                     if retry_at.is_some_and(|at| Instant::now() >= at) {
                         return Some(rv);
                     }
-                    self.pause(self.config.poll_interval).await;
+                    self.pause(jittered(self.config.poll_interval)).await;
                 }
                 Err(e) => self.fail(e, &mut backoff).await,
             }
@@ -1059,6 +1090,43 @@ mod tests {
         assert!(b.next() < Duration::from_secs(5), "capped");
         b.reset();
         assert!(b.next() < Duration::from_millis(1250));
+    }
+
+    #[test]
+    fn jitter_varies_even_on_a_microsecond_clock() {
+        // A microsecond clock: every nanosecond reading is a multiple of 1000.
+        let fractions: Vec<f64> = (1..=200u64).map(|us| jitter_fraction(us * 1000)).collect();
+        assert!(fractions.iter().all(|f| (0.0..0.25).contains(f)));
+        let distinct: std::collections::BTreeSet<u64> =
+            fractions.iter().map(|f| f.to_bits()).collect();
+        assert!(distinct.len() > 150, "{} distinct", distinct.len());
+        assert!(fractions.iter().any(|f| *f < 0.05) && fractions.iter().any(|f| *f > 0.2));
+    }
+
+    #[test]
+    fn jittered_adds_up_to_a_quarter_and_varies() {
+        let base = Duration::from_millis(500);
+        let delays: std::collections::BTreeSet<Duration> =
+            (0..50).map(|_| jittered(base)).collect();
+        assert!(
+            delays.iter().all(|d| *d >= base && *d < base.mul_f64(1.25)),
+            "{delays:?}"
+        );
+        assert!(delays.len() > 1, "{delays:?}");
+    }
+
+    #[test]
+    fn the_same_clock_value_gets_different_keys() {
+        let keys: std::collections::BTreeSet<u64> = (0..20).map(|_| keyed(42)).collect();
+        assert!(keys.len() > 1, "{keys:?}");
+    }
+
+    #[test]
+    fn backoffs_in_the_same_instant_get_different_jitter() {
+        let delays: std::collections::BTreeSet<Duration> = (0..20)
+            .map(|_| Backoff::between(Duration::from_secs(1), Duration::from_secs(4)).next())
+            .collect();
+        assert!(delays.len() > 1, "{delays:?}");
     }
 
     #[test]

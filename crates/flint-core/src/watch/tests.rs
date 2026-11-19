@@ -448,7 +448,8 @@ async fn apis_that_cannot_watch_are_polled() {
     assert_eq!(snap.feed, Feed::Poll);
     assert_eq!(snap.format, crate::table::ListFormat::Fallback);
     assert_eq!(names(&snap), ["p"]);
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // Two more polls: 500 ms each, plus up to 25% jitter.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
     assert!(fake.list_calls("pods") >= 3, "listed again on an interval");
     assert!(fake.watch_requests("pods").is_empty(), "never watched");
     task.abort();
