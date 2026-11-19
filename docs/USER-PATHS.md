@@ -109,6 +109,27 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   `flint mcp` exposes nothing rather than guessing.
 - Tests: unit, mcp.
 
+### UP-14 Limit what an agent may read
+- **When** I expose a cluster and limit it to some namespaces and kinds in the Expose to AI dialog.
+- **Then** the agent sees only those namespaces and kinds. Asking for anything else returns the same "not found" error
+  as an unexposed cluster. Cluster-scoped kinds are hidden unless I named them. Clearing the scope exposes everything
+  again.
+- Tests: unit (policy), mcp + cluster, ui.
+
+### UP-15 Credentials in logs don't reach the agent
+- **When** an agent reads pod logs or events that contain a token, a password pair, a private key or a cloud access
+  key.
+- **Then** each value is replaced with a marker, and the result says how many were replaced. The rest of the line is
+  unchanged.
+- Tests: unit (redactor patterns), mcp + cluster.
+
+### UP-16 See what an agent read
+- **When** an agent has called Flint's MCP tools, and I open a cluster's agent activity.
+- **Then** I see each call: when, which tool, what it named, how much came back, and whether it was cut short or
+  denied. No returned content is stored. The view updates while the agent works, even though `flint mcp` is a separate
+  process.
+- Tests: unit (record format, rotation), mcp, ui.
+
 ### UP-13 Appearance follows macOS
 - **When** macOS switches between light and dark.
 - **Then** Flint follows live. (The full themes come in M1.5. In M0, dark mode must at least work.)
