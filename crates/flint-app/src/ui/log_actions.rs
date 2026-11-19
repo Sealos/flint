@@ -7,7 +7,7 @@ use gpui_kit::*;
 
 use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
-    ExtendSelectionUp, FocusSearch, JumpToEnd, NextMatch, OnView, PrevMatch, SaveLines, SaveLogs,
+    ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, NextMatch, OnView, PrevMatch, SaveLines, SaveLogs,
     SaveScope, SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, TogglePause,
     ToggleTimestamps, ToggleWrap,
 };
@@ -19,8 +19,21 @@ impl LogView {
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<TogglePause>(Self::toggle_pause)
             .bind::<JumpToEnd>(|view, _, _, cx| {
+                // Following means new lines show again: a pause ends too (the selection stays).
+                if view.is_paused() {
+                    view.user_paused = false;
+                    view.selection_paused = false;
+                    view.sync_pause();
+                }
                 view.list.set_follow_mode(FollowMode::Tail);
                 cx.notify();
+            })
+            .bind::<JumpToStart>(|view, _, _, cx| {
+                if view.has_lines() {
+                    view.list.pause_following_tail();
+                    view.list.scroll_to(ListOffset::default());
+                    cx.notify();
+                }
             })
             .bind::<ToggleTimestamps>(|view, _, _, cx| {
                 view.timestamps = !view.timestamps;
@@ -60,13 +73,13 @@ impl LogView {
                 }
             })
             .bind::<CopyLines>(Self::copy_lines)
-            .bind::<SaveLogs>(|view, _, _, cx| {
+            .bind::<SaveLogs>(|view, _, window, cx| {
                 if view.check_save(SaveScope::All).is_ok() {
-                    view.save(SaveScope::All, None, cx);
+                    view.save(SaveScope::All, None, window, cx);
                 }
             })
-            .bind::<SaveLines>(|view, action, _, cx| match view.check_save(action.lines) {
-                Ok(()) => view.save(action.lines, action.timestamps, cx),
+            .bind::<SaveLines>(|view, action, window, cx| match view.check_save(action.lines) {
+                Ok(()) => view.save(action.lines, action.timestamps, window, cx),
                 Err(e) => tracing::warn!("{e}"),
             })
             .bind::<SelectLine>(Self::select_line)

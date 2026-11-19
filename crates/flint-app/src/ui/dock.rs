@@ -100,7 +100,16 @@ impl DockTab {
 struct Tab {
     id: u64,
     tab: DockTab,
+    /// The title and status drawn, so the tab bar redraws only when they change, not for every
+    /// snapshot of a chatty session.
+    shown: (SharedString, TabStatus),
     _observe: Subscription,
+}
+
+/// What the tab bar shows of a tab.
+fn tab_shown(tab: &DockTab, cx: &App) -> (SharedString, TabStatus) {
+    let item = tab.item(cx);
+    (item.tab_title(), item.tab_status())
 }
 
 pub enum DockEvent {
@@ -193,18 +202,32 @@ impl Dock {
             return id;
         }
         let tab = build(window, cx);
-        let observe = match &tab {
-            DockTab::Logs(view) => cx.observe(view, |_, _, cx| cx.notify()),
-        };
         let id = self.next_id;
         self.next_id += 1;
+        let observe = match &tab {
+            DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        };
+        let shown = tab_shown(&tab, cx);
         self.tabs.push(Tab {
             id,
             tab,
+            shown,
             _observe: observe,
         });
         self.activate(id, window, cx);
         id
+    }
+
+    /// Redraws the tab bar when tab `id`'s title or status changed.
+    fn tab_changed(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let now = tab_shown(&self.tabs[ix].tab, cx);
+        if self.tabs[ix].shown != now {
+            self.tabs[ix].shown = now;
+            cx.notify();
+        }
     }
 
     /// Shows the dock with tab `id` and focuses it.

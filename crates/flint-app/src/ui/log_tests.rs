@@ -8,6 +8,7 @@ use flint_core::logs::LogBuffer;
 use flint_core::{
     CoreConfig, CoreHandle, LineSelection, LogLine, LogSnapshot, LogState, LogTarget, Settings,
 };
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, Point, ScrollDelta,
@@ -268,6 +269,18 @@ async fn pause_holds_lines_back_and_scrolling_up_stops_following(cx: &mut TestAp
     })
     .await;
     assert!(view.read_with(cx, |v, _| v.list.is_following_tail()));
+
+    // Home goes to the oldest line and stops following; End follows again and resumes a pause.
+    press(cx, window, "home");
+    cx.wait_for(window, WAIT, |window, _| window.try_find(line_id(0)).is_some())
+        .await;
+    assert!(!view.read_with(cx, |v, _| v.list.is_following_tail()));
+    press(cx, window, "space");
+    press(cx, window, "end");
+    view.read_with(cx, |v, _| {
+        assert!(v.list.is_following_tail());
+        assert!(!v.is_paused() && !v.session.is_paused());
+    });
 }
 
 // covers UP-40, UP-43: the search highlights matches, counts them, keeps matching new lines,
@@ -488,6 +501,16 @@ async fn save_writes_matches_as_shown_to_the_chosen_file(cx: &mut TestAppContext
             cx,
         )
     })
+    .unwrap();
+    cx.run_until_parked();
+    // First a confirmation that says the file is not redacted; the save dialog only after it.
+    assert!(!cx.did_prompt_for_new_path());
+    cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch("ui::Confirm", serde_json::Value::Null, window, cx)
+    })
+    .unwrap()
     .unwrap();
     cx.run_until_parked();
     assert!(cx.did_prompt_for_new_path());

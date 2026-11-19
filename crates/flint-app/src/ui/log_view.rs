@@ -33,6 +33,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
+    WindowExt as _,
     h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -49,6 +50,8 @@ use super::theme;
 
 /// The height of one unwrapped log line.
 pub const LINE_HEIGHT: f32 = 18.;
+/// How long a search query must stay unchanged before the buffer is scanned for it.
+const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// What a log tab shows: a container of a pod on a cluster, and whether it is the previous
 /// (terminated) instance. Opening the same request again shows the existing tab.
@@ -68,6 +71,16 @@ impl LogRequest {
             ..LogOptions::default()
         }
     }
+}
+
+/// What a save writes, captured when the user asked for it (as shown then).
+#[derive(Clone)]
+struct PendingSave {
+    scope: SaveScope,
+    timestamps: bool,
+    lines: flint_core::LogLines,
+    matches: Vec<LineId>,
+    selection: Option<LineSelection>,
 }
 
 /// A line under the toolbar after a copy or a save.
@@ -106,7 +119,6 @@ pub struct LogView {
     focus: FocusHandle,
     _pump: Task<()>,
     _search: Task<()>,
-    _save: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -188,7 +200,6 @@ impl LogView {
             focus: cx.focus_handle(),
             _pump: pump,
             _search: Task::ready(()),
-            _save: Task::ready(()),
             _subscriptions: vec![on_search],
         }
     }
@@ -264,11 +275,14 @@ impl LogView {
         }
         self.searching = true;
         let generation = self.search_generation;
-        let scan = self
-            .core
-            .search_logs(LogSearch::new(query), self.snapshot.lines.clone());
+        let core = self.core.clone();
         self._search = cx.spawn(async move |this, cx| {
-            let search = scan.await;
+            // Typing replaces this task: only a query that stays for a moment scans the buffer.
+            cx.background_executor().timer(SEARCH_DELAY).await;
+            let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
+                return;
+            };
+            let search = core.search_logs(LogSearch::new(query), lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.search_generation == generation {
                     view.search = search;
@@ -352,18 +366,72 @@ impl LogView {
         }
     }
 
-    /// Asks where to save, then writes the lines `scope` names as shown when the action ran.
-    fn save(&mut self, scope: SaveScope, timestamps: Option<bool>, cx: &mut Context<Self>) {
-        let timestamps = timestamps.unwrap_or(self.timestamps);
-        let lines = self.snapshot.lines.clone();
-        let matches: Vec<LineId> = match scope {
-            SaveScope::Matches => self.search.matches().iter().copied().collect(),
-            _ => Vec::new(),
+    /// Says the file is written as shown and not redacted, then asks where to save and writes
+    /// the lines `scope` names, as they were shown when the action ran.
+    fn save(
+        &mut self,
+        scope: SaveScope,
+        timestamps: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let save = PendingSave {
+            scope,
+            timestamps: timestamps.unwrap_or(self.timestamps),
+            lines: self.snapshot.lines.clone(),
+            matches: match scope {
+                SaveScope::Matches => self.search.matches().iter().copied().collect(),
+                _ => Vec::new(),
+            },
+            selection: self.selection,
         };
-        let selection = self.selection;
+        let count = log_model::save_text(
+            &save.lines,
+            save.scope,
+            &save.matches,
+            save.selection,
+            save.timestamps,
+        )
+        .map_or(0, |(_, n)| n as u64);
+        let description = format!(
+            "{} will be written as shown{}. The file is not redacted: it holds whatever the \
+             pod logged, secrets included.",
+            log_model::line_count(count),
+            if save.timestamps {
+                ", with timestamps"
+            } else {
+                ", without timestamps"
+            },
+        );
+        let view = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (view, save) = (view.clone(), save.clone());
+            alert
+                .confirm()
+                .title("Save logs to a file?")
+                .description(description.clone())
+                .ok_text("Choose File…")
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    let save = save.clone();
+                    let _ = view.update(cx, |view, cx| view.write_lines(save, cx));
+                    true
+                })
+        });
+    }
+
+    /// Asks where to save, then writes `save`. The write finishes even if the tab closes.
+    fn write_lines(&mut self, save: PendingSave, cx: &mut Context<Self>) {
+        let PendingSave {
+            scope,
+            timestamps,
+            lines,
+            matches,
+            selection,
+        } = save;
         let name = log_model::suggested_file_name(&self.request.target, self.request.previous);
         let path = cx.prompt_for_new_path(&Self::save_dir(), Some(&name));
-        self._save = cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let path = match path.await {
                 Ok(Ok(Some(path))) => path,
                 Ok(Err(e)) => {
@@ -400,7 +468,8 @@ impl LogView {
                 }
                 cx.notify();
             });
-        });
+        })
+        .detach();
     }
 
     fn set_note(&mut self, tone: Tone, text: String) {

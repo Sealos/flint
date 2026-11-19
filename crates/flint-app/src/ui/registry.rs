@@ -130,6 +130,8 @@ actions!(
         TogglePause,
         /// Scroll to the newest line and keep following.
         JumpToEnd,
+        /// Scroll to the oldest line shown.
+        JumpToStart,
         /// Show or hide each line's timestamp.
         ToggleTimestamps,
         /// Wrap long lines, or cut them at the edge.
@@ -1369,10 +1371,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .keys(&["space"], Some(LOG_PLAIN)),
         Spec::unit::<JumpToEnd>(
             "Jump to Newest Line",
-            "Scroll to the newest line and keep following.",
+            "Scroll to the newest line and follow again, resuming a pause.",
         )
         .of(C::Logs, S::Logs)
         .keys(&["end", "cmd-down"], Some(LOG_PLAIN)),
+        Spec::unit::<JumpToStart>("Jump to Oldest Line", "Scroll to the oldest line shown.")
+            .of(C::Logs, S::Logs)
+            .keys(&["home", "cmd-up"], Some(LOG_PLAIN)),
         Spec::unit::<ToggleTimestamps>(
             "Toggle Timestamps",
             "Show or hide each line's timestamp, without reloading.",

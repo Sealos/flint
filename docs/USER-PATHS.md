@@ -273,8 +273,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-46 Save logs to a file
 - **When** I save a log tab's lines (Cmd-S, the Save menu, or the palette): all of them, the search matches, or the
   selection.
-- **Then** the native save dialog writes them as shown, with timestamps only if they are shown, and the tab says how
-  many lines went where. The file is not redacted, and the Save menu and the result say so.
+- **Then** a confirmation says how many lines will be written and that the file is not redacted; after it, the native
+  save dialog writes them as shown, with timestamps only if they are shown, and the tab says how many lines went
+  where.
 - Tests: unit, ui.
 
 ---

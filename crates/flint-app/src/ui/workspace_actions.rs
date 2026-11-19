@@ -20,7 +20,7 @@ use super::super::registry::{
     ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
     CloseDetail, CloseTab, CopyLines, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
-    Forward, Guards, HideFromAi, JumpToEnd, NextMatch, NextTab, OnView, OpenContainerLogs,
+    Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView, OpenContainerLogs,
     OpenLogs, OpenPreviousLogs, OpenView, PaneName, PrevMatch, PrevTab, Refresh, RetryConnection,
     SaveLines, SaveLogs, SaveScope, SelectAllLines, SelectCluster, SelectFirst, SelectLast,
     SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SetDockHeight,
@@ -213,6 +213,7 @@ impl Workspace {
             // The active log tab's.
             .when::<TogglePause>(|ws, cx| log(ws, cx).is_some_and(LogView::follows))
             .when::<JumpToEnd>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<JumpToStart>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<ToggleTimestamps>(|ws, cx| log(ws, cx).is_some())
             .when::<ToggleWrap>(|ws, cx| log(ws, cx).is_some())
             .when::<FocusSearch>(|ws, cx| log(ws, cx).is_some())
