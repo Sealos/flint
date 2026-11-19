@@ -1,23 +1,28 @@
-//! One log session: a task that reads a pod's log stream into a [`LogBuffer`], reconnects with
-//! backoff when the stream drops, and publishes coalesced [`LogSnapshot`]s (ADR-0002).
+//! One log session: a task that fills a [`LogBuffer`] from a pod's log stream, or from the
+//! streams of every pod of a workload, and publishes coalesced [`LogSnapshot`]s (ADR-0002).
+//!
+//! What fills the buffer is a [`Feed`]: [`PodFeed`] drives one [`Stream`], and
+//! [`WorkloadFeed`] a pod watch and one stream per pod container.
+//! The session around it is the same for both: the buffer, pausing, and publishing.
 //!
 //! Lines are never sent one by one: the task publishes at most once per
 //! [`SessionConfig::publish_every`], and only when something changed. A front end diffs two
 //! snapshots by line id (see [`LogLines::end_id`]), so each snapshot works as a delta too.
 
-use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use futures::StreamExt as _;
-use futures::future::BoxFuture;
 use k8s_openapi::jiff::Timestamp;
 use tokio::sync::watch;
-use tokio::time::{MissedTickBehavior, Sleep};
+use tokio::time::MissedTickBehavior;
 
 use super::buffer::{LogBuffer, LogLines};
 use super::line::LogLine;
-use super::source::{AfterEnd, LogError, LogRequest, LogSource, RawLine, RawLines};
+use super::pods::{PodSource, WorkloadTarget};
+use super::source::LogSource;
+use super::stream::{Backoff, Stream};
+use super::workload::{PodSetStatus, WorkloadFeed};
 
 /// Which container's logs to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -27,6 +32,25 @@ pub struct LogTarget {
     /// Required when the pod has more than one container; `None` lets the server pick the only
     /// one.
     pub container: Option<String>,
+}
+
+/// What a session reads: one pod's container, or the pods of a workload merged into one stream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LogSubject {
+    Pod(LogTarget),
+    Workload(WorkloadTarget),
+}
+
+impl From<LogTarget> for LogSubject {
+    fn from(target: LogTarget) -> Self {
+        LogSubject::Pod(target)
+    }
+}
+
+impl From<WorkloadTarget> for LogSubject {
+    fn from(target: WorkloadTarget) -> Self {
+        LogSubject::Workload(target)
+    }
 }
 
 /// Where the logs start, in time.
@@ -43,8 +67,9 @@ pub enum LogSince {
 pub struct LogOptions {
     /// Keep the stream open and add lines as they are written.
     pub follow: bool,
-    /// Start with at most this many of the newest lines. `None`, or more than the buffer holds,
-    /// asks for as many as the buffer holds.
+    /// Start with at most this many of the newest lines (per container in a workload session).
+    /// `None`, or more than the buffer holds, asks for as many as the buffer holds (shared out
+    /// between the containers of a workload session).
     pub tail_lines: Option<i64>,
     pub since: Option<LogSince>,
     /// The previous (terminated) instance of the container. Never followed.
@@ -64,14 +89,19 @@ impl Default for LogOptions {
 }
 
 /// Where a session is.
+///
+/// In a workload session this is the state of the session as a whole (resolving the workload
+/// and watching its pods); each stream's own state is in [`LogSnapshot::pods`]. A stream that
+/// fails does not end the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogState {
-    /// Opening the stream for the first time.
+    /// Opening the stream (or, for a workload, finding its pods) for the first time.
     Connecting,
     /// Reading (and, when following, waiting for new lines).
     Streaming,
-    /// The stream failed or ended while the container may log again; it is reopened after a
-    /// backoff, without repeating lines already shown. `error` is safe to show.
+    /// The stream (or a workload's pod watch) failed or ended while the container may log
+    /// again; it is reopened after a backoff, without repeating lines already shown. A
+    /// workload's streams keep running meanwhile. `error` is safe to show.
     Reconnecting { error: Option<String>, attempt: u32 },
     /// Nothing more will come: all lines were read (not following, or the previous instance),
     /// the container finished, or an error retrying cannot fix. `error` is safe to show.
@@ -90,6 +120,9 @@ pub struct LogSnapshot {
     pub held_back: u64,
     /// Grows with every snapshot of the session.
     pub version: u64,
+    /// A workload session's pods and streams: how many are live, failed or capped. `None` for a
+    /// pod session (and before a workload session first reports).
+    pub pods: Option<Arc<PodSetStatus>>,
 }
 
 impl LogSnapshot {
@@ -100,24 +133,14 @@ impl LogSnapshot {
             paused: false,
             held_back: 0,
             version: 0,
+            pods: None,
         }
     }
 }
 
-/// Reconnect delays: `first`, doubling up to `max`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Backoff {
-    pub first: Duration,
-    pub max: Duration,
-}
-
-impl Backoff {
-    fn delay(&self, attempt: u32) -> Duration {
-        self.first
-            .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)))
-            .min(self.max)
-    }
-}
+/// Most streams a workload session reads at once. Containers beyond it wait in a queue and
+/// start as others end; [`PodSetStatus::capped`] counts them.
+pub const MAX_STREAMS: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionConfig {
@@ -128,6 +151,8 @@ pub(crate) struct SessionConfig {
     /// At most one snapshot per this interval (ADR-0002's ~10 per second).
     pub publish_every: Duration,
     pub backoff: Backoff,
+    /// Most streams a workload session reads at once.
+    pub max_streams: usize,
 }
 
 impl SessionConfig {
@@ -140,79 +165,73 @@ impl SessionConfig {
                 first: Duration::from_secs(1),
                 max: Duration::from_secs(30),
             },
+            max_streams: MAX_STREAMS,
         }
+    }
+
+    /// The first request's `tail_lines` when `options` asks for `tail`: capped at the buffer.
+    pub fn tail(&self, tail: Option<i64>) -> i64 {
+        let limit = self.limit as i64;
+        tail.map_or(limit, |t| t.clamp(0, limit))
     }
 }
 
-/// Lines of the newest timestamp remembered for resuming. Enough to recognise where the shown
-/// lines end in a replay; a longer run of lines sharing one timestamp is matched on its end.
-const RESUME_GROUP: usize = 64;
-
-/// After a reconnect from `since_time` (which the server rounds down to the second), skips lines
-/// already shown. Lines older than the newest shown timestamp are skipped. Lines stamped exactly
-/// like it are held until the lines shown with that timestamp (`shown`, the newest ones) have
-/// been replayed in order: those and everything before them were seen or cut by the tail, and
-/// everything after them is new. The first request may have cut that group (`tail_lines`), so
-/// the overlap is found by content, not by count.
-#[derive(Debug, Clone)]
-struct Resume {
-    last: Timestamp,
-    shown: Vec<Arc<str>>,
-    held: Vec<LogLine>,
+/// What fills a session's buffer.
+pub(crate) trait Feed: Send {
+    /// Makes progress on one outcome (a line, a state change, a pod event), writing to `out`.
+    /// `Pending` when nothing is ready; the session publishes in between.
+    fn poll(&mut self, cx: &mut Context<'_>, out: &mut Output) -> Poll<()>;
 }
 
-enum Phase {
-    Connect(BoxFuture<'static, Result<RawLines, LogError>>),
-    Read(RawLines),
-    CheckEnd(BoxFuture<'static, Result<AfterEnd, LogError>>),
-    Wait(Pin<Box<Sleep>>),
-    Done,
-}
-
-enum Step {
-    Opened(Result<RawLines, LogError>),
-    Line(Result<RawLine, LogError>),
-    Eof,
-    AfterEnd(Result<AfterEnd, LogError>),
-    Retry,
-}
-
-impl Phase {
-    /// Waits for the phase's next outcome. Cancel-safe: the futures live in the phase.
-    async fn next(&mut self) -> Step {
-        match self {
-            Phase::Connect(open) => Step::Opened(open.await),
-            Phase::Read(lines) => match lines.next().await {
-                Some(line) => Step::Line(line),
-                None => Step::Eof,
-            },
-            Phase::CheckEnd(check) => Step::AfterEnd(check.await),
-            Phase::Wait(sleep) => {
-                sleep.await;
-                Step::Retry
-            }
-            Phase::Done => std::future::pending().await,
-        }
-    }
-}
-
-struct Session {
-    source: Arc<dyn LogSource>,
-    target: LogTarget,
+/// Builds the feed for `subject`.
+pub(crate) fn feed(
+    subject: LogSubject,
     options: LogOptions,
-    config: SessionConfig,
+    config: &SessionConfig,
+    logs: Arc<dyn LogSource>,
+    pods: Arc<dyn PodSource>,
+) -> Box<dyn Feed> {
+    match subject {
+        LogSubject::Pod(target) => Box::new(PodFeed::new(logs, target, options, config)),
+        LogSubject::Workload(target) => {
+            Box::new(WorkloadFeed::new(logs, pods, target, options, *config))
+        }
+    }
+}
+
+/// One pod's container.
+pub(crate) struct PodFeed {
+    stream: Stream,
+}
+
+impl PodFeed {
+    pub fn new(
+        source: Arc<dyn LogSource>,
+        target: LogTarget,
+        options: LogOptions,
+        config: &SessionConfig,
+    ) -> Self {
+        let tail = config.tail(options.tail_lines);
+        PodFeed {
+            stream: Stream::new(source, target, options, tail, config.backoff, None),
+        }
+    }
+}
+
+impl Feed for PodFeed {
+    fn poll(&mut self, cx: &mut Context<'_>, out: &mut Output) -> Poll<()> {
+        let step = ready!(self.stream.poll_step(cx));
+        self.stream.handle(step, &mut |line| out.append(line));
+        out.set_state(self.stream.state());
+        Poll::Ready(())
+    }
+}
+
+/// The session's side of a feed: the buffer, pausing, and what to publish next.
+pub(crate) struct Output {
     buffer: LogBuffer,
     state: LogState,
-    /// Failed attempts in a row, for the backoff. Reset when a line arrives.
-    attempts: u32,
-    /// The newest timestamp shown, and the texts of the newest lines shown with it (at most
-    /// [`RESUME_GROUP`]).
-    last_ts: Option<Timestamp>,
-    last_group: Vec<Arc<str>>,
-    resume: Option<Resume>,
-    /// The container finished: one last request without following picks up anything it wrote
-    /// after the followed stream ended (it may have restarted and finished again meanwhile).
-    draining: bool,
+    pods: Option<Arc<PodSetStatus>>,
     /// The lines of the last snapshot published; pausing freezes these, so lines the front end
     /// never saw count as held back.
     published: LogLines,
@@ -226,84 +245,22 @@ struct Session {
     dirty: bool,
 }
 
-impl Session {
-    /// The first request: as asked, with the tail capped at what the buffer holds.
-    fn first_request(&self) -> LogRequest {
-        let limit = self.config.limit as i64;
-        LogRequest {
-            target: self.target.clone(),
-            follow: self.options.follow && !self.options.previous && !self.draining,
-            tail_lines: Some(self.options.tail_lines.map_or(limit, |t| t.clamp(0, limit))),
-            since: self.options.since,
-            previous: self.options.previous,
+impl Output {
+    fn new(config: &SessionConfig) -> Self {
+        Output {
+            buffer: LogBuffer::with_budget(config.limit, config.budget),
+            state: LogState::Connecting,
+            pods: None,
+            published: LogLines::default(),
+            frozen: None,
+            frozen_dropped: 0,
+            version: 0,
+            dirty: true,
         }
     }
 
-    /// A reconnect: from the last timestamp seen, else as at first.
-    fn resume_request(&mut self) -> LogRequest {
-        let mut request = self.first_request();
-        if let Some(last) = self.last_ts {
-            request.since = Some(LogSince::Time(last));
-            request.tail_lines = None;
-            self.resume = Some(Resume {
-                last,
-                shown: self.last_group.clone(),
-                held: Vec::new(),
-            });
-        }
-        request
-    }
-
-    /// Appends a line unless it repeats one already shown after a reconnect. A new line resets
-    /// the backoff; repeats do not, so a crash-looping container that only replays its last
-    /// lines is polled less and less often.
-    fn push(&mut self, raw: RawLine) {
-        let line = LogLine::parse(&raw.text, raw.truncated);
-        if let Some(resume) = &mut self.resume {
-            match line.timestamp {
-                Some(ts) if ts < resume.last => return,
-                Some(ts) if ts == resume.last => {
-                    resume.held.push(line);
-                    let held = &resume.held;
-                    if held.len() >= resume.shown.len()
-                        && held[held.len() - resume.shown.len()..]
-                            .iter()
-                            .zip(&resume.shown)
-                            .all(|(l, s)| l.text == *s)
-                    {
-                        // The shown lines are replayed: the rest is new.
-                        self.resume = None;
-                    }
-                    return;
-                }
-                _ => {
-                    // The timestamp moved on without the shown lines replayed in order (the log
-                    // changed under us): keep the held lines that were not shown.
-                    let resume = self.resume.take().expect("checked above");
-                    for held in resume.held {
-                        if !resume.shown.contains(&held.text) {
-                            self.append(held);
-                        }
-                    }
-                }
-            }
-        }
-        self.append(line);
-    }
-
-    fn append(&mut self, line: LogLine) {
-        if let Some(ts) = line.timestamp {
-            if self.last_ts != Some(ts) {
-                self.last_ts = Some(ts);
-                self.last_group.clear();
-            }
-            if self.last_group.len() == RESUME_GROUP {
-                self.last_group.remove(0);
-            }
-            self.last_group.push(line.text.clone());
-        }
+    pub fn append(&mut self, line: LogLine) {
         self.buffer.push(line);
-        self.attempts = 0;
         self.dirty = true;
         if let Some(frozen) = &mut self.frozen
             && self.frozen_dropped != self.buffer.dropped_blocks()
@@ -313,66 +270,25 @@ impl Session {
         }
     }
 
-    fn set_state(&mut self, state: LogState) {
-        if self.state != state {
-            self.state = state;
+    pub fn set_state(&mut self, state: &LogState) {
+        if self.state != *state {
+            self.state = state.clone();
             self.dirty = true;
         }
     }
 
-    /// Waits before reopening the stream.
-    fn retry(&mut self, error: Option<LogError>) -> Phase {
-        self.attempts += 1;
-        let delay = self.config.backoff.delay(self.attempts);
-        if let Some(e) = &error {
-            tracing::debug!(pod = self.target.pod, error = %e.message, ?delay, "log stream retry");
+    pub fn set_pods(&mut self, pods: Arc<PodSetStatus>) {
+        self.pods = Some(pods);
+        self.dirty = true;
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        if paused != self.frozen.is_some() {
+            let first = self.buffer.first_id();
+            self.frozen = paused.then(|| self.published.trimmed(first));
+            self.frozen_dropped = self.buffer.dropped_blocks();
+            self.dirty = true;
         }
-        self.set_state(LogState::Reconnecting {
-            error: error.map(|e| e.message),
-            attempt: self.attempts,
-        });
-        Phase::Wait(Box::pin(tokio::time::sleep(delay)))
-    }
-
-    fn end(&mut self, error: Option<String>) -> Phase {
-        self.set_state(LogState::Ended { error });
-        Phase::Done
-    }
-
-    /// Applies one outcome; returns the next phase, or `None` to stay in the current one.
-    fn handle(&mut self, step: Step) -> Option<Phase> {
-        let next = match step {
-            Step::Line(Ok(raw)) => {
-                self.push(raw);
-                return None;
-            }
-            Step::Opened(Ok(lines)) => {
-                self.set_state(LogState::Streaming);
-                Phase::Read(lines)
-            }
-            // The last catch-up of a finished container: what was read is all there is.
-            Step::Opened(Err(e)) if e.fatal && self.draining => self.end(None),
-            Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.fatal => self.end(Some(e.message)),
-            Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
-                self.retry(Some(e))
-            }
-            Step::Eof if !self.options.follow || self.options.previous || self.draining => {
-                self.end(None)
-            }
-            Step::Eof => Phase::CheckEnd(self.source.after_end(&self.target)),
-            Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(None),
-            Step::AfterEnd(Ok(AfterEnd::Finished)) => {
-                self.draining = true;
-                let request = self.resume_request();
-                Phase::Connect(self.source.open(&request))
-            }
-            Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end(Some("the pod was deleted".to_owned())),
-            Step::Retry => {
-                let request = self.resume_request();
-                Phase::Connect(self.source.open(&request))
-            }
-        };
-        Some(next)
     }
 
     fn publish(&mut self, tx: &watch::Sender<Arc<LogSnapshot>>) {
@@ -386,6 +302,7 @@ impl Session {
             state: self.state.clone(),
             paused: self.frozen.is_some(),
             version: self.version,
+            pods: self.pods.clone(),
         }));
         self.dirty = false;
     }
@@ -393,33 +310,12 @@ impl Session {
 
 /// Runs a session until every receiver of `tx` is gone. `paused` pauses and resumes delivery.
 pub(crate) async fn run(
-    source: Arc<dyn LogSource>,
-    target: LogTarget,
-    options: LogOptions,
+    mut feed: Box<dyn Feed>,
     config: SessionConfig,
     tx: watch::Sender<Arc<LogSnapshot>>,
     mut paused: watch::Receiver<bool>,
 ) {
-    let mut session = Session {
-        buffer: LogBuffer::with_budget(config.limit, config.budget),
-        source,
-        target,
-        options,
-        config,
-        state: LogState::Connecting,
-        attempts: 0,
-        last_ts: None,
-        last_group: Vec::new(),
-        resume: None,
-        draining: false,
-        published: LogLines::default(),
-        frozen: None,
-        frozen_dropped: 0,
-        version: 0,
-        dirty: true,
-    };
-    let first = session.first_request();
-    let mut phase = Phase::Connect(session.source.open(&first));
+    let mut out = Output::new(&config);
     let mut tick = tokio::time::interval(config.publish_every);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pause_open = true;
@@ -434,19 +330,10 @@ pub(crate) async fn run(
                     continue;
                 }
                 let paused = *paused.borrow_and_update();
-                if paused != session.frozen.is_some() {
-                    let first = session.buffer.first_id();
-                    session.frozen = paused.then(|| session.published.trimmed(first));
-                    session.frozen_dropped = session.buffer.dropped_blocks();
-                    session.dirty = true;
-                }
+                out.set_paused(paused);
             }
-            _ = tick.tick(), if session.dirty => session.publish(&tx),
-            step = phase.next() => {
-                if let Some(next) = session.handle(step) {
-                    phase = next;
-                }
-            }
+            _ = tick.tick(), if out.dirty => out.publish(&tx),
+            () = std::future::poll_fn(|cx| feed.poll(cx, &mut out)) => {}
         }
     }
 }
@@ -455,7 +342,9 @@ pub(crate) async fn run(
 mod tests {
     use super::*;
     use crate::logs::BLOCKS_PER_BUDGET;
-    use futures::FutureExt as _;
+    use crate::logs::source::{AfterEnd, LogError, LogRequest, RawLine, RawLines};
+    use futures::future::BoxFuture;
+    use futures::{FutureExt as _, StreamExt as _};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -505,7 +394,11 @@ mod tests {
             async move { result }.boxed()
         }
 
-        fn after_end(&self, _: &LogTarget) -> BoxFuture<'static, Result<AfterEnd, LogError>> {
+        fn after_end(
+            &self,
+            _: &LogTarget,
+            _: Option<&str>,
+        ) -> BoxFuture<'static, Result<AfterEnd, LogError>> {
             let fate = self
                 .after_end
                 .lock()
@@ -533,6 +426,7 @@ mod tests {
                 first: Duration::from_millis(500),
                 max: Duration::from_secs(4),
             },
+            max_streams: MAX_STREAMS,
         }
     }
 
@@ -542,19 +436,24 @@ mod tests {
         fake: Arc<Fake>,
     }
 
+    /// Runs a pod session on `fake`.
+    fn spawn(
+        fake: Arc<Fake>,
+        options: LogOptions,
+        config: SessionConfig,
+        tx: watch::Sender<Arc<LogSnapshot>>,
+        paused: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let feed = PodFeed::new(fake, target(), options, &config);
+        tokio::spawn(run(Box::new(feed), config, tx, paused))
+    }
+
     fn start(scripts: Vec<Script>, options: LogOptions, limit: usize) -> Running {
         let fake = Arc::new(Fake::default());
         fake.scripts.lock().unwrap().extend(scripts);
         let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
         let (paused, paused_rx) = watch::channel(false);
-        tokio::spawn(run(
-            fake.clone(),
-            target(),
-            options,
-            config(limit),
-            tx,
-            paused_rx,
-        ));
+        spawn(fake.clone(), options, config(limit), tx, paused_rx);
         Running { rx, paused, fake }
     }
 
@@ -612,6 +511,7 @@ mod tests {
         let snapshot = run.until(ended).await;
         assert_eq!(texts(&snapshot), ["ERROR boom", "WARN slow"]);
         assert_eq!(snapshot.state, LogState::Ended { error: None });
+        assert!(snapshot.pods.is_none(), "a pod session has no pod set");
         let severities: Vec<_> = snapshot.lines.iter().map(|(_, l)| l.severity).collect();
         assert_eq!(
             severities,
@@ -864,14 +764,7 @@ mod tests {
             budget,
             ..config(100_000)
         };
-        tokio::spawn(run(
-            fake.clone(),
-            target(),
-            LogOptions::default(),
-            config,
-            tx,
-            paused_rx,
-        ));
+        spawn(fake.clone(), LogOptions::default(), config, tx, paused_rx);
         let mut run = Running { rx, paused, fake };
         let long: &'static str = Box::leak("z".repeat(32 * 1024).into_boxed_str());
         for _ in 0..40 {
@@ -906,14 +799,7 @@ mod tests {
             .push_back(Script::Hold(vec!["x"]));
         let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
         let (paused, paused_rx) = watch::channel(false);
-        let task = tokio::spawn(run(
-            fake,
-            target(),
-            LogOptions::default(),
-            config(10),
-            tx,
-            paused_rx,
-        ));
+        let task = spawn(fake, LogOptions::default(), config(10), tx, paused_rx);
         drop((rx, paused));
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -943,16 +829,5 @@ mod tests {
             .until(|s| matches!(s.state, LogState::Reconnecting { attempt: 3, .. }))
             .await;
         assert_eq!(texts(&snapshot), ["crashed"]);
-    }
-
-    #[test]
-    fn backoff_doubles_up_to_the_cap() {
-        let backoff = Backoff {
-            first: Duration::from_secs(1),
-            max: Duration::from_secs(30),
-        };
-        let delays: Vec<_> = (1..=7).map(|a| backoff.delay(a).as_secs()).collect();
-        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
-        assert_eq!(backoff.delay(u32::MAX).as_secs(), 30);
     }
 }

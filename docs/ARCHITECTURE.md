@@ -242,7 +242,29 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   `Exception` or `Error` (such as `NullPointerException`) mark an error; `WARN` and `WARNING` mark a warning; an
   error wins over a warning.
 - **Copy** puts the selected lines on the clipboard as shown (with timestamps only when they are shown) and without
-  redaction. AI log analysis redacts what it sends (see below).
+  redaction. AI log analysis redacts what it sends (see below). In a workload session copy keeps the
+  `[pod/container]` prefix unless the view hides it (`LineSelection::text_as`).
+- **Workload logs** (UP-45): `open_logs` also takes a `WorkloadTarget`: a Deployment, StatefulSet, DaemonSet,
+  ReplicaSet or Job (its `spec.selector`, read once), or a label selector. One session watches the matching pods
+  (a pod watch, not polling) and runs one stream per pod container: every regular container and native sidecar, or
+  the one named container. Streams start when a container has started, reopen at once when the watch sees it
+  restart (a stream that had ended reads on from where it stopped), and stop when the pod is deleted (after reading
+  what the server still sends, for at most 10 s). Pods are told apart by uid, so a pod recreated under the same
+  name gets a new stream and the old one never reads it. Each stream is a state machine polled by the session's one
+  task, with the same reconnect, backoff and dedup as a pod session.
+  - Lines carry their source (`pod/container`, one shared `Arc` per stream). `display`, copy (`text_as`) and
+    search (`SearchQuery::sources`) can include or leave out the `[pod/container]` prefix.
+  - Lines interleave in **arrival order**; there is no global timestamp sort. A reorder window would delay every
+    line and still misplace any line later than the window (a slow node, a replay after a reconnect), while line
+    ids must never change once assigned. Initial tails therefore show as one block per stream.
+  - **One budget** for the session: all streams fill the same buffer. Without `tail_lines`, the line limit is
+    shared out between the containers found at start (those over the cap included); an explicit `tail_lines`
+    applies per container (like `kubectl logs -l`). At most 32 streams read at once (`MAX_STREAMS`); further
+    containers queue and start as others end, counted as `capped`.
+  - A failing stream does not end the session. `LogSnapshot::pods` (`PodSetStatus`) lists each stream's state and
+    counts live, connecting, failed, waiting and capped ones. The session's own state covers the pod watch: a
+    broken watch reconnects and re-lists while streams keep running. An error retrying cannot fix (the workload is
+    missing, access is denied) or a context that now points at another server ends the whole session.
 
 ### AI log analysis
 

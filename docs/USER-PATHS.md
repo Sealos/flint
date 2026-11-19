@@ -250,6 +250,14 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   redaction. Following pauses while I select.
 - Tests: ui.
 
+### UP-45 Follow a workload's logs
+- **When** I open logs for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, or for a label selector.
+- **Then** one tab shows the lines of every pod and container merged in arrival order, each prefixed with its pod and
+  container (the prefix can be hidden). Pods that start, restart or replace deleted ones are followed without
+  reopening the tab. A pod whose stream fails does not stop the others, and the tab shows how many streams are
+  live, failed or over the limit. Search, severity, timestamps and selection work as for one pod.
+- Tests: unit, cluster, ui.
+
 ---
 
 ## M3: Editing and actions

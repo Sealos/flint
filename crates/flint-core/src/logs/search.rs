@@ -12,14 +12,18 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use super::buffer::LogLines;
-use super::line::LineId;
+use super::line::{LineId, LogLine};
 
-/// What to look for: a plain substring of a line's text (timestamps are not searched).
+/// What to look for: a plain substring of a line's text (timestamps are not searched), and
+/// optionally of its `pod/container` source.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchQuery {
     pub text: String,
     /// Off by default: `error` finds `ERROR`.
     pub case_sensitive: bool,
+    /// Also match a workload line's `pod/container` source, as the prefix shows it (set this
+    /// when the prefix is shown). Off by default.
+    pub sources: bool,
 }
 
 impl SearchQuery {
@@ -27,7 +31,20 @@ impl SearchQuery {
         SearchQuery {
             text: text.into(),
             case_sensitive: false,
+            sources: false,
         }
+    }
+
+    /// Whether `line` matches: its text, or its source when [`SearchQuery::sources`] is on.
+    /// [`SearchQuery::match_ranges`] highlights the text; for a match in the prefix, pass it the
+    /// source's [`label`](crate::LineSource::label) too.
+    pub fn matches_line(&self, line: &LogLine) -> bool {
+        self.is_match(&line.text)
+            || (self.sources
+                && line
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| self.is_match(s.label())))
     }
 
     /// Byte ranges of every non-overlapping match in `text`, for highlighting. Empty for an
@@ -146,7 +163,7 @@ impl LogSearch {
             self.matches.extend(
                 lines
                     .range(from, lines.end_id())
-                    .filter(|(_, line)| self.query.is_match(&line.text))
+                    .filter(|(_, line)| self.query.matches_line(line))
                     .map(|(id, _)| id),
             );
         }
@@ -245,6 +262,28 @@ mod tests {
         let mut empty = LogSearch::new(SearchQuery::default());
         empty.update(&buffer.view());
         assert_eq!(empty.count(), 0);
+    }
+
+    // covers UP-45
+    #[test]
+    fn sources_are_searched_only_when_asked() {
+        let mut buffer = LogBuffer::new(10);
+        let source = std::sync::Arc::new(crate::logs::LineSource::new("web-7f9", "app"));
+        for text in ["started", "web request", "done"] {
+            let mut line = LogLine::parse(text, false);
+            line.source = Some(source.clone());
+            buffer.push(line);
+        }
+        push(&mut buffer, "untagged");
+        let mut text_only = LogSearch::new(SearchQuery::new("web"));
+        text_only.update(&buffer.view());
+        assert_eq!(text_only.matches(), &[1]);
+
+        let mut with_sources = SearchQuery::new("WEB-7F9/APP");
+        with_sources.sources = true;
+        let mut search = LogSearch::new(with_sources);
+        search.update(&buffer.view());
+        assert_eq!(search.matches(), &[0, 1, 2]);
     }
 
     #[test]

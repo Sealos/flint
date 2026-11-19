@@ -3,19 +3,22 @@
 //! kind cluster (`scripts/dev-cluster.sh`). They use that file alone, create their pods in a
 //! namespace prefixed `logs-test-`, and delete it again (also when the test fails).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::{
-    LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogTarget, SearchQuery, Settings,
-    Severity, cluster, kubeconfig,
+    LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogSubject, LogTarget, PodSet,
+    SearchQuery, Settings, Severity, WorkloadKind, WorkloadTarget, cluster, kubeconfig,
 };
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::Client;
-use kube::api::{Api, DeleteParams, PostParams};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
 fn test_kubeconfig() -> PathBuf {
@@ -133,11 +136,15 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let kube = admin(&test_kubeconfig()).await;
+    // The clock may tick in microseconds (macOS), so tests starting together also need the
+    // counter to get distinct names.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos();
-    let ns = format!("logs-test-{}-{nanos}", std::process::id());
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let ns = format!("logs-test-{}-{nanos}-{n}", std::process::id());
     let namespaces: Api<Namespace> = Api::all(kube.clone());
     namespaces
         .create(
@@ -365,6 +372,124 @@ async fn picks_a_container_and_reads_the_previous_instance() {
             panic!("expected an error, got {:?}", done.state);
         };
         assert!(error.contains("container"), "{error}");
+    })
+    .await;
+}
+
+/// The pods (by name) that have lines in `snapshot`.
+fn pods_with_lines(snapshot: &LogSnapshot) -> BTreeSet<String> {
+    snapshot
+        .lines
+        .iter()
+        .filter_map(|(_, l)| l.source.as_ref().map(|s| s.pod().to_owned()))
+        .collect()
+}
+
+// covers UP-45
+#[tokio::test]
+#[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
+async fn follows_a_deployments_pods_as_they_scale_and_get_replaced() {
+    let path = test_kubeconfig();
+    in_namespace(move |kube, ns| async move {
+        let deployments: Api<Deployment> = Api::namespaced(kube.clone(), &ns);
+        // Each pod prints its own name, so the lines tell the pods apart by content too.
+        let printer =
+            r#"i=0; while true; do echo "$HOSTNAME line $i"; i=$((i+1)); sleep 0.2; done"#;
+        deployments
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({
+                    "metadata": {"name": "printer"},
+                    "spec": {
+                        "replicas": 2,
+                        "selector": {"matchLabels": {"app": "printer"}},
+                        "template": {
+                            "metadata": {"labels": {"app": "printer"}},
+                            "spec": {
+                                "containers": [container("app", printer)],
+                                "terminationGracePeriodSeconds": 0
+                            }
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let core = start(path, Settings::default());
+        let name = core
+            .wait_for(10, |e| match e {
+                Event::ClustersChanged(s) => Some(s.clusters[0].info.name.clone()),
+                _ => None,
+            })
+            .await;
+        core.activate(&name).await;
+        let target = WorkloadTarget {
+            namespace: ns.clone(),
+            pods: PodSet::Workload {
+                kind: WorkloadKind::Deployment,
+                name: "printer".into(),
+            },
+            container: None,
+        };
+        let mut session = core
+            .handle
+            .open_logs(&name, target.clone(), LogOptions::default());
+        assert_eq!(session.subject(), &LogSubject::Workload(target));
+        assert!(session.target().is_none());
+
+        // Both replicas, merged, each line tagged with its pod and container.
+        let two = until(&mut session, 180, |s| pods_with_lines(s).len() == 2).await;
+        assert_eq!(two.state, LogState::Streaming);
+        let status = two.pods.clone().expect("pod set status");
+        assert_eq!(status.selector.as_deref(), Some("app=printer"));
+        for (_, line) in two.lines.iter() {
+            let source = line.source.as_ref().expect("tagged");
+            assert_eq!(source.container(), "app");
+            assert!(
+                line.text.starts_with(&format!("{} line", source.pod())),
+                "{} came from {}",
+                line.text,
+                source.label()
+            );
+            assert!(
+                line.display(false)
+                    .starts_with(&format!("[{}] ", source.label()))
+            );
+        }
+
+        // Scale to 3: the third pod's lines appear in the same session.
+        deployments
+            .patch(
+                "printer",
+                &PatchParams::default(),
+                &Patch::Merge(json!({"spec": {"replicas": 3}})),
+            )
+            .await
+            .unwrap();
+        let three = until(&mut session, 180, |s| pods_with_lines(s).len() == 3).await;
+        let status = three.pods.clone().expect("pod set status");
+        assert_eq!(status.pods, 3, "{status:?}");
+        assert_eq!(status.failed(), 0, "{status:?}");
+
+        // Delete one pod: its stream goes, and its replacement is followed.
+        let before = pods_with_lines(&three);
+        let victim = before.iter().next().unwrap().clone();
+        let pods: Api<Pod> = Api::namespaced(kube.clone(), &ns);
+        pods.delete(&victim, &DeleteParams::default())
+            .await
+            .unwrap();
+        let replaced = until(&mut session, 180, |s| {
+            let status = s.pods.clone().unwrap_or_default();
+            pods_with_lines(s).difference(&before).count() >= 1
+                && status.live() == 3
+                && status.streams.iter().all(|st| st.source.pod() != victim)
+        })
+        .await;
+        assert_eq!(replaced.state, LogState::Streaming);
+        let status = replaced.pods.clone().unwrap();
+        assert_eq!((status.pods, status.capped), (3, 0), "{status:?}");
     })
     .await;
 }

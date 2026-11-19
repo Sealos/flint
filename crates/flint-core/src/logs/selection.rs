@@ -6,7 +6,7 @@
 //! tell the user. Copy uses [`LineSelection::text`]; AI log analysis (#56) sends the same lines.
 
 use super::buffer::LogLines;
-use super::line::{LineId, LogLine};
+use super::line::{LineFormat, LineId, LogLine};
 
 /// A range of lines from `anchor` (where the selection started) to `head` (where it was
 /// extended to, by mouse or Shift and the arrow keys). Either may be the larger.
@@ -97,14 +97,27 @@ impl LineSelection {
     }
 
     /// The selected lines as shown, one per line, without redaction: what copy puts on the
-    /// clipboard. `timestamps` matches the view's timestamp toggle.
+    /// clipboard. `timestamps` matches the view's timestamp toggle; lines of a workload session
+    /// keep their `[pod/container]` prefix ([`LineSelection::text_as`] can leave it out).
     pub fn text(&self, lines: &LogLines, timestamps: bool) -> String {
+        self.text_as(
+            lines,
+            LineFormat {
+                timestamps,
+                source: true,
+            },
+        )
+    }
+
+    /// The selected lines as [`LogLine::display_as`] shows them with `format`, one per line,
+    /// without redaction.
+    pub fn text_as(&self, lines: &LogLines, format: LineFormat) -> String {
         let mut out = String::new();
         for (i, (_, line)) in self.lines(lines).enumerate() {
             if i > 0 {
                 out.push('\n');
             }
-            out.push_str(&line.display(timestamps));
+            out.push_str(&line.display_as(format));
         }
         out
     }
@@ -177,5 +190,28 @@ mod tests {
         assert_eq!(sel.clamp(&buf.view()), None);
         assert_eq!(sel.text(&buf.view(), false), "");
         assert_eq!(LineSelection::line(0).clamp(&LogLines::default()), None);
+    }
+
+    // covers UP-45
+    #[test]
+    fn copy_keeps_or_drops_the_source_prefix() {
+        let mut buf = LogBuffer::new(10);
+        let source = std::sync::Arc::new(super::super::LineSource::new("web-1", "app"));
+        for text in ["2024-05-01T12:00:00Z a", "2024-05-01T12:00:01Z b"] {
+            let mut line = LogLine::parse(text, false);
+            line.source = Some(source.clone());
+            buf.push(line);
+        }
+        let view = buf.view();
+        let sel = LineSelection::new(0, 1);
+        assert_eq!(sel.text(&view, false), "[web-1/app] a\n[web-1/app] b");
+        let bare = LineFormat {
+            timestamps: true,
+            source: false,
+        };
+        assert_eq!(
+            sel.text_as(&view, bare),
+            "2024-05-01T12:00:00Z a\n2024-05-01T12:00:01Z b"
+        );
     }
 }

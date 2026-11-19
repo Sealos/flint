@@ -63,23 +63,53 @@ pub(crate) type RawLines = BoxStream<'static, Result<RawLine, LogError>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogError {
     pub message: String,
-    /// Retrying cannot help (the pod or container does not exist, access is denied).
-    pub fatal: bool,
+    pub kind: ErrorKind,
+}
+
+/// What a [`LogError`] means for the stream and the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    /// Worth retrying after a backoff.
+    Retry,
+    /// Retrying cannot help (the pod or container does not exist, access is denied): the stream
+    /// ends.
+    Fatal,
+    /// About the cluster, not one stream (it left the kubeconfig files, or the context now
+    /// points at another API server): the whole session ends, a workload's included.
+    Cluster,
 }
 
 impl LogError {
     pub fn retry(message: impl Into<String>) -> Self {
         LogError {
             message: message.into(),
-            fatal: false,
+            kind: ErrorKind::Retry,
         }
     }
 
     pub fn fatal(message: impl Into<String>) -> Self {
         LogError {
             message: message.into(),
-            fatal: true,
+            kind: ErrorKind::Fatal,
         }
+    }
+
+    /// See [`ErrorKind::Cluster`].
+    pub fn cluster(message: impl Into<String>) -> Self {
+        LogError {
+            message: message.into(),
+            kind: ErrorKind::Cluster,
+        }
+    }
+
+    /// Retrying cannot help (a [`ErrorKind::Fatal`] or [`ErrorKind::Cluster`] error).
+    pub fn is_fatal(&self) -> bool {
+        self.kind != ErrorKind::Retry
+    }
+
+    /// See [`ErrorKind::Cluster`].
+    pub fn is_cluster(&self) -> bool {
+        self.kind == ErrorKind::Cluster
     }
 
     pub fn from_kube(err: kube::Error) -> Self {
@@ -93,9 +123,11 @@ impl LogError {
             },
             _ => false,
         };
-        LogError {
-            message: ClusterError::kube(err).to_string(),
-            fatal,
+        let message = ClusterError::kube(err).to_string();
+        if fatal {
+            LogError::fatal(message)
+        } else {
+            LogError::retry(message)
         }
     }
 }
@@ -126,8 +158,13 @@ pub(crate) trait LogSource: Send + Sync + 'static {
     /// Opens a log stream.
     fn open(&self, request: &LogRequest) -> BoxFuture<'static, Result<RawLines, LogError>>;
 
-    /// Decides whether a followed stream that ended should be reopened.
-    fn after_end(&self, target: &LogTarget) -> BoxFuture<'static, Result<AfterEnd, LogError>>;
+    /// Decides whether a followed stream that ended should be reopened. With `uid`, a pod of
+    /// that name but another uid (recreated under the same name) counts as gone.
+    fn after_end(
+        &self,
+        target: &LogTarget,
+        uid: Option<&str>,
+    ) -> BoxFuture<'static, Result<AfterEnd, LogError>>;
 }
 
 /// Hands out the cluster's current client at every (re)connect, so a session uses a fresh client
@@ -162,26 +199,37 @@ impl LogSource for KubeLogSource {
         .boxed()
     }
 
-    fn after_end(&self, target: &LogTarget) -> BoxFuture<'static, Result<AfterEnd, LogError>> {
+    fn after_end(
+        &self,
+        target: &LogTarget,
+        uid: Option<&str>,
+    ) -> BoxFuture<'static, Result<AfterEnd, LogError>> {
         let client = self.client.clone();
         let target = target.clone();
+        let uid = uid.map(str::to_owned);
         async move {
             let client = client().await?;
             let api: Api<Pod> = Api::namespaced(client, &target.namespace);
-            fate_of(api.get_opt(&target.pod).await, target.container.as_deref())
+            let pod = api.get_opt(&target.pod).await;
+            fate_of(pod, target.container.as_deref(), uid.as_deref())
         }
         .boxed()
     }
 }
 
 /// [`fate`] from the pod lookup. A user may read `pods/log` without being allowed to get the
-/// pod: a 403 then means "unknown", and the stream is reopened with backoff.
+/// pod: a 403 then means "unknown", and the stream is reopened with backoff. With `uid`, a pod
+/// of another uid is another pod (recreated under the same name), so the stream's pod is gone.
 pub(crate) fn fate_of(
     lookup: Result<Option<Pod>, kube::Error>,
     container: Option<&str>,
+    uid: Option<&str>,
 ) -> Result<AfterEnd, LogError> {
     match lookup {
-        Ok(pod) => Ok(fate(pod.as_ref(), container)),
+        Ok(pod) => {
+            let pod = pod.filter(|p| uid.is_none_or(|uid| p.metadata.uid.as_deref() == Some(uid)));
+            Ok(fate(pod.as_ref(), container))
+        }
         Err(kube::Error::Api(status)) if status.code == 403 => Ok(AfterEnd::Restarts),
         Err(e) => Err(LogError::from_kube(e)),
     }
@@ -379,12 +427,12 @@ mod tests {
             400,
             "container \"c\" in pod \"p\" is waiting to start: ContainerCreating",
         ));
-        assert!(!starting.fatal);
+        assert!(!starting.is_fatal());
         let missing = LogError::from_kube(api_error(400, "container x is not valid for pod p"));
-        assert!(missing.fatal);
+        assert!(missing.is_fatal());
         assert!(missing.message.contains("not valid"), "{}", missing.message);
-        assert!(LogError::from_kube(api_error(404, "pods \"p\" not found")).fatal);
-        assert!(!LogError::from_kube(api_error(500, "boom")).fatal);
+        assert!(LogError::from_kube(api_error(404, "pods \"p\" not found")).is_fatal());
+        assert!(!LogError::from_kube(api_error(500, "boom")).is_fatal());
     }
 
     // covers UP-40
@@ -400,7 +448,7 @@ mod tests {
             }),
         });
         let error = LogError::from_kube(err);
-        assert!(!error.fatal);
+        assert!(!error.is_fatal());
         assert!(error.message.starts_with("authentication failed"));
         assert!(!error.message.contains("s3cr3t") && !error.message.contains("token-abc"));
     }
@@ -498,9 +546,17 @@ mod tests {
     #[test]
     fn a_forbidden_pod_lookup_falls_back_to_reconnecting() {
         let forbidden = Err(api_error(403, "pods \"p\" is forbidden"));
-        assert_eq!(fate_of(forbidden, None), Ok(AfterEnd::Restarts));
-        assert_eq!(fate_of(Ok(None), None), Ok(AfterEnd::Gone));
-        let missing = fate_of(Err(api_error(500, "boom")), None).unwrap_err();
-        assert!(!missing.fatal);
+        assert_eq!(fate_of(forbidden, None, None), Ok(AfterEnd::Restarts));
+        assert_eq!(fate_of(Ok(None), None, None), Ok(AfterEnd::Gone));
+        // A pod recreated under the same name is another pod.
+        let running = || Ok(Some(pod(json!({"metadata": {"uid": "new"}}))));
+        assert_eq!(fate_of(running(), None, Some("old")), Ok(AfterEnd::Gone));
+        assert_eq!(
+            fate_of(running(), None, Some("new")),
+            Ok(AfterEnd::Restarts)
+        );
+        assert_eq!(fate_of(running(), None, None), Ok(AfterEnd::Restarts));
+        let missing = fate_of(Err(api_error(500, "boom")), None, None).unwrap_err();
+        assert!(!missing.is_fatal());
     }
 }
