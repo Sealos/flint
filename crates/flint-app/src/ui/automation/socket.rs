@@ -163,12 +163,41 @@ fn serve_connection(stream: UnixStream, handle: &dyn Fn(&str) -> String) -> io::
 /// Whether the peer runs as this process's user. The 0600 mode already says so; this guards
 /// against a socket file whose mode was changed after the fact.
 fn same_user(stream: &UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions.
+    peer_uid(stream).is_some_and(|uid| uid == unsafe { libc::geteuid() })
+}
+
+/// The peer's effective user id: `getpeereid` on macOS and the BSDs.
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
     let mut uid = 0;
     let mut gid = 0;
     // SAFETY: getpeereid only writes the two out-parameters, for a socket fd we own.
     let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    // SAFETY: geteuid has no preconditions.
-    rc == 0 && uid == unsafe { libc::geteuid() }
+    (rc == 0).then_some(uid)
+}
+
+/// The peer's user id: `SO_PEERCRED` on Linux, which has no `getpeereid`.
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `cred`, a ucred we own, for a socket fd
+    // we own.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of::<libc::ucred>()).then_some(cred.uid)
 }
 
 #[cfg(test)]
@@ -204,6 +233,16 @@ mod tests {
         answer.clear();
         reader.read_line(&mut answer).unwrap();
         assert_eq!(answer, "echo two\n");
+    }
+
+    // Both ends of a socket pair are this process: the peer check (getpeereid on macOS,
+    // SO_PEERCRED on Linux) reads our own user.
+    #[test]
+    fn the_peer_is_this_user() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(peer_uid(&a), Some(unsafe { libc::geteuid() }));
+        assert!(same_user(&a));
     }
 
     #[test]

@@ -39,20 +39,22 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
 `crates/flint-app/src/ui/automation/`.
 
 - **Test builds only.** Built only with `--features automation`, and only without `--release` (a `compile_error!`
-  refuses both together). CI's `macos (flint-app)` job runs flint-app's clippy and tests with the feature, and checks
-  that its release binary has none of the channel's strings (the binary is stripped, so there are no symbols to look
-  for).
+  refuses both together). CI's `linux (flint-app)` and `macos (flint-app)` jobs run flint-app's clippy and tests with
+  the feature, and `scripts/check-no-automation.sh <binary>` checks that a release binary has none of the channel's
+  strings (release binaries are stripped, so there are no symbols to look for); every job that builds a release
+  binary runs it. The channel builds on Linux too (peer credentials through `SO_PEERCRED`, a 107-byte socket path),
+  where screenshots answer `not_available` if GPUI's renderer cannot draw offscreen.
 - **Where it may run.** Before anything starts, the app checks, and exits with code 3 and a reason if any check fails,
   so a harness fails fast instead of waiting for a socket:
-  - `FLINT_CONFIG_DIR` is set, is not the real config directory, belongs to the user and is not writable by group or
+  - `FLINT_CONFIG_DIR` is set, is not the real config directory (flint-core's platform default), belongs to the user and is not writable by group or
     others. It is created with mode `0700` when missing.
   - `KUBECONFIG` is set, so the app never falls back to `~/.kube/config`. Without it, `HOME` must be a scratch
     directory (not the account's home, from the user database) with no `.kube/config`, so there is nothing to fall
     back to (UP-02's "no kubeconfig" test).
   - With `FLINT_AUTOMATION_EXIT_ON_STDIN_EOF=1` the app quits when its stdin closes, so it never outlives the
     harness that started it.
-  - The socket path, `$FLINT_CONFIG_DIR/automation.sock`, fits macOS's limit of 103 bytes (`sun_path` is 104 with its
-    NUL), so keep `FLINT_CONFIG_DIR` short (`mktemp -d` is fine).
+  - The socket path, `$FLINT_CONFIG_DIR/automation.sock`, fits the limit: 103 bytes on macOS, 107 on Linux
+    (`sun_path` with its NUL), so keep `FLINT_CONFIG_DIR` short (`mktemp -d` is fine).
   - No other Flint is serving on that socket. A stale socket nobody answers on is replaced.
 - **The socket.** Mode `0600`. It is bound in a fresh private directory (`mkdtemp`, `0700`) and moved into place with
   link and unlink, so nobody can connect before its mode is set and an existing file is never replaced. Connections from
@@ -340,7 +342,7 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | Job | Runner | Runs |
 |---|---|---|
 | `test (<crate>)` | Linux | Unit tests for `flint-core`, `flint-mcp` and `flint-e2e` (the fake API server, the harness, and the MCP e2e tests against the fake server, with `flint-mcp` built first and named by `FLINT_E2E_MCP_BIN`), one job per crate |
-| `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display) |
+| `linux (flint-app)` | Linux | The app's clippy (with and without `--features automation`) and view tests (with the feature) on GPUI's Linux backend (headless test platform, no display) |
 | `appimage (x86_64)` | Linux | A release build packaged with `scripts/package-appimage.sh`, then `scripts/smoke-appimage.sh`: `--version` and `mcp` answering `initialize` through the AppImage, without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`). No display, so the window is not opened |
 | `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
 | `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job that needs macOS |

@@ -171,8 +171,16 @@ async fn screenshot(
         cx.background_executor().timer(FRAME).await;
     }
     settle(target, cx).await;
-    let image = in_window(target, cx, |window, _| window.render_to_image())?
-        .map_err(|e| failed("could not render the window", &e.to_string()))?;
+    // Platforms whose renderer cannot draw offscreen (GPUI's Linux backend, for one) say so.
+    let image = in_window(target, cx, |window, _| window.render_to_image())?.map_err(|e| {
+        Error::new(
+            ErrorCode::NotAvailable,
+            format!(
+                "screenshots are not available here: {}",
+                safe_error_summary(&e.to_string())
+            ),
+        )
+    })?;
     let (width, height) = image.dimensions();
     let job_path = path.clone();
     cx.background_spawn(async move {
@@ -572,6 +580,21 @@ mod tests {
         )
         .await;
         assert_eq!(response["error"]["code"], "invalid_args", "{response}");
+        // A plain name is written under the directory, or the platform says it cannot render.
+        let response = ask(
+            cx,
+            &target,
+            json!({"cmd": "screenshot", "args": {"name": "view"}}),
+        )
+        .await;
+        if response["ok"] == true {
+            let path = dir.path().join("view.png");
+            assert_eq!(response["result"]["path"], path.display().to_string());
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        } else {
+            assert_eq!(response["error"]["code"], "not_available", "{response}");
+        }
     }
 
     #[test]
