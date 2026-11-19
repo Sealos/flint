@@ -101,15 +101,35 @@ impl Backoff {
     fn next(&mut self) -> Duration {
         let base = self.next;
         self.next = (self.next * 2).min(self.max);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        base + base.mul_f64(f64::from(nanos % 250) / 1000.0)
+        base + base.mul_f64(jitter_fraction(jitter_entropy()))
     }
 
     fn reset(&mut self) {
         self.next = self.min;
     }
+}
+
+/// Fresh bits for one jitter: the clock, hashed with a per-call random key, so two kinds that
+/// back off in the same instant still differ.
+fn jitter_entropy() -> u64 {
+    use std::hash::BuildHasher as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::collections::hash_map::RandomState::new().hash_one(nanos)
+}
+
+/// A jitter between 0 and 25%, spread evenly whichever bits of `entropy` vary. (A raw clock
+/// reading is not enough: macOS clocks tick in microseconds, so the low digits of the
+/// nanoseconds are always zero there.)
+fn jitter_fraction(entropy: u64) -> f64 {
+    // splitmix64's finalizer: every input bit affects every output bit.
+    let mut z = entropy.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    // `% 1000` keeps the value exact as an f64.
+    (z % 1000) as f64 / 4000.0
 }
 
 enum StreamEnd {
@@ -1059,6 +1079,25 @@ mod tests {
         assert!(b.next() < Duration::from_secs(5), "capped");
         b.reset();
         assert!(b.next() < Duration::from_millis(1250));
+    }
+
+    #[test]
+    fn jitter_varies_even_on_a_microsecond_clock() {
+        // A microsecond clock: every nanosecond reading is a multiple of 1000.
+        let fractions: Vec<f64> = (1..=200u64).map(|us| jitter_fraction(us * 1000)).collect();
+        assert!(fractions.iter().all(|f| (0.0..0.25).contains(f)));
+        let distinct: std::collections::BTreeSet<u64> =
+            fractions.iter().map(|f| f.to_bits()).collect();
+        assert!(distinct.len() > 150, "{} distinct", distinct.len());
+        assert!(fractions.iter().any(|f| *f < 0.05) && fractions.iter().any(|f| *f > 0.2));
+    }
+
+    #[test]
+    fn backoffs_in_the_same_instant_get_different_jitter() {
+        let delays: std::collections::BTreeSet<Duration> = (0..20)
+            .map(|_| Backoff::between(Duration::from_secs(1), Duration::from_secs(4)).next())
+            .collect();
+        assert!(delays.len() > 1, "{delays:?}");
     }
 
     #[test]
