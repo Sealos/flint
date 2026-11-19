@@ -13,7 +13,7 @@ mod selection;
 mod session;
 mod source;
 
-pub use buffer::{CHUNK_LINES, LogBuffer, LogLines};
+pub use buffer::{BLOCKS_PER_BUDGET, CHUNK_LINES, LogBuffer, LogLines};
 pub use line::{LineId, LogLine, MAX_LINE_BYTES, Severity, classify};
 pub use search::{LogSearch, SearchQuery};
 pub use selection::LineSelection;

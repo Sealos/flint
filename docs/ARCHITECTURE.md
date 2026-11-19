@@ -163,8 +163,9 @@ again with a fresh list.
 
 `Api::<Pod>::log_stream` with `LogParams` (`follow`, `tail_lines`, `since_seconds`/`since_time`, `previous`,
 `container`). Lines go into a
-ring buffer with a size limit (a setting, default 100k lines) so long-running streams cannot grow memory without
-bound. Search runs over the buffer.
+ring buffer with two limits, both settings: a line count (`log_buffer_lines`, default 100k) and a memory budget
+(`log_buffer_mib`, default 64 MiB). Whichever is hit first evicts the oldest lines, so neither long-running streams
+nor very long lines (up to 64 KiB each) can grow memory without bound. Search runs over the buffer.
 
 - **Sessions** (`flint_core::logs`): `CoreHandle::open_logs` returns a `LogSession`; dropping it stops the stream.
   Sessions belong to no cluster slot, so they keep running across cluster switches. `timestamps=true` is always
@@ -172,9 +173,14 @@ bound. Search runs over the buffer.
   backoff, skipping lines already shown). A followed stream that ends is reopened only while the container can log
   again (it restarts, or the pod still runs).
 - **Delivery** follows [ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md): at most one `Arc<LogSnapshot>` per
-  ~100 ms. The buffer is stored in shared 1024-line chunks, so a snapshot of 100k lines costs a few hundred pointer
-  copies. Every line has a `LineId` that never changes, so a view diffs two snapshots by id. Pausing freezes the
-  lines shown and counts the lines held back; the buffer keeps filling.
+  ~100 ms. The buffer is stored in shared blocks (at most 1024 lines, or 1/32 of the memory budget), so a snapshot
+  of 100k lines costs a few hundred pointer copies. Every line has a `LineId` that never changes, so a view diffs
+  two snapshots by id.
+- **Memory:** the line limit is exact. The budget evicts whole blocks from the oldest end, so a session stays
+  within the budget plus one block. Pausing freezes the lines shown and counts the lines held back while the buffer
+  keeps filling. The frozen view is trimmed whenever the buffer drops a block, so a pause never keeps evicted blocks
+  alive and counts against the same budget. The cost: after a long pause, the oldest frozen lines disappear just as
+  they would while following.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
   following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.
@@ -288,7 +294,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 ## Settings and state
 
-- `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`), a `path`
+- `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
   override, and a `helm` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, which the user
   drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace

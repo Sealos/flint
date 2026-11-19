@@ -123,15 +123,18 @@ impl Backoff {
 pub(crate) struct SessionConfig {
     /// Lines the buffer keeps.
     pub limit: usize,
+    /// Bytes the buffer's lines may take.
+    pub budget: usize,
     /// At most one snapshot per this interval (ADR-0002's ~10 per second).
     pub publish_every: Duration,
     pub backoff: Backoff,
 }
 
 impl SessionConfig {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, budget: usize) -> Self {
         SessionConfig {
             limit,
+            budget,
             publish_every: Duration::from_millis(100),
             backoff: Backoff {
                 first: Duration::from_secs(1),
@@ -197,8 +200,12 @@ struct Session {
     /// The newest timestamp seen, and how many lines in a row carried it.
     last_ts: Option<(Timestamp, usize)>,
     resume: Option<Resume>,
-    /// The lines shown while paused.
+    /// The lines shown while paused. Trimmed to the buffer's oldest line whenever the buffer
+    /// drops a block, so a pause never keeps evicted blocks alive: a paused session stays within
+    /// the byte budget like a running one (plus the frozen copy of the open tail block).
     frozen: Option<LogLines>,
+    /// [`LogBuffer::dropped_blocks`] when `frozen` was last trimmed.
+    frozen_dropped: u64,
     version: u64,
     dirty: bool,
 }
@@ -254,6 +261,12 @@ impl Session {
         self.buffer.push(line);
         self.attempts = 0;
         self.dirty = true;
+        if let Some(frozen) = &mut self.frozen
+            && self.frozen_dropped != self.buffer.dropped_blocks()
+        {
+            *frozen = frozen.trimmed(self.buffer.first_id());
+            self.frozen_dropped = self.buffer.dropped_blocks();
+        }
     }
 
     fn set_state(&mut self, state: LogState) {
@@ -335,7 +348,7 @@ pub(crate) async fn run(
     mut paused: watch::Receiver<bool>,
 ) {
     let mut session = Session {
-        buffer: LogBuffer::new(config.limit),
+        buffer: LogBuffer::with_budget(config.limit, config.budget),
         source,
         target,
         options,
@@ -345,6 +358,7 @@ pub(crate) async fn run(
         last_ts: None,
         resume: None,
         frozen: None,
+        frozen_dropped: 0,
         version: 0,
         dirty: true,
     };
@@ -366,6 +380,7 @@ pub(crate) async fn run(
                 let paused = *paused.borrow_and_update();
                 if paused != session.frozen.is_some() {
                     session.frozen = paused.then(|| session.buffer.view());
+                    session.frozen_dropped = session.buffer.dropped_blocks();
                     session.dirty = true;
                 }
             }
@@ -382,6 +397,7 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logs::BLOCKS_PER_BUDGET;
     use futures::FutureExt as _;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -454,6 +470,7 @@ mod tests {
     fn config(limit: usize) -> SessionConfig {
         SessionConfig {
             limit,
+            budget: usize::MAX,
             publish_every: Duration::from_millis(100),
             backoff: Backoff {
                 first: Duration::from_millis(500),
@@ -693,6 +710,52 @@ mod tests {
         let resumed = run.until(|s| !s.paused).await;
         assert_eq!(texts(&resumed), ["one", "two", "three"]);
         assert_eq!(resumed.held_back, 0);
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn a_long_pause_stays_within_the_byte_budget() {
+        let (feed, lines) = futures::channel::mpsc::unbounded();
+        let budget = 2 * 1024 * 1024;
+        let fake = Arc::new(Fake::default());
+        fake.scripts.lock().unwrap().push_back(Script::Feed(lines));
+        let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (paused, paused_rx) = watch::channel(false);
+        let config = SessionConfig {
+            budget,
+            ..config(100_000)
+        };
+        tokio::spawn(run(
+            fake.clone(),
+            target(),
+            LogOptions::default(),
+            config,
+            tx,
+            paused_rx,
+        ));
+        let mut run = Running { rx, paused, fake };
+        let long: &'static str = Box::leak("z".repeat(32 * 1024).into_boxed_str());
+        for _ in 0..40 {
+            feed.unbounded_send(long).unwrap();
+        }
+        run.until(|s| s.lines.end_id() == 40).await;
+        run.paused.send(true).unwrap();
+        run.until(|s| s.paused).await;
+        // Five budgets' worth arrives while paused.
+        for _ in 0..(5 * budget / long.len()) {
+            feed.unbounded_send(long).unwrap();
+        }
+        let held = run.until(|s| s.held_back > 250).await;
+        // The frozen view lost its oldest lines with the buffer instead of keeping them alive.
+        assert!(held.paused);
+        assert!(held.lines.first_id() > 0);
+        let frozen_bytes: usize = held.lines.iter().map(|(_, l)| l.heap_bytes()).sum();
+        assert!(frozen_bytes <= budget, "{frozen_bytes}");
+        assert!(
+            held.lines.blocks() <= BLOCKS_PER_BUDGET + 1,
+            "{}",
+            held.lines.blocks()
+        );
     }
 
     #[tokio::test(start_paused = true)]

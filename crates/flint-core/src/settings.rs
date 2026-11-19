@@ -84,6 +84,11 @@ pub const DEFAULT_LOG_BUFFER_LINES: u32 = 100_000;
 /// buffer useless nor let a chatty pod use gigabytes.
 pub const LOG_BUFFER_LINES_RANGE: std::ops::RangeInclusive<u32> = 1_000..=1_000_000;
 
+/// MiB of log lines a session keeps by default ([`Settings::log_buffer_mib`]).
+pub const DEFAULT_LOG_BUFFER_MIB: u32 = 64;
+/// The range [`Settings::log_buffer_bytes`] keeps the setting in, in MiB.
+pub const LOG_BUFFER_MIB_RANGE: std::ops::RangeInclusive<u32> = 8..=1024;
+
 /// User settings from `settings.toml`. Unknown keys are ignored so newer files still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -106,6 +111,10 @@ pub struct Settings {
     /// Lines each log session keeps; older lines are dropped. Applies to sessions opened after
     /// a change. Read it through [`Settings::log_buffer_limit`].
     pub log_buffer_lines: u32,
+    /// MiB of memory each log session's lines may take; the oldest lines are dropped when either
+    /// this or `log_buffer_lines` is exceeded. Applies to sessions opened after a change. Read it
+    /// through [`Settings::log_buffer_bytes`].
+    pub log_buffer_mib: u32,
 }
 
 impl Default for Settings {
@@ -119,6 +128,7 @@ impl Default for Settings {
             watch_mode: WatchMode::default(),
             cluster_watch_mode: BTreeMap::new(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
+            log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
         }
     }
 }
@@ -130,6 +140,14 @@ impl Settings {
             *LOG_BUFFER_LINES_RANGE.start(),
             *LOG_BUFFER_LINES_RANGE.end(),
         ) as usize
+    }
+
+    /// [`Settings::log_buffer_mib`] in bytes, kept within [`LOG_BUFFER_MIB_RANGE`].
+    pub fn log_buffer_bytes(&self) -> usize {
+        let mib = self
+            .log_buffer_mib
+            .clamp(*LOG_BUFFER_MIB_RANGE.start(), *LOG_BUFFER_MIB_RANGE.end());
+        mib as usize * 1024 * 1024
     }
 
     /// The watch mode for a cluster: its override if there is one, else the global mode.
@@ -327,6 +345,15 @@ pub fn set_log_buffer_lines(dir: &Path, lines: u32) -> Result<Settings, Settings
     })
 }
 
+/// Sets the MiB of memory each log session's lines may take and writes `settings.toml`. Returns
+/// the settings as written.
+pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, _| {
+        table.insert("log_buffer_mib".into(), toml::Value::Integer(mib.into()));
+        Ok(())
+    })
+}
+
 /// Reads `settings.toml` as a TOML table, lets `edit` change it, checks the result still parses
 /// as [`Settings`], and writes it. Keys this version does not know survive; comments and
 /// formatting are not preserved.
@@ -435,6 +462,22 @@ mod tests {
         let written = set_log_buffer_lines(dir.path(), 20_000).unwrap();
         assert_eq!(written.log_buffer_lines, 20_000);
         assert_eq!(written.watch_mode, WatchMode::OnView);
+        assert_eq!(load_settings(dir.path()).unwrap(), written);
+    }
+
+    // covers UP-40
+    #[test]
+    fn log_buffer_mib_is_typed_bounded_and_written() {
+        assert_eq!(Settings::default().log_buffer_bytes(), 64 * 1024 * 1024);
+        let mib = |text: &str| toml::from_str::<Settings>(text).unwrap().log_buffer_bytes();
+        assert_eq!(mib("log_buffer_mib = 128"), 128 * 1024 * 1024);
+        assert_eq!(mib("log_buffer_mib = 0"), 8 * 1024 * 1024);
+        assert_eq!(mib("log_buffer_mib = 999999"), 1024 * 1024 * 1024);
+        assert!(toml::from_str::<Settings>("log_buffer_mib = 1.5").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let written = set_log_buffer_mib(dir.path(), 32).unwrap();
+        assert_eq!(written.log_buffer_mib, 32);
         assert_eq!(load_settings(dir.path()).unwrap(), written);
     }
 

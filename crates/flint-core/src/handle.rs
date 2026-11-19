@@ -77,6 +77,9 @@ pub enum Command {
     /// Set the lines each log session keeps and write it to `settings.toml`. Sessions opened
     /// afterwards use it. The change arrives back as `Event::SettingsChanged`.
     SetLogBufferLines(u32),
+    /// Set the MiB each log session's lines may take and write it to `settings.toml`. Sessions
+    /// opened afterwards use it. The change arrives back as `Event::SettingsChanged`.
+    SetLogBufferMib(u32),
 }
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
@@ -319,7 +322,8 @@ impl CoreHandle {
     }
 
     /// Opens a log session: streams `target`'s log on `cluster` into a ring buffer of
-    /// [`crate::Settings::log_buffer_limit`] lines, reconnecting when the stream drops. The
+    /// [`crate::Settings::log_buffer_limit`] lines and [`crate::Settings::log_buffer_bytes`]
+    /// bytes, reconnecting when the stream drops. The
     /// session keeps running when another cluster becomes active, until the returned
     /// [`LogSession`] is dropped. Snapshots arrive at most about every 100 ms. Never blocks.
     pub fn open_logs(&self, cluster: &str, target: LogTarget, options: LogOptions) -> LogSession {

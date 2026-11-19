@@ -308,6 +308,12 @@ impl ClusterManager {
                 })
                 .await
             }
+            Command::SetLogBufferMib(mib) => {
+                self.write_settings("the log buffer memory", move |dir| {
+                    settings::set_log_buffer_mib(dir, mib)
+                })
+                .await
+            }
         }
     }
 
@@ -361,7 +367,10 @@ impl ClusterManager {
                             .unwrap_or_else(|_| Err(LogError::fatal("the core stopped")))
                     })
                 });
-                let config = SessionConfig::new(self.settings.log_buffer_limit());
+                let config = SessionConfig::new(
+                    self.settings.log_buffer_limit(),
+                    self.settings.log_buffer_bytes(),
+                );
                 let source = Arc::new(KubeLogSource::new(lookup));
                 let task = tokio::spawn(logs::run(
                     source, target, options, config, snapshots, paused,

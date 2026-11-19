@@ -59,6 +59,17 @@ impl LogLine {
         }
     }
 
+    /// The memory this line takes in the buffer: the line itself, the shared text, and the
+    /// text's reference counts. What the byte budget counts.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<LogLine>() + 2 * std::mem::size_of::<usize>() + self.text.len()
+    }
+
+    /// [`LogLine::heap_bytes`] of the longest line kept.
+    pub fn max_heap_bytes() -> usize {
+        std::mem::size_of::<LogLine>() + 2 * std::mem::size_of::<usize>() + MAX_LINE_BYTES
+    }
+
     /// The line as shown: with its timestamp in front when `timestamps` is on and it has one.
     pub fn display(&self, timestamps: bool) -> String {
         match (&self.timestamp, timestamps) {
@@ -128,6 +139,8 @@ mod tests {
         let empty = LogLine::parse("2024-05-01T12:00:00Z", false);
         assert!(empty.timestamp.is_some());
         assert_eq!(&*empty.text, "");
+        assert!(empty.heap_bytes() < line.heap_bytes());
+        assert!(line.heap_bytes() <= LogLine::max_heap_bytes());
     }
 
     // covers UP-40
