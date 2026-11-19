@@ -19,8 +19,12 @@ fn main() -> ExitCode {
         Some("mcp") => Mode::Mcp,
         Some("-h" | "--help" | "help") => {
             println!(
-                "usage: flint          start the app\n       flint mcp      serve the read-only MCP server on stdio"
+                "usage: flint            start the app\n       flint mcp        serve the read-only MCP server on stdio\n       flint --version  print the version"
             );
+            return ExitCode::SUCCESS;
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("flint {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         Some(other) => {

@@ -104,6 +104,23 @@ claude mcp add flint -- "$PWD/target/release/flint" mcp
 
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
 
+## Releases
+
+Releases are cut by [release-please](https://github.com/googleapis/release-please) from
+[Conventional Commits](https://www.conventionalcommits.org/) on `master`. Commit subjects and PR titles follow that
+format, for example `feat(mcp): …` or `fix(core): …`.
+
+1. Every push to `master` updates an open **release PR** with the next version and the `CHANGELOG.md` entries.
+   Below 1.0, `feat` bumps the minor version and `fix` bumps the patch.
+2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release.
+3. The same workflow then builds `flint` for Apple Silicon and Intel, combines them into a universal binary, and
+   attaches `flint-vX.Y.Z-macos-universal.tar.gz` and its SHA-256 checksum to the release.
+
+Until M6, release binaries are **unsigned** and marked as pre-release. macOS will warn when you first run them.
+
+The version lives in the workspace `Cargo.toml` (marked `x-release-please-version`). The workflow refreshes
+`Cargo.lock` on the release PR, because CI builds with `--locked`.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
