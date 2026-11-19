@@ -1,7 +1,8 @@
 //! Where the channel may live, checked before the app starts: a scratch config directory that is
-//! not the user's real one and that only the user can write, an explicit `KUBECONFIG` (so the
-//! app never falls back to `~/.kube/config`), a socket path macOS can bind, and a screenshots
-//! directory. Any failure stops the app with a reason, so a test harness fails fast.
+//! not the user's real one and that only the user can write, an explicit `KUBECONFIG` (or, without
+//! one, a scratch `HOME` with no `.kube/config`, so the app never falls back to the user's
+//! `~/.kube/config`), a socket path macOS can bind, and a screenshots directory. Any failure stops
+//! the app with a reason, so a test harness fails fast.
 
 use std::ffi::OsString;
 use std::fs;
@@ -23,6 +24,8 @@ pub const SCREENSHOTS_ENV: &str = "FLINT_AUTOMATION_SCREENSHOTS";
 pub struct Env {
     pub config_dir: Option<OsString>,
     pub home: Option<PathBuf>,
+    /// The account's own home directory (from the user database, not `HOME`).
+    pub account_home: Option<PathBuf>,
     pub kubeconfig: Option<OsString>,
     pub screenshots: Option<OsString>,
 }
@@ -32,6 +35,7 @@ impl Env {
         Env {
             config_dir: std::env::var_os("FLINT_CONFIG_DIR"),
             home: std::env::home_dir(),
+            account_home: account_home(),
             kubeconfig: std::env::var_os("KUBECONFIG"),
             screenshots: std::env::var_os(SCREENSHOTS_ENV),
         }
@@ -53,11 +57,7 @@ pub fn prepare(env: &Env) -> Result<Places, String> {
         "FLINT_CONFIG_DIR is not set; the automation channel needs a scratch config directory",
     )?;
     if env.kubeconfig.as_ref().is_none_or(|k| k.is_empty()) {
-        return Err(
-            "KUBECONFIG is not set; the automation channel never falls back to \
-                    ~/.kube/config"
-                .to_owned(),
-        );
+        check_scratch_home(env)?;
     }
     let dir = PathBuf::from(raw);
     if !dir.exists() {
@@ -115,6 +115,54 @@ pub fn prepare(env: &Env) -> Result<Places, String> {
         socket,
         screenshots,
     })
+}
+
+/// Without `KUBECONFIG` the app reads `$HOME/.kube/config`. That is allowed only when `HOME` is
+/// a scratch directory (not the account's home) with no `.kube/config` in it, so a test can
+/// launch "with no kubeconfig" without the app ever reading the user's own.
+fn check_scratch_home(env: &Env) -> Result<(), String> {
+    const REFUSED: &str = "KUBECONFIG is not set; the automation channel never falls back to \
+                           ~/.kube/config";
+    let (Some(home), Some(account)) = (&env.home, &env.account_home) else {
+        return Err(REFUSED.to_owned());
+    };
+    let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    if canonical(home) == canonical(account) {
+        return Err(format!("{REFUSED} (HOME is the account's home directory)"));
+    }
+    let fallback = home.join(".kube").join("config");
+    if fallback.symlink_metadata().is_ok() {
+        return Err(format!(
+            "{REFUSED}, and {} exists; set KUBECONFIG explicitly",
+            fallback.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The account's home directory from the user database, which `HOME` cannot change.
+fn account_home() -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r writes into `pwd` and `buf`, both ours and live for the call; the
+    // strings it points `pwd` at live in `buf`, which outlives their use below.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` is a NUL-terminated string inside `buf`.
+    let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+    Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())))
 }
 
 /// The directory belongs to this user and nobody else may write to it.
@@ -176,6 +224,7 @@ mod tests {
         Env {
             config_dir: Some(config.as_os_str().to_owned()),
             home: Some(home.to_owned()),
+            account_home: Some("/Users/someone".into()),
             kubeconfig: Some("/tmp/kubeconfig".into()),
             screenshots: None,
         }
@@ -213,7 +262,30 @@ mod tests {
         );
         let mut no_kubeconfig = env(scratch.path(), home.path());
         no_kubeconfig.kubeconfig = None;
+        no_kubeconfig.account_home = Some(home.path().to_owned());
         assert!(prepare(&no_kubeconfig).unwrap_err().contains("KUBECONFIG"));
+        no_kubeconfig.account_home = None;
+        assert!(prepare(&no_kubeconfig).unwrap_err().contains("KUBECONFIG"));
+    }
+
+    // Without KUBECONFIG, a scratch HOME with nothing in .kube is allowed; one with a
+    // .kube/config is not, since the app would read it.
+    #[test]
+    fn without_kubeconfig_home_must_be_a_scratch_one() {
+        let home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut no_kubeconfig = env(scratch.path(), home.path());
+        no_kubeconfig.kubeconfig = None;
+        assert!(prepare(&no_kubeconfig).is_ok());
+        fs::create_dir_all(home.path().join(".kube")).unwrap();
+        fs::write(home.path().join(".kube/config"), "").unwrap();
+        let error = prepare(&no_kubeconfig).unwrap_err();
+        assert!(error.contains(".kube/config exists"), "{error}");
+    }
+
+    #[test]
+    fn the_account_home_comes_from_the_user_database() {
+        assert!(account_home().is_some_and(|h| h.is_absolute()));
     }
 
     #[test]

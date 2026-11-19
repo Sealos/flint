@@ -2025,6 +2025,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "libc",
  "rcgen",
  "rustls",
  "serde-saphyr 2.2.0",
@@ -2032,6 +2033,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "toml 1.2.1+spec-1.1.0",
 ]
 
 [[package]]

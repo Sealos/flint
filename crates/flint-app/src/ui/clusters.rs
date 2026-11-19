@@ -144,7 +144,9 @@ impl ClustersModel {
     /// Sets the appearance. Written to `settings.toml`; the change comes back as a settings
     /// event, and the window follows it.
     pub fn set_appearance(&mut self, appearance: Appearance) {
-        self.send(Command::SetAppearance(appearance));
+        // Not `send`: changing the theme is not an answer to the last error (a removed cluster,
+        // a failed write), so its notice stays.
+        self.core.send(Command::SetAppearance(appearance));
     }
 
     /// Tells the core which namespaces the user filters `cluster` on, for kinds the user may not

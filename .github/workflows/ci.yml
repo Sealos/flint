@@ -60,7 +60,12 @@ jobs:
         with:
           shared-key: linux
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      # The MCP e2e tests run flint-mcp; build it here rather than inside the tests.
+      - if: matrix.crate == 'flint-e2e'
+        run: cargo build -p flint-mcp --bin flint-mcp --locked
       - run: cargo test -p ${{ matrix.crate }} --locked
+        env:
+          FLINT_E2E_MCP_BIN: ${{ matrix.crate == 'flint-e2e' && format('{0}/target/debug/flint-mcp', github.workspace) || '' }}
 
   docs:
     runs-on: ubuntu-latest
