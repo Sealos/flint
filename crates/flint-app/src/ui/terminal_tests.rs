@@ -238,6 +238,9 @@ async fn copy_and_paste(cx: &mut TestAppContext) {
         !shell.view.read_with(cx, |v, _| v.has_selection()),
         "nothing selected"
     );
+    // Copy with nothing selected does nothing, and never reaches the shell (as ^C on Linux).
+    shell.press(cx, TERMINAL_COPY[0]);
+    assert_eq!(shell.sent(cx), b"");
 
     // A drag over "hello".
     let from = shell.cell_center(cx, 0, 0);
@@ -278,6 +281,10 @@ async fn copy_and_paste(cx: &mut TestAppContext) {
         cx.read_from_clipboard().and_then(|i| i.text()).as_deref(),
         Some("world\nsecond")
     );
+
+    // The program clearing the screen drops the selection: Copy has nothing then.
+    shell.print(cx, b"\x1b[H\x1b[2J");
+    assert!(!shell.view.read_with(cx, |v, _| v.has_selection()));
 
     cx.write_to_clipboard(ClipboardItem::new_string("echo a\necho b".into()));
     shell.press(cx, TERMINAL_PASTE[0]);

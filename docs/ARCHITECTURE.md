@@ -332,7 +332,8 @@ opens in a tab in the bottom dock.
   stay aligned. Colors come from the theme: the default foreground, background, cursor (the accent) and selection are
   theme tokens, the 16 ANSI colors are a `terminal` palette per theme in `themes/flint.json` (checked for contrast in
   both themes), 16 to 255 are xterm's table (`terminal_palette.rs`). Bold, italic, underline, strikethrough, dim,
-  hidden and inverse are drawn; the cursor is a block, beam or underline, hollow without focus; the bell flashes the
+  hidden and inverse are drawn; the cursor is a block, beam or underline (a hollow block, or a faded beam or underline,
+  without focus); the bell flashes the
   screen. The grid size comes from the element's size and the font's advance; a change is sent after 80 ms without
   further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed
   (reason); after the end the screen stays scrollable and copyable. Closing the tab drops the session.
@@ -343,8 +344,9 @@ opens in a tab in the bottom dock.
   with the program's modes (`terminal_keys.rs`: application cursor keys, xterm modifier parameters, Ctrl codes,
   function keys; Alt as Meta except on macOS, where Option composes text). Text, including what an input method
   composes, arrives through the platform text input. What stays the app's: Cmd shortcuts on macOS; on Linux,
-  Ctrl-Shift ones (copy is Ctrl-Shift-C, paste Ctrl-Shift-V) and Ctrl-Tab for the dock. Known conflicts: on Linux the
-  app's `secondary-` shortcuts (Ctrl) do not work while a shell has focus; Shift-Page Up/Down and Shift-Home/End
+  Ctrl-Shift ones (copy is Ctrl-Shift-C, paste Ctrl-Shift-V) and Ctrl-Tab for the dock. Known conflicts: on Linux an app
+  shortcut on Ctrl with a letter (without Shift) would not fire while a shell has focus (today's are Cmd/Super or
+  Ctrl-Shift); Shift-Page Up/Down and Shift-Home/End
   scroll the tab instead of reaching the program; mouse reporting (programs that ask for clicks) is not sent, the
   mouse always selects.
 - **Mouse in a shell tab.** Dragging selects (double click: words, triple click: lines, Option: a block, Shift-click

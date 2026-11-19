@@ -10,8 +10,8 @@
 //!   programs such as `vi`, `less` and `top` turn on) and `ESC [ A` otherwise. With modifiers
 //!   they send xterm's `ESC [ 1 ; m A`, where `m` is 1 plus 1 for Shift, 2 for Alt and 4 for Ctrl.
 //! - **Ctrl** with a letter sends its control character (Ctrl-C is 0x03), and Ctrl with `@`,
-//!   `[`, `\`, `]`, `^`, `_`, `?` (or the digits 2 to 8 standing for them, as xterm does) the
-//!   control characters past the letters.
+//!   `[`, `\`, `]`, `^`, `_` (also `/`), `?` (or the digits 2 to 8 standing for them, as xterm
+//!   does) the control characters past the letters.
 //! - **Alt as Meta** prefixes ESC (Alt-B sends `ESC b`). It is on where Alt does not compose text
 //!   ([`ALT_IS_META`]): off on macOS, where Option types characters such as `@` on many
 //!   keyboards, so Option-letters go to the text input and type what the keyboard composes.
@@ -129,7 +129,7 @@ fn control_char(c: char) -> Option<u8> {
         '\\' | '4' => 0x1c,
         ']' | '5' => 0x1d,
         '^' | '6' => 0x1e,
-        '_' | '-' | '7' => 0x1f,
+        '_' | '-' | '/' | '7' => 0x1f,
         '?' | '8' => 0x7f,
         _ => return None,
     })
@@ -205,6 +205,7 @@ mod tests {
         assert_eq!(send("ctrl-\\").unwrap(), [0x1c]);
         assert_eq!(send("ctrl-2").unwrap(), [0]);
         assert_eq!(send("ctrl-8").unwrap(), [0x7f]);
+        assert_eq!(send("ctrl-/").unwrap(), [0x1f]);
         assert_eq!(send("ctrl-alt-c").unwrap(), [0x1b, 0x03]);
         assert_eq!(send("ctrl-,"), None);
     }

@@ -9,7 +9,7 @@
 //!   text of each row shaped in [`Segment`]s with every glyph forced to the cell width, so the
 //!   grid stays aligned; wide characters and combining marks are shaped on their own. Colors come
 //!   from the theme ([`TerminalPalette`]); the cursor is a block, beam or underline in the accent
-//!   color, hollow while the tab does not have focus.
+//!   color; without focus a block is hollow and a beam or underline fades.
 //! - **Keys** ([`terminal_keys`]): the key handler encodes what does not type text, using the
 //!   modes the program set; text, including what an input method composes, arrives through the
 //!   platform text input ([`TerminalInput`]). The terminal's key context passes Tab, Esc, the
@@ -207,6 +207,15 @@ impl TerminalView {
         if snapshot.state.is_finished() {
             self.marked = None;
         }
+        // The terminal drops a selection on its own (the program cleared the screen, switched
+        // screens or wrote over it): once no cell shows one, Copy has nothing. A selection
+        // scrolled out of view counts as gone too, until it is scrolled back.
+        if self.selection
+            && self.press.is_none()
+            && !snapshot.terminal.cells.iter().any(|c| c.selected)
+        {
+            self.selection = false;
+        }
         self.snapshot = snapshot;
         cx.notify();
     }
@@ -250,6 +259,8 @@ impl TerminalView {
     /// The grid measured `size` this frame: tell the pod once it stays put.
     fn grid_resized(&mut self, size: TerminalSize, cx: &mut Context<Self>) {
         if size == self.wanted_size() {
+            // The first layout matched the size the session started with.
+            self.resized = true;
             return;
         }
         if size == self.size {
