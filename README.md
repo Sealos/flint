@@ -68,8 +68,9 @@ FLINT_CLUSTER=kind-flint-dev FLINT_VIEW=demo/deployments/web#yaml FLINT_APPEARAN
 
 ## Development cluster
 
-`scripts/dev-cluster.sh` manages a throwaway [kind](https://kind.sigs.k8s.io/) cluster named `flint-dev`, with
-metrics-server and a sample Helm release. Its kubeconfig is written to `.dev/kubeconfig` (gitignored), so your own
+`scripts/dev-cluster.sh` manages a throwaway [kind](https://kind.sigs.k8s.io/) cluster named `flint-dev`, with the
+fixtures the cluster tests expect (`scripts/cluster-fixtures.sh`): metrics-server, a `demo` namespace with a Deployment
+and the `podinfo` Helm release, and a compacted etcd. Its kubeconfig is written to `.dev/kubeconfig` (gitignored), so your own
 `~/.kube/config` is never touched.
 
 ```sh
@@ -110,12 +111,16 @@ message unless asked:
     cargo test -p flint-core --test watch_recovery -- --ignored --nocapture
   ```
 
-CI (`.github/workflows/ci.yml`, macOS) runs format, clippy and the tests above without a cluster.
+CI on macOS (`.github/workflows/ci.yml`) runs format, clippy and the tests above without a cluster. The cluster tests
+run on Linux against kind (`.github/workflows/cluster-e2e.yml`).
 
 ### Checks CI runs
 
 - **CI (macOS):** `cargo fmt --check`, clippy with `-D warnings`, `cargo test -p <crate>` for each crate as a separate
   job, `cargo doc` with `-D warnings`, and a release build.
+- **Cluster e2e (Linux):** a kind cluster set up by `scripts/cluster-fixtures.sh`, then the `flint-core` and
+  `flint-mcp` tests with `--include-ignored`, the MCP ones through the GPUI-free `flint-mcp` binary. Runs on PRs that
+  touch core or MCP, on master, and nightly (which adds the API-server restart test).
 - **Lint (Linux):**
   - `cargo deny check` (advisories, licenses, bans, sources; config in `deny.toml`);
   - `cargo machete` (unused dependencies);

@@ -1,22 +1,22 @@
 //! `flint-mcp`: the read-only MCP server on stdio, without the desktop app.
 //!
-//! It serves the same [`flint_mcp::run_stdio`] as `flint mcp`, but links no GPUI, so it builds on
-//! Linux. CI runs the MCP end-to-end tests against kind with it. Users get `flint mcp`.
+//! It runs the same [`flint_mcp::serve_stdio_main`] as `flint mcp`, but links no GPUI, so it builds
+//! on Linux. CI runs the MCP end-to-end tests against kind with it. It is not shipped: users run
+//! `flint mcp`.
 
 use std::process::ExitCode;
 
-use flint_core::bootstrap::{self, Bootstrap};
-use flint_core::env_path::PathSource;
+const USAGE: &str = "\
+usage: flint-mcp            serve the read-only MCP server on stdio
+       flint-mcp --version  print the version
+
+Same server as `flint mcp`, without the desktop app. Not shipped; register `flint mcp` in AI clients.";
 
 /// `Ok` to serve; `Err` holds what to print and the exit code. Program name excluded.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(), (String, u8)> {
     match args.into_iter().next().as_deref() {
         None => Ok(()),
-        Some("-h" | "--help" | "help") => Err((
-            "usage: flint-mcp            serve the read-only MCP server on stdio\n       flint-mcp --version  print the version"
-                .to_owned(),
-            0,
-        )),
+        Some("-h" | "--help" | "help") => Err((USAGE.to_owned(), 0)),
         Some("-V" | "--version" | "version") => {
             Err((format!("flint-mcp {}", env!("CARGO_PKG_VERSION")), 0))
         }
@@ -28,7 +28,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(), (String, u8)
 }
 
 fn main() -> ExitCode {
-    // Only argument parsing may run before `bootstrap`: it must not start threads.
+    // Only argument parsing may run before the server's bootstrap: it must not start threads.
     match parse_args(std::env::args().skip(1)) {
         Ok(()) => {}
         Err((text, 0)) => {
@@ -40,52 +40,8 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
     }
-
-    // SAFETY: nothing has started a thread yet. This must stay ahead of anything that might:
-    // it changes the process environment (PATH), which is only sound while single-threaded.
-    let boot = match unsafe { bootstrap::bootstrap() } {
-        Ok(boot) => boot,
-        Err(e) => {
-            eprintln!("flint-mcp: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    init_logging();
-    log_bootstrap(&boot);
-
-    match flint_mcp::run_stdio(&boot) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            tracing::error!("mcp server failed: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Logs go to stderr: stdout carries the protocol.
-fn init_logging() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("FLINT_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-}
-
-fn log_bootstrap(boot: &Bootstrap) {
-    match &boot.path.source {
-        PathSource::Settings => tracing::info!("PATH from settings.toml"),
-        PathSource::LoginShell => tracing::info!("PATH from login shell"),
-        PathSource::Fallback(reason) => {
-            tracing::warn!(reason, "PATH from fallback (login shell not used)")
-        }
-    }
-    tracing::debug!(path = %boot.path.value, "resolved PATH");
-    tracing::info!(config_dir = %boot.config_dir.display(), "config directory");
-    if let Some(e) = &boot.settings_error {
-        tracing::warn!("using default settings: {e}");
-    }
+    // SAFETY: nothing has started a thread yet.
+    unsafe { flint_mcp::serve_stdio_main("flint-mcp") }
 }
 
 #[cfg(test)]
@@ -103,7 +59,9 @@ mod tests {
 
     #[test]
     fn help_and_version_exit_zero_and_unknown_arguments_exit_two() {
-        assert_eq!(parse(&["--help"]).unwrap_err().1, 0);
+        let (help, code) = parse(&["--help"]).unwrap_err();
+        assert_eq!(code, 0);
+        assert!(help.contains("register `flint mcp`"), "{help}");
         let (text, code) = parse(&["--version"]).unwrap_err();
         assert_eq!(code, 0);
         assert_eq!(text, format!("flint-mcp {}", env!("CARGO_PKG_VERSION")));

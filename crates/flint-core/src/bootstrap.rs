@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use crate::env_path::{self, ResolvedPath};
+use tracing_subscriber::EnvFilter;
+
+use crate::env_path::{self, PathSource, ResolvedPath};
 use crate::handle::CoreConfig;
 use crate::kubeconfig;
 use crate::settings::{self, Settings, SettingsError};
@@ -36,6 +38,34 @@ impl Bootstrap {
     pub fn kubeconfig_paths(&self) -> Vec<PathBuf> {
         kubeconfig::paths_for_settings(&self.kubeconfig_base, &self.settings, self.home.as_deref())
     }
+
+    /// Logs where `PATH`, the config directory and the settings came from. Call it once logging
+    /// is set up ([`init_logging`]).
+    pub fn log_summary(&self) {
+        match &self.path.source {
+            PathSource::Settings => tracing::info!("PATH from settings.toml"),
+            PathSource::LoginShell => tracing::info!("PATH from login shell"),
+            PathSource::Fallback(reason) => {
+                tracing::warn!(reason, "PATH from fallback (login shell not used)")
+            }
+        }
+        tracing::debug!(path = %self.path.value, "resolved PATH");
+        tracing::info!(config_dir = %self.config_dir.display(), "config directory");
+        if let Some(e) = &self.settings_error {
+            tracing::warn!("using default settings: {e}");
+        }
+    }
+}
+
+/// Sends logs to stderr, filtered by `FLINT_LOG` (default `info`). Never stdout: in `flint mcp`,
+/// stdout carries the protocol. Call it once, after [`bootstrap`].
+pub fn init_logging() {
+    let filter = EnvFilter::try_from_env("FLINT_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
 }
 
 /// Loads settings, resolves and installs `PATH`, and computes the kubeconfig files.
@@ -76,7 +106,7 @@ mod tests {
             settings_error: Some("bad".into()),
             path: ResolvedPath {
                 value: "/bin".into(),
-                source: env_path::PathSource::Settings,
+                source: PathSource::Settings,
             },
             kubeconfig_base: vec![PathBuf::from("/home/u/.kube/config")],
             home: Some(PathBuf::from("/home/u")),
@@ -93,6 +123,33 @@ mod tests {
             config.kubeconfig_base,
             [PathBuf::from("/home/u/.kube/config")]
         );
+    }
+
+    #[test]
+    fn the_summary_names_the_path_source_and_a_settings_error() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || Writer(writer.clone()))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || boot(Vec::new()).log_summary());
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("PATH from settings.toml"), "{text}");
+        assert!(text.contains("config_dir=/cfg"), "{text}");
+        assert!(text.contains("using default settings: bad"), "{text}");
+    }
+
+    struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Writer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

@@ -11,20 +11,22 @@ on:
       - Cargo.toml
       - Cargo.lock
       - scripts/cluster-fixtures.sh
+      - scripts/dev-cluster.sh
       - .github/workflows/cluster-e2e.yml
   push:
     branches: [master]
   schedule:
-    # Nightly, to catch drift in kind, metrics-server and the podinfo chart.
+    # Nightly, to catch drift in the runner image and the tests' timing.
     - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Only PR runs replace each other; master and nightly runs always finish.
 concurrency:
-  group: cluster-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: cluster-e2e-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +35,8 @@ env:
   KUBECONFIG: ${{ github.workspace }}/.dev/kubeconfig
   FLINT_TEST_KUBECONFIG: ${{ github.workspace }}/.dev/kubeconfig
   FLINT_CONFIG_DIR: ${{ github.workspace }}/target/ci-flint-config
+  # Nightly only: UP-27 stops the kind control plane for about a minute.
+  FLINT_TEST_SLOW: ${{ github.event_name == 'schedule' && '1' || '' }}
 
 jobs:
   cluster-e2e:
@@ -48,27 +52,44 @@ jobs:
       # Compile before the cluster exists, so a build failure doesn't wait on kind.
       - name: Build tests
         run: cargo test -p flint-core -p flint-mcp --locked --no-run
+      - name: Pinned kind node image
+        id: node
+        run: echo "image=$(scripts/dev-cluster.sh node-image)" >> "$GITHUB_OUTPUT"
       # Named like scripts/dev-cluster.sh's cluster: the tests expect context kind-flint-dev.
-      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+      - name: Create kind cluster (flint-dev)
+        id: kind
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
+          version: v0.33.0
+          node_image: ${{ steps.node.outputs.image }}
           cluster_name: flint-dev
           kubeconfig: ${{ env.KUBECONFIG }}
           wait: 120s
       - name: Install fixtures
         run: scripts/cluster-fixtures.sh
-      - name: Unit, cluster and MCP e2e tests
-        run: cargo test -p flint-core -p flint-mcp --locked -- --include-ignored
+      - name: flint-core tests
+        run: cargo test -p flint-core --locked --no-fail-fast -- --include-ignored
+      - name: flint-mcp e2e
+        if: ${{ !cancelled() && steps.kind.outcome == 'success' }}
+        run: cargo test -p flint-mcp --locked --no-fail-fast -- --include-ignored
       # Tests create their objects in namespaces and a CRD group of their own and delete them.
       - name: Nothing left behind
+        if: ${{ !cancelled() && steps.kind.outcome == 'success' }}
         run: |
-          leftovers="$(kubectl get ns,crd -o name | grep -E 'm1fix|flint' || true)"
-          leftovers="$leftovers$(kubectl -n demo get secret -o name | grep flint-test || true)"
+          leftovers="$(
+            kubectl get ns,crd -o name | grep -E 'm1fix|flint' || true
+            kubectl -n demo get secret -o name | grep flint-test || true
+          )"
           if [ -n "$leftovers" ]; then
-            echo "::error::tests left objects behind: $leftovers"
+            echo "$leftovers"
+            echo "::error::tests left the objects above behind"
             exit 1
           fi
       - name: Cluster state
-        if: failure()
+        if: ${{ failure() && steps.kind.outcome == 'success' }}
         run: |
           kubectl get nodes,pods -A -o wide || true
+          kubectl get apiservice || true
+          kubectl -n kube-system logs deployment/metrics-server --tail=50 || true
+          kubectl -n demo get all || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true

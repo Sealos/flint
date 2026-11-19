@@ -23,9 +23,7 @@ serde_json.workspace = true
 serde-saphyr.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-# Logging for the `flint-mcp` binary, as in `flint mcp`.
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

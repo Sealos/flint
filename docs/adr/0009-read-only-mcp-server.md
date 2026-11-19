@@ -25,3 +25,6 @@ An exposure is stored as context name plus API server URL, not as a name alone. 
 different cluster in another `KUBECONFIG`, or after it is re-pointed (for example with
 `aws eks update-kubeconfig --alias`). Without the URL, that could quietly expose a production cluster. When the URL
 does not match, the cluster counts as not exposed.
+
+The `flint-mcp` crate also builds a `flint-mcp` binary: the same server and the same policy as `flint mcp`, without
+GPUI, so the MCP end-to-end tests run on Linux CI against kind. It is not shipped; AI clients register `flint mcp`.

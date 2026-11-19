@@ -3,7 +3,9 @@
 //! the same server. No cluster: the kubeconfig names 127.0.0.1:1, which refuses connections.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -37,17 +39,32 @@ fn flint_mcp_answers_on_stdio() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut exchange = |msg: Value| -> Option<Value> {
+    let stdout = child.stdout.take().unwrap();
+    // Read on a thread, so a silent or dead server fails the test instead of hanging it.
+    let (tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut exchange = |child: &mut Child, msg: Value| -> Option<Value> {
         writeln!(stdin, "{msg}").unwrap();
         stdin.flush().unwrap();
         msg.get("id")?;
-        let mut line = String::new();
-        stdout.read_line(&mut line).unwrap();
+        let line = match lines.recv_timeout(Duration::from_secs(30)) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("no answer within 30 s to {msg}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("flint mcp closed stdout: {:?}", child.wait())
+            }
+        };
         Some(serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON-RPC ({e}): {line}")))
     };
 
     let init = exchange(
+        &mut child,
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
@@ -56,8 +73,15 @@ fn flint_mcp_answers_on_stdio() {
     )
     .unwrap();
     assert_eq!(init["result"]["serverInfo"]["name"], "flint", "{init}");
-    exchange(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-    let tools = exchange(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+    exchange(
+        &mut child,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    let tools = exchange(
+        &mut child,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .unwrap();
     let tools = tools["result"]["tools"].as_array().unwrap();
     assert!(
         tools.iter().any(|t| t["name"] == "list_clusters"),

@@ -253,7 +253,6 @@ fn forbidden() -> FetchError {
 
 /// Waits (in paused time) until the newest snapshot satisfies `pred`. The limit is above the
 /// slowest retry these tests wait for: the 30 s all-namespaces recheck plus up to 25% jitter.
-/// (macOS clocks tick in microseconds, which makes the jitter 0 there; Linux shows the real one.)
 async fn until(
     rx: &mut tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
     pred: impl Fn(&KindSnapshot) -> bool,
