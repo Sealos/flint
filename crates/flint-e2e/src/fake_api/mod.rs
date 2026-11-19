@@ -2,7 +2,8 @@
 //!
 //! It replays the fixtures recorded from the kind dev cluster (`scripts/record-fixtures.sh`):
 //! version, aggregated discovery, OpenAPI v3, Table lists with `includeObject=Metadata`, plain
-//! lists and objects. Watches (including streaming lists) are served from the same rows and
+//! lists, objects and pod logs, with timestamps shifted to the server's start
+//! ([`clock`]). Watches (including streaming lists) are served from the same rows and
 //! can be scripted ([`FakeApiServer::script_watch`]) or fed live
 //! ([`FakeApiServer::send_watch`]). Faults ([`Fault`]) refuse, delay or drop matching
 //! requests.
@@ -21,6 +22,7 @@
 //! # }
 //! ```
 
+pub mod clock;
 mod faults;
 pub mod fixtures;
 pub mod kubeconfig;
@@ -38,5 +40,5 @@ pub use fixtures::{Fixtures, Gvr};
 pub use kubeconfig::CONTEXT;
 pub use route::{Query, Verb};
 pub use row::FakeRow;
-pub use server::{FakeApiServer, Options, RequestRecord};
+pub use server::{FakeApiServer, Options, RequestRecord, write_kubeconfigs};
 pub use watch::WatchStep;

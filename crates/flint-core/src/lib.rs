@@ -32,7 +32,7 @@ pub use discovery::{
 pub use exec::{ExecRequest, ExecSession, ExecSnapshot, ExecState};
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, CoreHandle, Event,
-    LogSession, Subscription,
+    LogSession, Subscription, WatchTiming,
 };
 pub use logs::{
     LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogOptions, LogSearch,

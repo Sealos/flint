@@ -120,6 +120,7 @@ async fn lists_recover_after_the_api_server_restarts() {
         kubeconfig_base: vec![path.clone()],
         home: None,
         watch_files: false,
+        watch_timing: Default::default(),
     })
     .unwrap();
     let events = core.events();

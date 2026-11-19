@@ -25,6 +25,11 @@ impl FieldSelector {
         FieldSelector(terms)
     }
 
+    /// The field paths the selector compares.
+    pub fn fields(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(path, _, _)| path.as_str())
+    }
+
     /// Whether `object` matches every term. A missing field compares as an empty string.
     pub fn matches(&self, object: &Value) -> bool {
         self.0.iter().all(|(path, equal, value)| {
@@ -158,6 +163,9 @@ mod tests {
         assert!(FieldSelector::parse("count=3").matches(&event));
         assert!(FieldSelector::parse("spec.nodeName=").matches(&event));
         assert!(FieldSelector::parse("").matches(&event));
+        let selector = FieldSelector::parse("a.b=1,c!=2");
+        let fields: Vec<&str> = selector.fields().collect();
+        assert_eq!(fields, ["a.b", "c"]);
     }
 
     #[test]

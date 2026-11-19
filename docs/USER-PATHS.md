@@ -23,6 +23,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - `scripts/dev-cluster.sh up` creates the kind cluster `flint-dev` with namespace `demo`, the `web` deployment and
   service, the `podinfo` Helm release, and metrics-server.
 - Scratch kubeconfigs are hand-written per test (unreachable servers, duplicates, broken YAML).
+- The fake API server (`flint_e2e::fake_api`, see [`TESTING.md`](./TESTING.md#fake-api-server)) replays responses
+  recorded from that cluster, with scripted watches and injected faults, where kind is not available.
 - Every run sets a scratch `FLINT_CONFIG_DIR`.
 
 **Safety:** paths are only ever exercised against the kind cluster, never a real one.

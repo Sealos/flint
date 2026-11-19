@@ -22,7 +22,8 @@ impl FakeRow {
             "name": name,
             "uid": stable_uid(&format!("test/{}/{name}", namespace.unwrap_or(""))),
             "resourceVersion": "1",
-            "creationTimestamp": "2026-01-01T00:00:00Z",
+            // Fixture time "now": the server shows it as created when it serves it.
+            "creationTimestamp": super::clock::FIXTURE_NOW,
         });
         if let Some(ns) = namespace {
             metadata["namespace"] = ns.into();
@@ -82,10 +83,14 @@ impl FakeRow {
         self
     }
 
-    /// Replaces one cell.
+    /// Replaces one cell. Panics if the row has no cell `index` (see
+    /// [`super::FakeApiServer::column`]).
     pub fn with_cell(mut self, index: usize, value: impl Into<Value>) -> Self {
-        if let Some(cell) = self.cells_mut().and_then(|c| c.get_mut(index)) {
-            *cell = value.into();
+        let width = self.cells().len();
+        let name = self.name().to_owned();
+        match self.cells_mut().and_then(|c| c.get_mut(index)) {
+            Some(cell) => *cell = value.into(),
+            None => panic!("row {name} has {width} cells; there is no cell {index}"),
         }
         self
     }
@@ -103,6 +108,11 @@ impl FakeRow {
 
     pub fn as_json(&self) -> &Value {
         &self.0
+    }
+
+    /// The row's `PartialObjectMetadata` metadata.
+    pub fn metadata(&self) -> &Value {
+        self.0.pointer("/object/metadata").unwrap_or(&Value::Null)
     }
 
     pub(crate) fn set_resource_version(&mut self, rv: u64) {
@@ -168,9 +178,15 @@ mod tests {
                 .get("generateName")
                 .is_none()
         );
-        let mut row = row.with_cell(99, "ignored");
+        let mut row = row;
         row.set_resource_version(42);
         assert_eq!(row.resource_version(), "42");
+    }
+
+    #[test]
+    #[should_panic(expected = "there is no cell 9")]
+    fn setting_a_missing_cell_panics() {
+        let _ = web().with_cell(9, "x");
     }
 
     #[test]
@@ -178,6 +194,10 @@ mod tests {
         let row = FakeRow::build(Some("demo"), "cm", vec!["cm".into(), 1.into()]);
         assert_eq!(row.namespace(), Some("demo"));
         assert!(!row.uid().is_empty());
+        assert_eq!(
+            row.metadata()["creationTimestamp"],
+            super::super::clock::FIXTURE_NOW
+        );
         assert_eq!(FakeRow::build(None, "n", vec![]).namespace(), None);
     }
 }

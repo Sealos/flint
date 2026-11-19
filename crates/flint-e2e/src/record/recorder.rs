@@ -2,13 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use kube::Client;
 use serde_json::Value;
 
 use super::normalize::{self, UidMap};
+use crate::fake_api::clock;
 use crate::fake_api::fixtures::{self, Fixtures, Gvr, Layout};
 use crate::fake_api::resources::{ResourceIndex, ResourceInfo};
 
@@ -40,7 +42,8 @@ pub enum ObjectScope {
 }
 
 /// Objects are recorded for the demo namespace, a few cluster-scoped resources, and core events
-/// in every namespace. Metrics change on every scrape and are only recorded as Tables.
+/// (later kept only in `default` and `demo`). Metrics change on every scrape and are only
+/// recorded as Tables.
 pub fn object_scope(resource: &ResourceInfo) -> Option<ObjectScope> {
     let gvr = &resource.gvr;
     if gvr.group == "metrics.k8s.io" || gvr.group == "events.k8s.io" {
@@ -65,7 +68,7 @@ pub fn filter_openapi_index(index: &mut Value) {
     }
 }
 
-/// What was recorded, by file, with its size in bytes.
+/// What was recorded, by path relative to the fixtures directory, with its size in bytes.
 #[derive(Debug, Default)]
 pub struct Summary {
     pub files: BTreeMap<PathBuf, usize>,
@@ -81,14 +84,34 @@ struct Recording {
     objects: BTreeMap<Gvr, Value>,
 }
 
+/// Tries per request; the waits between them double from [`RETRY_WAIT`].
+const ATTEMPTS: u32 = 4;
+const RETRY_WAIT: Duration = Duration::from_millis(500);
+
 async fn get(client: &Client, path: &str, accept: &str) -> Result<Value> {
-    let request = http::Request::get(path)
-        .header(http::header::ACCEPT, accept)
-        .body(Vec::new())?;
-    let text = client
-        .request_text(request)
-        .await
-        .with_context(|| format!("GET {path}"))?;
+    let mut attempt = 0;
+    let text = loop {
+        let request = http::Request::get(path)
+            .header(http::header::ACCEPT, accept)
+            .body(Vec::new())?;
+        match client.request_text(request).await {
+            Ok(text) => break text,
+            Err(e) if attempt + 1 < ATTEMPTS => {
+                eprintln!("  GET {path} failed ({e}); retrying");
+                tokio::time::sleep(RETRY_WAIT * 2u32.pow(attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                let hint = match &e {
+                    kube::Error::Api(s) if s.code == 503 && path.contains("metrics.k8s.io") => {
+                        " (metrics-server is probably still starting; wait a minute and retry)"
+                    }
+                    _ => "",
+                };
+                return Err(anyhow::Error::new(e).context(format!("GET {path}{hint}")));
+            }
+        }
+    };
     serde_json::from_str(&text).with_context(|| format!("parsing GET {path}"))
 }
 
@@ -121,6 +144,7 @@ async fn fetch(client: &Client) -> Result<Recording> {
     let mut objects = BTreeMap::new();
     for resource in resources.preferred_listable() {
         let gvr = &resource.gvr;
+        eprintln!("  {gvr}");
         let path = format!("{}?includeObject=Metadata", gvr.collection_path(None));
         let mut table = get(client, &path, ACCEPT_TABLE).await?;
         if table.get("kind").and_then(Value::as_str) != Some("Table") {
@@ -161,8 +185,12 @@ async fn fetch(client: &Client) -> Result<Recording> {
     })
 }
 
-/// Scrubs and normalizes a recording in place.
-fn clean(recording: &mut Recording) {
+/// Scrubs and normalizes a recording in place; `recorded_at` is when it was fetched (Unix
+/// seconds).
+fn clean(recording: &mut Recording, recorded_at: i64) {
+    if let Some(list) = recording.objects.get_mut(&Gvr::core("configmaps")) {
+        normalize::scrub_helm_configmaps(list);
+    }
     let secrets = Gvr::core("secrets");
     if let Some(table) = recording.tables.get_mut(&secrets) {
         normalize::scrub_secret_table(table);
@@ -194,55 +222,94 @@ fn clean(recording: &mut Recording) {
         ]);
     for value in values {
         uids.normalize(value);
+        normalize::to_fixture_time(value, recorded_at);
     }
 }
 
-/// Records every fixture from `client` into `out`, replacing what was there.
-pub async fn record(client: &Client, out: PathBuf) -> Result<Summary> {
-    let mut recording = fetch(client).await?;
-    clean(&mut recording);
-
-    let layout = Layout::new(out);
-    for dir in ["tables", "objects", "openapi", "discovery"] {
-        let path = layout.root().join(dir);
-        if path.exists() {
-            fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
-        }
-    }
+/// Every fixture file's text, by path relative to the fixtures directory.
+fn render(recording: &Recording) -> Result<BTreeMap<PathBuf, String>> {
+    let layout = Layout::new("");
+    let mut files = BTreeMap::new();
     for (path, value) in &recording.openapi {
-        fixtures::write_compact_json(&layout.openapi_document(path), value)?;
+        files.insert(
+            layout.openapi_document(path),
+            fixtures::json_text(value, true)?,
+        );
     }
-    let mut writes: Vec<(PathBuf, &Value)> = vec![
+    let mut pretty: Vec<(PathBuf, &Value)> = vec![
         (layout.version(), &recording.version),
         (layout.discovery_core(), &recording.discovery_core),
         (layout.discovery_groups(), &recording.discovery_groups),
         (layout.openapi_index(), &recording.openapi_index),
     ];
-    writes.extend(recording.tables.iter().map(|(g, v)| (layout.table(g), v)));
-    writes.extend(
+    pretty.extend(recording.tables.iter().map(|(g, v)| (layout.table(g), v)));
+    pretty.extend(
         recording
             .objects
             .iter()
             .map(|(g, v)| (layout.objects(g), v)),
     );
-    let mut summary = Summary::default();
-    for (path, value) in writes {
-        fixtures::write_json(&path, value)?;
+    for (path, value) in pretty {
+        files.insert(path, fixtures::json_text(value, false)?);
     }
-    for path in fixtures::json_files(layout.root())? {
-        let text = fs::read_to_string(&path)?;
-        let leaks = normalize::find_leaks(&text);
+    Ok(files)
+}
+
+/// Fails if any file still holds a credential or a local path. Runs before anything is written.
+fn check_leaks(files: &BTreeMap<PathBuf, String>) -> Result<()> {
+    for (path, text) in files {
+        let leaks = normalize::find_leaks(text);
         if !leaks.is_empty() {
             bail!(
-                "{} still contains {leaks:?}; fix the scrubbing",
+                "{} would contain {leaks:?}; fix the scrubbing",
                 path.display()
             );
         }
-        summary.files.insert(path, text.len());
     }
-    // What was written must load as the fake server will load it.
-    Fixtures::load(&layout).context("the new fixtures do not load")?;
+    Ok(())
+}
+
+/// Writes `files` to a new directory next to `out` and swaps it in once complete and loadable,
+/// so a failed run leaves the previous fixtures untouched.
+pub(crate) fn install(files: &BTreeMap<PathBuf, String>, out: &Path) -> Result<Summary> {
+    check_leaks(files)?;
+    let name = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("the fixtures directory has no name")?;
+    let staging = out.with_file_name(format!(".{name}.new"));
+    let previous = out.with_file_name(format!(".{name}.old"));
+    for dir in [&staging, &previous] {
+        if dir.exists() {
+            fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+        }
+    }
+    let mut summary = Summary::default();
+    for (path, text) in files {
+        fixtures::write_text(&staging.join(path), text)?;
+        summary.files.insert(path.clone(), text.len());
+    }
+    if let Err(e) = Fixtures::load(&Layout::new(&staging)) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e.context("the new fixtures do not load; the old ones are kept"));
+    }
+    if out.exists() {
+        fs::rename(out, &previous).with_context(|| format!("moving {} aside", out.display()))?;
+    }
+    fs::rename(&staging, out).with_context(|| format!("installing {}", out.display()))?;
+    if previous.exists() {
+        fs::remove_dir_all(&previous)?;
+    }
     Ok(summary)
+}
+
+/// Records every fixture from `client` into `out`, replacing what was there only once the new
+/// set is complete, clean and loadable.
+pub async fn record(client: &Client, out: PathBuf) -> Result<Summary> {
+    let recorded_at = clock::unix(SystemTime::now());
+    let mut recording = fetch(client).await?;
+    clean(&mut recording, recorded_at);
+    install(&render(&recording)?, &out)
 }
 
 #[cfg(test)]
@@ -307,7 +374,7 @@ mod tests {
                 "items": [{"metadata": {"name": "s", "namespace": "demo", "uid": uid}, "data": {"k": "dg=="}}]}),
             )]),
         };
-        clean(&mut recording);
+        clean(&mut recording, clock::FIXTURE_NOW_SECONDS);
         let stable = normalize::stable_uid("/secrets/demo/s");
         let secrets = Gvr::core("secrets");
         assert_eq!(
@@ -322,5 +389,47 @@ mod tests {
             recording.objects[&secrets]["items"][0]["data"]["k"],
             normalize::SECRET_MARKER
         );
+    }
+
+    #[test]
+    fn a_failed_install_keeps_the_old_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("fixtures");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("version.json"), "{\"old\": true}\n").unwrap();
+        let leaking = BTreeMap::from([(PathBuf::from("version.json"), "MIIBkTCB".to_owned())]);
+        assert!(
+            install(&leaking, &out)
+                .unwrap_err()
+                .to_string()
+                .contains("MII")
+        );
+        let incomplete = BTreeMap::from([(PathBuf::from("version.json"), "{}\n".to_owned())]);
+        assert!(install(&incomplete, &out).is_err());
+        assert_eq!(
+            fs::read_to_string(out.join("version.json")).unwrap(),
+            "{\"old\": true}\n"
+        );
+        assert!(!dir.path().join(".fixtures.new").exists());
+
+        // A complete set replaces the old one.
+        let complete = Fixtures::load_default().unwrap();
+        let recording = Recording {
+            version: complete.version.clone(),
+            discovery_core: complete.discovery_core.clone(),
+            discovery_groups: complete.discovery_groups.clone(),
+            openapi_index: complete.openapi_index.clone(),
+            openapi: complete.openapi.clone(),
+            tables: complete.tables.clone(),
+            objects: complete.objects.clone(),
+        };
+        let summary = install(&render(&recording).unwrap(), &out).unwrap();
+        assert!(
+            summary
+                .files
+                .contains_key(Path::new("tables/core/v1/pods.json"))
+        );
+        assert!(Fixtures::load(&Layout::new(&out)).is_ok());
+        assert!(!dir.path().join(".fixtures.old").exists());
     }
 }

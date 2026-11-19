@@ -2019,6 +2019,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "k8s-openapi",
  "kube",
  "rcgen",
  "rustls",

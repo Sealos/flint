@@ -1,20 +1,22 @@
-//! Makes recorded responses safe to commit and stable across recordings: Secret values and
-//! anything that looks like a credential are scrubbed, and uids, timestamps, resource versions
-//! and server-rendered ages are replaced with fixed or derived values.
+//! Makes recorded responses safe to commit and stable across recordings: Secret values, Helm
+//! release ConfigMaps and anything that looks like a credential are scrubbed; uids, resource
+//! versions and server-rendered ages are replaced with fixed or derived values; timestamps are
+//! stored relative to [`FIXTURE_NOW`], rounded (see [`clock::round_age`]).
 
 use std::collections::BTreeMap;
 
 use flint_core::redact;
 use serde_json::{Map, Value};
 
+#[cfg(doc)]
+use crate::fake_api::clock::FIXTURE_NOW;
+use crate::fake_api::clock::{self, FIXTURE_NOW_SECONDS};
+
 /// Replaces every Secret `data`/`stringData` value. Base64 of `redacted`, so values still decode.
 pub const SECRET_MARKER: &str = "cmVkYWN0ZWQ=";
 
 /// Replaces strings that hold a certificate, key or token.
 pub const CREDENTIAL_MARKER: &str = "<redacted>";
-
-/// Every timestamp becomes this instant (fractional seconds are kept as zeros).
-pub const FIXED_TIME: &str = "2026-01-01T00:00:00";
 
 /// Every resource version becomes this. The fake server sets its own on lists and events.
 pub const FIXED_RESOURCE_VERSION: &str = "1";
@@ -28,7 +30,7 @@ const AGE_COLUMNS: &[&str] = &[
     "Duration",
 ];
 
-/// What an age cell becomes.
+/// What an age cell becomes. The fake server renders `Age` cells itself from the creation time.
 const FIXED_AGE: &str = "1d";
 
 /// Node fields that identify the machine the cluster ran on.
@@ -42,6 +44,8 @@ const LEAKS: &[&str] = &[
     "PRIVATE KEY",
     "LS0tLS1",    // base64 of "-----", a PEM block
     "eyJhbGciOi", // base64 of {"alg":, a JWT
+    "H4sI",       // base64 of a gzip stream (Helm releases)
+    "MII",        // base64 DER: a certificate or key without PEM armour
     "Bearer ",
 ];
 
@@ -179,12 +183,6 @@ impl UidMap {
         if looks_like_credential(s) {
             return CREDENTIAL_MARKER.to_owned();
         }
-        if let Some(fraction) = timestamp_fraction(s) {
-            return match fraction {
-                0 => format!("{FIXED_TIME}Z"),
-                n => format!("{FIXED_TIME}.{}Z", "0".repeat(n)),
-            };
-        }
         self.replace_in(s)
     }
 }
@@ -196,33 +194,19 @@ fn is_uuid(b: &[u8]) -> bool {
     })
 }
 
-/// For an RFC 3339 UTC timestamp (`2026-11-19T10:00:00Z`, `...00.123456Z`), the number of
-/// fractional digits.
-fn timestamp_fraction(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    let shape = b"dddd-dd-ddTdd:dd:dd";
-    if b.len() < shape.len() + 1 || *b.last()? != b'Z' {
-        return None;
-    }
-    let head_ok = shape.iter().zip(b).all(|(p, c)| match p {
-        b'd' => c.is_ascii_digit(),
-        p => p == c,
+/// Stores every timestamp relative to [`FIXTURE_NOW`]: its age at `recorded_at` (Unix
+/// seconds), rounded so re-recordings stay stable, before the fixture's "now".
+pub fn to_fixture_time(value: &mut Value, recorded_at: i64) {
+    clock::map_timestamps(value, &|s| {
+        FIXTURE_NOW_SECONDS - clock::round_age(recorded_at - s)
     });
-    let rest = &b[shape.len()..b.len() - 1];
-    match rest {
-        [] if head_ok => Some(0),
-        [b'.', digits @ ..]
-            if head_ok && !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) =>
-        {
-            Some(digits.len())
-        }
-        _ => None,
-    }
 }
 
 /// Certificates, keys and tokens, inline or base64-encoded.
 fn looks_like_credential(s: &str) -> bool {
-    s.contains("-----BEGIN ") || s.contains("LS0tLS1") || s.contains("eyJhbGciOi")
+    ["-----BEGIN ", "LS0tLS1", "eyJhbGciOi", "H4sI", "MII"]
+        .iter()
+        .any(|m| s.contains(m))
 }
 
 /// In a Table, replaces server-rendered ages with a fixed one, and "(2m ago)" in restart counts.
@@ -269,6 +253,33 @@ pub fn scrub_secret_list(list: &mut Value) {
         .flatten()
     {
         redact::mask_secret(item, SECRET_MARKER);
+    }
+}
+
+/// Hides the values of ConfigMaps labelled `owner=helm`: Helm's ConfigMap storage driver keeps
+/// whole releases there (gzip, base64), values and rendered Secrets included. Other ConfigMaps
+/// are kept: their content is useful to tests, and credential-shaped strings in them are caught
+/// by the generic scrub.
+pub fn scrub_helm_configmaps(list: &mut Value) {
+    for item in list
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if item
+            .pointer("/metadata/labels/owner")
+            .and_then(Value::as_str)
+            != Some("helm")
+        {
+            continue;
+        }
+        for field in ["data", "binaryData"] {
+            if let Some(map) = item.get_mut(field).and_then(Value::as_object_mut) {
+                map.values_mut()
+                    .for_each(|v| *v = Value::String(SECRET_MARKER.to_owned()));
+            }
+        }
     }
 }
 
@@ -427,30 +438,31 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_versions_and_machine_ids_are_fixed() {
+    fn versions_and_machine_ids_are_fixed_and_timestamps_relative() {
         let map = UidMap::default();
         let mut value = json!({
-            "metadata": {"creationTimestamp": "2026-11-19T10:23:45Z", "resourceVersion": "4711"},
-            "eventTime": "2026-11-19T10:23:45.123456Z",
+            "metadata": {"creationTimestamp": "2026-11-19T07:23:45Z", "resourceVersion": "4711"},
+            "eventTime": "2026-11-19T10:23:40.123456Z",
             "message": "started at 2026-11-19T10:23:45Z",
             "status": {"nodeInfo": {"bootID": "abc", "machineID": "def", "systemUUID": "ghi"},
                        "containerStatuses": [{"containerID": "containerd://f00d"}]},
         });
         map.normalize(&mut value);
+        let recorded_at = clock::parse("2026-11-19T10:23:45Z").unwrap().0;
+        to_fixture_time(&mut value, recorded_at);
+        // Three hours before the recording, and five seconds (rounded to ten).
         assert_eq!(
             value["metadata"]["creationTimestamp"],
-            "2026-01-01T00:00:00Z"
+            "2025-12-31T21:00:00Z"
         );
         assert_eq!(value["metadata"]["resourceVersion"], "1");
-        assert_eq!(value["eventTime"], "2026-01-01T00:00:00.000000Z");
+        assert_eq!(value["eventTime"], "2025-12-31T23:59:50.000000Z");
         assert_eq!(value["message"], "started at 2026-11-19T10:23:45Z");
         assert_eq!(value["status"]["nodeInfo"]["machineID"], "normalized");
         assert_eq!(
             value["status"]["containerStatuses"][0]["containerID"],
             "containerd://normalized"
         );
-        assert_eq!(timestamp_fraction("2026-11-19T10:23:45"), None);
-        assert_eq!(timestamp_fraction("2026-11-19T10:23:45.Z"), None);
     }
 
     #[test]
@@ -475,10 +487,12 @@ mod tests {
             "ca.crt": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
             "kubeconfig": "certificate-authority-data: LS0tLS1CRUdJTg==",
             "token": "eyJhbGciOiJSUzI1NiJ9.e30.sig",
+            "release": "H4sIAAAAAAAC/+x9",
+            "der": "MIIBkTCB+wIJ",
         });
-        assert_eq!(find_leaks(&value.to_string()).len(), 3);
+        assert_eq!(find_leaks(&value.to_string()).len(), 5);
         map.normalize(&mut value);
-        for key in ["ca.crt", "kubeconfig", "token"] {
+        for key in ["ca.crt", "kubeconfig", "token", "release", "der"] {
             assert_eq!(value[key], CREDENTIAL_MARKER);
         }
         assert!(find_leaks(&value.to_string()).is_empty());
@@ -514,6 +528,19 @@ mod tests {
             table["rows"][0]["object"]["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"],
             SECRET_MARKER
         );
+    }
+
+    #[test]
+    fn helm_configmaps_are_masked_and_others_kept() {
+        let mut list = json!({"items": [
+            {"metadata": {"name": "podinfo.v1", "labels": {"owner": "helm"}},
+             "data": {"release": "x"}, "binaryData": {"b": "eA=="}},
+            {"metadata": {"name": "app-config"}, "data": {"port": "8080"}},
+        ]});
+        scrub_helm_configmaps(&mut list);
+        assert_eq!(list["items"][0]["data"]["release"], SECRET_MARKER);
+        assert_eq!(list["items"][0]["binaryData"]["b"], SECRET_MARKER);
+        assert_eq!(list["items"][1]["data"]["port"], "8080");
     }
 
     #[test]

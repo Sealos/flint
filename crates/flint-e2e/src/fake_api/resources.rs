@@ -80,10 +80,44 @@ impl ResourceIndex {
         self.by_gvr.values()
     }
 
+    /// The preferred listable resource with this plural; the core group wins (`pods` is core
+    /// pods, not metrics).
+    pub fn by_plural(&self, plural: &str) -> Option<&ResourceInfo> {
+        self.preferred_listable()
+            .filter(|r| r.gvr.resource == plural)
+            .min_by_key(|r| !r.gvr.group.is_empty())
+    }
+
+    /// The resource a mistyped one most likely meant: same plural in another group or version,
+    /// else the closest plural.
+    pub fn suggest(&self, plural: &str) -> Option<&ResourceInfo> {
+        self.by_plural(plural).or_else(|| {
+            self.preferred_listable()
+                .min_by_key(|r| edit_distance(&r.gvr.resource, plural))
+        })
+    }
+
     /// The listable resources at their group's preferred version: what clients list.
     pub fn preferred_listable(&self) -> impl Iterator<Item = &ResourceInfo> {
         self.iter().filter(|r| r.preferred && r.supports("list"))
     }
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let next = (previous + usize::from(ca != *cb))
+                .min(row[j] + 1)
+                .min(row[j + 1] + 1);
+            previous = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
 }
 
 #[cfg(test)]
@@ -127,6 +161,18 @@ mod tests {
         assert!(!metrics.supports("watch"));
         let hpa_v1 = Gvr::new("autoscaling", "v1", "horizontalpodautoscalers");
         assert!(!index.get(&hpa_v1).unwrap().preferred);
+        assert_eq!(index.by_plural("pods").unwrap().gvr, Gvr::core("pods"));
+        assert_eq!(index.suggest("pod").unwrap().gvr, Gvr::core("pods"));
+        assert_eq!(
+            index
+                .suggest("horizontalpodautoscalers")
+                .unwrap()
+                .gvr
+                .version,
+            "v2"
+        );
+        assert!(index.by_plural("pod").is_none());
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
         let listable: Vec<String> = index
             .preferred_listable()
             .map(|r| r.gvr.to_string())

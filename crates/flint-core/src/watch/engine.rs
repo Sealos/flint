@@ -59,18 +59,31 @@ pub(crate) struct EngineConfig {
     pub watch_stall: Duration,
 }
 
+impl EngineConfig {
+    /// The defaults with the retry timings of `timing`.
+    pub fn with_timing(timing: &crate::handle::WatchTiming) -> Self {
+        EngineConfig {
+            backoff_min: timing.backoff_min,
+            backoff_max: timing.backoff_max,
+            denied_backoff_min: timing.denied_backoff_min,
+            ..EngineConfig::default()
+        }
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
+        let timing = crate::handle::WatchTiming::default();
         EngineConfig {
             page_size: 500,
             watch_timeout_secs: 290,
             publish_interval: Duration::from_millis(100),
             poll_interval: Duration::from_secs(15),
-            backoff_min: Duration::from_secs(1),
-            backoff_max: Duration::from_secs(30),
+            backoff_min: timing.backoff_min,
+            backoff_max: timing.backoff_max,
             denied_retry: Duration::from_secs(300),
             transient_denials: 3,
-            denied_backoff_min: Duration::from_millis(500),
+            denied_backoff_min: timing.denied_backoff_min,
             denied_wait_min: Duration::from_secs(5),
             watch_stall: Duration::from_secs(150),
         }
@@ -1127,6 +1140,21 @@ mod tests {
             .map(|_| Backoff::between(Duration::from_secs(1), Duration::from_secs(4)).next())
             .collect();
         assert!(delays.len() > 1, "{delays:?}");
+    }
+
+    #[test]
+    fn timing_overrides_only_the_retry_waits() {
+        let timing = crate::handle::WatchTiming {
+            backoff_min: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(50),
+            denied_backoff_min: Duration::from_millis(10),
+        };
+        let config = EngineConfig::with_timing(&timing);
+        assert_eq!(config.backoff_min, Duration::from_millis(10));
+        assert_eq!(config.denied_backoff_min, Duration::from_millis(10));
+        assert_eq!(config.page_size, EngineConfig::default().page_size);
+        let default = EngineConfig::with_timing(&crate::handle::WatchTiming::default());
+        assert_eq!(default.backoff_max, EngineConfig::default().backoff_max);
     }
 
     #[test]

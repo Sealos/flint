@@ -40,21 +40,42 @@ pub fn check(env: Option<&OsStr>) -> Result<Target> {
     if current != DEV_CONTEXT {
         bail!("refusing to record: the current context is {current:?}, not {DEV_CONTEXT:?}");
     }
-    let host = loaded
-        .context(DEV_CONTEXT)
-        .and_then(|c| c.server_host())
-        .unwrap_or("")
-        .to_owned();
-    let local = ["127.0.0.1:", "localhost:", "[::1]:"]
+    let context = loaded.context(DEV_CONTEXT);
+    let server = context.and_then(|c| c.server.clone()).unwrap_or_default();
+    if !is_local_server(&server) {
+        bail!("refusing to record: {DEV_CONTEXT} points at {server:?}, not a local kind cluster");
+    }
+    let proxied = loaded
+        .merged
+        .clusters
         .iter()
-        .any(|p| host.starts_with(p));
-    if !local {
-        bail!("refusing to record: {DEV_CONTEXT} points at {host:?}, not a local kind cluster");
+        .filter(|c| Some(&c.name) == context.and_then(|c| c.cluster.as_ref()))
+        .any(|c| c.cluster.as_ref().is_some_and(|c| c.proxy_url.is_some()));
+    if proxied {
+        bail!("refusing to record: {DEV_CONTEXT} goes through a proxy-url");
     }
     Ok(Target {
         path: path.clone(),
         loaded,
     })
+}
+
+/// Whether `server` is an `https://` URL on this machine (127.0.0.1, localhost or ::1), with no
+/// user info.
+fn is_local_server(server: &str) -> bool {
+    let Ok(uri) = server.parse::<http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    uri.scheme_str() == Some("https")
+        && !authority.as_str().contains('@')
+        && ["127.0.0.1", "localhost", "::1"].contains(&host)
 }
 
 #[cfg(test)]
@@ -85,6 +106,25 @@ mod tests {
         assert!(err.to_string().contains("current context"));
         let err = check_file(&kubeconfig(DEV_CONTEXT, "https://k8s.example.com")).unwrap_err();
         assert!(err.to_string().contains("not a local kind cluster"));
+    }
+
+    #[test]
+    fn only_local_https_servers_without_user_info_pass() {
+        assert!(is_local_server("https://127.0.0.1:6443"));
+        assert!(is_local_server("https://localhost:6443"));
+        assert!(is_local_server("https://[::1]:6443"));
+        assert!(!is_local_server("https://127.0.0.1.example.com:6443"));
+        assert!(!is_local_server("https://localhost.evil:6443"));
+        assert!(!is_local_server("https://user@127.0.0.1:6443"));
+        assert!(!is_local_server("https://127.0.0.1:6443@k8s.example.com"));
+        assert!(!is_local_server("http://127.0.0.1:6443"));
+        assert!(!is_local_server("not a url"));
+        let proxied = kubeconfig(DEV_CONTEXT, "https://127.0.0.1:6443").replace(
+            "    server:",
+            "    proxy-url: http://proxy.example.com:3128\n    server:",
+        );
+        let err = check_file(&proxied).unwrap_err();
+        assert!(err.to_string().contains("proxy-url"), "{err}");
     }
 
     #[test]

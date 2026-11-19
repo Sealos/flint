@@ -11,10 +11,12 @@ publish = false
 [[bin]]
 name = "record-fixtures"
 path = "src/bin/record-fixtures/main.rs"
+test = false
 
 [dependencies]
 flint-core.workspace = true
 kube.workspace = true
+k8s-openapi.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
 futures.workspace = true
 serde_json.workspace = true

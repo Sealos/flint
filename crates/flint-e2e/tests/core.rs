@@ -8,9 +8,9 @@ use std::time::Duration;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::read::{self, ListQuery};
 use flint_core::{
-    KindId, KindSnapshot, Settings, Subscription, SyncState, WatchMode, cluster, table,
+    KindId, KindSnapshot, Settings, Subscription, SyncState, WatchMode, WatchTiming, cluster, table,
 };
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, FakeRow, Fault, Gvr, Options, Verb, WatchStep};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, Gvr, Options, Verb, WatchStep};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -36,6 +36,12 @@ impl Core {
             kubeconfig_base: vec![kubeconfig],
             home: None,
             watch_files: false,
+            // The fake server answers at once; real waits would only slow the tests down.
+            watch_timing: WatchTiming {
+                backoff_min: Duration::from_millis(10),
+                backoff_max: Duration::from_millis(50),
+                denied_backoff_min: Duration::from_millis(10),
+            },
         })
         .unwrap();
         let core = Core { handle, _dir: dir };
@@ -234,11 +240,7 @@ async fn live_lists_follow_watch_events() {
     server.wait_for_watches(&gvr, 1, WAIT).await.unwrap();
 
     let data = server.column(&gvr, "Data").unwrap();
-    let fresh = FakeRow::build(
-        Some("demo"),
-        "fresh",
-        vec!["fresh".into(), 1.into(), "1d".into()],
-    );
+    let fresh = server.new_row(&gvr, Some("demo"), "fresh", &[("Data", "1")]);
     assert_eq!(server.send_watch(&gvr, WatchStep::Added(fresh.clone())), 1);
     until(&mut sub, "added", |s| {
         names(s, "demo").contains(&"fresh".to_owned())
@@ -347,7 +349,8 @@ async fn a_dropped_watch_reconnects() {
     let mut sub = core.subscribe(&kind);
     until(&mut sub, "synced", |s| s.state == SyncState::Synced).await;
     server.wait_for_watches(&gvr, 1, WAIT).await.unwrap();
-    server.inject(Fault::slow(Duration::from_millis(300)).on(&gvr).times(1));
+    // Holds the reconnect long enough for a snapshot to show it (they come every 100 ms).
+    server.inject(Fault::delay(Duration::from_millis(300)).on(&gvr).times(1));
     server.send_watch(&gvr, WatchStep::Drop);
     let stale = until(&mut sub, "reconnecting", |s| {
         matches!(s.state, SyncState::Reconnecting { .. })
@@ -383,8 +386,10 @@ async fn forbidden_lists_fail_or_fall_back_to_the_default_namespace() {
     assert!(err.to_string().contains("forbidden"), "{err}");
 
     let core = Core::start(&server, Some("demo")).await;
-    // A cluster-scoped kind cannot fall back: the list fails and says why.
+    // Both at once, so their retries overlap.
     let mut node_sub = core.subscribe(&KindId::new("", "nodes"));
+    let mut secret_sub = core.subscribe(&KindId::new("", "secrets"));
+    // A cluster-scoped kind cannot fall back: the list fails and says why.
     let failed = until(&mut node_sub, "nodes failed", |s| {
         matches!(s.state, SyncState::Failed { .. })
     })
@@ -395,7 +400,6 @@ async fn forbidden_lists_fail_or_fall_back_to_the_default_namespace() {
     assert!(error.contains("forbidden"), "{error}");
 
     // A namespaced kind is listed in the context's namespace instead.
-    let mut secret_sub = core.subscribe(&KindId::new("", "secrets"));
     let limited = until(&mut secret_sub, "secrets in demo", |s| {
         s.state == SyncState::Synced && s.limited_to.is_some()
     })

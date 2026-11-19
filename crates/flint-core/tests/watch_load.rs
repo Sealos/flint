@@ -80,6 +80,7 @@ async fn measure_all_mode_during_scale_down() {
         kubeconfig_base: vec![path.clone()],
         home: None,
         watch_files: false,
+        watch_timing: Default::default(),
     })
     .unwrap();
     let events = core.events();

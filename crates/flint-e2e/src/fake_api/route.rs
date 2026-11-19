@@ -149,6 +149,9 @@ pub struct Query {
     pub continue_token: Option<String>,
     pub field_selector: Option<String>,
     pub label_selector: Option<String>,
+    pub resource_version_match: Option<String>,
+    /// `tailLines` of a log request.
+    pub tail_lines: Option<usize>,
 }
 
 impl Query {
@@ -168,6 +171,8 @@ impl Query {
                 "continue" => q.continue_token = Some(value).filter(|v| !v.is_empty()),
                 "fieldSelector" => q.field_selector = Some(value).filter(|v| !v.is_empty()),
                 "labelSelector" => q.label_selector = Some(value).filter(|v| !v.is_empty()),
+                "resourceVersionMatch" => q.resource_version_match = Some(value),
+                "tailLines" => q.tail_lines = value.parse().ok(),
                 _ => {}
             }
         }
@@ -293,6 +298,8 @@ mod tests {
             Some("involvedObject.uid=abc,foo!=bar")
         );
         assert_eq!(q.label_selector.as_deref(), Some("app in"));
+        assert_eq!(q.resource_version_match.as_deref(), Some("NotOlderThan"));
+        assert_eq!(Query::parse(Some("tailLines=5")).tail_lines, Some(5));
         assert_eq!(Query::parse(None), Query::default());
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");

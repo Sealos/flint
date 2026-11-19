@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
 use kube::core::discovery::v2::APIGroupDiscoveryList;
@@ -175,6 +176,19 @@ impl Fixtures {
         Fixtures::load(&Layout::new(FIXTURES_DIR))
     }
 
+    /// The committed fixtures, parsed once per test binary and shared.
+    pub fn shared_default() -> Result<Arc<Self>> {
+        static SHARED: OnceLock<Result<Arc<Fixtures>, String>> = OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                Fixtures::load_default()
+                    .map(Arc::new)
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+
     pub fn load(layout: &Layout) -> Result<Self> {
         let discovery_core = read_json(&layout.discovery_core())?;
         let discovery_groups = read_json(&layout.discovery_groups())?;
@@ -220,19 +234,30 @@ pub fn read_json(path: &Path) -> Result<Value> {
 
 /// Writes `value` as pretty JSON with a trailing newline, creating parent directories.
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {
-    write_text(path, serde_json::to_string_pretty(value)?)
+    write_text(path, &json_text(value, false)?)
 }
 
 /// Writes `value` as JSON on one line: for large documents nobody reviews line by line.
 pub fn write_compact_json(path: &Path, value: &Value) -> Result<()> {
-    write_text(path, serde_json::to_string(value)?)
+    write_text(path, &json_text(value, true)?)
 }
 
-fn write_text(path: &Path, mut text: String) -> Result<()> {
+/// A fixture file's text: pretty (or compact) JSON and a trailing newline.
+pub fn json_text(value: &Value, compact: bool) -> Result<String> {
+    let mut text = if compact {
+        serde_json::to_string(value)?
+    } else {
+        serde_json::to_string_pretty(value)?
+    };
+    text.push('\n');
+    Ok(text)
+}
+
+/// Writes `text` to `path`, creating parent directories.
+pub fn write_text(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    text.push('\n');
     fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -327,7 +352,8 @@ mod tests {
 
     #[test]
     fn the_committed_fixtures_load() {
-        let fixtures = Fixtures::load_default().unwrap();
+        let fixtures = Fixtures::shared_default().unwrap();
+        assert!(Arc::ptr_eq(&fixtures, &Fixtures::shared_default().unwrap()));
         assert_eq!(fixtures.version["major"], "1");
         assert!(fixtures.tables.contains_key(&Gvr::core("pods")));
         assert!(fixtures.resources.get(&Gvr::core("pods")).is_some());

@@ -2,7 +2,7 @@
 
 use flint_core::redact;
 use flint_e2e::fake_api::fixtures::{FIXTURES_DIR, json_files};
-use flint_e2e::fake_api::{Fixtures, Gvr};
+use flint_e2e::fake_api::{Fixtures, Gvr, clock};
 use flint_e2e::record::normalize::{SECRET_MARKER, find_leaks};
 use serde_json::Value;
 
@@ -62,7 +62,10 @@ fn uids_and_timestamps_are_normalized() {
         for row in table["rows"].as_array().into_iter().flatten() {
             let meta = &row["object"]["metadata"];
             if let Some(created) = meta["creationTimestamp"].as_str() {
-                assert_eq!(created, "2026-01-01T00:00:00Z", "{gvr}");
+                // Stored as an age before the recording instant, rounded to at least 10 s.
+                let (seconds, _) = clock::parse(created).expect("an RFC 3339 timestamp");
+                assert!(seconds <= clock::FIXTURE_NOW_SECONDS, "{gvr}: {created}");
+                assert_eq!(seconds % 10, 0, "{gvr}: {created}");
             }
             if let Some(rv) = meta["resourceVersion"].as_str() {
                 assert_eq!(rv, "1", "{gvr}");

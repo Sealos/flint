@@ -31,6 +31,7 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ClustersModel>, tem
         kubeconfig_base: Vec::new(),
         home: None,
         watch_files: false,
+        watch_timing: Default::default(),
     })
     .unwrap();
     let config_dir = dir.path().to_owned();

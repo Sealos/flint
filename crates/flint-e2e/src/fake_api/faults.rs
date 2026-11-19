@@ -49,7 +49,8 @@ impl Fault {
         Fault::new(Effect::Status(code))
     }
 
-    pub fn slow(delay: Duration) -> Self {
+    /// Answers normally after `delay` ([`Effect::Delay`]).
+    pub fn delay(delay: Duration) -> Self {
         Fault::new(Effect::Delay(delay))
     }
 
@@ -89,6 +90,11 @@ impl Fault {
 
     pub fn effect(&self) -> &Effect {
         &self.effect
+    }
+
+    /// The resource the fault is limited to, if any.
+    pub fn resource(&self) -> Option<&Gvr> {
+        self.resource.as_ref()
     }
 
     fn matches(&self, verb: Verb, route: &Route) -> bool {
@@ -166,7 +172,7 @@ mod tests {
         let in_demo = Fault::status(500).in_namespace("demo");
         assert!(in_demo.matches(Verb::Get, &demo) && !in_demo.matches(Verb::Get, &all));
         assert_eq!(
-            Fault::slow(Duration::from_secs(1)).effect(),
+            Fault::delay(Duration::from_secs(1)).effect(),
             &Effect::Delay(Duration::from_secs(1))
         );
     }

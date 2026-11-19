@@ -224,6 +224,7 @@ impl ClusterManager {
             &config.settings,
             config.home.as_deref(),
         );
+        let engine_config = Arc::new(EngineConfig::with_timing(&config.watch_timing));
         Self {
             settings: Arc::new(config.settings.clone()),
             settings_error: config.settings_error.clone(),
@@ -238,7 +239,7 @@ impl ClusterManager {
             next_attempt: 1,
             watcher: None,
             hubs,
-            engine_config: Arc::new(EngineConfig::default()),
+            engine_config,
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
         }
@@ -1391,6 +1392,7 @@ mod tests {
             kubeconfig_base: Vec::new(),
             home: None,
             watch_files: false,
+            watch_timing: Default::default(),
         };
         let hubs = HubRegistry::default();
         let mut manager = ClusterManager::new(config, events, hubs.clone());

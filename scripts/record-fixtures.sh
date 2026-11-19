@@ -13,6 +13,10 @@ set -euo pipefail
 CONTEXT=kind-flint-dev
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+if ! command -v kubectl >/dev/null; then
+  echo "error: kubectl is not on PATH" >&2
+  exit 2
+fi
 if [ -z "${KUBECONFIG:-}" ]; then
   echo "error: set KUBECONFIG to the dev cluster's kubeconfig (KUBECONFIG=.dev/kubeconfig $0)" >&2
   exit 2
@@ -24,6 +28,9 @@ if [ ! -f "$KUBECONFIG" ]; then
   echo "error: KUBECONFIG $KUBECONFIG does not exist" >&2
   exit 2
 fi
+# Absolute, so it still names the same file after the cd below.
+KUBECONFIG="$(cd "$(dirname "$KUBECONFIG")" && pwd)/$(basename "$KUBECONFIG")"
+export KUBECONFIG
 current="$(kubectl --kubeconfig "$KUBECONFIG" config current-context 2>/dev/null || true)"
 if [ "$current" != "$CONTEXT" ]; then
   echo "error: refusing to record: current context is '$current', not '$CONTEXT'" >&2
@@ -34,4 +41,4 @@ export FLINT_CONFIG_DIR="${FLINT_CONFIG_DIR:-$(mktemp -d)}"
 
 cd "$ROOT"
 # The recorder checks the same things again before it connects.
-cargo run --quiet --locked -p flint-e2e --bin record-fixtures -- "$ROOT/crates/flint-e2e/fixtures"
+cargo run --locked -p flint-e2e --bin record-fixtures -- "$ROOT/crates/flint-e2e/fixtures"

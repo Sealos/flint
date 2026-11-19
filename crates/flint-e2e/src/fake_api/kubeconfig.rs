@@ -8,18 +8,23 @@ use kube::config::{
     AuthInfo, Cluster, Context, Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext,
 };
 
-/// The context (and cluster and user) name in the kubeconfig.
+/// The default context (and cluster and user) name in the kubeconfig.
 pub const CONTEXT: &str = "flint-e2e-fake";
 
-/// A kubeconfig with one context for `server`, trusting `ca_pem`, without credentials (the
-/// fake server does not authenticate).
-pub fn kubeconfig(server: &str, ca_pem: &str, namespace: Option<&str>) -> Kubeconfig {
+/// A kubeconfig with one context named `context` (cluster and user share the name) for
+/// `server`, trusting `ca_pem`, without credentials (the fake server does not authenticate).
+pub fn kubeconfig(
+    server: &str,
+    ca_pem: &str,
+    context: &str,
+    namespace: Option<&str>,
+) -> Kubeconfig {
     Kubeconfig {
         api_version: Some("v1".into()),
         kind: Some("Config".into()),
-        current_context: Some(CONTEXT.into()),
+        current_context: Some(context.into()),
         clusters: vec![NamedCluster {
-            name: CONTEXT.into(),
+            name: context.into(),
             cluster: Some(Cluster {
                 server: Some(server.into()),
                 certificate_authority_data: Some(
@@ -30,22 +35,46 @@ pub fn kubeconfig(server: &str, ca_pem: &str, namespace: Option<&str>) -> Kubeco
             ..NamedCluster::default()
         }],
         contexts: vec![NamedContext {
-            name: CONTEXT.into(),
+            name: context.into(),
             context: Some(Context {
-                cluster: CONTEXT.into(),
-                user: Some(CONTEXT.into()),
+                cluster: context.into(),
+                user: Some(context.into()),
                 namespace: namespace.map(str::to_owned),
                 ..Context::default()
             }),
             ..NamedContext::default()
         }],
         auth_infos: vec![NamedAuthInfo {
-            name: CONTEXT.into(),
+            name: context.into(),
             auth_info: Some(AuthInfo::default()),
             ..NamedAuthInfo::default()
         }],
         ..Kubeconfig::default()
     }
+}
+
+/// One kubeconfig with the clusters, contexts and users of all of `configs`; the current
+/// context is the first one's. Panics if two use the same name.
+pub fn merge(configs: Vec<Kubeconfig>) -> Kubeconfig {
+    let mut merged = Kubeconfig {
+        api_version: Some("v1".into()),
+        kind: Some("Config".into()),
+        current_context: configs.first().and_then(|c| c.current_context.clone()),
+        ..Kubeconfig::default()
+    };
+    for config in configs {
+        for context in &config.contexts {
+            assert!(
+                !merged.contexts.iter().any(|c| c.name == context.name),
+                "two fake servers use the context name {:?}; give each its own",
+                context.name
+            );
+        }
+        merged.clusters.extend(config.clusters);
+        merged.contexts.extend(config.contexts);
+        merged.auth_infos.extend(config.auth_infos);
+    }
+    merged
 }
 
 /// Writes `config` as YAML to `path`, readable only by its owner.
@@ -65,12 +94,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merged_kubeconfigs_keep_every_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        let a = kubeconfig("https://127.0.0.1:1", "ca-a", "kind-a", None);
+        let b = kubeconfig("https://127.0.0.1:2", "ca-b", "kind-b", Some("demo"));
+        write(&path, &merge(vec![a.clone(), b])).unwrap();
+        let loaded = flint_core::kubeconfig::load(std::slice::from_ref(&path));
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let names: Vec<&str> = loaded.contexts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["kind-a", "kind-b"]);
+        assert_eq!(
+            loaded.context("kind-b").unwrap().server.as_deref(),
+            Some("https://127.0.0.1:2")
+        );
+        assert_eq!(loaded.merged.current_context.as_deref(), Some("kind-a"));
+        let twice = std::panic::catch_unwind(|| merge(vec![a.clone(), a]));
+        assert!(twice.is_err());
+    }
+
+    #[test]
     fn written_kubeconfigs_load_with_flint_core() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config");
         let config = kubeconfig(
             "https://127.0.0.1:4443",
             "-----BEGIN CERTIFICATE-----\n",
+            CONTEXT,
             Some("demo"),
         );
         write(&path, &config).unwrap();

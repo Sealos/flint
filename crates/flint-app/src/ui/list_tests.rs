@@ -27,6 +27,7 @@ fn core() -> (CoreHandle, tempfile::TempDir) {
         kubeconfig_base: Vec::new(),
         home: None,
         watch_files: false,
+        watch_timing: Default::default(),
     })
     .unwrap();
     (core, dir)

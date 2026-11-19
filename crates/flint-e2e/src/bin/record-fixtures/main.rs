@@ -24,11 +24,10 @@ async fn main() -> anyhow::Result<()> {
         target.path.display(),
         out.display()
     );
-    let summary = record::record(&client, out.clone()).await?;
+    let summary = record::record(&client, out).await?;
     let total: usize = summary.files.values().sum();
     for (path, size) in &summary.files {
-        let shown = path.strip_prefix(&out).unwrap_or(path);
-        println!("{size:>9}  {}", shown.display());
+        println!("{size:>9}  {}", path.display());
     }
     println!("{total:>9}  total in {} files", summary.files.len());
     Ok(())
