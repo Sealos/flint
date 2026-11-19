@@ -5,7 +5,8 @@ Electron-based tools are slow to start, heavy on memory, and sluggish on large c
 and low memory**. Native look and feel comes second.
 
 This document describes the shape of the system. The reasons behind the hard-to-reverse choices are recorded as ADRs
-in [`docs/adr/`](./adr/).
+in [`docs/adr/`](./adr/). The journeys every release must keep working, with stable IDs for tests, are in
+[`docs/USER-PATHS.md`](./USER-PATHS.md).
 
 ## Scope
 
@@ -16,11 +17,16 @@ in [`docs/adr/`](./adr/).
 - Browse every resource kind, including CRDs, with live updates ([ADR-0003](./adr/0003-generic-resource-views.md)).
 - Pod logs: follow, search, pick a container, show previous logs.
 - Pod exec terminal.
-- Edit YAML in the app, with a server-side dry-run and a diff before apply ([ADR-0006](./adr/0006-yaml-validation-by-dry-run.md)).
+- Edit YAML in the app. Syntax and schema errors show inline as you type, and a server-side dry-run with a diff runs
+  before apply ([ADR-0006](./adr/0006-yaml-validation-by-dry-run.md)).
 - Common actions: delete, scale, rollout restart, cordon and drain.
 - Current CPU and memory from metrics-server ([ADR-0005](./adr/0005-metrics-server-only.md)).
 - Port-forwarding, for the current session only.
 - Helm releases: list, history, values, upgrade, rollback, uninstall ([ADR-0004](./adr/0004-helm-via-cli.md)).
+- A read-only MCP server (`flint mcp`) so AI agents can inspect clusters the user has opted in
+  ([ADR-0009](./adr/0009-read-only-mcp-server.md)).
+- A dense, keyboard-first look in the style of Zed, with orange accents, light and dark themes, a command palette and
+  a resource switcher.
 - Open source under Apache-2.0.
 
 ### v1 non-goals
@@ -32,6 +38,7 @@ in [`docs/adr/`](./adr/).
 - YAML schema autocomplete.
 - Saved port-forwards that come back after a restart.
 - An in-app auto-updater.
+- MCP write tools, an MCP server over HTTP, and a built-in AI chat panel.
 
 ## Stack
 
@@ -42,7 +49,8 @@ in [`docs/adr/`](./adr/).
 | Kubernetes client | `kube` (`client`, `runtime`, `ws` features) and `k8s-openapi` |
 | Async runtime (core) | `tokio`, on its own threads ([ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md)) |
 | Terminal emulation | `alacritty_terminal` |
-| YAML and diff | A maintained `serde_yaml` fork, `similar` |
+| YAML and diff | `serde-saphyr`, `tree-sitter-yaml` (syntax errors, path-to-position mapping), `similar` |
+| Schema validation | The cluster's OpenAPI v3 schema, cached per cluster, checked by a JSON Schema validator in Rust |
 | Settings | TOML in `~/Library/Application Support/Flint/` |
 | Helm | The user's `helm` CLI, called as a subprocess |
 | Packaging | `cargo-packager` (or `cargo-bundle`), universal binary via `lipo`, `codesign` with hardened runtime for both app and DMG, `notarytool` and `stapler`, GitHub Actions on macOS |
@@ -54,7 +62,9 @@ in [`docs/adr/`](./adr/).
 crates/
   flint-core/   Kubernetes logic: kubeconfig, connections, discovery, watches, stores, actions,
                 logs, exec, port-forward, metrics, Helm. Depends on tokio and kube. Never on GPUI.
-  flint-app/    The GPUI binary: windows, views, the terminal widget, settings UI, the bridge to core.
+  flint-mcp/    The MCP server (stdio): tool definitions, cluster opt-in checks, redaction. Depends on flint-core.
+  flint-app/    The `flint` binary: windows, views, the terminal widget, settings UI, the bridge to core.
+                `flint mcp` runs flint-mcp instead of starting the UI.
 ```
 
 Keeping `flint-core` free of GPUI has three benefits. The core can be tested without a window. It can be reused by a
@@ -157,6 +167,9 @@ opens in a tab in the bottom dock.
 ### Editing and actions
 
 1. The editor opens the live object without `metadata.managedFields` and `status`. It keeps `resourceVersion`.
+   While the user types, tree-sitter marks syntax errors and the object is checked against the cluster's OpenAPI v3
+   schema (fetched from `/openapi/v3` and cached per cluster), so unknown fields, wrong types and missing required
+   fields are underlined inline ([ADR-0006](./adr/0006-yaml-validation-by-dry-run.md)).
 2. **Review** sends a replace (`PUT`) with `dryRun=All` and shows a diff between the live object and the result.
 3. **Apply** sends the same `PUT` for real, with `fieldManager=flint`. If the object changed since it was opened, the
    `resourceVersion` makes the request fail with a conflict. The user is then offered a reload and a re-diff, so
@@ -194,9 +207,60 @@ files Flint loaded, because `--kubeconfig` takes only one file.
 
 If `helm` is not on the resolved `PATH`, the Helm section shows an install hint ([ADR-0004](./adr/0004-helm-via-cli.md)).
 
+## MCP server
+
+`flint mcp` runs a Model Context Protocol server over stdio for AI agents such as Claude Code and Claude Desktop
+([ADR-0009](./adr/0009-read-only-mcp-server.md)). It does not start GPUI. It resolves `PATH`, loads kubeconfig and
+settings the same way the app does, and serves these read-only tools:
+
+| Tool | Returns |
+|---|---|
+| `list_clusters` | Clusters marked Expose to AI: name, server, and whether a connection works |
+| `list_resource_kinds` | Kinds found by discovery for a cluster, CRDs included |
+| `list_resources` | Objects of a kind, with namespace and label selector filters |
+| `get_resource` | One object as YAML |
+| `get_events` | Events for a namespace or one object |
+| `get_pod_logs` | The last lines of a container's logs |
+
+Rules:
+
+- **Opt-in:** a cluster is visible only if `ai_exposed_clusters` in `settings.toml` has an entry with its context
+  name **and** the API server URL that context pointed to when the user exposed it. If the context now points to a
+  different server, for example because `flint mcp` was started with a different `KUBECONFIG` or the context was
+  re-pointed, it is treated as not exposed, and the app shows the toggle as off with a "cluster changed" note. The
+  user toggles exposure from the cluster sidebar. The list is read again on every call, and calls naming any other
+  cluster fail as if it did not exist.
+- **Read-only:** there are no tools that create, change, or delete anything, and no exec or port-forward.
+- **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept.
+  `metadata.managedFields` is removed from all output.
+- **Bounded output:** lists and logs have default and maximum sizes (for example 200 objects and 500 log lines). When
+  output is cut short, the result says so, so a large cluster cannot flood an agent's context.
+- **stdout is the protocol channel:** all logging goes to stderr.
+
+The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
+tool layer and the policy (opt-in, redaction, limits) live in `flint-mcp`.
+
+## Look and keyboard
+
+Flint looks and behaves like Zed: dense and minimal, with thin borders, tight spacing, and monospace text where it
+helps (names, YAML, logs). The keyboard is a primary way to use the app.
+
+- **Color:** neutral gray surfaces, in the style of Zed. Orange is only an accent: selection, focus rings, primary
+  buttons, the active cluster, and links. Status colors (red, yellow, green) keep their usual meaning and must stay
+  readable against both themes.
+- **Themes:** two built-in themes, Flint Light and Flint Dark, defined as gpui-component theme data. They follow the
+  macOS appearance and change with it live. An `appearance` setting (`system` | `light` | `dark`) overrides this.
+  User theme files are not supported in v1, but because themes are data, they could be added later.
+- **Theme tokens only:** views take every color from theme tokens and never hard-code one. This applies from M0
+  onward, so the M1.5 theme work does not mean restyling every view.
+- **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
+  switch cluster, change namespace, toggle watch mode, or toggle Expose to AI.
+- **Resource switcher (Cmd-P):** fuzzy search over the kinds and objects of the active cluster, jumping straight to
+  a list or a detail view. It searches the in-memory stores, so it never makes network calls.
+
 ## Settings and state
 
-- `settings.toml`: extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size, theme, a `path`
+- `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size, a `path`
   override, and a `helm` binary override.
 - `state.toml`: window layout, cluster order and pins in the sidebar, the last view open in each cluster.
 - Flint never writes to kubeconfig files.
@@ -205,10 +269,11 @@ If `helm` is not on the resolved `PATH`, the Helm section shows an install hint 
 
 | Milestone | Delivers |
 |---|---|
-| M0 | Cargo workspace, GPUI window, kubeconfig loading, cluster sidebar, connect and health check, PATH resolution |
+| M0 | Cargo workspace, GPUI window, kubeconfig loading, cluster sidebar, connect and health check, PATH resolution, read-only `flint mcp` server with Expose to AI toggle |
 | M1 | Discovery-driven navigation, Table lists (spike first), watch manager with both modes, generic detail and YAML view, namespace filter |
+| M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
 | M2 | Log viewer, exec terminal |
-| M3 | YAML editing with dry-run and diff, delete/scale/restart/cordon/drain |
+| M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain |
 | M4 | Curated views for core kinds, metrics-server columns and node/pod usage |
 | M5 | Port-forward panel, Helm releases |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
