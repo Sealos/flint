@@ -587,7 +587,7 @@ impl ResourceList {
                                 IconName::SortAscending
                             })
                             .xsmall()
-                            .text_color(theme.primary),
+                            .text_color(theme.foreground),
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -612,18 +612,22 @@ impl ResourceList {
         let wide = list_model::has_wide_columns(&snapshot.columns);
         let dropped = self.dropped_wide;
         h_flex()
+            .h(px(super::workspace::HEADER_HEIGHT))
             .px_3()
-            .py_1p5()
             .gap_2()
             .flex_none()
             .min_w_0()
+            .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
+            // The kind keeps its name (only an unusually long one truncates); the filter gives
+            // way first when the pane is narrow.
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .min_w_0()
+                    .flex_none()
+                    .max_w(px(200.))
                     .truncate()
                     .child(self.label.clone()),
             )
@@ -662,13 +666,18 @@ impl ResourceList {
             })
             .child(
                 // Shrinks with the pane, down to a usable minimum.
-                div().w(px(240.)).min_w(px(120.)).flex_shrink(1.).child(
-                    Input::new(&self.filter)
-                        .id("list-filter")
-                        .small()
-                        .cleanable(true)
-                        .prefix(Icon::new(IconName::Search).small()),
-                ),
+                div()
+                    .w(px(240.))
+                    .min_w(px(72.))
+                    .flex_shrink(1.)
+                    .overflow_hidden()
+                    .child(
+                        Input::new(&self.filter)
+                            .id("list-filter")
+                            .small()
+                            .cleanable(true)
+                            .prefix(Icon::new(IconName::Search).small()),
+                    ),
             )
     }
 

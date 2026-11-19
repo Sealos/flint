@@ -29,7 +29,7 @@ pub use handle::{
     Subscription,
 };
 pub use read::{KindId, KindInfo, ObjectDetail};
-pub use settings::{Settings, WatchMode};
+pub use settings::{Appearance, Settings, WatchMode};
 pub use store::{Feed, KindSnapshot, NamespaceLimit, SyncState};
 pub use table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
 pub use view::{SortBy, ViewQuery};

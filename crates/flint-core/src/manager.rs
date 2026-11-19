@@ -271,7 +271,18 @@ impl ClusterManager {
             Command::Activate(id) => self.activate(id),
             Command::SetAiExposed { cluster, server } => self.set_ai_exposed(cluster, server).await,
             Command::ReloadKubeconfig => self.reload_kubeconfig().await,
-            Command::SetWatchMode { cluster, mode } => self.set_watch_mode(cluster, mode).await,
+            Command::SetWatchMode { cluster, mode } => {
+                self.write_settings("the watch mode", move |dir| {
+                    settings::set_watch_mode(dir, cluster.as_deref(), mode)
+                })
+                .await
+            }
+            Command::SetAppearance(appearance) => {
+                self.write_settings("the appearance", move |dir| {
+                    settings::set_appearance(dir, appearance)
+                })
+                .await
+            }
             Command::SetNamespaceFilter {
                 cluster,
                 namespaces,
@@ -434,19 +445,21 @@ impl ClusterManager {
         });
     }
 
-    async fn set_watch_mode(&mut self, cluster: Option<ClusterId>, mode: Option<crate::WatchMode>) {
+    /// Writes one change to `settings.toml` (`what` names it in errors) and applies the result.
+    async fn write_settings(
+        &mut self,
+        what: &str,
+        write: impl FnOnce(&Path) -> Result<Settings, settings::SettingsError> + Send + 'static,
+    ) {
         if let Some(error) = &self.settings_error {
             self.emit(Event::Error(format!(
-                "settings.toml must be fixed before the watch mode can change: {}",
+                "settings.toml must be fixed before {what} can change: {}",
                 crate::redact::safe_error_summary(error)
             )));
             return;
         }
         let dir = self.config.config_dir.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            settings::set_watch_mode(&dir, cluster.as_deref(), mode)
-        })
-        .await;
+        let result = tokio::task::spawn_blocking(move || write(&dir)).await;
         match result {
             Ok(Ok(settings)) => self.apply_settings(Ok(settings)).await,
             // A settings write error can quote the file: one sanitized line.

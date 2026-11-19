@@ -40,6 +40,17 @@ pub enum WatchMode {
     OnView,
 }
 
+/// Light or dark, or following macOS (`system`, the default). The app applies a change at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    /// Follow the macOS appearance, live.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// One cluster the user exposed to AI agents (ADR-0009): the context name and the API server URL
 /// it pointed to when the user exposed it. Both must match for the cluster to count as exposed,
 /// so a context that is re-pointed, or has the same name in another `KUBECONFIG`, is not exposed.
@@ -71,6 +82,8 @@ impl AiExposureState {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Flint Light, Flint Dark, or whichever macOS uses.
+    pub appearance: Appearance,
     /// Clusters the MCP server may see (ADR-0009), as context name plus API server URL. Empty by
     /// default: nothing is exposed.
     pub ai_exposed_clusters: Vec<AiExposure>,
@@ -262,6 +275,14 @@ pub fn set_watch_mode(
     })
 }
 
+/// Sets the appearance and writes `settings.toml`. Returns the settings as written.
+pub fn set_appearance(dir: &Path, appearance: Appearance) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, _| {
+        table.insert("appearance".into(), toml::Value::try_from(appearance)?);
+        Ok(())
+    })
+}
+
 /// Reads `settings.toml` as a TOML table, lets `edit` change it, checks the result still parses
 /// as [`Settings`], and writes it. Keys this version does not know survive; comments and
 /// formatting are not preserved.
@@ -341,6 +362,7 @@ mod tests {
         assert_eq!(settings.path, None);
         assert_eq!(settings.helm, None);
         assert_eq!(settings.watch_mode, WatchMode::All);
+        assert_eq!(settings.appearance, Appearance::System);
         assert_eq!(load_state(dir.path()).unwrap(), State::default());
     }
 
@@ -360,6 +382,7 @@ mod tests {
             path = "/custom/bin:/usr/bin"
             helm = "/opt/helm"
             watch_mode = "on_view"
+            appearance = "dark"
             some_future_key = 3
 
             [cluster_watch_mode]
@@ -381,6 +404,7 @@ mod tests {
         assert_eq!(settings.path.as_deref(), Some("/custom/bin:/usr/bin"));
         assert_eq!(settings.helm.as_deref(), Some(Path::new("/opt/helm")));
         assert_eq!(settings.watch_mode, WatchMode::OnView);
+        assert_eq!(settings.appearance, Appearance::Dark);
         assert_eq!(settings.watch_mode_for("small"), WatchMode::All);
         assert_eq!(settings.watch_mode_for("other"), WatchMode::OnView);
         assert_eq!(
@@ -441,6 +465,33 @@ mod tests {
     #[test]
     fn rejects_unknown_watch_mode() {
         assert!(toml::from_str::<Settings>("watch_mode = \"sometimes\"").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_appearance() {
+        assert!(toml::from_str::<Settings>("appearance = \"sepia\"").is_err());
+        assert!(toml::from_str::<Settings>("appearance = \"Dark\"").is_err());
+    }
+
+    // covers UP-32
+    #[test]
+    fn appearance_is_written_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "watch_mode = \"on_view\"\nfuture_key = 1\n",
+        )
+        .unwrap();
+        let s = set_appearance(dir.path(), Appearance::Light).unwrap();
+        assert_eq!(s.appearance, Appearance::Light);
+        let s = set_appearance(dir.path(), Appearance::System).unwrap();
+        assert_eq!(s.appearance, Appearance::System);
+        let loaded = load_settings(dir.path()).unwrap();
+        assert_eq!(loaded, s);
+        assert_eq!(loaded.watch_mode, WatchMode::OnView);
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("appearance = \"system\""), "{text}");
+        assert!(text.contains("future_key"), "unknown keys survive: {text}");
     }
 
     #[test]

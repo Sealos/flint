@@ -17,7 +17,7 @@ use crate::discovery::ClusterDiscovery;
 use crate::kubeconfig::ContextInfo;
 use crate::manager::ClusterManager;
 use crate::read::{KindId, ObjectDetail};
-use crate::settings::{Settings, WatchMode};
+use crate::settings::{Appearance, Settings, WatchMode};
 use crate::store::{Feed, KindSnapshot, SyncState};
 use crate::view::{self, ViewQuery};
 use crate::watch::HubRegistry;
@@ -62,6 +62,9 @@ pub enum Command {
         cluster: Option<ClusterId>,
         mode: Option<WatchMode>,
     },
+    /// Set the appearance (light, dark, or following macOS) and write it to `settings.toml`. The
+    /// change arrives back as `Event::SettingsChanged`.
+    SetAppearance(Appearance),
     /// The namespaces the user filters `cluster` on (empty: all). When the user may not list a
     /// kind in all namespaces, it is listed in these one by one; without a filter, in the
     /// context's default namespace, else in every namespace the user can list. The filter

@@ -60,7 +60,7 @@ Two more development aids work together with `FLINT_CLUSTER`, so screenshots can
 - `FLINT_VIEW` opens a view once the cluster's discovery arrives: a kind (`pods`, `deployments.apps`,
   `widgets.example.com`; the group may be left out), `kind/name` for a cluster-scoped object, or
   `namespace/kind/name`. Add `#yaml` to an object to open its YAML tab. Without `FLINT_CLUSTER` it is ignored.
-- `FLINT_APPEARANCE=light` or `dark` forces a theme instead of following macOS.
+- `FLINT_APPEARANCE=light` or `dark` forces a theme over the `appearance` setting and macOS.
 
 ```sh
 FLINT_CLUSTER=kind-flint-dev FLINT_VIEW=demo/deployments/web#yaml FLINT_APPEARANCE=light cargo run -p flint-app
@@ -121,13 +121,18 @@ CI (`.github/workflows/ci.yml`, macOS) runs format, clippy and the tests above w
   - `cargo machete` (unused dependencies);
   - `typos`;
   - `actionlint`;
-  - `scripts/check-module-tests.sh`.
+  - `scripts/check-module-tests.sh`;
+  - `scripts/check-theme-colors.sh` (no hard-coded colors in UI code; see below).
 - **PR title:** must be a Conventional Commit, because PRs are squash-merged and release-please reads the subject.
 - **Dependabot:** weekly Cargo and GitHub Actions updates. `gpui-kit` is excluded because it is pinned on purpose.
 
 **Unit tests per module:** every source module has unit tests, either a `#[cfg(test)] mod tests` or a
 `// module-tests: <file>` line pointing to its test file. `lib.rs`, `main.rs` and `mod.rs` are wiring and are exempt.
 `scripts/module-tests-allowlist.txt` lists the modules that predate this rule. The list may only shrink.
+
+**Theme tokens only:** views take every color from the theme (`cx.theme()`). Colors live only in
+`crates/flint-app/src/ui/themes/flint.json` (Flint Light and Flint Dark) and `ui/accent.rs` (the orange accent).
+`scripts/check-theme-colors.sh` fails on a color literal anywhere else under `ui/`.
 
 ## MCP server for AI agents
 

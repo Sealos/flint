@@ -30,10 +30,12 @@ use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
 use super::list::{ListEvent, ResourceList};
 use super::nav::{NavEvent, NavPanel};
 use super::startup::{self, StartupView};
+use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
 
-const HEADER_HEIGHT: f32 = 36.;
+/// The height of the main area's header and the list's toolbar.
+pub const HEADER_HEIGHT: f32 = 32.;
 
 /// The panes the user can resize by dragging their edge, with default and limit widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,11 @@ const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
 pub struct Workspace {
     model: Entity<ClustersModel>,
+    /// `FLINT_APPEARANCE`, a development aid that wins over the setting.
+    forced_appearance: Option<ThemeMode>,
+    /// The appearance last forced on the native window chrome (`Some(None)`: following macOS),
+    /// so it is set only when it changes.
+    chrome: Option<Option<WindowAppearance>>,
     ui_state: UiState,
     nav: Entity<NavPanel>,
     /// The cluster the main area shows: the active one.
@@ -136,21 +143,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Follow macOS light and dark mode, now and whenever it changes, unless the
-        // `FLINT_APPEARANCE` development aid forces one.
-        let appearance = match forced_appearance {
-            Some(mode) => {
-                Theme::change(mode, Some(window), cx);
-                cx.observe_window_appearance(window, |_, _, _| {})
-            }
-            None => {
-                Theme::sync_system_appearance(Some(window), cx);
-                cx.observe_window_appearance(window, |_, window, cx| {
-                    Theme::sync_system_appearance(Some(window), cx);
-                })
-            }
-        };
+        // Flint Light or Flint Dark, per the `appearance` setting, following macOS live when it
+        // is `system`, and re-applied whenever the settings change.
+        let appearance = cx.observe_window_appearance(window, |this, window, cx| {
+            this.show_appearance(window, cx);
+        });
         let observe = cx.observe_in(&model, window, |this, _, window, cx| {
+            this.show_appearance(window, cx);
             this.sync(window, cx);
             cx.notify();
         });
@@ -210,8 +209,10 @@ impl Workspace {
                 }
             }
         });
-        Self {
+        let mut this = Self {
             model,
+            forced_appearance,
+            chrome: None,
             panes: ui_state.panes(),
             ui_state,
             nav,
@@ -230,7 +231,24 @@ impl Workspace {
             _list_subscriptions: Vec::new(),
             _detail_subscriptions: Vec::new(),
             _subscriptions: vec![observe, appearance, on_nav, on_namespace_input, on_quit],
+        };
+        this.show_appearance(window, cx);
+        this
+    }
+
+    /// Shows the theme the `appearance` setting, macOS and `FLINT_APPEARANCE` call for, and
+    /// makes the native window chrome (titlebar, border) match it.
+    fn show_appearance(&mut self, window: &Window, cx: &mut App) {
+        let setting = self.model.read(cx).settings.appearance;
+        // Clear a forced chrome appearance before reading the window's: while one is forced,
+        // the window reports it instead of macOS's.
+        let chrome = theme::chrome(setting, self.forced_appearance);
+        if self.chrome != Some(chrome) {
+            self.chrome = Some(chrome);
+            cx.set_window_appearance(chrome);
         }
+        let mode = theme::resolve(setting, self.forced_appearance, window.appearance());
+        theme::show(mode, cx);
     }
 
     /// Writes `state.toml` off the UI thread, after any write still running.
@@ -524,7 +542,7 @@ impl Workspace {
         let model = self.model.read(cx);
         let active = model.active.clone();
 
-        let mut list = v_flex().gap_0p5().p_2();
+        let mut list = v_flex().gap_px().px_1p5().py_1();
         if let Some(error) = &model.settings_error {
             list = list.child(sidebar_error(
                 "settings-error",
@@ -594,7 +612,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(
                 div()
-                    .px_4()
+                    .px_3()
                     .pt_3()
                     .pb_1()
                     .text_xs()
@@ -662,17 +680,13 @@ impl Workspace {
         h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             .gap_2()
-            .px_2()
-            .py_1p5()
-            .rounded_md()
+            .px_1p5()
+            .py_1()
+            .rounded(theme.radius)
             .cursor_pointer()
-            .when(is_active, |el| {
-                el.bg(theme.sidebar_accent)
-                    .text_color(theme.sidebar_accent_foreground)
-            })
-            .when(!is_active, |el| {
-                el.hover(|el| el.bg(theme.sidebar_accent.opacity(0.5)))
-            })
+            // The active cluster is marked with the accent, as selections are.
+            .when(is_active, |el| el.bg(theme.list_active))
+            .when(!is_active, |el| el.hover(|el| el.bg(theme.list_hover)))
             .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
             .on_click(move |_, _, cx| {
                 row_model.update(cx, |m, _| m.activate(row_name.clone()));
@@ -682,21 +696,37 @@ impl Workspace {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_sm().truncate().child(title))
+                    .child(div().text_sm().line_height(px(18.)).truncate().child(title))
                     .child(
                         div()
                             .text_xs()
+                            .line_height(px(14.))
                             .truncate()
                             .text_color(theme.muted_foreground)
                             .child(subtitle),
                     ),
             )
+            // Neutral: the toggle next to it already shows the exposure in the accent.
             .when(exposure.is_exposed(), |row| {
-                row.child(Tag::primary().xsmall().flex_none().child("AI"))
+                row.child(Tag::secondary().outline().xsmall().flex_none().child("AI"))
             })
             .when(
                 matches!(exposure, AiExposureState::ServerChanged { .. }),
-                |row| row.child(Tag::warning().xsmall().flex_none().child("Cluster changed")),
+                |row| {
+                    row.child(
+                        div()
+                            .id(SharedString::from(format!("cluster-changed-{name}")))
+                            .flex_none()
+                            .child(Tag::warning().outline().xsmall().child("Changed"))
+                            .tooltip(|window, cx| {
+                                Tooltip::new(
+                                    "Cluster changed: this context points at a different server \
+                                     than the one exposed to AI agents.",
+                                )
+                                .build(window, cx)
+                            }),
+                    )
+                },
             )
             .child(self.render_exposure_toggle(&name, server, exposure, settings_ok))
             .into_any_element()
@@ -825,7 +855,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(
                 div()
-                    .px_4()
+                    .px_3()
                     .pt_3()
                     .pb_1()
                     .text_xs()
@@ -874,6 +904,8 @@ impl Workspace {
             };
             crumbs.push((object.name.clone().into(), full));
         }
+        // The object's name is a resource name: monospace, like the list's names.
+        let mono_last = self.detail.is_some();
         let crumb_count = crumbs.len();
         let mut breadcrumb = h_flex().flex_1().min_w_0().gap_1().text_sm();
         for (i, (text, tip)) in crumbs.into_iter().enumerate() {
@@ -892,6 +924,9 @@ impl Workspace {
                     .truncate()
                     .when(!last, |el| el.text_color(theme.muted_foreground))
                     .when(last, |el| el.font_semibold())
+                    .when(last && mono_last, |el| {
+                        el.font_family(theme.mono_font_family.clone())
+                    })
                     .child(text)
                     .when(!tip.is_empty(), |el| {
                         el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -1056,7 +1091,19 @@ impl Workspace {
             })
     }
 
-    fn render_main(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+    /// The detail pane's width: as dragged, but narrower when the window is, so the list keeps
+    /// [`MIN_LIST_WIDTH`] (a remembered width from a wider window would squeeze it).
+    fn detail_width(&self, window_width: f32) -> f32 {
+        let room = window_width
+            - Pane::Clusters.get(&self.panes)
+            - Pane::Navigation.get(&self.panes)
+            - MIN_LIST_WIDTH;
+        Pane::Detail
+            .get(&self.panes)
+            .min(room.max(Pane::Detail.limits().0))
+    }
+
+    fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
         let model = self.model.read(cx);
         let Some(cluster) = model.active_cluster().cloned() else {
             return centered(
@@ -1081,7 +1128,7 @@ impl Workspace {
                 .when_some(self.detail.clone(), |el, detail| {
                     el.child(
                         div()
-                            .w(px(Pane::Detail.get(&self.panes)))
+                            .w(px(self.detail_width(window_width)))
                             .h_full()
                             .flex_none()
                             .relative()
@@ -1290,7 +1337,8 @@ pub fn namespace_summary(filter: &[String]) -> String {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let window_width = f32::from(window.viewport_size().width);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
@@ -1307,7 +1355,7 @@ impl Render for Workspace {
             }))
             .child(self.render_sidebar(theme, cx))
             .when(has_cluster, |el| el.child(self.render_nav_column(theme)))
-            .child(self.render_main(theme, cx))
+            .child(self.render_main(window_width, theme, cx))
     }
 }
 

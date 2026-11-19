@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use flint_core::settings::AiExposureState;
 use flint_core::{
-    ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle, Event,
-    Settings, WatchMode,
+    Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
+    Event, Settings, WatchMode,
 };
 use gpui_kit::*;
 
@@ -37,7 +37,13 @@ pub struct ClustersModel {
 }
 
 impl ClustersModel {
-    pub fn new(core: CoreHandle, startup_cluster: Option<String>, cx: &mut Context<Self>) -> Self {
+    /// `settings` are the ones loaded at startup, until the core reports its own.
+    pub fn new(
+        core: CoreHandle,
+        settings: Settings,
+        startup_cluster: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let events = core.events();
         let task = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
@@ -54,7 +60,7 @@ impl ClustersModel {
             kubeconfig_env: std::env::var_os("KUBECONFIG"),
             loaded: false,
             active: None,
-            settings: Arc::default(),
+            settings: Arc::new(settings),
             settings_error: None,
             last_error: None,
             discovery: HashMap::new(),
@@ -133,6 +139,12 @@ impl ClustersModel {
     /// removes it). Written to `settings.toml`; the change comes back as a settings event.
     pub fn set_watch_mode(&mut self, cluster: Option<ClusterId>, mode: Option<WatchMode>) {
         self.send(Command::SetWatchMode { cluster, mode });
+    }
+
+    /// Sets the appearance. Written to `settings.toml`; the change comes back as a settings
+    /// event, and the window follows it.
+    pub fn set_appearance(&mut self, appearance: Appearance) {
+        self.send(Command::SetAppearance(appearance));
     }
 
     /// Tells the core which namespaces the user filters `cluster` on, for kinds the user may not
