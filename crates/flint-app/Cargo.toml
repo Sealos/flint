@@ -38,3 +38,5 @@ automation = ["dep:async-channel", "dep:image", "dep:libc", "gpui-kit/test-suppo
 # Headless GPUI windows for view tests (`#[gpui_kit::test]`).
 gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+# `ApiResource`, to build stub discovery (`KindInfo`) in tests.
+kube.workspace = true

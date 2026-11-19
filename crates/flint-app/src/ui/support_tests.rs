@@ -156,28 +156,30 @@ pub fn pods(rows: &[(&str, &str, i64)]) -> Arc<KindSnapshot> {
 /// Gives `alpha` a navigation with Pods, as if its discovery had arrived.
 #[cfg(feature = "automation")]
 pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
-    use flint_core::{ClusterDiscovery, NavEntry, NavSection, Navigation, SectionKind};
+    use flint_core::{ClusterDiscovery, KindInfo};
 
     use super::clusters::Discovered;
 
-    let discovery = ClusterDiscovery {
-        kinds: Vec::new(),
-        navigation: Navigation {
-            sections: vec![NavSection {
-                title: "Workloads".into(),
-                kind: SectionKind::BuiltIn,
-                entries: vec![NavEntry {
-                    id: KindId::pods(),
-                    label: "Pods".into(),
-                    kind: "Pod".into(),
-                    api_version: "v1".into(),
-                    namespaced: true,
-                    listable: true,
-                    watchable: true,
-                }],
-            }],
+    // Built from a kind, as real discovery is, so the core resolver (`OpenView`, FLINT_VIEW)
+    // finds `pods` and `po` too.
+    let pods = KindInfo {
+        resource: kube::discovery::ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            plural: "pods".into(),
         },
+        namespaced: true,
+        verbs: ["get", "list", "watch"].map(String::from).to_vec(),
+        singular: "pod".into(),
+        short_names: vec!["po".into()],
     };
+    let discovery = ClusterDiscovery::new(vec![pods]);
+    assert!(
+        discovery.nav_entry("pods").is_ok(),
+        "stub discovery must list Pods in the navigation"
+    );
     t.model.update(cx, |model, cx| {
         model.discovery.insert(
             "alpha".into(),

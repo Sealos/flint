@@ -1922,6 +1922,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "k8s-openapi",
+ "kube",
  "libc",
  "serde",
  "serde-saphyr 2.2.0",
