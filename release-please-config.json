@@ -18,6 +18,7 @@
   "packages": {
     ".": {
       "package-name": "flint",
+      "initial-version": "0.1.0",
       "changelog-path": "CHANGELOG.md",
       "extra-files": ["Cargo.toml"]
     }
