@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flint — a native Kubernetes desktop for macOS</title>
+  <meta name="description" content="Flint is a fast, native Kubernetes desktop manager for macOS, written in Rust with GPUI, with a read-only MCP server for AI agents.">
+  <meta name="color-scheme" content="light dark">
+  <meta property="og:title" content="Flint — a native Kubernetes desktop for macOS">
+  <meta property="og:description" content="Fast, native and keyboard-first. Written in Rust with GPUI. Open source under Apache-2.0.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="./" aria-label="Flint home">
+        <img src="favicon.svg" alt="" width="22" height="22">
+        <span>Flint</span>
+      </a>
+      <nav class="topnav" aria-label="Sections">
+        <a href="#features">Features</a>
+        <a href="#mcp">MCP</a>
+        <a href="#roadmap">Roadmap</a>
+        <a href="https://github.com/Sealos/flint">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero wrap">
+      <p class="eyebrow"><span class="dot" aria-hidden="true"></span> Early development · open source</p>
+      <h1>A Kubernetes desktop that keeps up with your clusters.</h1>
+      <p class="lede">
+        Flint is a native Kubernetes manager for macOS, in the space of Lens and Freelens. It is written in Rust with
+        <a href="https://www.gpui.rs/">GPUI</a>, so it starts fast, stays light on memory and keeps up
+        with large clusters.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/Sealos/flint">View on GitHub</a>
+        <a class="btn" href="https://github.com/Sealos/flint/releases">Releases</a>
+      </div>
+      <p class="fineprint">macOS only for now. Builds are unsigned until the first public release.</p>
+    </section>
+
+    <div class="wrap">
+      <figure class="window" role="img" aria-label="Illustration of the Flint window: a cluster sidebar, a list of pods with status and age, and a detail panel">
+        <div class="win-titlebar" aria-hidden="true">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="win-title">kind-flint-dev · demo · Pods</span>
+        </div>
+        <div class="win-body" aria-hidden="true" inert>
+          <aside class="win-sidebar">
+            <p class="win-label">Clusters</p>
+            <p class="win-item active">kind-flint-dev <b>AI</b></p>
+            <p class="win-item">staging-eu</p>
+            <p class="win-item">lab</p>
+            <p class="win-label">Workloads</p>
+            <p class="win-item sel">Pods</p>
+            <p class="win-item">Deployments</p>
+            <p class="win-item">StatefulSets</p>
+            <p class="win-item">Jobs</p>
+            <p class="win-label">Custom resources</p>
+            <p class="win-item">widgets.example.com</p>
+          </aside>
+          <div class="win-main">
+            <div class="win-filter"><span>⌕</span> Filter pods…</div>
+            <table class="win-table">
+              <thead><tr><th>Name</th><th>Ready</th><th>Status</th><th>Restarts</th><th>Age</th></tr></thead>
+              <tbody>
+                <tr class="sel"><td>web-7c9d8f6b5-2xkqp</td><td>1/1</td><td><span class="ok">Running</span></td><td>0</td><td>3h</td></tr>
+                <tr><td>web-7c9d8f6b5-h8r4m</td><td>1/1</td><td><span class="ok">Running</span></td><td>0</td><td>3h</td></tr>
+                <tr><td>api-5f6c7d8b9-qq2lz</td><td>1/1</td><td><span class="ok">Running</span></td><td>1</td><td>2d</td></tr>
+                <tr><td>worker-68b7d-9tdx4</td><td>0/1</td><td><span class="warn">Pending</span></td><td>0</td><td>12s</td></tr>
+                <tr><td>migrate-28851200-jv7nc</td><td>0/1</td><td><span class="err">CrashLoopBackOff</span></td><td>7</td><td>14m</td></tr>
+                <tr><td>redis-0</td><td>1/1</td><td><span class="ok">Running</span></td><td>0</td><td>9d</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </figure>
+      <p class="caption">An illustration of the window, not a screenshot.</p>
+    </div>
+
+    <section id="features" class="wrap section">
+      <h2>What it does today</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>Every kind, CRDs included</h3>
+          <p>Navigation comes from the cluster's own discovery, so custom resources show up next to Pods and
+            Deployments with the same columns <code>kubectl get</code> prints.</p>
+        </article>
+        <article class="card">
+          <h3>Live lists</h3>
+          <p>Lists update as the cluster changes, with a namespace and text filter. Watch every kind on the active
+            cluster, or only the ones you are looking at.</p>
+        </article>
+        <article class="card">
+          <h3>Detail and YAML</h3>
+          <p>Metadata, conditions and events for any object, plus its YAML. Secret values are redacted.</p>
+        </article>
+        <article class="card">
+          <h3>Your kubeconfig, untouched</h3>
+          <p>Flint reads kubeconfig the way <code>kubectl</code> does and never writes to it. It connects to nothing
+            until you pick a cluster.</p>
+        </article>
+        <article class="card">
+          <h3>Light on resources</h3>
+          <p>On a test cluster with 62 kinds watched, the whole process used about 19&nbsp;MiB and the open lists
+            synced in about 120&nbsp;ms. Laying out a 10,000-row list takes about half a millisecond per frame.</p>
+        </article>
+        <article class="card">
+          <h3>Follows macOS light and dark</h3>
+          <p>Switches with the system appearance, or set it yourself. Zed-style themes, a command palette and a
+            resource switcher come next.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="mcp" class="wrap section split">
+      <div>
+        <h2>Let AI agents look, not touch</h2>
+        <p><code>flint mcp</code> is a read-only <a href="https://modelcontextprotocol.io/">Model Context Protocol</a>
+          server. Agents can list clusters, kinds, objects, events and pod logs, and nothing else.</p>
+        <ul class="ticks">
+          <li>Nothing is exposed by default. You opt in per cluster with <b>Expose to AI</b>.</li>
+          <li>An exposure is tied to the API server URL, so a re-pointed context is hidden again.</li>
+          <li>Secret values are always redacted, and large outputs are cut short.</li>
+        </ul>
+      </div>
+      <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># register it with Claude Code</span>
+claude mcp add flint -- /path/to/flint mcp
+
+<span class="c"># other MCP clients take the same command</span>
+/path/to/flint mcp</code></pre>
+    </section>
+
+    <section id="roadmap" class="wrap section">
+      <h2>Roadmap</h2>
+      <ol class="roadmap">
+        <li class="done"><b>M0</b><span>Cluster sidebar, connect and health check, read-only MCP server</span></li>
+        <li class="done"><b>M1</b><span>Every kind with live lists, namespace filter, detail and YAML view</span></li>
+        <li class="next"><b>M1.5</b><span>Flint Light and Dark themes, command palette, resource switcher</span></li>
+        <li><b>M2</b><span>Pod logs and exec terminal</span></li>
+        <li><b>M3</b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
+        <li><b>M4</b><span>Curated views for core kinds, CPU and memory from metrics-server</span></li>
+        <li><b>M5</b><span>Port-forward panel, Helm releases</span></li>
+        <li><b>M6</b><span>Signed and notarized universal build, Homebrew cask, first public release</span></li>
+      </ol>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <span>Flint is open source under the Apache-2.0 license.</span>
+      <span><a href="https://github.com/Sealos/flint">Source</a> · <a href="https://github.com/Sealos/flint/issues">Issues</a></span>
+    </div>
+  </footer>
+</body>
+</html>
