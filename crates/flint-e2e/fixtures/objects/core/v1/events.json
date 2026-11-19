@@ -1,0 +1,1417 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "count": 8,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeHasSufficientMemory",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e98718ace40503",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "ab9b4b07-1190-d892-4c5b-cf2653e433cb"
+      },
+      "reason": "NodeHasSufficientMemory",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 8,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeHasNoDiskPressure",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e98718ace43919",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "ba6dbbe9-0ddc-a7e7-d762-11f14879ae05"
+      },
+      "reason": "NodeHasNoDiskPressure",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 7,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeHasSufficientPID",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e98718ace45472",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "e7bdb1ce-b99c-91fe-d164-6c95c24bbb9e"
+      },
+      "reason": "NodeHasSufficientPID",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Updated Node Allocatable limit across pods",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e98718b1adccaf",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "0047d166-d839-198e-a3ff-1b4729842ebf"
+      },
+      "reason": "NodeAllocatableEnforced",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Starting kubelet.",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871c36e55850",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "b4d0fc54-5921-1bbc-714b-854233027c12"
+      },
+      "reason": "Starting",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Updated Node Allocatable limit across pods",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871c4a25a854",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "aaa1ea73-de7a-185b-f5f5-f579756c2bfe"
+      },
+      "reason": "NodeAllocatableEnforced",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane",
+        "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeHasSufficientMemory",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871c50b3656a",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "70697045-bfe7-9a78-99a9-a5805e29de38"
+      },
+      "reason": "NodeHasSufficientMemory",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane",
+        "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeHasNoDiskPressure",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871c50b3a65c",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "b624adb3-22d1-834a-c4c9-12305ff0ee2e"
+      },
+      "reason": "NodeHasNoDiskPressure",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane",
+        "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeHasSufficientPID",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871c50b3b197",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "bd412ace-5636-a4fa-0b37-8cac65ba433d"
+      },
+      "reason": "NodeHasSufficientPID",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane",
+        "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane event: Registered Node flint-dev-control-plane in Controller",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871db506d807",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "ca7f18d9-3a38-655d-2455-e65179c4cfa2"
+      },
+      "reason": "RegisteredNode",
+      "reportingComponent": "node-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "node-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "action": "StartKubeProxy",
+      "eventTime": "2026-01-01T00:00:00.000000Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane"
+      },
+      "lastTimestamp": null,
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e9871e985b6942",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "5acc0f34-9d44-28ce-5096-73621c4fb532"
+      },
+      "reason": "Starting",
+      "reportingComponent": "kube-proxy",
+      "reportingInstance": "kube-proxy-flint-dev-control-plane",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "flint-dev-control-plane",
+        "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Node flint-dev-control-plane status is now: NodeReady",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "flint-dev-control-plane.18e987212b48abf6",
+        "namespace": "default",
+        "resourceVersion": "1",
+        "uid": "83eb5a23-c451-8797-bcd2-b86b16487885"
+      },
+      "reason": "NodeReady",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "podinfo-c6497595d-b5r9c",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully assigned demo/podinfo-c6497595d-b5r9c to flint-dev-control-plane",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo-c6497595d-b5r9c.18e987229fd872bd",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "942a6e88-4f20-6356-a61a-bb877903c63c"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "",
+      "source": {
+        "component": "default-scheduler"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{podinfo}",
+        "kind": "Pod",
+        "name": "podinfo-c6497595d-b5r9c",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Pulling image \"ghcr.io/stefanprodan/podinfo:6.17.0\"",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo-c6497595d-b5r9c.18e98722c5c4a1cb",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "91886f54-8e29-b72c-2f74-0e268eebcdcd"
+      },
+      "reason": "Pulling",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{podinfo}",
+        "kind": "Pod",
+        "name": "podinfo-c6497595d-b5r9c",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully pulled image \"ghcr.io/stefanprodan/podinfo:6.17.0\" in 3.433s (10.902s including waiting). Image size: 33594805 bytes.",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo-c6497595d-b5r9c.18e987254fab9cb7",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "bf7a83ba-fb0a-d20d-f600-c3ecee6d4b5a"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{podinfo}",
+        "kind": "Pod",
+        "name": "podinfo-c6497595d-b5r9c",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container created",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo-c6497595d-b5r9c.18e9872550346332",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "f752d820-b7f7-f794-a9af-b600b8569467"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{podinfo}",
+        "kind": "Pod",
+        "name": "podinfo-c6497595d-b5r9c",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container started",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo-c6497595d-b5r9c.18e9872553e74b03",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "7af59afc-b3b5-5e48-dc5a-7e21c1b4cfeb"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "podinfo-c6497595d",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "0fdd95a9-f381-794a-bd56-9973a3b183ce"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Created pod: podinfo-c6497595d-b5r9c",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo-c6497595d.18e987229c4771b0",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "333b1760-6368-912a-e5f1-e0ed6a8e7dd7"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "podinfo",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "58d4b8b8-e472-5cde-bf83-d09a1d2f2d01"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Scaled up replica set podinfo-c6497595d from 0 to 1",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "podinfo.18e987229a032824",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "8f256368-7fed-1ee5-48ec-e9eedabb0c31"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-fshvp",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "8ed74a30-af88-c125-d2ae-7561d9926e39"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully assigned demo/web-69c6f74b8b-fshvp to flint-dev-control-plane",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-fshvp.18e988011bfb441a",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "c5b04c57-88a9-7900-8eae-7e347fc6ce92"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "",
+      "source": {
+        "component": "default-scheduler"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-fshvp",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "8ed74a30-af88-c125-d2ae-7561d9926e39"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container image \"nginx:1.27\" already present on machine and can be accessed by the pod",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-fshvp.18e9880139c96bd9",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6356559d-fe2c-299c-6cc6-3f9816d62226"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-fshvp",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "8ed74a30-af88-c125-d2ae-7561d9926e39"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container created",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-fshvp.18e988013ad6f0fd",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "829798e9-4b6e-9894-1eb5-d14a093f754a"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-fshvp",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "8ed74a30-af88-c125-d2ae-7561d9926e39"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container started",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-fshvp.18e988013f0aebce",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "da7a6113-5ffd-3a63-9689-327593577f45"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-fshvp",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "8ed74a30-af88-c125-d2ae-7561d9926e39"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Stopping container nginx",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-fshvp.18e988013f2df74c",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "0bd478e3-d608-6b24-a975-db76815f3478"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-glf4m",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2a6628e4-776d-9b8c-1558-2b0a91ec8ac7"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully assigned demo/web-69c6f74b8b-glf4m to flint-dev-control-plane",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-glf4m.18e987c90976686b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "423c03c7-a90d-554e-1c40-ebc46ec0aa9d"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "",
+      "source": {
+        "component": "default-scheduler"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-glf4m",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2a6628e4-776d-9b8c-1558-2b0a91ec8ac7"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container image \"nginx:1.27\" already present on machine and can be accessed by the pod",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-glf4m.18e987c92de91cf4",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "89130ef8-a3e5-2ec6-5d5f-511d22c4e361"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-glf4m",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2a6628e4-776d-9b8c-1558-2b0a91ec8ac7"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container created",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-glf4m.18e987c9320f7175",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "f698f8fc-64f5-46fc-d5c6-4af23c7d0498"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-glf4m",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2a6628e4-776d-9b8c-1558-2b0a91ec8ac7"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container started",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-glf4m.18e987c93ad7d754",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "3d066720-0be6-ae54-617d-21b30bf5560c"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-glf4m",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2a6628e4-776d-9b8c-1558-2b0a91ec8ac7"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Stopping container nginx",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-glf4m.18e987c93b54e664",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "acf2b80d-1d21-1f8a-eb70-d4ab2e096b06"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-pjhg5",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully assigned demo/web-69c6f74b8b-pjhg5 to flint-dev-control-plane",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-pjhg5.18e98721f8b5a50f",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "4a9afdf4-63b6-43f8-6d7f-3735459ff8d0"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "",
+      "source": {
+        "component": "default-scheduler"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-pjhg5",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Pulling image \"nginx:1.27\"",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-pjhg5.18e98722371076c9",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "cb830df6-5607-1db9-6499-e6daf31285e8"
+      },
+      "reason": "Pulling",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-pjhg5",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully pulled image \"nginx:1.27\" in 6.376s (9.126s including waiting). Image size: 68857691 bytes.",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-pjhg5.18e98724570b59f7",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "9b2065c8-f573-8b16-b7bb-5a03976e0ef7"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-pjhg5",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container created",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-pjhg5.18e9872459165c26",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "de10e706-c636-1073-bc14-09417a9bbb56"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-pjhg5",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container started",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-pjhg5.18e9872465c89abd",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "ff6fd8ab-3d5f-9bec-5138-1efdba31a8d6"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-x9t6b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully assigned demo/web-69c6f74b8b-x9t6b to flint-dev-control-plane",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-x9t6b.18e9872201538435",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "aa62a798-8cda-ae24-1196-9484a10447f2"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "",
+      "source": {
+        "component": "default-scheduler"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-x9t6b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Pulling image \"nginx:1.27\"",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-x9t6b.18e987223a90bd61",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a3284287-8561-db29-bae7-af330dcc6828"
+      },
+      "reason": "Pulling",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-x9t6b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Successfully pulled image \"nginx:1.27\" in 738ms (9.805s including waiting). Image size: 68857691 bytes.",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-x9t6b.18e987248309ac80",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "71fcdb9a-ac5e-e64b-aa56-18967ecf2572"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-x9t6b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container created",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-x9t6b.18e9872484f6fdab",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "64cd22de-f9c5-1195-59a7-045eeaeddfd0"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{nginx}",
+        "kind": "Pod",
+        "name": "web-69c6f74b8b-x9t6b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Container started",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b-x9t6b.18e987248ec79e65",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "81aa43cb-76de-a829-c82b-6c6869e38710"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "flint-dev-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "flint-dev-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "web-69c6f74b8b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Created pod: web-69c6f74b8b-pjhg5",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b.18e98721f4b94b1d",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "30dbe3a1-3738-0d63-969c-fa3b0bc44395"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "web-69c6f74b8b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Created pod: web-69c6f74b8b-x9t6b",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b.18e98721f9b1d20d",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "581793fb-6296-f193-c1e1-629f53a41cb0"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "web-69c6f74b8b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Created pod: web-69c6f74b8b-glf4m",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b.18e987c905e04e98",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "f9b8c44a-edd3-7b35-4d78-df17cc129986"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "web-69c6f74b8b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Deleted pod: web-69c6f74b8b-glf4m",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b.18e987c92fe432ed",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a5527e19-332a-fa5d-95df-b4d7295c7600"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "web-69c6f74b8b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Created pod: web-69c6f74b8b-fshvp",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b.18e9880117125109",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a9122f04-0a7a-256d-a452-f1c743f3b4a1"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "web-69c6f74b8b",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "6fcab885-7bfa-3c86-e713-1fe2ae170c98"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Deleted pod: web-69c6f74b8b-fshvp",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web-69c6f74b8b.18e988013c844450",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "830f83b9-1120-e2cf-43aa-45caf70a87f8"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "web",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "71da68b1-4e9c-ce37-f6f1-476535be4b4a"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Scaled up replica set web-69c6f74b8b from 0 to 2",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web.18e98721f36ca44a",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2693794b-0c68-c2fc-3350-97f53019e600"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "web",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "71da68b1-4e9c-ce37-f6f1-476535be4b4a"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Scaled up replica set web-69c6f74b8b from 2 to 3",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web.18e987c8fcca4fd1",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "f946f986-6465-ca09-ca11-a7798db02480"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-01-01T00:00:00Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "web",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "71da68b1-4e9c-ce37-f6f1-476535be4b4a"
+      },
+      "lastTimestamp": "2026-01-01T00:00:00Z",
+      "message": "Scaled down replica set web-69c6f74b8b from 3 to 2",
+      "metadata": {
+        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "name": "web.18e987c92c7b4ef7",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "2c0787ed-abe1-b651-840d-5313a85d2cb4"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    }
+  ],
+  "kind": "EventList",
+  "metadata": {
+    "resourceVersion": "1"
+  }
+}

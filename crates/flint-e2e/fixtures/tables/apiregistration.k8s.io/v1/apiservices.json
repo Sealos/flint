@@ -1,0 +1,525 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The reference to the service that hosts this API endpoint.",
+      "format": "",
+      "name": "Service",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Whether this service is available.",
+      "format": "",
+      "name": "Available",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "v1.",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.",
+          "resourceVersion": "1",
+          "uid": "0d513932-84a8-ff07-4039-668d284f4649"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.admissionregistration.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.admissionregistration.k8s.io",
+          "resourceVersion": "1",
+          "uid": "4a21af92-1fbf-c3dd-759a-0e597f6467be"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.apiextensions.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.apiextensions.k8s.io",
+          "resourceVersion": "1",
+          "uid": "78babc19-45a0-2a1f-b521-8c63e45077c6"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.apps",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.apps",
+          "resourceVersion": "1",
+          "uid": "a1dd674b-c937-180c-32e8-b910e0a84243"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.authentication.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.authentication.k8s.io",
+          "resourceVersion": "1",
+          "uid": "34c238a5-3dc7-0a83-20bb-4de24c491741"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.authorization.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.authorization.k8s.io",
+          "resourceVersion": "1",
+          "uid": "cfb6cd41-ac7b-574e-84d4-d5a96afdc011"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.autoscaling",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.autoscaling",
+          "resourceVersion": "1",
+          "uid": "63fe1f97-cd71-3d2a-04ad-04ed5100440e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.batch",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.batch",
+          "resourceVersion": "1",
+          "uid": "efb415ad-4228-0d83-048b-9215ee3d05c5"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.certificates.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.certificates.k8s.io",
+          "resourceVersion": "1",
+          "uid": "f9e50ceb-2432-d8cc-c259-4425ae8d3f37"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.coordination.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.coordination.k8s.io",
+          "resourceVersion": "1",
+          "uid": "63a28164-fa28-7042-54cc-14f53c537cec"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.discovery.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.discovery.k8s.io",
+          "resourceVersion": "1",
+          "uid": "a1e0a015-f228-1708-f642-8aaca3e54f96"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.events.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.events.k8s.io",
+          "resourceVersion": "1",
+          "uid": "0cf274e6-c0bd-cf54-b763-3617cc87b4a7"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.flowcontrol.apiserver.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.flowcontrol.apiserver.k8s.io",
+          "resourceVersion": "1",
+          "uid": "a8a97b56-0f02-81e7-a8fa-3b8d72257206"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.networking.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.networking.k8s.io",
+          "resourceVersion": "1",
+          "uid": "46077422-25cc-6052-c6b5-3f10b959011e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.node.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.node.k8s.io",
+          "resourceVersion": "1",
+          "uid": "bfc1bdf3-6477-fe18-8c2e-618c8f24a89d"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.policy",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.policy",
+          "resourceVersion": "1",
+          "uid": "3f1760f8-d8e9-4b15-e1b8-df1982c3a41c"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.rbac.authorization.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.rbac.authorization.k8s.io",
+          "resourceVersion": "1",
+          "uid": "29bbd241-4c92-3cde-37f5-efdba82b917e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.resource.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.resource.k8s.io",
+          "resourceVersion": "1",
+          "uid": "354fd2a3-3e73-1185-18bd-2fd2abbc980a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.scheduling.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.scheduling.k8s.io",
+          "resourceVersion": "1",
+          "uid": "3cb219e4-4af8-9e53-3c88-571875718412"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.storage.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.storage.k8s.io",
+          "resourceVersion": "1",
+          "uid": "a71d2769-baa6-9071-36fe-1e2fc84505ea"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1.storagemigration.k8s.io",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v1.storagemigration.k8s.io",
+          "resourceVersion": "1",
+          "uid": "9fe109ec-ee3d-8864-383f-bddfa77b5ef1"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v1beta1.metrics.k8s.io",
+        "kube-system/metrics-server",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apiregistration.k8s.io/v1\",\"kind\":\"APIService\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"v1beta1.metrics.k8s.io\"},\"spec\":{\"group\":\"metrics.k8s.io\",\"groupPriorityMinimum\":100,\"insecureSkipTLSVerify\":true,\"service\":{\"name\":\"metrics-server\",\"namespace\":\"kube-system\"},\"version\":\"v1beta1\",\"versionPriority\":100}}\n"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "k8s-app": "metrics-server"
+          },
+          "name": "v1beta1.metrics.k8s.io",
+          "resourceVersion": "1",
+          "uid": "baa74acf-b395-bcf7-0352-0409751d3f23"
+        }
+      }
+    },
+    {
+      "cells": [
+        "v2.autoscaling",
+        "Local",
+        "True",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "kube-aggregator.kubernetes.io/automanaged": "onstart"
+          },
+          "name": "v2.autoscaling",
+          "resourceVersion": "1",
+          "uid": "c8970860-d59d-5912-0ead-418ca7f9bb87"
+        }
+      }
+    }
+  ]
+}

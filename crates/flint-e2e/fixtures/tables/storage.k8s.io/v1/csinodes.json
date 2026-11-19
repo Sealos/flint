@@ -1,0 +1,60 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Drivers indicates the number of CSI drivers registered on the node",
+      "format": "",
+      "name": "Drivers",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "flint-dev-control-plane",
+        0,
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "storage.alpha.kubernetes.io/migrated-plugins": "kubernetes.io/aws-ebs,kubernetes.io/azure-disk,kubernetes.io/azure-file,kubernetes.io/cinder,kubernetes.io/gce-pd,kubernetes.io/portworx-volume,kubernetes.io/vsphere-volume"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "name": "flint-dev-control-plane",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "kind": "Node",
+              "name": "flint-dev-control-plane",
+              "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "63c45800-7ce3-6279-64f8-72285540e425"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,252 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Number of the pod with ready state",
+      "format": "",
+      "name": "Ready",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Total number of non-terminating pods targeted by this deployment that have the desired template spec.",
+      "format": "",
+      "name": "Up-to-date",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Total number of available non-terminating pods (ready for at least minReadySeconds) targeted by this deployment.",
+      "format": "",
+      "name": "Available",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Names of each container in the template.",
+      "format": "",
+      "name": "Containers",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Images referenced by each container in the template.",
+      "format": "",
+      "name": "Images",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Label selector for pods. Existing ReplicaSets whose pods are selected by this will be the ones affected by this deployment. It must match the pod template's labels.",
+      "format": "",
+      "name": "Selector",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "podinfo",
+        "1/1",
+        1,
+        1,
+        "1d",
+        "podinfo",
+        "ghcr.io/stefanprodan/podinfo:6.17.0",
+        "app.kubernetes.io/name=podinfo"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/revision": "1",
+            "meta.helm.sh/release-name": "podinfo",
+            "meta.helm.sh/release-namespace": "demo"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "labels": {
+            "app.kubernetes.io/managed-by": "Helm",
+            "app.kubernetes.io/name": "podinfo",
+            "app.kubernetes.io/version": "6.17.0",
+            "helm.sh/chart": "podinfo-6.17.0"
+          },
+          "name": "podinfo",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "58d4b8b8-e472-5cde-bf83-d09a1d2f2d01"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web",
+        "2/2",
+        2,
+        2,
+        "1d",
+        "nginx",
+        "nginx:1.27",
+        "app=web"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/revision": "1",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"web\"},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"replicas\":2,\"selector\":{\"matchLabels\":{\"app\":\"web\"}},\"strategy\":{},\"template\":{\"metadata\":{\"labels\":{\"app\":\"web\"}},\"spec\":{\"containers\":[{\"image\":\"nginx:1.27\",\"name\":\"nginx\",\"resources\":{}}]}}},\"status\":{}}\n"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 5,
+          "labels": {
+            "app": "web"
+          },
+          "name": "web",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "71da68b1-4e9c-ce37-f6f1-476535be4b4a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "web",
+        "2/2",
+        2,
+        2,
+        "1d",
+        "pause",
+        "registry.k8s.io/pause:3.10",
+        "app=web"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/revision": "1"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "labels": {
+            "app": "web"
+          },
+          "name": "web",
+          "namespace": "flint-automation-test",
+          "resourceVersion": "1",
+          "uid": "c257c162-273f-3b06-52a0-71260d6ef1cd"
+        }
+      }
+    },
+    {
+      "cells": [
+        "coredns",
+        "2/2",
+        2,
+        2,
+        "1d",
+        "coredns",
+        "registry.k8s.io/coredns/coredns:v1.14.6",
+        "k8s-app=kube-dns"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/revision": "1"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "kube-dns"
+          },
+          "name": "coredns",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "76212d88-b80a-4538-5853-0ac613b22a7d"
+        }
+      }
+    },
+    {
+      "cells": [
+        "metrics-server",
+        "1/1",
+        1,
+        1,
+        "1d",
+        "metrics-server",
+        "registry.k8s.io/metrics-server/metrics-server:v0.9.1",
+        "k8s-app=metrics-server"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/revision": "6",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"metrics-server\",\"namespace\":\"kube-system\"},\"spec\":{\"selector\":{\"matchLabels\":{\"k8s-app\":\"metrics-server\"}},\"strategy\":{\"rollingUpdate\":{\"maxUnavailable\":0}},\"template\":{\"metadata\":{\"labels\":{\"k8s-app\":\"metrics-server\"}},\"spec\":{\"containers\":[{\"args\":[\"--cert-dir=/tmp\",\"--secure-port=10250\",\"--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname\",\"--kubelet-use-node-status-port\",\"--metric-resolution=15s\"],\"image\":\"registry.k8s.io/metrics-server/metrics-server:v0.9.1\",\"imagePullPolicy\":\"IfNotPresent\",\"livenessProbe\":{\"failureThreshold\":3,\"httpGet\":{\"path\":\"/livez\",\"port\":\"https\",\"scheme\":\"HTTPS\"},\"periodSeconds\":10},\"name\":\"metrics-server\",\"ports\":[{\"containerPort\":10250,\"name\":\"https\",\"protocol\":\"TCP\"}],\"readinessProbe\":{\"failureThreshold\":3,\"httpGet\":{\"path\":\"/readyz\",\"port\":\"https\",\"scheme\":\"HTTPS\"},\"initialDelaySeconds\":20,\"periodSeconds\":10},\"resources\":{\"requests\":{\"cpu\":\"100m\",\"memory\":\"200Mi\"}},\"securityContext\":{\"allowPrivilegeEscalation\":false,\"capabilities\":{\"drop\":[\"ALL\"]},\"readOnlyRootFilesystem\":true,\"runAsNonRoot\":true,\"runAsUser\":1000,\"seccompProfile\":{\"type\":\"RuntimeDefault\"}},\"volumeMounts\":[{\"mountPath\":\"/tmp\",\"name\":\"tmp-dir\"}]}],\"nodeSelector\":{\"kubernetes.io/os\":\"linux\"},\"priorityClassName\":\"system-cluster-critical\",\"serviceAccountName\":\"metrics-server\",\"volumes\":[{\"emptyDir\":{},\"name\":\"tmp-dir\"}]}}}}\n"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 6,
+          "labels": {
+            "k8s-app": "metrics-server"
+          },
+          "name": "metrics-server",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "88c2c74a-fb79-090c-d5e0-53bb4c4aced3"
+        }
+      }
+    },
+    {
+      "cells": [
+        "local-path-provisioner",
+        "1/1",
+        1,
+        1,
+        "1d",
+        "local-path-provisioner",
+        "docker.io/kindest/local-path-provisioner:v20260820-69b56db7",
+        "app=local-path-provisioner"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "deployment.kubernetes.io/revision": "1",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"annotations\":{},\"name\":\"local-path-provisioner\",\"namespace\":\"local-path-storage\"},\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"local-path-provisioner\"}},\"template\":{\"metadata\":{\"labels\":{\"app\":\"local-path-provisioner\"}},\"spec\":{\"containers\":[{\"command\":[\"local-path-provisioner\",\"--debug\",\"start\",\"--helper-image\",\"docker.io/kindest/local-path-helper:v20260131-7181c60a\",\"--config\",\"/etc/config/config.json\"],\"env\":[{\"name\":\"POD_NAMESPACE\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"metadata.namespace\"}}},{\"name\":\"CONFIG_MOUNT_PATH\",\"value\":\"/etc/config/\"}],\"image\":\"docker.io/kindest/local-path-provisioner:v20260820-69b56db7\",\"imagePullPolicy\":\"IfNotPresent\",\"name\":\"local-path-provisioner\",\"volumeMounts\":[{\"mountPath\":\"/etc/config/\",\"name\":\"config-volume\"}]}],\"nodeSelector\":{\"kubernetes.io/os\":\"linux\"},\"serviceAccountName\":\"local-path-provisioner-service-account\",\"tolerations\":[{\"effect\":\"NoSchedule\",\"key\":\"node-role.kubernetes.io/control-plane\",\"operator\":\"Equal\"},{\"effect\":\"NoSchedule\",\"key\":\"node-role.kubernetes.io/master\",\"operator\":\"Equal\"}],\"volumes\":[{\"configMap\":{\"name\":\"local-path-config\"},\"name\":\"config-volume\"}]}}}}\n"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "local-path-provisioner",
+          "namespace": "local-path-storage",
+          "resourceVersion": "1",
+          "uid": "2b8d9d38-98f6-28d8-b523-6a38b5c2490e"
+        }
+      }
+    }
+  ]
+}

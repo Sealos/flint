@@ -1,0 +1,77 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "provisioner indicates the type of the provisioner.",
+      "format": "",
+      "name": "Provisioner",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "reclaimPolicy controls the reclaimPolicy for dynamically provisioned PersistentVolumes of this storage class. Defaults to Delete.",
+      "format": "",
+      "name": "ReclaimPolicy",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "volumeBindingMode indicates how PersistentVolumeClaims should be provisioned and bound.  When unset, VolumeBindingImmediate is used. This field is only honored by servers that enable the VolumeScheduling feature.",
+      "format": "",
+      "name": "VolumeBindingMode",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "allowVolumeExpansion shows whether the storage class allow volume expand.",
+      "format": "",
+      "name": "AllowVolumeExpansion",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "standard (default)",
+        "rancher.io/local-path",
+        "Delete",
+        "WaitForFirstConsumer",
+        false,
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"storage.k8s.io/v1\",\"kind\":\"StorageClass\",\"metadata\":{\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"},\"name\":\"standard\"},\"provisioner\":\"rancher.io/local-path\",\"reclaimPolicy\":\"Delete\",\"volumeBindingMode\":\"WaitForFirstConsumer\"}\n",
+            "storageclass.kubernetes.io/is-default-class": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "name": "standard",
+          "resourceVersion": "1",
+          "uid": "5450d083-2b13-2a2e-8fc4-09bdafc8d734"
+        }
+      }
+    }
+  ]
+}

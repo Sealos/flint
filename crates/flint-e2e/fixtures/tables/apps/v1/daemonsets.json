@@ -1,0 +1,150 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "The total number of nodes that should be running the daemon pod (including nodes correctly running the daemon pod). More info: https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/",
+      "format": "",
+      "name": "Desired",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "The number of nodes that are running at least 1 daemon pod and are supposed to run the daemon pod. More info: https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/",
+      "format": "",
+      "name": "Current",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "numberReady is the number of nodes that should be running the daemon pod and have one or more of the daemon pod running with a Ready Condition.",
+      "format": "",
+      "name": "Ready",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "The total number of nodes that are running updated daemon pod",
+      "format": "",
+      "name": "Up-to-date",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "The number of nodes that should be running the daemon pod and have one or more of the daemon pod running and available (ready for at least spec.minReadySeconds)",
+      "format": "",
+      "name": "Available",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "NodeSelector is a selector which must be true for the pod to fit on a node. Selector which must match a node's labels for the pod to be scheduled on that node. More info: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/",
+      "format": "",
+      "name": "Node Selector",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Names of each container in the template.",
+      "format": "",
+      "name": "Containers",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Images referenced by each container in the template.",
+      "format": "",
+      "name": "Images",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "A label query over pods that are managed by the daemon set. Must match in order to be controlled. It must match the pod template's labels. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors",
+      "format": "",
+      "name": "Selector",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "kindnet",
+        1,
+        1,
+        1,
+        1,
+        1,
+        "kubernetes.io/os=linux",
+        "1d",
+        "kindnet-cni",
+        "docker.io/kindest/kindnetd:v20260820-69b56db7",
+        "app=kindnet"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "labels": {
+            "app": "kindnet",
+            "k8s-app": "kindnet",
+            "tier": "node"
+          },
+          "name": "kindnet",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "6095326d-76e1-c753-0445-55d0fb47e995"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-proxy",
+        1,
+        1,
+        1,
+        1,
+        1,
+        "kubernetes.io/os=linux",
+        "1d",
+        "kube-proxy",
+        "registry.k8s.io/kube-proxy:v1.37.0",
+        "k8s-app=kube-proxy"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "labels": {
+            "k8s-app": "kube-proxy"
+          },
+          "name": "kube-proxy",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "a2125fcf-b653-c10e-0cf4-070643b7f6be"
+        }
+      }
+    }
+  ]
+}

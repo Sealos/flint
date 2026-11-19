@@ -56,7 +56,8 @@ A test-only control socket lets e2e tests and agents drive the real app.
 
 ### E2E harness: `crates/flint-e2e`
 
-A Rust crate of integration tests and helpers:
+A Rust crate of integration tests and helpers. The fake API server (below) is there today; `App` and `Mcp` follow
+in [Sealos/flint#40](https://github.com/Sealos/flint/issues/40).
 
 - **`App`:** starts `flint` (built with `--features automation`) with a scratch `FLINT_CONFIG_DIR` and the given
   `KUBECONFIG`. It connects to the socket and exposes typed calls such as `app.open_view("pods")`,
@@ -68,15 +69,38 @@ A Rust crate of integration tests and helpers:
 
 ### Fake API server
 
-GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API server instead of kind.
+GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API server instead of kind. It lives in
+`flint_e2e::fake_api`, and its tests run in plain `cargo test` (no cluster).
 
-- **Recording:** `scripts/record-fixtures.sh` captures real responses from the kind dev cluster into
-  `crates/flint-e2e/fixtures/`: discovery, OpenAPI, Table lists, objects and events. Secrets are scrubbed and uids and
-  timestamps are normalized. Re-record whenever the supported Kubernetes version changes.
-- **Replay:** a small Rust HTTPS server in `flint-e2e` serves those fixtures. It also serves scripted watch streams
-  (ADDED, MODIFIED, DELETED, BOOKMARK, and an ERROR 410) and can inject failures (a 403, a slow response, a dropped
-  connection), so reconnect and permission paths are testable without a real cluster.
-- **Wiring:** the test writes a kubeconfig that points at the fake server's address and its self-signed CA.
+- **Recording:** `KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh` captures real responses from the kind dev
+  cluster into `crates/flint-e2e/fixtures/`. It refuses to run unless `KUBECONFIG` names exactly one file whose
+  current context is `kind-flint-dev` on this machine. Re-record whenever the supported Kubernetes version changes.
+  - `version.json`, aggregated discovery (`discovery/api.json`, `discovery/apis.json`).
+  - OpenAPI v3: the index and `apis/apps/v1` only, descriptions dropped, one line per file.
+  - `tables/<group>/<version>/<resource>.json`: the Table list (`includeObject=Metadata`) of every listable kind at
+    its preferred version, in all namespaces. Row `managedFields` are dropped (clients strip them anyway).
+  - `objects/<group>/<version>/<resource>.json`: plain lists of the objects in namespace `demo`, of namespaces and
+    nodes, and core events in `default` and `demo` (events in Tables are limited to those namespaces too).
+  - Secrets are masked with `flint_core::redact::mask_secret` (values become base64 of `redacted`, keys stay), and
+    Secret Table cells outside the safe columns are hidden. Strings holding a certificate, key or token are replaced.
+  - Uids are derived from each object's group, resource, namespace and name, and every timestamp, resource version,
+    server-rendered age and machine id is fixed, so re-recording an unchanged cluster gives no diff.
+  - `tests/fixtures.rs` checks the committed fixtures for credentials, local paths and Secret values.
+- **Replay:** `FakeApiServer::start()` serves the fixtures over HTTPS on `127.0.0.1` with a CA generated per server.
+  - Aggregated discovery only (legacy discovery is 404), Table or plain lists (by `Accept`), single objects, field
+    and label selectors, `limit`/`continue`. Writes get 405: the server is read-only.
+  - Watches and streaming lists (`sendInitialEvents`) are served from the same rows: the first event carries
+    `columnDefinitions`, bookmarks have a fake row, and an expired watch is an `ERROR` 410 inside HTTP 200. Kinds
+    that cannot watch (metrics.k8s.io) get 405. `Options { streaming_lists: false }` rejects streaming lists so
+    clients fall back to list and watch.
+  - `script_watch` queues steps (`ADDED`, `MODIFIED`, `DELETED`, `BOOKMARK`, `Expired`, `Wait`, `End`, `Drop`) for
+    the next watch on a resource. `send_watch` sends a step to every open watch. `set_row`/`remove_row` change the
+    rows silently, so only a relist shows the change.
+  - `inject(Fault)` refuses (403 with the real RBAC message, or any status), delays, or drops the connection of
+    matching requests (by resource, verb, namespace scope, and count).
+  - `requests()` records every request, for asserting relists and retries.
+- **Wiring:** `server.write_kubeconfig(path, namespace)` writes a kubeconfig (context `flint-e2e-fake`) that points
+  at the server and trusts its CA.
 
 ### Where things run in CI
 

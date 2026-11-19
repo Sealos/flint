@@ -1,0 +1,119 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "holderIdentity contains the identity of the holder of a current lease. If Coordinated Leader Election is used, the holder identity must be equal to the elected LeaseCandidate.metadata.name field.",
+      "format": "",
+      "name": "Holder",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "flint-dev-control-plane",
+        "flint-dev-control-plane",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "name": "flint-dev-control-plane",
+          "namespace": "kube-node-lease",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "kind": "Node",
+              "name": "flint-dev-control-plane",
+              "uid": "0b75c1cb-5293-f25e-c70f-c01e25e68721"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "a9fa45a9-c991-8cb5-78cc-50c8d5926cbe"
+        }
+      }
+    },
+    {
+      "cells": [
+        "apiserver-d6rayzowl6k7omg2ch3vj2f3pe",
+        "apiserver-d6rayzowl6k7omg2ch3vj2f3pe_819e14c2-9488-6db0-ef0e-cf4e9ba8a1be",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubernetes.io/peer-advertise-address": "172.18.0.2:6443"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "apiserver.kubernetes.io/identity": "kube-apiserver",
+            "kubernetes.io/hostname": "flint-dev-control-plane"
+          },
+          "name": "apiserver-d6rayzowl6k7omg2ch3vj2f3pe",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "c1f3165e-8a5b-da5b-0804-fdaecb230063"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-controller-manager",
+        "flint-dev-control-plane_998f4263-9ab9-97a1-9d63-94116085adab",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "name": "kube-controller-manager",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "e125e9ab-fd6a-d980-4688-ff729dd454e2"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-scheduler",
+        "flint-dev-control-plane_0bde9dcb-3272-ee22-8343-eed4df3188c9",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "name": "kube-scheduler",
+          "namespace": "kube-system",
+          "resourceVersion": "1",
+          "uid": "83954e4c-776a-645b-66d4-0b097fe562f0"
+        }
+      }
+    }
+  ]
+}

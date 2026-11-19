@@ -1,0 +1,87 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "capacity is the description of the persistent volume's resources and capacity. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#capacity",
+      "format": "",
+      "name": "Capacity",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "accessModes contains all ways the volume can be mounted. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes",
+      "format": "",
+      "name": "Access Modes",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "persistentVolumeReclaimPolicy defines what happens to a persistent volume when released from its claim. Valid options are Retain (default for manually created PersistentVolumes), Delete (default for dynamically provisioned PersistentVolumes), and Recycle (deprecated). Recycle must be supported by the volume plugin underlying this PersistentVolume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#reclaiming",
+      "format": "",
+      "name": "Reclaim Policy",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "phase indicates if a volume is available, bound to a claim, or released by a claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#phase",
+      "format": "",
+      "name": "Status",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "claimRef is part of a bi-directional binding between PersistentVolume and PersistentVolumeClaim. Expected to be non-nil when bound. claim.VolumeName is the authoritative bind between PV and PVC. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#binding",
+      "format": "",
+      "name": "Claim",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "StorageClass of the pv",
+      "format": "",
+      "name": "StorageClass",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "VolumeAttributesClass of the pv",
+      "format": "",
+      "name": "VolumeAttributesClass",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "reason is a brief CamelCase string that describes any failure and is meant for machine parsing and tidy display in the CLI.",
+      "format": "",
+      "name": "Reason",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "volumeMode defines if a volume is intended to be used with a formatted filesystem or to remain in raw block state. Value of Filesystem is implied when not included in spec.",
+      "format": "",
+      "name": "VolumeMode",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": []
+}

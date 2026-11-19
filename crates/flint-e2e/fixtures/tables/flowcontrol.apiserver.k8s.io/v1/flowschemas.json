@@ -1,0 +1,317 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "`name` is the name of the priority level configuration being referenced Required.",
+      "format": "",
+      "name": "PriorityLevel",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "`matchingPrecedence` is used to choose among the FlowSchemas that match a given request. The chosen FlowSchema is among those with the numerically lowest (which we take to be logically highest) MatchingPrecedence.  Each MatchingPrecedence value must be ranged in [1,10000]. Note that if the precedence is not specified, it will be set to 1000 as default.",
+      "format": "",
+      "name": "MatchingPrecedence",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "`distinguisherMethod` defines how to compute the flow distinguisher for requests that match this schema. `nil` specifies that the distinguisher is disabled and thus will always be the empty string.",
+      "format": "",
+      "name": "DistinguisherMethod",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "references a broken or non-existent PriorityLevelConfiguration",
+      "format": "",
+      "name": "MissingPL",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "catch-all",
+        "catch-all",
+        10000,
+        "ByUser",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "catch-all",
+          "resourceVersion": "1",
+          "uid": "53e2dcf2-f0f6-fba6-05b4-9ce4b4d9ac5b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "exempt",
+        "exempt",
+        1,
+        "<none>",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "exempt",
+          "resourceVersion": "1",
+          "uid": "58d3d249-c063-7db2-9399-3da8acfccce3"
+        }
+      }
+    },
+    {
+      "cells": [
+        "global-default",
+        "global-default",
+        9900,
+        "ByUser",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "global-default",
+          "resourceVersion": "1",
+          "uid": "9ac12246-a564-5fd7-c574-3c8b4e1a24eb"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-controller-manager",
+        "workload-high",
+        800,
+        "ByNamespace",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "kube-controller-manager",
+          "resourceVersion": "1",
+          "uid": "57189b24-dab6-868e-1dcf-0f82cb996a45"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-scheduler",
+        "workload-high",
+        800,
+        "ByNamespace",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "kube-scheduler",
+          "resourceVersion": "1",
+          "uid": "dcf905ab-c3e9-b961-3b79-c934934d0693"
+        }
+      }
+    },
+    {
+      "cells": [
+        "kube-system-service-accounts",
+        "workload-high",
+        900,
+        "ByNamespace",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "kube-system-service-accounts",
+          "resourceVersion": "1",
+          "uid": "41d49920-d5b7-8709-8788-66fe931d620f"
+        }
+      }
+    },
+    {
+      "cells": [
+        "probes",
+        "exempt",
+        2,
+        "<none>",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "probes",
+          "resourceVersion": "1",
+          "uid": "16e210b5-4195-f08a-35f0-0717304cf4a9"
+        }
+      }
+    },
+    {
+      "cells": [
+        "service-accounts",
+        "workload-low",
+        9000,
+        "ByUser",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "service-accounts",
+          "resourceVersion": "1",
+          "uid": "454885e4-61f9-eae5-25c4-94d2c94aa337"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system-leader-election",
+        "leader-election",
+        100,
+        "ByUser",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "system-leader-election",
+          "resourceVersion": "1",
+          "uid": "2bd30777-d655-e728-2cc2-db4b31c75324"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system-node-high",
+        "node-high",
+        400,
+        "ByUser",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "system-node-high",
+          "resourceVersion": "1",
+          "uid": "9707d66f-ebfe-874e-bd36-136dd3132d2b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "system-nodes",
+        "system",
+        500,
+        "ByUser",
+        "1d",
+        "False"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "apf.kubernetes.io/autoupdate-spec": "true"
+          },
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "generation": 1,
+          "name": "system-nodes",
+          "resourceVersion": "1",
+          "uid": "18c55345-ff2e-34b2-26ce-accf5553b908"
+        }
+      }
+    }
+  ]
+}

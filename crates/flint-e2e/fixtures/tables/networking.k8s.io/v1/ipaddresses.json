@@ -1,0 +1,130 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "parentRef references the resource that an IPAddress is attached to. An IPAddress must reference a parent object.",
+      "format": "",
+      "name": "ParentRef",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "10.96.0.1",
+        "services/default/kubernetes",
+        "24m"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "ipaddress.kubernetes.io/ip-family": "IPv4",
+            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
+          },
+          "name": "10.96.0.1",
+          "resourceVersion": "1",
+          "uid": "a850a7ca-4263-d4cf-dac5-fa2d6d91ab94"
+        }
+      }
+    },
+    {
+      "cells": [
+        "10.96.0.10",
+        "services/kube-system/kube-dns",
+        "24m"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "ipaddress.kubernetes.io/ip-family": "IPv4",
+            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
+          },
+          "name": "10.96.0.10",
+          "resourceVersion": "1",
+          "uid": "9340275e-c8c8-d1e1-57ba-74726e18986c"
+        }
+      }
+    },
+    {
+      "cells": [
+        "10.96.100.18",
+        "services/demo/podinfo",
+        "23m"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "ipaddress.kubernetes.io/ip-family": "IPv4",
+            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
+          },
+          "name": "10.96.100.18",
+          "resourceVersion": "1",
+          "uid": "9a570615-89e0-3110-33ef-3c7e4becf668"
+        }
+      }
+    },
+    {
+      "cells": [
+        "10.96.20.234",
+        "services/demo/web",
+        "23m"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "ipaddress.kubernetes.io/ip-family": "IPv4",
+            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
+          },
+          "name": "10.96.20.234",
+          "resourceVersion": "1",
+          "uid": "1f6cc87a-5e2b-620e-847f-d7ce34a6ac2e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "10.96.46.98",
+        "services/kube-system/metrics-server",
+        "23m"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "ipaddress.kubernetes.io/ip-family": "IPv4",
+            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
+          },
+          "name": "10.96.46.98",
+          "resourceVersion": "1",
+          "uid": "abd33ee4-4371-9bd3-a56d-1fe70b6750e0"
+        }
+      }
+    }
+  ]
+}

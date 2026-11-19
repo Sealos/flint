@@ -1,0 +1,61 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name of the resource",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "",
+      "format": "quantity",
+      "name": "cpu",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "",
+      "format": "quantity",
+      "name": "memory",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "",
+      "format": "duration",
+      "name": "Window",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {},
+  "rows": [
+    {
+      "cells": [
+        "flint-dev-control-plane",
+        "177482669n",
+        "938984Ki",
+        "20.051s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "labels": {
+            "beta.kubernetes.io/arch": "arm64",
+            "beta.kubernetes.io/os": "linux",
+            "kubernetes.io/arch": "arm64",
+            "kubernetes.io/hostname": "flint-dev-control-plane",
+            "kubernetes.io/os": "linux",
+            "node-role.kubernetes.io/control-plane": ""
+          },
+          "name": "flint-dev-control-plane"
+        }
+      }
+    }
+  ]
+}

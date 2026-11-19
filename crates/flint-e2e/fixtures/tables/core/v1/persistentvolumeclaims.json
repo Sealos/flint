@@ -1,0 +1,73 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "phase represents the current phase of PersistentVolumeClaim.",
+      "format": "",
+      "name": "Status",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "volumeName is the binding reference to the PersistentVolume backing this claim.",
+      "format": "",
+      "name": "Volume",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "capacity represents the actual resources of the underlying volume.",
+      "format": "",
+      "name": "Capacity",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "accessModes contains the actual access modes the volume backing the PVC has. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1",
+      "format": "",
+      "name": "Access Modes",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "StorageClass of the pvc",
+      "format": "",
+      "name": "StorageClass",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "VolumeAttributesClass of the pvc",
+      "format": "",
+      "name": "VolumeAttributesClass",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "volumeMode defines what type of volume is required by the claim. Value of Filesystem is implied when not included in claim spec.",
+      "format": "",
+      "name": "VolumeMode",
+      "priority": 1,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": []
+}

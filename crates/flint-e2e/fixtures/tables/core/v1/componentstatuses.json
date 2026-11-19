@@ -1,0 +1,82 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Status of the component conditions",
+      "format": "",
+      "name": "Status",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Message of the component conditions",
+      "format": "",
+      "name": "Message",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Error of the component conditions",
+      "format": "",
+      "name": "Error",
+      "priority": 0,
+      "type": "string"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {},
+  "rows": [
+    {
+      "cells": [
+        "controller-manager",
+        "Healthy",
+        "ok",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "name": "controller-manager"
+        }
+      }
+    },
+    {
+      "cells": [
+        "etcd-0",
+        "Healthy",
+        "ok",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "name": "etcd-0"
+        }
+      }
+    },
+    {
+      "cells": [
+        "scheduler",
+        "Healthy",
+        "ok",
+        ""
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "name": "scheduler"
+        }
+      }
+    }
+  ]
+}
