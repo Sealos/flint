@@ -17,18 +17,21 @@ pub struct StartupView {
     pub name: Option<String>,
     /// Open the detail view on its YAML tab instead of Overview.
     pub yaml: bool,
+    /// Open the pod's logs in the dock once its detail is fetched (`#logs`).
+    pub logs: bool,
 }
 
 /// Parses `kind`, `kind/name` (cluster-scoped), or `namespace/kind/name`, optionally followed by
-/// `#yaml`. Returns `None` for anything else.
+/// `#yaml` or `#logs`. Returns `None` for anything else.
 pub fn parse(value: &str) -> Option<StartupView> {
     let (path, tab) = match value.split_once('#') {
         Some((path, tab)) => (path, Some(tab)),
         None => (value, None),
     };
-    let yaml = match tab {
-        None | Some("overview") => false,
-        Some("yaml") => true,
+    let (yaml, logs) = match tab {
+        None | Some("overview") => (false, false),
+        Some("yaml") => (true, false),
+        Some("logs") => (false, true),
         Some(_) => return None,
     };
     let parts: Vec<&str> = path.split('/').collect();
@@ -41,7 +44,7 @@ pub fn parse(value: &str) -> Option<StartupView> {
         [namespace, kind, name] => (Some(*namespace), *kind, Some(*name)),
         _ => return None,
     };
-    if yaml && name.is_none() {
+    if (yaml || logs) && name.is_none() {
         return None;
     }
     Some(StartupView {
@@ -49,6 +52,7 @@ pub fn parse(value: &str) -> Option<StartupView> {
         namespace: namespace.map(str::to_owned),
         name: name.map(str::to_owned),
         yaml,
+        logs,
     })
 }
 
@@ -64,7 +68,8 @@ mod tests {
                 kind: "pods".into(),
                 namespace: None,
                 name: None,
-                yaml: false
+                yaml: false,
+                logs: false
             })
         );
         let web = parse("demo/deployments/web#yaml").unwrap();
@@ -73,7 +78,9 @@ mod tests {
             (web.kind.as_str(), web.name.as_deref()),
             ("deployments", Some("web"))
         );
-        assert!(web.yaml);
+        assert!(web.yaml && !web.logs);
+        let logs = parse("demo/pods/web-1#logs").unwrap();
+        assert!(logs.logs && !logs.yaml);
         let node = parse("nodes/kind-control-plane").unwrap();
         assert_eq!(
             (node.namespace, node.name.as_deref()),
@@ -85,7 +92,8 @@ mod tests {
             "a//b",
             "a/b/c/d",
             "pods#yaml",
-            "demo/pods/x#logs",
+            "pods#logs",
+            "demo/pods/x#shell",
             "/pods",
         ] {
             assert_eq!(parse(bad), None, "{bad}");

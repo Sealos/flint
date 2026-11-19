@@ -564,6 +564,16 @@ impl LogSession {
         self.rx.borrow().clone()
     }
 
+    /// A second reader of this session's snapshots, for a task that waits on them while the
+    /// owner keeps the session (to pause it, and to stop it by dropping it). It starts with the
+    /// newest snapshot unseen, and it does not keep the session running: once the session is
+    /// dropped, [`LogUpdates::changed`] returns `false`.
+    pub fn updates(&self) -> LogUpdates {
+        let mut rx = self.rx.clone();
+        rx.mark_changed();
+        LogUpdates { rx }
+    }
+
     /// Pauses (`true`) or resumes delivery. While paused, snapshots keep the lines shown when
     /// the session was paused and count the lines held back; the buffer keeps filling (and
     /// evicting), so nothing is lost unless it overflows. Resuming shows everything at once.
@@ -573,6 +583,26 @@ impl LogSession {
 
     pub fn is_paused(&self) -> bool {
         *self.paused.borrow()
+    }
+}
+
+/// Reads a [`LogSession`]'s snapshots from elsewhere; see [`LogSession::updates`].
+#[derive(Debug)]
+pub struct LogUpdates {
+    rx: watch::Receiver<Arc<LogSnapshot>>,
+}
+
+impl LogUpdates {
+    /// Waits until a snapshot newer than the last one read with [`LogUpdates::latest`] is
+    /// published. Returns `false` once the session is closed or the core has stopped. Works on
+    /// any executor.
+    pub async fn changed(&mut self) -> bool {
+        self.rx.changed().await.is_ok()
+    }
+
+    /// The newest snapshot, marking it as seen.
+    pub fn latest(&mut self) -> Arc<LogSnapshot> {
+        self.rx.borrow_and_update().clone()
     }
 }
 
@@ -694,6 +724,47 @@ mod tests {
         })
         .await
         .expect("pause shown");
+    }
+
+    // covers UP-42: a view waits on a second reader while it keeps (and later drops) the session.
+    #[tokio::test]
+    async fn a_second_reader_follows_the_session_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let target = LogTarget {
+            namespace: "ns".into(),
+            pod: "p".into(),
+            container: None,
+        };
+        let session = core.open_logs("nowhere", target, LogOptions::default());
+        let mut updates = session.updates();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(updates.changed().await, "session open");
+                if matches!(updates.latest().state, crate::logs::LogState::Ended { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the reader sees the session end");
+        session.set_paused(true);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !updates.latest().paused {
+                assert!(updates.changed().await);
+            }
+        })
+        .await
+        .expect("the reader sees the pause");
+        drop(session);
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while updates.changed().await {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the reader ends once the session is dropped"
+        );
     }
 
     #[tokio::test]

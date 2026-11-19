@@ -86,6 +86,17 @@ pub fn selection_edge(color: Hsla, inset: Pixels) -> Div {
         .bg(color)
 }
 
+/// The background of a search match in a log line: a tint of the warning color, as editors
+/// mark matches, so it never reads as the (accent) selection.
+pub fn log_match(theme: &Theme) -> Hsla {
+    theme.warning.opacity(0.16)
+}
+
+/// The background of the current search match (where next and previous move).
+pub fn log_current_match(theme: &Theme) -> Hsla {
+    theme.warning.opacity(0.3)
+}
+
 /// Installs Flint Light and Flint Dark in place of gpui-component's defaults, showing `mode`.
 /// Call after `gpui_kit::init`.
 pub fn init(mode: ThemeMode, cx: &mut App) {
@@ -138,7 +149,7 @@ pub fn show(mode: ThemeMode, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
-    use super::{THEMES, chrome, resolve, themes};
+    use super::{THEMES, chrome, log_current_match, log_match, resolve, themes};
     use crate::ui::accent::{ACCENT, CANDIDATES};
     use flint_core::Appearance;
     use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, try_parse_color};
@@ -512,6 +523,33 @@ mod tests {
             base,
             UI,
         );
+        // Log lines (`log_view`): error and warning lines and timestamps on the background and
+        // on a selected line are checked above (status text and muted text on the selected
+        // row). Matched text is drawn in the foreground color over the match tint, also inside
+        // a selected line.
+        let selected_line = base.blend(t.table_active);
+        for (bg_name, bg, under) in [
+            ("search match", log_match(t), base),
+            ("current match", log_current_match(t), base),
+            (
+                "search match in a selected line",
+                log_match(t),
+                selected_line,
+            ),
+            (
+                "current match in a selected line",
+                log_current_match(t),
+                selected_line,
+            ),
+        ] {
+            need(
+                &format!("log text on {bg_name}"),
+                t.foreground,
+                bg,
+                under,
+                BODY,
+            );
+        }
         failures
     }
 

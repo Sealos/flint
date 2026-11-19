@@ -201,17 +201,20 @@ pub struct State {
     /// The kind last open per cluster (context name), as a kind id (`pods`,
     /// `deployments.apps`). Reopened when the cluster is selected again, after a restart too.
     pub last_views: BTreeMap<String, String>,
-    /// Pane widths the user dragged, in points. Missing means the default.
+    /// Pane sizes the user dragged, in points. Missing means the default.
     pub panes: PaneWidths,
 }
 
-/// Widths of the window's resizable panes, in points.
+/// Sizes of the window's resizable panes, in points: the widths of the side panes and the
+/// height of the bottom dock (`[panes]` in `state.toml`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PaneWidths {
     pub clusters: Option<u32>,
     pub navigation: Option<u32>,
     pub detail: Option<u32>,
+    /// The bottom dock's height (log and shell tabs).
+    pub dock: Option<u32>,
 }
 
 /// Flint's config directory, from `FLINT_CONFIG_DIR` or the macOS default.
@@ -659,6 +662,7 @@ mod tests {
                 clusters: Some(180),
                 navigation: None,
                 detail: Some(520),
+                dock: Some(300),
             },
             ..Default::default()
         };

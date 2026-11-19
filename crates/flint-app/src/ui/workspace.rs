@@ -1,6 +1,6 @@
 //! The main window: the cluster sidebar, the active cluster's navigation, and the main area
 //! with a header (breadcrumb, namespace filter, watch mode), the resource list, and the detail
-//! pane.
+//! pane, above the bottom dock (log tabs, which outlive cluster switches).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,6 +10,7 @@ use flint_core::settings::{AiExposureState, PaneWidths, State};
 use flint_core::{
     ClusterId, ClusterSummary, ConnectionState, KindId, NavEntry, SyncState, WatchMode,
 };
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -27,7 +28,9 @@ use gpui_kit::*;
 
 use super::clusters::{ClustersModel, state_label};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
+use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
 use super::list::{ListEvent, ResourceList};
+use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
@@ -98,6 +101,16 @@ impl Render for PaneDrag {
     }
 }
 
+/// What a drag of the dock's top edge carries.
+#[derive(Debug, Clone, Copy)]
+struct DockDrag;
+
+impl Render for DockDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 /// The list keeps at least this much room when the detail pane is dragged wider.
 /// 360 px fits Name, Namespace and a status column of a pods list.
 const MIN_LIST_WIDTH: f32 = 360.;
@@ -160,6 +173,8 @@ pub struct Workspace {
     cluster: Option<ClusterId>,
     list: Option<Entity<ResourceList>>,
     detail: Option<Entity<DetailView>>,
+    /// The bottom dock. It does not change with the active cluster.
+    dock: Entity<Dock>,
     /// Namespace names of the active cluster, for the namespace filter.
     namespaces: Vec<String>,
     /// Whether the user may list namespaces (`Failed` when not), for the namespace filter.
@@ -172,6 +187,8 @@ pub struct Workspace {
     startup_view: Option<StartupView>,
     /// Open the next detail view on its YAML tab (`FLINT_VIEW=…#yaml`).
     startup_yaml: bool,
+    /// Open the next detail view's pod logs (`FLINT_VIEW=…#logs`).
+    startup_logs: bool,
     /// The last write of `state.toml`; the next one waits for it, so writes land in order.
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
@@ -253,6 +270,10 @@ impl Workspace {
                 }
             }
         });
+        let dock = cx.new(Dock::new);
+        let on_dock = cx.subscribe_in(&dock, window, |this, _, event, window, cx| match event {
+            DockEvent::Blurred => this.reclaim_focus(window, cx),
+        });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         // Focus left with a closed view (a cluster switch drops the list): take it back, so keys
@@ -271,10 +292,12 @@ impl Workspace {
             cluster: None,
             list: None,
             detail: None,
+            dock,
             namespaces: Vec::new(),
             namespaces_state: SyncState::Idle,
             namespace_input,
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
+            startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             startup_view,
             saving: None,
             _save_panes: Task::ready(()),
@@ -289,6 +312,7 @@ impl Workspace {
                 on_namespace_input,
                 on_quit,
                 on_focus_lost,
+                on_dock,
             ],
         };
         this.show_appearance(window, cx);
@@ -363,6 +387,11 @@ impl Workspace {
             return;
         }
         cx.notify();
+        self.save_panes_later(cx);
+    }
+
+    /// Saves the pane sizes once changes pause for [`PANE_SAVE_DELAY`].
+    fn save_panes_later(&mut self, cx: &mut Context<Self>) {
         let panes = self.panes;
         self._save_panes = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PANE_SAVE_DELAY).await;
@@ -371,6 +400,43 @@ impl Workspace {
                 this.persist(save, cx);
             });
         });
+    }
+
+    /// The dock's height as shown in a window `window_height` tall.
+    pub(in crate::ui) fn dock_height(&self, window_height: f32) -> f32 {
+        dock::dock_height(self.panes.dock, window_height)
+    }
+
+    /// Sets the dock's height within its limits and saves it once changes pause. Dragging its
+    /// edge and `SetDockHeight` both end here.
+    fn resize_dock(&mut self, height: f32, window_height: f32, cx: &mut Context<Self>) {
+        let shown = self.dock_height(window_height);
+        let height = dock::dock_height(Some(height.max(0.).round() as u32), window_height);
+        if height == shown {
+            return;
+        }
+        self.panes.dock = Some(height as u32);
+        cx.notify();
+        self.save_panes_later(cx);
+    }
+
+    /// Opens (or shows) the log tab for `request` in the dock, and focuses it.
+    pub(in crate::ui) fn open_logs(
+        &mut self,
+        request: LogRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let core = self.model.read(cx).core().clone();
+        self.dock.update(cx, |dock, cx| {
+            dock.open(
+                TabKey::Logs(request.clone()),
+                |window, cx| DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx))),
+                window,
+                cx,
+            )
+        });
+        cx.notify();
     }
 
     /// Brings the navigation and main area in line with the model: the active cluster and its
@@ -568,16 +634,30 @@ impl Workspace {
                         .map_or(DetailTab::Overview, |d| d.read(cx).tab())
                 };
                 let core = self.model.read(cx).core().clone();
-                let detail = cx.new(|cx| DetailView::new(core, object, tab, window, cx));
+                let startup_logs = std::mem::take(&mut self.startup_logs);
+                let detail = cx.new(|cx| {
+                    let mut detail = DetailView::new(core, object, tab, window, cx);
+                    if startup_logs {
+                        detail.open_logs_when_loaded();
+                    }
+                    detail
+                });
                 let list = self.list.clone();
                 self._detail_subscriptions =
-                    vec![cx.subscribe(&detail, move |_, _, event, cx| match event {
-                        DetailEvent::Close => {
-                            if let Some(list) = &list {
-                                list.update(cx, |list, cx| list.clear_selection(cx));
+                    vec![
+                        cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
+                            match event {
+                                DetailEvent::Close => {
+                                    if let Some(list) = &list {
+                                        list.update(cx, |list, cx| list.clear_selection(cx));
+                                    }
+                                }
+                                DetailEvent::OpenLogs(request) => {
+                                    this.open_logs(request.clone(), window, cx)
+                                }
                             }
-                        }
-                    })];
+                        }),
+                    ];
                 self.detail = Some(detail);
             }
             ListEvent::SelectedChanged => {
@@ -1393,8 +1473,7 @@ pub fn namespace_summary(filter: &[String]) -> String {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let window_width = f32::from(window.viewport_size().width);
-        // Focus left with a closed view: take it back, so registered actions still reach the
-        // workspace (GPUI dispatches from the focused element up).
+        let window_height = f32::from(window.viewport_size().height);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
@@ -1420,11 +1499,55 @@ impl Render for Workspace {
                 let width = f32::from(e.bounds.size.width);
                 this.drag_pane(pane, x, width, cx);
             }))
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<DockDrag>, _, cx| {
+                let bottom = e.bounds.origin.y + e.bounds.size.height;
+                let height = f32::from(bottom - e.event.position.y);
+                this.resize_dock(height, f32::from(e.bounds.size.height), cx);
+            }))
             .child(self.render_sidebar(&widths, theme, cx))
             .when(has_cluster, |el| {
                 el.child(self.render_nav_column(widths.navigation, theme))
             })
-            .child(self.render_main(window_width, theme, cx))
+            .child(
+                // The main area over the dock, which spans it whichever cluster is active.
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(h_flex().flex_1().min_h_0().w_full().child(self.render_main(
+                        window_width,
+                        theme,
+                        cx,
+                    )))
+                    .when(self.dock.read(cx).is_visible(), |el| {
+                        el.child(
+                            div()
+                                .id("dock-pane")
+                                .h(px(self.dock_height(window_height)))
+                                .flex_none()
+                                .w_full()
+                                .relative()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .child(self.dock.clone())
+                                .child(
+                                    resize_handle::<DockDrag, DockDrag>(
+                                        "dock-edge",
+                                        Axis::Vertical,
+                                    )
+                                    .inside(HandleEdge::Leading)
+                                    .on_drag(
+                                        DockDrag,
+                                        |drag, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.new(|_| *drag)
+                                        },
+                                    ),
+                                )
+                                .test_support(),
+                        )
+                    }),
+            )
     }
 }
 

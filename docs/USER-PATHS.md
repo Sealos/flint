@@ -227,9 +227,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ## M2: Logs and exec
 
 ### UP-40 Read pod logs
-- **When** I open logs for a pod.
-- **Then** I can pick a container, follow new lines, see the previous container's logs, search, and pause following.
-  Memory stays bounded on chatty pods.
+- **When** I open logs for a pod (Logs in its detail pane, or Cmd-L).
+- **Then** a tab opens in the bottom dock (or the open one for that container is shown). I can pick a container, follow
+  new lines, see the previous container's logs, search with highlighted matches and move between them, and pause
+  following, with the number of lines held back shown. Scrolling up stops following; scrolling back to the bottom (or
+  Jump to Newest Line) follows again. The tab says whether it is connecting, streaming, reconnecting (and which
+  attempt) or ended (and why). Memory stays bounded on chatty pods.
 - Tests: cluster, ui.
 
 ### UP-41 Shell into a container
@@ -240,7 +243,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (terminal model, session logic), cluster, ui.
 
 ### UP-42 Sessions outlive navigation
-- **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them.
+- **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them (the tab's
+  close button, or Cmd-W while the dock has focus; elsewhere Cmd-W still closes the window). Cmd-J shows and hides the
+  dock, and its height is remembered.
 - Tests: ui.
 
 ### UP-43 Spot errors in a log stream
@@ -264,6 +269,13 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   reopening the tab. A pod whose stream fails does not stop the others, and the tab shows how many streams are
   live, failed or over the limit. Search, severity, timestamps and selection work as for one pod.
 - Tests: unit, cluster, ui.
+
+### UP-46 Save logs to a file
+- **When** I save a log tab's lines (Cmd-S, the Save menu, or the palette): all of them, the search matches, or the
+  selection.
+- **Then** the native save dialog writes them as shown, with timestamps only if they are shown, and the tab says how
+  many lines went where. The file is not redacted, and the Save menu and the result say so.
+- Tests: unit, ui.
 
 ---
 

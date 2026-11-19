@@ -13,6 +13,7 @@ use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
@@ -23,11 +24,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::list::tabular_figures;
+use super::log_view::LogRequest;
 use super::notice::notice;
-use super::object::{self, MASK, Overview, SecretValue};
+use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
-    self, Close, Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels,
-    ToggleManagedFields, ToggleSecretValue,
+    self, Close, OpenContainerLogs, OpenLogs, Refresh, ShowOverview, ShowYaml, ToggleAnnotations,
+    ToggleLabels, ToggleManagedFields, ToggleSecretValue,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,8 @@ enum Fetch {
 
 pub enum DetailEvent {
     Close,
+    /// Open (or show) a log tab for one of the pod's containers.
+    OpenLogs(LogRequest),
 }
 
 impl EventEmitter<DetailEvent> for DetailView {}
@@ -85,6 +89,8 @@ pub struct DetailView {
     yaml_text: String,
     /// Show `metadata.managedFields` in the YAML (hidden by default).
     show_managed_fields: bool,
+    /// Open the pod's logs once it is fetched (`FLINT_VIEW=…#logs`).
+    open_logs_when_loaded: bool,
     _fetch: Task<()>,
     _yaml: Task<()>,
 }
@@ -120,6 +126,7 @@ impl DetailView {
             yaml,
             yaml_text: String::new(),
             show_managed_fields: false,
+            open_logs_when_loaded: false,
             _fetch: Task::ready(()),
             _yaml: Task::ready(()),
         };
@@ -133,6 +140,11 @@ impl DetailView {
 
     pub fn tab(&self) -> DetailTab {
         self.tab
+    }
+
+    /// Opens the pod's logs as soon as it is fetched, as Logs would (`FLINT_VIEW=…#logs`).
+    pub fn open_logs_when_loaded(&mut self) {
+        self.open_logs_when_loaded = true;
     }
 
     /// Fetches the object again. Calls while a fetch runs coalesce into one more fetch.
@@ -170,6 +182,9 @@ impl DetailView {
                         // A re-render of the previous copy must not land after this one.
                         view._yaml = Task::ready(());
                         view.fetch = Fetch::Loaded { detail, overview };
+                        if std::mem::take(&mut view.open_logs_when_loaded) {
+                            view.open_logs::<OpenLogs>(None, false, cx);
+                        }
                         if view.show_managed_fields == managed {
                             view.set_yaml(yaml, window, cx);
                         } else {
@@ -230,6 +245,17 @@ impl DetailView {
         cx.notify();
     }
 
+    /// Shows `detail` as if a fetch had just returned it: the test servers never answer.
+    #[cfg(test)]
+    pub fn show_fetched(&mut self, detail: ObjectDetail, cx: &mut Context<Self>) {
+        let overview = Arc::new(object::overview(&detail.object, self.is_secret));
+        self.fetch = Fetch::Loaded {
+            detail: Arc::new(detail),
+            overview,
+        };
+        cx.notify();
+    }
+
     fn render_header(&self, theme: &Theme, _cx: &mut Context<Self>) -> impl IntoElement {
         let selected = match self.tab {
             DetailTab::Overview => 0,
@@ -274,6 +300,7 @@ impl DetailView {
                             }),
                     )
                     .when(self.fetching, |el| el.child(Spinner::new().xsmall()))
+                    .children(self.render_logs_button())
                     .child(
                         Button::new("detail-refresh")
                             .icon(IconName::RefreshCw)
@@ -310,6 +337,57 @@ impl DetailView {
                         }
                     }),
             )
+    }
+
+    /// For pods: Logs, with a container picker when the pod has several containers or a
+    /// previous instance to read.
+    fn render_logs_button(&self) -> Option<AnyElement> {
+        let containers: Vec<PodContainer> = self.log_containers().to_vec();
+        let button = Button::new("detail-logs")
+            .xsmall()
+            .ghost()
+            .label("Logs")
+            .tooltip("Open the logs in the dock (⌘L)");
+        match containers.as_slice() {
+            [] => None,
+            [only] if !only.has_previous => Some(
+                button
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            ),
+            _ => Some(
+                button
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let mut menu = menu.label("Container");
+                        for c in &containers {
+                            let label = if c.init {
+                                format!("{} (init)", c.name)
+                            } else {
+                                c.name.clone()
+                            };
+                            menu = menu.item(PopupMenuItem::new(label).on_click(
+                                registry::on_click(OpenContainerLogs {
+                                    container: c.name.clone(),
+                                    previous: false,
+                                }),
+                            ));
+                        }
+                        if containers.iter().any(|c| c.has_previous) {
+                            menu = menu.separator().label("Previous instance");
+                            for c in containers.iter().filter(|c| c.has_previous) {
+                                menu = menu.item(PopupMenuItem::new(c.name.clone()).on_click(
+                                    registry::on_click(OpenContainerLogs {
+                                        container: c.name.clone(),
+                                        previous: true,
+                                    }),
+                                ));
+                            }
+                        }
+                        menu
+                    })
+                    .into_any_element(),
+            ),
+        }
     }
 
     fn render_notices(&self, theme: &Theme) -> Vec<AnyElement> {

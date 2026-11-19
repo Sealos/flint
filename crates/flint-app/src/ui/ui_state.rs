@@ -1,5 +1,5 @@
 //! UI state kept in `state.toml`: the namespace filter and the last open kind of each cluster,
-//! and the pane widths.
+//! and the pane sizes (side pane widths and the dock's height).
 //!
 //! The file is read once at startup and written whole after each change, off the UI thread.
 //! The app is its only writer.
@@ -185,6 +185,7 @@ mod tests {
             clusters: Some(200),
             navigation: Some(260),
             detail: None,
+            dock: Some(240),
         };
         save(ui.set_panes(panes).unwrap());
         assert!(ui.set_panes(panes).is_none());
