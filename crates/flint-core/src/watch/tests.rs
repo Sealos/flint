@@ -251,12 +251,14 @@ fn forbidden() -> FetchError {
     FetchError::Denied("pods is forbidden: User \"dev\" cannot list resource \"pods\"".into())
 }
 
-/// Waits (in paused time) until the newest snapshot satisfies `pred`.
+/// Waits (in paused time) until the newest snapshot satisfies `pred`. The limit is above the
+/// slowest retry these tests wait for: the 30 s all-namespaces recheck plus up to 25% jitter.
+/// (macOS clocks tick in microseconds, which makes the jitter 0 there; Linux shows the real one.)
 async fn until(
     rx: &mut tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
     pred: impl Fn(&KindSnapshot) -> bool,
 ) -> Arc<KindSnapshot> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let snap = rx.borrow_and_update().clone();
             if pred(&snap) {

@@ -82,8 +82,23 @@ GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API serv
 | `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
-`flint mcp` must be buildable without GPUI for that job. `app-e2e` runs on PRs. `cluster-e2e` runs on PRs that touch
-`flint-core` or `flint-mcp`, on master, and nightly.
+`app-e2e` runs on PRs. `cluster-e2e` runs on PRs that touch `flint-core` or `flint-mcp`, on master, and nightly.
+
+**The MCP server without GPUI.** The `flint-mcp` crate has a binary target, `flint-mcp`, that serves the same
+`flint_mcp::run_stdio` as `flint mcp` and links no GPUI. The MCP e2e tests (`crates/flint-mcp/tests/mcp_stdio.rs`)
+drive that binary, so they run on Linux. A smoke test in `flint-app` checks that `flint mcp` reaches the same server.
+Users still run `flint mcp`; the release ships only `flint`. A separate binary was chosen over a cargo feature on
+`flint-app` because it keeps GPUI out of the Linux build graph entirely, with no feature combinations to test.
+
+**Cluster setup.** `scripts/cluster-fixtures.sh` installs metrics-server and the `demo` fixtures on a kind cluster.
+`scripts/dev-cluster.sh up` and the `cluster-e2e` job both call it, so local runs and CI test the same cluster. To run
+the cluster tests locally:
+
+```sh
+scripts/dev-cluster.sh up
+KUBECONFIG=.dev/kubeconfig FLINT_TEST_KUBECONFIG=.dev/kubeconfig FLINT_CONFIG_DIR="$(mktemp -d)" \
+  cargo test --workspace -- --include-ignored
+```
 
 ### Screenshots
 

@@ -1,0 +1,74 @@
+name: Cluster e2e
+
+# flint-core and flint-mcp against a real API server: kind on Linux (docs/TESTING.md). macOS
+# runners have no Docker, so this is the only CI job that talks to a cluster. The MCP e2e tests
+# drive the GPUI-free `flint-mcp` binary, the same server as `flint mcp`.
+on:
+  pull_request:
+    paths:
+      - crates/flint-core/**
+      - crates/flint-mcp/**
+      - Cargo.toml
+      - Cargo.lock
+      - scripts/cluster-fixtures.sh
+      - .github/workflows/cluster-e2e.yml
+  push:
+    branches: [master]
+  schedule:
+    # Nightly, to catch drift in kind, metrics-server and the podinfo chart.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cluster-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # The cluster kind-action creates; the tests and scripts use this file only.
+  KUBECONFIG: ${{ github.workspace }}/.dev/kubeconfig
+  FLINT_TEST_KUBECONFIG: ${{ github.workspace }}/.dev/kubeconfig
+  FLINT_CONFIG_DIR: ${{ github.workspace }}/target/ci-flint-config
+
+jobs:
+  cluster-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-cluster-e2e
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # Compile before the cluster exists, so a build failure doesn't wait on kind.
+      - name: Build tests
+        run: cargo test -p flint-core -p flint-mcp --locked --no-run
+      # Named like scripts/dev-cluster.sh's cluster: the tests expect context kind-flint-dev.
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: flint-dev
+          kubeconfig: ${{ env.KUBECONFIG }}
+          wait: 120s
+      - name: Install fixtures
+        run: scripts/cluster-fixtures.sh
+      - name: Unit, cluster and MCP e2e tests
+        run: cargo test -p flint-core -p flint-mcp --locked -- --include-ignored
+      # Tests create their objects in namespaces and a CRD group of their own and delete them.
+      - name: Nothing left behind
+        run: |
+          leftovers="$(kubectl get ns,crd -o name | grep -E 'm1fix|flint' || true)"
+          leftovers="$leftovers$(kubectl -n demo get secret -o name | grep flint-test || true)"
+          if [ -n "$leftovers" ]; then
+            echo "::error::tests left objects behind: $leftovers"
+            exit 1
+          fi
+      - name: Cluster state
+        if: failure()
+        run: |
+          kubectl get nodes,pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true

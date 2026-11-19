@@ -1,7 +1,8 @@
-//! Drives `flint mcp` over stdio against the dev cluster. Ignored by default; run it with
-//! `--include-ignored` and `FLINT_TEST_KUBECONFIG` set (see `scripts/dev-cluster.sh`). The server
-//! gets that kubeconfig (plus one extra context that is not exposed) and a scratch config dir,
-//! never the user's own files. The test also uses `kubectl` with that kubeconfig, only.
+//! Drives the MCP server over stdio, as the `flint-mcp` binary: the same server as `flint mcp`,
+//! without GPUI, so this runs on Linux CI against kind. The cluster test is ignored by default;
+//! run it with `--include-ignored` and `FLINT_TEST_KUBECONFIG` set (see `scripts/dev-cluster.sh`).
+//! The server gets that kubeconfig (plus one extra context that is not exposed) and a scratch
+//! config dir, never the user's own files. The test also uses `kubectl` with that kubeconfig, only.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -72,10 +73,9 @@ struct Server {
 }
 
 impl Server {
-    /// Starts `flint mcp` with only the given kubeconfig list and config dir, and initializes it.
+    /// Starts `flint-mcp` with only the given kubeconfig list and config dir, and initializes it.
     fn start(kubeconfig: &std::ffi::OsStr, config_dir: &std::path::Path) -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_flint"))
-            .arg("mcp")
+        let mut child = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
             .env("FLINT_LOG", "warn")

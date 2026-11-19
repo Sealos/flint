@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# The server without the desktop app, so it builds where GPUI does not (Linux CI). Users run
+# `flint mcp`; see docs/TESTING.md.
+[[bin]]
+name = "flint-mcp"
+path = "src/main.rs"
+
 [dependencies]
 flint-core.workspace = true
 rmcp.workspace = true
@@ -17,6 +23,9 @@ serde_json.workspace = true
 serde-saphyr.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+# Logging for the `flint-mcp` binary, as in `flint mcp`.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
