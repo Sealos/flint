@@ -24,38 +24,69 @@ pub enum ClusterError {
     Config { context: String, message: String },
     #[error("{0}")]
     Kube(String),
-    /// `server` is already safe to show ([`redact::server_url`]); build it with
-    /// [`ClusterError::timeout`].
-    #[error("Timed out after {} {}", seconds(*after), reaching(server.as_deref()))]
+    /// A request or the whole attempt took too long. `after` is the limit, when known (a
+    /// connection timeout inside kube does not say). Build it with [`ClusterError::timeout`] or
+    /// [`ClusterError::kube`]; [`ClusterError::for_target`] names the server and the plugin.
+    /// Both are already safe to show ([`Target`]).
+    #[error("{}", timeout_message(*after, server.as_deref(), exec_command.as_deref()))]
     Timeout {
-        after: Duration,
+        after: Option<Duration>,
         server: Option<String>,
+        exec_command: Option<String>,
     },
     /// The exec auth plugin's program is not on `PATH`. `command` is its file name only
     /// ([`redact::command_name`]), filled in by [`ClusterError::for_target`].
-    #[error("{} not found on PATH ({})", plugin(command.as_deref()), crate::env_path::process_path_origin())]
+    #[error("{}", exec_not_found_message(command.as_deref()))]
     ExecPluginNotFound { command: Option<String> },
 }
 
-fn plugin(command: Option<&str>) -> String {
-    match command {
-        Some(command) => format!("Exec plugin `{command}`"),
-        None => "Exec auth plugin".to_owned(),
+/// `timed out after 10s reaching https://host:6443 (including exec plugin `aws`)`.
+fn timeout_message(after: Option<Duration>, server: Option<&str>, exec: Option<&str>) -> String {
+    let mut out = "timed out".to_owned();
+    if let Some(after) = after {
+        out.push_str(&format!(" after {}", go_duration(after)));
     }
-}
-
-fn seconds(d: Duration) -> String {
-    if d.subsec_millis() == 0 {
-        format!("{} s", d.as_secs())
-    } else {
-        format!("{:.1} s", d.as_secs_f64())
-    }
-}
-
-fn reaching(server: Option<&str>) -> String {
     match server {
-        Some(server) => format!("reaching {server}"),
-        None => "connecting".to_owned(),
+        Some(server) => out.push_str(&format!(" reaching {server}")),
+        None => out.push_str(" connecting"),
+    }
+    if let Some(exec) = exec {
+        out.push_str(&format!(" (including exec plugin `{exec}`)"));
+    }
+    out
+}
+
+/// The one wording for a missing exec auth plugin, wherever it is reported.
+fn exec_not_found_message(command: Option<&str>) -> String {
+    let plugin = match command {
+        Some(command) => format!("exec auth plugin `{command}`"),
+        None => "exec auth plugin".to_owned(),
+    };
+    format!(
+        "{plugin} not found on PATH ({}); install it, or set `path` in Flint's settings.toml",
+        crate::env_path::process_path_origin()
+    )
+}
+
+/// A duration as Go (and so kubectl) prints it: `500ms`, `10s`, `1.5s`, `1m0s`.
+fn go_duration(d: Duration) -> String {
+    let millis = d.as_millis();
+    if millis < 1000 {
+        return format!("{millis}ms");
+    }
+    let secs = d.as_secs();
+    let frac = d.subsec_millis();
+    let seconds = |s: u64| {
+        if frac == 0 {
+            format!("{s}s")
+        } else {
+            format!("{}s", format!("{s}.{frac:03}").trim_end_matches('0'))
+        }
+    };
+    if secs < 60 {
+        seconds(secs)
+    } else {
+        format!("{}m{}", secs / 60, seconds(secs % 60))
     }
 }
 
@@ -67,6 +98,12 @@ impl ClusterError {
         match &err {
             kube::Error::Api(status) => ClusterError::Kube(api_status_message(status)),
             _ if is_exec_not_found(&err) => ClusterError::ExecPluginNotFound { command: None },
+            // kube's own connection timeout: the server did not answer at all.
+            _ if is_transport_timeout(&err) => ClusterError::Timeout {
+                after: None,
+                server: None,
+                exec_command: None,
+            },
             _ => ClusterError::Kube(error_chain(&err)),
         }
     }
@@ -75,9 +112,15 @@ impl ClusterError {
     /// [`redact::server_url`]).
     pub fn timeout(after: Duration, server: Option<&str>) -> Self {
         ClusterError::Timeout {
-            after,
+            after: Some(after),
             server: server.map(redact::server_url),
+            exec_command: None,
         }
+    }
+
+    /// Whether the cluster could not be reached in time (the server did not answer).
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, ClusterError::Timeout { .. })
     }
 
     /// Names what failed: the API server a timeout was reaching, the plugin that is missing.
@@ -86,10 +129,12 @@ impl ClusterError {
         match self {
             ClusterError::Timeout {
                 after,
-                server: None,
+                server,
+                exec_command,
             } => ClusterError::Timeout {
                 after,
-                server: target.server.clone(),
+                server: server.or_else(|| target.server.clone()),
+                exec_command: exec_command.or_else(|| target.exec_command.clone()),
             },
             ClusterError::ExecPluginNotFound { command: None } => {
                 ClusterError::ExecPluginNotFound {
@@ -267,6 +312,21 @@ pub fn error_chain(err: &(dyn StdError + 'static)) -> String {
     out
 }
 
+/// Whether `err` is a connection or read that timed out below kube (its `connect_timeout`).
+fn is_transport_timeout(err: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if e.is::<tokio::time::error::Elapsed>()
+            || e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
 /// Whether `err` is an exec auth plugin whose program could not be found.
 fn is_exec_not_found(err: &(dyn StdError + 'static)) -> bool {
     matches!(
@@ -305,10 +365,9 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
         A::AuthExec(_) => {
             "authentication failed: the exec auth plugin reported an error".to_owned()
         }
-        A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
-            "authentication failed: the exec auth plugin was not found on PATH ({})",
-            crate::env_path::process_path_origin()
-        ),
+        A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            exec_not_found_message(None)
+        }
         A::AuthExecStart(e) => format!(
             "authentication failed: the exec auth plugin could not be started ({}). Is it on PATH?",
             e.kind()
@@ -435,24 +494,23 @@ mod tests {
             .to_string();
         assert_eq!(
             message,
-            "Exec plugin `aws` not found on PATH (inherited PATH)"
+            "exec auth plugin `aws` not found on PATH (inherited PATH); install it, or set \
+             `path` in Flint's settings.toml"
         );
         for secret in ["s3cr3t", "secret-arg", "someone", "pw", "token"] {
             assert!(!message.contains(secret), "{message}");
         }
-        // Without a target, the message still says what is missing.
-        assert_eq!(
-            ClusterError::kube(exec_not_found()).to_string(),
-            "Exec auth plugin not found on PATH (inherited PATH)"
-        );
-        // Strings built from the chain (watch errors) say the same, without the command.
-        let chain = error_chain(&exec_not_found());
-        assert!(chain.contains("not found on PATH"), "{chain}");
+        // Without a target, and in strings built from the chain (watch errors), the wording is
+        // the same, without the command.
+        let anonymous = "exec auth plugin not found on PATH (inherited PATH); install it, or set \
+                         `path` in Flint's settings.toml";
+        assert_eq!(ClusterError::kube(exec_not_found()).to_string(), anonymous);
+        assert_eq!(error_chain(&exec_not_found()), anonymous);
     }
 
     // covers UP-04
     #[test]
-    fn timeouts_name_the_api_server_without_credentials() {
+    fn timeouts_name_the_api_server_and_plugin_without_credentials() {
         let target = Target::of(&exec_kubeconfig("aws"), "ctx");
         assert_eq!(
             target.server.as_deref(),
@@ -461,7 +519,7 @@ mod tests {
         let err = ClusterError::timeout(Duration::from_secs(10), None).for_target(&target);
         assert_eq!(
             err.to_string(),
-            "Timed out after 10 s reaching https://eks.example.com:443/x"
+            "timed out after 10s reaching https://eks.example.com:443/x (including exec plugin `aws`)"
         );
         let direct = ClusterError::timeout(
             Duration::from_millis(1500),
@@ -469,21 +527,52 @@ mod tests {
         );
         assert_eq!(
             direct.to_string(),
-            "Timed out after 1.5 s reaching https://127.0.0.1:6443"
+            "timed out after 1.5s reaching https://127.0.0.1:6443"
         );
         // A server already named is kept.
+        let token_target = Target::of(&kubeconfig("https://other:6443"), "ctx");
         assert_eq!(
-            direct.for_target(&target).to_string(),
-            "Timed out after 1.5 s reaching https://127.0.0.1:6443"
+            direct.for_target(&token_target).to_string(),
+            "timed out after 1.5s reaching https://127.0.0.1:6443"
         );
         assert_eq!(
-            ClusterError::timeout(Duration::from_secs(60), None).to_string(),
-            "Timed out after 60 s connecting"
+            ClusterError::timeout(CONNECT_TIMEOUT, None).to_string(),
+            "timed out after 1m0s connecting"
         );
         assert_eq!(
             Target::of(&exec_kubeconfig("aws"), "nope"),
             Target::default()
         );
+    }
+
+    // covers UP-04
+    #[test]
+    fn durations_print_as_go_does() {
+        for (d, s) in [
+            (Duration::from_millis(500), "500ms"),
+            (Duration::from_secs(10), "10s"),
+            (Duration::from_millis(1500), "1.5s"),
+            (Duration::from_millis(2250), "2.25s"),
+            (Duration::from_secs(60), "1m0s"),
+            (Duration::from_secs(90), "1m30s"),
+        ] {
+            assert_eq!(go_duration(d), s);
+        }
+    }
+
+    // covers UP-04
+    #[test]
+    fn transport_timeouts_become_timeouts() {
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline has elapsed");
+        let err = ClusterError::kube(kube::Error::Service(Box::new(io)));
+        assert!(err.is_timeout(), "{err}");
+        let target = Target::of(&kubeconfig("https://10.255.255.1:6443"), "ctx");
+        assert_eq!(
+            err.for_target(&target).to_string(),
+            "timed out reaching https://10.255.255.1:6443"
+        );
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(!ClusterError::kube(kube::Error::Service(Box::new(refused))).is_timeout());
     }
 
     // covers UP-04
@@ -504,7 +593,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            format!("Timed out after 2 s reaching http://{addr}")
+            format!("timed out after 2s reaching http://{addr}")
         );
     }
 }

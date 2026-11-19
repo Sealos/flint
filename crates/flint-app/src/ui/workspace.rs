@@ -429,26 +429,24 @@ impl Workspace {
         if let Some(view) = self.startup_view.take() {
             // Names as kubectl takes them (`deploy`, `po`, `Deployment.apps`), resolved by the
             // same core resolver as the MCP server.
-            let entry = match discovery.resolve(&view.kind) {
-                Ok(kind) => entries().find(|e| e.id == kind.id()).cloned(),
-                Err(e) => {
-                    tracing::warn!("FLINT_VIEW: {e}");
+            let entry = match discovery.nav_entry(&view.kind) {
+                Ok(entry) => Some(entry.clone()),
+                Err(e @ flint_core::NavEntryError::Unresolved(_)) => {
+                    tracing::warn!(kind = view.kind, "FLINT_VIEW names no kind: {e}");
+                    None
+                }
+                Err(e @ flint_core::NavEntryError::NotInNavigation(_)) => {
+                    tracing::warn!(kind = view.kind, "FLINT_VIEW cannot be opened: {e}");
                     None
                 }
             };
-            match entry {
-                Some(entry) => {
-                    self.open_kind(&entry, window, cx);
-                    if let (Some(list), Some(name)) = (&self.list, view.name) {
-                        list.update(cx, |list, cx| {
-                            list.select_when_listed(view.namespace, name, cx)
-                        });
-                    }
+            if let Some(entry) = entry {
+                self.open_kind(&entry, window, cx);
+                if let (Some(list), Some(name)) = (&self.list, view.name) {
+                    list.update(cx, |list, cx| {
+                        list.select_when_listed(view.namespace, name, cx)
+                    });
                 }
-                None => tracing::warn!(
-                    kind = view.kind,
-                    "FLINT_VIEW names a kind this cluster does not serve"
-                ),
             }
         } else if let Some(entry) = self
             .ui_state

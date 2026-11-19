@@ -93,34 +93,62 @@ pub fn safe_error_summary(error: &str) -> String {
     redact_quoted(&crate::kubeconfig::error_summary(error))
 }
 
-/// What may be shown of an API server URL: scheme, host, port and path. User info, query and
-/// fragment are dropped, since a hand-written kubeconfig could put a credential there. The rest
-/// is what kubeconfig, `settings.toml` (ADR-0009) and the app's sidebar already show.
+/// Shown instead of a server URL that cannot be shown safely.
+pub const HIDDEN_SERVER_URL: &str = "<server URL not shown>";
+
+/// What may be shown of an API server URL: `scheme://host[:port][/path]`. User info, query and
+/// fragment are dropped, since a hand-written kubeconfig could put a credential there. A URL that
+/// does not parse, or that still holds an `@` after that (a password with a `/` or `?` in it),
+/// becomes [`HIDDEN_SERVER_URL`]. The rest is what kubeconfig, `settings.toml` (ADR-0009) and the
+/// app's sidebar already show.
 pub fn server_url(url: &str) -> String {
-    let url = url.trim();
-    let (scheme, rest) = match url.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, url),
+    let Ok(uri) = url.trim().parse::<http::Uri>() else {
+        return HIDDEN_SERVER_URL.to_owned();
     };
-    let rest = rest.split(['?', '#']).next().unwrap_or_default();
-    let (authority, path) = match rest.find('/') {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
+    let Some(host) = uri.host().filter(|h| !h.is_empty()) else {
+        return HIDDEN_SERVER_URL.to_owned();
     };
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    match scheme {
-        Some(scheme) => format!("{scheme}://{host}{path}"),
-        None => format!("{host}{path}"),
+    let authority = uri.authority().map_or("", |a| a.as_str());
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    // An `@` outside the authority means a `/`, `?` or `#` in a password split the URL early,
+    // and a port that is not a number is the rest of a user name and password: either way,
+    // what parsed as the host is part of a credential.
+    let port = if host_port.starts_with('[') {
+        host_port.rsplit_once("]:").map(|(_, port)| port)
+    } else {
+        host_port.rsplit_once(':').map(|(_, port)| port)
+    };
+    let bad_port = port.is_some_and(|p| p.parse::<u16>().is_err());
+    if (url.contains('@') && !authority.contains('@')) || bad_port {
+        return HIDDEN_SERVER_URL.to_owned();
     }
+    let mut out = String::new();
+    if let Some(scheme) = uri.scheme_str() {
+        out.push_str(scheme);
+        out.push_str("://");
+    }
+    out.push_str(host);
+    if let Some(port) = uri.port_u16() {
+        out.push_str(&format!(":{port}"));
+    }
+    let path = uri.path();
+    if path != "/" {
+        out.push_str(path);
+    }
+    if out.contains('@') {
+        return HIDDEN_SERVER_URL.to_owned();
+    }
+    out
 }
 
 /// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
-/// its directory (which can name the user's home), arguments or environment.
+/// its directory (which can name the user's home), arguments or environment. A command written
+/// with its arguments (`aws eks get-token`) keeps only the first word.
 pub fn command_name(command: &str) -> String {
-    let command = command.trim();
-    std::path::Path::new(command)
+    let program = command.split_whitespace().next().unwrap_or_default();
+    std::path::Path::new(program)
         .file_name()
-        .map_or_else(|| command.to_owned(), |n| n.to_string_lossy().into_owned())
+        .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -170,24 +198,47 @@ mod tests {
     }
 
     #[test]
-    fn server_urls_drop_user_info_query_and_fragment() {
-        assert_eq!(
-            server_url("https://127.0.0.1:6443"),
-            "https://127.0.0.1:6443"
-        );
-        assert_eq!(
-            server_url(" https://admin:hunter2@api.example.com:6443/k8s/clusters/c-1?token=x#y "),
-            "https://api.example.com:6443/k8s/clusters/c-1"
-        );
-        assert_eq!(server_url("u:p@host:443"), "host:443");
+    fn server_urls_keep_scheme_host_port_and_path_only() {
+        for (url, shown) in [
+            ("https://127.0.0.1:6443", "https://127.0.0.1:6443"),
+            ("https://127.0.0.1:6443/", "https://127.0.0.1:6443"),
+            (
+                " https://admin:hunter2@api.example.com:6443/k8s/clusters/c-1?token=x#y ",
+                "https://api.example.com:6443/k8s/clusters/c-1",
+            ),
+            ("https://[::1]:6443", "https://[::1]:6443"),
+            ("u:p@host:443", "host:443"),
+        ] {
+            assert_eq!(server_url(url), shown, "{url}");
+        }
     }
 
     #[test]
-    fn command_names_drop_the_directory() {
+    fn server_urls_never_show_user_info() {
+        // Passwords with `/`, `?` or `#` move the rest of the user info into the path or query.
+        for url in [
+            "https://admin:pa/ss@host",
+            "https://u:p?x@host",
+            "https://u:123/x@host",
+            "https://u:p#x@host",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(server_url(url), HIDDEN_SERVER_URL, "{url}");
+        }
+    }
+
+    #[test]
+    fn command_names_drop_the_directory_and_arguments() {
         assert_eq!(command_name("aws"), "aws");
         assert_eq!(
             command_name("/Users/someone/bin/gke-gcloud-auth-plugin"),
             "gke-gcloud-auth-plugin"
         );
+        assert_eq!(
+            command_name(" /opt/bin/aws eks get-token --secret x"),
+            "aws"
+        );
+        assert_eq!(command_name(""), "");
     }
 }

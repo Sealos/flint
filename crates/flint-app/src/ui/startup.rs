@@ -8,8 +8,10 @@ pub const FLINT_VIEW: &str = "FLINT_VIEW";
 /// What `FLINT_VIEW` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupView {
-    /// A kind as `plural` (core group) or `plural.group`, matched like `kubectl get` would
-    /// match the plural: `pods`, `deployments`, `deployments.apps`, `widgets.example.com`.
+    /// A kind as `kubectl get` takes it, ignoring case: Kind, plural, singular or short name,
+    /// optionally with `.group` (`po`, `deploy`, `Deployment.apps`, `widgets.example.com`).
+    /// Resolved by the core resolver once discovery arrives
+    /// ([`flint_core::ClusterDiscovery::nav_entry`]).
     pub kind: String,
     pub namespace: Option<String>,
     pub name: Option<String>,

@@ -89,7 +89,7 @@ async fn reads_kinds_and_objects() {
         .await
         .unwrap();
 
-    let kinds = read::discover_kinds(&client).await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap().kinds;
     let pods = read::resolve_kind(&kinds, "pods", None).unwrap();
     assert_eq!(pods.api_version(), "v1");
     assert!(pods.namespaced && pods.is_listable());

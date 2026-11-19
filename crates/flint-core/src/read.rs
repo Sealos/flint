@@ -4,7 +4,10 @@
 //! These functions apply no policy. Callers decide limits, redaction, and who may see what (the
 //! MCP server does this in `flint-mcp`; the UI will use these directly).
 
-use futures::AsyncReadExt as _;
+use std::future::Future;
+use std::time::Duration;
+
+use futures::{AsyncReadExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::{Event, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResourceList;
 use kube::Client;
@@ -101,49 +104,120 @@ impl std::fmt::Display for KindId {
     }
 }
 
+/// How long each discovery request may take. A server that does not answer fails discovery
+/// after this, instead of after kube's 30 s connection timeout.
+pub const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the whole of discovery may take (many groups on a slow server, without aggregated
+/// discovery).
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Group discovery requests in flight at once, without aggregated discovery.
+const DISCOVERY_CONCURRENCY: usize = 8;
+
+/// What [`discover_kinds`] found.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredKinds {
+    /// Every kind found, core kinds first, then by group and kind.
+    pub kinds: Vec<KindInfo>,
+    /// API groups whose discovery failed and that are missing from `kinds` (an aggregated API
+    /// whose backend is down, often metrics.k8s.io). Sorted. Only servers without aggregated
+    /// discovery report these; aggregated discovery lists such groups as stale instead.
+    pub skipped_groups: Vec<String>,
+}
+
 /// Runs API discovery and returns every kind, CRDs included, at each group's preferred version.
-/// Core kinds come first. Uses aggregated discovery when the server supports it (1.30+, beta
-/// from 1.26), which needs two requests instead of one per group.
+/// Uses aggregated discovery when the server supports it (1.30+, beta from 1.26), which needs two
+/// requests instead of one per group.
+///
+/// Falls back to one request per group only when the server does not support aggregated
+/// discovery, never because the server could not be reached. Each request is bounded by
+/// [`DISCOVERY_REQUEST_TIMEOUT`] and the whole by [`DISCOVERY_TIMEOUT`]; a timeout is a
+/// [`ClusterError::Timeout`] (pass it through [`ClusterError::for_target`] to name the server).
 ///
 /// Discovery is read here rather than through `kube::Discovery`, which drops the singular and
 /// short names that [`resolve_kind`] matches (`deploy`, `po`, `svc`).
-pub async fn discover_kinds(client: &Client) -> Result<Vec<KindInfo>, ClusterError> {
-    let mut kinds = match discover_aggregated(client).await {
-        Ok(Some(kinds)) => kinds,
-        Ok(None) => {
-            tracing::debug!("no aggregated discovery, falling back");
-            discover_per_group(client)
-                .await
-                .map_err(ClusterError::kube)?
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "aggregated discovery failed, falling back");
-            discover_per_group(client)
-                .await
-                .map_err(ClusterError::kube)?
+pub async fn discover_kinds(client: &Client) -> Result<DiscoveredKinds, ClusterError> {
+    discover_kinds_within(client, DISCOVERY_REQUEST_TIMEOUT, DISCOVERY_TIMEOUT).await
+}
+
+async fn discover_kinds_within(
+    client: &Client,
+    per_request: Duration,
+    overall: Duration,
+) -> Result<DiscoveredKinds, ClusterError> {
+    let discover = async {
+        match discover_aggregated(client, per_request).await? {
+            Some(kinds) => Ok(DiscoveredKinds {
+                kinds,
+                skipped_groups: Vec::new(),
+            }),
+            None => {
+                tracing::debug!("no aggregated discovery, discovering each group");
+                discover_per_group(client, per_request).await
+            }
         }
     };
+    let mut found = tokio::time::timeout(overall, discover)
+        .await
+        .unwrap_or_else(|_| Err(ClusterError::timeout(overall, None)))?;
     // Put the core group first, then sort by group and kind.
-    kinds.sort_by(|a, b| {
+    found.kinds.sort_by(|a, b| {
         (!a.group().is_empty(), a.group(), a.kind()).cmp(&(
             !b.group().is_empty(),
             b.group(),
             b.kind(),
         ))
     });
-    Ok(kinds)
+    Ok(found)
+}
+
+/// One discovery request, bounded by `limit`. The outer error is the timeout; the inner one is
+/// kube's, kept so the caller can tell "not supported" from "failed".
+async fn bounded<T>(
+    limit: Duration,
+    request: impl Future<Output = Result<T, kube::Error>>,
+) -> Result<Result<T, kube::Error>, ClusterError> {
+    tokio::time::timeout(limit, request)
+        .await
+        .map_err(|_| ClusterError::timeout(limit, None))
+}
+
+/// [`bounded`], with kube's error converted too.
+async fn bounded_request<T>(
+    limit: Duration,
+    request: impl Future<Output = Result<T, kube::Error>>,
+) -> Result<T, ClusterError> {
+    bounded(limit, request).await?.map_err(ClusterError::kube)
+}
+
+/// Whether an aggregated discovery request failed because the server does not offer it: no such
+/// path (404), the media type refused (406), or a body that is not the aggregated document.
+fn aggregated_not_supported(err: &kube::Error) -> bool {
+    match err {
+        kube::Error::Api(status) => matches!(status.code, 404 | 406),
+        kube::Error::SerdeError(_) => true,
+        _ => false,
+    }
 }
 
 /// Aggregated discovery: `/api` and `/apis`, each in one request. `None` when the server does
 /// not support it.
-async fn discover_aggregated(client: &Client) -> Result<Option<Vec<KindInfo>>, kube::Error> {
-    let core = client.list_core_api_versions_aggregated().await?;
-    // A server without aggregated discovery answers with the plain document, which parses as
-    // an empty list. The core group is always served, so empty means "not supported".
-    if core.items.is_empty() {
-        return Ok(None);
-    }
-    let apis = client.list_api_groups_aggregated().await?;
+async fn discover_aggregated(
+    client: &Client,
+    limit: Duration,
+) -> Result<Option<Vec<KindInfo>>, ClusterError> {
+    let core = match bounded(limit, client.list_core_api_versions_aggregated()).await? {
+        // A server without aggregated discovery answers with the plain document, which parses
+        // as an empty list. The core group is always served, so empty means "not supported".
+        Ok(core) if core.items.is_empty() => return Ok(None),
+        Ok(core) => core,
+        Err(e) if aggregated_not_supported(&e) => return Ok(None),
+        Err(e) => return Err(ClusterError::kube(e)),
+    };
+    let apis = match bounded(limit, client.list_api_groups_aggregated()).await? {
+        Ok(apis) => apis,
+        Err(e) if aggregated_not_supported(&e) => return Ok(None),
+        Err(e) => return Err(ClusterError::kube(e)),
+    };
     Ok(Some(
         core.items
             .into_iter()
@@ -179,33 +253,54 @@ fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
         .collect()
 }
 
-/// Discovery for servers without aggregated discovery: one request per group, at its preferred
-/// version. A group whose discovery fails (an aggregated API whose backend is down, often
-/// metrics-server) is left out instead of failing the whole cluster.
-async fn discover_per_group(client: &Client) -> Result<Vec<KindInfo>, kube::Error> {
+/// Discovery for servers without aggregated discovery: one request per group at its preferred
+/// version, [`DISCOVERY_CONCURRENCY`] at a time. A group whose request fails or times out is
+/// left out and named in [`DiscoveredKinds::skipped_groups`] instead of failing the whole
+/// cluster. The core group and the group list must succeed.
+async fn discover_per_group(
+    client: &Client,
+    limit: Duration,
+) -> Result<DiscoveredKinds, ClusterError> {
     let mut kinds = Vec::new();
-    let core = client.list_core_api_versions().await?;
+    let core = bounded_request(limit, client.list_core_api_versions()).await?;
     if let Some(version) = core.versions.first() {
-        let list = client.list_core_api_resources(version).await?;
+        let list = bounded_request(limit, client.list_core_api_resources(version)).await?;
         kinds.extend(kinds_from_resource_list("", version, list));
     }
-    for group in client.list_api_groups().await?.groups {
-        let Some(gv) = group
-            .preferred_version
-            .or_else(|| group.versions.into_iter().next())
-        else {
-            continue;
-        };
-        match client.list_api_group_resources(&gv.group_version).await {
-            Ok(list) => kinds.extend(kinds_from_resource_list(&group.name, &gv.version, list)),
-            Err(e) => tracing::warn!(
-                group = group.name,
-                error = %e,
-                "discovery failed for an API group; leaving it out"
-            ),
+    let groups = bounded_request(limit, client.list_api_groups())
+        .await?
+        .groups;
+    let mut found: Vec<(String, Result<Vec<KindInfo>, ClusterError>)> =
+        futures::stream::iter(groups.into_iter().filter_map(|group| {
+            let gv = group
+                .preferred_version
+                .or_else(|| group.versions.into_iter().next())?;
+            Some((group.name, gv))
+        }))
+        .map(|(name, gv)| async move {
+            let result = bounded_request(limit, client.list_api_group_resources(&gv.group_version))
+                .await
+                .map(|list| kinds_from_resource_list(&name, &gv.version, list));
+            (name, result)
+        })
+        .buffer_unordered(DISCOVERY_CONCURRENCY)
+        .collect()
+        .await;
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut skipped_groups = Vec::new();
+    for (name, result) in found {
+        match result {
+            Ok(group_kinds) => kinds.extend(group_kinds),
+            Err(e) => {
+                tracing::warn!(group = name, error = %e, "discovery failed for an API group; leaving it out");
+                skipped_groups.push(name);
+            }
         }
     }
-    Ok(kinds)
+    Ok(DiscoveredKinds {
+        kinds,
+        skipped_groups,
+    })
 }
 
 fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -> Vec<KindInfo> {
@@ -238,13 +333,13 @@ fn api_resource(group: &str, version: &str, kind: String, plural: String) -> Api
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ResolveKindError {
     #[error("no resource kind matches \"{0}\"")]
     NotFound(String),
     /// Several kinds match equally well. `candidates` are their ids (`plural.group`).
     #[error(
-        "\"{query}\" matches several resource kinds: {}. Name one of them",
+        "\"{query}\" matches several resource kinds. Pass one of these as kind: {}",
         candidates.join(", ")
     )]
     Ambiguous {
@@ -819,8 +914,8 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "\"wd\" matches several resource kinds: gadgets.other.example.org, \
-             widgets.example.com. Name one of them"
+            "\"wd\" matches several resource kinds. Pass one of these as kind: \
+             gadgets.other.example.org, widgets.example.com"
         );
     }
 
@@ -906,5 +1001,204 @@ mod tests {
         assert!(resolve_kind(&kinds(), "", None).is_err());
         assert!(resolve_kind(&kinds(), ".apps", None).is_err());
         assert!(resolve_kind(&kinds(), "Pod", Some("apps/v1")).is_err());
+    }
+
+    /// A fake API server: answers each path in `routes` with its status and JSON body, anything
+    /// else with 404, and counts connections. Plain HTTP on 127.0.0.1, one request per
+    /// connection.
+    async fn fake_api(
+        routes: Vec<(&'static str, u16, serde_json::Value)>,
+    ) -> (Client, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        let routes = std::sync::Arc::new(routes);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let path = text
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/")
+                        .to_owned();
+                    let (code, body) = routes
+                        .iter()
+                        .find(|(p, _, _)| *p == path)
+                        .map(|(_, code, body)| (*code, body.to_string()))
+                        .unwrap_or_else(|| {
+                            (
+                                404,
+                                serde_json::json!({"kind": "Status", "code": 404}).to_string(),
+                            )
+                        });
+                    let response = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let config = kube::Config::new(url.parse().unwrap());
+        (Client::try_from(config).unwrap(), connections)
+    }
+
+    fn resource(name: &str, kind: &str, short: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "singularName": kind.to_ascii_lowercase(), "namespaced": true,
+            "kind": kind, "verbs": ["get", "list", "watch"], "shortNames": short,
+        })
+    }
+
+    // covers UP-10, UP-22
+    #[tokio::test]
+    async fn without_aggregated_discovery_each_group_is_read_and_failures_are_skipped() {
+        use serde_json::json;
+        // The plain `/api` document parses as an empty aggregated list: "not supported".
+        let (client, _) = fake_api(vec![
+            ("/api", 200, json!({"kind": "APIVersions", "versions": ["v1"]})),
+            (
+                "/api/v1",
+                200,
+                json!({"groupVersion": "v1", "resources": [
+                    resource("pods", "Pod", &["po"]),
+                    resource("pods/log", "Pod", &[]),
+                ]}),
+            ),
+            (
+                "/apis",
+                200,
+                json!({"kind": "APIGroupList", "groups": [
+                    {"name": "apps", "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
+                     "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}},
+                    {"name": "metrics.k8s.io",
+                     "versions": [{"groupVersion": "metrics.k8s.io/v1beta1", "version": "v1beta1"}]},
+                    {"name": "broken.example.com",
+                     "versions": [{"groupVersion": "broken.example.com/v1", "version": "v1"}]},
+                ]}),
+            ),
+            (
+                "/apis/apps/v1",
+                200,
+                json!({"groupVersion": "apps/v1", "resources": [
+                    resource("deployments", "Deployment", &["deploy"]),
+                ]}),
+            ),
+            (
+                "/apis/metrics.k8s.io/v1beta1",
+                503,
+                json!({"kind": "Status", "code": 503, "message": "service unavailable"}),
+            ),
+            (
+                "/apis/broken.example.com/v1",
+                500,
+                json!({"kind": "Status", "code": 500, "message": "internal error"}),
+            ),
+        ])
+        .await;
+        // kube retries a 503 until the per-request limit; a 500 fails at once. Both skip.
+        let found =
+            discover_kinds_within(&client, Duration::from_millis(500), Duration::from_secs(5))
+                .await
+                .unwrap();
+        let ids: Vec<String> = found.kinds.iter().map(|k| k.id().to_string()).collect();
+        assert_eq!(ids, ["pods", "deployments.apps"]);
+        assert_eq!(
+            found.skipped_groups,
+            ["broken.example.com", "metrics.k8s.io"]
+        );
+        assert_eq!(id(&found.kinds, "deploy", None), "deployments.apps");
+        assert_eq!(id(&found.kinds, "po", None), "pods");
+    }
+
+    // covers UP-10
+    #[tokio::test]
+    async fn aggregated_discovery_is_used_when_served() {
+        use serde_json::json;
+        let group = |name: &str, kind: &str, plural: &str| {
+            json!({"metadata": {"name": name}, "versions": [{"version": "v1", "resources": [{
+                "resource": plural, "responseKind": {"kind": kind}, "scope": "Namespaced",
+                "verbs": ["list"], "shortNames": ["x"],
+            }]}]})
+        };
+        let (client, _) = fake_api(vec![
+            ("/api", 200, json!({"items": [group("", "Pod", "pods")]})),
+            (
+                "/apis",
+                200,
+                json!({"items": [group("apps", "Deployment", "deployments")]}),
+            ),
+        ])
+        .await;
+        let found = discover_kinds(&client).await.unwrap();
+        let ids: Vec<String> = found.kinds.iter().map(|k| k.id().to_string()).collect();
+        assert_eq!(ids, ["pods", "deployments.apps"]);
+        assert!(found.skipped_groups.is_empty());
+    }
+
+    // covers UP-04
+    #[tokio::test]
+    async fn an_unreachable_server_fails_fast_without_the_fallback() {
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
+        let limit = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = discover_kinds_within(&client, limit, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.is_timeout(), "{err}");
+        assert_eq!(err.to_string(), "timed out after 300ms connecting");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // One request, no per-group fallback after it.
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // covers UP-10
+    #[test]
+    fn only_missing_aggregated_discovery_means_not_supported() {
+        let status = |code| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            }))
+        };
+        assert!(aggregated_not_supported(&status(404)));
+        assert!(aggregated_not_supported(&status(406)));
+        assert!(!aggregated_not_supported(&status(403)));
+        assert!(!aggregated_not_supported(&status(503)));
+        let parse = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert!(aggregated_not_supported(&kube::Error::SerdeError(parse)));
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline has elapsed");
+        assert!(!aggregated_not_supported(&kube::Error::Service(Box::new(
+            io
+        ))));
     }
 }

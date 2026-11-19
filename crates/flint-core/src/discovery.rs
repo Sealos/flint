@@ -28,6 +28,27 @@ impl ClusterDiscovery {
     pub fn resolve(&self, query: &str) -> Result<&KindInfo, ResolveKindError> {
         crate::read::resolve_kind(&self.kinds, query, None)
     }
+
+    /// The navigation entry for a kind the user typed (`deploy`, `po`, `Deployment.apps`), for
+    /// opening its list. A kind can resolve and still have no entry: only listable kinds are
+    /// in the navigation.
+    pub fn nav_entry(&self, query: &str) -> Result<&NavEntry, NavEntryError> {
+        let kind = self.resolve(query).map_err(NavEntryError::Unresolved)?;
+        let id = kind.id();
+        self.navigation
+            .entry(&id)
+            .ok_or(NavEntryError::NotInNavigation(id))
+    }
+}
+
+/// Why [`ClusterDiscovery::nav_entry`] found no entry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NavEntryError {
+    #[error(transparent)]
+    Unresolved(ResolveKindError),
+    /// The name resolved to this kind, which is served but cannot be listed, so has no view.
+    #[error("{0} is served but cannot be listed, so it has no list to open")]
+    NotInNavigation(KindId),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -531,6 +552,35 @@ pub(crate) mod tests {
         assert!(matches!(
             discovery.resolve("nope"),
             Err(ResolveKindError::NotFound(_))
+        ));
+    }
+
+    // covers UP-21
+    #[test]
+    fn nav_entries_for_typed_names() {
+        let mut deploy = kind("apps", "Deployment", "deployments", true, LW);
+        deploy.short_names = vec!["deploy".into()];
+        let discovery = ClusterDiscovery::new(vec![
+            kind("", "Pod", "pods", true, LW),
+            kind("", "Binding", "bindings", true, &["create"]),
+            deploy,
+        ]);
+        assert_eq!(
+            discovery.nav_entry("deploy").unwrap().id.as_str(),
+            "deployments.apps"
+        );
+        assert_eq!(discovery.nav_entry("PODS").unwrap().id.as_str(), "pods");
+        assert_eq!(
+            discovery.nav_entry("binding").unwrap_err(),
+            NavEntryError::NotInNavigation(KindId::new("", "bindings"))
+        );
+        assert_eq!(
+            discovery.nav_entry("binding").unwrap_err().to_string(),
+            "bindings is served but cannot be listed, so it has no list to open"
+        );
+        assert!(matches!(
+            discovery.nav_entry("sprocket"),
+            Err(NavEntryError::Unresolved(ResolveKindError::NotFound(_)))
         ));
     }
 }

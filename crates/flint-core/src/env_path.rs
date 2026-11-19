@@ -33,12 +33,12 @@ pub enum PathSource {
 
 impl PathSource {
     /// Where the `PATH` came from, for messages such as "not found on PATH (PATH from login
-    /// shell)".
+    /// shell)". The fallback's reason is left out: it can quote the shell's output.
     pub fn describe(&self) -> &'static str {
         match self {
             PathSource::Settings => "PATH from settings.toml",
             PathSource::LoginShell => "PATH from login shell",
-            PathSource::Fallback(_) => "fallback PATH, login shell not used",
+            PathSource::Fallback(_) => "fallback PATH: the login shell could not be read",
         }
     }
 }
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(PathSource::Settings.describe(), "PATH from settings.toml");
         assert_eq!(
             PathSource::Fallback("timeout".into()).describe(),
-            "fallback PATH, login shell not used"
+            "fallback PATH: the login shell could not be read"
         );
         // Tests never install a PATH.
         assert_eq!(process_path_origin(), "inherited PATH");
