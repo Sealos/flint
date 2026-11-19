@@ -1901,6 +1901,43 @@ pub mod tests {
         }
     }
 
+    // covers UP-41: on Linux, `secondary-` app shortcuts become Ctrl ones. Every one that is
+    // Ctrl with a plain letter (what a shell uses: Ctrl-W, Ctrl-R, Ctrl-L, ...) must be in the
+    // terminal's passthrough, so it reaches the shell inside a shell tab. Checked for Linux on
+    // every host, since the keys are written once for both.
+    #[test]
+    fn linux_ctrl_letter_shortcuts_reach_the_shell() {
+        use gpui_kit::{Keystroke, OperatingSystem};
+        let linux = |k: &str| Keystroke::parse_with_os(k, OperatingSystem::Linux).unwrap();
+        let passthrough: Vec<Keystroke> = super::TERMINAL_PASSTHROUGH
+            .iter()
+            .map(|k| linux(k))
+            .collect();
+        for spec in actions() {
+            if spec.key_context == Some(super::TERMINAL) {
+                continue;
+            }
+            for key in spec.keys {
+                let k = linux(key);
+                let m = k.modifiers;
+                let ctrl_letter = m.control
+                    && !m.shift
+                    && !m.alt
+                    && !m.platform
+                    && k.key.len() == 1
+                    && k.key.chars().all(|c| c.is_ascii_alphabetic());
+                if ctrl_letter {
+                    assert!(
+                        passthrough.contains(&k),
+                        "{} binds {key} (Ctrl-{} on Linux), which a shell tab must pass through",
+                        spec.name,
+                        k.key
+                    );
+                }
+            }
+        }
+    }
+
     // covers UP-41: the keys a shell needs are not the app's inside a shell tab, and the tab's
     // own shortcuts are not among them.
     #[test]

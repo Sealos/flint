@@ -404,7 +404,10 @@ impl DetailView {
             .xsmall()
             .ghost()
             .label("Shell")
-            .tooltip("Open a shell in the dock (⇧⌘E)");
+            .tooltip(format!(
+                "Open a shell in the dock ({})",
+                registry::key_hint("secondary-shift-e")
+            ));
         match containers.as_slice() {
             [] => None,
             [_] => Some(
