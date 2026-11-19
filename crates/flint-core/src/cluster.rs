@@ -27,7 +27,7 @@ pub enum ClusterError {
 }
 
 impl ClusterError {
-    /// API errors become "<reason>: <message>" (for example "NotFound: pods \"x\" not found");
+    /// API errors become `"<reason>: <message>"` (for example "NotFound: pods \"x\" not found");
     /// other errors keep their full source chain.
     pub fn kube(err: kube::Error) -> Self {
         match &err {
