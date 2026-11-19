@@ -32,11 +32,9 @@ use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
 use clusters::ClustersModel;
-use registry::{CloseWindow, Quit};
+use registry::{AppearanceDark, AppearanceLight, AppearanceSystem, CloseWindow, Quit};
 use ui_state::UiState;
 use workspace::Workspace;
-
-actions!(flint, [AppearanceSystem, AppearanceLight, AppearanceDark]);
 
 /// Names a context to activate at startup, exactly as clicking it would. A development and testing
 /// aid (for example for agents taking screenshots); it never selects anything else.
@@ -174,9 +172,21 @@ fn appearance_menu(appearance: Appearance) -> Menu {
         disabled: false,
     };
     Menu::new("View").items([MenuItem::submenu(Menu::new("Appearance").items([
-        item("System", Box::new(AppearanceSystem), Appearance::System),
-        item("Light", Box::new(AppearanceLight), Appearance::Light),
-        item("Dark", Box::new(AppearanceDark), Appearance::Dark),
+        item(
+            registry::label::<AppearanceSystem>(),
+            Box::new(AppearanceSystem),
+            Appearance::System,
+        ),
+        item(
+            registry::label::<AppearanceLight>(),
+            Box::new(AppearanceLight),
+            Appearance::Light,
+        ),
+        item(
+            registry::label::<AppearanceDark>(),
+            Box::new(AppearanceDark),
+            Appearance::Dark,
+        ),
     ]))])
 }
 

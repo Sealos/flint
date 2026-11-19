@@ -43,7 +43,13 @@ actions!(
         /// Quit Flint.
         Quit,
         /// Close the front window.
-        CloseWindow
+        CloseWindow,
+        /// Follow macOS light and dark mode (the `appearance` setting).
+        AppearanceSystem,
+        /// Always use Flint Light.
+        AppearanceLight,
+        /// Always use Flint Dark.
+        AppearanceDark
     ]
 );
 actions!(
@@ -956,6 +962,15 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<CloseWindow>("Close Window", "Close the front window.")
             .of(C::Flint, S::App)
             .keys(&["cmd-w"], None),
+        Spec::unit::<AppearanceSystem>(
+            "Use System Appearance",
+            "Follow macOS light and dark mode.",
+        )
+        .of(C::Flint, S::App),
+        Spec::unit::<AppearanceLight>("Use Light Appearance", "Always use Flint Light.")
+            .of(C::Flint, S::App),
+        Spec::unit::<AppearanceDark>("Use Dark Appearance", "Always use Flint Dark.")
+            .of(C::Flint, S::App),
         Spec::confirm(),
         Spec::unit::<Cancel>("Cancel", "Dismiss the open dialog.").of(C::Flint, S::Dialog),
         // Clusters.

@@ -14,9 +14,10 @@ use gpui_kit::{
 
 use super::accent::ACCENT;
 use super::clusters::ClustersModel;
+use super::registry::{AppearanceDark, AppearanceLight, AppearanceSystem};
+use super::theme;
 use super::ui_state::UiState;
 use super::workspace::Workspace;
-use super::{AppearanceDark, AppearanceLight, AppearanceSystem, theme};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -108,7 +109,7 @@ async fn switching_appearance_swaps_the_theme_colors(cx: &mut TestAppContext) {
     cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
         .await;
     let light_text = cx.update(|cx| cx.theme().foreground);
-    assert_eq!(checked(cx), ["System"]);
+    assert_eq!(checked(cx), ["Use System Appearance"]);
 
     cx.update(|cx| cx.dispatch_action(&AppearanceDark));
     cx.wait_for(window, WAIT, shows("Flint Dark", ThemeMode::Dark))
@@ -118,7 +119,7 @@ async fn switching_appearance_swaps_the_theme_colors(cx: &mut TestAppContext) {
         assert_ne!(theme.foreground, light_text);
         assert_eq!(theme.primary, hex(ACCENT.dark.fill));
     });
-    assert_eq!(checked(cx), ["Dark"]);
+    assert_eq!(checked(cx), ["Use Dark Appearance"]);
     // Persisted: written to settings.toml, so the next start opens dark.
     let saved = flint_core::settings::load_settings(dir.path()).unwrap();
     assert_eq!(saved.appearance, Appearance::Dark);
@@ -130,14 +131,19 @@ async fn switching_appearance_swaps_the_theme_colors(cx: &mut TestAppContext) {
         assert_eq!(cx.theme().foreground, light_text);
         assert_eq!(cx.theme().primary, hex(ACCENT.light.fill));
     });
-    assert_eq!(checked(cx), ["Light"]);
+    assert_eq!(checked(cx), ["Use Light Appearance"]);
 
-    cx.update(|cx| cx.dispatch_action(&AppearanceDark));
+    // The same action by name, as the palette and automation send it.
+    cx.update_window(window, |_, window, cx| {
+        super::registry::dispatch("flint::AppearanceDark", serde_json::Value::Null, window, cx)
+    })
+    .unwrap()
+    .unwrap();
     cx.wait_for(window, WAIT, shows("Flint Dark", ThemeMode::Dark))
         .await;
     // Back to following the window's own appearance.
     cx.update(|cx| cx.dispatch_action(&AppearanceSystem));
     cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
         .await;
-    assert_eq!(checked(cx), ["System"]);
+    assert_eq!(checked(cx), ["Use System Appearance"]);
 }
