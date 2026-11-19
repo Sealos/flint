@@ -901,6 +901,10 @@ impl Render for DetailView {
 #[path = "detail_actions.rs"]
 mod actions;
 
+#[cfg(any(test, feature = "automation"))]
+#[path = "detail_state.rs"]
+mod state;
+
 #[cfg(test)]
 mod tests {
     use super::timestamp_age;

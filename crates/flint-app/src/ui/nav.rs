@@ -414,6 +414,10 @@ impl Render for NavPanel {
 #[path = "nav_actions.rs"]
 mod actions;
 
+#[cfg(any(test, feature = "automation"))]
+#[path = "nav_state.rs"]
+mod state;
+
 #[cfg(test)]
 mod tests {
     use super::{Collapsed, Marker, collapsed_by_default, marker};

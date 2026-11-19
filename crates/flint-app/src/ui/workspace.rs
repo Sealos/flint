@@ -1405,6 +1405,10 @@ impl Render for Workspace {
 #[path = "workspace_actions.rs"]
 mod actions;
 
+#[cfg(any(test, feature = "automation"))]
+#[path = "workspace_state.rs"]
+mod state;
+
 #[cfg(test)]
 mod tests {
     use super::{Layout, MIN_LIST_WIDTH, layout, namespace_summary};

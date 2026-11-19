@@ -285,13 +285,13 @@ pub struct Arg {
 pub enum ActionError {
     /// No action has this name.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     Unknown(String),
     /// The arguments do not fit the action.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     InvalidArgs { action: String, message: String },
@@ -380,7 +380,7 @@ impl ActionSpec {
 
     /// Builds the action from its arguments: a JSON object, or `null` for none.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     pub fn build(&self, args: Value) -> Result<Box<dyn Action>, ActionError> {
@@ -521,7 +521,7 @@ pub fn available_in<'a>(
 /// its key binding would, after the availability and guard checks. Names outside the registry
 /// are built by GPUI, so library actions work too (without guards).
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "automation")),
     expect(dead_code, reason = "used by the command palette (#29) and automation")
 )]
 pub fn dispatch(

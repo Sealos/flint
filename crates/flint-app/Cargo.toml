@@ -24,6 +24,16 @@ serde_json.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
 
+# The automation channel only (feature `automation`).
+async-channel = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+[features]
+# The test-only automation channel (docs/TESTING.md). Never in release builds. GPUI's test
+# support renders the window to an image for screenshots.
+automation = ["dep:async-channel", "dep:image", "dep:libc", "gpui-kit/test-support"]
+
 [dev-dependencies]
 # Headless GPUI windows for view tests (`#[gpui_kit::test]`).
 gpui-kit = { workspace = true, features = ["test-support"] }

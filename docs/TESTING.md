@@ -35,24 +35,56 @@ perform a registered action; `scripts/check-click-actions.sh` enforces this in C
 
 ### Automation channel
 
-A test-only control socket lets e2e tests and agents drive the real app.
+A test-only control socket lets e2e tests and agents drive the real app. The code is in
+`crates/flint-app/src/ui/automation/`.
 
-- **Built only with `--features automation`.** Release builds contain no automation code. CI's release-build job checks
-  that the symbol is absent.
-- **Socket location:** a Unix socket in `FLINT_CONFIG_DIR`, readable and writable only by its owner (mode `0600`). The
-  app refuses to start the channel when `FLINT_CONFIG_DIR` is not set, so it never uses the user's real config.
-- **Protocol:** newline-delimited JSON. A request is `{"id", "cmd", "args"}`. Commands:
-  - `select_cluster`
-  - `open_view`
-  - `select_row`
-  - `dispatch_action` (any registered action, such as menu items or palette commands)
-  - `type_text`
-  - `press_key`
-  - `state` (returns the visible view tree as JSON: views, rows, banners, focus)
-  - `wait_for` (a predicate on `state`, with a timeout)
-  - `screenshot` (captures the app window)
+- **Built only with `--features automation`.** Release builds contain no automation code. CI's `macos (flint-app)`
+  job runs flint-app's clippy and tests with the feature too, and checks that its release binary has none of the
+  channel's strings (the binary is stripped, so there are no symbols to look for).
+- **Socket location:** `$FLINT_CONFIG_DIR/automation.sock`, mode `0600`. It is created in a private directory and
+  moved into place, so nobody can connect before its mode is set, and connections from another user are refused.
+  The app refuses to start the channel (it logs an error and runs on without it) when `FLINT_CONFIG_DIR` is not set,
+  so it never uses the user's real config. The socket is removed when the app quits.
+- **Protocol:** newline-delimited JSON. A request is `{"id", "cmd", "args"}`; `id` is echoed back and `args` may be
+  left out when a command takes none. A response is `{"id", "ok": true, "result"}` or
+  `{"id", "ok": false, "error": {"code", "message"}}`, with `code` one of `bad_request`, `unknown_command`,
+  `invalid_args`, `not_found` (no such action), `not_available` (nothing handles it now, or it is disabled),
+  `rejected` (available, but the arguments would do nothing: an unknown cluster, kind, row or column), `timeout`,
+  `failed`. Commands:
+  - `select_cluster {cluster}`: the sidebar click.
+  - `open_view {kind}`: the navigation click. `kind` matches like `FLINT_VIEW`: `pods`, `deployments.apps`.
+  - `select_row {namespace?, name}`: the row click, among the rows passing the filters.
+  - These three dispatch `workspace::SelectCluster`, `workspace::OpenView` and `resource_list::SelectRow`, so the
+    registry's guards check them exactly as they check a click.
+  - `dispatch_action {name, args?}`: any registered action by name (`workspace::SetNamespaces`,
+    `detail::ShowTab`), and any other GPUI action, such as a dialog's.
+  - `type_text {text}`: one keystroke per character, to the focused element.
+  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `cmd-w`).
+  - `state`: the visible view tree: `focus`, `dialog`, `clusters`, sidebar `banners`, `active_cluster`, `main`,
+    `header`, `nav` (sections, and the entries of open ones), `list` (columns as drawn and up to 500 rows in display
+    order, Secret cells masked, with its `banners` and `placeholder`) and `detail` (which object, tab and fetch
+    state; never its content). Errors in it are sanitized summaries.
+  - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` until the value at a JSON Pointer passes one test
+    (`equals`, `not_equals`, `at_least`, `at_most` (numbers, or an array's length), `exists`, `contains`), and returns
+    that state. Default timeout 5 s, at most 120 s.
+  - `screenshot {path?}`: renders the window to a PNG (default `$FLINT_CONFIG_DIR/screenshots/`) and returns its path
+    and size in pixels. It renders the last drawn frame offscreen, so it needs no screen-recording permission.
+- Commands that act draw the window before they return (as GPUI does before handling a key), so the next command
+  sees the new focus and views even while the window is hidden or the screen is locked. They do not wait for data:
+  follow them with `wait_for`. `screenshot` draws first too.
 - The automation channel calls the same code paths as clicks and keys, never shortcuts into the core. Otherwise a
-  passing e2e test proves nothing about the UI.
+  passing e2e test proves nothing about the UI. It reaches controls through the action registry
+  (`crates/flint-app/src/ui/registry.rs`), where every interactive control is a named action; the command palette
+  uses the same registry.
+
+Try it by hand:
+
+```sh
+cargo build -p flint-app --features automation
+export FLINT_CONFIG_DIR=$(mktemp -d)
+KUBECONFIG=.dev/kubeconfig FLINT_CLUSTER=kind-flint-dev target/debug/flint &
+echo '{"id":1,"cmd":"open_view","args":{"kind":"pods"}}' | nc -U "$FLINT_CONFIG_DIR/automation.sock"
+```
 
 ### E2E harness: `crates/flint-e2e`
 
@@ -84,7 +116,7 @@ GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API serv
 |---|---|---|
 | `test (<crate>)` | Linux | Unit tests for `flint-core` and `flint-mcp`, one job per crate |
 | `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display). Flint ships for macOS only; this is a cheap second check |
-| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, and a release build. The only CI job that needs macOS |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. The only CI job that needs macOS |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 | `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
 

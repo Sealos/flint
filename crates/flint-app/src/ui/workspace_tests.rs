@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::ui::detail::DetailTab;
 use crate::ui::registry::{self, ActionError};
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
+use crate::ui::view_state::Focus;
 
 /// Selects `cluster` and waits until the workspace follows.
 async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
@@ -115,6 +116,20 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
         Err(ActionError::Rejected { .. })
     ));
     activate(cx, &t, "beta").await;
+
+    // The automation `state` sees the same: the active cluster, its row, where focus is.
+    let workspace = t.workspace.clone();
+    let state = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx))
+        })
+        .unwrap();
+    assert_eq!(state.active_cluster.as_deref(), Some("beta"));
+    assert!(state.clusters.iter().any(|c| c.name == "beta" && c.active));
+    assert_eq!(state.focus, Focus::Workspace);
+    assert!(state.list.is_none() && state.detail.is_none() && !state.dialog);
+    assert!(state.header.is_some());
+
     let offered = names(cx);
     assert!(offered.contains(&"workspace::OpenView"), "{offered:?}");
     assert!(offered.contains(&"workspace::ShowAllNamespaces"));
@@ -192,6 +207,14 @@ async fn list_and_detail_actions_work_from_the_workspace(cx: &mut TestAppContext
 
     focus_workspace(cx, &t);
     dispatch(cx, &t, "detail::ShowYaml", Value::Null).unwrap();
+    let workspace = t.workspace.clone();
+    let state = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx))
+        })
+        .unwrap();
+    assert_eq!(state.detail.as_ref().map(|d| d.tab), Some("yaml"));
+    assert_eq!(state.list.as_ref().map(|l| l.shown), Some(2));
     let tab = t
         .workspace
         .read_with(cx, |ws, cx| ws.detail.as_ref().map(|d| d.read(cx).tab()));

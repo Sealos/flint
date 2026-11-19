@@ -8,6 +8,8 @@
 mod accent;
 #[cfg(test)]
 mod appearance_tests;
+#[cfg(feature = "automation")]
+mod automation;
 mod clusters;
 mod detail;
 mod list;
@@ -21,6 +23,8 @@ mod startup;
 mod support_tests;
 mod theme;
 mod ui_state;
+#[cfg(any(test, feature = "automation"))]
+mod view_state;
 mod workspace;
 
 use std::cell::Cell;
@@ -127,13 +131,19 @@ pub fn run(boot: Bootstrap) {
                 }),
                 ..Default::default()
             };
-            if let Err(e) = gpui_kit::open_window(options, cx, |window, cx| {
+            match gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
                     Workspace::new(model, ui_state, startup_view, forced_appearance, window, cx)
                 })
             }) {
-                tracing::error!("could not open the window: {e:#}");
-                cx.quit();
+                #[cfg(feature = "automation")]
+                Ok((window, workspace)) => automation::start(window, workspace, cx),
+                #[cfg(not(feature = "automation"))]
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("could not open the window: {e:#}");
+                    cx.quit();
+                }
             }
             cx.activate(true);
         });

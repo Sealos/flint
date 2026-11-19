@@ -106,8 +106,9 @@ jobs:
         run: cargo test -p flint-app --locked
 
   # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
-  # and docs, and a release build that catches profile-only problems (LTO, strip) before
-  # release-please does.
+  # and docs (also with the test-only automation channel), and a release build that catches
+  # profile-only problems (LTO, strip) before release-please does, and proves the automation
+  # channel is not in it.
   macos:
     name: macos (flint-app)
     runs-on: macos-latest
@@ -125,10 +126,22 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy
         run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
+      - name: Clippy (automation channel)
+        run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
       - name: Tests
         run: cargo test -p flint-app --locked
+      - name: Tests (automation channel)
+        run: cargo test -p flint-app --features automation --locked
       - name: Docs
         run: cargo doc -p flint-app --no-deps --document-private-items --locked
       - name: Release build
         run: cargo build --release --locked -p flint-app
       - run: ./target/release/flint --help
+      # The automation channel is test-only (docs/TESTING.md): its socket name and log lines
+      # must not be in what ships. The release binary is stripped, so look for its strings.
+      - name: Release binary has no automation channel
+        run: |
+          if strings -a ./target/release/flint | grep -E 'automation\.sock|automation channel'; then
+            echo "::error::the release binary contains the automation channel"
+            exit 1
+          fi
