@@ -158,7 +158,8 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected(ServerVersion),
-    Failed(String),
+    /// Why it failed, as safe to show ([`crate::cluster::ClusterError::summary`]).
+    Failed(crate::SafeErrorText),
 }
 
 /// A cluster as the sidebar shows it.

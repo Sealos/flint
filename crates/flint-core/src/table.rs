@@ -810,7 +810,10 @@ impl PageError {
 
     /// The error as the watch engine sorts it, naming `target`'s server.
     pub fn into_fetch(self, target: &cluster::Target) -> FetchError {
-        FetchError::from_kind(self.kind, self.error.for_target(target).to_string())
+        FetchError::from_kind(
+            self.kind,
+            self.error.for_target(target).summary().to_string(),
+        )
     }
 }
 
@@ -837,7 +840,7 @@ pub(crate) async fn fetch_page(
     if object.is_status() {
         return Err(PageError {
             kind: ApiErrorKind::from_code(object.code.unwrap_or(0)),
-            error: ClusterError::Kube(object.status_message()),
+            error: ClusterError::Api(object.status_message()),
         });
     }
     Ok(object)

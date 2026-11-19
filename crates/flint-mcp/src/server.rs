@@ -88,9 +88,10 @@ struct Conn {
 }
 
 impl Conn {
-    /// A cluster error as the agent reads it: naming the server and the exec plugin.
+    /// A cluster error as the agent reads it: naming the server and the exec plugin, with the
+    /// server's own text cut to one short line ([`ClusterError::for_agent`]).
     fn fail(&self, e: ClusterError) -> ToolError {
-        ToolError(e.for_target(&self.target).to_string())
+        ToolError(e.for_target(&self.target).for_agent())
     }
 }
 
@@ -341,7 +342,7 @@ impl FlintMcp {
                 .map_err(|_| ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None))?
             })
             .await
-            .map_err(|e| e.for_target(&target).to_string())
+            .map_err(|e| e.for_target(&target).for_agent())
             .map_err(ToolError)?
             .clone();
         Ok(Conn {

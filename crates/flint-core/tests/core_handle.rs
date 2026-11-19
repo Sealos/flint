@@ -269,8 +269,11 @@ async fn unreachable_cluster_fails_with_a_readable_error() {
     })
     .await
     .expect("the attempt fails well within the timeout");
-    assert!(message.to_lowercase().contains("connect"), "{message}");
-    assert!(!message.contains("Status {"), "{message}");
+    assert!(
+        message.as_str().to_lowercase().contains("connect"),
+        "{message}"
+    );
+    assert!(!message.as_str().contains("Status {"), "{message}");
     // The core still answers: another cluster can be selected.
     core.send(Command::Activate("two".into()));
     tokio::time::timeout(Duration::from_secs(5), async {

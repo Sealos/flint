@@ -26,7 +26,7 @@ pub mod terminal;
 pub mod view;
 mod watch;
 
-pub use cluster::{ClusterId, ServerVersion};
+pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{
     ClusterDiscovery, NavEntry, NavEntryError, NavSection, Navigation, SectionKind,
 };

@@ -8,8 +8,8 @@
 //! [`flint_core::redact::safe_error_summary`] (connection errors arrive already reduced, see
 //! [`connection_error_text`]).
 
-use flint_core::SyncState;
 use flint_core::redact::safe_error_summary;
+use flint_core::{SafeErrorText, SyncState};
 use serde::Serialize;
 
 /// The whole window.
@@ -287,10 +287,10 @@ pub fn error_text(error: &str) -> String {
 }
 
 /// A failed connection's error as the screen shows it. Core already reduced the text that came
-/// from kube or the kubeconfig ([`flint_core::cluster::ClusterError::summary`]); hiding quoted
-/// values again would hide what Flint quotes itself, the exec plugin's name.
-pub fn connection_error_text(error: &str) -> String {
-    error.to_owned()
+/// from kube or the kubeconfig ([`SafeErrorText`]); hiding quoted values again would hide what
+/// Flint quotes itself, the exec plugin's name.
+pub fn connection_error_text(error: &SafeErrorText) -> String {
+    error.to_string()
 }
 
 #[cfg(test)]

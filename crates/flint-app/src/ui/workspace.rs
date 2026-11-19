@@ -1349,7 +1349,7 @@ impl Workspace {
                         div()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child(message.clone()),
+                            .child(message.to_string()),
                     )
                     .child(
                         div().pt_2().child(

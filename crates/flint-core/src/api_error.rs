@@ -35,18 +35,24 @@ impl<'a> ApiError<'a> {
         ApiErrorKind::from_code(self.code)
     }
 
-    /// `"<reason>: <message>"` from the server's `Status`, or `None` when it says nothing
-    /// [`status_meaning`] would not say better: no `Status` body, an empty one, or a 401 (whose
-    /// `Status` only repeats "Unauthorized").
+    /// `"<reason>: <message>"` from the server's `Status` (just the message when it already
+    /// starts with the reason, as RBAC's "forbidden: User …" does), or `None` when it says
+    /// nothing [`status_meaning`] would not say better: no `Status` body, an empty one, or a 401
+    /// (whose `Status` only repeats "Unauthorized").
     pub fn explanation(&self) -> Option<String> {
         if self.kind() == ApiErrorKind::Unauthorized || self.reason == UNPARSED_STATUS {
             return None;
         }
-        match (self.reason.is_empty(), self.message.is_empty()) {
+        let (reason, message) = (self.reason, self.message);
+        let repeats_reason = message
+            .get(..reason.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(reason));
+        match (reason.is_empty(), message.is_empty()) {
             (true, true) => None,
-            (false, true) => Some(self.reason.to_owned()),
-            (true, false) => Some(self.message.to_owned()),
-            (false, false) => Some(format!("{}: {}", self.reason, self.message)),
+            (false, true) => Some(reason.to_owned()),
+            (true, false) => Some(message.to_owned()),
+            (false, false) if repeats_reason => Some(message.to_owned()),
+            (false, false) => Some(format!("{reason}: {message}")),
         }
     }
 }
@@ -60,7 +66,7 @@ const SOME_SERVER: &str = "the API server";
 
 /// What an HTTP error status means, naming `server` (a URL already through
 /// [`crate::redact::server_url`]): `https://host:6443 rejected the credentials (401
-/// Unauthorized); log in again or renew the token`.
+/// Unauthorized); log in again or renew the credentials`.
 pub fn status_meaning(code: u16, server: Option<&str>) -> String {
     let s = server.unwrap_or(SOME_SERVER);
     let status = match http::StatusCode::from_u16(code)
@@ -71,16 +77,21 @@ pub fn status_meaning(code: u16, server: Option<&str>) -> String {
         None => format!("HTTP {code}"),
     };
     match ApiErrorKind::from_code(code) {
-        ApiErrorKind::Unauthorized => {
-            format!("{s} rejected the credentials ({status}); log in again or renew the token")
-        }
+        ApiErrorKind::Unauthorized => format!(
+            "{s} rejected the credentials ({status}); log in again or renew the credentials"
+        ),
         ApiErrorKind::Forbidden => {
             format!("{s} denied access ({status}); check your RBAC permissions")
         }
-        ApiErrorKind::NotFound => format!("{s} has no such resource ({status})"),
+        ApiErrorKind::NotFound => {
+            format!("{s} answered {status}; is the server URL (and its path) right?")
+        }
         _ => match code {
             429 => format!("{s} is limiting requests ({status}); try again later"),
-            500 => format!("{s} failed with an internal error ({status})"),
+            500 => format!(
+                "{s} failed with an internal error ({status}); try again, or check the API \
+                 server's logs"
+            ),
             502 => format!("a proxy in front of {s} could not reach it ({status})"),
             503 => format!("{s} is unavailable ({status}); it may be starting or overloaded"),
             504 => format!("a proxy in front of {s} timed out waiting for it ({status})"),
@@ -96,8 +107,8 @@ pub enum Transport {
     Refused,
     /// The server's host name does not resolve.
     Unresolved,
-    /// The TLS handshake failed; the reason in plain words.
-    Tls(String),
+    /// The TLS handshake failed.
+    Tls(Tls),
     /// The server (or something between) reset the connection.
     Reset,
     /// The connection closed before the response, or a streaming response, was complete.
@@ -107,20 +118,98 @@ pub enum Transport {
 }
 
 impl Transport {
-    /// The problem as a sentence fragment naming `server` (a URL already through
-    /// [`crate::redact::server_url`]), or "the API server" when it is not known.
+    /// The problem as a sentence naming `server` (a URL already through
+    /// [`crate::redact::server_url`]), or "the API server" when it is not known, with a hint
+    /// at what to check.
     pub fn message(&self, server: Option<&str>) -> String {
         let s = server.unwrap_or(SOME_SERVER);
+        let host = server.and_then(host_of);
         match self {
-            Transport::Refused => format!("connection refused by {s}"),
-            Transport::Unresolved => match server.and_then(host_of) {
-                Some(host) => format!("could not resolve host {host}"),
-                None => "could not resolve the API server's host name".to_owned(),
+            Transport::Refused => format!(
+                "connection refused by {s}; is the API server running, and is the port right?"
+            ),
+            Transport::Unresolved => match (&host, server) {
+                (Some(host), Some(server)) => format!(
+                    "could not resolve host {host} ({server}); check the server address, VPN or \
+                     DNS"
+                ),
+                _ => "could not resolve the API server's host name; check the server address, \
+                      VPN or DNS"
+                    .to_owned(),
             },
-            Transport::Tls(reason) => format!("TLS handshake with {s} failed: {reason}"),
-            Transport::Reset => format!("connection reset by {s}"),
+            Transport::Tls(Tls::Failed) => format!("TLS handshake with {s} failed"),
+            Transport::Tls(tls) => {
+                format!(
+                    "TLS handshake with {s} failed: {}",
+                    tls.reason(host.as_deref())
+                )
+            }
+            Transport::Reset => format!(
+                "connection reset by {s}; a proxy, firewall or wrong port may be in the way"
+            ),
             Transport::Dropped => format!("the connection to {s} dropped"),
             Transport::Unreachable => format!("{s} is unreachable (no route to host)"),
+        }
+    }
+}
+
+/// Why a TLS handshake failed. Only Flint's own words: nothing from the peer or the platform
+/// verifier is quoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tls {
+    /// Not signed by the CA kubeconfig trusts (or by one of the same name).
+    UntrustedCa,
+    Expired,
+    NotValidYet,
+    /// Not issued for the host name connected to.
+    WrongHost,
+    Revoked,
+    Malformed,
+    /// Rejected for another reason (a platform verifier's own check).
+    NotTrusted,
+    /// The server answered, but not in TLS.
+    NotTls,
+    /// The server sent a certificate alert: it did not accept the client certificate.
+    ClientCertificateRejected,
+    /// Another alert, as lowercase words (`handshake failure`).
+    Alert(String),
+    NoCommonVersion,
+    NoCertificate,
+    /// Anything else.
+    Failed,
+}
+
+impl Tls {
+    /// The reason in plain words; `host` names the server's host for a name mismatch.
+    fn reason(&self, host: Option<&str>) -> String {
+        match self {
+            Tls::UntrustedCa => "the server's certificate is not signed by a trusted CA (check \
+                                 the cluster's certificate-authority in kubeconfig)"
+                .to_owned(),
+            Tls::Expired => "the server's certificate has expired".to_owned(),
+            Tls::NotValidYet => {
+                "the server's certificate is not valid yet (check the clock)".to_owned()
+            }
+            Tls::WrongHost => format!(
+                "the server's certificate is not valid for {} (check the server address or \
+                 tls-server-name)",
+                host.unwrap_or("this host name")
+            ),
+            Tls::Revoked => "the server's certificate was revoked".to_owned(),
+            Tls::Malformed => "the server's certificate is malformed".to_owned(),
+            Tls::NotTrusted => "the server's certificate is not trusted".to_owned(),
+            Tls::NotTls => {
+                "the server did not answer in TLS (is it an http:// endpoint?)".to_owned()
+            }
+            Tls::ClientCertificateRejected => "the server rejected the client certificate \
+                                               (check client-certificate in kubeconfig)"
+                .to_owned(),
+            Tls::Alert(words) => format!("the server ended the handshake ({words})"),
+            Tls::NoCommonVersion => {
+                "the server and Flint have no TLS version or cipher in common".to_owned()
+            }
+            Tls::NoCertificate => "the server sent no certificate".to_owned(),
+            Tls::Failed => "the handshake failed".to_owned(),
         }
     }
 }
@@ -138,7 +227,7 @@ pub fn classify_transport(err: &(dyn StdError + 'static)) -> Option<Transport> {
 
 fn classify_one(e: &(dyn StdError + 'static)) -> Option<Transport> {
     if let Some(tls) = e.downcast_ref::<rustls::Error>() {
-        return Some(Transport::Tls(tls_reason(tls)));
+        return Some(Transport::Tls(tls_problem(tls)));
     }
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
         return match io.kind() {
@@ -180,45 +269,52 @@ pub(crate) fn causes<'a>(
     })
 }
 
-/// Why a TLS handshake failed, in words a user can act on.
-fn tls_reason(err: &rustls::Error) -> String {
+/// What a rustls error means for the user.
+fn tls_problem(err: &rustls::Error) -> Tls {
+    use rustls::AlertDescription as A;
     use rustls::CertificateError as C;
     use rustls::Error as E;
     match err {
         E::InvalidCertificate(cert) => match cert {
             // A bad signature is what a CA of the same name gives: every kubeadm CA is called
             // "kubernetes", so a kubeconfig left from an earlier cluster ends up here.
-            C::UnknownIssuer | C::BadSignature => {
-                "the server's certificate is not signed by a trusted certificate \
-                                 authority (check certificate-authority-data in kubeconfig)"
-                    .to_owned()
-            }
-            C::Expired | C::ExpiredContext { .. } => {
-                "the server's certificate has expired".to_owned()
-            }
-            C::NotValidYet | C::NotValidYetContext { .. } => {
-                "the server's certificate is not valid yet (check the clock)".to_owned()
-            }
-            C::NotValidForName | C::NotValidForNameContext { .. } => {
-                "the server's certificate is not valid for this host name".to_owned()
-            }
-            C::Revoked => "the server's certificate was revoked".to_owned(),
-            C::BadEncoding => "the server's certificate is malformed".to_owned(),
+            C::UnknownIssuer | C::BadSignature => Tls::UntrustedCa,
+            C::Expired | C::ExpiredContext { .. } => Tls::Expired,
+            C::NotValidYet | C::NotValidYetContext { .. } => Tls::NotValidYet,
+            C::NotValidForName | C::NotValidForNameContext { .. } => Tls::WrongHost,
+            C::Revoked => Tls::Revoked,
+            C::BadEncoding => Tls::Malformed,
             // Platform verifiers (macOS) report distrust as `Other`, with a status code.
-            _ => "the server's certificate is not trusted".to_owned(),
+            _ => Tls::NotTrusted,
         },
-        E::InvalidMessage(_) | E::InappropriateMessage { .. } => {
-            "the server did not answer in TLS (is it an http:// endpoint?)".to_owned()
-        }
-        E::AlertReceived(alert) => {
-            format!("the server ended the handshake ({alert:?}); check the client certificate")
-        }
-        E::PeerIncompatible(_) => {
-            "the server and Flint have no TLS version or cipher in common".to_owned()
-        }
-        E::NoCertificatesPresented => "the server sent no certificate".to_owned(),
-        other => other.to_string(),
+        E::InvalidMessage(_) | E::InappropriateMessage { .. } => Tls::NotTls,
+        E::AlertReceived(
+            A::BadCertificate
+            | A::CertificateRequired
+            | A::UnknownCA
+            | A::CertificateExpired
+            | A::CertificateRevoked
+            | A::CertificateUnknown
+            | A::UnsupportedCertificate
+            | A::AccessDenied,
+        ) => Tls::ClientCertificateRejected,
+        E::AlertReceived(alert) => Tls::Alert(words(&format!("{alert:?}"))),
+        E::PeerIncompatible(_) => Tls::NoCommonVersion,
+        E::NoCertificatesPresented => Tls::NoCertificate,
+        _ => Tls::Failed,
     }
+}
+
+/// `HandshakeFailure` as `handshake failure`.
+fn words(camel: &str) -> String {
+    let mut out = String::new();
+    for c in camel.chars() {
+        if c.is_ascii_uppercase() && !out.is_empty() {
+            out.push(' ');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,42 +381,85 @@ mod tests {
 
     #[test]
     fn messages_name_the_server_or_say_the_api_server() {
-        let server = Some("https://127.0.0.1:6443");
+        let server = Some("https://api.example.test:6443");
         for (problem, named, anonymous) in [
             (
                 Transport::Refused,
-                "connection refused by https://127.0.0.1:6443",
-                "connection refused by the API server",
+                "connection refused by https://api.example.test:6443; is the API server running, \
+                 and is the port right?",
+                "connection refused by the API server; is the API server running, and is the \
+                 port right?",
             ),
             (
                 Transport::Unresolved,
-                "could not resolve host 127.0.0.1",
-                "could not resolve the API server's host name",
+                "could not resolve host api.example.test (https://api.example.test:6443); check \
+                 the server address, VPN or DNS",
+                "could not resolve the API server's host name; check the server address, VPN or \
+                 DNS",
             ),
             (
-                Transport::Tls("why".into()),
-                "TLS handshake with https://127.0.0.1:6443 failed: why",
-                "TLS handshake with the API server failed: why",
+                Transport::Tls(Tls::WrongHost),
+                "TLS handshake with https://api.example.test:6443 failed: the server's \
+                 certificate is not valid for api.example.test (check the server address or \
+                 tls-server-name)",
+                "TLS handshake with the API server failed: the server's certificate is not valid \
+                 for this host name (check the server address or tls-server-name)",
+            ),
+            (
+                Transport::Tls(Tls::Failed),
+                "TLS handshake with https://api.example.test:6443 failed",
+                "TLS handshake with the API server failed",
             ),
             (
                 Transport::Reset,
-                "connection reset by https://127.0.0.1:6443",
-                "connection reset by the API server",
+                "connection reset by https://api.example.test:6443; a proxy, firewall or wrong \
+                 port may be in the way",
+                "connection reset by the API server; a proxy, firewall or wrong port may be in \
+                 the way",
             ),
             (
                 Transport::Dropped,
-                "the connection to https://127.0.0.1:6443 dropped",
+                "the connection to https://api.example.test:6443 dropped",
                 "the connection to the API server dropped",
             ),
             (
                 Transport::Unreachable,
-                "https://127.0.0.1:6443 is unreachable (no route to host)",
+                "https://api.example.test:6443 is unreachable (no route to host)",
                 "the API server is unreachable (no route to host)",
             ),
         ] {
             assert_eq!(problem.message(server), named);
             assert_eq!(problem.message(None), anonymous);
         }
+    }
+
+    #[test]
+    fn explanations_keep_the_server_words_once() {
+        let api = |code, reason, message| ApiError {
+            code,
+            reason,
+            message,
+        };
+        assert_eq!(
+            api(
+                403,
+                "Forbidden",
+                "forbidden: User \"jane\" cannot get path \"/version\""
+            )
+            .explanation()
+            .as_deref(),
+            Some("forbidden: User \"jane\" cannot get path \"/version\"")
+        );
+        assert_eq!(
+            api(404, "NotFound", "pods \"x\" not found")
+                .explanation()
+                .as_deref(),
+            Some("NotFound: pods \"x\" not found")
+        );
+        assert_eq!(api(401, "Unauthorized", "Unauthorized").explanation(), None);
+        assert_eq!(api(502, UNPARSED_STATUS, "<html>").explanation(), None);
+        assert_eq!(api(500, "", "").explanation(), None);
+        assert_eq!(api(409, "", "x").explanation().as_deref(), Some("x"));
     }
 
     #[test]
@@ -352,44 +491,52 @@ mod tests {
             ErrorKind::InvalidData,
             rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
         ));
-        assert_eq!(
-            classify_transport(&tls),
-            Some(Transport::Tls(
-                "the server's certificate has expired".to_owned()
-            ))
-        );
+        assert_eq!(classify_transport(&tls), Some(Transport::Tls(Tls::Expired)));
     }
 
     #[test]
-    fn tls_reasons_are_plain() {
+    fn tls_errors_map_to_problems_without_quoting_the_peer() {
+        use rustls::AlertDescription as A;
         use rustls::CertificateError as C;
-        for (err, reason) in [
+        for (err, problem) in [
             (
                 rustls::Error::InvalidCertificate(C::NotValidForName),
-                "the server's certificate is not valid for this host name",
+                Tls::WrongHost,
             ),
             (
                 rustls::Error::InvalidCertificate(C::NotValidYet),
-                "the server's certificate is not valid yet (check the clock)",
+                Tls::NotValidYet,
             ),
-            (
-                rustls::Error::InvalidCertificate(C::Revoked),
-                "the server's certificate was revoked",
-            ),
+            (rustls::Error::InvalidCertificate(C::Revoked), Tls::Revoked),
             (
                 rustls::Error::InvalidCertificate(C::ApplicationVerificationFailure),
-                "the server's certificate is not trusted",
+                Tls::NotTrusted,
             ),
             (
-                rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate),
-                "the server ended the handshake (BadCertificate); check the client certificate",
+                rustls::Error::AlertReceived(A::BadCertificate),
+                Tls::ClientCertificateRejected,
             ),
             (
-                rustls::Error::NoCertificatesPresented,
-                "the server sent no certificate",
+                rustls::Error::AlertReceived(A::CertificateRequired),
+                Tls::ClientCertificateRejected,
+            ),
+            (
+                rustls::Error::AlertReceived(A::HandshakeFailure),
+                Tls::Alert("handshake failure".into()),
+            ),
+            (rustls::Error::NoCertificatesPresented, Tls::NoCertificate),
+            // Free text from rustls or a verifier is never shown.
+            (
+                rustls::Error::General("peer said \"s3cr3t\"".into()),
+                Tls::Failed,
             ),
         ] {
-            assert_eq!(tls_reason(&err), reason);
+            assert_eq!(tls_problem(&err), problem);
         }
+        assert_eq!(
+            Transport::Tls(Tls::ClientCertificateRejected).message(None),
+            "TLS handshake with the API server failed: the server rejected the client \
+             certificate (check client-certificate in kubeconfig)"
+        );
     }
 }

@@ -116,3 +116,11 @@ pub fn until<T: Debug>(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// A local port nothing listens on: one the OS just handed out, released again.
+pub fn closed_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("a free local port")
+}

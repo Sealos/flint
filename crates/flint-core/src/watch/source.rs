@@ -168,7 +168,9 @@ impl Source for KubeSource {
                     // Says "the connection to https://… dropped", not hyper's "error reading a
                     // body from connection".
                     Err(e) => Some(Err(FetchError::Other(
-                        cluster::ClusterError::stream("watch stream", &e, &target).to_string(),
+                        cluster::ClusterError::stream("watch stream", &e, &target)
+                            .summary()
+                            .to_string(),
                     ))),
                 };
                 std::future::ready(result)

@@ -13,7 +13,7 @@ use kube::api::{Api, LogParams};
 use super::line::MAX_LINE_BYTES;
 use super::session::{LogSince, LogTarget};
 use crate::api_error::{ApiError, ApiErrorKind};
-use crate::cluster::{ClusterError, error_chain};
+use crate::cluster::{ClusterError, Target};
 
 /// One request to the log endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +62,7 @@ pub(crate) struct RawLine {
 pub(crate) type RawLines = BoxStream<'static, Result<RawLine, LogError>>;
 
 /// A failure to read logs. The message is safe to show: kube errors go through
-/// [`ClusterError::kube`] and [`error_chain`], which summarise exec auth plugin errors instead of
+/// [`ClusterError::kube`] and [`crate::cluster::error_chain`], which summarise exec auth plugin errors instead of
 /// quoting their command, environment, or output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogError {
@@ -134,7 +134,7 @@ impl LogError {
             ApiErrorKind::BadRequest => !is_starting(api.message),
             _ => false,
         });
-        let message = ClusterError::kube(err).to_string();
+        let message = ClusterError::kube(err).summary().to_string();
         if fatal {
             LogError::fatal(message)
         } else {
@@ -345,8 +345,13 @@ pub(crate) fn split_lines(reader: impl AsyncBufRead + Send + 'static) -> RawLine
             let buf = match reader.fill_buf().await {
                 Ok(buf) => buf,
                 Err(e) => {
-                    let error =
-                        LogError::retry(format!("the log stream broke: {}", error_chain(&e)));
+                    // The source does not know the server: "the connection to the API server
+                    // dropped".
+                    let error = LogError::retry(
+                        ClusterError::stream("log stream", &e, &Target::default())
+                            .summary()
+                            .to_string(),
+                    );
                     return Some((Err(error), (reader, true)));
                 }
             };

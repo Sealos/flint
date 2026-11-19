@@ -140,7 +140,7 @@ enum Internal {
     Connected {
         cluster: ClusterId,
         attempt: u64,
-        result: Result<(Client, ServerVersion), String>,
+        result: Result<(Client, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
     Discovered {
@@ -423,11 +423,18 @@ impl ClusterManager {
                     let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
                     return;
                 };
+                let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 tokio::spawn(async move {
-                    let result = read::object_detail(&client, &info, namespace.as_deref(), &name)
-                        .await
-                        .map(Arc::new)
-                        .map_err(|e| e.to_string());
+                    let result = read::object_detail_at(
+                        &client,
+                        &info,
+                        namespace.as_deref(),
+                        &name,
+                        &target,
+                    )
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| e.for_target(&target).summary().to_string());
                     let _ = reply.send(result);
                 });
             }
@@ -512,7 +519,7 @@ impl ClusterManager {
         tokio::spawn(async move {
             let result = read::discover_kinds(&client)
                 .await
-                .map_err(|e| e.for_target(&target).to_string());
+                .map_err(|e| e.for_target(&target).summary().to_string());
             let _ = internal.send(Internal::Discovered {
                 cluster,
                 attempt,
@@ -958,10 +965,9 @@ impl ClusterManager {
             });
             // The app shows this message as it is: only safe text ([`ClusterError::summary`]).
             let result = attempt_task.await.unwrap_or_else(|e| {
-                Err(format!(
-                    "connection task failed: {}",
-                    crate::redact::safe_error_summary(&e.to_string())
-                ))
+                Err(cluster::SafeErrorText::reduced(&format!(
+                    "connection task failed: {e}"
+                )))
             });
             if let Err(e) = &result {
                 tracing::warn!(cluster, error = %e, "connection failed");
@@ -1451,7 +1457,7 @@ mod tests {
         let hubs = HubRegistry::default();
         let mut manager = ClusterManager::new(config, events, hubs.clone());
         let mut slot = Cluster::new(context(None), None, &hubs, &manager.engine_config);
-        slot.state = ConnectionState::Failed("offline".into());
+        slot.state = ConnectionState::Failed(cluster::SafeErrorText::fixed("offline"));
         manager.clusters.push(slot);
 
         let same = manager
