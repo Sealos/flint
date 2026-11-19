@@ -193,12 +193,17 @@ pub struct CellStyle {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    /// Concealed text: only its background is drawn (a color emoji ignores a transparent
+    /// foreground, so the glyph is not drawn at all).
+    pub hidden: bool,
 }
 
 impl CellStyle {
-    /// Draws nothing but its background: a space without lines through or under it.
+    /// Draws nothing but its background: concealed, or a space without lines through or
+    /// under it.
     pub fn is_blank(&self, cell: &Cell) -> bool {
-        cell.c == ' ' && cell.zerowidth.is_none() && !self.underline && !self.strikethrough
+        self.hidden
+            || (cell.c == ' ' && cell.zerowidth.is_none() && !self.underline && !self.strikethrough)
     }
 }
 
@@ -227,6 +232,7 @@ pub fn cell_style(cell: &Cell, palette: &TerminalPalette) -> CellStyle {
         italic: flags.contains(CellFlags::ITALIC),
         underline: flags.intersects(CellFlags::ALL_UNDERLINES),
         strikethrough: flags.contains(CellFlags::STRIKEOUT),
+        hidden: flags.contains(CellFlags::HIDDEN),
     }
 }
 
@@ -384,7 +390,12 @@ mod tests {
             cell_style(&cell(fg, bg, CellFlags::DIM), &p).fg,
             p.foreground.opacity(DIM)
         );
-        assert_eq!(cell_style(&cell(fg, bg, CellFlags::HIDDEN), &p).fg.a, 0.);
+        let hidden = cell(fg, bg, CellFlags::HIDDEN | CellFlags::UNDERLINE);
+        assert_eq!(cell_style(&hidden, &p).fg.a, 0.);
+        assert!(
+            cell_style(&hidden, &p).is_blank(&hidden),
+            "concealed text is not drawn"
+        );
 
         let mut space = cell(fg, bg, CellFlags::empty());
         space.c = ' ';

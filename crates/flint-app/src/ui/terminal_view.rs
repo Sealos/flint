@@ -208,13 +208,9 @@ impl TerminalView {
             self.marked = None;
         }
         // The terminal drops a selection on its own (the program cleared the screen, switched
-        // screens or wrote over it): once no cell shows one, Copy has nothing. A selection
-        // scrolled out of view counts as gone too, until it is scrolled back.
-        if self.selection
-            && self.press.is_none()
-            && !snapshot.terminal.cells.iter().any(|c| c.selected)
-        {
-            self.selection = false;
+        // screens or wrote over it); one scrolled out of view is still there to copy.
+        if self.press.is_none() {
+            self.selection = snapshot.terminal.has_selection;
         }
         self.snapshot = snapshot;
         cx.notify();
@@ -369,8 +365,27 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.press = None;
+    /// Ends a press: a drag's selection ends where the button was released, even off the grid
+    /// or past the last move seen.
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        let Some(layout) = self.layout.get() else {
+            return;
+        };
+        let (row, col, side) = layout.cell_at(event.position, self.snapshot.terminal.size);
+        if press.started {
+            self.session.update_selection(row, col, side);
+        } else if (row, col, side) != (press.row, press.col, press.side) {
+            self.session
+                .start_selection(press.kind, press.row, press.col, press.side);
+            self.session.update_selection(row, col, side);
+            self.selection = true;
+        } else {
+            return;
+        }
+        cx.notify();
     }
 
     fn clear_selection(&mut self) {
@@ -610,6 +625,9 @@ impl Render for TerminalView {
         let frame = self.frame(&theme, window);
         let layout = self.layout.clone();
         let wanted = self.wanted_size();
+        // The first layout is reported even when it matches the starting size, so later
+        // changes are debounced.
+        let first = !self.resized;
         let view = cx.weak_entity();
         let focus = self.focus.clone();
         let grid = canvas(
@@ -618,7 +636,7 @@ impl Render for TerminalView {
                 move |bounds, window, cx| {
                     let grid = measure(&frame, bounds, window);
                     layout.set(Some(grid));
-                    if grid.size != wanted {
+                    if grid.size != wanted || first {
                         // Not while drawing: the view is told after this frame.
                         cx.defer(move |cx| {
                             let _ = view.update(cx, |view, cx| view.grid_resized(grid.size, cx));
@@ -628,7 +646,27 @@ impl Render for TerminalView {
                 }
             },
             move |bounds, (frame, grid), window, cx| {
-                window.handle_input(&focus, TerminalInput { view, bounds }, cx);
+                window.handle_input(
+                    &focus,
+                    TerminalInput {
+                        view: view.clone(),
+                        bounds,
+                    },
+                    cx,
+                );
+                // A drag goes on past the grid's edge (the cell is clamped), so it follows the
+                // pointer over the whole window, not only over the grid.
+                let moved = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let _ = moved.update(cx, |view, cx| view.mouse_move(event, window, cx));
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                        let _ = view.update(cx, |view, cx| view.mouse_up(event, window, cx));
+                    }
+                });
                 paint_grid(&frame, &grid, bounds, window, cx);
             },
         )
@@ -655,10 +693,6 @@ impl Render for TerminalView {
                     .cursor(CursorStyle::IBeam)
                     // not-an-action: presses and drags select screen cells (SelectText is the action).
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-                    .on_mouse_move(cx.listener(Self::mouse_move))
-                    // not-an-action: ends a mouse selection.
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
                     .on_scroll(cx.listener(Self::scroll_wheel))
                     .child(grid)
                     .test_support(),
@@ -835,6 +869,7 @@ fn paint_cursor(
             italic: false,
             underline: true,
             strikethrough: false,
+            hidden: false,
         };
         let line = window.text_system().shape_line(
             marked.clone().into(),
@@ -859,7 +894,7 @@ fn paint_cursor(
     match shape {
         CursorShape::Block if solid => {
             window.paint_quad(fill(bounds, color));
-            if cell.c != ' ' {
+            if cell.c != ' ' && !cell_style(cell, &frame.palette).hidden {
                 let mut text = String::from(cell.c);
                 if let Some(extra) = &cell.zerowidth {
                     text.extend(extra.iter());

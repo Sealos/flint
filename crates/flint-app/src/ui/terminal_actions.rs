@@ -76,10 +76,9 @@ impl TerminalView {
     /// Puts the selection on the clipboard as the core reads it (history included), and says
     /// how much was copied.
     fn copy_text(&mut self, _: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
-        // Never propagated: the key would reach the shell (on Linux, Ctrl-Shift-C as ^C).
-        if !self.selection {
-            return;
-        }
+        // Never propagated: the key would reach the shell (on Linux, Ctrl-Shift-C as ^C). The
+        // core is asked even when the flag says nothing is selected: a snapshot may lag behind
+        // a selection just made.
         let text = self.session.selection_text();
         cx.spawn(async move |this, cx| {
             let Some(text) = text.await else {

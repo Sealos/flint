@@ -7,8 +7,9 @@ use flint_core::terminal::TerminalSize;
 use flint_core::{ExecState, TerminalSnapshot};
 use gpui_kit::test::{ClickOptions, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, ClipboardItem, Entity, InputHandler as _, Point,
-    ScrollDelta, TestAppContext, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, ClipboardItem, Entity, InputHandler as _, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, ScrollDelta,
+    TestAppContext, WindowBounds, WindowOptions, point, px, size,
 };
 use serde_json::json;
 
@@ -38,7 +39,12 @@ fn open(cx: &mut TestAppContext) -> Shell {
         gpui_kit::init(cx);
         registry::init(cx);
     });
-    let (session, mut fake) = FakeExec::open(request().exec_request(TerminalSize::default()));
+    open_window(cx, TerminalSize::default())
+}
+
+/// Another shell tab in a window of its own, its session started at `start`.
+fn open_window(cx: &mut TestAppContext, start: TerminalSize) -> Shell {
+    let (session, mut fake) = FakeExec::open(request().exec_request(start));
     let (window, view) = cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
@@ -162,9 +168,11 @@ async fn keys_and_text_reach_the_shell(cx: &mut TestAppContext) {
     shell.press(cx, "up");
     shell.press(cx, "f1");
     assert_eq!(shell.sent(cx), b"\x1bOA\x1bOP");
-    // App shortcuts stay the app's: a Cmd (Ctrl-Shift on Linux) key sends nothing.
-    shell.press(cx, "secondary-shift-l");
+    // The tab's own shortcuts stay the app's: Shift-Page Up scrolls instead of reaching the shell.
+    shell.print(cx, &b"line\r\n".repeat(80));
+    shell.press(cx, "shift-pageup");
     assert_eq!(shell.sent(cx), b"");
+    assert!(shell.fake.scrolls().iter().any(|&lines| lines > 0));
 }
 
 // covers UP-41: text composed with an input method shows at the cursor until it is committed,
@@ -465,4 +473,114 @@ async fn clicks_select_words_and_lines(cx: &mut TestAppContext) {
     assert!(check(cx, (0, 0), (0, 3)).is_ok());
     assert!(check(cx, (0, 0), (500, 0)).is_err());
     assert!(check(cx, (1, 0), (0, 3)).is_err());
+}
+
+// covers UP-41: a first layout that matches the size the session started with sends nothing,
+// and the next change still waits for the size to settle.
+#[gpui_kit::test]
+async fn a_first_layout_at_the_starting_size_is_remembered(cx: &mut TestAppContext) {
+    let first = open(cx);
+    let fits = first.view.read_with(cx, |v, _| v.layout()).unwrap().size;
+    let mut shell = open_window(cx, fits);
+    assert!(shell.fake.resizes().is_empty(), "already the right size");
+    cx.simulate_window_resize(shell.window, size(px(500.), px(300.)));
+    shell.settle(cx);
+    shell.fake.pump();
+    assert!(
+        shell.fake.resizes().is_empty(),
+        "waits for the size to settle"
+    );
+    cx.executor().advance_clock(RESIZE_DELAY);
+    cx.run_until_parked();
+    shell.fake.pump();
+    assert_eq!(shell.fake.resizes().len(), 1);
+}
+
+// covers UP-41: a selection scrolled out of view can still be copied.
+#[gpui_kit::test]
+async fn a_selection_scrolled_out_of_view_is_still_copyable(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    let mut output = Vec::new();
+    for n in 0..100 {
+        output.extend(format!("line {n}\r\n").bytes());
+    }
+    shell.print(cx, &output);
+    shell
+        .dispatch(
+            cx,
+            "terminal::SelectText",
+            json!({"start_row": 0, "start_col": 0, "end_row": 0, "end_col": 6}),
+        )
+        .unwrap();
+    shell.fake.pump();
+    shell.settle(cx);
+    let selected = shell.screen(cx).row_text(0);
+    shell
+        .dispatch(cx, "terminal::ScrollToTop", json!(null))
+        .unwrap();
+    shell.fake.pump();
+    shell.settle(cx);
+    assert!(!shell.screen(cx).cells.iter().any(|c| c.selected));
+    assert!(shell.view.read_with(cx, |v, _| v.has_selection()));
+    shell.press(cx, TERMINAL_COPY[0]);
+    shell.fake.pump();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|i| i.text()),
+        Some(selected)
+    );
+}
+
+// covers UP-41: a drag that leaves the grid keeps selecting, up to where the button is released.
+#[gpui_kit::test]
+async fn a_drag_past_the_grid_selects_to_its_edge(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    shell.print(cx, b"aaaa\r\nbbbb\r\ncccc");
+    let layout = shell.view.read_with(cx, |v, _| v.layout()).unwrap();
+    let start = layout.cell_bounds(2, 3, 1).origin + point(px(1.), px(2.));
+    // Over the toolbar, above the grid, in line with column 1.
+    let end = point(
+        layout.cell_bounds(0, 1, 1).origin.x + px(1.),
+        layout.origin.y - px(20.),
+    );
+    let modifiers = Modifiers::default();
+    cx.update_window(shell.window, |_, window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                modifiers,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: end,
+                modifiers,
+                click_count: 1,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    shell.fake.pump();
+    shell.settle(cx);
+    shell.press(cx, TERMINAL_COPY[0]);
+    shell.fake.pump();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|i| i.text()).as_deref(),
+        Some("aaa\nbbbb\nccc")
+    );
 }

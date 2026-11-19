@@ -3,8 +3,8 @@
 //! and nothing it drew keeps running. A callback that captured the view strongly (a timer, a
 //! task, a frame callback) fails these tests.
 //!
-//! GPUI tracks entity handles only when built with `GPUI_LEAK_DETECTION=1`; without it the
-//! checks pass trivially, so CI runs this crate's tests both ways.
+//! GPUI tracks entity handles only when built with `GPUI_LEAK_DETECTION=1` (as CI builds this
+//! crate's tests); without it the checks pass trivially.
 
 use flint_core::exec::fake::FakeExec;
 use flint_core::terminal::TerminalSize;
