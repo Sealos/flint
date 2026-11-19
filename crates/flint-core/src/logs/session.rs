@@ -144,13 +144,21 @@ impl SessionConfig {
     }
 }
 
+/// Lines of the newest timestamp remembered for resuming. Enough to recognise where the shown
+/// lines end in a replay; a longer run of lines sharing one timestamp is matched on its end.
+const RESUME_GROUP: usize = 64;
+
 /// After a reconnect from `since_time` (which the server rounds down to the second), skips lines
-/// already in the buffer: those older than the last line seen, and as many lines stamped exactly
-/// like it as the buffer already holds.
-#[derive(Debug, Clone, Copy)]
+/// already shown. Lines older than the newest shown timestamp are skipped. Lines stamped exactly
+/// like it are held until the lines shown with that timestamp (`shown`, the newest ones) have
+/// been replayed in order: those and everything before them were seen or cut by the tail, and
+/// everything after them is new. The first request may have cut that group (`tail_lines`), so
+/// the overlap is found by content, not by count.
+#[derive(Debug, Clone)]
 struct Resume {
     last: Timestamp,
-    skip_equal: usize,
+    shown: Vec<Arc<str>>,
+    held: Vec<LogLine>,
 }
 
 enum Phase {
@@ -197,9 +205,17 @@ struct Session {
     state: LogState,
     /// Failed attempts in a row, for the backoff. Reset when a line arrives.
     attempts: u32,
-    /// The newest timestamp seen, and how many lines in a row carried it.
-    last_ts: Option<(Timestamp, usize)>,
+    /// The newest timestamp shown, and the texts of the newest lines shown with it (at most
+    /// [`RESUME_GROUP`]).
+    last_ts: Option<Timestamp>,
+    last_group: Vec<Arc<str>>,
     resume: Option<Resume>,
+    /// The container finished: one last request without following picks up anything it wrote
+    /// after the followed stream ended (it may have restarted and finished again meanwhile).
+    draining: bool,
+    /// The lines of the last snapshot published; pausing freezes these, so lines the front end
+    /// never saw count as held back.
+    published: LogLines,
     /// The lines shown while paused. Trimmed to the buffer's oldest line whenever the buffer
     /// drops a block, so a pause never keeps evicted blocks alive: a paused session stays within
     /// the byte budget like a running one (plus the frozen copy of the open tail block).
@@ -216,7 +232,7 @@ impl Session {
         let limit = self.config.limit as i64;
         LogRequest {
             target: self.target.clone(),
-            follow: self.options.follow && !self.options.previous,
+            follow: self.options.follow && !self.options.previous && !self.draining,
             tail_lines: Some(self.options.tail_lines.map_or(limit, |t| t.clamp(0, limit))),
             since: self.options.since,
             previous: self.options.previous,
@@ -226,12 +242,13 @@ impl Session {
     /// A reconnect: from the last timestamp seen, else as at first.
     fn resume_request(&mut self) -> LogRequest {
         let mut request = self.first_request();
-        if let Some((last, count)) = self.last_ts {
+        if let Some(last) = self.last_ts {
             request.since = Some(LogSince::Time(last));
             request.tail_lines = None;
             self.resume = Some(Resume {
                 last,
-                skip_equal: count,
+                shown: self.last_group.clone(),
+                held: Vec::new(),
             });
         }
         request
@@ -245,18 +262,45 @@ impl Session {
         if let Some(resume) = &mut self.resume {
             match line.timestamp {
                 Some(ts) if ts < resume.last => return,
-                Some(ts) if ts == resume.last && resume.skip_equal > 0 => {
-                    resume.skip_equal -= 1;
+                Some(ts) if ts == resume.last => {
+                    resume.held.push(line);
+                    let held = &resume.held;
+                    if held.len() >= resume.shown.len()
+                        && held[held.len() - resume.shown.len()..]
+                            .iter()
+                            .zip(&resume.shown)
+                            .all(|(l, s)| l.text == *s)
+                    {
+                        // The shown lines are replayed: the rest is new.
+                        self.resume = None;
+                    }
                     return;
                 }
-                _ => self.resume = None,
+                _ => {
+                    // The timestamp moved on without the shown lines replayed in order (the log
+                    // changed under us): keep the held lines that were not shown.
+                    let resume = self.resume.take().expect("checked above");
+                    for held in resume.held {
+                        if !resume.shown.contains(&held.text) {
+                            self.append(held);
+                        }
+                    }
+                }
             }
         }
+        self.append(line);
+    }
+
+    fn append(&mut self, line: LogLine) {
         if let Some(ts) = line.timestamp {
-            self.last_ts = match self.last_ts {
-                Some((last, count)) if last == ts => Some((ts, count + 1)),
-                _ => Some((ts, 1)),
-            };
+            if self.last_ts != Some(ts) {
+                self.last_ts = Some(ts);
+                self.last_group.clear();
+            }
+            if self.last_group.len() == RESUME_GROUP {
+                self.last_group.remove(0);
+            }
+            self.last_group.push(line.text.clone());
         }
         self.buffer.push(line);
         self.attempts = 0;
@@ -306,14 +350,22 @@ impl Session {
                 self.set_state(LogState::Streaming);
                 Phase::Read(lines)
             }
+            // The last catch-up of a finished container: what was read is all there is.
+            Step::Opened(Err(e)) if e.fatal && self.draining => self.end(None),
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.fatal => self.end(Some(e.message)),
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
                 self.retry(Some(e))
             }
-            Step::Eof if !self.options.follow || self.options.previous => self.end(None),
+            Step::Eof if !self.options.follow || self.options.previous || self.draining => {
+                self.end(None)
+            }
             Step::Eof => Phase::CheckEnd(self.source.after_end(&self.target)),
             Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(None),
-            Step::AfterEnd(Ok(AfterEnd::Finished)) => self.end(None),
+            Step::AfterEnd(Ok(AfterEnd::Finished)) => {
+                self.draining = true;
+                let request = self.resume_request();
+                Phase::Connect(self.source.open(&request))
+            }
             Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end(Some("the pod was deleted".to_owned())),
             Step::Retry => {
                 let request = self.resume_request();
@@ -326,6 +378,7 @@ impl Session {
     fn publish(&mut self, tx: &watch::Sender<Arc<LogSnapshot>>) {
         self.version += 1;
         let lines = self.frozen.clone().unwrap_or_else(|| self.buffer.view());
+        self.published = lines.clone();
         let end = self.buffer.last_id().map_or(0, |id| id + 1);
         tx.send_replace(Arc::new(LogSnapshot {
             held_back: end - lines.end_id(),
@@ -356,7 +409,10 @@ pub(crate) async fn run(
         state: LogState::Connecting,
         attempts: 0,
         last_ts: None,
+        last_group: Vec::new(),
         resume: None,
+        draining: false,
+        published: LogLines::default(),
         frozen: None,
         frozen_dropped: 0,
         version: 0,
@@ -379,7 +435,8 @@ pub(crate) async fn run(
                 }
                 let paused = *paused.borrow_and_update();
                 if paused != session.frozen.is_some() {
-                    session.frozen = paused.then(|| session.buffer.view());
+                    let first = session.buffer.first_id();
+                    session.frozen = paused.then(|| session.published.trimmed(first));
                     session.frozen_dropped = session.buffer.dropped_blocks();
                     session.dirty = true;
                 }
@@ -529,6 +586,10 @@ mod tests {
             .collect()
     }
 
+    fn leak(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+
     fn ended(s: &LogSnapshot) -> bool {
         matches!(s.state, LogState::Ended { .. })
     }
@@ -635,6 +696,84 @@ mod tests {
         );
         assert_eq!(resume.tail_lines, None);
         assert!(resume.follow);
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn a_tail_that_cut_a_timestamp_group_resumes_after_what_was_shown() {
+        const T: &str = "2024-05-01T12:00:01.100Z";
+        let mut run = start(
+            vec![
+                // tail_lines = 1 cut A and B, which share C's timestamp.
+                Script::Lines(
+                    vec![leak(&format!("{T} C"))],
+                    Some(LogError::retry("reset")),
+                ),
+                Script::Hold(vec![
+                    leak(&format!("{T} A")),
+                    leak(&format!("{T} B")),
+                    leak(&format!("{T} C")),
+                    leak(&format!("{T} D")),
+                    "2024-05-01T12:00:02Z E",
+                ]),
+            ],
+            LogOptions {
+                tail_lines: Some(1),
+                ..LogOptions::default()
+            },
+            100,
+        );
+        let snapshot = run.until(|s| s.lines.len() == 3).await;
+        assert_eq!(texts(&snapshot), ["C", "D", "E"]);
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_container_is_drained_once_before_the_session_ends() {
+        let mut run = start(
+            vec![
+                Script::Lines(vec!["2024-05-01T12:00:00Z run 1"], None),
+                // It restarted and finished again before the status check.
+                Script::Lines(
+                    vec!["2024-05-01T12:00:00Z run 1", "2024-05-01T12:00:03Z run 2"],
+                    None,
+                ),
+            ],
+            LogOptions::default(),
+            100,
+        );
+        run.fake
+            .after_end
+            .lock()
+            .unwrap()
+            .push_back(AfterEnd::Finished);
+        let snapshot = run.until(ended).await;
+        assert_eq!(snapshot.state, LogState::Ended { error: None });
+        assert_eq!(texts(&snapshot), ["run 1", "run 2"]);
+        let requests = run.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].follow);
+        assert!(!requests[1].follow, "the catch-up does not follow");
+        assert!(requests[1].since.is_some());
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn pausing_freezes_what_was_last_published() {
+        let (feed, lines) = futures::channel::mpsc::unbounded();
+        let mut run = start(vec![Script::Feed(lines)], LogOptions::default(), 100);
+        feed.unbounded_send("one").unwrap();
+        feed.unbounded_send("two").unwrap();
+        run.until(|s| s.lines.len() == 2).await;
+        // "three" reaches the buffer but no snapshot before the pause.
+        feed.unbounded_send("three").unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        run.paused.send(true).unwrap();
+        let paused = run.until(|s| s.paused).await;
+        assert_eq!(texts(&paused), ["one", "two"]);
+        assert_eq!(paused.held_back, 1);
     }
 
     // covers UP-40

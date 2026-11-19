@@ -168,13 +168,22 @@ impl LogSource for KubeLogSource {
         async move {
             let client = client().await?;
             let api: Api<Pod> = Api::namespaced(client, &target.namespace);
-            let pod = api
-                .get_opt(&target.pod)
-                .await
-                .map_err(LogError::from_kube)?;
-            Ok(fate(pod.as_ref(), target.container.as_deref()))
+            fate_of(api.get_opt(&target.pod).await, target.container.as_deref())
         }
         .boxed()
+    }
+}
+
+/// [`fate`] from the pod lookup. A user may read `pods/log` without being allowed to get the
+/// pod: a 403 then means "unknown", and the stream is reopened with backoff.
+pub(crate) fn fate_of(
+    lookup: Result<Option<Pod>, kube::Error>,
+    container: Option<&str>,
+) -> Result<AfterEnd, LogError> {
+    match lookup {
+        Ok(pod) => Ok(fate(pod.as_ref(), container)),
+        Err(kube::Error::Api(status)) if status.code == 403 => Ok(AfterEnd::Restarts),
+        Err(e) => Err(LogError::from_kube(e)),
     }
 }
 
@@ -195,6 +204,25 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         spec.and_then(|s| s.containers.first())
             .map(|c| c.name.clone())
     });
+    let pod_policy = spec
+        .and_then(|s| s.restart_policy.as_deref())
+        .unwrap_or("Always");
+    // The container's own policy wins: a native sidecar (an init container with
+    // `restartPolicy: Always`) restarts in any pod; an ordinary init container runs to success
+    // once. Regular containers follow the pod.
+    let regular = spec
+        .into_iter()
+        .flat_map(|s| s.containers.iter())
+        .find(|c| Some(&c.name) == name.as_ref());
+    let init = spec
+        .into_iter()
+        .flat_map(|s| s.init_containers.iter().flatten())
+        .find(|c| Some(&c.name) == name.as_ref());
+    let policy = match (regular, init) {
+        (Some(c), _) => c.restart_policy.as_deref().unwrap_or(pod_policy),
+        (None, Some(c)) => c.restart_policy.as_deref().unwrap_or("Once"),
+        (None, None) => pod_policy,
+    };
     let exit_code = status
         .into_iter()
         .flat_map(|s| {
@@ -206,11 +234,10 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         .find(|c| Some(&c.name) == name.as_ref())
         .and_then(|c| c.state.as_ref()?.terminated.as_ref())
         .map(|t| t.exit_code);
-    let policy = spec
-        .and_then(|s| s.restart_policy.as_deref())
-        .unwrap_or("Always");
     match (exit_code, policy) {
-        (Some(_), "Never") | (Some(0), "OnFailure") => AfterEnd::Finished,
+        (Some(_), "Never") | (Some(0), "OnFailure" | "Once") => AfterEnd::Finished,
+        // A failed init container is retried unless the pod never restarts anything.
+        (Some(_), "Once") if pod_policy == "Never" => AfterEnd::Finished,
         _ => AfterEnd::Restarts,
     }
 }
@@ -421,5 +448,59 @@ mod tests {
             AfterEnd::Restarts,
             "the sidecar still runs"
         );
+    }
+
+    fn with_init(pod_policy: &str, sidecar: bool, code: i32) -> Pod {
+        let mut init = json!({"name": "init"});
+        if sidecar {
+            init["restartPolicy"] = json!("Always");
+        }
+        pod(json!({
+            "spec": {"restartPolicy": pod_policy, "initContainers": [init],
+                     "containers": [{"name": "app"}]},
+            "status": {"phase": "Running", "initContainerStatuses": [
+                {"name": "init", "image": "i", "imageID": "", "ready": false, "restartCount": 0,
+                 "state": {"terminated": {"exitCode": code}}}
+            ]}
+        }))
+    }
+
+    // covers UP-40
+    #[test]
+    fn the_containers_own_restart_policy_decides() {
+        let init = Some("init");
+        // A native sidecar restarts even in a pod that restarts nothing else.
+        assert_eq!(
+            fate(Some(&with_init("Never", true, 1)), init),
+            AfterEnd::Restarts
+        );
+        assert_eq!(
+            fate(Some(&with_init("OnFailure", true, 0)), init),
+            AfterEnd::Restarts
+        );
+        // An ordinary init container that succeeded is done, even in an Always pod.
+        assert_eq!(
+            fate(Some(&with_init("Always", false, 0)), init),
+            AfterEnd::Finished
+        );
+        // A failed one is retried, unless the pod never restarts.
+        assert_eq!(
+            fate(Some(&with_init("Always", false, 1)), init),
+            AfterEnd::Restarts
+        );
+        assert_eq!(
+            fate(Some(&with_init("Never", false, 1)), init),
+            AfterEnd::Finished
+        );
+    }
+
+    // covers UP-40
+    #[test]
+    fn a_forbidden_pod_lookup_falls_back_to_reconnecting() {
+        let forbidden = Err(api_error(403, "pods \"p\" is forbidden"));
+        assert_eq!(fate_of(forbidden, None), Ok(AfterEnd::Restarts));
+        assert_eq!(fate_of(Ok(None), None), Ok(AfterEnd::Gone));
+        let missing = fate_of(Err(api_error(500, "boom")), None).unwrap_err();
+        assert!(!missing.fatal);
     }
 }

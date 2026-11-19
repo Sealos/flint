@@ -168,6 +168,8 @@ enum Internal {
     /// A log session (re)connects and needs the cluster's current client.
     LogClient {
         cluster: ClusterId,
+        /// The API server the session was opened against.
+        server: Option<String>,
         reply: oneshot::Sender<Result<Client, LogError>>,
     },
 }
@@ -356,10 +358,18 @@ impl ClusterManager {
                 paused,
             } => {
                 let internal = self.internal_tx.clone();
+                // Pinned now: a reconnect must never read logs from another server that the
+                // context was re-pointed to in the meantime (UP-06).
+                let server = self
+                    .clusters
+                    .iter()
+                    .find(|c| c.info.name == cluster)
+                    .and_then(|c| c.info.server.clone());
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
                     let _ = internal.send(Internal::LogClient {
                         cluster: cluster.clone(),
+                        server: server.clone(),
                         reply,
                     });
                     Box::pin(async move {
@@ -757,8 +767,12 @@ impl ClusterManager {
                     self.hubs.release(&cluster, &kind);
                 }
             }
-            Internal::LogClient { cluster, reply } => {
-                let _ = reply.send(self.log_client(&cluster));
+            Internal::LogClient {
+                cluster,
+                server,
+                reply,
+            } => {
+                let _ = reply.send(self.log_client(&cluster, server.as_deref()));
             }
             Internal::CrdsChanged {
                 cluster,
@@ -798,13 +812,21 @@ impl ClusterManager {
 
     /// The client a log session should use for `cluster` now. A cluster that was never
     /// connected is connected (the session asked for it); one whose connection failed is not
-    /// retried here, so a broken exec plugin does not run again at every session retry.
-    fn log_client(&mut self, cluster: &str) -> Result<Client, LogError> {
+    /// retried here, so a broken exec plugin does not run again at every session retry. A
+    /// context that now points at another API server than `server` (the one the session was
+    /// opened against) ends the session.
+    fn log_client(&mut self, cluster: &str, server: Option<&str>) -> Result<Client, LogError> {
         let Some(slot) = self.clusters.iter().find(|c| c.info.name == cluster) else {
             return Err(LogError::fatal(format!(
                 "\"{cluster}\" is no longer in your kubeconfig files"
             )));
         };
+        if slot.info.server.as_deref() != server {
+            return Err(LogError::fatal(format!(
+                "\"{cluster}\" now points to a different API server; open the logs again to read \
+                 from it"
+            )));
+        }
         if let Some(client) = &slot.client {
             return Ok(client.clone());
         }
@@ -1256,6 +1278,43 @@ mod tests {
             ["x", "y"],
             "else what the user can list"
         );
+    }
+
+    // covers UP-06, UP-40
+    #[test]
+    fn a_log_session_never_reconnects_to_a_re_pointed_context() {
+        let (events, _rx) = async_channel::unbounded();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+        };
+        let hubs = HubRegistry::default();
+        let mut manager = ClusterManager::new(config, events, hubs.clone());
+        let mut slot = Cluster::new(context(None), None, &hubs, &manager.engine_config);
+        slot.state = ConnectionState::Failed("offline".into());
+        manager.clusters.push(slot);
+
+        let same = manager
+            .log_client("dev", Some("https://dev"))
+            .err()
+            .expect("no client");
+        assert!(!same.fatal, "the same server is retried: {}", same.message);
+        let moved = manager
+            .log_client("dev", Some("https://old"))
+            .err()
+            .expect("no client");
+        assert!(moved.fatal);
+        assert!(
+            moved.message.contains("different API server"),
+            "{}",
+            moved.message
+        );
+        let gone = manager.log_client("other", None).err().expect("no client");
+        assert!(gone.fatal);
     }
 
     // covers UP-24
