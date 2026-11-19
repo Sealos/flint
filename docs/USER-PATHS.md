@@ -280,6 +280,20 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ---
 
+### UP-54 Protected clusters are read-only
+- **When** I connect to a remote cluster I have not trusted, and try to edit, delete, scale, restart, drain, exec or
+  port-forward.
+- **Then** the action is disabled and says the cluster is protected, with an Unlock button in place. Browsing, logs and
+  details work as usual. A cluster on my machine (kind, minikube, Docker Desktop, OrbStack) starts unlocked.
+- Tests: unit (core refuses writes on protected clusters), ui, e2e.
+
+### UP-55 Unlock or trust a cluster
+- **When** I unlock a protected cluster, or mark it trusted.
+- **Then** an unlock asks once, naming the cluster and its server, and lasts until Flint quits; the sidebar shows an open
+  lock, and Lock Again relocks it. Trust lasts across restarts and is pinned to the server URL: if the context is
+  re-pointed, the cluster is protected again.
+- Tests: unit (settings, pinning), ui.
+
 ## M4: Curated views, metrics and the resource diagram
 
 ### UP-60 Understand a workload at a glance
@@ -396,6 +410,26 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 
 ---
 
+### UP-82 Combine clusters into one view
+- **When** I Cmd-click two to five clusters in the sidebar, open Pods, and sort by Status.
+- **Then** one list shows the pods of every selected cluster with a Cluster column (and each cluster's colour tag), the
+  crashing ones first. The group-by-cluster toggle shows one section per cluster instead. Opening a row shows its
+  detail from its own cluster.
+- Tests: unit (merging, union columns), ui, e2e (two kind clusters).
+
+### UP-83 Save and reopen a cluster set
+- **When** I save a selection as a named set, quit, and open the set again.
+- **Then** the same clusters open combined. If one member's context now points to a different server, it is left out
+  and the set marks it changed.
+- Tests: unit (settings, pinning), ui.
+
+### UP-84 Kinds and columns that differ between clusters
+- **When** a set's clusters run different Kubernetes versions, or a CRD exists on only some of them.
+- **Then** the resource tree lists the CRD with a `2/3` badge, its combined list names the cluster that lacks it, and
+  columns that only some clusters return are shown with blank cells for the others. One unreachable member shows a
+  note and doesn't block the others' rows.
+- Tests: unit, e2e.
+
 ## M6: Install
 
 ### UP-80 Install from the DMG
@@ -409,6 +443,21 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - Tests: manual, plus a CI smoke test.
 
 ---
+
+## M7: Fleet actions (after 1.0)
+
+### UP-100 Restart a workload on several clusters
+- **When** I select a Deployment in a combined view and choose Rollout Restart on 3 clusters.
+- **Then** a preview lists each target cluster with a dry-run result and a checkbox. The restart runs one cluster at a
+  time and stops at the first failure, saying which clusters were done and which were not. Locked clusters in the list
+  need their name typed first.
+- Tests: unit (sequencing, stop on failure), e2e.
+
+### UP-101 Apply one manifest to several clusters
+- **When** I apply a YAML manifest to a cluster set.
+- **Then** I see a server-side dry-run diff per cluster before anything changes, can drop clusters from the target list,
+  and the apply runs one cluster at a time as above. Scale and delete follow the same flow.
+- Tests: unit, e2e.
 
 ## Always true
 
