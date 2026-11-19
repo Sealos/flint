@@ -1,5 +1,8 @@
 # Watch every kind on the active cluster, with an on-view mode as an option
 
+**Amended by [ADR-0012](./0012-keep-recently-used-clusters-warm.md).** The last few clusters the user selected stay
+warm and keep their watches. Only clusters outside that set drop their watches as described below.
+
 By default, while a cluster is active (shown in the window), Flint watches every discovered kind that can be listed
 and watched, so moving between lists is instant. A setting, global with a per-cluster override, switches to **on
 view** mode, which watches a kind only while one of its views is open. Clusters that are not active drop all their

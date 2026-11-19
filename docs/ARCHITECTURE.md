@@ -13,15 +13,21 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 ### v1 goals
 
 - macOS only. The core stays portable so Linux and Windows can follow ([ADR-0001](./adr/0001-rust-and-gpui.md)).
-- Multiple clusters, loaded from the user's kubeconfig files, shown in one window with a cluster sidebar.
+- Multiple clusters, loaded from the user's kubeconfig files, shown in one window with a cluster sidebar. The
+  clusters used most recently stay warm, so switching between them is instant
+  ([ADR-0012](./adr/0012-keep-recently-used-clusters-warm.md)).
 - Browse every resource kind, including CRDs, with live updates ([ADR-0003](./adr/0003-generic-resource-views.md)).
-- Pod logs: follow, search, pick a container, show previous logs.
+- Pod logs: follow, search, pick a container, show previous logs, toggle timestamps, and highlight errors and
+  warnings.
+- AI log analysis: send selected log lines, redacted, to the user's own Claude Code CLI (`claude`) and read the
+  answer in a side panel ([ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md)).
 - Pod exec terminal.
 - Edit YAML in the app. Syntax and schema errors show inline as you type, and a server-side dry-run with a diff runs
   before apply ([ADR-0006](./adr/0006-yaml-validation-by-dry-run.md)).
 - Common actions: delete, scale, rollout restart, cordon and drain.
 - Current CPU and memory from metrics-server ([ADR-0005](./adr/0005-metrics-server-only.md)).
-- Port-forwarding, for the current session only.
+- Port-forwarding to pods and services, for the current session only, with open in browser for HTTP ports.
+- A resource diagram: the ownership tree of one namespace's workloads.
 - Helm releases: list, history, values, upgrade, rollback, uninstall ([ADR-0004](./adr/0004-helm-via-cli.md)).
 - A read-only MCP server (`flint mcp`) so AI agents can inspect clusters the user has opted in
   ([ADR-0009](./adr/0009-read-only-mcp-server.md)).
@@ -38,7 +44,11 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 - YAML schema autocomplete.
 - Saved port-forwards that come back after a restart.
 - An in-app auto-updater.
-- MCP write tools, an MCP server over HTTP, and a built-in AI chat panel.
+- MCP write tools, an MCP server over HTTP, and a built-in AI chat panel. The log analysis panel shows one answer
+  per request and takes no follow-up prompts.
+- LLM API keys or provider clients in Flint. AI features go through the user's own tools.
+- Views that show several clusters side by side. Several clusters can be connected, but views show one at a time.
+- Network edges in the resource diagram (Service to Pod, Ingress to Service).
 
 ## Stack
 
@@ -62,7 +72,8 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 crates/
   flint-core/   Kubernetes logic: kubeconfig, connections, discovery, watches, stores, actions,
                 logs, exec, port-forward, metrics, Helm. Depends on tokio and kube. Never on GPUI.
-  flint-mcp/    The MCP server (stdio): tool definitions, cluster opt-in checks, redaction. Depends on flint-core.
+  flint-mcp/    The MCP server (stdio): tool definitions, cluster opt-in checks, output limits. Depends on flint-core.
+                Redaction rules live in `flint_core::redact`, shared with the app.
                 Its `flint-mcp` binary is the same server without GPUI, for Linux CI only; not shipped.
   flint-app/    The `flint` binary: windows, views, the terminal widget, settings UI, the bridge to core.
                 `flint mcp` runs flint-mcp instead of starting the UI.
@@ -87,6 +98,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 │                      ├─ Sessions: log streams, exec, port-forwards          │
 │                      └─ Metrics poller (metrics.k8s.io)                     │
 │  HelmRunner (spawns `helm` subprocesses)                                    │
+│  LogAnalysisRunner (spawns `claude`, on a user action only)                 │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,10 +123,22 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   plus `/opt/homebrew/bin:/usr/local/bin`. A `path` value in `settings.toml` overrides all of this. Flint sets the
   result as its own process `PATH` before starting the tokio runtime or any threads, because `kube` starts exec
   plugins with Flint's own environment. VS Code does the same.
-- One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view. Clusters that are not
-  active keep their client and discovery cache but drop their watches ([ADR-0008](./adr/0008-watch-everything-on-active-cluster.md)).
-  Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
-  another cluster. They end only when the user closes them or quits Flint.
+- One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view.
+- The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
+  with their watches running in the background, so switching to them is instant. The least recently used is made
+  **cold** when the set is full, when the stores of the background clusters (not the active one) go over
+  `warm_memory_mib` (default 128), after 30 minutes unused, or when the Mac sleeps. A cold cluster keeps its client
+  and discovery cache but drops its watches ([ADR-0008](./adr/0008-watch-everything-on-active-cluster.md), amended
+  by [ADR-0012](./adr/0012-keep-recently-used-clusters-warm.md)).
+- The warm set starts empty on launch. Flint never runs an exec plugin for a cluster that is not active. A warm
+  cluster whose credential expires goes cold with a "sign-in needed" badge. One whose watches fail, or stay
+  disconnected for over 2 minutes, goes cold with an error badge. Background errors show only in the sidebar, never
+  as toasts.
+- The sidebar shows each cluster as active, warm or cold, with a badge for reconnecting, sign-in needed or error.
+  Clicking a row with a badge makes it active and retries auth in the foreground. Disconnect makes a warm cluster
+  cold.
+- Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
+  another cluster, warm or cold. They end only when the user closes them or quits Flint.
 
 ## Resources
 
@@ -154,8 +178,26 @@ Two modes, set globally with an optional per-cluster override ([ADR-0008](./adr/
 - **On view:** Flint watches a kind only while a list or detail view for it is open. Uses less memory on very large
   clusters, but a list may need a moment to load when you open it.
 
-When the user switches to another cluster, the old cluster's watches stop in both modes. Switching back starts them
-again with a fresh list.
+When the user switches to another cluster, the old one stays warm. In mode All it keeps its watches, except the
+high-churn kinds no open view needs (Events, Leases, EndpointSlices), which start again when it becomes active. In
+mode On view it keeps the watches of the views that were open when the user left. When a cluster goes cold, its
+watches stop in both modes, and switching back starts them again with a fresh list.
+
+### Resource diagram
+
+A read-only view of one namespace's ownership tree: Deployment, ReplicaSet and Pods, StatefulSets and DaemonSets
+and their Pods, and CronJob, Job and Pods on three levels. Each owner is drawn as a group around what it owns.
+Status colors come from theme tokens. Clicking a node opens its detail view.
+
+- **Size:** empty ReplicaSets and finished Jobs are collapsed by default. Each group can be collapsed, and a group of
+  more than about 50 pods shows a count instead of every pod. Past a node limit, the rest is shown as one summary
+  node.
+- **Data:** the tree is built from the stores, with no API requests beyond the watches the diagram needs. In mode All
+  those are already running. In On view mode, opening the diagram starts them, like any view. Kinds the user may not
+  list are left out, and the diagram says so.
+- **Owners:** each row keeps the uid of its controller owner reference, stored compactly (as a `u128` or interned).
+  Rows did not keep owner references before. The comment in `table.rs` that says so changes with this.
+- Network edges (Service to Pod, Ingress to Service) are not drawn in the first version.
 
 ## Features
 
@@ -184,6 +226,35 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
   following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.
+- **Highlighting:** the view colors each line by its severity with the theme's error and warning tokens. The rules
+  live in `logs::classify`: case-insensitive whole words; `ERROR`, `FATAL`, `panic`, and any word ending in
+  `Exception` or `Error` (such as `NullPointerException`) mark an error; `WARN` and `WARNING` mark a warning; an
+  error wins over a warning.
+- **Copy** puts the selected lines on the clipboard as shown (with timestamps only when they are shown) and without
+  redaction. AI log analysis redacts what it sends (see below).
+
+### AI log analysis
+
+The log viewer has an **Analyze with Claude** button. A palette action with a shortcut does the same. `claude` is
+found on the resolved `PATH` (relative and empty entries ignored) or set in `settings.toml`. If it is not found, the
+button and the action are hidden. Codex is not supported in v1, because it has no way to turn its tools off. The full
+design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
+
+1. The user selects lines and clicks Analyze with Claude. The opt-in is checked against the log session's own
+   cluster (context name plus server URL), not the active one.
+2. Flint redacts the lines with the log redactor in `flint_core::redact`: credential shapes, vendor tokens, private
+   keys, and the values of Secrets, env and ConfigMaps the pod references, read at that moment. It sends at most
+   1,000 lines, 4 KiB per line and 256 KiB in total.
+3. A sheet shows the exact prompt and lines and names the CLI and its path. The first time on a cluster it has a
+   checkbox "Allow log analysis on `<context>` (`<server>`)", and on every cluster an "Always for this cluster"
+   option. The opt-in stores the CLI and its binary path, and "Always" resets when either changes. The opt-in is
+   revoked from the sidebar context menu or the palette.
+4. Flint starts the CLI in its own process group, with a cleared environment plus an allowlist, `KUBECONFIG` set to
+   `/dev/null`, and a private temporary directory. Claude Code runs with its tools, MCP servers, settings and hooks
+   off, and Flint checks its `system/init` event before anything is sent. The prompt goes in on stdin. It says the
+   lines are untrusted data and must not be followed.
+5. The answer streams into a side panel as text, below what was sent. Stop kills the process group. Flint never acts
+   on the answer.
 
 ### Exec terminal
 
@@ -218,7 +289,13 @@ open. If metrics-server is not installed, the metric columns are hidden and a hi
 ### Port-forward
 
 `Api::<Pod>::portforward` behind a local `TcpListener`. When the target is a Service, Flint picks a ready pod behind
-it. A panel lists the active forwards with stop buttons. Forwards end when the app quits.
+it, and picks another one if that pod goes away. The user picks the local port, or lets Flint choose a free one, and
+can forward several ports of one target at once.
+
+A panel lists the active forwards: target, local and remote port, and state, with stop buttons. Ports named `http`
+or `web`, or with `appProtocol` `http`, get an **Open in browser** action for `http://localhost:<port>`. Ports named
+`https`, or with `appProtocol` `https`, open `https://localhost:<port>`. Unnamed ports offer Open in browser from the
+row's context menu. Forwards bind to `127.0.0.1` only and end when the app quits.
 
 ### Helm
 
@@ -272,7 +349,8 @@ Rules:
 - **stdout is the protocol channel:** all logging goes to stderr.
 
 The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
-tool layer and the policy (opt-in, redaction, limits) live in `flint-mcp`.
+tool layer and the policy (opt-in, limits) live in `flint-mcp`. The redaction rules live in `flint_core::redact`, so
+the app and the MCP server hide the same things.
 
 ## Look and keyboard
 
@@ -288,7 +366,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Theme tokens only:** views take every color from theme tokens and never hard-code one. This applies from M0
   onward, so the M1.5 theme work does not mean restyling every view.
 - **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
-  switch cluster, change namespace, toggle watch mode, or toggle Expose to AI.
+  switch cluster, change namespace, toggle watch mode, toggle Expose to AI, disconnect a cluster, open the diagram,
+  or analyze the selected log lines.
 - **Action registry (`flint-app/src/ui/registry.rs`):** every interactive control is a named GPUI action with a Title
   Case label, a description, a category (Flint, Cluster, Namespace, View, List, Detail), typed arguments (so a palette
   can offer pickers), default keys, and whether the palette shows it (automation-only actions such as a pane width or
@@ -311,7 +390,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 ## Settings and state
 
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
-  override, and a `helm` binary override.
+  override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
+  `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
+  analysis line limit, and a `claude` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, which the user
   drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
   filter of each cluster.
@@ -325,10 +406,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M1 | Discovery-driven navigation, Table lists (spike first), watch manager with both modes, generic detail and YAML view, namespace filter |
 | T | Test foundation: unit tests for every module, headless view tests, automation channel (test builds only), `flint-e2e` harness, recorded fake API server, Linux kind e2e, e2e screenshots ([TESTING.md](./TESTING.md)) |
 | M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
-| M2 | Log viewer, exec terminal |
+| M2 | Log viewer with streaming, search, timestamps and error highlighting; exec terminal |
 | M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain |
-| M4 | Curated views for core kinds, metrics-server columns and node/pod usage |
-| M5 | Port-forward panel, Helm releases |
+| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram |
+| M5 | Port-forward panel with local ports and open in browser, Helm releases |
+| M5.5 | Multi-cluster and AI: warm clusters for instant switching, AI log analysis through the user's Claude Code CLI |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
 
 ## Risks
@@ -346,3 +428,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Exec plugin latency.** Some auth plugins take seconds to run. Cache tokens until they expire (`kube` does this)
   and show connection progress in the UI.
 - **No `helm` installed.** Covered by an install hint. Bundling the binary is a possible follow-up.
+- **AI CLI flags change.** `claude` is young, and its flags can change. Keep the flags in one place, and fail
+  closed when the CLI rejects them or its `system/init` check fails.
+- **Log lines leave the machine.** Redaction is pattern-based and can miss a secret. The confirmation shows exactly
+  what is sent, so the user is the last check.
+- **Memory with warm clusters.** Covered by the count, the memory budget and the idle limit. Watch storms on a warm
+  cluster cost CPU, but no view redraws for them. The target is under 1% CPU with 3 idle warm clusters.
+- **Only one AI CLI.** Codex users get no Analyze button in v1. Support is reconsidered when `codex exec` can turn its
+  tools off (ADR-0011).
