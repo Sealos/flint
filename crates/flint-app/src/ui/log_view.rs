@@ -727,7 +727,10 @@ impl LogView {
                         .xsmall()
                         .ghost()
                         .disabled(!has_matches)
-                        .tooltip("Previous match (⇧⌘G)")
+                        .tooltip(format!(
+                            "Previous match ({})",
+                            registry::key_hint("secondary-shift-g")
+                        ))
                         .on_click(registry::on_click(PrevMatch)),
                 )
                 .child(
@@ -736,7 +739,10 @@ impl LogView {
                         .xsmall()
                         .ghost()
                         .disabled(!has_matches)
-                        .tooltip("Next match (⌘G)")
+                        .tooltip(format!(
+                            "Next match ({})",
+                            registry::key_hint("secondary-g")
+                        ))
                         .on_click(registry::on_click(NextMatch)),
                 )
             })
@@ -841,8 +847,9 @@ impl LogView {
             let lines = &self.snapshot.lines;
             let count = selection.lines(lines).count() as u64;
             let mut text = format!(
-                "{} selected. ⌘C copies and Save writes them as shown, not redacted. Esc clears.",
-                log_model::line_count(count)
+                "{} selected. {} copies and Save writes them as shown, not redacted. Esc clears.",
+                log_model::line_count(count),
+                registry::key_hint("secondary-c")
             );
             if selection.is_cut(lines) {
                 text.push_str(" Some selected lines left the buffer.");

@@ -574,10 +574,10 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
     });
     cx.update_window(t.window, |_, window, cx| window.focus(&focus, cx))
         .unwrap();
-    press(cx, &t, "cmd-w");
+    press(cx, &t, "secondary-w");
     assert_eq!(dock_tabs(cx, &t).1.len(), 2);
-    press(cx, &t, "cmd-w");
-    press(cx, &t, "cmd-w");
+    press(cx, &t, "secondary-w");
+    press(cx, &t, "secondary-w");
     assert_eq!(dock_tabs(cx, &t), (false, Vec::new()));
     cx.run_until_parked();
     assert!(first.upgrade().is_none(), "closing a tab ends its session");
@@ -692,7 +692,7 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     focus_workspace(cx, &t);
-    press(cx, &t, "cmd-j");
+    press(cx, &t, "secondary-j");
     assert_eq!(dock_tabs(cx, &t), (true, Vec::new()));
     cx.wait_for(t.window, WAIT, |window, _| {
         window.try_find("dock-empty").is_some()
@@ -732,6 +732,6 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     );
 
     focus_workspace(cx, &t);
-    press(cx, &t, "cmd-j");
+    press(cx, &t, "secondary-j");
     assert_eq!(dock_tabs(cx, &t), (false, Vec::new()));
 }

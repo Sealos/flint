@@ -405,7 +405,7 @@ impl Dock {
                     .xsmall()
                     .ghost()
                     .tab_stop(false)
-                    .tooltip("Close tab (⌘W)")
+                    .tooltip(format!("Close tab ({})", registry::key_hint("secondary-w")))
                     .on_click(registry::on_click_contained(CloseTab { tab: id })),
             )
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -437,9 +437,11 @@ impl Render for Dock {
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child("No sessions.")
-                .child(div().text_xs().child(
-                    "Open a pod's logs (Logs, ⌘L) or a shell (Shell, ⇧⌘E) from its detail pane.",
-                ))
+                .child(div().text_xs().child(format!(
+                    "Open a pod's logs (Logs, {}) or a shell (Shell, {}) from its detail pane.",
+                    registry::key_hint("secondary-l"),
+                    registry::key_hint("secondary-shift-e")
+                )))
                 .test_support()
                 .into_any_element(),
         };
@@ -473,7 +475,10 @@ impl Render for Dock {
                                 .xsmall()
                                 .ghost()
                                 .tab_stop(false)
-                                .tooltip("Hide the dock (⌘J)")
+                                .tooltip(format!(
+                                    "Hide the dock ({})",
+                                    registry::key_hint("secondary-j")
+                                ))
                                 .on_click(registry::on_click(ToggleDock)),
                         ),
                     ),

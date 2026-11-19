@@ -75,7 +75,7 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     `enabled` and `available` now. Ask it when a dispatch says `not_available`.
   - `type_text {text}`: one keystroke per character (Shift for capitals and shifted symbols), to the focused element.
     At most 4 KiB.
-  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `cmd-w`, `?`).
+  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `secondary-w`, `?`; `secondary` is Cmd on macOS, Ctrl on Linux).
   - `state`: the visible view tree: `focus`, `dialog` (`{title, text, buttons}` while one is open), `appearance`,
     `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`), sidebar `banners`, `active_cluster`,
     `main`, `header` (with `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the entries of open ones),

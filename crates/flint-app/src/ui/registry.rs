@@ -654,6 +654,20 @@ impl ActionSpec {
     }
 }
 
+/// A chord in GPUI syntax (`secondary-shift-g`) written the way this OS shows it: "⌘⇧G" on
+/// macOS, Ctrl and Shift spelled out on Linux. For key hints in tooltips and notes.
+pub fn key_hint(keys: &str) -> String {
+    let os = if cfg!(target_os = "macos") {
+        OperatingSystem::Mac
+    } else {
+        OperatingSystem::Linux
+    };
+    match Keystroke::parse_with_os(keys, os) {
+        Ok(keystroke) => keystroke.display(os).to_string(),
+        Err(_) => keys.to_owned(),
+    }
+}
+
 /// Every action, in menu order.
 #[cfg_attr(
     not(any(test, feature = "automation")),
@@ -1394,13 +1408,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .hidden(),
         Spec::unit::<OpenLogs>("Open Logs", "Open the shown pod's logs in the dock.")
             .of(C::Logs, S::Detail)
-            .keys(&["cmd-l"], Some(WORKSPACE)),
+            .keys(&["secondary-l"], Some(WORKSPACE)),
         Spec::unit::<OpenPreviousLogs>(
             "Open Previous Logs",
             "Open the logs of the previous instance of the shown pod's container.",
         )
         .of(C::Logs, S::Detail)
-        .keys(&["cmd-shift-l"], Some(WORKSPACE)),
+        .keys(&["secondary-shift-l"], Some(WORKSPACE)),
         Spec::with_args::<OpenContainerLogs>(
             "Open Container Logs…",
             "Open the logs of one container of the shown pod, or of its previous instance.",
@@ -1422,13 +1436,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // The dock.
         Spec::unit::<ToggleDock>("Toggle Dock", "Show or hide the bottom dock.")
             .of(C::View, S::Dock)
-            .keys(&["cmd-j"], Some(WORKSPACE)),
+            .keys(&["secondary-j"], Some(WORKSPACE)),
         Spec::unit::<CloseActiveTab>(
             "Close Dock Tab",
             "Close the dock's active tab, ending its session.",
         )
         .of(C::View, S::Dock)
-        .keys(&["cmd-w"], Some(DOCK)),
+        .keys(&["secondary-w"], Some(DOCK)),
         Spec::unit::<NextTab>("Next Dock Tab", "Show the dock's next tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-tab"], Some(DOCK)),
@@ -1460,10 +1474,10 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Scroll to the newest line and follow again, resuming a pause.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["end", "cmd-down"], Some(LOG_PLAIN)),
+        .keys(&["end", "secondary-down"], Some(LOG_PLAIN)),
         Spec::unit::<JumpToStart>("Jump to Oldest Line", "Scroll to the oldest line shown.")
             .of(C::Logs, S::Logs)
-            .keys(&["home", "cmd-up"], Some(LOG_PLAIN)),
+            .keys(&["home", "secondary-up"], Some(LOG_PLAIN)),
         Spec::unit::<ToggleTimestamps>(
             "Toggle Timestamps",
             "Show or hide each line's timestamp, without reloading.",
@@ -1481,16 +1495,16 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(&["w"], Some(LOG_PLAIN)),
         Spec::unit::<FocusSearch>("Search Logs", "Move focus to the log search field.")
             .of(C::Logs, S::Logs)
-            .keys(&["cmd-f"], Some(LOG_VIEW)),
+            .keys(&["secondary-f"], Some(LOG_VIEW)),
         Spec::unit::<NextMatch>("Next Match", "Go to the next line matching the search.")
             .of(C::Logs, S::Logs)
-            .keys(&["cmd-g"], Some(LOG_VIEW)),
+            .keys(&["secondary-g"], Some(LOG_VIEW)),
         Spec::unit::<PrevMatch>(
             "Previous Match",
             "Go to the previous line matching the search.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-shift-g"], Some(LOG_VIEW)),
+        .keys(&["secondary-shift-g"], Some(LOG_VIEW)),
         Spec::unit::<SelectPrevLine>(
             "Select Previous Line",
             "Select the line above, or the newest line.",
@@ -1517,7 +1531,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .keys(&["shift-down"], Some(LOG_PLAIN)),
         Spec::unit::<SelectAllLines>("Select All Lines", "Select every line shown.")
             .of(C::Logs, S::Logs)
-            .keys(&["cmd-a"], Some(LOG_PLAIN)),
+            .keys(&["secondary-a"], Some(LOG_PLAIN)),
         Spec::unit::<ClearSelection>(
             "Clear Line Selection",
             "Clear the line selection and resume following.",
@@ -1529,25 +1543,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Copy the selected lines as shown, without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-c"], Some(LOG_PLAIN)),
+        .keys(&["secondary-c"], Some(LOG_PLAIN)),
         Spec::unit::<SaveLogs>(
             "Save Logs",
             "Save every line shown to a file, as shown and without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-s"], Some(LOG_VIEW)),
+        .keys(&["secondary-s"], Some(LOG_VIEW)),
         Spec::unit::<SaveMatchingLines>(
             "Save Matching Lines",
             "Save the lines matching the search to a file, as shown and without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-shift-s"], Some(LOG_VIEW)),
+        .keys(&["secondary-shift-s"], Some(LOG_VIEW)),
         Spec::unit::<SaveSelectedLines>(
             "Save Selected Lines",
             "Save the selected lines to a file, as shown and without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-alt-s"], Some(LOG_VIEW)),
+        .keys(&["secondary-alt-s"], Some(LOG_VIEW)),
         Spec::with_args::<SaveLines>(
             "Save Log Lines…",
             "Save all lines, the search matches or the selection to a file, as shown and without redaction.",
@@ -1704,7 +1718,8 @@ pub mod tests {
 
     use super::ArgKind;
     use super::{
-        ActionError, Bind, Category, Handler, OpenView, Scope, SelectRow, Visibility, actions, find,
+        ActionError, Bind, Category, Handler, OpenView, Scope, SelectRow, Visibility, actions,
+        find, key_hint,
     };
 
     /// Collects the names of the actions a view binds.
@@ -1780,6 +1795,17 @@ pub mod tests {
         );
         // Bool is for future toggles that take a value.
         assert_ne!(ArgKind::Bool, ArgKind::Text);
+    }
+
+    #[test]
+    fn key_hints_use_the_platform_modifier() {
+        let hint = key_hint("secondary-shift-g");
+        if cfg!(target_os = "macos") {
+            assert_eq!(hint, "⌘⇧G");
+        } else {
+            assert!(hint.to_lowercase().contains("ctrl"), "{hint}");
+            assert!(!hint.contains('⌘'), "{hint}");
+        }
     }
 
     #[test]
