@@ -44,7 +44,7 @@ actions!(
         Quit,
         /// Close the front window.
         CloseWindow,
-        /// Follow macOS light and dark mode (the `appearance` setting).
+        /// Follow the system light and dark mode (the `appearance` setting).
         AppearanceSystem,
         /// Always use Flint Light.
         AppearanceLight,
@@ -540,8 +540,8 @@ pub struct ActionSpec {
     pub scope: Scope,
     pub visibility: Visibility,
     pub args: &'static [Arg],
-    /// Default keys, in GPUI keystroke syntax ("cmd-q", "down"), and the key context they
-    /// apply in (`None`: everywhere).
+    /// Default keys, in GPUI keystroke syntax ("secondary-q", "down"), and the key context they
+    /// apply in (`None`: everywhere). `secondary` is Cmd on macOS and Ctrl on Linux.
     pub keys: &'static [&'static str],
     pub key_context: Option<&'static str>,
     type_id: TypeId,
@@ -1213,13 +1213,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // Flint.
         Spec::unit::<Quit>("Quit Flint", "Quit the app.")
             .of(C::Flint, S::App)
-            .keys(&["cmd-q"], None),
+            .keys(&["secondary-q"], None),
         Spec::unit::<CloseWindow>("Close Window", "Close the front window.")
             .of(C::Flint, S::App)
-            .keys(&["cmd-w"], None),
+            .keys(&["secondary-w"], None),
         Spec::unit::<AppearanceSystem>(
             "Use System Appearance",
-            "Follow macOS light and dark mode.",
+            "Follow the system light and dark mode.",
         )
         .of(C::Flint, S::App),
         Spec::unit::<AppearanceLight>("Use Light Appearance", "Always use Flint Light.")
@@ -1252,7 +1252,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Connect to the active cluster again after a failure.",
         )
         .of(C::Cluster, S::Workspace)
-        .keys(&["cmd-r"], Some(WORKSPACE)),
+        .keys(&["secondary-r"], Some(WORKSPACE)),
         Spec::unit::<WatchAllKinds>("Watch All Kinds", "Watch every kind on the active cluster.")
             .of(C::Cluster, S::Workspace),
         Spec::unit::<WatchOpenViewsOnly>(
@@ -1321,7 +1321,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // Resource list.
         Spec::unit::<FocusFilter>("Focus Filter", "Move focus to the list's text filter.")
             .of(C::List, S::List)
-            .keys(&["cmd-f"], Some(WORKSPACE)),
+            .keys(&["secondary-f"], Some(WORKSPACE)),
         Spec::unit::<SelectPrev>("Select Previous Row", "Move the selection up.")
             .of(C::List, S::List)
             .keys(&["up"], Some(PLAIN)),
@@ -1366,13 +1366,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(&["escape"], Some(PLAIN)),
         Spec::unit::<ShowOverview>("Show Overview", "Show the object's overview.")
             .of(C::Detail, S::Detail)
-            .keys(&["cmd-1"], Some(WORKSPACE)),
+            .keys(&["secondary-1"], Some(WORKSPACE)),
         Spec::unit::<ShowYaml>("Show YAML", "Show the object as YAML.")
             .of(C::Detail, S::Detail)
-            .keys(&["cmd-2"], Some(WORKSPACE)),
+            .keys(&["secondary-2"], Some(WORKSPACE)),
         Spec::unit::<Refresh>("Refresh Object", "Fetch the shown object again.")
             .of(C::Detail, S::Detail)
-            .keys(&["cmd-r"], Some(WORKSPACE)),
+            .keys(&["secondary-r"], Some(WORKSPACE)),
         Spec::unit::<ToggleManagedFields>(
             "Toggle Managed Fields",
             "Show or hide metadata.managedFields in the YAML.",
@@ -1855,6 +1855,14 @@ pub mod tests {
                 );
             } else {
                 assert!(spec.build(Value::Null).is_ok(), "{}", spec.name);
+            }
+            // Cmd exists only on macOS; on Linux it is the Super key, which the desktop owns.
+            for key in spec.keys {
+                assert!(
+                    !key.to_lowercase().split('-').any(|m| m == "cmd"),
+                    "{} binds {key}: use secondary- (Cmd on macOS, Ctrl on Linux)",
+                    spec.name
+                );
             }
             // Plain keys never fire while typing in a field.
             if spec.keys.iter().any(|k| !k.contains('-')) {

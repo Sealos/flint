@@ -141,6 +141,9 @@ pub fn run(boot: Bootstrap) {
                     title: Some("Flint".into()),
                     ..Default::default()
                 }),
+                // Linux desktops match the window to `flint.desktop` (packaging/linux) by this
+                // id (Wayland app_id, X11 WM_CLASS), for its icon and taskbar grouping.
+                app_id: Some("flint".into()),
                 ..Default::default()
             };
             match gpui_kit::open_window(options, cx, |window, cx| {
@@ -164,7 +167,8 @@ pub fn run(boot: Bootstrap) {
 }
 
 /// The app menu with Quit and Close Window (their keys come from the registry), plus
-/// View > Appearance.
+/// View > Appearance. GPUI shows no menu bar on Linux: there, Quit and Close Window are reached
+/// by their keys, and Appearance by the `appearance` setting until the command palette (#29).
 fn install_menus(appearance: Appearance, cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
