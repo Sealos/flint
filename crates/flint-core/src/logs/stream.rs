@@ -328,6 +328,16 @@ impl Stream {
         }
     }
 
+    /// The pod is back before its stream ended: it left the pod set and matches again (its
+    /// labels changed back) within [`GONE_GRACE`]. The same pod (same uid) still runs, so the
+    /// pending end is called off and the stream reads on as if the pod had never left.
+    pub fn pod_back(&mut self) {
+        if self.gone && !self.is_done() {
+            self.gone = false;
+            self.deadline = None;
+        }
+    }
+
     /// Appends a line unless it repeats one already shown after a reconnect. A new line resets
     /// the backoff; repeats do not, so a crash-looping container that only replays its last
     /// lines is polled less and less often.
