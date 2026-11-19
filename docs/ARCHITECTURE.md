@@ -365,6 +365,17 @@ Flint polls `metrics.k8s.io/v1beta1` `PodMetrics` and `NodeMetrics` about every 
 open. If metrics-server is not installed, the metric columns are hidden and a hint is shown
 ([ADR-0005](./adr/0005-metrics-server-only.md)).
 
+### Recordings (after 1.0)
+
+A recording keeps capturing a workload's, pod's or label selector's logs, its Kubernetes events and its pods' CPU and
+memory samples while Flint runs, with no tab open, across restarts and replacements
+([ADR-0018](./adr/0018-recordings.md)). Recordings start by hand, or automatically on trouble on clusters where the
+user enabled it (CrashLoopBackOff, OOMKilled, failed Jobs; up to 10 pods; stopping 30 minutes after recovery). They
+are stored in `recordings.sqlite` in Flint's data directory (typed tables, owner-only, WAL), as written, with
+configurable retention (7 days, 500 MB per recording and 2 GB in total by default; starred ones kept). Expired
+credentials pause a recording with a "sign-in needed" badge. A recording opens as a timeline of logs, events and
+metric tracks. Agents can query recordings read-only through MCP, redacted and scoped; a time range can be exported.
+
 ### Port-forward
 
 `Api::<Pod>::portforward` behind a local `TcpListener`. When the target is a Service, Flint picks a ready pod behind
@@ -475,6 +486,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, and the dock's height,
   which the user drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
   filter of each cluster.
+- `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
+  ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.
 
 ## Milestones
@@ -492,6 +505,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets, colour tags and a set dashboard, AI log analysis through the user's Claude Code CLI |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
 | M7 | Fleet actions on a cluster set: rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
+| M8 | Recordings: background capture of a workload's logs, events and metrics into SQLite, automatic recording on trouble, a timeline view, MCP access and export |
 
 ## Risks
 
