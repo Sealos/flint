@@ -7,6 +7,8 @@ use std::time::Duration;
 use kube::Client;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
+use crate::redact;
+
 /// How long a connection attempt may take, exec auth plugin included. Some plugins (SSO logins)
 /// are slow, so this is generous.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -22,17 +24,116 @@ pub enum ClusterError {
     Config { context: String, message: String },
     #[error("{0}")]
     Kube(String),
-    #[error("timed out after {0:?}")]
-    Timeout(Duration),
+    /// `server` is already safe to show ([`redact::server_url`]); build it with
+    /// [`ClusterError::timeout`].
+    #[error("Timed out after {} {}", seconds(*after), reaching(server.as_deref()))]
+    Timeout {
+        after: Duration,
+        server: Option<String>,
+    },
+    /// The exec auth plugin's program is not on `PATH`. `command` is its file name only
+    /// ([`redact::command_name`]), filled in by [`ClusterError::for_target`].
+    #[error("{} not found on PATH ({})", plugin(command.as_deref()), crate::env_path::process_path_origin())]
+    ExecPluginNotFound { command: Option<String> },
+}
+
+fn plugin(command: Option<&str>) -> String {
+    match command {
+        Some(command) => format!("Exec plugin `{command}`"),
+        None => "Exec auth plugin".to_owned(),
+    }
+}
+
+fn seconds(d: Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{} s", d.as_secs())
+    } else {
+        format!("{:.1} s", d.as_secs_f64())
+    }
+}
+
+fn reaching(server: Option<&str>) -> String {
+    match server {
+        Some(server) => format!("reaching {server}"),
+        None => "connecting".to_owned(),
+    }
 }
 
 impl ClusterError {
     /// API errors become `"<reason>: <message>"` (for example `"NotFound: pods \"x\" not found"`);
-    /// other errors keep their full source chain.
+    /// other errors keep their full source chain, except auth plugin errors (see
+    /// [`error_chain`]).
     pub fn kube(err: kube::Error) -> Self {
         match &err {
             kube::Error::Api(status) => ClusterError::Kube(api_status_message(status)),
+            _ if is_exec_not_found(&err) => ClusterError::ExecPluginNotFound { command: None },
             _ => ClusterError::Kube(error_chain(&err)),
+        }
+    }
+
+    /// A timeout while reaching `server` (a kubeconfig `server` URL, shown through
+    /// [`redact::server_url`]).
+    pub fn timeout(after: Duration, server: Option<&str>) -> Self {
+        ClusterError::Timeout {
+            after,
+            server: server.map(redact::server_url),
+        }
+    }
+
+    /// Names what failed: the API server a timeout was reaching, the plugin that is missing.
+    /// Only details missing from the error are filled in.
+    pub fn for_target(self, target: &Target) -> Self {
+        match self {
+            ClusterError::Timeout {
+                after,
+                server: None,
+            } => ClusterError::Timeout {
+                after,
+                server: target.server.clone(),
+            },
+            ClusterError::ExecPluginNotFound { command: None } => {
+                ClusterError::ExecPluginNotFound {
+                    command: target.exec_command.clone(),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// What a context connects to, as far as error messages may say: safe to show to the user, in
+/// logs, and to an AI agent. Holds no credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Target {
+    /// The API server URL, through [`redact::server_url`].
+    pub server: Option<String>,
+    /// The exec auth plugin's program name, through [`redact::command_name`].
+    pub exec_command: Option<String>,
+}
+
+impl Target {
+    /// The target of `context` in `kubeconfig`. Missing entries leave fields empty.
+    pub fn of(kubeconfig: &Kubeconfig, context: &str) -> Self {
+        let ctx = kubeconfig
+            .contexts
+            .iter()
+            .find(|c| c.name == context)
+            .and_then(|c| c.context.as_ref());
+        let server = ctx
+            .and_then(|c| kubeconfig.clusters.iter().find(|n| n.name == c.cluster))
+            .and_then(|n| n.cluster.as_ref())
+            .and_then(|c| c.server.as_deref())
+            .map(redact::server_url);
+        let exec_command = ctx
+            .and_then(|c| c.user.as_ref())
+            .and_then(|u| kubeconfig.auth_infos.iter().find(|n| &n.name == u))
+            .and_then(|n| n.auth_info.as_ref())
+            .and_then(|a| a.exec.as_ref())
+            .and_then(|e| e.command.as_deref())
+            .map(redact::command_name);
+        Target {
+            server,
+            exec_command,
         }
     }
 }
@@ -78,10 +179,11 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
             context: context.to_owned(),
             message: error_chain(&e),
         })?;
+    let target = Target::of(kubeconfig, context);
     tokio::task::spawn_blocking(move || Client::try_from(config))
         .await
         .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
-        .map_err(ClusterError::kube)
+        .map_err(|e| ClusterError::kube(e).for_target(&target))
 }
 
 /// Stops exec auth plugins from prompting: they get no stdin and cannot ask for input. Used when
@@ -113,13 +215,15 @@ pub async fn connect_and_check(
     context: &str,
     timeout: Duration,
 ) -> Result<(Client, ServerVersion), ClusterError> {
+    let target = Target::of(kubeconfig, context);
     tokio::time::timeout(timeout, async {
         let client = connect(kubeconfig, context).await?;
         let version = server_version(&client).await?;
         Ok((client, version))
     })
     .await
-    .map_err(|_| ClusterError::Timeout(timeout))?
+    .unwrap_or_else(|_| Err(ClusterError::timeout(timeout, None)))
+    .map_err(|e| e.for_target(&target))
 }
 
 /// A hash of everything that decides how a context connects: the context, its cluster entry, and
@@ -163,6 +267,14 @@ pub fn error_chain(err: &(dyn StdError + 'static)) -> String {
     out
 }
 
+/// Whether `err` is an exec auth plugin whose program could not be found.
+fn is_exec_not_found(err: &(dyn StdError + 'static)) -> bool {
+    matches!(
+        find_auth_error(err),
+        Some(kube::client::AuthError::AuthExecStart(e)) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// The first auth error in `err`'s chain, if any.
 fn find_auth_error<'a>(err: &'a (dyn StdError + 'static)) -> Option<&'a kube::client::AuthError> {
     let mut current = Some(err);
@@ -193,6 +305,10 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
         A::AuthExec(_) => {
             "authentication failed: the exec auth plugin reported an error".to_owned()
         }
+        A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
+            "authentication failed: the exec auth plugin was not found on PATH ({})",
+            crate::env_path::process_path_origin()
+        ),
         A::AuthExecStart(e) => format!(
             "authentication failed: the exec auth plugin could not be started ({}). Is it on PATH?",
             e.kind()
@@ -293,5 +409,102 @@ mod tests {
     async fn unknown_context_is_an_error() {
         let result = connect(&kubeconfig("https://a"), "nope").await;
         assert!(matches!(result, Err(ClusterError::UnknownContext(_))));
+    }
+
+    fn exec_not_found() -> kube::Error {
+        kube::Error::Auth(kube::client::AuthError::AuthExecStart(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        )))
+    }
+
+    fn exec_kubeconfig(command: &str) -> Kubeconfig {
+        Kubeconfig::from_yaml(&format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: https://admin:pw@eks.example.com:443/x?token=t\nusers:\n- name: u\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {command}\n      args: [eks, get-token, --secret-arg]\n      env:\n      - name: AWS_SECRET_ACCESS_KEY\n        value: s3cr3t\ncontexts:\n- name: ctx\n  context:\n    cluster: c\n    user: u\n"
+        ))
+        .unwrap()
+    }
+
+    // covers UP-04, UP-05
+    #[test]
+    fn missing_exec_plugin_names_the_program_and_the_path_source() {
+        let target = Target::of(&exec_kubeconfig("/Users/someone/bin/aws"), "ctx");
+        assert_eq!(target.exec_command.as_deref(), Some("aws"));
+        let message = ClusterError::kube(exec_not_found())
+            .for_target(&target)
+            .to_string();
+        assert_eq!(
+            message,
+            "Exec plugin `aws` not found on PATH (inherited PATH)"
+        );
+        for secret in ["s3cr3t", "secret-arg", "someone", "pw", "token"] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        // Without a target, the message still says what is missing.
+        assert_eq!(
+            ClusterError::kube(exec_not_found()).to_string(),
+            "Exec auth plugin not found on PATH (inherited PATH)"
+        );
+        // Strings built from the chain (watch errors) say the same, without the command.
+        let chain = error_chain(&exec_not_found());
+        assert!(chain.contains("not found on PATH"), "{chain}");
+    }
+
+    // covers UP-04
+    #[test]
+    fn timeouts_name_the_api_server_without_credentials() {
+        let target = Target::of(&exec_kubeconfig("aws"), "ctx");
+        assert_eq!(
+            target.server.as_deref(),
+            Some("https://eks.example.com:443/x")
+        );
+        let err = ClusterError::timeout(Duration::from_secs(10), None).for_target(&target);
+        assert_eq!(
+            err.to_string(),
+            "Timed out after 10 s reaching https://eks.example.com:443/x"
+        );
+        let direct = ClusterError::timeout(
+            Duration::from_millis(1500),
+            Some("https://u:p@127.0.0.1:6443"),
+        );
+        assert_eq!(
+            direct.to_string(),
+            "Timed out after 1.5 s reaching https://127.0.0.1:6443"
+        );
+        // A server already named is kept.
+        assert_eq!(
+            direct.for_target(&target).to_string(),
+            "Timed out after 1.5 s reaching https://127.0.0.1:6443"
+        );
+        assert_eq!(
+            ClusterError::timeout(Duration::from_secs(60), None).to_string(),
+            "Timed out after 60 s connecting"
+        );
+        assert_eq!(
+            Target::of(&exec_kubeconfig("aws"), "nope"),
+            Target::default()
+        );
+    }
+
+    // covers UP-04
+    #[tokio::test(start_paused = true)]
+    async fn connect_and_check_timeouts_name_the_server() {
+        // A server that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _keep = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let kc = kubeconfig(&format!("http://{addr}"));
+        let Err(err) = connect_and_check(&kc, "ctx", Duration::from_secs(2)).await else {
+            panic!("a server that never answers cannot connect");
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("Timed out after 2 s reaching http://{addr}")
+        );
     }
 }

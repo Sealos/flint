@@ -93,6 +93,36 @@ pub fn safe_error_summary(error: &str) -> String {
     redact_quoted(&crate::kubeconfig::error_summary(error))
 }
 
+/// What may be shown of an API server URL: scheme, host, port and path. User info, query and
+/// fragment are dropped, since a hand-written kubeconfig could put a credential there. The rest
+/// is what kubeconfig, `settings.toml` (ADR-0009) and the app's sidebar already show.
+pub fn server_url(url: &str) -> String {
+    let url = url.trim();
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}{path}"),
+        None => format!("{host}{path}"),
+    }
+}
+
+/// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
+/// its directory (which can name the user's home), arguments or environment.
+pub fn command_name(command: &str) -> String {
+    let command = command.trim();
+    std::path::Path::new(command)
+        .file_name()
+        .map_or_else(|| command.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +166,28 @@ mod tests {
         assert_eq!(
             redact_quoted("unknown variant `abc`"),
             "unknown variant `…`"
+        );
+    }
+
+    #[test]
+    fn server_urls_drop_user_info_query_and_fragment() {
+        assert_eq!(
+            server_url("https://127.0.0.1:6443"),
+            "https://127.0.0.1:6443"
+        );
+        assert_eq!(
+            server_url(" https://admin:hunter2@api.example.com:6443/k8s/clusters/c-1?token=x#y "),
+            "https://api.example.com:6443/k8s/clusters/c-1"
+        );
+        assert_eq!(server_url("u:p@host:443"), "host:443");
+    }
+
+    #[test]
+    fn command_names_drop_the_directory() {
+        assert_eq!(command_name("aws"), "aws");
+        assert_eq!(
+            command_name("/Users/someone/bin/gke-gcloud-auth-plugin"),
+            "gke-gcloud-auth-plugin"
         );
     }
 }

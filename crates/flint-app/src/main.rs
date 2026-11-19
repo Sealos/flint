@@ -6,6 +6,13 @@ use std::process::ExitCode;
 
 use flint_core::bootstrap;
 
+const MCP_USAGE: &str = "\
+usage: flint mcp            serve the read-only MCP server on stdio
+       flint mcp --help     print this help
+
+Register `flint mcp` as a stdio MCP server in your AI client. It only sees the clusters marked
+Expose to AI in Flint.";
+
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     App,
@@ -20,7 +27,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Mode, (String, u
     let mut args = args.into_iter().filter(|a| !a.starts_with("-psn_"));
     match args.next().as_deref() {
         None => Ok(Mode::App),
-        Some("mcp") => Ok(Mode::Mcp),
+        // Checked before the server starts: on stdio, `--help` would otherwise be served as a
+        // session that ends at once.
+        Some("mcp") => match args.next().as_deref() {
+            None => Ok(Mode::Mcp),
+            Some("-h" | "--help" | "help") => Err((MCP_USAGE.to_owned(), 0)),
+            Some(other) => Err((
+                format!("flint mcp: unknown argument \"{other}\" (try flint mcp --help)"),
+                2,
+            )),
+        },
         Some("-h" | "--help" | "help") => Err((
             "usage: flint            start the app\n       flint mcp        serve the read-only MCP server on stdio\n       flint --version  print the version"
                 .to_owned(),
@@ -86,6 +102,19 @@ mod tests {
         assert_eq!(parse(&["mcp"]), Ok(Mode::Mcp));
         assert_eq!(parse(&["--help"]).unwrap_err().1, 0);
         assert_eq!(parse(&["bogus"]).unwrap_err().1, 2);
+    }
+
+    #[test]
+    fn mcp_help_prints_usage_instead_of_serving() {
+        for help in ["-h", "--help", "help"] {
+            let (text, code) = parse(&["mcp", help]).unwrap_err();
+            assert_eq!(code, 0);
+            assert!(text.starts_with("usage: flint mcp"), "{text}");
+            assert!(text.contains("Register `flint mcp`"), "{text}");
+        }
+        let (text, code) = parse(&["mcp", "--bogus"]).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(text.contains("--bogus"), "{text}");
     }
 
     #[test]

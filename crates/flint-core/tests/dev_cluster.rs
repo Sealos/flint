@@ -93,8 +93,25 @@ async fn reads_kinds_and_objects() {
     let pods = read::resolve_kind(&kinds, "pods", None).unwrap();
     assert_eq!(pods.api_version(), "v1");
     assert!(pods.namespaced && pods.is_listable());
-    let deployments = read::resolve_kind(&kinds, "deploy", None);
-    assert!(deployments.is_err(), "short names are not supported");
+    // Short and singular names come from discovery, as in kubectl.
+    for name in ["deploy", "deployment", "Deployment.apps"] {
+        let deployments = read::resolve_kind(&kinds, name, None).unwrap();
+        assert_eq!(deployments.id().as_str(), "deployments.apps", "{name}");
+    }
+    assert_eq!(
+        read::resolve_kind(&kinds, "po", None)
+            .unwrap()
+            .id()
+            .as_str(),
+        "pods"
+    );
+    assert_eq!(
+        read::resolve_kind(&kinds, "svc", None)
+            .unwrap()
+            .id()
+            .as_str(),
+        "services"
+    );
 
     let page = read::list(
         &client,

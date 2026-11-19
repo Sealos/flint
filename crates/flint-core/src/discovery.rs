@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::read::{KindId, KindInfo};
+use crate::read::{KindId, KindInfo, ResolveKindError};
 
 /// Discovery results for one cluster, kept while the cluster is not active.
 #[derive(Debug, Clone)]
@@ -21,6 +21,12 @@ impl ClusterDiscovery {
 
     pub fn kind(&self, id: &KindId) -> Option<&KindInfo> {
         self.kinds.iter().find(|k| k.id() == *id)
+    }
+
+    /// The kind a user typed, as `kubectl get` accepts it (`deploy`, `po`, `Deployment.apps`):
+    /// see [`resolve_kind`](crate::read::resolve_kind).
+    pub fn resolve(&self, query: &str) -> Result<&KindInfo, ResolveKindError> {
+        crate::read::resolve_kind(&self.kinds, query, None)
     }
 }
 
@@ -409,6 +415,8 @@ pub(crate) mod tests {
             },
             namespaced,
             verbs: verbs.iter().map(|v| (*v).to_owned()).collect(),
+            singular: kind.to_ascii_lowercase(),
+            short_names: Vec::new(),
         }
     }
 
@@ -505,5 +513,24 @@ pub(crate) mod tests {
         ] {
             assert_eq!(kind_label(kind, plural), label, "{kind}");
         }
+    }
+
+    // covers UP-10, UP-21
+    #[test]
+    fn resolves_typed_names_through_the_shared_resolver() {
+        let mut deploy = kind("apps", "Deployment", "deployments", true, LW);
+        deploy.short_names = vec!["deploy".into()];
+        let discovery = ClusterDiscovery::new(vec![kind("", "Pod", "pods", true, LW), deploy]);
+        for q in ["deploy", "deployment", "Deployment", "deployments.apps"] {
+            assert_eq!(
+                discovery.resolve(q).unwrap().id().as_str(),
+                "deployments.apps",
+                "{q}"
+            );
+        }
+        assert!(matches!(
+            discovery.resolve("nope"),
+            Err(ResolveKindError::NotFound(_))
+        ));
     }
 }

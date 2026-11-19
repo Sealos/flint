@@ -10,7 +10,7 @@ use std::time::Duration;
 use flint_core::cache::{SlotMap, slot};
 use flint_core::cluster::{self, ClusterError};
 use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
-use flint_core::read::{self, KindInfo};
+use flint_core::read::{self, KindInfo, ResolveKindError};
 use flint_core::settings;
 use flint_core::table::{self, TablePage};
 use kube::Client;
@@ -74,6 +74,17 @@ fn finish(result: Result<String, ToolError>) -> ToolResult {
     })
 }
 
+/// What the agent reads when a kind does not resolve: how to find the kinds, or which of the
+/// candidates to name.
+fn kind_error(e: ResolveKindError) -> ToolError {
+    match e {
+        ResolveKindError::NotFound(_) => {
+            ToolError(format!("{e}. Call list_resource_kinds for the kinds."))
+        }
+        ResolveKindError::Ambiguous { .. } => ToolError(format!("{e}.")),
+    }
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String, ToolError> {
     Ok(serde_json::to_string_pretty(value)?)
 }
@@ -88,7 +99,9 @@ pub struct ClusterParams {
 pub struct ListResourcesParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
-    /// Kind, plural, or singular name: "Pod", "pods", "deployments.apps", or a CRD kind.
+    /// The kind as kubectl accepts it, ignoring case: Kind, plural, singular, or short name
+    /// ("Deployment", "deployments", "deployment", "deploy", "po", "svc", or a CRD's), optionally
+    /// with ".group" ("deploy.apps") when it exists in several groups.
     pub kind: String,
     /// Optional apiVersion or group ("apps/v1", "v1", "apps") when a kind exists in several groups.
     pub api_version: Option<String>,
@@ -108,7 +121,9 @@ pub struct ListResourcesParams {
 pub struct GetResourceParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
-    /// Kind, plural, or singular name: "Pod", "pods", "deployments.apps", or a CRD kind.
+    /// The kind as kubectl accepts it, ignoring case: Kind, plural, singular, or short name
+    /// ("Deployment", "deployments", "deployment", "deploy", "po", "svc", or a CRD's), optionally
+    /// with ".group" ("deploy.apps") when it exists in several groups.
     pub kind: String,
     /// Optional apiVersion or group when a kind exists in several groups.
     pub api_version: Option<String>,
@@ -276,7 +291,7 @@ impl FlintMcp {
                     cluster::connect(&ctx.kubeconfig.merged, &info.name),
                 )
                 .await
-                .map_err(|_| ClusterError::Timeout(TOOL_CONNECT_TIMEOUT))?
+                .map_err(|_| ClusterError::timeout(TOOL_CONNECT_TIMEOUT, info.server.as_deref()))?
             })
             .await?;
         Ok((client.clone(), fingerprint))
@@ -311,7 +326,7 @@ impl FlintMcp {
         let (client, fp) = self.client(&ctx, cluster).await?;
         let kinds = self.kinds(cluster, &client, fp).await?;
         let kind = read::resolve_kind(&kinds, kind, api_version)
-            .map_err(|e| ToolError(format!("{e}. Call list_resource_kinds for the kinds.")))?
+            .map_err(kind_error)?
             .clone();
         Ok((client, kind))
     }
@@ -344,7 +359,7 @@ impl FlintMcp {
             };
             rows.push(json!({
                 "name": info.name,
-                "server": info.server,
+                "server": info.server.as_deref().map(flint_core::redact::server_url),
                 "default_namespace": info.namespace,
                 "reachable": reachable,
                 "server_version": version,
@@ -371,6 +386,7 @@ impl FlintMcp {
         let mut set = tokio::task::JoinSet::new();
         for info in exposed {
             let name = info.name.clone();
+            let server = info.server.clone();
             let this = self.clone();
             let ctx = ctx.clone();
             set.spawn(async move {
@@ -383,7 +399,9 @@ impl FlintMcp {
                 };
                 let result = tokio::time::timeout(PROBE_TIMEOUT, probe)
                     .await
-                    .unwrap_or_else(|_| Err(format!("timed out after {PROBE_TIMEOUT:?}")));
+                    .unwrap_or_else(|_| {
+                        Err(ClusterError::timeout(PROBE_TIMEOUT, server.as_deref()).to_string())
+                    });
                 (name, result)
             });
         }
@@ -407,6 +425,7 @@ impl FlintMcp {
                     "kind": k.kind(),
                     "apiVersion": k.api_version(),
                     "plural": k.plural(),
+                    "shortNames": k.short_names,
                     "namespaced": k.namespaced,
                     "listable": k.is_listable(),
                 })
@@ -684,6 +703,26 @@ mod tests {
     }
 
     // covers UP-10
+    // covers UP-10
+    #[test]
+    fn kind_errors_point_to_list_resource_kinds_or_name_the_candidates() {
+        let missing = kind_error(ResolveKindError::NotFound("sprocket".into())).0;
+        assert_eq!(
+            missing,
+            "no resource kind matches \"sprocket\". Call list_resource_kinds for the kinds."
+        );
+        let ambiguous = kind_error(ResolveKindError::Ambiguous {
+            query: "wd".into(),
+            candidates: vec!["gadgets.example.org".into(), "widgets.example.com".into()],
+        })
+        .0;
+        assert_eq!(
+            ambiguous,
+            "\"wd\" matches several resource kinds: gadgets.example.org, widgets.example.com. \
+             Name one of them."
+        );
+    }
+
     #[test]
     fn rows_carry_server_columns_and_computed_age() {
         let page = page(
