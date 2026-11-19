@@ -224,7 +224,14 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 - **Leaks and memory errors in native code** (the C libraries GPUI and kube link, and Flint's few `unsafe`
   blocks): the nightly `Memory` workflow runs the `flint-core` and `flint-mcp` tests under AddressSanitizer
   with LeakSanitizer on Linux. Run it by hand with "Run workflow", or locally on Linux with
-  `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p flint-core -p flint-mcp --lib --tests --target x86_64-unknown-linux-gnu`.
+  `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p flint-core -p flint-mcp --lib --tests --target x86_64-unknown-linux-gnu`
+  (on macOS, in a Linux container with `--target aarch64-unknown-linux-gnu`; set `ASAN_SYMBOLIZER_PATH` to an
+  `llvm-symbolizer` for readable stacks). The `flint-mcp` tests spawn the instrumented binary and check its exit
+  status, so a leak in the server process fails them too. Tests must not leak either: never `Box::leak` a
+  fixture to get a `&'static str`, have the fake own `String`s. Fix a leak rather than suppress it; suppress only
+  a third-party or process-lifetime allocation Flint cannot free, with a narrow `leak:<symbol>` line and a comment
+  saying why in `.github/lsan-suppressions.txt` (none is needed today; `memory.yml` would pass it with
+  `LSAN_OPTIONS=suppressions=…`), never a wildcard.
 - **Memory that keeps growing** (watch caches, log buffers, terminal scrollback, queues): a soak test runs the
   app against the fake API server with lists, log tabs and an exec session open, samples the process's
   memory, and fails if it is still climbing after warm-up. It runs nightly, not on PRs.

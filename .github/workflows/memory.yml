@@ -34,7 +34,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: nightly
+      # Without a symbolizer, leak reports are bare addresses.
+      - name: Install llvm-symbolizer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq llvm
+          echo "ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)" >> "$GITHUB_ENV"
+      # --no-fail-fast: a leak in one test binary must not hide the others' reports.
       - name: Tests under AddressSanitizer and LeakSanitizer
         run: >
           cargo +nightly test -p flint-core -p flint-mcp --lib --tests --locked
-          --target x86_64-unknown-linux-gnu
+          --target x86_64-unknown-linux-gnu --no-fail-fast
