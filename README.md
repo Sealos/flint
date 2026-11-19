@@ -35,18 +35,19 @@ a browser, macOS blocks the first run: remove the quarantine flag with
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
+needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later). Releases after v0.1.1 have it; replace
+`vX.Y.Z` with the newest tag on the releases page.
 
 ```sh
-gh release download v0.1.1 -R Sealos/flint -p 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
-sha256sum -c flint-v0.1.1-linux-x86_64.AppImage.sha256
-chmod +x flint-v0.1.1-linux-x86_64.AppImage
-install -D flint-v0.1.1-linux-x86_64.AppImage ~/.local/bin/flint
+gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
+sha256sum -c flint-vX.Y.Z-linux-x86_64.AppImage.sha256
+chmod +x flint-vX.Y.Z-linux-x86_64.AppImage
+install -D flint-vX.Y.Z-linux-x86_64.AppImage ~/.local/bin/flint
 flint --version
 flint                                   # opens the window
 ```
 
-AppImages mount themselves with FUSE (`libfuse2` on most distributions). Without it, for example in a container, set
+AppImages mount themselves with FUSE (the `fusermount` or `fusermount3` command). Without it, for example in a container, set
 `APPIMAGE_EXTRACT_AND_RUN=1` to run it without mounting. The AppImage is unsigned; the `.sha256` file is the check.
 On Linux there is no menu bar: Quit is Ctrl-Q, Close Window is Ctrl-W, and every Cmd shortcut is Ctrl. Settings and
 state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).

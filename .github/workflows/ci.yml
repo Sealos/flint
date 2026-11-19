@@ -108,10 +108,11 @@ jobs:
         run: cargo test -p flint-app --locked
 
   # The release build packaged as an AppImage, as release-please does, then run without FUSE:
-  # `--version` and `mcp` through the AppImage. x86_64 only; the release also builds aarch64.
+  # `--version` and `mcp` through the AppImage. x86_64 only; the release also builds aarch64. On
+  # Ubuntu 24.04 like the release, whose glibc sets the AppImage's floor.
   appimage:
     name: appimage (x86_64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

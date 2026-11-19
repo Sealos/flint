@@ -13,7 +13,7 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
   GL and Vulkan drivers, fontconfig and freetype (linuxdeploy's excludelist). Vulkan is loaded at run time and is
   never bundled. appimagetool then wraps the AppDir with the AppImage type-2 runtime. All three tools are official
   releases from the linuxdeploy and AppImage GitHub organizations, pinned by version and SHA-256 in the script.
-- **Built natively.** The release builds x86_64 on `ubuntu-latest` and aarch64 on `ubuntu-24.04-arm`; linuxdeploy
+- **Built natively.** The release builds x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`; linuxdeploy
   inspects the binary with the host's loader, so there is no cross-compiling. CI packages and smoke-tests the x86_64
   AppImage on every pull request (`--version` and `mcp`, without FUSE).
 - **Publishing.** The macOS and Linux build jobs upload to the draft release; a separate `publish` job publishes it
@@ -39,7 +39,8 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
   on Linux, but nothing tests it on a real X11 or Wayland desktop, or across distributions. Bugs that only show on a
   desktop are found by users.
 - **glibc floor.** The binary links the glibc of the build runner (Ubuntu 24.04, glibc 2.39), so older
-  distributions cannot run it. Building on an older image would lower the floor.
+  distributions cannot run it. The runners are pinned to 24.04 rather than `ubuntu-latest`, which would raise the
+  floor silently when GitHub moves it. Building on an older image would lower the floor.
 - **No menu bar.** GPUI on Linux shows no application menu. Quit and Close Window are on their keys (Ctrl-Q,
   Ctrl-W); every default key uses GPUI's `secondary-` modifier, which is Cmd on macOS and Ctrl on Linux. The View >
   Appearance choice is the `appearance` setting in `settings.toml` until the command palette lands; then every

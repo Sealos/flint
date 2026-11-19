@@ -101,7 +101,8 @@ jobs:
         run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
 
   # One AppImage per architecture (ADR-0016), each built natively: linuxdeploy inspects the
-  # binary with the host's loader.
+  # binary with the host's loader. Both on Ubuntu 24.04, not ubuntu-latest: the binary needs the
+  # build image's glibc (2.39) or newer, and the README promises that floor.
   build-linux:
     name: build-linux (${{ matrix.arch }})
     needs: release-please
@@ -111,7 +112,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}

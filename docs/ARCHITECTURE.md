@@ -484,7 +484,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Theme tokens only:** views take every color from theme tokens and never hard-code one. This applies from M0
   onward, so the M1.5 theme work does not mean restyling every view.
 - **Keys:** default keys use GPUI's `secondary-` modifier, which is Cmd on macOS and Ctrl on Linux, so the shortcuts
-  below read Ctrl-… on Linux. Linux has no menu bar, so the palette is how menu items are reached there.
+  below read Ctrl-… on Linux. Linux has no menu bar: Quit and Close Window work by their keys, and View > Appearance only through the
+  `appearance` setting until the palette exists; then the palette reaches every menu item.
 - **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
   switch cluster, change namespace, toggle watch mode, toggle Expose to AI, disconnect a cluster, open the diagram,
   or analyze the selected log lines.
