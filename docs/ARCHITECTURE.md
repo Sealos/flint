@@ -166,6 +166,19 @@ again with a fresh list.
 ring buffer with a size limit (a setting, default 100k lines) so long-running streams cannot grow memory without
 bound. Search runs over the buffer.
 
+- **Sessions** (`flint_core::logs`): `CoreHandle::open_logs` returns a `LogSession`; dropping it stops the stream.
+  Sessions belong to no cluster slot, so they keep running across cluster switches. `timestamps=true` is always
+  requested, so showing timestamps is a view toggle, and a dropped stream resumes from the last timestamp (with
+  backoff, skipping lines already shown). A followed stream that ends is reopened only while the container can log
+  again (it restarts, or the pod still runs).
+- **Delivery** follows [ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md): at most one `Arc<LogSnapshot>` per
+  ~100 ms. The buffer is stored in shared 1024-line chunks, so a snapshot of 100k lines costs a few hundred pointer
+  copies. Every line has a `LineId` that never changes, so a view diffs two snapshots by id. Pausing freezes the
+  lines shown and counts the lines held back; the buffer keeps filling.
+- **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
+  following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
+  of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.
+
 ### Exec terminal
 
 `Api::<Pod>::exec` with a TTY, over the `ws` feature. Bytes go to `alacritty_terminal`, and a GPUI terminal view
@@ -275,7 +288,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 ## Settings and state
 
-- `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size, a `path`
+- `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`), a `path`
   override, and a `helm` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, which the user
   drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace

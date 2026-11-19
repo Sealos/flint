@@ -12,6 +12,7 @@ pub mod display;
 pub mod env_path;
 pub mod handle;
 pub mod kubeconfig;
+pub mod logs;
 mod manager;
 pub mod paging;
 pub mod read;
@@ -26,7 +27,11 @@ pub use cluster::{ClusterId, ServerVersion};
 pub use discovery::{ClusterDiscovery, NavEntry, NavSection, Navigation, SectionKind};
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, CoreHandle, Event,
-    Subscription,
+    LogSession, Subscription,
+};
+pub use logs::{
+    LineId, LineSelection, LogLine, LogLines, LogOptions, LogSearch, LogSince, LogSnapshot,
+    LogState, LogTarget, SearchQuery, Severity,
 };
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};

@@ -15,6 +15,7 @@ use tokio::sync::{oneshot, watch};
 use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
 use crate::kubeconfig::ContextInfo;
+use crate::logs::{LogLines, LogOptions, LogSearch, LogSnapshot, LogTarget};
 use crate::manager::ClusterManager;
 use crate::read::{KindId, ObjectDetail};
 use crate::settings::{Appearance, Settings, WatchMode};
@@ -73,6 +74,9 @@ pub enum Command {
         cluster: ClusterId,
         namespaces: Vec<String>,
     },
+    /// Set the lines each log session keeps and write it to `settings.toml`. Sessions opened
+    /// afterwards use it. The change arrives back as `Event::SettingsChanged`.
+    SetLogBufferLines(u32),
 }
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
@@ -99,6 +103,17 @@ pub(crate) enum Request {
     WatchedKinds {
         cluster: ClusterId,
         reply: oneshot::Sender<Vec<(KindId, Feed)>>,
+    },
+    OpenLogs {
+        id: u64,
+        cluster: ClusterId,
+        target: LogTarget,
+        options: LogOptions,
+        snapshots: watch::Sender<Arc<LogSnapshot>>,
+        paused: watch::Receiver<bool>,
+    },
+    CloseLogs {
+        id: u64,
     },
 }
 
@@ -303,6 +318,51 @@ impl CoreHandle {
         async move { rx.await.unwrap_or_else(|_| Arc::from(Vec::new())) }
     }
 
+    /// Opens a log session: streams `target`'s log on `cluster` into a ring buffer of
+    /// [`crate::Settings::log_buffer_limit`] lines, reconnecting when the stream drops. The
+    /// session keeps running when another cluster becomes active, until the returned
+    /// [`LogSession`] is dropped. Snapshots arrive at most about every 100 ms. Never blocks.
+    pub fn open_logs(&self, cluster: &str, target: LogTarget, options: LogOptions) -> LogSession {
+        let (snapshots, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        rx.mark_changed();
+        let (paused, paused_rx) = watch::channel(false);
+        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let _ = self.requests.try_send(Request::OpenLogs {
+            id,
+            cluster: cluster.to_owned(),
+            target: target.clone(),
+            options: options.clone(),
+            snapshots,
+            paused: paused_rx,
+        });
+        LogSession {
+            id,
+            cluster: cluster.to_owned(),
+            target,
+            options,
+            rx,
+            paused,
+            requests: self.requests.clone(),
+        }
+    }
+
+    /// Brings `search` up to date with `lines` on the core's threads (see [`LogSearch`]). Use it
+    /// for the first scan of a new query over a full buffer; later updates while following
+    /// scan only new lines and are cheap enough to run anywhere. Works on any executor.
+    pub fn search_logs(
+        &self,
+        mut search: LogSearch,
+        lines: LogLines,
+    ) -> impl Future<Output = LogSearch> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        let query = search.query().clone();
+        self.runtime.spawn_blocking(move || {
+            search.update(&lines);
+            let _ = tx.send(search);
+        });
+        async move { rx.await.unwrap_or_else(|_| LogSearch::new(query)) }
+    }
+
     /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
     pub fn send(&self, command: Command) {
         if self.commands.try_send(command).is_err() {
@@ -382,6 +442,77 @@ impl std::fmt::Debug for Subscription {
     }
 }
 
+/// A running log session, from [`CoreHandle::open_logs`]. Holds only the newest snapshot, so a
+/// slow reader skips intermediate ones. Dropping it stops the session.
+pub struct LogSession {
+    id: u64,
+    cluster: ClusterId,
+    target: LogTarget,
+    options: LogOptions,
+    rx: watch::Receiver<Arc<LogSnapshot>>,
+    paused: watch::Sender<bool>,
+    requests: async_channel::Sender<Request>,
+}
+
+impl LogSession {
+    /// The cluster the session reads from, whichever cluster is active.
+    pub fn cluster(&self) -> &str {
+        &self.cluster
+    }
+
+    pub fn target(&self) -> &LogTarget {
+        &self.target
+    }
+
+    pub fn options(&self) -> &LogOptions {
+        &self.options
+    }
+
+    /// Waits until a snapshot newer than the last one read with [`LogSession::latest`] is
+    /// published. The first call resolves at once. Returns `false` once the core has stopped.
+    /// Works on any executor.
+    pub async fn changed(&mut self) -> bool {
+        self.rx.changed().await.is_ok()
+    }
+
+    /// The newest snapshot, marking it as seen.
+    pub fn latest(&mut self) -> Arc<LogSnapshot> {
+        self.rx.borrow_and_update().clone()
+    }
+
+    /// The newest snapshot, without marking it as seen.
+    pub fn peek(&self) -> Arc<LogSnapshot> {
+        self.rx.borrow().clone()
+    }
+
+    /// Pauses (`true`) or resumes delivery. While paused, snapshots keep the lines shown when
+    /// the session was paused and count the lines held back; the buffer keeps filling (and
+    /// evicting), so nothing is lost unless it overflows. Resuming shows everything at once.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.send_replace(paused);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.paused.borrow()
+    }
+}
+
+impl Drop for LogSession {
+    fn drop(&mut self) {
+        let _ = self.requests.try_send(Request::CloseLogs { id: self.id });
+    }
+}
+
+impl std::fmt::Debug for LogSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogSession")
+            .field("cluster", &self.cluster)
+            .field("target", &self.target)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
+
 struct RuntimeGuard(Option<tokio::runtime::Runtime>);
 
 impl Drop for RuntimeGuard {
@@ -444,6 +575,60 @@ mod tests {
         assert!(err.contains("not connected"), "{err}");
         assert!(core.discovery("nowhere").await.is_none());
         assert!(core.watched_kinds("nowhere").await.is_empty());
+    }
+
+    // covers UP-40
+    #[tokio::test]
+    async fn a_log_session_on_an_unknown_cluster_ends_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let target = LogTarget {
+            namespace: "ns".into(),
+            pod: "p".into(),
+            container: None,
+        };
+        let mut session = core.open_logs("nowhere", target.clone(), LogOptions::default());
+        assert_eq!(session.cluster(), "nowhere");
+        assert_eq!(session.target(), &target);
+        assert!(session.options().follow);
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(session.changed().await, "core running");
+                let snapshot = session.latest();
+                if let crate::logs::LogState::Ended { error } = &snapshot.state {
+                    return error.clone();
+                }
+            }
+        })
+        .await
+        .expect("the session ended");
+        assert!(ended.unwrap().contains("nowhere"));
+        session.set_paused(true);
+        assert!(session.is_paused());
+        // An ended session still answers, until it is dropped.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !session.latest().paused {
+                assert!(session.changed().await);
+            }
+        })
+        .await
+        .expect("pause shown");
+    }
+
+    #[tokio::test]
+    async fn search_logs_runs_off_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let mut buffer = crate::logs::LogBuffer::new(10);
+        buffer.push(crate::logs::LogLine::parse("needle", false));
+        buffer.push(crate::logs::LogLine::parse("hay", false));
+        let search = core
+            .search_logs(
+                LogSearch::new(crate::logs::SearchQuery::new("NEEDLE")),
+                buffer.view(),
+            )
+            .await;
+        assert_eq!(search.matches(), &[0]);
     }
 
     #[tokio::test]

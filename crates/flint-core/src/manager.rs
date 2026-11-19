@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use kube::Client;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::cluster::{self, CONNECT_TIMEOUT, ClusterId, ServerVersion};
@@ -19,6 +19,7 @@ use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
+use crate::logs::{self, KubeLogSource, LogError, SessionConfig};
 use crate::read::{self, KindId, KindInfo};
 use crate::settings::{self, Settings};
 use crate::store::{KindSnapshot, SyncState};
@@ -164,6 +165,11 @@ enum Internal {
         cluster: ClusterId,
         kind: KindId,
     },
+    /// A log session (re)connects and needs the cluster's current client.
+    LogClient {
+        cluster: ClusterId,
+        reply: oneshot::Sender<Result<Client, LogError>>,
+    },
 }
 
 /// Which watched files changed.
@@ -193,6 +199,9 @@ pub(crate) struct ClusterManager {
     engine_config: Arc<EngineConfig>,
     /// Open subscriptions by id.
     subscriptions: HashMap<u64, (ClusterId, KindId)>,
+    /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
+    /// switches and kubeconfig reloads (UP-42).
+    log_sessions: HashMap<u64, JoinHandle<()>>,
 }
 
 struct FileWatcher {
@@ -229,6 +238,7 @@ impl ClusterManager {
             hubs,
             engine_config: Arc::new(EngineConfig::default()),
             subscriptions: HashMap::new(),
+            log_sessions: HashMap::new(),
         }
     }
 
@@ -292,6 +302,12 @@ impl ClusterManager {
                     slot.update_scope();
                 }
             }
+            Command::SetLogBufferLines(lines) => {
+                self.write_settings("the log buffer size", move |dir| {
+                    settings::set_log_buffer_lines(dir, lines)
+                })
+                .await
+            }
         }
     }
 
@@ -324,6 +340,39 @@ impl ClusterManager {
             }
             Request::WatchedKinds { cluster, reply } => {
                 let _ = reply.send(self.watched_kinds(&cluster));
+            }
+            Request::OpenLogs {
+                id,
+                cluster,
+                target,
+                options,
+                snapshots,
+                paused,
+            } => {
+                let internal = self.internal_tx.clone();
+                let lookup: logs::ClientLookup = Arc::new(move || {
+                    let (reply, rx) = oneshot::channel();
+                    let _ = internal.send(Internal::LogClient {
+                        cluster: cluster.clone(),
+                        reply,
+                    });
+                    Box::pin(async move {
+                        rx.await
+                            .unwrap_or_else(|_| Err(LogError::fatal("the core stopped")))
+                    })
+                });
+                let config = SessionConfig::new(self.settings.log_buffer_limit());
+                let source = Arc::new(KubeLogSource::new(lookup));
+                let task = tokio::spawn(logs::run(
+                    source, target, options, config, snapshots, paused,
+                ));
+                self.log_sessions.retain(|_, t| !t.is_finished());
+                self.log_sessions.insert(id, task);
+            }
+            Request::CloseLogs { id } => {
+                if let Some(task) = self.log_sessions.remove(&id) {
+                    task.abort();
+                }
             }
             Request::FetchObject {
                 cluster,
@@ -699,6 +748,9 @@ impl ClusterManager {
                     self.hubs.release(&cluster, &kind);
                 }
             }
+            Internal::LogClient { cluster, reply } => {
+                let _ = reply.send(self.log_client(&cluster));
+            }
             Internal::CrdsChanged {
                 cluster,
                 fingerprint,
@@ -731,6 +783,32 @@ impl ClusterManager {
                 if changed.kubeconfig {
                     self.reload_kubeconfig().await;
                 }
+            }
+        }
+    }
+
+    /// The client a log session should use for `cluster` now. A cluster that was never
+    /// connected is connected (the session asked for it); one whose connection failed is not
+    /// retried here, so a broken exec plugin does not run again at every session retry.
+    fn log_client(&mut self, cluster: &str) -> Result<Client, LogError> {
+        let Some(slot) = self.clusters.iter().find(|c| c.info.name == cluster) else {
+            return Err(LogError::fatal(format!(
+                "\"{cluster}\" is no longer in your kubeconfig files"
+            )));
+        };
+        if let Some(client) = &slot.client {
+            return Ok(client.clone());
+        }
+        match &slot.state {
+            ConnectionState::Failed(error) => Err(LogError::retry(format!(
+                "\"{cluster}\" is not connected: {error}"
+            ))),
+            ConnectionState::Disconnected => {
+                self.ensure_connected(cluster);
+                Err(LogError::retry(format!("connecting to \"{cluster}\"")))
+            }
+            ConnectionState::Connecting | ConnectionState::Connected(_) => {
+                Err(LogError::retry(format!("connecting to \"{cluster}\"")))
             }
         }
     }

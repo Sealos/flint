@@ -1,0 +1,370 @@
+//! Log session tests against the dev cluster, through the public `CoreHandle` API. Ignored by
+//! default; run with `--include-ignored` and `FLINT_TEST_KUBECONFIG` pointing at the throwaway
+//! kind cluster (`scripts/dev-cluster.sh`). They use that file alone, create their pods in a
+//! namespace prefixed `logs-test-`, and delete it again (also when the test fails).
+
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
+use flint_core::{
+    LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogTarget, SearchQuery, Settings,
+    Severity, cluster, kubeconfig,
+};
+use k8s_openapi::api::core::v1::{Namespace, Pod};
+use kube::Client;
+use kube::api::{Api, DeleteParams, PostParams};
+use serde_json::json;
+
+fn test_kubeconfig() -> PathBuf {
+    match std::env::var_os("FLINT_TEST_KUBECONFIG") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => panic!("FLINT_TEST_KUBECONFIG must point at the dev cluster's kubeconfig"),
+    }
+}
+
+/// A copy of the dev kubeconfig with a second context for the same cluster.
+fn two_context_kubeconfig(dir: &Path) -> (PathBuf, String, String) {
+    let mut kc = kube::config::Kubeconfig::read_from(test_kubeconfig()).unwrap();
+    let first = kc.contexts[0].clone();
+    let mut second = first.clone();
+    second.name = format!("{}-second", first.name);
+    kc.contexts.push(second.clone());
+    kc.current_context = Some(first.name.clone());
+    let path = dir.join("kubeconfig");
+    std::fs::write(&path, serde_json::to_string(&kc).unwrap()).unwrap();
+    (path, first.name, second.name)
+}
+
+struct Core {
+    handle: CoreHandle,
+    events: async_channel::Receiver<Event>,
+    _dir: tempfile::TempDir,
+}
+
+fn start(kubeconfig: PathBuf, settings: Settings) -> Core {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = CoreHandle::start(CoreConfig {
+        config_dir: dir.path().join("config"),
+        settings,
+        settings_error: None,
+        kubeconfig_base: vec![kubeconfig],
+        home: None,
+        watch_files: false,
+    })
+    .unwrap();
+    let events = handle.events();
+    Core {
+        handle,
+        events,
+        _dir: dir,
+    }
+}
+
+impl Core {
+    async fn wait_for<T>(&self, secs: u64, mut pick: impl FnMut(Event) -> Option<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(secs), async {
+            loop {
+                let event = self.events.recv().await.expect("core running");
+                if let Event::ConnectionChanged {
+                    state: ConnectionState::Failed(e),
+                    ..
+                } = &event
+                {
+                    panic!("connection failed: {e}");
+                }
+                if let Some(t) = pick(event) {
+                    return t;
+                }
+            }
+        })
+        .await
+        .expect("event arrived in time")
+    }
+
+    async fn activate(&self, name: &str) {
+        self.handle.send(Command::Activate(name.to_owned()));
+        self.wait_for(60, |e| match e {
+            Event::ConnectionChanged {
+                cluster,
+                state: ConnectionState::Connected(_),
+            } if cluster == name => Some(()),
+            _ => None,
+        })
+        .await;
+    }
+}
+
+async fn admin(path: &Path) -> Client {
+    let loaded = kubeconfig::load(&[path.to_owned()]);
+    let context = &loaded.contexts[0].name;
+    cluster::connect(&loaded.merged, context).await.unwrap()
+}
+
+/// The first snapshot of `session` for which `pred` holds.
+async fn until(
+    session: &mut LogSession,
+    secs: u64,
+    pred: impl Fn(&LogSnapshot) -> bool,
+) -> Arc<LogSnapshot> {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            let snapshot = session.latest();
+            if pred(&snapshot) {
+                return snapshot;
+            }
+            assert!(session.changed().await, "core running");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("log condition not reached: {:?}", session.peek().state))
+}
+
+/// Runs `body` in a fresh namespace and deletes the namespace afterwards, also when it panics.
+async fn in_namespace<F, Fut>(body: F)
+where
+    F: FnOnce(Client, String) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let kube = admin(&test_kubeconfig()).await;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let ns = format!("logs-test-{}-{nanos}", std::process::id());
+    let namespaces: Api<Namespace> = Api::all(kube.clone());
+    namespaces
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(json!({"metadata": {"name": ns}})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let result = tokio::spawn(body(kube.clone(), ns.clone())).await;
+    let _ = namespaces.delete(&ns, &DeleteParams::default()).await;
+    if let Err(e) = result {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn create_pod(kube: &Client, ns: &str, pod: serde_json::Value) -> Api<Pod> {
+    let pods: Api<Pod> = Api::namespaced(kube.clone(), ns);
+    pods.create(
+        &PostParams::default(),
+        &serde_json::from_value(pod).unwrap(),
+    )
+    .await
+    .unwrap();
+    pods
+}
+
+async fn wait_pod(pods: &Api<Pod>, name: &str, pred: impl Fn(&Pod) -> bool) {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            if pods.get_opt(name).await.unwrap().is_some_and(|p| pred(&p)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pod {name} never got ready"));
+}
+
+fn running(pod: &Pod) -> bool {
+    pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+}
+
+fn container(name: &str, script: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "image": "nginx:1.27",
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["sh", "-c", script],
+    })
+}
+
+/// Prints 3000 lines at once, then a few lines a second forever, every tenth an error and
+/// every tenth (offset by five) a warning.
+const CHATTY: &str = r#"i=0; while [ $i -lt 3000 ]; do echo "boot $i"; i=$((i+1)); done
+i=0; while true; do
+  case $((i % 10)) in 0) echo "ERROR tick $i";; 5) echo "WARN tick $i";; *) echo "info tick $i";; esac
+  i=$((i+1)); sleep 0.05
+done"#;
+
+// covers UP-40, UP-42
+#[tokio::test]
+#[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
+async fn follows_a_chatty_pod_within_the_buffer_and_across_cluster_switches() {
+    let kc_dir = tempfile::tempdir().unwrap();
+    let (path, first, second) = two_context_kubeconfig(kc_dir.path());
+    in_namespace(move |kube, ns| async move {
+        let pods = create_pod(
+            &kube,
+            &ns,
+            json!({
+                "metadata": {"name": "chatty"},
+                "spec": {"containers": [container("app", CHATTY)], "terminationGracePeriodSeconds": 0}
+            }),
+        )
+        .await;
+        wait_pod(&pods, "chatty", running).await;
+
+        let settings = Settings {
+            log_buffer_lines: 1000,
+            ..Settings::default()
+        };
+        let core = start(path, settings);
+        core.wait_for(10, |e| matches!(e, Event::ClustersChanged(_)).then_some(()))
+            .await;
+        core.activate(&first).await;
+
+        let target = LogTarget {
+            namespace: ns.clone(),
+            pod: "chatty".into(),
+            container: None,
+        };
+        let mut session = core
+            .handle
+            .open_logs(&first, target.clone(), LogOptions::default());
+        // The tail asks for no more than the buffer holds (1000 of the 3000+ lines); as ticks
+        // follow, the oldest lines are evicted and the buffer stays at 1000.
+        let snapshot = until(&mut session, 60, |s| {
+            s.lines.end_id() > 1020 && s.state == LogState::Streaming
+        })
+        .await;
+        assert_eq!(snapshot.lines.len(), 1000);
+        assert!(snapshot.lines.first_id() > 0, "evicted the oldest");
+        assert!(snapshot.lines.iter().all(|(_, l)| l.timestamp.is_some()));
+        let error = snapshot
+            .lines
+            .iter()
+            .find(|(_, l)| l.text.starts_with("ERROR tick"))
+            .expect("an error line");
+        assert_eq!(error.1.severity, Severity::Error);
+        let warn = snapshot
+            .lines
+            .iter()
+            .find(|(_, l)| l.text.starts_with("WARN tick"))
+            .expect("a warning line");
+        assert_eq!(warn.1.severity, Severity::Warning);
+
+        // Search keeps matching new lines while following.
+        let search = core
+            .handle
+            .search_logs(LogSearch::new(SearchQuery::new("error tick")), snapshot.lines.clone())
+            .await;
+        let before = search.count();
+        assert!(before >= 1);
+
+        // Another cluster becomes active; the session keeps streaming.
+        core.activate(&second).await;
+        let end = snapshot.lines.end_id();
+        let later = until(&mut session, 30, |s| s.lines.end_id() >= end + 40).await;
+        assert_eq!(later.state, LogState::Streaming);
+        assert_eq!(later.lines.len(), 1000);
+        let mut search = search;
+        search.update(&later.lines);
+        assert!(search.count() > before, "{} > {before}", search.count());
+
+        // Tail without following: exactly the newest lines, then the end.
+        let tail = LogOptions {
+            follow: false,
+            tail_lines: Some(5),
+            ..LogOptions::default()
+        };
+        let mut short = core.handle.open_logs(&first, target, tail);
+        let done = until(&mut short, 30, |s| matches!(s.state, LogState::Ended { .. })).await;
+        assert_eq!(done.state, LogState::Ended { error: None });
+        assert_eq!(done.lines.len(), 5);
+        assert!(done.lines.iter().all(|(_, l)| l.text.contains("tick")));
+    })
+    .await;
+}
+
+// covers UP-40
+#[tokio::test]
+#[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
+async fn picks_a_container_and_reads_the_previous_instance() {
+    let path = test_kubeconfig();
+    in_namespace(move |kube, ns| async move {
+        let pods = create_pod(
+            &kube,
+            &ns,
+            json!({
+                "metadata": {"name": "twins"},
+                "spec": {
+                    "containers": [
+                        container("app", "echo \"app run $(date +%s%N)\"; sleep 2; exit 1"),
+                        container("side", "echo side-hello; sleep 3600"),
+                    ],
+                    "terminationGracePeriodSeconds": 0
+                }
+            }),
+        )
+        .await;
+        wait_pod(&pods, "twins", |p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.container_statuses.as_ref())
+                .and_then(|c| c.iter().find(|c| c.name == "app"))
+                .is_some_and(|c| c.restart_count >= 1)
+        })
+        .await;
+
+        let core = start(path, Settings::default());
+        let name = core
+            .wait_for(10, |e| match e {
+                Event::ClustersChanged(s) => Some(s.clusters[0].info.name.clone()),
+                _ => None,
+            })
+            .await;
+        core.activate(&name).await;
+        let target = |container: Option<&str>| LogTarget {
+            namespace: ns.clone(),
+            pod: "twins".into(),
+            container: container.map(str::to_owned),
+        };
+        let ended = |s: &LogSnapshot| matches!(s.state, LogState::Ended { .. });
+
+        let previous = LogOptions {
+            previous: true,
+            ..LogOptions::default()
+        };
+        let mut session = core.handle.open_logs(&name, target(Some("app")), previous);
+        let done = until(&mut session, 30, ended).await;
+        assert_eq!(done.state, LogState::Ended { error: None });
+        assert_eq!(done.lines.len(), 1);
+        assert!(
+            done.lines
+                .iter()
+                .all(|(_, l)| l.text.starts_with("app run"))
+        );
+
+        let once = LogOptions {
+            follow: false,
+            ..LogOptions::default()
+        };
+        let mut side = core
+            .handle
+            .open_logs(&name, target(Some("side")), once.clone());
+        let done = until(&mut side, 30, ended).await;
+        let texts: Vec<_> = done.lines.iter().map(|(_, l)| l.text.to_string()).collect();
+        assert_eq!(texts, ["side-hello"]);
+
+        // Two containers and none picked: the server's reason, and no retrying.
+        let mut unpicked = core.handle.open_logs(&name, target(None), once);
+        let done = until(&mut unpicked, 30, ended).await;
+        let LogState::Ended { error: Some(error) } = &done.state else {
+            panic!("expected an error, got {:?}", done.state);
+        };
+        assert!(error.contains("container"), "{error}");
+    })
+    .await;
+}
