@@ -1,7 +1,10 @@
 //! `settings.toml` and `state.toml` in Flint's config directory.
 //!
-//! The directory is `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`.
-//! A missing file means defaults. Flint never writes to kubeconfig files.
+//! The directory is `FLINT_CONFIG_DIR` if set, else the platform's config directory:
+//! `~/Library/Application Support/Flint/` on macOS, and `$XDG_CONFIG_HOME/flint/` (by default
+//! `~/.config/flint/`) on Linux. `state.toml` lives beside `settings.toml` on every platform, so
+//! one directory (and one override) holds all of Flint's files. A missing file means defaults.
+//! Flint never writes to kubeconfig files.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -40,11 +43,11 @@ pub enum WatchMode {
     OnView,
 }
 
-/// Light or dark, or following macOS (`system`, the default). The app applies a change at once.
+/// Light or dark, or following the system (`system`, the default). The app applies a change at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Appearance {
-    /// Follow the macOS appearance, live.
+    /// Follow the system appearance (macOS, or the desktop's on Linux), live.
     #[default]
     System,
     Light,
@@ -93,7 +96,7 @@ pub const LOG_BUFFER_MIB_RANGE: std::ops::RangeInclusive<u32> = 8..=1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Flint Light, Flint Dark, or whichever macOS uses.
+    /// Flint Light, Flint Dark, or whichever the system uses.
     pub appearance: Appearance,
     /// Clusters the MCP server may see (ADR-0009), as context name plus API server URL. Empty by
     /// default: nothing is exposed.
@@ -217,24 +220,61 @@ pub struct PaneWidths {
     pub dock: Option<u32>,
 }
 
-/// Flint's config directory, from `FLINT_CONFIG_DIR` or the macOS default.
+/// Where an OS keeps per-user configuration, for [`config_dir_from`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigLayout {
+    /// `~/Library/Application Support/Flint`.
+    MacOs,
+    /// The XDG Base Directory layout: `$XDG_CONFIG_HOME/flint`, else `~/.config/flint`.
+    Xdg,
+}
+
+impl ConfigLayout {
+    const HOST: ConfigLayout = if cfg!(target_os = "macos") {
+        ConfigLayout::MacOs
+    } else {
+        ConfigLayout::Xdg
+    };
+}
+
+/// Flint's config directory: `FLINT_CONFIG_DIR`, else the platform default (see the module docs).
 pub fn config_dir() -> Result<PathBuf, SettingsError> {
     config_dir_from(
+        ConfigLayout::HOST,
         std::env::var_os("FLINT_CONFIG_DIR").map(PathBuf::from),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::home_dir(),
     )
 }
 
-/// The config directory: `override_dir` if set and not empty, else the macOS default under `home`.
-pub fn config_dir_from(
+/// The directory Flint uses on this OS when `FLINT_CONFIG_DIR` is not set, for the given
+/// `XDG_CONFIG_HOME` (read on Linux only) and home directory.
+pub fn default_config_dir(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, SettingsError> {
+    config_dir_from(ConfigLayout::HOST, None, xdg_config_home, home)
+}
+
+/// The config directory: `override_dir` if set and not empty, else `layout`'s default.
+fn config_dir_from(
+    layout: ConfigLayout,
     override_dir: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Result<PathBuf, SettingsError> {
     if let Some(dir) = override_dir.filter(|d| !d.as_os_str().is_empty()) {
         return Ok(dir);
     }
-    home.map(|h| h.join("Library/Application Support/Flint"))
-        .ok_or(SettingsError::NoConfigDir)
+    match layout {
+        ConfigLayout::MacOs => home.map(|h| h.join("Library/Application Support/Flint")),
+        // The XDG spec says a relative `XDG_CONFIG_HOME` is invalid and must be ignored.
+        ConfigLayout::Xdg => match xdg_config_home.filter(|d| d.is_absolute()) {
+            Some(dir) => Some(dir.join("flint")),
+            None => home.map(|h| h.join(".config/flint")),
+        },
+    }
+    .ok_or(SettingsError::NoConfigDir)
 }
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
@@ -609,15 +649,62 @@ mod tests {
 
     #[test]
     fn config_dir_prefers_override() {
+        for layout in [ConfigLayout::MacOs, ConfigLayout::Xdg] {
+            assert_eq!(
+                config_dir_from(
+                    layout,
+                    Some("/tmp/x".into()),
+                    Some("/xdg".into()),
+                    Some("/home/me".into())
+                )
+                .unwrap(),
+                PathBuf::from("/tmp/x")
+            );
+            assert!(config_dir_from(layout, Some("".into()), None, None).is_err());
+        }
+    }
+
+    #[test]
+    fn config_dir_on_macos_is_application_support() {
         assert_eq!(
-            config_dir_from(Some("/tmp/x".into()), Some("/home/me".into())).unwrap(),
-            PathBuf::from("/tmp/x")
+            config_dir_from(
+                ConfigLayout::MacOs,
+                None,
+                Some("/xdg".into()),
+                Some("/Users/me".into())
+            )
+            .unwrap(),
+            PathBuf::from("/Users/me/Library/Application Support/Flint")
         );
-        assert_eq!(
-            config_dir_from(None, Some("/home/me".into())).unwrap(),
-            PathBuf::from("/home/me/Library/Application Support/Flint")
-        );
-        assert!(config_dir_from(Some("".into()), None).is_err());
+    }
+
+    #[test]
+    fn config_dir_on_linux_follows_xdg() {
+        let dir = |xdg: Option<&str>| {
+            config_dir_from(
+                ConfigLayout::Xdg,
+                Some("".into()),
+                xdg.map(PathBuf::from),
+                Some("/home/me".into()),
+            )
+            .unwrap()
+        };
+        assert_eq!(dir(Some("/xdg")), PathBuf::from("/xdg/flint"));
+        assert_eq!(dir(None), PathBuf::from("/home/me/.config/flint"));
+        // An empty or relative XDG_CONFIG_HOME is ignored, as the spec says.
+        assert_eq!(dir(Some("")), PathBuf::from("/home/me/.config/flint"));
+        assert_eq!(dir(Some("rel")), PathBuf::from("/home/me/.config/flint"));
+        assert!(config_dir_from(ConfigLayout::Xdg, None, None, None).is_err());
+    }
+
+    #[test]
+    fn host_layout_matches_the_target() {
+        let want = if cfg!(target_os = "macos") {
+            ConfigLayout::MacOs
+        } else {
+            ConfigLayout::Xdg
+        };
+        assert_eq!(ConfigLayout::HOST, want);
     }
 
     // covers UP-07
