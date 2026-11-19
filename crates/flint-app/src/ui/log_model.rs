@@ -300,6 +300,21 @@ pub fn suggested_file_name(subject: &LogSubject, previous: bool) -> String {
     format!("{stem}.log")
 }
 
+/// How many lines [`save_text`] writes for `scope`, without building the text: cheap enough
+/// for the UI thread.
+pub fn save_count(
+    lines: &LogLines,
+    scope: SaveScope,
+    matches: &[LineId],
+    selection: Option<LineSelection>,
+) -> usize {
+    match scope {
+        SaveScope::All => lines.len(),
+        SaveScope::Matches => matches.iter().filter(|id| lines.contains(**id)).count(),
+        SaveScope::Selection => selection.map_or(0, |s| s.lines(lines).count()),
+    }
+}
+
 /// The lines to save, as shown with `format`, one per line and ending in a newline, and how
 /// many there are. Not redacted: the file holds what the tab showed.
 /// `None` when the scope has nothing (no search, no selection).
@@ -609,5 +624,19 @@ mod tests {
             save_text(&LogLines::default(), SaveScope::All, &[], None, ts(false)),
             None
         );
+        // The count the confirmation shows is the count written.
+        for (scope, sel) in [
+            (SaveScope::All, None),
+            (SaveScope::Matches, None),
+            (SaveScope::Selection, selection),
+            (SaveScope::Selection, None),
+        ] {
+            let written = save_text(&shown, scope, &[1, 9], sel, ts(false)).map_or(0, |(_, n)| n);
+            assert_eq!(
+                save_count(&shown, scope, &[1, 9], sel),
+                written,
+                "{scope:?}"
+            );
+        }
     }
 }

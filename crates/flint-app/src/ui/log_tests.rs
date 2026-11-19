@@ -429,6 +429,16 @@ async fn selecting_pauses_and_copies_the_lines_as_shown(cx: &mut TestAppContext)
         view.read_with(cx, |v, _| v.selection),
         Some(LineSelection::new(2, 5))
     );
+    // End follows again with the lines still selected; selecting more pauses again.
+    press(cx, window, "end");
+    view.read_with(cx, |v, _| {
+        assert!(v.selection.is_some() && !v.session.is_paused());
+    });
+    press(cx, window, "shift-up");
+    assert!(
+        view.read_with(cx, |v, _| v.session.is_paused()),
+        "selecting after a resume pauses again"
+    );
     press(cx, window, "escape");
     view.read_with(cx, |v, _| {
         assert_eq!(v.selection, None);

@@ -338,7 +338,8 @@ impl LogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.selection.is_none() && self.follows() {
+        // Selecting pauses following, also after a resume while lines stayed selected.
+        if self.follows() && !self.is_paused() {
             self.selection_paused = true;
             self.sync_pause();
         }
@@ -409,14 +410,9 @@ impl LogView {
             },
             selection: self.selection,
         };
-        let count = log_model::save_text(
-            &save.lines,
-            save.scope,
-            &save.matches,
-            save.selection,
-            save.format,
-        )
-        .map_or(0, |(_, n)| n as u64);
+        // Counted, not built: the file's text is built off the UI thread once a path is chosen.
+        let count =
+            log_model::save_count(&save.lines, save.scope, &save.matches, save.selection) as u64;
         let description = format!(
             "{} will be written as shown{}. The file is not redacted: it holds whatever the \
              pod logged, secrets included.",
