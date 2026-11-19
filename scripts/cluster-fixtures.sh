@@ -82,7 +82,11 @@ etcdctl compact "$revision" >/dev/null || true
 # The kind node container; the kubelet starts the stopped API server again.
 node="${context#kind-}-control-plane"
 echo "cluster-fixtures: restarting the API server in $node"
-apiserver_id() { docker exec "$node" crictl ps -q --name kube-apiserver 2>/dev/null | head -1; }
+# `|| true`: under pipefail a failed `crictl ps` (the same RPC deadline) would otherwise end the
+# script silently; an empty result is handled below instead.
+apiserver_id() {
+  docker exec "$node" crictl --timeout 30s ps -q --name kube-apiserver 2>/dev/null | head -1 || true
+}
 old_id="$(apiserver_id)"
 if [ -z "$old_id" ]; then
   echo "cluster-fixtures: no running kube-apiserver container in $node" >&2
@@ -93,8 +97,10 @@ fi
 # new kube-apiserver container.
 restarted=
 for attempt in 1 2 3; do
-  docker exec "$node" crictl --timeout 60s stop "$old_id" >/dev/null 2>&1 ||
-    echo "cluster-fixtures: crictl stop attempt $attempt did not report success; checking the container"
+  # The global --timeout is crictl's RPC deadline (default 2s), which is what ran out on CI.
+  if ! out="$(docker exec "$node" crictl --timeout 60s stop "$old_id" 2>&1)"; then
+    echo "cluster-fixtures: crictl stop attempt $attempt failed (${out:0:200}); checking the container" >&2
+  fi
   for _ in $(seq 30); do
     new_id="$(apiserver_id)"
     if [ -n "$new_id" ] && [ "$new_id" != "$old_id" ]; then restarted=1 && break 2; fi
@@ -102,7 +108,9 @@ for attempt in 1 2 3; do
   done
 done
 if [ -z "$restarted" ]; then
-  echo "cluster-fixtures: the API server in $node was not restarted after 3 attempts" >&2
+  echo "cluster-fixtures: the API server in $node was not restarted after 3 attempts" \
+    "(on a dev cluster restarted often, kubelet back-off may be the cause; wait 10 minutes)" >&2
+  docker exec "$node" crictl --timeout 30s ps -a --name kube-apiserver >&2 || true
   exit 1
 fi
 ready=
