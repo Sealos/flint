@@ -10,6 +10,7 @@ pub mod cluster;
 pub mod discovery;
 pub mod display;
 pub mod env_path;
+pub mod exec;
 pub mod handle;
 pub mod kubeconfig;
 pub mod logs;
@@ -20,11 +21,13 @@ pub mod redact;
 pub mod settings;
 pub mod store;
 pub mod table;
+pub mod terminal;
 pub mod view;
 mod watch;
 
 pub use cluster::{ClusterId, ServerVersion};
 pub use discovery::{ClusterDiscovery, NavEntry, NavSection, Navigation, SectionKind};
+pub use exec::{ExecRequest, ExecSession, ExecSnapshot, ExecState};
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, CoreHandle, Event,
     LogSession, Subscription,
@@ -37,4 +40,5 @@ pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};
 pub use store::{Feed, KindSnapshot, NamespaceLimit, SyncState};
 pub use table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
+pub use terminal::{TerminalSize, TerminalSnapshot};
 pub use view::{SortBy, ViewQuery};

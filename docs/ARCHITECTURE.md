@@ -262,6 +262,19 @@ design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
 draws the grid, as Zed does. Window size changes are sent to the pod as terminal resize messages. Each exec session
 opens in a tab in the bottom dock.
 
+- **Core side (`flint_core::exec`, `flint_core::terminal`).** `CoreHandle::exec` starts a session on its own task,
+  apart from the cluster manager, so it survives cluster switches and ends only when closed or dropped. The
+  `alacritty_terminal` grid lives in the core: output is parsed on the core runtime, terminal replies (cursor
+  position reports) go straight back to the pod, and the UI reads immutable screen snapshots, at most one per frame
+  (16 ms; the first after a quiet spell at once). Keystrokes, pastes (bracketed when asked for), resizes, scrolling and
+  selections go back through the session. The screen stays scrollable and selectable after the command exits.
+- **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
+  the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
+  127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.
+- **OSC 52** (clipboard access by the remote program) is disabled.
+- **Synchronized updates** (DECSET 2026) that a program never ends are applied after alacritty's 150 ms timeout,
+  and at the end of the output.
+
 ### Editing and actions
 
 1. The editor opens the live object without `metadata.managedFields` and `status`. It keeps `resourceVersion`.

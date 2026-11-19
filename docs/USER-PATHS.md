@@ -228,8 +228,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-41 Shell into a container
 - **When** I open a shell on a pod.
 - **Then** I get an interactive terminal that resizes with the window and supports copy and paste. Images without `bash`
-  fall back to `sh`.
-- Tests: cluster, ui.
+  fall back to `sh`. When the command exits, its exit code is shown and the output stays readable until I close the
+  tab.
+- Tests: unit (terminal model, session logic), cluster, ui.
 
 ### UP-42 Sessions outlive navigation
 - **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them.

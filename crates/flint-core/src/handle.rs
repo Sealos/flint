@@ -14,6 +14,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
+use crate::exec::{ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{LogLines, LogOptions, LogSearch, LogSnapshot, LogTarget};
 use crate::manager::ClusterManager;
@@ -117,6 +118,11 @@ pub(crate) enum Request {
     },
     CloseLogs {
         id: u64,
+    },
+    /// The cluster's client, if it is connected. For sessions, which run on their own tasks.
+    Client {
+        cluster: ClusterId,
+        reply: oneshot::Sender<Option<kube::Client>>,
     },
 }
 
@@ -365,6 +371,31 @@ impl CoreHandle {
             let _ = tx.send(search);
         });
         async move { rx.await.unwrap_or_else(|_| LogSearch::new(query)) }
+    }
+
+    /// Opens an exec session (a shell in a container, by default) on a connected cluster. The
+    /// session runs on its own task: it keeps running when the active cluster changes, and ends
+    /// when it is closed or dropped. When the cluster is not connected, it fails at once. Never
+    /// blocks.
+    pub fn exec(&self, request: ExecRequest) -> ExecSession {
+        let (session, channels) = ExecSession::new(request.clone());
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::Client {
+            cluster: request.cluster.clone(),
+            reply,
+        });
+        self.runtime.spawn(async move {
+            let client = match sent {
+                Ok(()) => match rx.await {
+                    Ok(Some(client)) => Ok(client),
+                    Ok(None) => Err(format!("\"{}\" is not connected", request.cluster)),
+                    Err(_) => Err("the core stopped before answering".to_owned()),
+                },
+                Err(_) => Err("the core is not running".to_owned()),
+            };
+            crate::exec::start(client, request, channels).await;
+        });
+        session
     }
 
     /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
@@ -633,6 +664,29 @@ mod tests {
             )
             .await;
         assert_eq!(search.matches(), &[0]);
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn exec_on_a_cluster_that_is_not_connected_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let mut session = core.exec(ExecRequest::shell("nowhere", "ns", "pod"));
+        let state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = session.latest().state.clone();
+                if state.is_finished() {
+                    return state;
+                }
+                assert!(session.changed().await);
+            }
+        })
+        .await
+        .expect("fails at once");
+        assert_eq!(
+            state,
+            crate::exec::ExecState::Failed("\"nowhere\" is not connected".to_owned())
+        );
     }
 
     #[tokio::test]
