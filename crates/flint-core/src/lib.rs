@@ -4,7 +4,7 @@
 //! through [`CoreHandle`] (ADR-0002); one-shot callers such as the MCP server use the functions
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
-mod api_error;
+pub mod api_error;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;

@@ -25,7 +25,10 @@ async fn dev_source() -> (Arc<KubeSource>, Vec<KindInfo>) {
             .await
             .unwrap();
     let kinds = read::discover_kinds(&client).await.unwrap().kinds;
-    (KubeSource::new(client, Some(&version)), kinds)
+    (
+        KubeSource::new(client, Some(&version), cluster::Target::default()),
+        kinds,
+    )
 }
 
 fn find(kinds: &[KindInfo], group: &str, plural: &str) -> KindInfo {

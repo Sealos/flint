@@ -370,6 +370,14 @@ mod tests {
         .await;
         assert_eq!(waited["ok"], true, "{waited}");
         assert_eq!(waited["result"]["clusters"][1]["active"], true);
+        // Nothing listens on beta's port: the error says so in plain words, naming the server.
+        let failed = ask(
+            cx,
+            &target,
+            json!({"id": 3, "cmd": "wait_for", "args": {"pointer": "/main/error", "equals": "connection refused by https://127.0.0.1:9"}}),
+        )
+        .await;
+        assert_eq!(failed["ok"], true, "{failed}");
 
         // Errors name what is wrong, with the request's id.
         let cases = [

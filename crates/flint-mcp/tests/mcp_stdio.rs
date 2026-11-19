@@ -280,6 +280,11 @@ fn mcp_policy_without_a_cluster() {
     assert_eq!(listed.len(), 1, "{clusters}");
     assert_eq!(listed[0]["name"], "dev");
     assert_eq!(listed[0]["reachable"], false);
+    // In the same words the app shows (UP-04).
+    assert_eq!(
+        listed[0]["error"], "connection refused by https://127.0.0.1:1",
+        "{clusters}"
+    );
     assert!(clusters.get("hint").is_none(), "{clusters}");
 
     // A malformed file exposes nothing, and the error does not quote the file.

@@ -10,7 +10,7 @@ use gpui_kit::*;
 use super::super::clusters::Presence;
 use super::super::view_state::{
     AppState, Banner, ClusterState, DialogState, Focus, HeaderState, KubeconfigPath,
-    KubeconfigState, Level, Main, error_text,
+    KubeconfigState, Level, Main, connection_error_text, error_text,
 };
 use super::{Workspace, header_controls, namespace_summary};
 
@@ -41,7 +41,7 @@ impl Workspace {
                     ConnectionState::Disconnected => ("disconnected", None),
                     ConnectionState::Connecting => ("connecting", None),
                     ConnectionState::Connected(_) => ("connected", None),
-                    ConnectionState::Failed(e) => ("failed", Some(error_text(e))),
+                    ConnectionState::Failed(e) => ("failed", Some(connection_error_text(e))),
                 };
                 let is_active = active.as_deref() == Some(cluster.info.name.as_str());
                 ClusterState {
@@ -86,7 +86,7 @@ impl Workspace {
             None if model.loaded && model.clusters.is_empty() => Main::NoContexts,
             None => Main::NoCluster,
             Some(ConnectionState::Failed(e)) => Main::Failed {
-                error: error_text(e),
+                error: connection_error_text(e),
             },
             Some(_) if list.is_some() => Main::List,
             Some(ConnectionState::Connected(v)) => Main::Connected {

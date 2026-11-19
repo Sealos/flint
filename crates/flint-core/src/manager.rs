@@ -649,6 +649,7 @@ impl ClusterManager {
                 attempt,
                 result,
             } => {
+                let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 let Some(slot) = self.cluster_mut(&cluster) else {
                     return;
                 };
@@ -658,8 +659,11 @@ impl ClusterManager {
                 let connected = result.is_ok();
                 match result {
                     Ok((client, version)) => {
-                        slot.watches
-                            .set_source(Some(KubeSource::new(client.clone(), Some(&version))));
+                        slot.watches.set_source(Some(KubeSource::new(
+                            client.clone(),
+                            Some(&version),
+                            target,
+                        )));
                         slot.client = Some(client);
                         slot.state = ConnectionState::Connected(version);
                     }
@@ -950,11 +954,15 @@ impl ClusterManager {
             let attempt_task = tokio::spawn(async move {
                 cluster::connect_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.summary())
             });
-            let result = attempt_task
-                .await
-                .unwrap_or_else(|e| Err(format!("connection task failed: {e}")));
+            // The app shows this message as it is: only safe text ([`ClusterError::summary`]).
+            let result = attempt_task.await.unwrap_or_else(|e| {
+                Err(format!(
+                    "connection task failed: {}",
+                    crate::redact::safe_error_summary(&e.to_string())
+                ))
+            });
             if let Err(e) = &result {
                 tracing::warn!(cluster, error = %e, "connection failed");
             }

@@ -22,6 +22,8 @@ tracing.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 http.workspace = true
+# Already in the tree through kube; names TLS handshake failures (`api_error`).
+rustls.workspace = true
 serde-saphyr.workspace = true
 # `bootstrap::init_logging`, shared by the app and the MCP server.
 tracing-subscriber.workspace = true
@@ -32,6 +34,8 @@ alacritty_terminal.workspace = true
 test-support = []
 
 [dev-dependencies]
+rcgen.workspace = true
+tokio-rustls.workspace = true
 async-channel.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

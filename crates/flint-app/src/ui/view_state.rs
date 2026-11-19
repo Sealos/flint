@@ -5,7 +5,8 @@
 //! Each view fills in its own part (`*_state.rs` next to it). Text that could carry secrets
 //! follows the screen: Secret cells are masked as the list masks them, Secret values are never
 //! included (only which keys are revealed), and error messages go through
-//! [`flint_core::redact::safe_error_summary`].
+//! [`flint_core::redact::safe_error_summary`] (connection errors arrive already reduced, see
+//! [`connection_error_text`]).
 
 use flint_core::SyncState;
 use flint_core::redact::safe_error_summary;
@@ -283,6 +284,13 @@ pub fn sync_word(state: &SyncState, polled: bool) -> &'static str {
 /// An error as `state` reports it: a sanitized one-line summary.
 pub fn error_text(error: &str) -> String {
     safe_error_summary(error)
+}
+
+/// A failed connection's error as the screen shows it. Core already reduced the text that came
+/// from kube or the kubeconfig ([`flint_core::cluster::ClusterError::summary`]); hiding quoted
+/// values again would hide what Flint quotes itself, the exec plugin's name.
+pub fn connection_error_text(error: &str) -> String {
+    error.to_owned()
 }
 
 #[cfg(test)]
