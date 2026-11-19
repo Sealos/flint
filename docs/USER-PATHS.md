@@ -162,11 +162,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: cluster, ui.
 
 ### UP-24 Switch clusters
-- **When** I switch to another cluster and back.
+- **When** I switch to another cluster and back, and the old cluster is not kept warm (`warm_clusters = 1`, or it went
+  cold).
 - **Then** the old cluster's watches stop. Switching back loads fresh data. Log, exec and port-forward sessions keep
-  running across the switch.
-- From M5.5, this holds for clusters that went cold. Recently used clusters stay warm (UP-78).
-- Tests: cluster, ui.
+  running across the switch. (Before M5.5 every cluster behaves this way. Warm clusters are UP-78.)
+- Tests: cluster, ui (from M5.5 with `warm_clusters = 1`).
 
 ### UP-25 Change the watch mode
 - **When** I set the watch mode to "On view", globally or for one cluster.
@@ -237,14 +237,16 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-43 Spot errors in a log stream
 - **When** I follow a pod's logs and turn timestamps on and off.
-- **Then** lines with `ERROR`, `FATAL`, `panic`, `exception` or `Traceback` are marked in the error color, and lines
-  with `WARN` in the warning color, in both themes. Timestamps appear and disappear without reloading the stream.
-  Searching keeps the highlighting.
+- **Then** error lines are marked in the error color and warning lines in the warning color, in both themes.
+  Matching ignores case and works on whole words: `ERROR`, `FATAL`, `panic`, and words ending in `Exception` or
+  `Error` are errors, `WARN` and `WARNING` are warnings. Timestamps appear and disappear without reloading the
+  stream. Searching keeps the highlighting.
 - Tests: unit (pattern matching), cluster, ui.
 
 ### UP-44 Select and copy log lines
 - **When** I select a range of lines, with the mouse or Shift and the arrow keys, and press Cmd-C.
-- **Then** exactly those lines are copied, with timestamps only if they are shown. Following pauses while I select.
+- **Then** exactly those lines are copied as they appear, with timestamps only if they are shown, and without
+  redaction. Following pauses while I select.
 - Tests: ui.
 
 ---
@@ -291,16 +293,22 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-62 See how a namespace's workloads fit together
 - **When** I open the diagram for the `demo` namespace.
-- **Then** I see each Deployment around its ReplicaSets and their Pods, and StatefulSets, DaemonSets, Jobs and
-  CronJobs around what they own. Each node has its status color. Clicking a node opens its detail view. No API
-  request is made beyond the watches already running.
-- Tests: unit (tree from owner uids), cluster, ui.
+- **Then** I see each Deployment around its ReplicaSets and their Pods, StatefulSets and DaemonSets around their
+  Pods, and CronJob, Job and Pods on three levels. Each node has its status color. Clicking a node opens its detail
+  view. No API request is made beyond the watches the diagram needs. This holds in both watch modes.
+- Tests: unit (tree from owner uids), cluster (mode All and On view), ui.
 
 ### UP-63 The diagram follows the cluster
 - **When** I scale or roll out a deployment while the diagram is open.
 - **Then** pods and ReplicaSets appear, change color and disappear within about a second. Objects whose owner is not
   in the namespace, or that have no owner, are shown on their own, not hidden.
 - Tests: cluster, ui.
+
+### UP-64 A large namespace stays readable
+- **Given** a namespace with hundreds of pods, old empty ReplicaSets and many finished Jobs.
+- **Then** empty ReplicaSets and finished Jobs start collapsed, a group of more than about 50 pods shows a count,
+  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI.
+- Tests: unit (collapsing, limits), cluster (generated load), ui.
 
 ---
 
@@ -329,50 +337,61 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (port choice), cluster, ui.
 
 ### UP-74 Open a forwarded HTTP port
-- **Given** a forward to a port named `http` or with `appProtocol: http`.
+- **Given** a forward to a port named `http`, `https` or `web`, or with `appProtocol` `http` or `https`.
 - **Then** the forwards panel shows its target, local and remote port and state, and an Open in browser action that
-  opens `http://localhost:<port>`. Ports that are not HTTP have no such action. A forward to a service survives
-  the loss of the pod behind it if another pod is ready.
+  opens `http://localhost:<port>`, or `https://` for an `https` port. An unnamed port offers Open in browser from
+  its context menu. A forward to a service survives the loss of the pod behind it if another pod is ready.
 - Tests: cluster, ui.
 
 ---
 
 ## M5.5: Multi-cluster and AI
 
+M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 and uses UP-75 to UP-79.
+
 ### UP-75 Analyze log lines with my AI CLI
-- **Given** `claude` or `codex` on my login-shell `PATH`, and log analysis allowed for the cluster.
-- **When** I select log lines and click Analyze with Claude (or Codex), then confirm.
-- **Then** the answer streams into a side panel. Stop ends it. Nothing in the answer runs, opens or changes anything.
-  If the cluster was not allowed, a confirmation naming the context and server comes first. A re-pointed context
-  counts as not allowed.
-- Tests: unit (prompt, allow policy), ui (with a fake CLI on `PATH`).
+- **Given** `claude` or `codex` on my login-shell `PATH`.
+- **When** I select log lines and press Analyze (or its palette action), tick "Allow log analysis on `<context>`
+  (`<server>`)" the first time, and confirm.
+- **Then** the answer streams into a side panel, below what was sent. Stop ends the process and anything it started.
+  Nothing in the answer runs, opens or changes anything. The opt-in is checked against the log's own cluster, even
+  if I have switched to another one since. A re-pointed context counts as not allowed. The split button's menu offers
+  the CLI that is not the default.
+- Tests: unit (prompt, allow policy, process environment), ui (with a fake CLI on `PATH`).
 
 ### UP-76 See exactly what leaves my Mac
 - **When** the confirmation opens.
-- **Then** it shows the full prompt and the lines as they will be sent, with Secret values and credential-shaped
-  strings already replaced, and names the CLI and its path. More than the line limit is cut, and it says so. With
-  "Always for this cluster", later sends skip the confirmation but are still redacted. The fake CLI receives byte for
-  byte what the confirmation showed.
-- Tests: unit (redaction patterns), ui (fake CLI).
+- **Then** it shows the full prompt and the lines as they will be sent, with credential shapes, vendor tokens,
+  private keys and the values of Secrets, env and ConfigMaps the pod references already replaced. It names the CLI
+  and its path. Lines past 1,000, past 4 KiB each or past 256 KiB in total are cut, and it says so. If Flint could
+  not read the pod's Secrets or ConfigMaps, it says those values were not checked. For Codex, it warns that a
+  command Codex starts may run before Flint stops it. With "Always for this cluster", later sends skip the sheet but
+  are still redacted, and the panel shows what was sent. "Always" resets if the CLI or its path changes. The fake CLI
+  receives byte for byte what was shown.
+- Tests: unit (redaction patterns and encodings, limits), ui (fake CLI).
 
 ### UP-77 No AI CLI installed
-- **Given** neither `claude` nor `codex` on the resolved `PATH` or in settings.
-- **Then** the log viewer shows no Analyze button and no error.
+- **Given** neither `claude` nor `codex` on the resolved `PATH` (relative and empty entries ignored), nor in settings,
+  nor in a supported version.
+- **Then** the log viewer shows no Analyze button, the palette has no Analyze action, and there is no error.
 - Tests: unit (CLI lookup), ui.
 
 ### UP-78 Switch between recent clusters instantly
 - **When** I use clusters A, B and C, then switch back to A.
-- **Then** A's lists show current data at once, with no loading state. The sidebar marks A as active and B and C as
+- **Then** A's lists show current data at once, with no loading state (in mode All, Events, Leases and
+  EndpointSlices reload, because warm clusters drop them). The sidebar marks A as active and B and C as
   warm. Changes made on a warm cluster while I was away are already there. Relaunching Flint connects nothing
   until I select a cluster.
 - Tests: unit (warm set), cluster, ui.
 
-### UP-79 Warm clusters stay bounded
-- **When** I use more clusters than `warm_clusters`, or the warm clusters go over `warm_memory_mib`, or a warm
-  cluster's auth expires.
-- **Then** the least recently used cluster goes cold, and the sidebar shows it. A cluster whose auth failed shows the
-  error and does not retry until I select it. Disconnect makes a warm cluster cold by hand.
-- Tests: unit (eviction, budget), cluster.
+### UP-79 Warm clusters stay bounded and quiet
+- **When** I use more clusters than `warm_clusters`, the background clusters go over `warm_memory_mib`, a warm
+  cluster sits unused for 30 minutes, the Mac sleeps, or a warm cluster's credential expires.
+- **Then** the least recently used (or the affected) cluster goes cold, and the sidebar shows it. An expired
+  credential shows a "sign-in needed" badge, and no exec plugin runs until I click the cluster. Background errors
+  show only in the sidebar, never as toasts. Disconnect makes a warm cluster cold by hand. With 3 idle warm
+  clusters, Flint uses under 1% CPU.
+- Tests: unit (eviction, budget, idle limit), cluster, manual (exec-plugin cluster).
 
 ---
 

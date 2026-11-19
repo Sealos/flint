@@ -1,33 +1,130 @@
 # AI log analysis through the user's local CLI
 
-The log viewer gets an **Analyze with Claude** or **Analyze with Codex** button. It runs the user's own `claude`
-(Claude Code) or `codex` (OpenAI Codex CLI) in its non-interactive mode as a child process. The selected log lines go
-in on stdin, after a short prompt with the pod and container context. The answer streams into a side panel. Flint
-holds no API keys and talks to no LLM provider itself. The CLI uses the account the user already signed in with.
+The log viewer gets an **Analyze** button. It runs the user's own `claude` (Claude Code) or `codex` (OpenAI Codex
+CLI) in its non-interactive mode as a child process. A short prompt with the pod and container context and the
+selected log lines go in on stdin. The answer streams into a side panel. Flint holds no API keys and talks to no LLM
+provider itself. The CLI uses the account the user already signed in with.
 
 This is hard to reverse because log lines leave the machine through a third-party tool. So the rules are strict:
 
-- **Only on a user action.** Nothing is sent unless the user clicks the button and confirms. Flint never analyzes on
-  its own, on a schedule, or when an error appears.
+- **Only on a user action.** Nothing is sent unless the user clicks Analyze (or runs its palette action) and
+  confirms, or chose "Always for this cluster" for that cluster. Flint never analyzes on its own, on a schedule, or
+  when an error appears.
 - **Only for clusters the user allowed.** Log analysis is a per-cluster opt-in, off by default, separate from Expose
-  to AI. It is stored as context name plus API server URL, like an exposure. If the context is re-pointed, it counts
-  as not allowed.
-- **Redacted first.** The lines pass through `flint_core::redact` before they are shown or sent. It replaces the
-  values of Secrets the pod references (env, `envFrom`, volumes) and credential-shaped strings: bearer tokens, JWTs,
-  PEM blocks, cloud access keys, `password=`/`token=`/`secret=` pairs and passwords in URLs.
-- **The user sees exactly what is sent.** A confirmation shows the full prompt and the redacted lines, names the
-  CLI and its path, and has an "Always for this cluster" option. That option is a typed setting on the cluster's
-  opt-in entry. It skips the confirmation, never the redaction.
-- **Bounded.** At most 1,000 lines (a setting) are sent. The confirmation says when the selection was cut.
+  to AI. The opt-in is checked when the lines are sent, against the cluster of the log session (context name plus
+  server URL), not the active cluster.
+- **Redacted first.** What is sent, and what the confirmation and the panel show, passes through the log redactor
+  (see Redaction). The log viewer and copying from it are not changed.
+- **The user sees exactly what is sent.** See Consent.
+- **Bounded.** At most 1,000 lines, 4 KiB per line and 256 KiB in total. The confirmation shows what was cut.
 - **Log text is untrusted.** The prompt says the lines are data from a container, may contain instructions, and must
-  not be followed. The CLI runs with its tools turned off (or in a read-only sandbox where it cannot turn them off),
-  with no MCP servers, in an empty temporary directory, and without `KUBECONFIG`. Flint shows the answer as text.
-  It never runs a command from it, opens a link from it, or turns it into an action.
-- **One shot.** The panel shows one answer per click, with Stop and Copy. It has no follow-up prompt, so it is not a
-  chat panel.
+  not be followed. The CLI runs isolated (see Isolation). Flint shows the answer as text. It never runs a command
+  from it, opens a link from it, or turns it into an action.
+- **One shot.** The panel shows one answer per request, with Stop and Copy. It has no follow-up prompt, so it is not
+  a chat panel.
 
-The CLI is found on the resolved login-shell `PATH`, the same way exec plugins and `helm` are. `claude` and `codex`
-binary overrides live in `settings.toml`. If neither CLI is found, the button is hidden.
+## The button and the CLI
+
+- One split button: **Analyze** runs the default CLI (`log_analysis_cli`, a setting), and its menu offers the other
+  one. A palette action with a shortcut does the same. If neither CLI is found, the button and the action are hidden.
+- The CLI is found on the resolved login-shell `PATH`, the same way exec plugins and `helm` are. Relative and empty
+  `PATH` entries are ignored. `claude` and `codex` binary overrides live in `settings.toml`. Flint resolves the
+  binary to a canonical absolute path and shows that path in the confirmation.
+- Each CLI has a minimum version. Older versions are treated as not found, with a hint.
+
+## Consent
+
+- **First use on a cluster** is one sheet. It shows the full prompt and the redacted lines, names the CLI and its
+  path, and has a checkbox "Allow log analysis on `<context>` (`<server>`)" that must be ticked to send. A second
+  checkbox, "Always for this cluster", skips the sheet next time.
+- The opt-in entry stores the context name, the server URL, the CLI and the canonical binary path, and whether to
+  skip the sheet. If the context is re-pointed, it counts as not allowed. If the CLI or its path changes, "Always"
+  is reset and the sheet comes back.
+- With "Always", the panel still shows what was sent, read-only, above the answer. "Always" never skips the
+  redaction or the limits.
+- The opt-in is revoked from the cluster sidebar's context menu and from the command palette, like Expose to AI.
+  Revoking needs no confirmation.
+
+## Isolation
+
+Flint starts the CLI as a child process in its own process group. Stop, closing the panel, or quitting Flint kills
+the group. Stdin and stdout are handled by separate tasks, so a CLI that stops reading cannot block Flint.
+
+**Environment.** The child starts with a cleared environment plus an allowlist: `HOME`, `PATH` (the resolved one),
+`USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TMPDIR`, and `TERM=dumb`. Each CLI also gets its own auth variables, and
+only when they are set:
+
+- `claude`: `ANTHROPIC_*`, `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and only with those, the matching
+  cloud variables (`AWS_*` for Bedrock, `GOOGLE_APPLICATION_CREDENTIALS` and `CLOUD_ML_REGION` for Vertex).
+- `codex`: `CODEX_HOME` and `OPENAI_*`.
+
+`KUBECONFIG` is set to `/dev/null`. It is never left unset, because unset falls back to `~/.kube/config`. The prompt
+goes on stdin, never in argv. The working directory is a new temporary directory with mode `0700`, removed
+afterwards.
+
+**Claude Code** ([CLI reference](https://code.claude.com/docs/en/cli-reference),
+[headless mode](https://code.claude.com/docs/en/headless)):
+
+```
+claude -p --tools "" --disallowedTools "*" --strict-mcp-config --setting-sources "" \
+  --disable-slash-commands --no-session-persistence --max-turns 1 \
+  --output-format stream-json --verbose
+```
+
+Without these flags, a `-p` run loads the user's MCP servers (possibly `flint mcp` itself), hooks and plugins, as an
+interactive session would. `--tools ""` removes the built-in tools, `--disallowedTools "*"` denies any that remain,
+`--strict-mcp-config` with no `--mcp-config` loads no MCP servers, and `--setting-sources ""` loads no user, project
+or local settings, so no hooks. Flint reads the `system/init` event and aborts unless `tools` and `mcp_servers` are
+empty and no plugins loaded. Any hook event before it also aborts the run. That `--setting-sources` accepts an empty
+list must be verified during implementation.
+
+**Codex** ([developer commands](https://learn.chatgpt.com/docs/developer-commands?surface=cli)):
+
+```
+codex exec --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config \
+  --ignore-rules -C <tmpdir> --json -
+```
+
+Codex has no flag that turns tools off. `--sandbox read-only` stops writes, but commands can still read any file the
+user can, such as `~/.kube/config` or `~/.aws/credentials`, and send what they read to the model. Non-interactive
+approval handling is also still in flux ([openai/codex#24135](https://github.com/openai/codex/issues/24135)). So
+Flint reads the `--json` event stream and kills the process group at the first command or tool event. That is a
+stop after the fact: a command that started before the kill may already have run. The Codex confirmation says so
+in plain words.
+
+**Checks.** Unknown flags make the CLI fail before the run, and Flint shows that error instead of retrying with
+fewer flags. The run also has to pass the session check above (Claude's `system/init`, Codex's events) and the
+minimum CLI version.
+
+**Open decision: ship Claude only first.** Codex's isolation is weaker than Claude's: it rests on a kill after the
+fact, not on tools being absent. Shipping Codex in M5.5 with the warning, or holding it until Codex has a tools-off
+mode, is the user's call. Until it is decided, the implementation issue treats Codex as a separate acceptance step.
+
+## Redaction
+
+The log redactor is new. It joins the existing `flint_core::redact` module, which already holds Secret masking and
+error-message redaction shared by the app and `flint mcp`. It replaces:
+
+- **Credential shapes**, in `key=value`, JSON, YAML and header form: `password`, `passwd`, `token`, `secret`,
+  `api_key`, `access_key`, `client_secret` and similar keys; `Authorization: Basic` and `Bearer`; `X-Api-Key`;
+  `Cookie` and `Set-Cookie`.
+- **Connection strings:** passwords in URLs (`user:pass@`), `AccountKey=`, `SharedAccessSignature=`.
+- **Vendor-prefixed tokens:** `ghp_`, `github_pat_`, `xoxb-`/`xoxa-`/`xoxp-`, `sk_live_`, `sk-`, `AIza`, `glpat-`,
+  `AKIA`/`ASIA` access key IDs, and JWTs.
+- **Private keys:** PEM blocks, including PEM with escaped `\n` inside JSON, and the `private_key` of GCP service
+  account JSON.
+- **Known values:** the values of Secrets the pod references (env `secretKeyRef`, `envFrom`, secret volumes), with
+  their base64, URL-encoded and JSON-escaped forms; literal `env[].value` from the pod spec; and values from
+  ConfigMaps the pod references. Only values of 8 or more characters are matched, at token boundaries.
+
+Known values are read when the user clicks Analyze. That is a cluster read, made only then. If the user may not read
+those Secrets or ConfigMaps, the confirmation says the values could not be checked. Matching uses Aho-Corasick for
+known values and a `RegexSet` for shapes. Known values are kept in memory for that send only, never logged, and
+zeroized afterwards.
+
+**Limits.** Secrets injected outside the pod spec (Vault agents, CSI drivers, External Secrets written to files) are
+unknown to Flint and caught only if they match a shape. Personal data is out of scope. The confirmation is the last
+check, so the user sees everything before it is sent.
 
 ## Considered Options
 
@@ -38,23 +135,23 @@ binary overrides live in `settings.toml`. If neither CLI is found, the button is
   secrets, pick providers and models, and maintain an API client. That is what [ADR-0009](./0009-read-only-mcp-server.md)
   already ruled out.
 - **The user's local CLI (chosen):** no secrets in Flint, the user's own account, model choice and data policy, and
-  little code. The cost is a dependency on the CLIs' command-line flags, which can change.
+  little code. The cost is a dependency on the CLIs' flags and event formats, which can change.
+- **Claude's `--bare` mode:** it skips hooks, plugins and MCP servers in one flag, but it never reads the user's
+  subscription login and needs `ANTHROPIC_API_KEY`. Rejected, because most users sign in without a key.
 
 ### Reuse Expose to AI or a separate opt-in?
 
 A separate opt-in. Expose to AI gives any MCP client a standing read of the whole cluster. Log analysis sends a few
-lines the user picked, each time they click. If one toggle covered both, a user who wants to analyze one production
-log line would have to let agents read all of production. The two toggles share their storage shape and the
+lines the user picked, each time they ask. If one toggle covered both, a user who wants to analyze one production
+log line would have to let agents read all of production. The two opt-ins share their storage shape and the
 re-pointing check, so the code stays small.
 
 ## Consequences
 
-- `flint_core::redact` gets a log redactor with unit tests for every pattern. The Secret values it matches are read
-  when the user clicks the button, kept in memory for that send only, and never logged. If the user may not read
-  those Secrets, the confirmation says the values could not be checked.
-- The CLI's flags are pinned in one place and checked against each CLI's version at first use. If a CLI no longer
-  accepts them, the button shows an error instead of running it without the safety flags.
+- The redactor gets unit tests for every pattern and every encoded form.
+- The CLI flags and minimum versions are kept in one place. When a CLI changes its flags or events, analysis with
+  that CLI fails closed until Flint is updated.
 - The prompt never includes the cluster name, the server URL, or kubeconfig data. It carries the namespace, pod,
   container, owner, phase, restart count and last termination reason.
-- The CLI's account, provider and data retention are the user's. Flint names the CLI in the confirmation, so the user
-  knows where the lines go.
+- The CLI's account, provider and data retention are the user's. Flint names the CLI and its path in the
+  confirmation, so the user knows where the lines go.
