@@ -181,19 +181,29 @@ pub fn fit_columns(
     }
 }
 
-/// Narrows the Name column, down to `name_min`, when the drawn columns are wider than `room`, so
-/// the status columns to its right stay in view instead of scrolling off. Long names truncate and
-/// show in full in a tooltip.
-pub fn squeeze_name(drawn: &mut [(usize, f32)], columns: &[Column], room: f32, name_min: f32) {
-    let total: f32 = drawn.iter().map(|(_, w)| w).sum();
-    let Some((_, name)) = drawn
-        .iter_mut()
-        .find(|(i, _)| columns[*i].role == ColumnRole::Name)
-    else {
-        return;
-    };
-    if total > room && *name > name_min {
-        *name = (*name - (total - room)).max(name_min);
+/// Narrows the Name column, then the Namespace column, down to their minimums when the drawn
+/// columns are wider than `room`, so the status columns to their right stay in view instead of
+/// scrolling off. Long names truncate and show in full in a tooltip.
+pub fn squeeze_identity(
+    drawn: &mut [(usize, f32)],
+    columns: &[Column],
+    room: f32,
+    name_min: f32,
+    namespace_min: f32,
+) {
+    for (role, min) in [
+        (ColumnRole::Name, name_min),
+        (ColumnRole::Namespace, namespace_min),
+    ] {
+        let total: f32 = drawn.iter().map(|(_, w)| w).sum();
+        if total <= room {
+            return;
+        }
+        if let Some((_, width)) = drawn.iter_mut().find(|(i, _)| columns[*i].role == role)
+            && *width > min
+        {
+            *width = (*width - (total - room)).max(min);
+        }
     }
 }
 
@@ -217,10 +227,41 @@ pub enum Tone {
     Muted,
 }
 
-/// The tone of a cell, from its column's name and its text. Only the status-like columns of the
-/// built-in kinds are colored (Status, Phase, Ready, Restarts); every other cell is normal, so
-/// color keeps meaning "look here".
-pub fn cell_tone(column: &str, text: &str) -> Tone {
+/// Whether `kind` is a built-in kind whose Status, Phase, Ready and Restarts columns mean what
+/// `kubectl` means by them. A CRD's printer column of the same name can mean anything (a
+/// configured `Restarts` limit, say), so CRDs are never colored.
+pub fn has_health_columns(kind: &str) -> bool {
+    matches!(
+        kind,
+        "pods"
+            | "nodes"
+            | "namespaces"
+            | "persistentvolumes"
+            | "persistentvolumeclaims"
+            | "replicationcontrollers"
+            | "deployments.apps"
+            | "statefulsets.apps"
+            | "daemonsets.apps"
+            | "replicasets.apps"
+            | "jobs.batch"
+    )
+}
+
+/// Whether a row has finished for good: its Status or Phase reads Completed or Succeeded. Its
+/// `0/1` ready count is then expected, not a warning.
+pub fn row_finished(columns: &[Column], text_of: impl Fn(usize) -> String) -> bool {
+    columns.iter().enumerate().any(|(i, column)| {
+        let status =
+            column.name.eq_ignore_ascii_case("status") || column.name.eq_ignore_ascii_case("phase");
+        status && status_tone(text_of(i).trim()) == Tone::Muted
+    })
+}
+
+/// The tone of a cell of a kind with [`has_health_columns`], from its column's name and its
+/// text. Only the status-like columns are colored (Status, Phase, Ready, Restarts); every other
+/// cell is normal, so color keeps meaning "look here". In a `finished` row the ready count is
+/// muted along with the status.
+pub fn cell_tone(column: &str, text: &str, finished: bool) -> Tone {
     let text = text.trim();
     if column.eq_ignore_ascii_case("restarts") {
         // `3` or `3 (5m ago)`.
@@ -241,10 +282,10 @@ pub fn cell_tone(column: &str, text: &str) -> Tone {
         if let Some((ready, total)) = text.split_once('/')
             && let (Ok(ready), Ok(total)) = (ready.parse::<u32>(), total.parse::<u32>())
         {
-            return if ready < total {
-                Tone::Warning
-            } else {
-                Tone::Normal
+            return match (ready < total, finished) {
+                (true, true) => Tone::Muted,
+                (true, false) => Tone::Warning,
+                (false, _) => Tone::Normal,
             };
         }
     }
@@ -513,33 +554,66 @@ mod tests {
             ("Up-to-date", "1/2", Normal),
         ];
         for (column, text, want) in cases {
-            assert_eq!(cell_tone(column, text), want, "{column} = {text}");
+            assert_eq!(cell_tone(column, text, false), want, "{column} = {text}");
         }
+        // A completed Job pod's 0/1 is expected, not a warning.
+        assert_eq!(cell_tone("Ready", "0/1", true), Muted);
     }
 
-    // covers UP-20: a long pod name must not push Status and Ready out of a narrow list.
+    // covers UP-20, UP-22
     #[test]
-    fn a_long_name_column_gives_way_to_the_status_columns() {
-        let columns = pod_columns();
-        let name_min = 100.;
-        // Name 400 + Namespace 100 + Ready 60 + Restarts 80 + Age 60 = 700.
-        let widths = [400., 100., 60., 80., 60.];
+    fn only_built_in_kinds_get_health_colors_and_finished_rows_are_recognized() {
+        assert!(has_health_columns("pods"));
+        assert!(has_health_columns("deployments.apps"));
+        assert!(!has_health_columns("widgets.example.com"));
+        assert!(!has_health_columns("configmaps"));
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Ready", 0, ColumnRole::Value, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+        ];
+        let row = |status: &'static str| move |i: usize| ["job-x", "0/1", status][i].to_owned();
+        assert!(row_finished(&columns, row("Completed")));
+        assert!(!row_finished(&columns, row("Running")));
+        assert!(!row_finished(&columns, row("Error")));
+    }
+
+    // covers UP-20, UP-23: a long pod name must not push Status out of the list beside an open
+    // detail pane.
+    #[test]
+    fn long_names_give_way_so_the_status_column_stays_in_view() {
+        // The real pod columns, in kubectl order.
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Namespace", 0, ColumnRole::Namespace, ColumnType::String),
+            col("Ready", 0, ColumnRole::Value, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+            col("Restarts", 0, ColumnRole::Value, ColumnType::Integer),
+            col("Age", 0, ColumnRole::Age, ColumnType::String),
+        ];
+        let (name_min, namespace_min) = (118., 84.);
+        // Name 400, Namespace 170 (local-path-storage), Ready 60, Status 152, Restarts 80, Age 76.
+        let widths = [400., 170., 60., 152., 80., 76.];
         let drawn = || -> Vec<(usize, f32)> { widths.iter().copied().enumerate().collect() };
+        let status_x = |d: &[(usize, f32)]| d[0].1 + d[1].1 + d[2].1;
 
         let mut roomy = drawn();
-        squeeze_name(&mut roomy, &columns, 900., name_min);
+        squeeze_identity(&mut roomy, &columns, 1000., name_min, namespace_min);
         assert_eq!(roomy, drawn(), "nothing changes when everything fits");
 
-        let mut tight = drawn();
-        squeeze_name(&mut tight, &columns, 500., name_min);
-        assert_eq!(tight[0].1, 200.);
-        assert_eq!(tight.iter().map(|(_, w)| w).sum::<f32>(), 500.);
+        // Mid-size: only Name gives way.
+        let mut mid = drawn();
+        squeeze_identity(&mut mid, &columns, 800., name_min, namespace_min);
+        assert_eq!((mid[0].1, mid[1].1), (262., 170.));
 
-        let mut tiny = drawn();
-        squeeze_name(&mut tiny, &columns, 200., name_min);
-        assert_eq!(
-            tiny[0].1, name_min,
-            "never below the minimum; the table scrolls instead"
+        // The list's 360 px minimum beside a detail pane: Status starts well inside the list.
+        let mut tight = drawn();
+        squeeze_identity(&mut tight, &columns, 360., name_min, namespace_min);
+        assert_eq!((tight[0].1, tight[1].1), (name_min, namespace_min));
+        assert!(
+            360. - status_x(&tight) >= 90.,
+            "Status starts at {}",
+            status_x(&tight)
         );
     }
 }

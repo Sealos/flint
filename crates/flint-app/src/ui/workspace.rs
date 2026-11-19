@@ -107,10 +107,15 @@ struct Layout {
     detail: f32,
 }
 
-fn layout(panes: &PaneWidths, window_width: f32, detail_open: bool) -> Layout {
+fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: bool) -> Layout {
     let mut widths = Layout {
         clusters: Pane::Clusters.get(panes),
-        navigation: Pane::Navigation.get(panes),
+        // Hidden (no active cluster): it takes no room.
+        navigation: if nav_shown {
+            Pane::Navigation.get(panes)
+        } else {
+            0.
+        },
         detail: if detail_open {
             Pane::Detail.get(panes)
         } else {
@@ -127,7 +132,9 @@ fn layout(panes: &PaneWidths, window_width: f32, detail_open: bool) -> Layout {
     if detail_open {
         give(&mut widths.detail, Pane::Detail.limits().0);
     }
-    give(&mut widths.navigation, Pane::Navigation.limits().0);
+    if nav_shown {
+        give(&mut widths.navigation, Pane::Navigation.limits().0);
+    }
     give(&mut widths.clusters, Pane::Clusters.limits().0);
     widths
 }
@@ -312,7 +319,7 @@ impl Workspace {
     /// Follows a pane-edge drag, and saves the widths once it pauses.
     fn drag_pane(&mut self, pane: Pane, x: f32, window_width: f32, cx: &mut Context<Self>) {
         // Measured from the panes as shown, which a narrow window may have shrunk.
-        let shown = layout(&self.panes, window_width, self.detail.is_some());
+        let shown = self.layout(window_width, cx);
         let width = match pane {
             Pane::Clusters => x,
             Pane::Navigation => x - shown.clusters,
@@ -323,7 +330,10 @@ impl Workspace {
         };
         let before = self.panes;
         pane.set(&mut self.panes, width);
-        if self.panes == before {
+        // A drag that a narrow window keeps from moving the divider changes nothing on screen;
+        // saving it would replace the preference the user gets back in a wider window.
+        if self.panes == before || self.layout(window_width, cx) == shown {
+            self.panes = before;
             return;
         }
         cx.notify();
@@ -1142,7 +1152,13 @@ impl Workspace {
     /// The detail pane's width: as dragged, but narrower when the window is, so the list keeps
     /// [`MIN_LIST_WIDTH`] (a remembered width from a wider window would squeeze it).
     fn detail_width(&self, window_width: f32) -> f32 {
-        layout(&self.panes, window_width, true).detail
+        layout(&self.panes, window_width, true, true).detail
+    }
+
+    /// The pane widths as shown now, with the panes that are showing.
+    fn layout(&self, window_width: f32, cx: &App) -> Layout {
+        let nav_shown = self.model.read(cx).active_cluster().is_some();
+        layout(&self.panes, window_width, nav_shown, self.detail.is_some())
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -1384,7 +1400,7 @@ impl Render for Workspace {
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
-        let widths = layout(&self.panes, window_width, self.detail.is_some());
+        let widths = self.layout(window_width, cx);
         h_flex()
             .id("workspace")
             .size_full()
@@ -1418,7 +1434,7 @@ mod tests {
     fn a_narrow_window_shrinks_the_side_panes_before_the_list() {
         let saved = PaneWidths::default();
         // Wide enough: every pane as saved (the defaults).
-        let wide = layout(&saved, 1600., true);
+        let wide = layout(&saved, 1600., true, true);
         assert_eq!(
             wide,
             Layout {
@@ -1428,11 +1444,11 @@ mod tests {
             }
         );
         // The detail pane gives way first.
-        let medium = layout(&saved, 1100., true);
+        let medium = layout(&saved, 1100., true, true);
         assert_eq!((medium.clusters, medium.navigation), (200., 220.));
         assert_eq!(list_width(medium, 1100.), MIN_LIST_WIDTH);
         // A third of a 2560 px screen: everything at its minimum, and the list gets the rest.
-        let narrow = layout(&saved, 853., true);
+        let narrow = layout(&saved, 853., true, true);
         assert_eq!(
             narrow,
             Layout {
@@ -1443,11 +1459,14 @@ mod tests {
         );
         assert_eq!(list_width(narrow, 853.), 263.);
         // With the detail pane closed, the side panes keep their widths while the list fits.
-        let closed = layout(&saved, 853., false);
+        let closed = layout(&saved, 853., true, false);
         assert_eq!(
             (closed.clusters, closed.navigation, closed.detail),
             (200., 220., 0.)
         );
+        // No active cluster: navigation is hidden and takes no room from the sidebar.
+        let welcome = layout(&saved, 650., false, false);
+        assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
     }
 
     // covers UP-21

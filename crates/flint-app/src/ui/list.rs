@@ -42,6 +42,9 @@ pub const ROW_HEIGHT: f32 = 24.;
 /// Approximate advance of one character at the table's text size, for column widths.
 const CHAR_WIDTH: f32 = 8.5;
 const CELL_PADDING: f32 = 16.;
+/// How narrow Name and Namespace get in a tight list (characters), so status columns fit.
+const SQUEEZED_NAME_CHARS: usize = 12;
+const SQUEEZED_NAMESPACE_CHARS: usize = 8;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -462,8 +465,14 @@ impl ResourceList {
             available,
         );
         if let Some(room) = available {
-            let name_min = list_model::NAME_MIN_CHARS as f32 * CHAR_WIDTH + CELL_PADDING;
-            list_model::squeeze_name(&mut drawn, columns, room, name_min);
+            let min = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
+            list_model::squeeze_identity(
+                &mut drawn,
+                columns,
+                room,
+                min(SQUEEZED_NAME_CHARS),
+                min(SQUEEZED_NAMESPACE_CHARS),
+            );
         }
         (drawn, dropped)
     }
@@ -481,6 +490,7 @@ impl ResourceList {
         // Secret rows show only identity columns, as the MCP server does: a printer column
         // added by an extension could show a value.
         let secrets = self.kind.as_str() == "secrets";
+        let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);
         let mut elements = Vec::with_capacity(range.len());
@@ -517,6 +527,10 @@ impl ResourceList {
                         }
                     })
                 });
+            let finished = health
+                && list_model::row_finished(&self.shown.columns, |i| {
+                    cell_text(row, i, now).to_string()
+                });
             for &(col, width) in &self.drawn {
                 let column = &self.shown.columns[col];
                 let text = if secrets && !is_safe_secret_column(&column.name) {
@@ -525,10 +539,10 @@ impl ResourceList {
                     cell_text(row, col, now)
                 };
                 // Stale rows are already muted; masked secrets have no status.
-                let tone = if stale || secrets {
+                let tone = if stale || !health {
                     list_model::Tone::Normal
                 } else {
-                    list_model::cell_tone(&column.name, &text)
+                    list_model::cell_tone(&column.name, &text, finished)
                 };
                 let numeric = list_model::is_numeric(column);
                 let is_name = column.role == ColumnRole::Name;
