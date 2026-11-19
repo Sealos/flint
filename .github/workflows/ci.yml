@@ -30,9 +30,63 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # macOS runners cost about ten times as much as Linux ones, so only the app, which is a
+  # macOS GPUI app, runs on macOS. flint-core and flint-mcp build and test on Linux.
   clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux
+      - run: cargo clippy -p flint-core -p flint-mcp --all-targets --locked -- -D warnings
+
+  # One job per crate, so a failure points at the module that broke. flint-app's tests run in
+  # the macOS job below.
+  test:
+    name: test (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [flint-core, flint-mcp]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo test -p ${{ matrix.crate }} --locked
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux
+          save-if: false
+      - run: cargo doc -p flint-core -p flint-mcp --no-deps --document-private-items --locked
+
+  # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
+  # and docs, and a release build that catches profile-only problems (LTO, strip) before
+  # release-please does.
+  macos:
+    name: macos (flint-app)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -41,49 +95,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: macos
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  # One job per crate, so a failure points at the module that broke.
-  test:
-    name: test (${{ matrix.crate }})
-    runs-on: macos-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [flint-core, flint-mcp, flint-app]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: macos
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - run: cargo test -p ${{ matrix.crate }} --locked
-
-  docs:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: macos
-          save-if: false
-      - run: cargo doc --workspace --no-deps --document-private-items --locked
-
-  # A release build catches profile-only problems (LTO, strip) before release-please does.
-  build-release:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: macos-release
-      - run: cargo build --release --locked -p flint-app
+      - name: Clippy
+        run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test -p flint-app --locked
+      - name: Docs
+        run: cargo doc -p flint-app --no-deps --document-private-items --locked
+      - name: Release build
+        run: cargo build --release --locked -p flint-app
       - run: ./target/release/flint --help

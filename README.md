@@ -133,13 +133,16 @@ message unless asked:
     cargo test -p flint-core --test watch_recovery -- --ignored --nocapture
   ```
 
-CI on macOS (`.github/workflows/ci.yml`) runs format, clippy and the tests above without a cluster. The cluster tests
-run on Linux against kind (`.github/workflows/cluster-e2e.yml`).
+CI (`.github/workflows/ci.yml`) runs format, clippy, docs and the tests above without a cluster. Everything runs on
+Linux except the app, which is the only part that needs macOS. The cluster tests run on Linux against kind
+(`.github/workflows/cluster-e2e.yml`).
 
 ### Checks CI runs
 
-- **CI (macOS):** `cargo fmt --check`, clippy with `-D warnings`, `cargo test -p <crate>` for each crate as a separate
-  job, `cargo doc` with `-D warnings`, and a release build.
+- **CI (Linux):** `cargo fmt --check`, and for `flint-core` and `flint-mcp`: clippy with `-D warnings`,
+  `cargo test -p <crate>` as a separate job per crate, and `cargo doc` with `-D warnings`.
+- **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. macOS
+  runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
 - **Cluster e2e (Linux):** a kind cluster set up by `scripts/cluster-fixtures.sh`, then the `flint-core` and
   `flint-mcp` tests with `--include-ignored`, the MCP ones through the GPUI-free `flint-mcp` binary. Runs on PRs that
   touch core or MCP, on master, and nightly (which adds the API-server restart test).
