@@ -16,7 +16,7 @@ use super::accent::ACCENT;
 use super::clusters::ClustersModel;
 use super::ui_state::UiState;
 use super::workspace::Workspace;
-use super::{AppearanceDark, AppearanceLight, AppearanceSystem, list, theme};
+use super::{AppearanceDark, AppearanceLight, AppearanceSystem, theme};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -36,7 +36,7 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ClustersModel>, tem
     let (window, model) = cx.update(|cx| {
         gpui_kit::init(cx);
         theme::init(ThemeMode::Light, cx);
-        list::init(cx);
+        super::registry::init(cx);
         let model = cx.new(|cx| ClustersModel::new(core, Settings::default(), None, cx));
         super::install_menus(Appearance::System, cx);
         super::handle_appearance_menu(&model, cx);

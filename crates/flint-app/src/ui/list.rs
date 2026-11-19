@@ -32,12 +32,10 @@ use flint_core::redact::is_safe_secret_column;
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
 
-actions!(
-    resource_list,
-    [SelectPrev, SelectNext, SelectFirst, SelectLast, CloseDetail]
-);
+use super::registry::{CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev};
 
-const CONTEXT: &str = "ResourceList";
+/// The list's key context; the registry binds the list's keys in it.
+pub const CONTEXT: &str = "ResourceList";
 pub const ROW_HEIGHT: f32 = 24.;
 /// Approximate advance of one character at the table's text size, for column widths.
 const CHAR_WIDTH: f32 = 8.5;
@@ -45,16 +43,6 @@ const CELL_PADDING: f32 = 16.;
 /// How narrow Name and Namespace get in a tight list (characters), so status columns fit.
 const SQUEEZED_NAME_CHARS: usize = 12;
 const SQUEEZED_NAMESPACE_CHARS: usize = 8;
-
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", SelectPrev, Some(CONTEXT)),
-        KeyBinding::new("down", SelectNext, Some(CONTEXT)),
-        KeyBinding::new("home", SelectFirst, Some(CONTEXT)),
-        KeyBinding::new("end", SelectLast, Some(CONTEXT)),
-        KeyBinding::new("escape", CloseDetail, Some(CONTEXT)),
-    ]);
-}
 
 /// The object a list has selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,11 +970,7 @@ impl Render for ResourceList {
             .id("resource-list")
             .key_context(CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::select_prev))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_first))
-            .on_action(cx.listener(Self::select_last))
-            .on_action(cx.listener(Self::close_detail))
+            .map(|el| Self::register_actions(el, cx))
             .size_full()
             .min_w_0()
             .child(self.render_toolbar(theme, cx))
@@ -994,6 +978,9 @@ impl Render for ResourceList {
             .child(body)
     }
 }
+
+#[path = "list_actions.rs"]
+mod actions;
 
 #[cfg(test)]
 #[path = "list_tests.rs"]

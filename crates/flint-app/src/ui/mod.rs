@@ -15,6 +15,7 @@ mod list_model;
 mod nav;
 mod notice;
 mod object;
+mod registry;
 mod startup;
 mod theme;
 mod ui_state;
@@ -29,19 +30,11 @@ use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
 use clusters::ClustersModel;
+use registry::{CloseWindow, Quit};
 use ui_state::UiState;
 use workspace::Workspace;
 
-actions!(
-    flint,
-    [
-        Quit,
-        CloseWindow,
-        AppearanceSystem,
-        AppearanceLight,
-        AppearanceDark
-    ]
-);
+actions!(flint, [AppearanceSystem, AppearanceLight, AppearanceDark]);
 
 /// Names a context to activate at startup, exactly as clicking it would. A development and testing
 /// aid (for example for agents taking screenshots); it never selects anything else.
@@ -111,7 +104,7 @@ pub fn run(boot: Bootstrap) {
                 ),
                 cx,
             );
-            list::init(cx);
+            registry::init(cx);
             install_menus(settings.appearance, cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
@@ -146,7 +139,8 @@ pub fn run(boot: Bootstrap) {
         });
 }
 
-/// The app menu with Quit (cmd-q) and Close Window (cmd-w), plus View > Appearance.
+/// The app menu with Quit and Close Window (their keys come from the registry), plus
+/// View > Appearance.
 fn install_menus(appearance: Appearance, cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
@@ -154,10 +148,6 @@ fn install_menus(appearance: Appearance, cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-    ]);
     set_menus(appearance, cx);
 }
 

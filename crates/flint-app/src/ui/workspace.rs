@@ -171,6 +171,8 @@ pub struct Workspace {
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
     _save_panes: Task<()>,
+    /// Holds focus when nothing inside does, so registered actions reach the workspace.
+    focus: FocusHandle,
     _namespaces: Task<()>,
     _tick: Task<()>,
     _list_subscriptions: Vec<Subscription>,
@@ -253,8 +255,11 @@ impl Workspace {
                 }
             }
         });
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         let mut this = Self {
             model,
+            focus,
             forced_appearance,
             chrome: None,
             panes: ui_state.panes(),
@@ -1397,12 +1402,19 @@ pub fn namespace_summary(filter: &[String]) -> String {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let window_width = f32::from(window.viewport_size().width);
+        // Focus left with a closed view: take it back, so registered actions still reach the
+        // workspace (GPUI dispatches from the focused element up).
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus, cx);
+        }
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
         let widths = self.layout(window_width, cx);
         h_flex()
             .id("workspace")
+            .track_focus(&self.focus)
+            .map(|el| self.register_actions(el, cx))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
@@ -1419,6 +1431,9 @@ impl Render for Workspace {
             .child(self.render_main(window_width, theme, cx))
     }
 }
+
+#[path = "workspace_actions.rs"]
+mod actions;
 
 #[cfg(test)]
 mod tests {

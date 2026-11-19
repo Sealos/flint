@@ -1890,6 +1890,7 @@ dependencies = [
  "flint-mcp",
  "gpui-kit",
  "k8s-openapi",
+ "serde",
  "serde-saphyr 2.2.0",
  "serde_json",
  "tempfile",

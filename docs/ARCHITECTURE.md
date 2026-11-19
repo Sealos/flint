@@ -270,6 +270,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   onward, so the M1.5 theme work does not mean restyling every view.
 - **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
   switch cluster, change namespace, toggle watch mode, or toggle Expose to AI.
+- **Action registry (`flint-app/src/ui/registry.rs`):** every interactive control is a named GPUI action with a label,
+  description, arguments and default keys. Views own the handlers and list them once (a `bind_actions` function per
+  view); clicks, keys, the palette and the test automation channel all end in those handlers. A new control is not
+  done until it is in the registry; a unit test per view checks that it binds every action of its scope.
 - **Resource switcher (Cmd-P):** fuzzy search over the kinds and objects of the active cluster, jumping straight to
   a list or a detail view. It searches the in-memory stores, so it never makes network calls.
 

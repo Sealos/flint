@@ -99,7 +99,7 @@ fn open_sized(
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
-        super::init(cx);
+        crate::ui::registry::init(cx);
     });
     cx.update(|cx| {
         let bounds = Bounds {
@@ -388,6 +388,86 @@ async fn clicking_and_arrows_select_rows(cx: &mut TestAppContext) {
     assert_eq!(
         *events.borrow(),
         [Some("api".to_owned()), Some("web".to_owned()), None]
+    );
+}
+
+// The registry drives the list by name, through the handlers its keys and clicks use.
+#[gpui_kit::test]
+async fn registered_actions_drive_the_list(cx: &mut TestAppContext) {
+    use crate::ui::registry::{self, ActionError};
+    use serde_json::json;
+
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(
+                &[("demo", "api", 0), ("demo", "web", 2), ("data", "db", 1)],
+                SyncState::Synced,
+                1,
+            ),
+            cx,
+        )
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-web").is_some()
+    })
+    .await;
+    let focus = list.read_with(cx, |list, _| list.focus_handle().clone());
+    let dispatch = |cx: &mut TestAppContext, name: &str, args: serde_json::Value| {
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            registry::dispatch(name, args, window, cx)
+        })
+        .unwrap()
+    };
+    let selected = |cx: &mut TestAppContext| {
+        list.read_with(cx, |list, _| list.selected.as_ref().map(|s| s.name.clone()))
+    };
+
+    dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(selected(cx).as_deref(), Some("web"));
+
+    dispatch(cx, "resource_list::SelectFirst", serde_json::Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(selected(cx).as_deref(), Some("db"));
+
+    // Sorting by a column, as a header click does: ascending restarts.
+    dispatch(cx, "resource_list::SortBy", json!({"column": "Restarts"})).unwrap();
+    let expect = ["uid-api", "uid-db", "uid-web"];
+    cx.wait_for(window, WAIT, move |window, _| {
+        visible_rows(window, &expect) == expect
+    })
+    .await;
+
+    dispatch(cx, "resource_list::ToggleWide", serde_json::Value::Null).unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Node").is_some()
+    })
+    .await;
+
+    dispatch(cx, "resource_list::CloseDetail", serde_json::Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(selected(cx), None);
+
+    // Nothing in this window handles the detail pane's actions, and bad input is refused.
+    assert_eq!(
+        dispatch(cx, "detail::Close", serde_json::Value::Null),
+        Err(ActionError::NotAvailable("detail::Close".into()))
+    );
+    assert!(matches!(
+        dispatch(cx, "resource_list::SelectRow", json!({"row": 1})),
+        Err(ActionError::InvalidArgs { .. })
+    ));
+    assert_eq!(
+        dispatch(cx, "nope::Nothing", serde_json::Value::Null),
+        Err(ActionError::Unknown("nope::Nothing".into()))
     );
 }
 

@@ -20,6 +20,8 @@ flint-mcp.workspace = true
 # Detail view: the object as JSON, its events, and a redacted YAML rendering for Secrets.
 k8s-openapi.workspace = true
 serde_json.workspace = true
+# Typed arguments of registered actions.
+serde.workspace = true
 serde-saphyr.workspace = true
 
 [dev-dependencies]

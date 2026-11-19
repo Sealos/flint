@@ -411,6 +411,7 @@ impl Render for NavPanel {
         }
         v_flex()
             .id("nav")
+            .map(|el| Self::register_actions(el, cx))
             .track_scroll(&self.scroll)
             .size_full()
             .overflow_y_scroll()
@@ -420,6 +421,9 @@ impl Render for NavPanel {
             .children(rows)
     }
 }
+
+#[path = "nav_actions.rs"]
+mod actions;
 
 #[cfg(test)]
 mod tests {

@@ -894,6 +894,7 @@ impl Render for DetailView {
         };
         v_flex()
             .id("detail")
+            .map(|el| Self::register_actions(el, cx))
             .size_full()
             .min_w_0()
             .bg(theme.background)
@@ -902,6 +903,9 @@ impl Render for DetailView {
             .child(content)
     }
 }
+
+#[path = "detail_actions.rs"]
+mod actions;
 
 #[cfg(test)]
 mod tests {
