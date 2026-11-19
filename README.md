@@ -197,6 +197,18 @@ format, for example `feat(mcp): …` or `fix(core): …`.
 
 Until M6, release binaries are **unsigned** and marked as pre-release. macOS will warn when you first run them.
 
+After every published release:
+
+1. **Reviews of the shipped build:** usability (install and use it as a new user), product development (is the
+   roadmap right?) and market fit (against Lens, Freelens, k9s, Headlamp and other tools). Their findings become
+   issues.
+2. **A refactor pass:** behaviour-preserving `refactor(<scope>): …` PRs that work through the
+   [refactor backlog](https://github.com/Sealos/flint/issues/87) and the duplication the release added. Existing
+   tests must pass unchanged; add tests first where coverage is thin.
+
+Each milestone also ends with a release review (correctness, UI/UX, performance, feature set, and tests against
+[`docs/USER-PATHS.md`](docs/USER-PATHS.md)) before its release is cut.
+
 The version lives in the workspace `Cargo.toml` (marked `x-release-please-version`). The workflow refreshes
 `Cargo.lock` on the release PR, because CI builds with `--locked`.
 
