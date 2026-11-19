@@ -131,6 +131,16 @@ jobs:
           scripts/package-appimage.sh target/release/flint "$VERSION" x86_64
       - name: Smoke test
         run: scripts/smoke-appimage.sh "flint-v$VERSION-linux-x86_64.AppImage" "$VERSION"
+      # The runner has every -dev package installed, so the test above cannot catch a library the
+      # AppImage expects from the host. Run it again where only the documented packages are.
+      - name: Smoke test in a clean Ubuntu 24.04
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e VERSION -e DEBIAN_FRONTEND=noninteractive \
+            ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
+            bash -c 'apt-get update -qq &&
+              grep -v "^#" packaging/linux/ubuntu-runtime-packages.txt |
+                xargs apt-get install -y -qq --no-install-recommends >/dev/null &&
+              scripts/smoke-appimage.sh "flint-v$VERSION-linux-x86_64.AppImage" "$VERSION"'
 
   # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
   # and docs (also with the test-only automation channel), and a release build that catches

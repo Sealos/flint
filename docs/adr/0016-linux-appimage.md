@@ -10,9 +10,14 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
   binary.
 - **What is bundled.** `scripts/package-appimage.sh` runs linuxdeploy, which copies the shared libraries the binary
   links and a desktop may lack (for example `libxkbcommon-x11`), and leaves out what must come from the host: glibc,
-  GL and Vulkan drivers, fontconfig and freetype (linuxdeploy's excludelist). Vulkan is loaded at run time and is
-  never bundled. appimagetool then wraps the AppDir with the AppImage type-2 runtime. All three tools are official
+  GL and Vulkan drivers, fontconfig and freetype, libxcb (linuxdeploy's excludelist). Vulkan is loaded at run time
+  and is never bundled. The packages a minimal Debian or Ubuntu system needs for the rest are in
+  `packaging/linux/ubuntu-runtime-packages.txt`; CI and the release run the AppImage in a clean `ubuntu:24.04`
+  container with only those installed. appimagetool then wraps the AppDir with the AppImage type-2 runtime. All three tools are official
   releases from the linuxdeploy and AppImage GitHub organizations, pinned by version and SHA-256 in the script.
+  The runtime is MIT-licensed and embedded in every AppImage, so its notice
+  (`packaging/linux/appimage-runtime-LICENSE`, checked against the pinned tag) ships in the AppDir next to Flint's
+  `LICENSE`; linuxdeploy copies the bundled libraries' copyright files.
 - **Built natively.** The release builds x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`; linuxdeploy
   inspects the binary with the host's loader, so there is no cross-compiling. CI packages and smoke-tests the x86_64
   AppImage on every pull request (`--version` and `mcp`, without FUSE).
@@ -49,7 +54,14 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
   (GNOME on Wayland) show the window without a title bar; Flint draws none of its own yet.
 - **XDG directories.** On Linux `settings.toml` and `state.toml` live in `$XDG_CONFIG_HOME/flint` (default
   `~/.config/flint`). State stays beside settings rather than in `$XDG_STATE_HOME`, so one directory holds all of
-  Flint's files on every platform and `FLINT_CONFIG_DIR` keeps overriding both.
+  Flint's files on every platform and `FLINT_CONFIG_DIR` keeps overriding both. Linux was never released before
+  this; source builds from before it used the macOS path (`~/Library/Application Support/Flint` under `$HOME`).
+  Their users can move `settings.toml` and `state.toml` to `~/.config/flint/`, or set `FLINT_CONFIG_DIR`. Flint
+  does not migrate them.
+- **Extract-and-run without FUSE.** With `APPIMAGE_EXTRACT_AND_RUN=1` the runtime extracts to
+  `$TMPDIR/appimage_extracted_<md5 of the AppImage>` and deletes that directory when the process exits, so two
+  launches sharing a `TMPDIR` (the app and `flint mcp`, say) can delete each other's files. The README tells users
+  to give each launch its own `TMPDIR`, with a ready MCP registration line; the smoke test does the same.
 - **No auto-update or desktop integration.** The AppImage carries no update information, and Flint does not install
   a desktop entry; tools such as AppImageLauncher or Gear Lever do that if the user wants it.
 - **Icon.** The icon in `packaging/linux/` is a placeholder (the site's favicon), kept as one SVG plus the PNG

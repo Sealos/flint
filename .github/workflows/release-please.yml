@@ -140,6 +140,15 @@ jobs:
           echo "APPIMAGE=$APPIMAGE" >> "$GITHUB_ENV"
       - name: Smoke test
         run: scripts/smoke-appimage.sh "$APPIMAGE" "$VERSION"
+      # Again with only the host packages the README documents (see ci.yml).
+      - name: Smoke test in a clean Ubuntu 24.04
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e APPIMAGE -e VERSION -e DEBIAN_FRONTEND=noninteractive \
+            ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
+            bash -c 'apt-get update -qq &&
+              grep -v "^#" packaging/linux/ubuntu-runtime-packages.txt |
+                xargs apt-get install -y -qq --no-install-recommends >/dev/null &&
+              scripts/smoke-appimage.sh "$APPIMAGE" "$VERSION"'
       - name: Upload to the draft release
         run: gh release upload "$TAG" "$APPIMAGE" "$APPIMAGE.sha256" --clobber
 

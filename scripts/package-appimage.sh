@@ -29,6 +29,9 @@ arch=$3
 LINUXDEPLOY_VERSION=1-alpha-20251107-1
 APPIMAGETOOL_VERSION=1.9.1
 RUNTIME_VERSION=20251108
+# packaging/linux/appimage-runtime-LICENSE is the LICENSE file at that runtime tag. Refresh it
+# with the runtime: gh api "repos/AppImage/type2-runtime/contents/LICENSE?ref=<tag>" --jq .content | base64 -d
+RUNTIME_LICENSE_SHA256=aa154fc9070614bbe7921f89db11efd1dba7a1f3a41685958110e2230f9c0ca1
 case "$arch" in
   x86_64)
     LINUXDEPLOY_SHA256=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
@@ -103,6 +106,14 @@ unset UPDATE_INFORMATION LDAI_UPDATE_INFORMATION
   --icon-file "$repo/packaging/linux/flint.png" \
   --icon-filename flint
 install -Dm644 "$repo/LICENSE" "$appdir/usr/share/doc/flint/LICENSE"
+# The runtime is MIT: its notice must travel with every AppImage. linuxdeploy already copies the
+# bundled libraries' copyright files into usr/share/doc.
+runtime_license=$repo/packaging/linux/appimage-runtime-LICENSE
+if ! echo "$RUNTIME_LICENSE_SHA256  $runtime_license" | sha256sum --check --status; then
+  echo "error: $runtime_license is not the LICENSE of type2-runtime $RUNTIME_VERSION" >&2
+  exit 1
+fi
+install -Dm644 "$runtime_license" "$appdir/usr/share/doc/appimage-runtime/LICENSE"
 
 # The binary must be called flint: the desktop file's Exec and the AppRun link point at it.
 test -x "$appdir/usr/bin/flint"
@@ -115,4 +126,10 @@ ARCH=$arch VERSION=$version "$tools/appimagetool-$APPIMAGETOOL_VERSION-$arch.App
 
 echo "bundled libraries:"
 find "$appdir/usr/lib" -maxdepth 1 -name '*.so*' -printf '  %f\n' 2>/dev/null | sort || true
+# What the host must provide: the binary's direct needs that were not bundled (README lists the
+# packages; CI checks them in a clean container).
+echo "libraries left to the host:"
+readelf -d "$appdir/usr/bin/flint" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort | while read -r lib; do
+  [ -e "$appdir/usr/lib/$lib" ] || echo "  $lib"
+done
 ls -l "$out"

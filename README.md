@@ -47,8 +47,23 @@ flint --version
 flint                                   # opens the window
 ```
 
-AppImages mount themselves with FUSE (the `fusermount` or `fusermount3` command). Without it, for example in a container, set
-`APPIMAGE_EXTRACT_AND_RUN=1` to run it without mounting. The AppImage is unsigned; the `.sha256` file is the check.
+**Host libraries.** The AppImage bundles what a desktop may lack, but takes glibc, fontconfig and libxcb from the
+host; without them it does not start at all, not even `--version` or `mcp`. Every desktop has them. On a minimal or
+headless system install them (on Debian and Ubuntu: `libfontconfig1 libxcb1`, listed in
+[`packaging/linux/ubuntu-runtime-packages.txt`](packaging/linux/ubuntu-runtime-packages.txt); CI runs the AppImage in
+a clean `ubuntu:24.04` with only those). The window also needs an X11 or Wayland session and a GPU driver with
+Vulkan or OpenGL ES (Mesa on most systems).
+
+**FUSE.** AppImages mount themselves with FUSE (the `fusermount` or `fusermount3` command). Without it, for example
+in a container, set `APPIMAGE_EXTRACT_AND_RUN=1` to extract to `$TMPDIR` and run from there instead. Give each such
+launch its own `TMPDIR`: two launches of the same AppImage share one extraction directory, and the first to exit
+deletes it under the other.
+
+```sh
+TMPDIR=$(mktemp -d) APPIMAGE_EXTRACT_AND_RUN=1 flint
+```
+
+The AppImage is unsigned; the `.sha256` file is the check.
 On Linux there is no menu bar: Quit is Ctrl-Q, Close Window is Ctrl-W, and every Cmd shortcut is Ctrl. Settings and
 state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
 
@@ -208,6 +223,13 @@ On Linux, register the AppImage the same way; it passes `mcp` through to `flint`
 
 ```sh
 claude mcp add flint -- "$HOME/.local/bin/flint" mcp
+```
+
+Without FUSE, give every `flint mcp` launch its own `TMPDIR` (see above), so it cannot clash with the app or another
+agent's server:
+
+```sh
+claude mcp add flint -- sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTRACT_AND_RUN=1 "$HOME/.local/bin/flint" mcp; s=$?; rm -rf "$d"; exit $s'
 ```
 
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.

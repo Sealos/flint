@@ -16,6 +16,13 @@ appimage=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 version=${2#v}
 export APPIMAGE_EXTRACT_AND_RUN=1
 
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+# Each extract-and-run launch extracts to $TMPDIR/appimage_extracted_<md5> and deletes it on exit,
+# so concurrent launches sharing a TMPDIR could delete each other's files. Keep ours private.
+mkdir -p "$scratch/tmp"
+export TMPDIR=$scratch/tmp
+
 got=$("$appimage" --version)
 if [ "$got" != "flint $version" ]; then
   echo "error: --version printed \"$got\", want \"flint $version\"" >&2
@@ -23,8 +30,6 @@ if [ "$got" != "flint $version" ]; then
 fi
 echo "--version: $got"
 
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/config"
 # A fixed PATH, so no login shell runs.
 echo 'path = "/usr/bin:/bin"' >"$scratch/config/settings.toml"
