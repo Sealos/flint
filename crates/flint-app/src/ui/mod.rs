@@ -1,10 +1,13 @@
 //! The GPUI front end. Views read from [`clusters::ClustersModel`], which is fed by the core's
 //! event stream; the UI never waits on core work (ADR-0002).
 //!
-//! Views take every color from theme tokens (`cx.theme()`), never a hard-coded color, so light and
-//! dark mode both work and the M1.5 themes need no view changes (ARCHITECTURE.md, "Theme tokens
-//! only").
+//! Views take every color from theme tokens (`cx.theme()`), never a hard-coded color
+//! (ARCHITECTURE.md, "Theme tokens only"). The tokens come from Flint Light and Flint Dark
+//! ([`theme`]).
 
+mod accent;
+#[cfg(test)]
+mod appearance_tests;
 mod clusters;
 mod detail;
 mod list;
@@ -13,11 +16,15 @@ mod nav;
 mod notice;
 mod object;
 mod startup;
+mod theme;
 mod ui_state;
 mod workspace;
 
-use flint_core::CoreHandle;
+use std::cell::Cell;
+use std::rc::Rc;
+
 use flint_core::bootstrap::Bootstrap;
+use flint_core::{Appearance, CoreHandle};
 use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
@@ -25,7 +32,16 @@ use clusters::ClustersModel;
 use ui_state::UiState;
 use workspace::Workspace;
 
-actions!(flint, [Quit, CloseWindow]);
+actions!(
+    flint,
+    [
+        Quit,
+        CloseWindow,
+        AppearanceSystem,
+        AppearanceLight,
+        AppearanceDark
+    ]
+);
 
 /// Names a context to activate at startup, exactly as clicking it would. A development and testing
 /// aid (for example for agents taking screenshots); it never selects anything else.
@@ -72,20 +88,31 @@ pub fn run(boot: Bootstrap) {
         _ => None,
     };
     let ui_state = UiState::load(boot.config_dir.clone());
-    // A development and testing aid, for screenshots of both themes: `light` or `dark`
-    // instead of following macOS. The user-facing `appearance` setting comes with M1.5.
+    // A development and testing aid, for screenshots of both themes: `light` or `dark`, over the
+    // `appearance` setting and macOS.
     let forced_appearance = match std::env::var("FLINT_APPEARANCE").as_deref() {
         Ok("light") => Some(ThemeMode::Light),
         Ok("dark") => Some(ThemeMode::Dark),
         _ => None,
     };
 
+    let settings = boot.settings.clone();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // The window is not open yet: start from the app's appearance; the workspace
+            // follows the window's from then on.
+            theme::init(
+                theme::resolve(
+                    settings.appearance,
+                    forced_appearance,
+                    cx.window_appearance(),
+                ),
+                cx,
+            );
             list::init(cx);
-            install_menus(cx);
+            install_menus(settings.appearance, cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -93,7 +120,8 @@ pub fn run(boot: Bootstrap) {
             })
             .detach();
 
-            let model = cx.new(|cx| ClustersModel::new(core, startup_cluster, cx));
+            let model = cx.new(|cx| ClustersModel::new(core, settings, startup_cluster, cx));
+            handle_appearance_menu(&model, cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -118,8 +146,8 @@ pub fn run(boot: Bootstrap) {
         });
 }
 
-/// The app menu with Quit (cmd-q) and Close Window (cmd-w).
-fn install_menus(cx: &mut App) {
+/// The app menu with Quit (cmd-q) and Close Window (cmd-w), plus View > Appearance.
+fn install_menus(appearance: Appearance, cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx.active_window() {
@@ -130,8 +158,51 @@ fn install_menus(cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
     ]);
+    set_menus(appearance, cx);
+}
+
+fn set_menus(appearance: Appearance, cx: &mut App) {
     cx.set_menus([
         Menu::new("Flint").items([MenuItem::action("Quit Flint", Quit)]),
+        appearance_menu(appearance),
         Menu::new("Window").items([MenuItem::action("Close Window", CloseWindow)]),
     ]);
+}
+
+/// View > Appearance: System, Light and Dark, with a check mark on the current setting.
+fn appearance_menu(appearance: Appearance) -> Menu {
+    let item = |name: &'static str, action: Box<dyn Action>, this: Appearance| MenuItem::Action {
+        name: name.into(),
+        action,
+        os_action: None,
+        checked: appearance == this,
+        disabled: false,
+    };
+    Menu::new("View").items([MenuItem::submenu(Menu::new("Appearance").items([
+        item("System", Box::new(AppearanceSystem), Appearance::System),
+        item("Light", Box::new(AppearanceLight), Appearance::Light),
+        item("Dark", Box::new(AppearanceDark), Appearance::Dark),
+    ]))])
+}
+
+/// Handles the View > Appearance actions by writing the `appearance` setting, and moves the
+/// menu's check mark when the setting changes (from the menu or from `settings.toml`).
+fn handle_appearance_menu(model: &Entity<ClustersModel>, cx: &mut App) {
+    fn set(model: &Entity<ClustersModel>, appearance: Appearance, cx: &mut App) {
+        model.update(cx, |m, _| m.set_appearance(appearance));
+    }
+    let m = model.clone();
+    cx.on_action(move |_: &AppearanceSystem, cx| set(&m, Appearance::System, cx));
+    let m = model.clone();
+    cx.on_action(move |_: &AppearanceLight, cx| set(&m, Appearance::Light, cx));
+    let m = model.clone();
+    cx.on_action(move |_: &AppearanceDark, cx| set(&m, Appearance::Dark, cx));
+    let shown = Rc::new(Cell::new(model.read(cx).settings.appearance));
+    cx.observe(model, move |model, cx| {
+        let appearance = model.read(cx).settings.appearance;
+        if shown.replace(appearance) != appearance {
+            set_menus(appearance, cx);
+        }
+    })
+    .detach();
 }

@@ -245,8 +245,8 @@ impl DetailView {
             .border_color(theme.border)
             .child(
                 h_flex()
+                    .h(px(super::workspace::HEADER_HEIGHT))
                     .px_3()
-                    .pt_2()
                     .gap_2()
                     .child(
                         div()
@@ -388,36 +388,36 @@ impl DetailView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let now = unix_now();
-        let mut body = v_flex().gap_4().p_3().pb_6();
+        let mut body = v_flex().gap_3().p_3().pb_6();
 
-        // Metadata.
+        // Metadata. Names and identifiers are monospace.
         let mut meta = Vec::new();
-        meta.push(("Name", o.name.clone()));
+        meta.push(("Name", o.name.clone(), true));
         if let Some(ns) = &o.namespace {
-            meta.push(("Namespace", ns.clone()));
+            meta.push(("Namespace", ns.clone(), true));
         }
-        meta.push(("Kind", format!("{} ({})", o.kind, o.api_version)));
+        meta.push(("Kind", format!("{} ({})", o.kind, o.api_version), false));
         if let Some(created) = &o.created {
             let age = timestamp_age(created, now)
                 .map(|a| format!(" ({a} ago)"))
                 .unwrap_or_default();
-            meta.push(("Created", format!("{created}{age}")));
+            meta.push(("Created", format!("{created}{age}"), false));
         }
-        meta.push(("UID", o.uid.clone()));
-        meta.push(("Resource version", o.resource_version.clone()));
+        meta.push(("UID", o.uid.clone(), true));
+        meta.push(("Resource version", o.resource_version.clone(), true));
         if let Some(generation) = o.generation {
-            meta.push(("Generation", generation.to_string()));
+            meta.push(("Generation", generation.to_string(), false));
         }
         if !o.finalizers.is_empty() {
-            meta.push(("Finalizers", o.finalizers.join(", ")));
+            meta.push(("Finalizers", o.finalizers.join(", "), true));
         }
         body = body.child(section(
             "Metadata",
             None,
-            v_flex().gap_0p5().children(
+            v_flex().children(
                 meta.into_iter()
                     .enumerate()
-                    .map(|(i, (k, v))| key_value(("meta", i), k, v, theme)),
+                    .map(|(i, (k, v, mono))| key_value(("meta", i), k, v, mono, theme)),
             ),
             theme,
         ));
@@ -796,10 +796,18 @@ fn section(
         .child(content)
 }
 
-fn key_value(id: (&'static str, usize), key: &str, value: String, theme: &Theme) -> AnyElement {
+/// One metadata line; `mono` for names and identifiers.
+fn key_value(
+    id: (&'static str, usize),
+    key: &str,
+    value: String,
+    mono: bool,
+    theme: &Theme,
+) -> AnyElement {
     let full = value.clone();
     h_flex()
         .id(id)
+        .h(px(22.))
         .gap_2()
         .text_sm()
         .child(
@@ -809,7 +817,15 @@ fn key_value(id: (&'static str, usize), key: &str, value: String, theme: &Theme)
                 .text_color(theme.muted_foreground)
                 .child(key.to_owned()),
         )
-        .child(div().flex_1().min_w_0().truncate().child(value))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_features(tabular_figures())
+                .when(mono, |el| el.font_family(theme.mono_font_family.clone()))
+                .child(value),
+        )
         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
         .into_any_element()
 }

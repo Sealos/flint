@@ -113,6 +113,27 @@ async fn set_ai_exposed_writes_context_and_server() {
     assert!(on_disk.ai_exposure("one", Some(SERVER)).is_exposed());
 }
 
+// covers UP-32
+#[tokio::test]
+async fn set_appearance_is_written_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), false);
+    let events = core.events();
+    next_clusters(&events).await;
+    core.send(Command::SetAppearance(flint_core::Appearance::Dark));
+    let (settings, error) = tokio::time::timeout(
+        Duration::from_secs(5),
+        settings_where(&events, |s, _| s.appearance == flint_core::Appearance::Dark),
+    )
+    .await
+    .unwrap();
+    assert_eq!(error, None);
+    assert_eq!(settings.appearance, flint_core::Appearance::Dark);
+    let on_disk = flint_core::settings::load_settings(&dir.path().join("config")).unwrap();
+    assert_eq!(on_disk.appearance, flint_core::Appearance::Dark);
+}
+
 // covers UP-07, UP-08
 #[tokio::test]
 async fn exposing_a_server_the_context_no_longer_has_is_refused() {

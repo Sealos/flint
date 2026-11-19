@@ -200,7 +200,7 @@ impl NavPanel {
             .pr_2()
             .h(px(24.))
             .gap_1()
-            .rounded_md()
+            .rounded(theme.radius)
             .text_sm()
             .when(!listable, |el| {
                 el.text_color(theme.muted_foreground.opacity(0.6))
@@ -209,12 +209,16 @@ impl NavPanel {
                 el.cursor_pointer()
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(NavEvent::Open(open.clone()))))
             })
+            // The open kind is marked with the accent, as selections are.
+            .relative()
             .when(is_selected, |el| {
-                el.bg(theme.sidebar_accent)
-                    .text_color(theme.sidebar_accent_foreground)
+                el.bg(theme.list_active).child(super::theme::selection_edge(
+                    theme.list_active_border,
+                    px(4.),
+                ))
             })
             .when(!is_selected && listable, |el| {
-                el.hover(|el| el.bg(theme.sidebar_accent.opacity(0.5)))
+                el.hover(|el| el.bg(theme.list_hover))
             })
             .child(
                 div()
@@ -317,6 +321,7 @@ impl Render for NavPanel {
                                 .pt_3()
                                 .pb_1()
                                 .text_xs()
+                                .font_semibold()
                                 .text_color(theme.muted_foreground)
                                 .child("CUSTOM RESOURCES"))
                             .into_any_element(),
@@ -335,12 +340,12 @@ impl Render for NavPanel {
                             .px_1()
                             .h(px(24.))
                             .gap_1()
-                            .rounded_md()
+                            .rounded(theme.radius)
                             .cursor_pointer()
                             .text_xs()
                             .font_semibold()
                             .text_color(theme.muted_foreground)
-                            .hover(|el| el.bg(theme.sidebar_accent.opacity(0.5)))
+                            .hover(|el| el.bg(theme.list_hover))
                             .child(
                                 Icon::new(if is_collapsed {
                                     IconName::ChevronRight
@@ -359,7 +364,7 @@ impl Render for NavPanel {
                             .when(is_collapsed, |el| {
                                 el.child(
                                     div()
-                                        .text_color(theme.muted_foreground.opacity(0.7))
+                                        .font_features(super::list::tabular_figures())
                                         .child(section.entries.len().to_string()),
                                 )
                             })
@@ -410,7 +415,8 @@ impl Render for NavPanel {
             .size_full()
             .overflow_y_scroll()
             .gap_px()
-            .p_2()
+            .px_1p5()
+            .py_1()
             .children(rows)
     }
 }

@@ -492,7 +492,14 @@ impl ResourceList {
                 .border_b_1()
                 .border_color(theme.table_row_border)
                 .when(ix % 2 == 1, |el| el.bg(theme.table_even))
-                .when(is_selected, |el| el.bg(theme.table_active))
+                .relative()
+                .when(is_selected, |el| {
+                    el.bg(theme.table_active)
+                        .child(super::theme::selection_edge(
+                            theme.table_active_border,
+                            px(0.),
+                        ))
+                })
                 .when(!is_selected, |el| el.hover(|el| el.bg(theme.table_hover)))
                 .when(stale, |el| el.text_color(theme.muted_foreground))
                 .on_click({
@@ -587,7 +594,7 @@ impl ResourceList {
                                 IconName::SortAscending
                             })
                             .xsmall()
-                            .text_color(theme.primary),
+                            .text_color(theme.foreground),
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -612,18 +619,23 @@ impl ResourceList {
         let wide = list_model::has_wide_columns(&snapshot.columns);
         let dropped = self.dropped_wide;
         h_flex()
+            .h(px(super::workspace::HEADER_HEIGHT))
             .px_3()
-            .py_1p5()
             .gap_2()
             .flex_none()
             .min_w_0()
+            .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
+            // When the pane is narrow the filter gives way first, down to its minimum; only then
+            // does the kind's name truncate, so the filter stays usable (UP-21).
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .min_w_0()
+                    .flex_shrink(1.)
+                    .min_w(px(40.))
+                    .max_w(px(200.))
                     .truncate()
                     .child(self.label.clone()),
             )
@@ -662,13 +674,19 @@ impl ResourceList {
             })
             .child(
                 // Shrinks with the pane, down to a usable minimum.
-                div().w(px(240.)).min_w(px(120.)).flex_shrink(1.).child(
-                    Input::new(&self.filter)
-                        .id("list-filter")
-                        .small()
-                        .cleanable(true)
-                        .prefix(Icon::new(IconName::Search).small()),
-                ),
+                div()
+                    .w(px(240.))
+                    .min_w(px(72.))
+                    // Far more willing to shrink than the title, so it reaches its minimum first.
+                    .flex_shrink(1000.)
+                    .overflow_hidden()
+                    .child(
+                        Input::new(&self.filter)
+                            .id("list-filter")
+                            .small()
+                            .cleanable(true)
+                            .prefix(Icon::new(IconName::Search).small()),
+                    ),
             )
     }
 
