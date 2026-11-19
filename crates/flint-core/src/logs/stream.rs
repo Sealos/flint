@@ -428,7 +428,7 @@ mod tests {
 
     /// Serves the same lines at every open; they end (EOF) when `ends`, else stay open.
     struct Fixed {
-        lines: Vec<&'static str>,
+        lines: Vec<String>,
         ends: bool,
         uids: std::sync::Mutex<Vec<Option<String>>>,
     }
@@ -441,7 +441,7 @@ mod tests {
                 .iter()
                 .map(|t| {
                     Ok(RawLine {
-                        text: (*t).to_owned(),
+                        text: t.clone(),
                         truncated: false,
                     })
                 })
@@ -465,13 +465,13 @@ mod tests {
         }
     }
 
-    fn stream(lines: Vec<&'static str>, tag: Option<Arc<LineSource>>) -> Stream {
+    fn stream(lines: &[&str], tag: Option<Arc<LineSource>>) -> Stream {
         stream_on(fixed(lines, false), tag)
     }
 
-    fn fixed(lines: Vec<&'static str>, ends: bool) -> Arc<Fixed> {
+    fn fixed(lines: &[&str], ends: bool) -> Arc<Fixed> {
         Arc::new(Fixed {
-            lines,
+            lines: lines.iter().map(|&t| t.to_owned()).collect(),
             ends,
             uids: Default::default(),
         })
@@ -532,7 +532,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn lines_are_tagged_with_the_streams_source() {
         let tag = Arc::new(LineSource::new("web-1", "app"));
-        let mut s = stream(vec!["one", "two"], Some(tag.clone()));
+        let mut s = stream(&["one", "two"], Some(tag.clone()));
         let lines = drain(&mut s).await;
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|l| l.source.as_ref() == Some(&tag)));
@@ -543,7 +543,7 @@ mod tests {
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn a_deleted_pods_stream_reads_on_for_a_grace_period_then_ends() {
-        let mut s = stream(vec!["last"], None);
+        let mut s = stream(&["last"], None);
         assert_eq!(drain(&mut s).await.len(), 1);
         s.pod_gone(true);
         assert!(!s.is_done(), "still reading the last lines");
@@ -557,7 +557,7 @@ mod tests {
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn a_nudge_skips_the_rest_of_the_backoff() {
-        let mut s = stream(vec![], None);
+        let mut s = stream(&[], None);
         drain(&mut s).await;
         s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
         assert!(matches!(
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(s.state(), &LogState::Streaming, "reopened without waiting");
 
         // A stream that is not waiting ends at once when its pod goes.
-        let mut waiting = stream(vec![], None);
+        let mut waiting = stream(&[], None);
         waiting.handle(Step::Opened(Err(LogError::retry("x"))), &mut |_| {});
         waiting.pod_gone(true);
         assert!(waiting.is_done());
@@ -579,7 +579,7 @@ mod tests {
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn a_workload_stream_ends_quietly_with_its_pod_and_revives_on_a_restart() {
-        let source = fixed(vec!["2024-05-01T12:00:00Z last words"], true);
+        let source = fixed(&["2024-05-01T12:00:00Z last words"], true);
         let tag = Arc::new(LineSource::new("web-1", "app"));
         let mut s = stream_on(source.clone(), Some(tag));
         assert_eq!(drain(&mut s).await.len(), 1);
@@ -595,7 +595,7 @@ mod tests {
         assert!(s.is_done());
 
         // A pod session still says why it ended.
-        let plain = fixed(vec![], true);
+        let plain = fixed(&[], true);
         let mut single = stream_on(plain.clone(), None);
         drain(&mut single).await;
         assert_eq!(
@@ -610,7 +610,7 @@ mod tests {
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn a_cluster_error_ends_even_a_draining_stream_loudly() {
-        let mut s = stream(vec![], None);
+        let mut s = stream(&[], None);
         s.handle(Step::AfterEnd(Ok(AfterEnd::Finished)), &mut |_| {});
         let changed = s.handle(
             Step::Opened(Err(LogError::cluster("re-pointed"))),
@@ -619,7 +619,7 @@ mod tests {
         assert!(changed);
         assert!(s.is_done() && s.ended_on_cluster_error());
         // A plain fatal error while draining is just the end.
-        let mut d = stream(vec![], None);
+        let mut d = stream(&[], None);
         d.handle(Step::AfterEnd(Ok(AfterEnd::Finished)), &mut |_| {});
         d.handle(Step::Opened(Err(LogError::fatal("gone"))), &mut |_| {});
         assert_eq!(d.state(), &LogState::Ended { error: None });
@@ -630,11 +630,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reopen_never_reads_a_pod_recreated_under_the_name() {
         let tag = Arc::new(LineSource::new("db-0", "db"));
-        let mut s = stream(vec![], Some(tag));
+        let mut s = stream(&[], Some(tag));
         // Every open (the first and each reconnect) names the pod's uid for the source to check.
         assert_eq!(s.first_request().uid.as_deref(), Some("u1"));
         assert_eq!(s.resume_request().uid.as_deref(), Some("u1"));
-        assert_eq!(stream(vec![], None).first_request().uid, None);
+        assert_eq!(stream(&[], None).first_request().uid, None);
         // The source found another pod by that name: the stream ends without reading it.
         s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
         let changed = s.handle(
@@ -648,10 +648,9 @@ mod tests {
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn an_ended_stream_keeps_no_line_text_alive() {
-        let long: &'static str =
-            Box::leak(format!("2024-05-01T12:00:00Z {}", "x".repeat(1000)).into_boxed_str());
+        let long = format!("2024-05-01T12:00:00Z {}", "x".repeat(1000));
         let mut s = stream_on(
-            fixed(vec![long, long], true),
+            fixed(&[&long, &long], true),
             Some(Arc::new(LineSource::new("p", "c"))),
         );
         let lines = drain(&mut s).await;
@@ -664,7 +663,7 @@ mod tests {
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn a_cluster_error_is_reported_as_such() {
-        let mut s = stream(vec![], None);
+        let mut s = stream(&[], None);
         s.handle(
             Step::Opened(Err(LogError::cluster("re-pointed"))),
             &mut |_| {},

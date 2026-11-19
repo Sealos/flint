@@ -351,11 +351,11 @@ mod tests {
     /// One scripted outcome of `open`: an error, or lines then an end (EOF or an error).
     enum Script {
         Fail(LogError),
-        Lines(Vec<&'static str>, Option<LogError>),
+        Lines(Vec<String>, Option<LogError>),
         /// Lines, then the stream stays open.
-        Hold(Vec<&'static str>),
+        Hold(Vec<String>),
         /// Lines as the test sends them.
-        Feed(futures::channel::mpsc::UnboundedReceiver<&'static str>),
+        Feed(futures::channel::mpsc::UnboundedReceiver<String>),
     }
 
     #[derive(Default)]
@@ -369,9 +369,9 @@ mod tests {
         fn open(&self, request: &LogRequest) -> BoxFuture<'static, Result<RawLines, LogError>> {
             self.requests.lock().unwrap().push(request.clone());
             let script = self.scripts.lock().unwrap().pop_front();
-            let raw = |t: &str| {
+            let raw = |text: String| {
                 Ok(RawLine {
-                    text: t.to_owned(),
+                    text,
                     truncated: false,
                 })
             };
@@ -485,8 +485,8 @@ mod tests {
             .collect()
     }
 
-    fn leak(text: &str) -> &'static str {
-        Box::leak(text.to_owned().into_boxed_str())
+    fn owned<const N: usize>(lines: [&str; N]) -> Vec<String> {
+        lines.map(str::to_owned).into()
     }
 
     fn ended(s: &LogSnapshot) -> bool {
@@ -503,10 +503,10 @@ mod tests {
             tail_lines: Some(500),
             ..LogOptions::default()
         };
-        let lines = vec![
+        let lines = owned([
             "2024-05-01T12:00:00Z ERROR boom",
             "2024-05-01T12:00:01Z WARN slow",
-        ];
+        ]);
         let mut run = start(vec![Script::Lines(lines, None)], options, 100);
         let snapshot = run.until(ended).await;
         assert_eq!(texts(&snapshot), ["ERROR boom", "WARN slow"]);
@@ -529,9 +529,7 @@ mod tests {
     // covers UP-40
     #[tokio::test(start_paused = true)]
     async fn many_lines_arrive_in_few_snapshots_and_stay_bounded() {
-        let lines: Vec<&'static str> = (0..5000)
-            .map(|n| &*Box::leak(format!("{T1} line {n}").into_boxed_str()))
-            .collect();
+        let lines = (0..5000).map(|n| format!("{T1} line {n}")).collect();
         let mut run = start(vec![Script::Hold(lines)], LogOptions::default(), 1000);
         let mut versions = 0;
         let snapshot = loop {
@@ -551,20 +549,20 @@ mod tests {
     // covers UP-40
     #[tokio::test(start_paused = true)]
     async fn reconnects_with_backoff_without_repeating_lines() {
-        let first = vec![
+        let first = owned([
             "2024-05-01T12:00:00.500Z a",
             "2024-05-01T12:00:01.100Z b",
             "2024-05-01T12:00:01.100Z c",
-        ];
+        ]);
         // From `since_time` rounded down to the second: a repeat of b and c, then new lines,
         // one of which shares their timestamp.
-        let second = vec![
+        let second = owned([
             "2024-05-01T12:00:01.000Z old",
             "2024-05-01T12:00:01.100Z b",
             "2024-05-01T12:00:01.100Z c",
             "2024-05-01T12:00:01.100Z d",
             "2024-05-01T12:00:02Z e",
-        ];
+        ]);
         let mut run = start(
             vec![
                 Script::Lines(first, Some(LogError::retry("connection reset"))),
@@ -605,16 +603,13 @@ mod tests {
         let mut run = start(
             vec![
                 // tail_lines = 1 cut A and B, which share C's timestamp.
-                Script::Lines(
-                    vec![leak(&format!("{T} C"))],
-                    Some(LogError::retry("reset")),
-                ),
+                Script::Lines(vec![format!("{T} C")], Some(LogError::retry("reset"))),
                 Script::Hold(vec![
-                    leak(&format!("{T} A")),
-                    leak(&format!("{T} B")),
-                    leak(&format!("{T} C")),
-                    leak(&format!("{T} D")),
-                    "2024-05-01T12:00:02Z E",
+                    format!("{T} A"),
+                    format!("{T} B"),
+                    format!("{T} C"),
+                    format!("{T} D"),
+                    "2024-05-01T12:00:02Z E".to_owned(),
                 ]),
             ],
             LogOptions {
@@ -632,10 +627,10 @@ mod tests {
     async fn a_finished_container_is_drained_once_before_the_session_ends() {
         let mut run = start(
             vec![
-                Script::Lines(vec!["2024-05-01T12:00:00Z run 1"], None),
+                Script::Lines(owned(["2024-05-01T12:00:00Z run 1"]), None),
                 // It restarted and finished again before the status check.
                 Script::Lines(
-                    vec!["2024-05-01T12:00:00Z run 1", "2024-05-01T12:00:03Z run 2"],
+                    owned(["2024-05-01T12:00:00Z run 1", "2024-05-01T12:00:03Z run 2"]),
                     None,
                 ),
             ],
@@ -662,11 +657,11 @@ mod tests {
     async fn pausing_freezes_what_was_last_published() {
         let (feed, lines) = futures::channel::mpsc::unbounded();
         let mut run = start(vec![Script::Feed(lines)], LogOptions::default(), 100);
-        feed.unbounded_send("one").unwrap();
-        feed.unbounded_send("two").unwrap();
+        feed.unbounded_send("one".to_owned()).unwrap();
+        feed.unbounded_send("two".to_owned()).unwrap();
         run.until(|s| s.lines.len() == 2).await;
         // "three" reaches the buffer but no snapshot before the pause.
-        feed.unbounded_send("three").unwrap();
+        feed.unbounded_send("three".to_owned()).unwrap();
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
@@ -681,8 +676,8 @@ mod tests {
     async fn a_followed_stream_that_ends_reconnects_only_while_the_container_can_log() {
         let mut run = start(
             vec![
-                Script::Lines(vec!["2024-05-01T12:00:00Z run 1"], None),
-                Script::Lines(vec!["2024-05-01T12:00:05Z run 2"], None),
+                Script::Lines(owned(["2024-05-01T12:00:00Z run 1"]), None),
+                Script::Lines(owned(["2024-05-01T12:00:05Z run 2"]), None),
             ],
             LogOptions::default(),
             100,
@@ -724,7 +719,11 @@ mod tests {
             previous: true,
             ..LogOptions::default()
         };
-        let mut run = start(vec![Script::Lines(vec!["last words"], None)], options, 100);
+        let mut run = start(
+            vec![Script::Lines(owned(["last words"]), None)],
+            options,
+            100,
+        );
         let snapshot = run.until(ended).await;
         assert_eq!(snapshot.state, LogState::Ended { error: None });
         let request = &run.requests()[0];
@@ -736,12 +735,12 @@ mod tests {
     async fn pausing_freezes_the_lines_and_counts_what_is_held_back() {
         let (feed, lines) = futures::channel::mpsc::unbounded();
         let mut run = start(vec![Script::Feed(lines)], LogOptions::default(), 100);
-        feed.unbounded_send("one").unwrap();
-        feed.unbounded_send("two").unwrap();
+        feed.unbounded_send("one".to_owned()).unwrap();
+        feed.unbounded_send("two".to_owned()).unwrap();
         run.until(|s| s.lines.len() == 2).await;
         run.paused.send(true).unwrap();
         run.until(|s| s.paused).await;
-        feed.unbounded_send("three").unwrap();
+        feed.unbounded_send("three".to_owned()).unwrap();
         let paused = run.until(|s| s.held_back == 1).await;
         assert!(paused.paused);
         assert_eq!(texts(&paused), ["one", "two"]);
@@ -766,16 +765,16 @@ mod tests {
         };
         spawn(fake.clone(), LogOptions::default(), config, tx, paused_rx);
         let mut run = Running { rx, paused, fake };
-        let long: &'static str = Box::leak("z".repeat(32 * 1024).into_boxed_str());
+        let long = "z".repeat(32 * 1024);
         for _ in 0..40 {
-            feed.unbounded_send(long).unwrap();
+            feed.unbounded_send(long.clone()).unwrap();
         }
         run.until(|s| s.lines.end_id() == 40).await;
         run.paused.send(true).unwrap();
         run.until(|s| s.paused).await;
         // Five budgets' worth arrives while paused.
         for _ in 0..(5 * budget / long.len()) {
-            feed.unbounded_send(long).unwrap();
+            feed.unbounded_send(long.clone()).unwrap();
         }
         let held = run.until(|s| s.held_back > 250).await;
         // The frozen view lost its oldest lines with the buffer instead of keeping them alive.
@@ -796,7 +795,7 @@ mod tests {
         fake.scripts
             .lock()
             .unwrap()
-            .push_back(Script::Hold(vec!["x"]));
+            .push_back(Script::Hold(owned(["x"])));
         let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
         let (paused, paused_rx) = watch::channel(false);
         let task = spawn(fake, LogOptions::default(), config(10), tx, paused_rx);
@@ -813,9 +812,9 @@ mod tests {
         let last = "2024-05-01T12:00:00Z crashed";
         let mut run = start(
             vec![
-                Script::Lines(vec![last], None),
-                Script::Lines(vec![last], None),
-                Script::Lines(vec![last], None),
+                Script::Lines(owned([last]), None),
+                Script::Lines(owned([last]), None),
+                Script::Lines(owned([last]), None),
             ],
             LogOptions::default(),
             100,
