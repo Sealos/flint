@@ -38,7 +38,8 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 ### v1 non-goals
 
 - Linux and Windows builds.
-- Prometheus charts or any metric history.
+- Prometheus charts or stored metric history. Dashboards keep an hour of their own samples in memory
+  ([ADR-0017](./adr/0017-cluster-dashboards.md)).
 - Local terminal tabs and node shells (shells into a node through a privileged pod).
 - An extension or plugin API ([ADR-0007](./adr/0007-no-extension-api-in-v1.md)).
 - YAML schema autocomplete.
@@ -346,6 +347,18 @@ the UI offers a session unlock in its place. Destructive actions show the cluste
 works like `kubectl drain`: cordon the node, then evict its pods through the Eviction API. Pods blocked by a
 PodDisruptionBudget are reported back to the user instead of being retried forever.
 
+### Dashboards
+
+Each cluster opens on a dashboard, also reachable from **Overview** at the top of the resource tree
+([ADR-0017](./adr/0017-cluster-dashboards.md)). Its fixed layout has three parts: **problems now** (failing pods,
+not-ready nodes, Warning events in the last hour, pending PVCs, failed Jobs, workloads short of replicas), each count
+opening the matching filtered list; **capacity and usage** (CPU and memory used against allocatable, requests and
+limits against capacity, per node and in total, with a sparkline of the last hour); and **recent activity** (Warning
+events and rollouts). The sparklines come from Flint's own 15-second metrics-server samples, kept in a bounded
+in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
+the dashboard. The dashboard counts as an open view of the kinds it needs. A cluster set's dashboard shows one card per
+member, worst first, under a totals strip. `get_cluster_summary` gives agents the same summary.
+
 ### Metrics
 
 Flint polls `metrics.k8s.io/v1beta1` `PodMetrics` and `NodeMetrics` about every 15 s, and only for views that are
@@ -474,9 +487,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
 | M2 | Log viewer with streaming, search, timestamps and error highlighting; exec terminal |
 | M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain, clusters protected by default |
-| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram |
+| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram, cluster dashboard with thresholds and `get_cluster_summary` |
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
-| M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets and colour tags, AI log analysis through the user's Claude Code CLI |
+| M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets, colour tags and a set dashboard, AI log analysis through the user's Claude Code CLI |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
 | M7 | Fleet actions on a cluster set: rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
 
