@@ -3,25 +3,41 @@
 //! emits [`Event`]s.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kube::Client;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::cluster::{self, CONNECT_TIMEOUT, ClusterId, ServerVersion};
+use crate::discovery::ClusterDiscovery;
 use crate::handle::{
-    ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event,
+    ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
+use crate::read::{self, KindId, KindInfo};
 use crate::settings::{self, Settings};
+use crate::store::{KindSnapshot, SyncState};
+use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 
 /// Changes to watched files often come in bursts (editor save, `kind` rewriting the file).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
+/// CRD changes come in bursts too (create, then status updates as names are accepted).
+const CRD_DEBOUNCE: Duration = Duration::from_millis(500);
+/// The API server publishes a new CRD in discovery a moment after the CRD changes. When
+/// discovery does not match the CRD list yet, it is retried this often, at most
+/// `DISCOVERY_RETRIES` times per change.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(1);
+const DISCOVERY_RETRIES: u32 = 10;
+/// A failed discovery (API server restarting, network blip) is retried with a backoff that
+/// doubles from `DISCOVERY_RETRY` up to this, while the cluster is active.
+const DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// One kubeconfig context and its connection. M1 adds the discovery cache and watch manager here.
+/// One kubeconfig context: its connection, discovery cache, and watches.
 pub(crate) struct Cluster {
     info: ContextInfo,
     fingerprint: Option<u64>,
@@ -30,17 +46,85 @@ pub(crate) struct Cluster {
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
+    /// Kept while the cluster is not active (ADR-0008).
+    discovery: Option<Arc<ClusterDiscovery>>,
+    discovering: bool,
+    /// The CRDs changed while discovery ran: run it again when it finishes.
+    rediscover: bool,
+    /// The CRD list as last seen, so a changed list triggers a refresh.
+    crd_fingerprint: Option<u64>,
+    /// Kinds the CRD list defines, and kinds it defined before the last change.
+    crds: HashSet<KindId>,
+    removed_crds: HashSet<KindId>,
+    discovery_retries: u32,
+    /// Discoveries that failed in a row, for the retry backoff.
+    discovery_failures: u32,
+    watches: ClusterWatches,
+    /// Follows the CRD list while the cluster is active.
+    crd_task: Option<JoinHandle<()>>,
+    /// Follows the namespace list while the cluster is active, for namespace-limited lists.
+    namespaces_task: Option<JoinHandle<()>>,
+    /// The front end's namespace filter (empty: all namespaces).
+    namespace_filter: Vec<String>,
+    /// Namespaces the user can list, as last seen.
+    listed_namespaces: Vec<String>,
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for task in [self.crd_task.take(), self.namespaces_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+    }
 }
 
 impl Cluster {
-    fn new(info: ContextInfo, fingerprint: Option<u64>) -> Self {
+    fn new(
+        info: ContextInfo,
+        fingerprint: Option<u64>,
+        hubs: &HubRegistry,
+        config: &Arc<EngineConfig>,
+    ) -> Self {
+        let watches = ClusterWatches::new(info.name.clone(), hubs.clone(), config.clone());
         Self {
             info,
             fingerprint,
             state: ConnectionState::Disconnected,
             client: None,
             attempt: 0,
+            discovery: None,
+            discovering: false,
+            rediscover: false,
+            crd_fingerprint: None,
+            crds: HashSet::new(),
+            removed_crds: HashSet::new(),
+            discovery_retries: 0,
+            discovery_failures: 0,
+            watches,
+            crd_task: None,
+            namespaces_task: None,
+            namespace_filter: Vec::new(),
+            listed_namespaces: Vec::new(),
         }
+    }
+
+    /// Where namespace-limited lists look (see [`Command::SetNamespaceFilter`]).
+    fn namespace_scope(&self) -> Vec<String> {
+        if !self.namespace_filter.is_empty() {
+            self.namespace_filter.clone()
+        } else if let Some(ns) = self.info.namespace.as_ref().filter(|n| !n.is_empty()) {
+            vec![ns.clone()]
+        } else {
+            self.listed_namespaces.clone()
+        }
+    }
+
+    fn update_scope(&mut self) {
+        let scope = self.namespace_scope();
+        self.watches.set_scope(scope);
     }
 
     fn summary(&self) -> ClusterSummary {
@@ -58,6 +142,28 @@ enum Internal {
         result: Result<(Client, ServerVersion), String>,
     },
     FilesChanged(Changed),
+    Discovered {
+        cluster: ClusterId,
+        attempt: u64,
+        result: Result<Vec<KindInfo>, String>,
+    },
+    CrdsChanged {
+        cluster: ClusterId,
+        fingerprint: u64,
+        kinds: HashSet<KindId>,
+    },
+    RetryDiscovery {
+        cluster: ClusterId,
+    },
+    NamespacesListed {
+        cluster: ClusterId,
+        names: Vec<String>,
+    },
+    /// A follower stopped: forget its hub unless a watch still feeds it.
+    ReleaseHub {
+        cluster: ClusterId,
+        kind: KindId,
+    },
 }
 
 /// Which watched files changed.
@@ -83,6 +189,10 @@ pub(crate) struct ClusterManager {
     /// Source of connection attempt ids; never reused.
     next_attempt: u64,
     watcher: Option<FileWatcher>,
+    hubs: HubRegistry,
+    engine_config: Arc<EngineConfig>,
+    /// Open subscriptions by id.
+    subscriptions: HashMap<u64, (ClusterId, KindId)>,
 }
 
 struct FileWatcher {
@@ -92,7 +202,11 @@ struct FileWatcher {
 }
 
 impl ClusterManager {
-    pub(crate) fn new(config: CoreConfig, events: async_channel::Sender<Event>) -> Self {
+    pub(crate) fn new(
+        config: CoreConfig,
+        events: async_channel::Sender<Event>,
+        hubs: HubRegistry,
+    ) -> Self {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
         let kubeconfig_paths = kubeconfig::paths_for_settings(
             &config.kubeconfig_base,
@@ -112,10 +226,17 @@ impl ClusterManager {
             active: None,
             next_attempt: 1,
             watcher: None,
+            hubs,
+            engine_config: Arc::new(EngineConfig::default()),
+            subscriptions: HashMap::new(),
         }
     }
 
-    pub(crate) async fn run(mut self, commands: async_channel::Receiver<Command>) {
+    pub(crate) async fn run(
+        mut self,
+        commands: async_channel::Receiver<Command>,
+        requests: async_channel::Receiver<Request>,
+    ) {
         let mut internal_rx = self.internal_rx.take().expect("run is called once");
         self.emit_settings();
         self.reload_kubeconfig().await;
@@ -127,6 +248,7 @@ impl ClusterManager {
                     // Every CoreHandle is gone.
                     Err(_) => break,
                 },
+                Ok(request) = requests.recv() => self.handle_request(request),
                 Some(msg) = internal_rx.recv() => self.handle_internal(msg).await,
             }
         }
@@ -149,6 +271,189 @@ impl ClusterManager {
             Command::Activate(id) => self.activate(id),
             Command::SetAiExposed { cluster, server } => self.set_ai_exposed(cluster, server).await,
             Command::ReloadKubeconfig => self.reload_kubeconfig().await,
+            Command::SetWatchMode { cluster, mode } => self.set_watch_mode(cluster, mode).await,
+            Command::SetNamespaceFilter {
+                cluster,
+                namespaces,
+            } => {
+                if let Some(slot) = self.cluster_mut(&cluster) {
+                    slot.namespace_filter = namespaces;
+                    slot.update_scope();
+                }
+            }
+        }
+    }
+
+    fn handle_request(&mut self, request: Request) {
+        match request {
+            Request::Subscribe { id, cluster, kind } => {
+                self.subscriptions.insert(id, (cluster.clone(), kind));
+                self.reconcile(&cluster);
+            }
+            Request::Unsubscribe { id } => {
+                if let Some((cluster, kind)) = self.subscriptions.remove(&id) {
+                    self.reconcile(&cluster);
+                    let running = self
+                        .clusters
+                        .iter()
+                        .find(|c| c.info.name == cluster)
+                        .is_some_and(|c| c.watches.running().contains_key(&kind));
+                    if !running {
+                        self.hubs.release(&cluster, &kind);
+                    }
+                }
+            }
+            Request::Discovery { cluster, reply } => {
+                let discovery = self
+                    .clusters
+                    .iter()
+                    .find(|c| c.info.name == cluster)
+                    .and_then(|c| c.discovery.clone());
+                let _ = reply.send(discovery);
+            }
+            Request::WatchedKinds { cluster, reply } => {
+                let _ = reply.send(self.watched_kinds(&cluster));
+            }
+            Request::FetchObject {
+                cluster,
+                kind,
+                namespace,
+                name,
+                reply,
+            } => {
+                let found = self.clusters.iter().find(|c| c.info.name == cluster);
+                let client = found.and_then(|c| c.client.clone());
+                let info = found
+                    .and_then(|c| c.discovery.as_ref())
+                    .and_then(|d| d.kind(&kind).cloned());
+                let (client, info) = match (client, info) {
+                    (Some(c), Some(i)) => (c, i),
+                    (None, _) => {
+                        let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
+                        return;
+                    }
+                    (_, None) => {
+                        let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
+                        return;
+                    }
+                };
+                tokio::spawn(async move {
+                    let result = read::object_detail(&client, &info, namespace.as_deref(), &name)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                });
+            }
+        }
+    }
+
+    fn watched_kinds(&self, cluster: &str) -> Vec<(KindId, crate::store::Feed)> {
+        let mut kinds: Vec<_> = self
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .map(|c| c.watches.running().into_iter().collect())
+            .unwrap_or_default();
+        kinds.sort();
+        kinds
+    }
+
+    /// Brings a cluster's watches in line with whether it is active, its watch mode, and the
+    /// open subscriptions, and follows its CRDs while it is active.
+    fn reconcile(&mut self, id: &str) {
+        let active = self.active.as_deref() == Some(id);
+        let mode = self.settings.watch_mode_for(id);
+        let subscribed: HashSet<KindId> = self
+            .subscriptions
+            .values()
+            .filter(|(c, _)| c == id)
+            .map(|(_, k)| k.clone())
+            .collect();
+        let hubs = self.hubs.clone();
+        let internal = self.internal_tx.clone();
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        let follow = active && slot.discovery.is_some() && slot.client.is_some();
+        if !follow {
+            // Before the watches stop, so the followers' hubs can be released (each follower
+            // asks for that when it is gone; see `Follower`).
+            for task in [slot.crd_task.take(), slot.namespaces_task.take()]
+                .into_iter()
+                .flatten()
+            {
+                task.abort();
+            }
+        }
+        slot.watches.reconcile(active, mode, &subscribed);
+        if follow && slot.crd_task.is_none() {
+            let follower =
+                Follower::new(&hubs, id, KindId::custom_resource_definitions(), &internal);
+            slot.crd_task = Some(tokio::spawn(follow_crds(follower, internal.clone())));
+        }
+        if follow && slot.namespaces_task.is_none() {
+            let follower = Follower::new(&hubs, id, KindId::namespaces(), &internal);
+            slot.namespaces_task = Some(tokio::spawn(follow_namespaces(follower, internal)));
+        }
+    }
+
+    fn reconcile_all(&mut self) {
+        let ids: Vec<String> = self.clusters.iter().map(|c| c.info.name.clone()).collect();
+        for id in ids {
+            self.reconcile(&id);
+        }
+    }
+
+    /// Runs discovery for a connected cluster unless it is already running.
+    fn start_discovery(&mut self, id: &str) {
+        let internal = self.internal_tx.clone();
+        let Some(slot) = self.cluster_mut(id) else {
+            return;
+        };
+        let Some(client) = slot.client.clone() else {
+            return;
+        };
+        if slot.discovering {
+            slot.rediscover = true;
+            return;
+        }
+        slot.discovering = true;
+        slot.rediscover = false;
+        let attempt = slot.attempt;
+        let cluster = id.to_owned();
+        tokio::spawn(async move {
+            let result = read::discover_kinds(&client)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = internal.send(Internal::Discovered {
+                cluster,
+                attempt,
+                result,
+            });
+        });
+    }
+
+    async fn set_watch_mode(&mut self, cluster: Option<ClusterId>, mode: Option<crate::WatchMode>) {
+        if let Some(error) = &self.settings_error {
+            self.emit(Event::Error(format!(
+                "settings.toml must be fixed before the watch mode can change: {}",
+                crate::redact::safe_error_summary(error)
+            )));
+            return;
+        }
+        let dir = self.config.config_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            settings::set_watch_mode(&dir, cluster.as_deref(), mode)
+        })
+        .await;
+        match result {
+            Ok(Ok(settings)) => self.apply_settings(Ok(settings)).await,
+            // A settings write error can quote the file: one sanitized line.
+            Ok(Err(e)) => self.emit(Event::Error(crate::redact::safe_error_summary(
+                &e.to_string(),
+            ))),
+            Err(e) => self.emit(Event::Error(format!("settings write failed: {e}"))),
         }
     }
 
@@ -171,7 +476,8 @@ impl ClusterManager {
         if let Some(error) = &self.settings_error {
             // Rewriting a file that does not parse would fail anyway; say why.
             self.emit(Event::Error(format!(
-                "settings.toml must be fixed before exposure can change: {error}"
+                "settings.toml must be fixed before exposure can change: {}",
+                crate::redact::safe_error_summary(error)
             )));
             return;
         }
@@ -192,7 +498,10 @@ impl ClusterManager {
                     self.rebuild_watcher();
                 }
             }
-            Ok(Err(e)) => self.emit(Event::Error(e.to_string())),
+            // A settings write error can quote the file: one sanitized line.
+            Ok(Err(e)) => self.emit(Event::Error(crate::redact::safe_error_summary(
+                &e.to_string(),
+            ))),
             Err(e) => self.emit(Event::Error(format!("settings write failed: {e}"))),
         }
     }
@@ -213,7 +522,10 @@ impl ClusterManager {
             Err(e) => {
                 // Expose nothing (as the MCP server does), but keep the other settings, so a
                 // typo does not make clusters from extra kubeconfig files disappear.
-                tracing::warn!("settings.toml unreadable; nothing is exposed to AI: {e}");
+                tracing::warn!(
+                    "settings.toml unreadable; nothing is exposed to AI: {}",
+                    crate::redact::safe_error_summary(&e)
+                );
                 let kept = Settings {
                     ai_exposed_clusters: Vec::new(),
                     ..(*self.settings).clone()
@@ -227,6 +539,8 @@ impl ClusterManager {
         self.settings = Arc::new(settings);
         self.settings_error = error;
         self.emit_settings();
+        // The watch mode may have changed.
+        self.reconcile_all();
         let paths = kubeconfig::paths_for_settings(
             &self.config.kubeconfig_base,
             &self.settings,
@@ -252,18 +566,149 @@ impl ClusterManager {
                 if slot.attempt != attempt {
                     return;
                 }
+                let connected = result.is_ok();
                 match result {
                     Ok((client, version)) => {
+                        slot.watches
+                            .set_source(Some(KubeSource::new(client.clone(), Some(&version))));
                         slot.client = Some(client);
                         slot.state = ConnectionState::Connected(version);
                     }
                     Err(message) => {
+                        slot.watches.set_source(None);
                         slot.client = None;
                         slot.state = ConnectionState::Failed(message);
                     }
                 }
                 let state = slot.state.clone();
-                self.emit(Event::ConnectionChanged { cluster, state });
+                self.emit(Event::ConnectionChanged {
+                    cluster: cluster.clone(),
+                    state,
+                });
+                if let Some(slot) = self.cluster_mut(&cluster) {
+                    slot.update_scope();
+                }
+                if connected {
+                    // Discovery runs at every connect; until it is back, a cached result (from an
+                    // earlier connection) keeps the navigation and watches going.
+                    self.start_discovery(&cluster);
+                    self.reconcile(&cluster);
+                }
+            }
+            Internal::Discovered {
+                cluster,
+                attempt,
+                result,
+            } => {
+                let Some(slot) = self.cluster_mut(&cluster) else {
+                    return;
+                };
+                if slot.attempt != attempt {
+                    return;
+                }
+                slot.discovering = false;
+                let again = std::mem::take(&mut slot.rediscover);
+                let mut retry = false;
+                let error = match result {
+                    Ok(kinds) => {
+                        let served: HashSet<KindId> = kinds.iter().map(KindInfo::id).collect();
+                        let behind = slot.crds.iter().any(|k| !served.contains(k))
+                            || slot.removed_crds.iter().any(|k| served.contains(k));
+                        if behind && !again && slot.discovery_retries < DISCOVERY_RETRIES {
+                            slot.discovery_retries += 1;
+                            retry = true;
+                        }
+                        tracing::info!(cluster, kinds = kinds.len(), "discovery done");
+                        slot.watches.set_kinds(&kinds);
+                        slot.discovery = Some(Arc::new(ClusterDiscovery::new(kinds)));
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(cluster, error = %e, "discovery failed");
+                        Some(e)
+                    }
+                };
+                // A failed discovery is retried with backoff while the cluster is active;
+                // selecting the cluster again also retries it (see `activate`).
+                let failed_retry = if error.is_some() {
+                    let delay = DISCOVERY_RETRY
+                        .saturating_mul(2u32.saturating_pow(slot.discovery_failures.min(6)))
+                        .min(DISCOVERY_RETRY_MAX);
+                    slot.discovery_failures += 1;
+                    Some(delay)
+                } else {
+                    slot.discovery_failures = 0;
+                    None
+                };
+                let discovery = slot.discovery.clone();
+                self.emit(Event::DiscoveryChanged {
+                    cluster: cluster.clone(),
+                    discovery,
+                    error,
+                });
+                self.reconcile(&cluster);
+                let active = self.active.as_deref() == Some(cluster.as_str());
+                let delay = if retry {
+                    Some(DISCOVERY_RETRY)
+                } else if again {
+                    self.start_discovery(&cluster);
+                    None
+                } else {
+                    failed_retry.filter(|_| active)
+                };
+                if let Some(delay) = delay {
+                    let internal = self.internal_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = internal.send(Internal::RetryDiscovery { cluster });
+                    });
+                }
+            }
+            // Only while the cluster is active: a timer may outlive a switch to another one.
+            Internal::RetryDiscovery { cluster } => {
+                if self.active.as_deref() == Some(cluster.as_str()) {
+                    self.start_discovery(&cluster);
+                }
+            }
+            Internal::NamespacesListed { cluster, names } => {
+                if let Some(slot) = self.cluster_mut(&cluster) {
+                    slot.listed_namespaces = names;
+                    slot.update_scope();
+                }
+            }
+            Internal::ReleaseHub { cluster, kind } => {
+                let running = self
+                    .clusters
+                    .iter()
+                    .find(|c| c.info.name == cluster)
+                    .is_some_and(|c| c.watches.is_running(&kind));
+                if !running {
+                    self.hubs.release(&cluster, &kind);
+                }
+            }
+            Internal::CrdsChanged {
+                cluster,
+                fingerprint,
+                kinds,
+            } => {
+                let Some(slot) = self.cluster_mut(&cluster) else {
+                    return;
+                };
+                slot.removed_crds = slot.crds.difference(&kinds).cloned().collect();
+                slot.crds = kinds;
+                slot.discovery_retries = 0;
+                let previous = slot.crd_fingerprint.replace(fingerprint);
+                let changed = previous.is_some_and(|p| p != fingerprint);
+                // The first list after (re)activation may already differ from discovery.
+                let behind = slot.discovery.as_ref().is_some_and(|d| {
+                    let served: HashSet<KindId> = d.kinds.iter().map(KindInfo::id).collect();
+                    slot.crds.iter().any(|k| !served.contains(k))
+                        || slot.removed_crds.iter().any(|k| served.contains(k))
+                });
+                if changed || behind {
+                    tracing::info!(cluster, "CRDs changed; refreshing discovery");
+                    self.start_discovery(&cluster);
+                }
             }
             Internal::FilesChanged(changed) => {
                 if changed.settings {
@@ -287,10 +732,23 @@ impl ClusterManager {
             return;
         }
         if self.active.as_deref() != Some(&id) {
-            self.active = Some(id.clone());
+            let previous = self.active.replace(id.clone());
             self.emit(Event::ActiveChanged(Some(id.clone())));
+            if let Some(previous) = previous {
+                // Its watches stop; its client and discovery stay (ADR-0008).
+                self.reconcile(&previous);
+            }
         }
         self.ensure_connected(&id);
+        // A connected cluster whose discovery failed gets another try when selected.
+        if let Some(slot) = self.cluster_mut(&id)
+            && slot.client.is_some()
+            && slot.discovery.is_none()
+            && !slot.discovering
+        {
+            self.start_discovery(&id);
+        }
+        self.reconcile(&id);
     }
 
     /// Starts a connection unless one is up or in progress.
@@ -350,8 +808,18 @@ impl ClusterManager {
 
     async fn reload_kubeconfig(&mut self) {
         let paths = self.kubeconfig_paths.clone();
-        let loaded = match tokio::task::spawn_blocking(move || kubeconfig::load(&paths)).await {
-            Ok(loaded) => Arc::new(loaded),
+        let loaded = tokio::task::spawn_blocking(move || {
+            let loaded = kubeconfig::load(&paths);
+            let exist: Vec<(PathBuf, bool)> = loaded
+                .paths
+                .iter()
+                .map(|p| (p.clone(), p.exists()))
+                .collect();
+            (loaded, exist)
+        })
+        .await;
+        let (loaded, path_exist) = match loaded {
+            Ok((loaded, exist)) => (Arc::new(loaded), exist),
             Err(e) => {
                 self.emit(Event::Error(format!("kubeconfig reload failed: {e}")));
                 return;
@@ -382,17 +850,24 @@ impl ClusterManager {
             let slot = match old.remove(&info.name) {
                 Some(mut existing) if existing.fingerprint == fingerprint => {
                     existing.info = info.clone();
+                    // The default namespace may have changed.
+                    existing.update_scope();
                     existing
                 }
-                Some(_) => {
+                Some(old) => {
                     // The context's connection details changed: the client is stale. The fresh
-                    // slot has attempt 0, which no in-flight attempt uses.
+                    // slot has attempt 0, which no in-flight attempt uses. The front end's
+                    // namespace filter still applies.
                     if self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
                     }
-                    Cluster::new(info.clone(), fingerprint)
+                    let mut fresh =
+                        Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
+                    fresh.namespace_filter = old.namespace_filter.clone();
+                    fresh.update_scope();
+                    fresh
                 }
-                None => Cluster::new(info.clone(), fingerprint),
+                None => Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config),
             };
             self.clusters.push(slot);
         }
@@ -401,7 +876,7 @@ impl ClusterManager {
         let snapshot = ClustersSnapshot {
             clusters: self.clusters.iter().map(Cluster::summary).collect(),
             errors: loaded.errors.clone(),
-            paths: loaded.paths.clone(),
+            paths: path_exist,
         };
         self.emit(Event::ClustersChanged(Arc::new(snapshot)));
 
@@ -519,5 +994,193 @@ async fn debounce(mut raw: mpsc::UnboundedReceiver<Changed>, out: mpsc::Unbounde
         if out.send(Internal::FilesChanged(changed)).is_err() {
             break;
         }
+    }
+}
+
+/// A subscription a follower task reads. When the task ends (aborted, or the core stops), the
+/// receiver is dropped first and the manager is then asked to release the hub, so hubs of
+/// followed kinds do not pile up as clusters are deactivated or removed.
+struct Follower {
+    rx: Option<watch::Receiver<Arc<KindSnapshot>>>,
+    cluster: ClusterId,
+    kind: KindId,
+    out: mpsc::UnboundedSender<Internal>,
+}
+
+impl Follower {
+    fn new(
+        hubs: &HubRegistry,
+        cluster: &str,
+        kind: KindId,
+        out: &mpsc::UnboundedSender<Internal>,
+    ) -> Self {
+        let (hub, rx) = hubs.subscribe(cluster, &kind);
+        hub.wake.notify_one();
+        Follower {
+            rx: Some(rx),
+            cluster: cluster.to_owned(),
+            kind,
+            out: out.clone(),
+        }
+    }
+
+    /// The next synced snapshot, at most every `debounce`. `None` once the hub is gone.
+    async fn next_synced(&mut self, debounce: Duration) -> Option<Arc<KindSnapshot>> {
+        let rx = self.rx.as_mut()?;
+        loop {
+            rx.changed().await.ok()?;
+            if !debounce.is_zero() {
+                tokio::time::sleep(debounce).await;
+            }
+            let snapshot = rx.borrow_and_update().clone();
+            if snapshot.state == SyncState::Synced {
+                return Some(snapshot);
+            }
+        }
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        self.rx = None;
+        let _ = self.out.send(Internal::ReleaseHub {
+            cluster: self.cluster.clone(),
+            kind: self.kind.clone(),
+        });
+    }
+}
+
+/// Follows the CRD list of an active cluster and reports its fingerprint when it changes, so
+/// discovery can be refreshed. Ends when aborted or the hub goes away.
+async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal>) {
+    let mut last = None;
+    while let Some(snapshot) = follower.next_synced(CRD_DEBOUNCE).await {
+        let fingerprint = crd_fingerprint(&snapshot);
+        if last == Some(fingerprint) {
+            continue;
+        }
+        last = Some(fingerprint);
+        tracing::debug!(
+            cluster = follower.cluster,
+            crds = snapshot.rows.len(),
+            "CRD list changed"
+        );
+        // A CRD's name is `<plural>.<group>`, which is its kind's id.
+        let kinds = snapshot
+            .rows
+            .iter()
+            .map(|r| {
+                let (plural, group) = r.name.split_once('.').unwrap_or((&r.name, ""));
+                KindId::new(group, plural)
+            })
+            .collect();
+        let msg = Internal::CrdsChanged {
+            cluster: follower.cluster.clone(),
+            fingerprint,
+            kinds,
+        };
+        if out.send(msg).is_err() {
+            return;
+        }
+    }
+}
+
+/// Follows the namespaces the user can list on an active cluster, for namespace-limited lists.
+/// Ends when aborted or the hub goes away.
+async fn follow_namespaces(mut follower: Follower, out: mpsc::UnboundedSender<Internal>) {
+    let mut last: Option<Vec<String>> = None;
+    while let Some(snapshot) = follower.next_synced(Duration::ZERO).await {
+        let names: Vec<String> = snapshot.names().into_iter().map(str::to_owned).collect();
+        if last.as_ref() == Some(&names) {
+            continue;
+        }
+        last = Some(names.clone());
+        let msg = Internal::NamespacesListed {
+            cluster: follower.cluster.clone(),
+            names,
+        };
+        if out.send(msg).is_err() {
+            return;
+        }
+    }
+}
+
+/// Changes when a CRD is added, removed, or its spec changes (versions, names, printer
+/// columns). Status-only updates (conditions) leave it alone.
+fn crd_fingerprint(snapshot: &KindSnapshot) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for row in &snapshot.rows {
+        row.uid.hash(&mut hasher);
+        row.generation.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(namespace: Option<&str>) -> ContextInfo {
+        ContextInfo {
+            name: "dev".into(),
+            cluster: None,
+            user: None,
+            namespace: namespace.map(str::to_owned),
+            server: Some("https://dev".into()),
+            source: PathBuf::from("/k"),
+        }
+    }
+
+    // covers UP-21
+    #[test]
+    fn namespace_limited_lists_use_the_filter_then_the_default_then_what_is_listable() {
+        let hubs = HubRegistry::default();
+        let config = Arc::new(EngineConfig::default());
+        let mut cluster = Cluster::new(context(Some("team-a")), None, &hubs, &config);
+        cluster.listed_namespaces = vec!["x".into(), "y".into()];
+        cluster.update_scope();
+        assert_eq!(
+            *cluster.watches.scope(),
+            ["team-a"],
+            "the context's default namespace"
+        );
+        cluster.namespace_filter = vec!["b".into(), "c".into()];
+        cluster.update_scope();
+        assert_eq!(*cluster.watches.scope(), ["b", "c"], "the filter wins");
+
+        let mut cluster = Cluster::new(context(None), None, &hubs, &config);
+        cluster.listed_namespaces = vec!["x".into(), "y".into()];
+        cluster.update_scope();
+        assert_eq!(
+            *cluster.watches.scope(),
+            ["x", "y"],
+            "else what the user can list"
+        );
+    }
+
+    // covers UP-24
+    #[tokio::test]
+    async fn a_stopped_follower_asks_for_its_hub_to_be_released() {
+        let hubs = HubRegistry::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let crds = KindId::custom_resource_definitions();
+        let follower = Follower::new(&hubs, "dev", crds.clone(), &tx);
+        let task = tokio::spawn(follow_crds(follower, tx.clone()));
+        // The watch manager stopped the CRD watch while the follower still listened: the hub
+        // stays (someone reads it).
+        hubs.release("dev", &crds);
+        assert_eq!(hubs.states("dev").len(), 1);
+        task.abort();
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Internal::ReleaseHub { cluster, kind } = msg else {
+            panic!("expected a release");
+        };
+        assert_eq!((cluster.as_str(), &kind), ("dev", &crds));
+        // What the manager does with it when no watch runs for the kind.
+        hubs.release(&cluster, &kind);
+        assert!(hubs.states("dev").is_empty(), "no hub left behind");
     }
 }

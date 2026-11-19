@@ -1,0 +1,1040 @@
+//! Engine and watch manager tests against a scripted fake API server.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::future::BoxFuture;
+use futures::{FutureExt as _, StreamExt as _};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+use super::source::{EventStream, Source, WatchRequest};
+use super::*;
+use crate::discovery::tests::kind;
+use crate::read::KindInfo;
+use crate::table::tests::pod_table;
+use crate::table::{FetchError, WireEvent, WireObject};
+
+type Push = mpsc::UnboundedSender<Result<WireEvent, FetchError>>;
+
+/// What the next watch call of a kind returns.
+enum WatchScript {
+    /// A stream fed by the test through the sender handed out by [`Fake::stream_sender`].
+    Live,
+    Fail(FetchError),
+}
+
+#[derive(Default)]
+struct FakeState {
+    /// List responses per plural (or `plural/namespace` for one namespace); the last one
+    /// repeats.
+    lists: HashMap<String, VecDeque<Value>>,
+    /// Keys (as for `lists`) whose lists fail with this error, before any scripted page.
+    list_errors: HashMap<String, VecDeque<FetchError>>,
+    watches: HashMap<String, VecDeque<WatchScript>>,
+    senders: HashMap<String, Vec<Push>>,
+    list_calls: HashMap<String, usize>,
+    watch_requests: HashMap<String, Vec<WatchRequest>>,
+}
+
+#[derive(Default)]
+struct Fake {
+    state: Mutex<FakeState>,
+    streaming: AtomicBool,
+    /// Watch streams currently open (dropped streams decrement it).
+    open_streams: Arc<AtomicUsize>,
+}
+
+struct OpenGuard(Arc<AtomicUsize>);
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Fake {
+    fn new() -> Arc<Self> {
+        Arc::new(Fake::default())
+    }
+    fn list(&self, plural: &str, page: Value) {
+        let mut s = self.state.lock().unwrap();
+        s.lists.entry(plural.into()).or_default().push_back(page);
+    }
+    /// The next list of `key` fails with `error`.
+    fn list_error(&self, key: &str, error: FetchError) {
+        let mut s = self.state.lock().unwrap();
+        s.list_errors
+            .entry(key.into())
+            .or_default()
+            .push_back(error);
+    }
+    fn script(&self, plural: &str, script: WatchScript) {
+        let mut s = self.state.lock().unwrap();
+        s.watches
+            .entry(plural.into())
+            .or_default()
+            .push_back(script);
+    }
+    fn list_calls(&self, plural: &str) -> usize {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .list_calls
+            .get(plural)
+            .unwrap_or(&0)
+    }
+    fn watch_requests(&self, plural: &str) -> Vec<WatchRequest> {
+        self.state
+            .lock()
+            .unwrap()
+            .watch_requests
+            .get(plural)
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// The sender of the newest live stream of `plural`.
+    fn sender(&self, plural: &str) -> Option<Push> {
+        self.state
+            .lock()
+            .unwrap()
+            .senders
+            .get(plural)
+            .and_then(|v| v.last().cloned())
+    }
+    fn open_streams(&self) -> usize {
+        self.open_streams.load(Ordering::SeqCst)
+    }
+}
+
+impl Source for Fake {
+    fn list(
+        &self,
+        kind: &KindInfo,
+        namespace: Option<&str>,
+        _limit: Option<u32>,
+        _token: Option<String>,
+    ) -> BoxFuture<'static, Result<WireObject, FetchError>> {
+        let key = key(kind, namespace);
+        let mut s = self.state.lock().unwrap();
+        *s.list_calls.entry(key.clone()).or_default() += 1;
+        if let Some(error) = s.list_errors.get_mut(&key).and_then(VecDeque::pop_front) {
+            return async move { Err(error) }.boxed();
+        }
+        let queue = s.lists.entry(key).or_default();
+        let page = if queue.len() > 1 {
+            queue.pop_front()
+        } else {
+            queue.front().cloned()
+        }
+        .unwrap_or_else(|| json!({"kind":"Table","metadata":{"resourceVersion":"1"},"columnDefinitions":[],"rows":[]}));
+        let parsed: WireObject = serde_json::from_value(page).unwrap();
+        async move { Ok(parsed) }.boxed()
+    }
+
+    fn watch(
+        &self,
+        kind: &KindInfo,
+        namespace: Option<&str>,
+        request: WatchRequest,
+    ) -> BoxFuture<'static, Result<EventStream, FetchError>> {
+        let mut s = self.state.lock().unwrap();
+        let plural = key(kind, namespace);
+        s.watch_requests
+            .entry(plural.clone())
+            .or_default()
+            .push(request);
+        let script = s
+            .watches
+            .get_mut(&plural)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(WatchScript::Live);
+        let result = match script {
+            WatchScript::Fail(e) => Err(e),
+            WatchScript::Live => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                s.senders.entry(plural).or_default().push(tx);
+                self.open_streams.fetch_add(1, Ordering::SeqCst);
+                let guard = OpenGuard(self.open_streams.clone());
+                let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+                    rx.recv().await.map(|item| (item, (rx, guard)))
+                });
+                Ok(stream.boxed())
+            }
+        };
+        async move { result }.boxed()
+    }
+
+    fn streaming_lists(&self) -> bool {
+        self.streaming.load(Ordering::SeqCst)
+    }
+
+    fn disable_streaming_lists(&self) {
+        self.streaming.store(false, Ordering::SeqCst);
+    }
+}
+
+/// How the fake keys a kind's lists and watches: `plural`, or `plural/namespace`.
+fn key(kind: &KindInfo, namespace: Option<&str>) -> String {
+    match namespace {
+        Some(ns) => format!("{}/{ns}", kind.plural()),
+        None => kind.plural().to_owned(),
+    }
+}
+
+fn event(ty: &str, object: Value) -> Result<WireEvent, FetchError> {
+    Ok(serde_json::from_value(json!({"type": ty, "object": object})).unwrap())
+}
+
+fn pod(uid: &str, name: &str, status: &str, rv: &str, columns: bool) -> Value {
+    pod_table(&[(uid, "demo", name, status)], columns, rv)
+}
+
+const LW: &[&str] = &["get", "list", "watch"];
+
+fn pods() -> KindInfo {
+    kind("", "Pod", "pods", true, LW)
+}
+
+fn config() -> Arc<EngineConfig> {
+    Arc::new(EngineConfig {
+        backoff_min: Duration::from_millis(10),
+        backoff_max: Duration::from_millis(50),
+        poll_interval: Duration::from_millis(500),
+        ..EngineConfig::default()
+    })
+}
+
+/// Starts an engine for `kind` with a listener on its hub.
+fn start_engine(
+    fake: &Arc<Fake>,
+    kind: KindInfo,
+    feed: Feed,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
+) {
+    let (task, rx, _) = start_engine_with(fake, kind, feed, None);
+    (task, rx)
+}
+
+/// [`start_engine`] with a namespace scope for namespace-limited lists, returning the hub too.
+fn start_engine_with(
+    fake: &Arc<Fake>,
+    kind: KindInfo,
+    feed: Feed,
+    scope: Option<engine::Scope>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
+    Arc<Hub>,
+) {
+    let hub = Arc::new(Hub::new("c".into(), kind.id()));
+    let rx = hub.subscribe();
+    let epoch = hub.take_over(KindSnapshot::default());
+    let engine = engine::Engine::new(
+        "c".into(),
+        kind,
+        fake.clone(),
+        hub.clone(),
+        epoch,
+        config(),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    )
+    .with_scope(scope);
+    (tokio::spawn(engine.run(feed)), rx, hub)
+}
+
+fn forbidden() -> FetchError {
+    FetchError::Denied("pods is forbidden: User \"dev\" cannot list resource \"pods\"".into())
+}
+
+/// Waits (in paused time) until the newest snapshot satisfies `pred`.
+async fn until(
+    rx: &mut tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
+    pred: impl Fn(&KindSnapshot) -> bool,
+) -> Arc<KindSnapshot> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snap = rx.borrow_and_update().clone();
+            if pred(&snap) {
+                return snap;
+            }
+            rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("condition reached")
+}
+
+fn names(snap: &KindSnapshot) -> Vec<String> {
+    snap.rows.iter().map(|r| r.name.to_string()).collect()
+}
+
+// covers UP-20
+#[tokio::test(start_paused = true)]
+async fn lists_then_applies_watch_events_and_bookmarks() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let snap = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(names(&snap), ["a"]);
+    assert_eq!(fake.watch_requests("pods")[0].resource_version, "10");
+
+    let tx = fake.sender("pods").unwrap();
+    // Only the first watch event carries column definitions.
+    tx.send(event("ADDED", pod("u2", "b", "Pending", "11", true)))
+        .unwrap();
+    tx.send(event("MODIFIED", pod("u2", "b", "Running", "12", false)))
+        .unwrap();
+    tx.send(event("DELETED", pod("u1", "a", "Running", "13", false)))
+        .unwrap();
+    // A bookmark's fake row is never a row.
+    tx.send(event(
+        "BOOKMARK",
+        json!({"kind":"Table","metadata":{"resourceVersion":"20"},"columnDefinitions":null,
+               "rows":[{"cells":["","0/0","","0","<unknown>",""],"object":{"metadata":{"resourceVersion":"20"}}}]}),
+    ))
+    .unwrap();
+    let snap = until(&mut rx, |s| names(s) == ["b"]).await;
+    assert_eq!(snap.rows[0].cell_text(3, 0), "Running");
+    // The stream ends (server timeout): the watch resumes from the bookmark's version.
+    drop(tx);
+    fake.state.lock().unwrap().senders.clear();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.watch_requests("pods").len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fake.watch_requests("pods")[1].resource_version, "20");
+    assert_eq!(fake.list_calls("pods"), 1, "no relist after a normal close");
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn expired_error_event_inside_a_200_relists() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "old", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods",
+        pod_table(&[("u2", "demo", "new", "Running")], true, "50"),
+    );
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    let tx = fake.sender("pods").unwrap();
+    tx.send(event(
+        "ERROR",
+        json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+               "message":"too old resource version: 1 (773)","reason":"Expired","code":410}),
+    ))
+    .unwrap();
+    let snap = until(&mut rx, |s| {
+        names(s) == ["new"] && s.state == SyncState::Synced
+    })
+    .await;
+    assert_eq!(snap.rows.len(), 1);
+    assert_eq!(fake.list_calls("pods"), 2);
+    let watches = fake.watch_requests("pods");
+    assert_eq!(
+        watches.last().unwrap().resource_version,
+        "50",
+        "watch from the new list"
+    );
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn repeated_410s_relist_with_growing_backoff() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    for _ in 0..50 {
+        fake.script(
+            "pods",
+            WatchScript::Fail(FetchError::Expired("too old".into())),
+        );
+    }
+    let (task, _rx) = start_engine(&fake, pods(), Feed::Watch);
+    // backoff 10 ms doubling to 50 ms (test config): 2 s allows a few dozen relists at most,
+    // where an unthrottled loop would run thousands.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let lists = fake.list_calls("pods");
+    assert!((3..=60).contains(&lists), "{lists} relists in 2 s");
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn errors_back_off_and_show_reconnecting() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    fake.script("pods", WatchScript::Live);
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::Other("connection refused".into())),
+    );
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::Other("connection refused".into())),
+    );
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    // Past the publish interval, so the reconnect is not coalesced away.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tx = fake.sender("pods").unwrap();
+    tx.send(Err(FetchError::Other("stream broke".into())))
+        .unwrap();
+    let snap = until(&mut rx, |s| {
+        matches!(s.state, SyncState::Reconnecting { .. })
+    })
+    .await;
+    assert_eq!(
+        names(&snap),
+        ["a"],
+        "last known rows stay, marked as reconnecting"
+    );
+    // After two refused attempts the watch is back, from the same version: no relist.
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    let watches = fake.watch_requests("pods");
+    assert_eq!(watches.len(), 4);
+    assert!(watches.iter().all(|w| w.resource_version == "10"));
+    assert_eq!(fake.list_calls("pods"), 1);
+    task.abort();
+}
+
+// covers UP-28
+#[tokio::test(start_paused = true)]
+async fn apis_that_cannot_watch_are_polled() {
+    let fake = Fake::new();
+    let metrics = kind(
+        "metrics.k8s.io",
+        "PodMetrics",
+        "pods",
+        true,
+        &["get", "list"],
+    );
+    fake.list(
+        "pods",
+        json!({"kind":"PodMetricsList","metadata":{},"items":[{"metadata":{"name":"p","namespace":"demo"}}]}),
+    );
+    let (task, mut rx) = start_engine(&fake, metrics, Feed::Poll);
+    let snap = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(snap.feed, Feed::Poll);
+    assert_eq!(snap.format, crate::table::ListFormat::Fallback);
+    assert_eq!(names(&snap), ["p"]);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(fake.list_calls("pods") >= 3, "listed again on an interval");
+    assert!(fake.watch_requests("pods").is_empty(), "never watched");
+    task.abort();
+
+    // A kind discovery calls watchable whose watch answers 405 falls back to polling.
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::MethodNotAllowed("405".into())),
+    );
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    until(&mut rx, |s| {
+        s.feed == Feed::Poll && s.state == SyncState::Synced
+    })
+    .await;
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_transient_403_or_404_is_retried_soon_instead_of_failing() {
+    let fake = Fake::new();
+    // An API server that just restarted: its authorizer refuses, then a recreated CRD is
+    // briefly not served, then the list works.
+    fake.list_error("pods", forbidden());
+    fake.list_error("pods", FetchError::NotFound("not found".into()));
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let started = tokio::time::Instant::now();
+    let mut seen_failed = false;
+    let snap = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snap = rx.borrow_and_update().clone();
+            seen_failed |= matches!(snap.state, SyncState::Failed { .. });
+            if snap.state == SyncState::Synced {
+                return snap;
+            }
+            rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!seen_failed, "a transient refusal is shown as reconnecting");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(names(&snap), ["a"]);
+    assert_eq!(fake.list_calls("pods"), 3);
+    task.abort();
+
+    // A refusal that persists is believed after a few tries, and then retried slowly.
+    let fake = Fake::new();
+    for _ in 0..5 {
+        fake.list_error("pods", forbidden());
+    }
+    let nodes = kind("", "Node", "nodes", false, LW);
+    fake.list_error("nodes", forbidden());
+    for _ in 0..5 {
+        fake.list_error("nodes", forbidden());
+    }
+    let (task, mut rx) = start_engine(&fake, nodes, Feed::Watch);
+    until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
+    let calls = fake.list_calls("nodes");
+    assert_eq!(calls, 4, "three quick retries, then failed");
+    // Then less and less often: 5 s, 10 s, 20 s, 40 s… up to denied_retry.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fake.list_calls("nodes"), calls, "not at once");
+    tokio::time::sleep(Duration::from_secs(76)).await;
+    let later = fake.list_calls("nodes");
+    assert!((calls + 3..=calls + 5).contains(&later), "{later}");
+    task.abort();
+}
+
+// covers UP-27, UP-28
+#[tokio::test(start_paused = true)]
+async fn a_refused_watch_is_polled_reported_as_polled_and_tried_again() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    for _ in 0..4 {
+        fake.script("pods", WatchScript::Fail(forbidden()));
+    }
+    // The second retry finds the watch allowed again.
+    fake.script("pods", WatchScript::Fail(forbidden()));
+    fake.script("pods", WatchScript::Live);
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, None);
+    until(&mut rx, |s| {
+        s.feed == Feed::Poll && s.state == SyncState::Synced
+    })
+    .await;
+    assert_eq!(hub.feed(), Feed::Poll, "watched_kinds reports the poll");
+    let refused = fake.watch_requests("pods").len();
+    assert_eq!(refused, 4, "three quick retries, then polling");
+    // Polls run every poll_interval; the watch is tried again after a successful poll, at a
+    // growing interval, and taken back once it works.
+    until(&mut rx, |s| {
+        s.feed == Feed::Watch && s.state == SyncState::Synced
+    })
+    .await;
+    assert_eq!(hub.feed(), Feed::Watch);
+    assert_eq!(fake.watch_requests("pods").len(), 6);
+    assert!(fake.list_calls("pods") >= 3, "polled meanwhile");
+    task.abort();
+}
+
+// covers UP-22
+#[tokio::test(start_paused = true)]
+async fn new_columns_in_a_bookmark_relist_instead_of_relabelling_old_cells() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    let mut edited = pod_table(&[("u1", "demo", "a", "Running")], true, "30");
+    edited["columnDefinitions"][1]["name"] = "Ready Now".into();
+    fake.list("pods", edited);
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let before = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    let tx = fake.sender("pods").unwrap();
+    // A resumed watch whose first event is a bookmark with the edited CRD's columns.
+    let mut bookmark = pod_table(&[], true, "20");
+    bookmark["columnDefinitions"][1]["name"] = "Ready Now".into();
+    tx.send(event("BOOKMARK", bookmark)).unwrap();
+    let after = until(&mut rx, |s| {
+        s.state == SyncState::Synced && s.columns.iter().any(|c| &*c.name == "Ready Now")
+    })
+    .await;
+    assert_eq!(fake.list_calls("pods"), 2, "relisted");
+    assert!(!Arc::ptr_eq(&before.columns, &after.columns));
+    for row in &after.rows {
+        assert_eq!(row.cells.len(), after.columns.len());
+    }
+    task.abort();
+}
+
+// covers UP-20, UP-21
+#[tokio::test(start_paused = true)]
+async fn a_namespace_limited_user_gets_the_namespaces_they_may_list_merged() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", forbidden());
+    }
+    fake.list(
+        "pods/b",
+        pod_table(&[("u2", "b", "y", "Running")], true, "20"),
+    );
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "x", "Running")], true, "10"),
+    );
+    for _ in 0..10 {
+        fake.list_error("pods/secret", forbidden());
+    }
+    fake.list(
+        "pods/c",
+        pod_table(&[("u3", "c", "z", "Pending")], true, "30"),
+    );
+    let (scope_tx, scope) = tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(Vec::new()));
+    let (task, mut rx, _) = start_engine_with(&fake, pods(), Feed::Watch, Some(scope));
+
+    // Nothing to fall back to yet: say how to get a list.
+    let snap = until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
+    let SyncState::Failed { error } = &snap.state else {
+        unreachable!()
+    };
+    assert!(error.contains("namespace filter"), "{error}");
+    assert!(snap.limited_to.is_some());
+
+    // The scope arrives (the filter, the default namespace, or the listable namespaces).
+    scope_tx.send_replace(Arc::from(vec![
+        "b".to_owned(),
+        "a".to_owned(),
+        "secret".to_owned(),
+    ]));
+    let snap = until(&mut rx, |s| {
+        s.state == SyncState::Synced && s.limited_to.as_ref().is_some_and(|l| !l.denied.is_empty())
+    })
+    .await;
+    assert_eq!(names(&snap), ["x", "y"], "merged in namespace order");
+    let limit = snap.limited_to.as_ref().unwrap();
+    assert_eq!(limit.listed, ["a", "b"]);
+    assert_eq!(limit.denied, ["secret"]);
+    assert!(limit.reason.contains("forbidden"));
+    assert_eq!(snap.columns.len(), 7);
+    assert!(fake.watch_requests("pods/a").len() == 1);
+
+    // Live updates arrive per namespace.
+    fake.sender("pods/b")
+        .unwrap()
+        .send(event(
+            "ADDED",
+            pod_table(&[("u4", "b", "y2", "Running")], true, "21"),
+        ))
+        .unwrap();
+    let snap = until(&mut rx, |s| s.rows.len() == 3).await;
+    assert_eq!(names(&snap), ["x", "y", "y2"]);
+
+    // The scope changes: lanes follow, and the removed namespace's rows go.
+    scope_tx.send_replace(Arc::from(vec!["c".to_owned()]));
+    let snap = until(&mut rx, |s| {
+        s.state == SyncState::Synced && names(s) == ["z"]
+    })
+    .await;
+    assert_eq!(snap.limited_to.as_ref().unwrap().listed, ["c"]);
+    assert_eq!(fake.open_streams(), 1, "the lanes of a and b stopped");
+    task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_namespace_limited_list_goes_back_to_all_namespaces_when_allowed_again() {
+    let fake = Fake::new();
+    // Refused long enough to be believed (an authorizer that took its time after a restart).
+    for _ in 0..4 {
+        fake.list_error("pods", forbidden());
+    }
+    fake.list(
+        "pods",
+        pod_table(
+            &[("u1", "a", "x", "Running"), ("u2", "b", "y", "Running")],
+            true,
+            "10",
+        ),
+    );
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "x", "Running")], true, "5"),
+    );
+    let (_scope_tx, scope) =
+        tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(vec!["a".to_owned()]));
+    let (task, mut rx, _) = start_engine_with(&fake, pods(), Feed::Watch, Some(scope));
+    let snap = until(&mut rx, |s| {
+        s.state == SyncState::Synced && s.limited_to.is_some()
+    })
+    .await;
+    assert_eq!(names(&snap), ["x"]);
+    // The all-namespaces list is tried again after a while, and taken back once it works.
+    let snap = until(&mut rx, |s| {
+        s.state == SyncState::Synced && s.limited_to.is_none()
+    })
+    .await;
+    assert_eq!(names(&snap), ["x", "y"]);
+    assert_eq!(fake.open_streams(), 1, "the lane stopped");
+    task.abort();
+}
+
+// covers UP-20
+#[tokio::test(start_paused = true)]
+async fn streaming_list_is_used_when_supported() {
+    let fake = Fake::new();
+    fake.streaming.store(true, Ordering::SeqCst);
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.sender("pods").is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let tx = fake.sender("pods").unwrap();
+    tx.send(event("ADDED", pod("u1", "a", "Running", "5", true)))
+        .unwrap();
+    tx.send(event("ADDED", pod("u2", "b", "Running", "6", false)))
+        .unwrap();
+    // Nothing is shown before the end marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rx.borrow().rows.is_empty());
+    tx.send(event(
+        "BOOKMARK",
+        json!({"kind":"Table","metadata":{"resourceVersion":"7"},"columnDefinitions":null,
+               "rows":[{"cells":[],"object":{"metadata":{"resourceVersion":"7",
+               "annotations":{"k8s.io/initial-events-end":"true"}}}}]}),
+    ))
+    .unwrap();
+    let snap = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(names(&snap), ["a", "b"]);
+    assert_eq!(fake.list_calls("pods"), 0);
+    assert!(fake.watch_requests("pods")[0].initial_events);
+    // The same stream keeps delivering changes.
+    tx.send(event("DELETED", pod("u1", "a", "Running", "8", false)))
+        .unwrap();
+    until(&mut rx, |s| names(s) == ["b"]).await;
+    task.abort();
+
+    // A server that rejects streaming lists: list + watch, and not asked again.
+    let fake = Fake::new();
+    fake.streaming.store(true, Ordering::SeqCst);
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::Invalid("sendInitialEvents is forbidden".into())),
+    );
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert!(!fake.streaming_lists());
+    assert_eq!(fake.list_calls("pods"), 1);
+    task.abort();
+}
+
+// covers UP-22
+#[tokio::test(start_paused = true)]
+async fn an_empty_streaming_list_still_learns_its_columns() {
+    let fake = Fake::new();
+    fake.streaming.store(true, Ordering::SeqCst);
+    // The probe list: no rows, but column definitions.
+    fake.list("pods", pod_table(&[], true, "7"));
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.sender("pods").is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let tx = fake.sender("pods").unwrap();
+    // The first (and only) initial event is the end bookmark, without columns.
+    tx.send(event(
+        "BOOKMARK",
+        json!({"kind":"Table","metadata":{"resourceVersion":"7"},"columnDefinitions":null,
+               "rows":[{"cells":[],"object":{"metadata":{"resourceVersion":"7",
+               "annotations":{"k8s.io/initial-events-end":"true"}}}}]}),
+    ))
+    .unwrap();
+    let snap = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(snap.columns.len(), 7, "server columns, not the fallback");
+    // A later object arrives without definitions and still maps onto the columns.
+    tx.send(event("ADDED", pod("u1", "a", "Running", "8", false)))
+        .unwrap();
+    let snap = until(&mut rx, |s| s.rows.len() == 1).await;
+    assert_eq!(snap.rows[0].cell_text(3, 0), "Running");
+    task.abort();
+}
+
+// covers UP-26
+#[tokio::test(start_paused = true)]
+async fn bursts_are_coalesced_to_one_snapshot_per_interval() {
+    let fake = Fake::new();
+    fake.list("pods", pod_table(&[], true, "1"));
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    let tx = fake.sender("pods").unwrap();
+    rx.borrow_and_update();
+
+    // A reader that wakes for every change notification, like the UI task.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let counter = counter.clone();
+        let mut rx = rx.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                rx.borrow_and_update();
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    // 1000 events over one second (a 200-pod scale-down is ~330).
+    let n = 1000;
+    let span = Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    for i in 0..n {
+        let uid = format!("u{i}");
+        let name = format!("p{i:04}");
+        tx.send(event(
+            "ADDED",
+            pod(&uid, &name, "Running", &format!("{}", i + 2), false),
+        ))
+        .unwrap();
+        tokio::time::sleep(span / n).await;
+    }
+    let elapsed = started.elapsed();
+    until(&mut rx, |s| s.rows.len() == n as usize).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The last snapshot may land up to one interval after the last event.
+    let bound = (elapsed.as_millis() as u64).div_ceil(100) + 1;
+    let notified = counter.load(Ordering::SeqCst) as u64;
+    assert!(
+        notified <= bound,
+        "{notified} UI notifications for {n} events in {elapsed:?} (bound {bound})"
+    );
+    assert!(
+        notified >= 5,
+        "updates kept flowing during the burst: {notified}"
+    );
+    reader.abort();
+    task.abort();
+}
+
+// covers UP-26
+#[tokio::test(start_paused = true)]
+async fn nothing_is_built_while_nobody_listens() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    let hub = Arc::new(Hub::new("c".into(), pods().id()));
+    let epoch = hub.take_over(KindSnapshot::default());
+    let engine = engine::Engine::new(
+        "c".into(),
+        pods(),
+        fake.clone(),
+        hub.clone(),
+        epoch,
+        config(),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    );
+    let initial = hub.latest().version;
+    let task = tokio::spawn(engine.run(Feed::Watch));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        hub.latest().version,
+        initial,
+        "only the manager's initial snapshot"
+    );
+    // A subscriber arrives: the held-back state is published at once.
+    let mut rx = hub.subscribe();
+    hub.wake.notify_one();
+    let snap = until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(names(&snap), ["a"]);
+    task.abort();
+}
+
+// ---- watch manager ----------------------------------------------------------------------
+
+fn kinds() -> Vec<KindInfo> {
+    vec![
+        kind("", "Pod", "pods", true, LW),
+        kind("", "ConfigMap", "configmaps", true, LW),
+        kind("", "Binding", "bindings", true, &["create"]),
+        kind("events.k8s.io", "Event", "events", true, LW),
+        kind(
+            "metrics.k8s.io",
+            "PodMetrics",
+            "pods",
+            true,
+            &["get", "list"],
+        ),
+        kind(
+            "apiextensions.k8s.io",
+            "CustomResourceDefinition",
+            "customresourcedefinitions",
+            false,
+            LW,
+        ),
+    ]
+}
+
+fn watches(fake: &Arc<Fake>, hubs: &HubRegistry) -> ClusterWatches {
+    let mut w = ClusterWatches::new("c".into(), hubs.clone(), config());
+    w.set_source(Some(fake.clone()));
+    w.set_kinds(&kinds());
+    w
+}
+
+fn running(w: &ClusterWatches) -> Vec<(String, Feed)> {
+    let mut v: Vec<(String, Feed)> = w
+        .running()
+        .into_iter()
+        .map(|(k, f)| (k.to_string(), f))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+fn subs(ids: &[KindId]) -> HashSet<KindId> {
+    ids.iter().cloned().collect()
+}
+
+// covers UP-25
+#[tokio::test]
+async fn watch_mode_transitions() {
+    let fake = Fake::new();
+    let hubs = HubRegistry::default();
+    let mut w = watches(&fake, &hubs);
+    let none = subs(&[]);
+    let crds = (
+        "customresourcedefinitions.apiextensions.k8s.io".to_owned(),
+        Feed::Watch,
+    );
+
+    w.reconcile(true, WatchMode::All, &none);
+    assert_eq!(
+        running(&w),
+        [
+            ("configmaps".to_owned(), Feed::Watch),
+            crds.clone(),
+            ("pods".to_owned(), Feed::Watch),
+        ],
+        "All: every listable+watchable kind except duplicates; metrics are not watched"
+    );
+
+    w.reconcile(true, WatchMode::OnView, &none);
+    assert_eq!(
+        running(&w),
+        std::slice::from_ref(&crds),
+        "On view: only the CRD list for discovery"
+    );
+
+    let metrics = KindId::new("metrics.k8s.io", "pods");
+    let open = subs(&[KindId::pods(), metrics.clone()]);
+    w.reconcile(true, WatchMode::OnView, &open);
+    assert_eq!(
+        running(&w),
+        [
+            crds.clone(),
+            ("pods".to_owned(), Feed::Watch),
+            ("pods.metrics.k8s.io".to_owned(), Feed::Poll)
+        ]
+    );
+
+    w.reconcile(true, WatchMode::All, &open);
+    assert_eq!(
+        running(&w).len(),
+        4,
+        "subscribed metrics stay polled in All mode"
+    );
+
+    // Closing the last view of a kind in On view mode stops it and drops its rows.
+    w.reconcile(
+        true,
+        WatchMode::OnView,
+        &subs(std::slice::from_ref(&metrics)),
+    );
+    assert!(!w.running().contains_key(&KindId::pods()));
+    let pods_hub = hubs.get_or_create("c", &KindId::pods());
+    assert_eq!(pods_hub.latest().state, SyncState::Idle);
+    assert!(pods_hub.latest().rows.is_empty());
+
+    // A subscription to a kind the cluster does not serve says so.
+    let missing = KindId::new("example.com", "widgets");
+    let (_hub, rx) = hubs.subscribe("c", &missing);
+    w.reconcile(
+        true,
+        WatchMode::OnView,
+        &subs(std::slice::from_ref(&missing)),
+    );
+    assert_eq!(rx.borrow().state, SyncState::Unavailable);
+}
+
+// covers UP-24
+#[tokio::test]
+async fn deactivating_stops_every_watch_and_reactivating_relists() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+    );
+    let hubs = HubRegistry::default();
+    let mut w = watches(&fake, &hubs);
+    let (_hub, mut rx) = hubs.subscribe("c", &KindId::pods());
+    let open = subs(&[KindId::pods()]);
+    w.reconcile(true, WatchMode::All, &open);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.open_streams() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("pods, configmaps and CRDs are watched");
+
+    w.reconcile(false, WatchMode::All, &open);
+    assert!(w.running().is_empty());
+    let snap = until(&mut rx, |s| s.state == SyncState::Idle).await;
+    assert!(
+        snap.rows.is_empty(),
+        "no stale rows from an inactive cluster"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.open_streams() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every watch stream closed");
+
+    w.reconcile(true, WatchMode::All, &open);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    assert_eq!(fake.list_calls("pods"), 2, "a fresh list on reactivation");
+
+    // A changed connection (new client) also restarts everything.
+    w.set_source(None);
+    assert!(w.running().is_empty());
+}

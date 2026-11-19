@@ -2,24 +2,24 @@
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use flint_core::cache::{SlotMap, slot};
 use flint_core::cluster::{self, ClusterError};
 use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
 use flint_core::read::{self, KindInfo};
 use flint_core::settings;
+use flint_core::table::{self, TablePage};
 use kube::Client;
-use kube::api::DynamicObject;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
 
 use crate::policy;
 
@@ -49,45 +49,12 @@ struct Inner {
     home: Option<PathBuf>,
     /// The last parsed kubeconfig and the file stamps it was parsed from.
     kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
-    clients: Mutex<HashMap<String, Arc<Slot<Client>>>>,
-    discovery: Mutex<HashMap<String, Arc<Slot<Kinds>>>>,
+    clients: SlotMap<Client>,
+    discovery: SlotMap<Kinds>,
 }
 
 /// Discovery results for one cluster.
 type Kinds = Arc<Vec<KindInfo>>;
-
-/// A per-cluster cache entry, built at most once even when calls race: concurrent callers wait on
-/// the same `OnceCell` instead of each connecting or running discovery. A failed build leaves the
-/// cell empty, so the next caller tries again.
-struct Slot<T> {
-    /// The context fingerprint the value belongs to.
-    fingerprint: u64,
-    created: Instant,
-    cell: OnceCell<T>,
-}
-
-/// The slot for `key`, replaced when the fingerprint changed or it is older than `ttl`.
-fn slot<T>(
-    map: &Mutex<HashMap<String, Arc<Slot<T>>>>,
-    key: &str,
-    fingerprint: u64,
-    ttl: Option<Duration>,
-) -> Arc<Slot<T>> {
-    let mut map = map.lock().unwrap();
-    if let Some(existing) = map.get(key)
-        && existing.fingerprint == fingerprint
-        && ttl.is_none_or(|ttl| existing.created.elapsed() < ttl)
-    {
-        return existing.clone();
-    }
-    let fresh = Arc::new(Slot {
-        fingerprint,
-        created: Instant::now(),
-        cell: OnceCell::new(),
-    });
-    map.insert(key.to_owned(), fresh.clone());
-    fresh
-}
 
 /// A failed call, shown to the agent as a tool error.
 struct ToolError(String);
@@ -217,8 +184,9 @@ impl FlintMcp {
     }
 
     #[tool(
-        description = "List objects of one kind with name, namespace, age, phase, and \
-        conditions. Use get_resource for a full object. When truncated is true, pass the returned \
+        description = "List objects of one kind as the rows `kubectl get -o wide` prints: \
+        the server's columns (ready counts, status, restarts, replicas, CRD printer columns) plus \
+        name, namespace and age. Use get_resource for a full object. When truncated is true, pass the returned \
         continue token to get the next page; if continue is null, narrow by namespace or label.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -276,7 +244,7 @@ impl FlintMcp {
                 ToolError(format!(
                     "Flint's settings.toml is invalid ({}), so no cluster is exposed. Ask the \
                      user to fix it; the Flint app shows the details.",
-                    kubeconfig::error_summary(&e.to_string())
+                    flint_core::redact::safe_error_summary(&e.to_string())
                 ))
             })?;
             let paths = kubeconfig::paths_for_settings(
@@ -362,7 +330,7 @@ impl FlintMcp {
             .map(|(path, error)| {
                 json!({
                     "file": path.display().to_string(),
-                    "error": policy::redact_quoted(&kubeconfig::error_summary(error)),
+                    "error": flint_core::redact::safe_error_summary(error),
                 })
             })
             .collect();
@@ -455,7 +423,7 @@ impl FlintMcp {
             return Err(ToolError(format!("{} cannot be listed", kind.kind())));
         }
         let limit = policy::OBJECTS.clamp(p.limit);
-        let page = read::list(
+        let page = table::list_table(
             &client,
             &kind,
             &read::ListQuery {
@@ -467,8 +435,10 @@ impl FlintMcp {
             },
         )
         .await?;
-        let rows: Vec<Value> = page.items.iter().map(summarize).collect();
-        to_json(&json!({
+        let is_secret = kind.group().is_empty() && kind.kind() == "Secret";
+        let (columns, rows, cut) =
+            table_rows(&page, is_secret, table::unix_now(), policy::LIST_BYTES);
+        let mut out = json!({
             "cluster": p.cluster,
             "kind": kind.kind(),
             "apiVersion": kind.api_version(),
@@ -476,8 +446,20 @@ impl FlintMcp {
             "count": rows.len(),
             "truncated": page.more,
             "continue": page.continue_token,
-            "items": rows,
-        }))
+            "columns": columns,
+            "rows": rows,
+        });
+        if cut {
+            // Rows were dropped from the middle of a server page; a continue token would skip
+            // them.
+            out["truncated"] = json!(true);
+            out["continue"] = Value::Null;
+            out["hint"] = json!(format!(
+                "Output was cut at {} bytes. Use a smaller limit, a namespace, or a label selector.",
+                policy::LIST_BYTES
+            ));
+        }
+        to_json(&out)
     }
 
     async fn do_get_resource(&self, p: GetResourceParams) -> Result<String, ToolError> {
@@ -516,6 +498,7 @@ impl FlintMcp {
             &read::EventQuery {
                 namespace: p.namespace.clone(),
                 involved: Some(involved),
+                field_selector: None,
                 fetch_limit: Some(EVENTS_FETCH),
             },
         )
@@ -612,36 +595,148 @@ impl Inner {
     }
 }
 
-/// A compact row for list_resources: identity, age, and a generic status summary.
-fn summarize(object: &DynamicObject) -> Value {
-    let status = object.data.get("status");
-    let phase = status.and_then(|s| s.get("phase")).cloned();
-    let conditions: Vec<String> = status
-        .and_then(|s| s.get("conditions"))
-        .and_then(Value::as_array)
-        .map(|conds| {
-            conds
-                .iter()
-                .filter_map(|c| {
-                    Some(format!(
-                        "{}={}",
-                        c.get("type")?.as_str()?,
-                        c.get("status")?.as_str()?
-                    ))
-                })
-                .collect()
+/// Column names and rows for list_resources. Each row is `{name, namespace, created, cells}`,
+/// with `cells` in column order as `kubectl get` prints them (ages computed from `now`).
+/// Wide (priority > 0) columns are marked with `"wide": true`. Rows stop once they add up to
+/// `max_bytes` of JSON; the flag says whether any were dropped.
+fn table_rows(
+    page: &TablePage,
+    is_secret: bool,
+    now: i64,
+    max_bytes: usize,
+) -> (Vec<Value>, Vec<Value>, bool) {
+    let columns: Vec<Value> = page
+        .columns
+        .iter()
+        .map(|c| {
+            let mut col = json!({ "name": c.name });
+            if c.priority > 0 {
+                col["wide"] = json!(true);
+            }
+            col
         })
-        .unwrap_or_default();
-    let mut row = json!({
-        "name": object.metadata.name,
-        "namespace": object.metadata.namespace,
-        "created": object.metadata.creation_timestamp.as_ref().map(|t| t.0.to_string()),
-    });
-    if let Some(phase) = phase {
-        row["phase"] = phase;
+        .collect();
+    let mut bytes = 0;
+    let mut cut = false;
+    let mut rows = Vec::new();
+    for row in &page.rows {
+        let value = {
+            let cells: Vec<String> = (0..page.columns.len())
+                .map(|i| {
+                    let text = row.cell_text(i, now);
+                    if is_secret && !policy::is_safe_secret_column(&page.columns[i].name) {
+                        policy::REDACTED.to_owned()
+                    } else {
+                        text.into_owned()
+                    }
+                })
+                .collect();
+            json!({
+                "name": row.name,
+                "namespace": row.namespace.as_deref(),
+                "created": row.created.and_then(table::format_timestamp),
+                "cells": cells,
+            })
+        };
+        bytes += value.to_string().len();
+        if bytes > max_bytes {
+            cut = true;
+            break;
+        }
+        rows.push(value);
     }
-    if !conditions.is_empty() {
-        row["conditions"] = json!(conditions);
+    (columns, rows, cut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flint_core::table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
+
+    fn col(name: &str, role: ColumnRole, priority: i32) -> Column {
+        Column {
+            name: name.into(),
+            ty: ColumnType::String,
+            format: "".into(),
+            description: "".into(),
+            priority,
+            role,
+        }
     }
-    row
+
+    fn page(columns: Vec<Column>, cells: Vec<Cell>) -> TablePage {
+        TablePage {
+            columns: columns.into(),
+            rows: vec![Row {
+                uid: "u".into(),
+                name: "web".into(),
+                namespace: Some("demo".into()),
+                resource_version: "1".into(),
+                generation: None,
+                created: Some(1_000),
+                labels: Box::new([]),
+                cells: cells.into(),
+            }],
+            format: ListFormat::Table,
+            more: false,
+            continue_token: None,
+        }
+    }
+
+    // covers UP-10
+    #[test]
+    fn rows_carry_server_columns_and_computed_age() {
+        let page = page(
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Namespace", ColumnRole::Namespace, 0),
+                col("Ready", ColumnRole::Value, 0),
+                col("Age", ColumnRole::Age, 0),
+                col("Node", ColumnRole::Value, 1),
+            ],
+            vec![
+                Cell::Name,
+                Cell::Namespace,
+                Cell::Text("1/1".into()),
+                Cell::Age,
+                Cell::Text("n1".into()),
+            ],
+        );
+        let (columns, rows, cut) = table_rows(&page, false, 1_090, policy::LIST_BYTES);
+        assert!(!cut);
+        let (_, few, cut) = table_rows(&page, false, 1_090, 10);
+        assert!(cut && few.is_empty(), "the byte cap applies");
+        assert_eq!(columns[4], json!({"name": "Node", "wide": true}));
+        assert_eq!(rows[0]["cells"], json!(["web", "demo", "1/1", "90s", "n1"]));
+        assert_eq!(rows[0]["created"], json!("1970-01-01T00:16:40Z"));
+    }
+
+    // covers UP-10
+    #[test]
+    fn secret_rows_never_carry_values() {
+        // A printer column that could show a value (an extension or a future server).
+        let page = page(
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Type", ColumnRole::Value, 0),
+                col("Data", ColumnRole::Value, 0),
+                col("Password", ColumnRole::Value, 0),
+                col("Age", ColumnRole::Age, 0),
+            ],
+            vec![
+                Cell::Name,
+                Cell::Text("Opaque".into()),
+                Cell::Int(2),
+                Cell::Text("hunter2".into()),
+                Cell::Age,
+            ],
+        );
+        let (_, rows, _) = table_rows(&page, true, 1_000, policy::LIST_BYTES);
+        let text = rows[0].to_string();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert_eq!(
+            rows[0]["cells"],
+            json!(["web", "Opaque", "2", policy::REDACTED, "0s"])
+        );
+    }
 }

@@ -6,8 +6,9 @@ with [GPUI](https://www.gpui.rs/) so it starts fast, stays light on memory, and 
 It also ships a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, so AI agents can inspect the
 clusters you choose to expose.
 
-Status: early development (milestone M0). The app lists your kubeconfig contexts, connects to the one you select,
-and shows its server version.
+Status: early development (milestone M1). The app lists your kubeconfig contexts, connects to the one you select,
+and browses every kind it serves, CRDs included: live lists with the `kubectl get` columns, a namespace and text
+filter, and a detail view with metadata, conditions, events and read-only YAML.
 
 ## Build and run
 
@@ -54,6 +55,17 @@ cluster:
 KUBECONFIG=$PWD/.dev/kubeconfig FLINT_CONFIG_DIR=$PWD/.dev/flint FLINT_CLUSTER=kind-flint-dev cargo run -p flint-app
 ```
 
+Two more development aids work together with `FLINT_CLUSTER`, so screenshots can show views nobody clicked to:
+
+- `FLINT_VIEW` opens a view once the cluster's discovery arrives: a kind (`pods`, `deployments.apps`,
+  `widgets.example.com`; the group may be left out), `kind/name` for a cluster-scoped object, or
+  `namespace/kind/name`. Add `#yaml` to an object to open its YAML tab. Without `FLINT_CLUSTER` it is ignored.
+- `FLINT_APPEARANCE=light` or `dark` forces a theme instead of following macOS.
+
+```sh
+FLINT_CLUSTER=kind-flint-dev FLINT_VIEW=demo/deployments/web#yaml FLINT_APPEARANCE=light cargo run -p flint-app
+```
+
 ## Development cluster
 
 `scripts/dev-cluster.sh` manages a throwaway [kind](https://kind.sigs.k8s.io/) cluster named `flint-dev`, with
@@ -83,6 +95,20 @@ unset). They also call `kubectl` with that kubeconfig.
 FLINT_TEST_KUBECONFIG=$PWD/.dev/kubeconfig KUBECONFIG=$PWD/.dev/kubeconfig \
   cargo test --workspace -- --include-ignored
 ```
+
+They create objects only in namespaces named `m1fix-*` (and one CRD in the `m1fix.flint.dev` group),
+wait for them to be deleted again, and can be run back to back. Two tests need more and skip with a
+message unless asked:
+
+- The load measurement (`tests/watch_load.rs`, UP-26) needs a prepared namespace named by
+  `FLINT_LOAD_NAMESPACE`; see its doc comment. Run it in release mode with `--nocapture`.
+- The API-server restart test (`tests/watch_recovery.rs`, UP-27) stops and starts the kind control-plane
+  container for about half a minute. Run it on its own, with nothing else using the cluster:
+
+  ```sh
+  FLINT_TEST_KUBECONFIG=$PWD/.dev/kubeconfig FLINT_TEST_SLOW=1 \
+    cargo test -p flint-core --test watch_recovery -- --ignored --nocapture
+  ```
 
 CI (`.github/workflows/ci.yml`, macOS) runs format, clippy and the tests above without a cluster.
 

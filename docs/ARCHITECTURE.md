@@ -128,6 +128,13 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   spike must confirm how Table rows and the objects behind them (`includeObject`) work together with the watch
   stream. If an API (some aggregated APIs, for example) cannot return Tables, the list falls back to name, namespace,
   and age columns.
+- **Namespace-limited access.** Many users may list a kind only in some namespaces (Roles, not
+  ClusterRoles). When the all-namespaces list of a namespaced kind is refused (403, after a few quick
+  retries, since a restarting API server can refuse briefly), Flint lists and watches it namespace by
+  namespace and merges the results into one list, which says it is limited and to which namespaces.
+  The namespaces are the user's namespace filter, else the context's default namespace, else every
+  namespace the user can list. This is Lens's "accessible namespaces", without a setting: the
+  namespace filter (which accepts typed names when namespaces cannot be listed) is the setting.
 - The table widget is virtualized. Only visible rows are laid out, so a list of 10,000 pods costs about the same to
   draw as a list of 50.
 
@@ -217,7 +224,7 @@ settings the same way the app does, and serves these read-only tools:
 |---|---|
 | `list_clusters` | Clusters marked Expose to AI: name, server, and whether a connection works |
 | `list_resource_kinds` | Kinds found by discovery for a cluster, CRDs included |
-| `list_resources` | Objects of a kind, with namespace and label selector filters |
+| `list_resources` | Objects of a kind as Table rows (the `kubectl get -o wide` columns, CRD printer columns included), with namespace and label selector filters |
 | `get_resource` | One object as YAML |
 | `get_events` | Events for a namespace or one object |
 | `get_pod_logs` | The last lines of a container's logs |
@@ -262,7 +269,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size, a `path`
   override, and a `helm` binary override.
-- `state.toml`: window layout, cluster order and pins in the sidebar, the last view open in each cluster.
+- `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, which the user
+  drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
+  filter of each cluster.
 - Flint never writes to kubeconfig files.
 
 ## Milestones
