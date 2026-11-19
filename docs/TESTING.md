@@ -77,7 +77,8 @@ GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API serv
 
 | Job | Runner | Runs |
 |---|---|---|
-| `test (<crate>)` | macOS | Unit and view tests, one job per crate |
+| `test (<crate>)` | Linux | Unit tests for `flint-core` and `flint-mcp`, one job per crate |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, and a release build. The only CI job that needs macOS |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 | `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
 

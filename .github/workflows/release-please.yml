@@ -39,7 +39,8 @@ jobs:
   update-lockfile:
     needs: release-please
     if: needs.release-please.outputs.prs_created == 'true'
-    runs-on: macos-latest
+    # Only Cargo.lock changes here; no build, so Linux is enough.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
