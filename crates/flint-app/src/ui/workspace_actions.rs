@@ -20,14 +20,14 @@ use super::super::registry::{
     ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
     CloseDetail, CloseTab, CopyLines, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
-    Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenLogs, OpenPreviousLogs, OpenView, PaneName, PrevMatch, PrevTab, Refresh, RetryConnection,
-    SaveLines, SaveLogs, SaveScope, SelectAllLines, SelectCluster, SelectFirst, SelectLast,
-    SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SetDockHeight,
-    SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview, ShowYaml, SortBy,
+    Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView,
+    OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenView, PaneName, PrevMatch, PrevTab, Refresh,
+    RetryConnection, SaveLines, SaveLogs, SaveScope, SelectAllLines, SelectCluster, SelectFirst,
+    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
+    SetDockHeight, SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview, ShowYaml, SortBy,
     ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleSecretValue, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode,
-    WatchAllKinds, WatchOpenViewsOnly,
+    TogglePause, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::ui_state;
 use super::{Pane, Workspace, confirm_expose, expose_dialog};
@@ -216,6 +216,7 @@ impl Workspace {
             .when::<JumpToStart>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<ToggleTimestamps>(|ws, cx| log(ws, cx).is_some())
             .when::<ToggleWrap>(|ws, cx| log(ws, cx).is_some())
+            .when::<ToggleSources>(|ws, cx| log(ws, cx).is_some_and(LogView::is_workload))
             .when::<FocusSearch>(|ws, cx| log(ws, cx).is_some())
             .when::<NextMatch>(|ws, cx| log(ws, cx).is_some_and(|l| l.match_count() > 0))
             .when::<PrevMatch>(|ws, cx| log(ws, cx).is_some_and(|l| l.match_count() > 0))

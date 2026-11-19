@@ -5,7 +5,8 @@
 use std::ops::Range;
 
 use flint_core::{
-    LineId, LineSelection, LogLine, LogLines, LogSearch, LogState, LogTarget, SearchQuery,
+    LineFormat, LineId, LineSelection, LogLine, LogLines, LogSearch, LogState, LogSubject, PodSet,
+    PodSetStatus, SearchQuery,
 };
 
 use super::registry::SaveScope;
@@ -44,12 +45,15 @@ pub fn list_change(old: Range<LineId>, new: Range<LineId>) -> ListChange {
 /// and shaping 64 KiB of text for every frame is not free.
 pub const UNWRAPPED_MAX_BYTES: usize = 4096;
 
-/// One line as drawn: its text (with the timestamp in front when shown), where the timestamp
-/// ends, and the byte ranges of search matches in that text.
+/// One line as drawn: its text, with the `[pod/container]` source and the timestamp in front
+/// when shown (as [`LogLine::display_as`] writes it), where those end, and the byte ranges of
+/// search matches in that text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShownLine {
     pub text: String,
-    /// The timestamp and the space after it; `0` when not shown.
+    /// The source prefix and the space after it; `0` when not shown (or a pod session).
+    pub source: usize,
+    /// Where the line's own text starts: after the source and the timestamp.
     pub prefix: usize,
     pub matches: Vec<Range<usize>>,
     /// The line was cut: at [`flint_core::logs::MAX_LINE_BYTES`] when it arrived, or here at
@@ -57,18 +61,34 @@ pub struct ShownLine {
     pub cut: bool,
 }
 
-/// `line` as shown: with its timestamp when `timestamps` is on, its search matches, and at most
-/// `max_bytes` of its text (on a character boundary).
+/// `line` as shown with `format`: its search matches (in the source too, when the query
+/// searches sources and the prefix is shown), and at most `max_bytes` of its text (on a
+/// character boundary).
 pub fn shown_line(
     line: &LogLine,
-    timestamps: bool,
+    format: LineFormat,
     query: &SearchQuery,
     max_bytes: Option<usize>,
 ) -> ShownLine {
-    let mut text = match (&line.timestamp, timestamps) {
-        (Some(ts), true) => format!("{ts} "),
-        _ => String::new(),
-    };
+    let mut text = String::new();
+    let mut matches = Vec::new();
+    if let Some(source) = line.source.as_ref().filter(|_| format.source) {
+        text.push('[');
+        if query.sources {
+            matches.extend(
+                query
+                    .match_ranges(source.label())
+                    .into_iter()
+                    .map(|r| r.start + 1..r.end + 1),
+            );
+        }
+        text.push_str(source.label());
+        text.push_str("] ");
+    }
+    let source = text.len();
+    if let Some(ts) = line.timestamp.as_ref().filter(|_| format.timestamps) {
+        text.push_str(&format!("{ts} "));
+    }
     let prefix = text.len();
     let mut body: &str = &line.text;
     let mut cut = line.truncated;
@@ -83,17 +103,52 @@ pub fn shown_line(
         cut = true;
     }
     text.push_str(body);
-    let matches = query
-        .match_ranges(body)
-        .into_iter()
-        .map(|r| r.start + prefix..r.end + prefix)
-        .collect();
+    matches.extend(
+        query
+            .match_ranges(body)
+            .into_iter()
+            .map(|r| r.start + prefix..r.end + prefix),
+    );
     ShownLine {
         text,
+        source,
         prefix,
         matches,
         cut,
     }
+}
+
+/// What a styled run of a shown line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Source,
+    Timestamp,
+    Match,
+}
+
+/// The styled runs of `shown`, in order and not overlapping: the source prefix and the timestamp,
+/// split around any matches inside them, then every match. The rest is plain text.
+pub fn line_parts(shown: &ShownLine) -> Vec<(Range<usize>, Part)> {
+    let mut out = Vec::with_capacity(shown.matches.len() + 2);
+    let mut matches = shown.matches.iter().peekable();
+    for (range, part) in [
+        (0..shown.source, Part::Source),
+        (shown.source..shown.prefix, Part::Timestamp),
+    ] {
+        let mut at = range.start;
+        while let Some(m) = matches.next_if(|m| m.start < range.end) {
+            if at < m.start {
+                out.push((at..m.start, part));
+            }
+            out.push((m.clone(), Part::Match));
+            at = m.end;
+        }
+        if at < range.end {
+            out.push((at..range.end, part));
+        }
+    }
+    out.extend(matches.map(|m| (m.clone(), Part::Match)));
+    out
 }
 
 /// The tone a state is drawn in.
@@ -169,11 +224,50 @@ pub fn match_text(search: &LogSearch, current: Option<LineId>) -> String {
     }
 }
 
-/// A tab's title: the pod, the container when named, and "previous" for a terminated instance.
-pub fn tab_title(target: &LogTarget, previous: bool) -> String {
-    let mut title = match &target.container {
-        Some(container) => format!("{} · {container}", target.pod),
-        None => target.pod.clone(),
+/// A workload session's streams in a few words: `3 pods · 4 live · 1 failed · 2 not read`.
+/// Counts that are zero are left out, except the pods and live streams.
+pub fn streams_text(status: &PodSetStatus) -> String {
+    let pods = match status.pods {
+        1 => "1 pod".to_owned(),
+        n => format!("{} pods", thousands(n as u64)),
+    };
+    let mut parts = vec![pods, format!("{} live", thousands(status.live() as u64))];
+    for (n, what) in [
+        (status.connecting(), "connecting"),
+        (status.waiting, "waiting to start"),
+        (status.failed(), "failed"),
+        (status.capped, "not read"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{} {what}", thousands(n as u64)));
+        }
+    }
+    parts.join(" · ")
+}
+
+/// What a session reads, as a tab names it: `web-1`, `deployment/web`, `-l app=web`.
+fn subject_name(subject: &LogSubject) -> (String, Option<&str>) {
+    match subject {
+        LogSubject::Pod(target) => (target.pod.clone(), target.container.as_deref()),
+        LogSubject::Workload(target) => (
+            match &target.pods {
+                PodSet::Workload { kind, name } => {
+                    format!("{}/{name}", kind.name().to_lowercase())
+                }
+                PodSet::Selector(selector) => format!("-l {selector}"),
+            },
+            target.container.as_deref(),
+        ),
+    }
+}
+
+/// A tab's title: the pod (or workload), the container when named, and "previous" for a
+/// terminated instance.
+pub fn tab_title(subject: &LogSubject, previous: bool) -> String {
+    let (name, container) = subject_name(subject);
+    let mut title = match container {
+        Some(container) => format!("{name} · {container}"),
+        None => name,
     };
     if previous {
         title.push_str(" (previous)");
@@ -181,11 +275,12 @@ pub fn tab_title(target: &LogTarget, previous: bool) -> String {
     title
 }
 
-/// The file name a save dialog suggests: `web-1_app.log`, `web-1_app_previous.log`. Only
-/// characters safe in a file name are kept.
-pub fn suggested_file_name(target: &LogTarget, previous: bool) -> String {
-    let mut stem = target.pod.clone();
-    if let Some(container) = &target.container {
+/// The file name a save dialog suggests: `web-1_app.log`, `deployment_web.log`,
+/// `web-1_app_previous.log`. Only characters safe in a file name are kept.
+pub fn suggested_file_name(subject: &LogSubject, previous: bool) -> String {
+    let (name, container) = subject_name(subject);
+    let mut stem = name.trim_start_matches("-l ").to_owned();
+    if let Some(container) = container {
         stem.push('_');
         stem.push_str(container);
     }
@@ -205,20 +300,20 @@ pub fn suggested_file_name(target: &LogTarget, previous: bool) -> String {
     format!("{stem}.log")
 }
 
-/// The lines to save, as shown (timestamps when `timestamps` is on), one per line and ending
-/// in a newline, and how many there are. Not redacted: the file holds what the tab showed.
+/// The lines to save, as shown with `format`, one per line and ending in a newline, and how
+/// many there are. Not redacted: the file holds what the tab showed.
 /// `None` when the scope has nothing (no search, no selection).
 pub fn save_text(
     lines: &LogLines,
     scope: SaveScope,
     matches: &[LineId],
     selection: Option<LineSelection>,
-    timestamps: bool,
+    format: LineFormat,
 ) -> Option<(String, usize)> {
     let mut out = String::new();
     let mut count = 0;
     let mut push = |line: &LogLine| {
-        out.push_str(&line.display(timestamps));
+        out.push_str(&line.display_as(format));
         out.push('\n');
         count += 1;
     };
@@ -235,9 +330,20 @@ pub fn save_text(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use flint_core::logs::LogBuffer;
+    use flint_core::{LineSource, LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
 
     use super::*;
+
+    /// Timestamps on or off, no source prefix.
+    fn ts(timestamps: bool) -> LineFormat {
+        LineFormat {
+            timestamps,
+            source: false,
+        }
+    }
 
     fn lines(texts: &[&str]) -> LogLines {
         let mut buffer = LogBuffer::new(100);
@@ -279,31 +385,103 @@ mod tests {
     fn a_shown_line_offsets_matches_past_the_timestamp() {
         let line = LogLine::parse("2024-05-01T12:00:00Z GET /api error 500 ERROR", false);
         let query = SearchQuery::new("error");
-        let plain = shown_line(&line, false, &query, None);
+        let plain = shown_line(&line, ts(false), &query, None);
         assert_eq!(plain.text, "GET /api error 500 ERROR");
         assert_eq!(plain.prefix, 0);
         assert_eq!(plain.matches, [9..14, 19..24]);
-        let stamped = shown_line(&line, true, &query, None);
+        let stamped = shown_line(&line, ts(true), &query, None);
         assert_eq!(stamped.prefix, "2024-05-01T12:00:00Z ".len());
         assert_eq!(&stamped.text[stamped.prefix..], plain.text);
         for (a, b) in stamped.matches.iter().zip(&plain.matches) {
             assert_eq!(&stamped.text[a.clone()], &plain.text[b.clone()]);
         }
         // A search never matches inside the timestamp.
-        let in_ts = shown_line(&line, true, &SearchQuery::new("2024"), None);
+        let in_ts = shown_line(&line, ts(true), &SearchQuery::new("2024"), None);
         assert!(in_ts.matches.is_empty());
         assert!(!plain.cut);
+    }
+
+    // covers UP-45: a workload line shows its `[pod/container]` source, as a view toggle, and a
+    // search over sources highlights it there.
+    #[test]
+    fn a_workload_line_shows_its_source_before_the_timestamp() {
+        let mut line = LogLine::parse("2024-05-01T12:00:00Z error in web", false);
+        line.source = Some(Arc::new(LineSource::new("web-1", "app")));
+        let both = LineFormat {
+            timestamps: true,
+            source: true,
+        };
+        let query = SearchQuery {
+            sources: true,
+            ..SearchQuery::new("web")
+        };
+        let shown = shown_line(&line, both, &query, None);
+        assert_eq!(shown.text, line.display_as(both));
+        assert_eq!(&shown.text[..shown.source], "[web-1/app] ");
+        assert_eq!(
+            &shown.text[shown.source..shown.prefix],
+            "2024-05-01T12:00:00Z "
+        );
+        let found: Vec<&str> = shown
+            .matches
+            .iter()
+            .map(|r| &shown.text[r.clone()])
+            .collect();
+        assert_eq!(found, ["web", "web"]);
+        // Styled runs: the source split around its match, the timestamp, the match in the text.
+        let body_match = shown.matches[1].clone();
+        assert_eq!(
+            line_parts(&shown),
+            [
+                (0..1, Part::Source),
+                (1..4, Part::Match),
+                (4..shown.source, Part::Source),
+                (shown.source..shown.prefix, Part::Timestamp),
+                (body_match, Part::Match),
+            ]
+        );
+        // Hidden prefix: nothing of the source is shown or matched.
+        let hidden = shown_line(&line, ts(false), &query, None);
+        assert_eq!((hidden.source, hidden.text.as_str()), (0, "error in web"));
+        assert_eq!(hidden.matches.len(), 1);
+    }
+
+    // covers UP-45: the header counts a workload session's streams.
+    #[test]
+    fn stream_counts_leave_out_zeros() {
+        let stream = |state| StreamStatus {
+            source: Arc::new(LineSource::new("web-1", "app")),
+            state,
+        };
+        let mut status = PodSetStatus {
+            pods: 3,
+            streams: vec![
+                stream(LogState::Streaming),
+                stream(LogState::Streaming),
+                stream(LogState::Ended {
+                    error: Some("x".into()),
+                }),
+            ],
+            max_streams: 50,
+            ..Default::default()
+        };
+        assert_eq!(streams_text(&status), "3 pods · 2 live · 1 failed");
+        status.capped = 4;
+        status.pods = 1;
+        status.streams.truncate(1);
+        assert_eq!(streams_text(&status), "1 pod · 1 live · 4 not read");
+        assert_eq!(streams_text(&PodSetStatus::default()), "0 pods · 0 live");
     }
 
     #[test]
     fn long_lines_are_cut_on_a_character_boundary() {
         let line = LogLine::parse(&"é".repeat(10), false);
-        let shown = shown_line(&line, false, &SearchQuery::default(), Some(5));
+        let shown = shown_line(&line, ts(false), &SearchQuery::default(), Some(5));
         assert_eq!(shown.text, "éé");
         assert!(shown.cut);
         assert!(shown.matches.is_empty());
         let truncated = LogLine::parse("x", true);
-        assert!(shown_line(&truncated, false, &SearchQuery::default(), None).cut);
+        assert!(shown_line(&truncated, ts(false), &SearchQuery::default(), None).cut);
     }
 
     // covers UP-40: the session state is always shown.
@@ -370,14 +548,32 @@ mod tests {
             pod: "web-1".into(),
             container: Some("app".into()),
         };
+        let workload = LogSubject::Workload(WorkloadTarget {
+            namespace: "demo".into(),
+            pods: PodSet::Workload {
+                kind: WorkloadKind::Deployment,
+                name: "web".into(),
+            },
+            container: None,
+        });
+        assert_eq!(tab_title(&workload, false), "deployment/web");
+        assert_eq!(suggested_file_name(&workload, false), "deployment_web.log");
+        let selector = LogSubject::Workload(WorkloadTarget {
+            namespace: "demo".into(),
+            pods: PodSet::Selector("app=web".into()),
+            container: Some("app".into()),
+        });
+        assert_eq!(tab_title(&selector, false), "-l app=web · app");
+        assert_eq!(suggested_file_name(&selector, false), "app_web_app.log");
+        let target = LogSubject::Pod(target);
         assert_eq!(tab_title(&target, false), "web-1 · app");
         assert_eq!(tab_title(&target, true), "web-1 · app (previous)");
         assert_eq!(suggested_file_name(&target, true), "web-1_app_previous.log");
-        let bare = LogTarget {
+        let bare = LogSubject::Pod(LogTarget {
+            namespace: "demo".into(),
             container: None,
             pod: "a/b c".into(),
-            ..target
-        };
+        });
         assert_eq!(tab_title(&bare, false), "a/b c");
         assert_eq!(suggested_file_name(&bare, false), "a_b_c.log");
     }
@@ -390,26 +586,27 @@ mod tests {
             "2024-05-01T12:00:01Z error two",
             "2024-05-01T12:00:02Z three",
         ]);
-        let (all, n) = save_text(&shown, SaveScope::All, &[], None, false).unwrap();
+        let (all, n) = save_text(&shown, SaveScope::All, &[], None, ts(false)).unwrap();
         assert_eq!(n, 3);
         assert_eq!(all, "first password=hunter2\nerror two\nthree\n");
-        let (stamped, _) = save_text(&shown, SaveScope::All, &[], None, true).unwrap();
+        let (stamped, _) = save_text(&shown, SaveScope::All, &[], None, ts(true)).unwrap();
         assert!(stamped.starts_with("2024-05-01T12:00:00Z first"));
-        let (matched, n) = save_text(&shown, SaveScope::Matches, &[1, 9], None, false).unwrap();
+        let (matched, n) = save_text(&shown, SaveScope::Matches, &[1, 9], None, ts(false)).unwrap();
         assert_eq!((matched.as_str(), n), ("error two\n", 1));
         let selection = Some(LineSelection::new(2, 1));
-        let (selected, n) = save_text(&shown, SaveScope::Selection, &[], selection, false).unwrap();
+        let (selected, n) =
+            save_text(&shown, SaveScope::Selection, &[], selection, ts(false)).unwrap();
         assert_eq!((selected.as_str(), n), ("error two\nthree\n", 2));
         assert_eq!(
-            save_text(&shown, SaveScope::Selection, &[], None, false),
+            save_text(&shown, SaveScope::Selection, &[], None, ts(false)),
             None
         );
         assert_eq!(
-            save_text(&shown, SaveScope::Matches, &[], None, false),
+            save_text(&shown, SaveScope::Matches, &[], None, ts(false)),
             None
         );
         assert_eq!(
-            save_text(&LogLines::default(), SaveScope::All, &[], None, false),
+            save_text(&LogLines::default(), SaveScope::All, &[], None, ts(false)),
             None
         );
     }

@@ -237,9 +237,10 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   alive and counts against the same budget. The cost: after a long pause, the oldest frozen lines disappear just as
   they would while following.
 - **Log tab** (`flint-app/src/ui/log_view.rs`): a virtualized list (GPUI `list` in tail-follow mode) spliced by line
-  id from each snapshot, so following costs only the new lines. Timestamps and wrapping are view toggles. Copy and
-  Save (the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot diff, line text and
-  highlights, state wording, save text) are in `log_model.rs`.
+  id from each snapshot, so following costs only the new lines. Timestamps, wrapping and a workload's
+  `[pod/container]` prefix are view toggles, and a workload tab counts its streams in the toolbar. Copy and Save
+  (after a confirmation, then the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot
+  diff, line text and highlights, state wording, save text) are in `log_model.rs`.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
   following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.

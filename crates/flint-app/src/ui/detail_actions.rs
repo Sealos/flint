@@ -2,7 +2,7 @@
 //! checks the workspace's guards share with them. The pane's buttons, tabs and toggles dispatch
 //! these actions.
 
-use flint_core::LogTarget;
+use flint_core::{LogSubject, LogTarget};
 use gpui_kit::*;
 
 use super::super::log_view::LogRequest;
@@ -83,11 +83,11 @@ impl DetailView {
         }
         Ok(LogRequest {
             cluster: self.object.cluster.clone(),
-            target: LogTarget {
+            subject: LogSubject::Pod(LogTarget {
                 namespace: self.object.namespace.clone().unwrap_or_default(),
                 pod: self.object.name.clone(),
                 container: Some(found.name.clone()),
-            },
+            }),
             previous,
         })
     }

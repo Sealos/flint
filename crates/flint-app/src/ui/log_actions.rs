@@ -7,9 +7,9 @@ use gpui_kit::*;
 
 use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
-    ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, NextMatch, OnView, PrevMatch, SaveLines, SaveLogs,
-    SaveScope, SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, TogglePause,
-    ToggleTimestamps, ToggleWrap,
+    ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, NextMatch, OnView, PrevMatch,
+    SaveLines, SaveLogs, SaveScope, SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine,
+    TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
@@ -40,6 +40,20 @@ impl LogView {
                 if view.wrap {
                     view.list.remeasure();
                 }
+                cx.notify();
+            })
+            .bind::<ToggleSources>(|view, _, _, cx| {
+                if !view.is_workload() {
+                    return;
+                }
+                view.sources = !view.sources;
+                if view.wrap {
+                    view.list.remeasure();
+                }
+                // The search covers sources only while they are shown.
+                let text = std::mem::take(&mut view.query.text);
+                view.query = Default::default();
+                view.set_query(text, cx);
                 cx.notify();
             })
             .bind::<ToggleWrap>(|view, _, _, cx| {
@@ -78,10 +92,12 @@ impl LogView {
                     view.save(SaveScope::All, None, window, cx);
                 }
             })
-            .bind::<SaveLines>(|view, action, window, cx| match view.check_save(action.lines) {
-                Ok(()) => view.save(action.lines, action.timestamps, window, cx),
-                Err(e) => tracing::warn!("{e}"),
-            })
+            .bind::<SaveLines>(
+                |view, action, window, cx| match view.check_save(action.lines) {
+                    Ok(()) => view.save(action.lines, action.timestamps, window, cx),
+                    Err(e) => tracing::warn!("{e}"),
+                },
+            )
             .bind::<SelectLine>(Self::select_line)
             .bind::<DragSelection>(Self::drag_selection)
     }

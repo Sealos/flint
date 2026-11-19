@@ -1,5 +1,7 @@
-//! A log tab in the bottom dock (#13, #75; UP-40, UP-42 to UP-45): one container's log, streamed
-//! by a core [`LogSession`] into a ring buffer and drawn as a virtualized list.
+//! A log tab in the bottom dock (#13, #75; UP-40, UP-42 to UP-46): one container's log, or a
+//! workload's pods merged into one stream (#62), read by a core [`LogSession`] into a ring buffer
+//! and drawn as a virtualized list. Workload lines carry a `[pod/container]` source prefix, a view
+//! toggle like timestamps, and the toolbar counts the workload's streams.
 //!
 //! The session publishes at most about ten snapshots a second (ADR-0002). Each snapshot is diffed
 //! against the one shown by line id ([`log_model::list_change`]), so following a chatty pod only
@@ -21,8 +23,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use flint_core::{
-    ClusterId, CoreHandle, LineId, LineSelection, LogOptions, LogSearch, LogSession, LogSnapshot,
-    LogState, LogTarget, SearchQuery, Severity,
+    ClusterId, CoreHandle, LineFormat, LineId, LineSelection, LogOptions, LogSearch, LogSession,
+    LogSnapshot, LogState, LogSubject, SearchQuery, Severity,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -33,8 +35,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
-    WindowExt as _,
-    h_flex, v_flex,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -44,7 +45,7 @@ use super::log_model::{self, ListChange, Tone};
 use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, SaveLines, SaveScope, SelectLine,
-    TogglePause, ToggleTimestamps, ToggleWrap,
+    TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
 
@@ -53,12 +54,12 @@ pub const LINE_HEIGHT: f32 = 18.;
 /// How long a search query must stay unchanged before the buffer is scanned for it.
 const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// What a log tab shows: a container of a pod on a cluster, and whether it is the previous
-/// (terminated) instance. Opening the same request again shows the existing tab.
+/// What a log tab shows: a pod's container or a workload's pods on a cluster, and whether it is
+/// the previous (terminated) instance. Opening the same request again shows the existing tab.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogRequest {
     pub cluster: ClusterId,
-    pub target: LogTarget,
+    pub subject: LogSubject,
     pub previous: bool,
 }
 
@@ -77,7 +78,7 @@ impl LogRequest {
 #[derive(Clone)]
 struct PendingSave {
     scope: SaveScope,
-    timestamps: bool,
+    format: LineFormat,
     lines: flint_core::LogLines,
     matches: Vec<LineId>,
     selection: Option<LineSelection>,
@@ -99,6 +100,8 @@ pub struct LogView {
     snapshot: Arc<LogSnapshot>,
     list: ListState,
     timestamps: bool,
+    /// Show workload lines' `[pod/container]` prefix (on by default; pod sessions have none).
+    sources: bool,
     wrap: bool,
     /// Paused with the Pause button or key.
     user_paused: bool,
@@ -129,7 +132,7 @@ impl LogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let session = core.open_logs(&request.cluster, request.target.clone(), request.options());
+        let session = core.open_logs(&request.cluster, request.subject.clone(), request.options());
         let mut updates = session.updates();
         let pump = cx.spawn(async move |this, cx| {
             while updates.changed().await {
@@ -185,6 +188,7 @@ impl LogView {
             }),
             list,
             timestamps: false,
+            sources: true,
             wrap: false,
             user_paused: false,
             selection_paused: false,
@@ -257,9 +261,26 @@ impl LogView {
         cx.notify();
     }
 
-    /// Searches for `text` from now on: the first scan runs on the core's threads.
+    /// Whether the session reads a workload's pods, whose lines carry a source.
+    pub fn is_workload(&self) -> bool {
+        matches!(self.request.subject, LogSubject::Workload(_))
+    }
+
+    /// How lines are shown, copied and saved now.
+    pub fn format(&self) -> LineFormat {
+        LineFormat {
+            timestamps: self.timestamps,
+            source: self.sources && self.is_workload(),
+        }
+    }
+
+    /// Searches for `text` from now on: the first scan runs on the core's threads. The search
+    /// covers workload sources while their prefix is shown.
     fn set_query(&mut self, text: String, cx: &mut Context<Self>) {
-        let query = SearchQuery::new(text);
+        let query = SearchQuery {
+            sources: self.format().source,
+            ..SearchQuery::new(text)
+        };
         if query == self.query {
             return;
         }
@@ -354,7 +375,7 @@ impl LogView {
     /// (#56) use.
     pub fn selection_text(&self) -> Option<String> {
         let selection = self.selection?;
-        Some(selection.text(&self.snapshot.lines, self.timestamps))
+        Some(selection.text_as(&self.snapshot.lines, self.format()))
     }
 
     /// Where the save dialog opens: Downloads, else the home folder.
@@ -377,7 +398,10 @@ impl LogView {
     ) {
         let save = PendingSave {
             scope,
-            timestamps: timestamps.unwrap_or(self.timestamps),
+            format: LineFormat {
+                timestamps: timestamps.unwrap_or(self.timestamps),
+                ..self.format()
+            },
             lines: self.snapshot.lines.clone(),
             matches: match scope {
                 SaveScope::Matches => self.search.matches().iter().copied().collect(),
@@ -390,14 +414,14 @@ impl LogView {
             save.scope,
             &save.matches,
             save.selection,
-            save.timestamps,
+            save.format,
         )
         .map_or(0, |(_, n)| n as u64);
         let description = format!(
             "{} will be written as shown{}. The file is not redacted: it holds whatever the \
              pod logged, secrets included.",
             log_model::line_count(count),
-            if save.timestamps {
+            if save.format.timestamps {
                 ", with timestamps"
             } else {
                 ", without timestamps"
@@ -424,12 +448,12 @@ impl LogView {
     fn write_lines(&mut self, save: PendingSave, cx: &mut Context<Self>) {
         let PendingSave {
             scope,
-            timestamps,
+            format,
             lines,
             matches,
             selection,
         } = save;
-        let name = log_model::suggested_file_name(&self.request.target, self.request.previous);
+        let name = log_model::suggested_file_name(&self.request.subject, self.request.previous);
         let path = cx.prompt_for_new_path(&Self::save_dir(), Some(&name));
         cx.spawn(async move |this, cx| {
             let path = match path.await {
@@ -447,7 +471,7 @@ impl LogView {
             let written = cx
                 .background_spawn(async move {
                     let (text, count) =
-                        log_model::save_text(&lines, scope, &matches, selection, timestamps)
+                        log_model::save_text(&lines, scope, &matches, selection, format)
                             .ok_or_else(|| "there are no such lines".to_owned())?;
                     std::fs::write(&path, text)
                         .map(|()| (path, count))
@@ -491,7 +515,7 @@ impl LogView {
             return div().into_any_element();
         };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
-        let shown = log_model::shown_line(line, self.timestamps, &self.query, max);
+        let shown = log_model::shown_line(line, self.format(), &self.query, max);
         let selected = self.selection.is_some_and(|s| s.contains(id));
         let color = match line.severity {
             Severity::Error => theme.danger,
@@ -503,26 +527,28 @@ impl LogView {
         } else {
             theme::log_match(theme)
         };
-        let mut highlights = Vec::with_capacity(shown.matches.len() + 1);
-        if shown.prefix > 0 {
-            highlights.push((
-                0..shown.prefix,
-                HighlightStyle {
-                    color: Some(theme.muted_foreground),
-                    ..Default::default()
-                },
-            ));
-        }
-        for range in shown.matches {
-            highlights.push((
-                range,
-                HighlightStyle {
-                    color: Some(theme.foreground),
-                    background_color: Some(match_bg),
-                    ..Default::default()
-                },
-            ));
-        }
+        // The source prefix in the info color, so it reads apart from the line, the timestamp
+        // muted, and matches in the foreground color over the match tint.
+        let highlights = log_model::line_parts(&shown)
+            .into_iter()
+            .map(|(range, part)| {
+                let style = match part {
+                    log_model::Part::Source => HighlightStyle {
+                        color: Some(theme.info),
+                        ..Default::default()
+                    },
+                    log_model::Part::Timestamp => HighlightStyle {
+                        color: Some(theme.muted_foreground),
+                        ..Default::default()
+                    },
+                    log_model::Part::Match => HighlightStyle {
+                        color: Some(theme.foreground),
+                        background_color: Some(match_bg),
+                        ..Default::default()
+                    },
+                };
+                (range, style)
+            });
         let text = StyledText::new(shown.text).with_highlights(highlights);
         h_flex()
             .id(("log-line", id as usize))
@@ -621,6 +647,26 @@ impl LogView {
                     .child(log_model::line_count(lines.len() as u64))
                     .test_support(),
             )
+            .when_some(self.snapshot.pods.clone(), |el, pods| {
+                let selector = pods.selector.clone();
+                el.child(
+                    div()
+                        .id("log-streams")
+                        .flex_none()
+                        .text_color(if pods.failed() > 0 {
+                            theme.warning
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(log_model::streams_text(&pods))
+                        .when_some(selector, |el, selector| {
+                            el.tooltip(move |window, cx| {
+                                Tooltip::new(format!("Pods matching {selector}")).build(window, cx)
+                            })
+                        })
+                        .test_support(),
+                )
+            })
             .when(paused, |el| {
                 el.child(
                     div()
@@ -691,6 +737,17 @@ impl LogView {
                     .tooltip("Show or hide timestamps (T)")
                     .on_click(registry::on_click(ToggleTimestamps)),
             )
+            .when(self.is_workload(), |el| {
+                el.child(
+                    Button::new("log-sources")
+                        .xsmall()
+                        .ghost()
+                        .label("Pods")
+                        .selected(self.sources)
+                        .tooltip("Show or hide each line's pod and container (P)")
+                        .on_click(registry::on_click(ToggleSources)),
+                )
+            })
             .child(
                 Button::new("log-wrap")
                     .xsmall()
@@ -877,15 +934,25 @@ impl DockItem for LogView {
     }
 
     fn tab_title(&self) -> SharedString {
-        log_model::tab_title(&self.request.target, self.request.previous).into()
+        log_model::tab_title(&self.request.subject, self.request.previous).into()
     }
 
     fn tab_tooltip(&self) -> SharedString {
         let r = &self.request;
-        let mut text = format!("Logs of {}/{}", r.target.namespace, r.target.pod);
-        if let Some(container) = &r.target.container {
-            text.push_str(&format!(", container {container}"));
-        }
+        let mut text = match &r.subject {
+            LogSubject::Pod(target) => {
+                let mut text = format!("Logs of {}/{}", target.namespace, target.pod);
+                if let Some(container) = &target.container {
+                    text.push_str(&format!(", container {container}"));
+                }
+                text
+            }
+            LogSubject::Workload(target) => format!(
+                "Logs of {} in {}, every pod merged",
+                log_model::tab_title(&r.subject, false),
+                target.namespace
+            ),
+        };
         if r.previous {
             text.push_str(" (previous instance)");
         }

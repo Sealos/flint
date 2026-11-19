@@ -136,6 +136,8 @@ actions!(
         ToggleTimestamps,
         /// Wrap long lines, or cut them at the edge.
         ToggleWrap,
+        /// Show or hide a workload line's pod and container.
+        ToggleSources,
         /// Move focus to the log search field.
         FocusSearch,
         /// Go to the next line matching the search.
@@ -1384,6 +1386,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .keys(&["t"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleSources>(
+            "Toggle Pod Prefix",
+            "Show or hide each workload line's pod and container, without reloading.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["p"], Some(LOG_PLAIN)),
         Spec::unit::<ToggleWrap>("Toggle Line Wrap", "Wrap long lines, or cut them at the edge.")
             .of(C::Logs, S::Logs)
             .keys(&["w"], Some(LOG_PLAIN)),

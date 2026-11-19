@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use flint_core::logs::LogBuffer;
 use flint_core::{
-    CoreConfig, CoreHandle, LineSelection, LogLine, LogSnapshot, LogState, LogTarget, Settings,
+    CoreConfig, CoreHandle, LineSelection, LineSource, LogLine, LogSnapshot, LogState, LogSubject,
+    LogTarget, PodSet, PodSetStatus, Settings, StreamStatus, WorkloadKind, WorkloadTarget,
 };
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
@@ -38,11 +39,27 @@ fn core() -> (CoreHandle, tempfile::TempDir) {
 fn request() -> LogRequest {
     LogRequest {
         cluster: "test".into(),
-        target: LogTarget {
+        subject: LogSubject::Pod(LogTarget {
             namespace: "demo".into(),
             pod: "web-1".into(),
             container: Some("app".into()),
-        },
+        }),
+        previous: false,
+    }
+}
+
+/// The logs of Deployment `web`, every pod and container.
+fn workload_request() -> LogRequest {
+    LogRequest {
+        cluster: "test".into(),
+        subject: LogSubject::Workload(WorkloadTarget {
+            namespace: "demo".into(),
+            pods: PodSet::Workload {
+                kind: WorkloadKind::Deployment,
+                name: "web".into(),
+            },
+            container: None,
+        }),
         previous: false,
     }
 }
@@ -82,6 +99,7 @@ impl Feed {
             paused,
             held_back,
             version: self.version,
+            pods: None,
         })
     }
 
@@ -92,6 +110,14 @@ impl Feed {
 
 /// A log tab alone in a window, focused, reading snapshots only from the test.
 fn open(cx: &mut TestAppContext, core: CoreHandle) -> (AnyWindowHandle, Entity<LogView>) {
+    open_request(cx, core, request())
+}
+
+fn open_request(
+    cx: &mut TestAppContext,
+    core: CoreHandle,
+    request: LogRequest,
+) -> (AnyWindowHandle, Entity<LogView>) {
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -109,7 +135,7 @@ fn open(cx: &mut TestAppContext, core: CoreHandle) -> (AnyWindowHandle, Entity<L
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    let mut view = LogView::new(core, request(), window, cx);
+                    let mut view = LogView::new(core, request, window, cx);
                     view.stop_streaming();
                     view
                 })
@@ -272,8 +298,10 @@ async fn pause_holds_lines_back_and_scrolling_up_stops_following(cx: &mut TestAp
 
     // Home goes to the oldest line and stops following; End follows again and resumes a pause.
     press(cx, window, "home");
-    cx.wait_for(window, WAIT, |window, _| window.try_find(line_id(0)).is_some())
-        .await;
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(0)).is_some()
+    })
+    .await;
     assert!(!view.read_with(cx, |v, _| v.list.is_following_tail()));
     press(cx, window, "space");
     press(cx, window, "end");
@@ -311,7 +339,7 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
             [4, 9, 14, 19]
         );
         let line = v.snapshot.lines.get(9).unwrap();
-        let shown = crate::ui::log_model::shown_line(line, v.timestamps, &v.query, None);
+        let shown = crate::ui::log_model::shown_line(line, v.format(), &v.query, None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "ERROR");
         assert_eq!(line.severity, flint_core::Severity::Error);
     });
@@ -439,7 +467,7 @@ async fn timestamps_and_wrap_toggle_without_reloading(cx: &mut TestAppContext) {
     let shown = |cx: &mut TestAppContext| {
         view.read_with(cx, |v, _| {
             let line = v.snapshot.lines.get(4).unwrap();
-            crate::ui::log_model::shown_line(line, v.timestamps, &v.query, None).text
+            crate::ui::log_model::shown_line(line, v.format(), &v.query, None).text
         })
     };
     assert_eq!(shown(cx), "ERROR line 4");
@@ -459,7 +487,7 @@ async fn timestamps_and_wrap_toggle_without_reloading(cx: &mut TestAppContext) {
     assert_eq!(shown(cx), "ERROR line 4");
 }
 
-// covers UP-45 (#75): save writes the chosen lines as shown, not redacted, where the user
+// covers UP-46 (#75): save writes the chosen lines as shown, not redacted, where the user
 // picked in the save dialog.
 #[gpui_kit::test]
 async fn save_writes_matches_as_shown_to_the_chosen_file(cx: &mut TestAppContext) {
@@ -530,4 +558,80 @@ async fn save_writes_matches_as_shown_to_the_chosen_file(cx: &mut TestAppContext
         note.contains("not redacted") && note.contains("2 lines"),
         "{note}"
     );
+}
+
+// covers UP-45: a workload tab prefixes each line with its pod and container (a view toggle,
+// copied as shown) and counts the workload's streams in the toolbar.
+#[gpui_kit::test]
+async fn a_workload_tab_shows_sources_and_stream_counts(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open_request(cx, core, workload_request());
+    assert_eq!(
+        view.read_with(cx, |v, _| v.tab_title()),
+        "deployment/web".to_owned()
+    );
+    let mut buffer = LogBuffer::new(100);
+    for (pod, text) in [
+        ("web-1", "GET /a"),
+        ("web-2", "ERROR boom"),
+        ("web-1", "GET /b"),
+    ] {
+        let mut line = LogLine::parse(&format!("2024-05-01T12:00:00Z {text}"), false);
+        line.source = Some(Arc::new(LineSource::new(pod, "app")));
+        buffer.push(line);
+    }
+    let stream = |pod: &str, state| StreamStatus {
+        source: Arc::new(LineSource::new(pod, "app")),
+        state,
+    };
+    let pods = PodSetStatus {
+        selector: Some("app=web".into()),
+        pods: 2,
+        streams: vec![
+            stream("web-1", LogState::Streaming),
+            stream("web-2", LogState::Streaming),
+        ],
+        max_streams: 50,
+        ..Default::default()
+    };
+    feed(
+        cx,
+        &view,
+        Arc::new(LogSnapshot {
+            lines: buffer.view(),
+            state: LogState::Streaming,
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: Some(Arc::new(pods)),
+        }),
+    );
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-streams").is_some()
+            && window.try_find("log-sources").is_some()
+            && window.try_find(line_id(2)).is_some()
+    })
+    .await;
+
+    press(cx, window, "cmd-a");
+    press(cx, window, "cmd-c");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(
+        copied,
+        "[web-1/app] GET /a\n[web-2/app] ERROR boom\n[web-1/app] GET /b"
+    );
+    // P hides the prefix without reloading; copy follows what is shown.
+    press(cx, window, "p");
+    press(cx, window, "cmd-c");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied, "GET /a\nERROR boom\nGET /b");
+
+    // With the prefix shown, the search finds a pod's lines by its name.
+    press(cx, window, "p");
+    view.update(cx, |v, cx| v.set_query("web-2".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 1
+    })
+    .await;
 }
