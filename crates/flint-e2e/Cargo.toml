@@ -33,6 +33,10 @@ base64.workspace = true
 anyhow.workspace = true
 # Scratch config directories for the app and the MCP server.
 tempfile.workspace = true
+# Process groups and liveness checks for the app the harness starts.
+libc.workspace = true
+# Reads scratch settings.toml (does it set `path`?).
+toml.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

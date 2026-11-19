@@ -6,8 +6,8 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
-use flint_e2e::app::{App, AppOptions, Test, WAIT};
+use anyhow::Result;
+use flint_e2e::app::{App, AppOptions, WAIT};
 use flint_e2e::backend::{Backend, TestCluster};
 use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Options, WatchStep};
 use serde_json::{Value, json};
@@ -28,16 +28,15 @@ fn row<'a>(state: &'a Value, name: &str) -> &'a Value {
         .unwrap_or(&Value::Null)
 }
 
-/// Waits until `check` holds on the fake server, polling.
-fn until(what: &str, mut check: impl FnMut() -> bool) -> Result<()> {
-    let deadline = Instant::now() + WAIT;
-    while !check() {
-        if Instant::now() > deadline {
-            bail!("timed out waiting for {what}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    Ok(())
+/// A pod row for the fake server with every column `kubectl get pods` fills.
+fn pod_row(fake: &FakeApiServer, name: &str, status: &str) -> flint_e2e::fake_api::FakeRow {
+    let ready = if status == "Running" { "1/1" } else { "0/1" };
+    fake.new_row(
+        &fake.gvr("pods"),
+        Some("demo"),
+        name,
+        &[("Ready", ready), ("Status", status), ("Restarts", "0")],
+    )
 }
 
 // covers UP-20
@@ -62,17 +61,12 @@ fn up_20_browse_pods_with_live_updates() -> Result<()> {
     app.screenshot_themes("up20-pods")?;
 
     // A pod appears Pending, turns Running, and goes away, each within about a second.
-    let pending = fake.new_row(
-        &pods,
-        Some("demo"),
-        "scaled-up",
-        &[("Ready", "0/1"), ("Status", "Pending")],
-    );
-    until("a pods watch", || fake.open_watches(&pods) >= 1)?;
+    let pending = pod_row(fake, "scaled-up", "Pending");
+    until("a pods watch", || fake.open_watches(&pods), |n| *n >= 1)?;
     let quick = Duration::from_secs(2);
     let start = Instant::now();
     fake.send_watch(&pods, WatchStep::Added(pending.clone()));
-    app.wait_for(
+    app.wait_for_within(
         "/list/rows",
         Any(json!({"name": "scaled-up", "cells_by_column": {"Status": "Pending"}})),
         quick,
@@ -82,13 +76,13 @@ fn up_20_browse_pods_with_live_updates() -> Result<()> {
         .with_cell(fake.column(&pods, "Ready").unwrap(), "1/1")
         .with_cell(fake.column(&pods, "Status").unwrap(), "Running");
     fake.send_watch(&pods, WatchStep::Modified(running.clone()));
-    app.wait_for(
+    app.wait_for_within(
         "/list/rows",
         Any(json!({"name": "scaled-up", "cells_by_column": {"Status": "Running", "Ready": "1/1"}})),
         quick,
     )?;
     fake.send_watch(&pods, WatchStep::Deleted(running));
-    let state = app.wait_for("/list/shown", Equals(17.into()), quick)?;
+    let state = app.wait_for_within("/list/shown", Equals(17.into()), quick)?;
     assert!(row(&state, "scaled-up").is_null());
     eprintln!("add, modify and delete shown in {:?}", start.elapsed());
 
@@ -114,7 +108,7 @@ fn up_21_filter_and_sort() -> Result<()> {
 
     // One namespace, then two.
     app.dispatch("workspace::SetNamespaces", json!({"namespaces": ["demo"]}))?;
-    let state = wait(&app, "/list/shown", Equals(7.into()))?;
+    let state = app.wait_for("/list/shown", Equals(7.into()))?;
     assert_eq!(state["header"]["namespaces"], json!(["demo"]));
     assert!(
         state["list"]["rows"]
@@ -127,30 +121,29 @@ fn up_21_filter_and_sort() -> Result<()> {
         "workspace::ToggleNamespace",
         json!({"namespace": "local-path-storage"}),
     )?;
-    wait(&app, "/list/shown", Equals(8.into()))?;
+    app.wait_for("/list/shown", Equals(8.into()))?;
     app.dispatch(
         "workspace::ToggleNamespace",
         json!({"namespace": "local-path-storage"}),
     )?;
-    wait(&app, "/list/shown", Equals(7.into()))?;
+    app.wait_for("/list/shown", Equals(7.into()))?;
 
     // A text filter, typed into the filter field.
     app.dispatch("resource_list::FocusFilter", Value::Null)?;
-    wait(&app, "/focus", Equals("list_filter".into()))?;
+    app.wait_for("/focus", Equals("list_filter".into()))?;
     app.type_text("web")?;
-    let state = wait(&app, "/list/shown", Equals(2.into()))?;
+    let state = app.wait_for("/list/shown", Equals(2.into()))?;
     assert_eq!(state["list"]["filter"], "web");
     assert!(row_names(&state).iter().all(|n| n.starts_with("web-")));
     app.screenshot_themes("up21-filtered")?;
     for _ in 0..3 {
         app.press_key("backspace")?;
     }
-    wait(&app, "/list/shown", Equals(7.into()))?;
+    app.wait_for("/list/shown", Equals(7.into()))?;
 
     // Sort by a column: ascending, then descending.
     app.dispatch("resource_list::SortBy", json!({"column": "Name"}))?;
-    let state = wait(
-        &app,
+    let state = app.wait_for(
         "/list/sort",
         Equals(json!({"column": "Name", "descending": false})),
     )?;
@@ -159,9 +152,10 @@ fn up_21_filter_and_sort() -> Result<()> {
     sorted.sort();
     assert_eq!(names, sorted);
     app.dispatch("resource_list::SortBy", json!({"column": "Name"}))?;
-    let state = wait(&app, "/list/sort/descending", Equals(true.into()))?;
+    let state = app.wait_for("/list/sort/descending", Equals(true.into()))?;
     sorted.reverse();
     assert_eq!(row_names(&state), sorted);
+    app.screenshot_themes("up21-sorted")?;
 
     // The namespace choice is per cluster, and survives a switch and a relaunch.
     connect(&app, TwoClusters::B)?;
@@ -173,11 +167,11 @@ fn up_21_filter_and_sort() -> Result<()> {
         state["header"]
     );
     connect(&app, TwoClusters::A)?;
-    wait(&app, "/header/namespaces", Equals(json!(["demo"])))?;
+    app.wait_for("/header/namespaces", Equals(json!(["demo"])))?;
     let (scratch, _) = app.quit()?;
     let app = App::launch(AppOptions::new(two.kubeconfig()).reuse(scratch))?;
     connect(&app, TwoClusters::A)?;
-    wait(&app, "/header/namespaces", Equals(json!(["demo"])))?;
+    app.wait_for("/header/namespaces", Equals(json!(["demo"])))?;
     Ok(())
 }
 
@@ -190,7 +184,7 @@ fn up_22_browse_a_crd() -> Result<()> {
     };
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
     connect(&app, &cluster.context)?;
-    let state = wait(&app, "/nav/status", Equals("ready".into()))?;
+    let state = app.wait_for("/nav/status", Equals("ready".into()))?;
     let sections = state["nav"]["sections"].as_array().unwrap();
     assert!(
         sections.iter().any(|s| s["title"] == "fixtures.flint.dev"),
@@ -200,8 +194,7 @@ fn up_22_browse_a_crd() -> Result<()> {
         "workspace::ToggleNavSection",
         json!({"section": "fixtures.flint.dev"}),
     )?;
-    let state = wait(
-        &app,
+    let state = app.wait_for(
         "/nav/sections",
         Any(json!({"title": "fixtures.flint.dev", "collapsed": false})),
     )?;
@@ -227,7 +220,7 @@ fn up_22_browse_a_crd() -> Result<()> {
     );
     // Color is a priority-1 printer column: shown with -o wide, as kubectl does.
     app.dispatch("resource_list::ToggleWide", Value::Null)?;
-    let state = wait(&app, "/list/wide", Equals(true.into()))?;
+    let state = app.wait_for("/list/wide", Equals(true.into()))?;
     assert_eq!(
         state["list"]["columns"],
         json!(["Name", "Namespace", "Size", "Color", "Age"])
@@ -255,7 +248,7 @@ fn up_23_inspect_an_object() -> Result<()> {
         .find(|n| n.starts_with("web-"))
         .expect("a web pod");
     app.select_row(Some("demo"), &web)?;
-    let state = wait(&app, "/detail/fetch", Equals("loaded".into()))?;
+    let state = app.wait_for("/detail/fetch", Equals("loaded".into()))?;
     let detail = &state["detail"];
     assert_eq!(detail["name"], web);
     assert_eq!(detail["tab"], "overview");
@@ -269,20 +262,20 @@ fn up_23_inspect_an_object() -> Result<()> {
     assert!(count("Labels") >= Some(1), "{detail}");
     assert_eq!(count("Owners"), Some(1), "{detail}");
     assert!(count("Conditions") >= Some(1), "{detail}");
-    assert!(count("Events").is_some(), "{detail}");
+    assert!(count("Events") >= Some(1), "the pod's events: {detail}");
     assert_eq!(state["header"]["breadcrumb"][2], web);
     app.screenshot_themes("up23-detail-overview")?;
 
     app.dispatch("detail::ShowYaml", Value::Null)?;
-    let state = wait(&app, "/detail/tab", Equals("yaml".into()))?;
+    let state = app.wait_for("/detail/tab", Equals("yaml".into()))?;
     assert_eq!(state["detail"]["managed_fields_shown"], false);
     app.screenshot_themes("up23-detail-yaml")?;
     app.dispatch("detail::ShowOverview", Value::Null)?;
-    wait(&app, "/detail/tab", Equals("overview".into()))?;
+    app.wait_for("/detail/tab", Equals("overview".into()))?;
 
     // Escape in the list closes the detail.
     app.dispatch("resource_list::CloseDetail", Value::Null)?;
-    wait(&app, "/detail", Equals(Value::Null))?;
+    app.wait_for("/detail", Equals(Value::Null))?;
     Ok(())
 }
 
@@ -303,32 +296,36 @@ fn up_24_switch_clusters() -> Result<()> {
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     connect(&app, TwoClusters::A)?;
     open_live(&app, "pods", 17)?;
-    until("fake-a's watches", || open_watches(&two.a, &gvrs) >= 3)?;
+    until(
+        "fake-a's watches",
+        || open_watches(&two.a, &gvrs),
+        |n| *n >= 3,
+    )?;
 
     // Away to fake-b: fake-a's watches stop.
     connect(&app, TwoClusters::B)?;
-    until("fake-a's watches to stop", || {
-        open_watches(&two.a, &gvrs) == 0
-    })?;
+    until(
+        "fake-a's watches to stop",
+        || open_watches(&two.a, &gvrs),
+        |n| *n == 0,
+    )?;
     open_live(&app, "pods", 17)?;
-    app.screenshot("up24-switched")?;
 
     // A change on fake-a while nobody watches; switching back loads fresh data.
     let pods = two.a.gvr("pods");
-    two.a.set_row(
-        &pods,
-        two.a
-            .new_row(&pods, Some("demo"), "while-away", &[("Status", "Running")]),
-    );
+    two.a
+        .set_row(&pods, pod_row(&two.a, "while-away", "Running"));
     app.select_cluster(TwoClusters::A)?;
-    wait(&app, "/active_cluster", Equals(TwoClusters::A.into()))?;
+    app.wait_for("/active_cluster", Equals(TwoClusters::A.into()))?;
     if app.state()?["list"].is_null() {
         app.open_view("pods")?;
     }
-    wait(&app, "/list/rows", Any(json!({"name": "while-away"})))?;
-    until("fake-b's watches to stop", || {
-        open_watches(&two.b, &gvrs) == 0
-    })?;
+    app.wait_for("/list/rows", Any(json!({"name": "while-away"})))?;
+    until(
+        "fake-b's watches to stop",
+        || open_watches(&two.b, &gvrs),
+        |n| *n == 0,
+    )?;
     Ok(())
 }
 
@@ -341,40 +338,43 @@ fn up_25_change_the_watch_mode() -> Result<()> {
     let (pods, deployments) = (fake.gvr("pods"), fake.gvr("deployments"));
     open_live(&app, "pods", 17)?;
     // Default mode, all kinds: kinds not open are watched too.
-    until("deployments watched", || {
-        fake.open_watches(&deployments) >= 1
-    })?;
+    until(
+        "deployments watched",
+        || fake.open_watches(&deployments),
+        |n| *n >= 1,
+    )?;
 
     // On view, for this cluster: only the open list is watched, and it persists.
     app.dispatch("workspace::WatchOpenViewsOnly", Value::Null)?;
-    let state = wait(&app, "/header/watch_mode_source", Equals("cluster".into()))?;
+    let state = app.wait_for("/header/watch_mode_source", Equals("cluster".into()))?;
     assert_eq!(state["header"]["watch_mode"], "Live: open views only");
-    until("deployments unwatched", || {
-        fake.open_watches(&deployments) == 0
-    })?;
+    until(
+        "deployments unwatched",
+        || fake.open_watches(&deployments),
+        |n| *n == 0,
+    )?;
     assert!(fake.open_watches(&pods) >= 1);
     let settings = std::fs::read_to_string(app.config_dir().join("settings.toml"))?;
     assert!(
         settings.contains("cluster_watch_mode") && settings.contains(&cluster.context),
         "{settings}"
     );
-    app.screenshot_themes("up25-on-view")?;
 
     // Back to the default; then "on view" as the default for every cluster.
     app.dispatch("workspace::UseDefaultWatchMode", Value::Null)?;
-    wait(&app, "/header/watch_mode_source", Equals("default".into()))?;
-    until("deployments watched again", || {
-        fake.open_watches(&deployments) >= 1
-    })?;
-    app.dispatch("workspace::DefaultWatchOpenViewsOnly", Value::Null)?;
-    wait(
-        &app,
-        "/header/watch_mode",
-        Equals("Live: open views only".into()),
+    app.wait_for("/header/watch_mode_source", Equals("default".into()))?;
+    until(
+        "deployments watched again",
+        || fake.open_watches(&deployments),
+        |n| *n >= 1,
     )?;
-    until("deployments unwatched", || {
-        fake.open_watches(&deployments) == 0
-    })?;
+    app.dispatch("workspace::DefaultWatchOpenViewsOnly", Value::Null)?;
+    app.wait_for("/header/watch_mode", Equals("Live: open views only".into()))?;
+    until(
+        "deployments unwatched",
+        || fake.open_watches(&deployments),
+        |n| *n == 0,
+    )?;
     let settings = std::fs::read_to_string(app.config_dir().join("settings.toml"))?;
     assert!(settings.contains("watch_mode = \"on_view\""), "{settings}");
     Ok(())
@@ -388,37 +388,36 @@ fn up_27_recover_from_a_broken_watch() -> Result<()> {
     let fake = cluster.fake_server().expect("a fake server");
     let pods = fake.gvr("pods");
     open_live(&app, "pods", 17)?;
-    until("a pods watch", || fake.open_watches(&pods) >= 1)?;
+    until("a pods watch", || fake.open_watches(&pods), |n| *n >= 1)?;
 
     // The watch expires (410) after a change it never sent: the list re-syncs on its own.
-    fake.set_row(
-        &pods,
-        fake.new_row(&pods, Some("demo"), "missed-1", &[("Status", "Running")]),
-    );
+    fake.set_row(&pods, pod_row(fake, "missed-1", "Running"));
     fake.send_watch(&pods, WatchStep::Expired);
-    let state = wait(&app, "/list/rows", Any(json!({"name": "missed-1"})))?;
+    let state = app.wait_for("/list/rows", Any(json!({"name": "missed-1"})))?;
     assert_eq!(state["list"]["sync"], "live");
 
     // The connection drops and the server stays away: "reconnecting", never "live".
     fake.inject(Fault::drop_connection().on(&pods));
     fake.send_watch(&pods, WatchStep::Drop);
-    let state = wait(&app, "/list/sync", Equals("reconnecting".into()))?;
-    // The rows it had stay, under the "reconnecting" chip, not as live data.
+    let state = app.wait_for("/list/sync", Equals("reconnecting".into()))?;
+    // The rows it had stay, under the "reconnecting" chip and a banner, not as live data.
     assert!(!row(&state, "missed-1").is_null(), "{}", state["list"]);
+    let banners = state["list"]["banners"].to_string();
+    assert!(banners.contains("Reconnecting"), "{banners}");
+    // TODO(#98): the banner quotes the raw error ("watch stream broke: ServiceError: error
+    // reading a body from connection"). Once #98 lands, check it is plain words:
+    // assert!(!banners.contains("ServiceError"), "{banners}");
     app.screenshot_themes("up27-reconnecting")?;
     assert_eq!(app.state()?["list"]["sync"], "reconnecting");
 
     // The server is back with a change made meanwhile: it shows, and the list is live again.
-    fake.set_row(
-        &pods,
-        fake.new_row(&pods, Some("demo"), "missed-2", &[("Status", "Running")]),
-    );
+    fake.set_row(&pods, pod_row(fake, "missed-2", "Running"));
     fake.clear_faults();
-    let state = wait(&app, "/list/rows", Any(json!({"name": "missed-2"})))?;
+    let state = app.wait_for("/list/rows", Any(json!({"name": "missed-2"})))?;
     let state = if state["list"]["sync"] == "live" {
         state
     } else {
-        wait(&app, "/list/sync", Equals("live".into()))?
+        app.wait_for("/list/sync", Equals("live".into()))?
     };
     assert!(!row(&state, "missed-1").is_null());
     // Each re-sync is a fresh streaming list (a watch from the current state), not a resume.
@@ -440,7 +439,7 @@ fn up_27_recover_from_a_broken_watch() -> Result<()> {
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_28_an_api_without_tables() -> Result<()> {
     let configmaps = Gvr::core("configmaps");
-    let (_cluster, app) = fake_app(Options {
+    let (cluster, app) = fake_app(Options {
         plain_only: vec![configmaps],
         ..Options::default()
     })?;
@@ -453,8 +452,23 @@ fn up_28_an_api_without_tables() -> Result<()> {
 
     // metrics.k8s.io is polled, not watched.
     app.open_view("pods.metrics.k8s.io")?;
-    let state = wait(&app, "/list/sync", Equals("polled".into()))?;
+    let state = app.wait_for("/list/sync", Equals("polled".into()))?;
     assert_eq!(state["list"]["kind"], "pods.metrics.k8s.io");
-    wait(&app, "/list/rows", Test::AtLeast(1.0))?;
+    app.wait_for("/list/rows", Test::at_least(1))?;
+    app.screenshot_themes("up28-metrics-polled")?;
+    let fake = cluster.fake_server().expect("a fake server");
+    let watched: Vec<String> = fake
+        .requests()
+        .iter()
+        .filter(|r| r.path.starts_with("/apis/metrics.k8s.io/") && r.query.contains("watch="))
+        .map(ToString::to_string)
+        .collect();
+    assert!(watched.is_empty(), "metrics were watched: {watched:?}");
+    let polled = fake
+        .requests()
+        .iter()
+        .filter(|r| r.path.starts_with("/apis/metrics.k8s.io/") && r.path.ends_with("/pods"))
+        .count();
+    assert!(polled >= 1, "metrics were never listed");
     Ok(())
 }

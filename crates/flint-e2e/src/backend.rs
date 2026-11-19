@@ -5,7 +5,8 @@
 //! kind. Tests that script watches or inject faults use [`Backend::Fake`] directly.
 //!
 //! Safety: a Kind backend refuses a kubeconfig whose current context is not served from this
-//! machine (127.0.0.1, localhost or ::1), so a mistyped variable cannot reach a real cluster.
+//! machine (127.0.0.1, localhost or ::1), so a mistyped variable cannot reach a real cluster, and
+//! gives the app a copy holding only that context, never the whole file.
 
 use std::path::{Path, PathBuf};
 
@@ -86,19 +87,36 @@ impl TestCluster {
         })
     }
 
-    /// The kind cluster in `kubeconfig`, its current context. Refuses one not on this machine.
+    /// The kind cluster in `kubeconfig`: its current context, copied with its cluster and user
+    /// into a one-context kubeconfig in a scratch directory, so the app sees nothing else from
+    /// that file. Refuses a context whose server is not on this machine.
     pub fn kind(kubeconfig: &Path) -> Result<TestCluster> {
         let loaded = flint_core::kubeconfig::load(&[kubeconfig.to_owned()]);
         if let Some((path, error)) = loaded.errors.first() {
             bail!("{}: {error}", path.display());
         }
-        let context = loaded
-            .merged
+        let merged = &loaded.merged;
+        let context = merged
             .current_context
             .clone()
             .with_context(|| format!("{} has no current context", kubeconfig.display()))?;
-        let server = loaded
-            .context(&context)
+        let named = merged
+            .contexts
+            .iter()
+            .find(|c| c.name == context)
+            .with_context(|| format!("context {context} is not defined"))?;
+        let inner = named
+            .context
+            .as_ref()
+            .with_context(|| format!("context {context} is empty"))?;
+        let cluster = merged
+            .clusters
+            .iter()
+            .find(|c| c.name == inner.cluster)
+            .with_context(|| format!("context {context} names no defined cluster"))?;
+        let server = cluster
+            .cluster
+            .as_ref()
             .and_then(|c| c.server.clone())
             .with_context(|| format!("context {context} has no server"))?;
         if !is_local(&server) {
@@ -108,13 +126,29 @@ impl TestCluster {
                 kubeconfig.display()
             );
         }
+        let user = inner
+            .user
+            .as_ref()
+            .and_then(|u| merged.auth_infos.iter().find(|a| &a.name == u));
+        let one = kube::config::Kubeconfig {
+            api_version: Some("v1".into()),
+            kind: Some("Config".into()),
+            current_context: Some(context.clone()),
+            clusters: vec![cluster.clone()],
+            contexts: vec![named.clone()],
+            auth_infos: user.into_iter().cloned().collect(),
+            ..kube::config::Kubeconfig::default()
+        };
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kubeconfig");
+        crate::fake_api::kubeconfig::write(&path, &one)?;
         Ok(TestCluster {
             backend: Backend::Kind,
-            kubeconfig: kubeconfig.to_owned(),
+            kubeconfig: path,
             context,
             server,
             fake: None,
-            _dir: None,
+            _dir: Some(dir),
         })
     }
 
@@ -124,17 +158,22 @@ impl TestCluster {
     }
 }
 
-/// An `https` server on this machine.
+/// An `https` server on this machine: the URL's host is exactly 127.0.0.1, localhost or ::1,
+/// with no user info (`https://localhost@prod.example.com` is prod).
 fn is_local(server: &str) -> bool {
-    let Some(rest) = server.strip_prefix("https://") else {
+    let Ok(uri) = server.parse::<http::Uri>() else {
         return false;
     };
-    let host = rest.split('/').next().unwrap_or("");
-    let host = match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    let Some(authority) = uri.authority() else {
+        return false;
     };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    if uri.scheme_str() != Some("https") || authority.as_str().contains('@') {
+        return false;
+    }
+    matches!(
+        uri.host(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    )
 }
 
 #[cfg(test)]
@@ -149,6 +188,10 @@ mod tests {
         assert!(!is_local("http://127.0.0.1:6443"));
         assert!(!is_local("https://eks.amazonaws.com"));
         assert!(!is_local("https://127.0.0.1.example.com:443"));
+        assert!(!is_local("https://localhost:6443@prod.example.com"));
+        assert!(!is_local("https://user@127.0.0.1:6443"));
+        assert!(!is_local("https://prod.example.com/127.0.0.1"));
+        assert!(!is_local("not a url"));
     }
 
     #[test]
@@ -162,6 +205,28 @@ mod tests {
         .unwrap();
         let error = TestCluster::kind(&path).err().unwrap();
         assert!(error.to_string().contains("refusing"), "{error}");
+    }
+
+    #[test]
+    fn kind_passes_only_the_local_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kubeconfig");
+        std::fs::write(
+            &path,
+            "apiVersion: v1\nkind: Config\ncurrent-context: kind-dev\nclusters:\n- name: kind\n  cluster: {server: \"https://127.0.0.1:6443\"}\n- name: prod\n  cluster: {server: \"https://10.0.0.1:6443\"}\nusers:\n- name: kind\n  user: {token: kind-token}\n- name: prod\n  user: {token: prod-token}\ncontexts:\n- name: kind-dev\n  context: {cluster: kind, user: kind}\n- name: prod\n  context: {cluster: prod, user: prod}\n",
+        )
+        .unwrap();
+        let cluster = TestCluster::kind(&path).unwrap();
+        assert_ne!(cluster.kubeconfig, path);
+        let written = std::fs::read_to_string(&cluster.kubeconfig).unwrap();
+        assert!(written.contains("kind-token"), "{written}");
+        assert!(
+            !written.contains("prod") && !written.contains("10.0.0.1"),
+            "{written}"
+        );
+        let loaded = flint_core::kubeconfig::load(std::slice::from_ref(&cluster.kubeconfig));
+        let names: Vec<&str> = loaded.contexts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["kind-dev"]);
     }
 
     #[test]

@@ -148,3 +148,24 @@ async fn switching_appearance_swaps_the_theme_colors(cx: &mut TestAppContext) {
         .await;
     assert_eq!(checked(cx), ["Use System Appearance"]);
 }
+
+// covers UP-06: switching the theme keeps the sidebar's notice (the last error) on screen.
+#[gpui_kit::test]
+async fn switching_appearance_keeps_the_last_error(cx: &mut TestAppContext) {
+    let (window, model, _dir) = open(cx);
+    cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
+        .await;
+    cx.update(|cx| {
+        model.update(cx, |m, _| {
+            m.last_error = Some("\"gone\" was removed from your kubeconfig files.".into())
+        })
+    });
+    cx.update(|cx| cx.dispatch_action(&AppearanceDark));
+    cx.wait_for(window, WAIT, shows("Flint Dark", ThemeMode::Dark))
+        .await;
+    let error = cx.update(|cx| model.read(cx).last_error.clone());
+    assert_eq!(
+        error.as_deref(),
+        Some("\"gone\" was removed from your kubeconfig files.")
+    );
+}

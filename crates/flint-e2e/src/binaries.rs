@@ -73,6 +73,15 @@ fn locate(
 /// Runs `cargo build <args>` in the workspace and returns the path of the executable `name`.
 fn build(args: &[&str], name: &str) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    eprintln!(
+        "flint-e2e: building {name} (cargo build {}); set {} to use a prebuilt one",
+        args.join(" "),
+        if name == "flint" {
+            APP_BIN_ENV
+        } else {
+            MCP_BIN_ENV
+        }
+    );
     let output = Command::new(cargo)
         .arg("build")
         .args(args)

@@ -3,7 +3,13 @@
 //!
 //! [`Mcp::start`] runs the GPUI-free `flint-mcp` binary, so MCP e2e tests run on Linux too.
 //! [`Mcp::flint`] runs `flint mcp` from an app binary, for tests that check the app and the
-//! server agree. Either way the server gets only the given kubeconfig and config directory.
+//! server agree.
+//!
+//! Either way the server gets exactly the given kubeconfig (never an empty one, which would fall
+//! back to `~/.kube/config`), the given config directory (with a `settings.toml` setting a fixed
+//! `path` when there is none, so no login shell runs), and a scratch `HOME`. Inherited
+//! `KUBECONFIG` and `FLINT_*` variables are dropped. The server exits when its stdin closes, so
+//! it never outlives the test.
 
 use std::ffi::OsStr;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -16,6 +22,7 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
 use crate::binaries;
+use crate::scratch::{self, Scratch};
 
 /// How long one request may take.
 const ANSWER: Duration = Duration::from_secs(60);
@@ -26,6 +33,8 @@ pub struct Mcp {
     stdin: ChildStdin,
     lines: mpsc::Receiver<String>,
     next_id: u64,
+    /// The scratch `HOME`.
+    _home: Scratch,
 }
 
 impl Mcp {
@@ -41,6 +50,13 @@ impl Mcp {
     }
 
     fn spawn(binary: &Path, args: &[&str], kubeconfig: &OsStr, config_dir: &Path) -> Result<Mcp> {
+        if std::env::split_paths(kubeconfig).all(|p| p.as_os_str().is_empty()) {
+            bail!("the kubeconfig names no file; the server would read ~/.kube/config");
+        }
+        if !config_dir.join("settings.toml").exists() {
+            scratch::write_settings(config_dir, "")?;
+        }
+        let home = Scratch::new()?;
         let mut command = Command::new(binary);
         for (key, _) in std::env::vars_os() {
             let key = key.to_string_lossy();
@@ -52,6 +68,7 @@ impl Mcp {
             .args(args)
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
+            .env("HOME", home.home())
             .env("FLINT_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -74,6 +91,7 @@ impl Mcp {
             stdin,
             lines,
             next_id: 0,
+            _home: home,
         };
         let init = mcp.request(
             "initialize",
@@ -180,6 +198,17 @@ impl Drop for Mcp {
 mod tests {
     // The server itself is exercised by tests/mcp.rs; this checks only that a missing binary is
     // an error, not a hang.
+    #[test]
+    fn an_empty_kubeconfig_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for empty in ["", ":", "::"] {
+            let error = super::Mcp::flint(&dir.path().join("nope"), empty, dir.path())
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("names no file"), "{error}");
+        }
+    }
+
     #[test]
     fn a_missing_binary_is_an_error() {
         let dir = tempfile::tempdir().unwrap();

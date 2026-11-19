@@ -38,6 +38,13 @@ pub use setup::Places;
 /// The exit code when the channel cannot start.
 pub const EXIT_CODE: i32 = 3;
 
+/// Set to `1` by a test harness that holds the app's stdin open: the app quits when stdin reaches
+/// end of file, so it never outlives a harness that was killed.
+pub const EXIT_ON_STDIN_EOF_ENV: &str = "FLINT_AUTOMATION_EXIT_ON_STDIN_EOF";
+
+/// How long a quit may take after stdin closes before the process exits anyway.
+const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The most requests in flight at once; more get a `failed` response at once.
 const MAX_IN_FLIGHT: usize = 16;
 
@@ -112,12 +119,62 @@ pub fn start(places: Places, window: AnyWindowHandle, workspace: Entity<Workspac
         async {}
     })
     .detach();
+    if exit_on_stdin_eof(std::env::var_os(EXIT_ON_STDIN_EOF_ENV).as_deref()) {
+        quit_on_stdin_eof(cx);
+    }
     tracing::info!(path = %places.socket.display(), "automation channel listening");
+}
+
+fn exit_on_stdin_eof(flag: Option<&std::ffi::OsStr>) -> bool {
+    flag.is_some_and(|v| v == "1")
+}
+
+/// Quits the app when stdin reaches end of file (the harness died or closed it), and exits the
+/// process if quitting takes longer than [`QUIT_GRACE`].
+fn quit_on_stdin_eof(cx: &mut App) {
+    let (closed, on_close) = async_channel::bounded::<()>(1);
+    let spawned = std::thread::Builder::new()
+        .name("automation-stdin".into())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut stdin = std::io::stdin().lock();
+            let mut sink = [0u8; 256];
+            loop {
+                match stdin.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = closed.send_blocking(());
+            std::thread::sleep(QUIT_GRACE);
+            std::process::exit(0);
+        });
+    if let Err(e) = spawned {
+        fail(&format!("could not watch stdin: {e}"));
+    }
+    cx.spawn(async move |cx| {
+        if on_close.recv().await.is_ok() {
+            tracing::info!("stdin closed: quitting");
+            cx.update(|cx| cx.quit());
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
 mod tests {
     use gpui_kit::TestAppContext;
+
+    #[test]
+    fn only_the_harness_flag_quits_on_stdin_eof() {
+        use super::exit_on_stdin_eof;
+        assert!(exit_on_stdin_eof(Some("1".as_ref())));
+        assert!(!exit_on_stdin_eof(Some("0".as_ref())));
+        assert!(!exit_on_stdin_eof(Some("".as_ref())));
+        assert!(!exit_on_stdin_eof(None));
+    }
 
     use super::{Places, start};
     use crate::ui::support_tests::open_workspace;

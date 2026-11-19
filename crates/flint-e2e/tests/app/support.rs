@@ -1,33 +1,34 @@
 //! Helpers shared by the app e2e tests.
 
+use std::fmt::Debug;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use flint_e2e::app::{App, Test, WAIT};
+use anyhow::{Result, bail};
+use flint_e2e::app::{App, WAIT};
 use flint_e2e::fake_api::{FakeApiServer, Options, write_kubeconfigs};
 use flint_e2e::scratch::Scratch;
 use serde_json::Value;
 
-pub use flint_e2e::app::Test::{Any, AtLeast, Equals, Exists};
+pub use flint_e2e::app::Test::{self, Any, Contains, Equals, Exists};
 
 /// Selects `cluster` and waits until it is connected and its kinds are discovered.
 pub fn connect(app: &App, cluster: &str) -> Result<Value> {
     app.select_cluster(cluster)?;
-    app.wait_for("/active_cluster", Equals(cluster.into()), WAIT)?;
+    app.wait_for("/active_cluster", Equals(cluster.into()))?;
     app.wait_for(
         "/clusters",
         Any(serde_json::json!({"name": cluster, "connection": "connected"})),
-        WAIT,
     )?;
     // Discovery done: the navigation lists the kinds, and views can open.
-    Ok(app.wait_for("/nav/status", Equals("ready".into()), WAIT)?)
+    Ok(app.wait_for("/nav/status", Equals("ready".into()))?)
 }
 
 /// Opens `kind`'s list and waits until it is live with at least `rows` rows shown.
 pub fn open_live(app: &App, kind: &str, rows: usize) -> Result<Value> {
     app.open_view(kind)?;
-    app.wait_for("/list/sync", Equals("live".into()), WAIT)?;
-    Ok(app.wait_for("/list/rows", AtLeast(rows as f64), WAIT)?)
+    app.wait_for("/list/sync", Equals("live".into()))?;
+    Ok(app.wait_for("/list/rows", Test::at_least(rows as u32))?)
 }
 
 /// The names of the rows shown.
@@ -95,7 +96,23 @@ pub fn write(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Waits for the value at `pointer` to pass `test`, with the default wait.
-pub fn wait(app: &App, pointer: &str, test: Test) -> Result<Value> {
-    Ok(app.wait_for(pointer, test, WAIT)?)
+/// Polls `observe` until `done` holds on what it returns (for things outside the app's state,
+/// such as the fake server's open watches), for up to [`WAIT`]. A timeout names `what` and the
+/// last value seen.
+pub fn until<T: Debug>(
+    what: &str,
+    mut observe: impl FnMut() -> T,
+    done: impl Fn(&T) -> bool,
+) -> Result<T> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let seen = observe();
+        if done(&seen) {
+            return Ok(seen);
+        }
+        if Instant::now() > deadline {
+            bail!("timed out after {WAIT:?} waiting for {what}; last saw {seen:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
