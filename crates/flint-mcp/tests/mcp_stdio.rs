@@ -67,7 +67,8 @@ fn server_of(kubeconfig: &std::path::Path) -> String {
 
 struct Server {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once closed, which ends the server.
+    stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<String>,
     next_id: u64,
 }
@@ -96,7 +97,7 @@ impl Server {
         });
         let mut server = Server {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines,
             next_id: 0,
         };
@@ -132,8 +133,9 @@ impl Server {
     }
 
     fn send(&mut self, msg: Value) {
-        writeln!(self.stdin, "{msg}").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
     }
 
     /// Calls a tool; returns (is_error, text).
@@ -154,9 +156,24 @@ impl Server {
 }
 
 impl Drop for Server {
+    /// Closes stdin and expects a clean exit, so the server's shutdown runs in full (and, under
+    /// LeakSanitizer, its leak check, which fails the exit status). Kills it if it hangs.
     fn drop(&mut self) {
+        self.stdin = None;
+        for _ in 0..200 {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                if !std::thread::panicking() {
+                    assert!(status.success(), "flint-mcp exited with {status}");
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !std::thread::panicking() {
+            panic!("flint-mcp did not exit within 10 s of stdin closing");
+        }
     }
 }
 
@@ -191,6 +208,8 @@ fn logs_stay_off_stdout_and_eof_ends_the_server() {
         String::from_utf8_lossy(&out.stdout)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Exactly the failure code: LeakSanitizer exits with its own code when the server leaks.
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("using default settings"), "{stderr}");
     assert!(stderr.contains("mcp server failed"), "{stderr}");
 }
