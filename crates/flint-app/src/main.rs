@@ -4,8 +4,7 @@ mod ui;
 
 use std::process::ExitCode;
 
-use flint_core::bootstrap::{self, Bootstrap};
-use flint_core::env_path::PathSource;
+use flint_core::bootstrap;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -51,6 +50,11 @@ fn main() -> ExitCode {
         }
     };
 
+    if mode == Mode::Mcp {
+        // SAFETY: nothing has started a thread yet.
+        return unsafe { flint_mcp::serve_stdio_main("flint") };
+    }
+
     // SAFETY: nothing has started a thread yet. This must stay ahead of anything that might:
     // it changes the process environment (PATH), which is only sound while single-threaded.
     let boot = match unsafe { bootstrap::bootstrap() } {
@@ -60,48 +64,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    init_logging();
-    log_bootstrap(&boot);
-
-    match mode {
-        Mode::App => {
-            ui::run(boot);
-            ExitCode::SUCCESS
-        }
-        Mode::Mcp => match flint_mcp::run_stdio(&boot) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                tracing::error!("mcp server failed: {e:#}");
-                ExitCode::FAILURE
-            }
-        },
-    }
-}
-
-/// Logs go to stderr: in `flint mcp`, stdout carries the protocol.
-fn init_logging() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("FLINT_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-}
-
-fn log_bootstrap(boot: &Bootstrap) {
-    match &boot.path.source {
-        PathSource::Settings => tracing::info!("PATH from settings.toml"),
-        PathSource::LoginShell => tracing::info!("PATH from login shell"),
-        PathSource::Fallback(reason) => {
-            tracing::warn!(reason, "PATH from fallback (login shell not used)")
-        }
-    }
-    tracing::debug!(path = %boot.path.value, "resolved PATH");
-    tracing::info!(config_dir = %boot.config_dir.display(), "config directory");
-    if let Some(e) = &boot.settings_error {
-        tracing::warn!("using default settings: {e}");
-    }
+    bootstrap::init_logging();
+    boot.log_summary();
+    ui::run(boot);
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

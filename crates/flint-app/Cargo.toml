@@ -16,7 +16,6 @@ path = "src/main.rs"
 flint-core.workspace = true
 gpui-kit.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 flint-mcp.workspace = true
 # Detail view: the object as JSON, its events, and a redacted YAML rendering for Secrets.
 k8s-openapi.workspace = true

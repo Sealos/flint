@@ -8,8 +8,38 @@ mod server;
 
 pub use server::FlintMcp;
 
-use flint_core::bootstrap::Bootstrap;
+use std::process::ExitCode;
+
+use flint_core::bootstrap::{self, Bootstrap};
 use rmcp::ServiceExt;
+
+/// The whole MCP server process, after argument parsing: bootstrap, logging to stderr, then
+/// [`run_stdio`] until the client disconnects. `flint mcp` and the `flint-mcp` binary both run
+/// this, so they behave the same. `program` prefixes a startup error.
+///
+/// # Safety
+///
+/// Like [`bootstrap::bootstrap`]: call it while the process is single-threaded, before anything
+/// starts a thread.
+pub unsafe fn serve_stdio_main(program: &str) -> ExitCode {
+    // SAFETY: forwarded to the caller.
+    let boot = match unsafe { bootstrap::bootstrap() } {
+        Ok(boot) => boot,
+        Err(e) => {
+            eprintln!("{program}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    bootstrap::init_logging();
+    boot.log_summary();
+    match run_stdio(&boot) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("mcp server failed: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 /// Serves MCP over stdin/stdout until the client disconnects. Starts its own tokio runtime, so
 /// call it after [`flint_core::bootstrap::bootstrap`] and from a plain (non-async) context.

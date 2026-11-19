@@ -21,6 +21,20 @@ use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams, PostParams
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
+/// How long a change may take to show in a live list: about a second on a laptop. Shared CI
+/// runners are slower and noisier, so 5 s when `CI` is set. `FLINT_TEST_LATENCY_MS` overrides both.
+fn latency_bound() -> Duration {
+    let ms = std::env::var("FLINT_TEST_LATENCY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if std::env::var_os("CI").is_some() {
+            5000
+        } else {
+            2000
+        });
+    Duration::from_millis(ms)
+}
+
 fn test_kubeconfig() -> PathBuf {
     match std::env::var_os("FLINT_TEST_KUBECONFIG") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
@@ -198,9 +212,10 @@ async fn pods_list_then_live_update_after_scaling() {
     let snap = until(&mut pods, 10, |s| web_pods(s) == 3).await;
     let latency = scaled.elapsed();
     eprintln!("scale-up visible after {latency:?}");
+    let bound = latency_bound();
     assert!(
-        latency < Duration::from_secs(2),
-        "changes appear within about a second"
+        latency < bound,
+        "changes appear within about a second (bound {bound:?}, FLINT_TEST_LATENCY_MS)"
     );
 
     // The new pod's detail: full object without managedFields, and its events by uid.

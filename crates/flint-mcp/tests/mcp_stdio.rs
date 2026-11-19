@@ -1,7 +1,8 @@
-//! Drives `flint mcp` over stdio against the dev cluster. Ignored by default; run it with
-//! `--include-ignored` and `FLINT_TEST_KUBECONFIG` set (see `scripts/dev-cluster.sh`). The server
-//! gets that kubeconfig (plus one extra context that is not exposed) and a scratch config dir,
-//! never the user's own files. The test also uses `kubectl` with that kubeconfig, only.
+//! Drives the MCP server over stdio, as the `flint-mcp` binary: the same server as `flint mcp`,
+//! without GPUI, so this runs on Linux CI against kind. The cluster test is ignored by default;
+//! run it with `--include-ignored` and `FLINT_TEST_KUBECONFIG` set (see `scripts/dev-cluster.sh`).
+//! The server gets that kubeconfig (plus one extra context that is not exposed) and a scratch
+//! config dir, never the user's own files. The test also uses `kubectl` with that kubeconfig, only.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -72,10 +73,9 @@ struct Server {
 }
 
 impl Server {
-    /// Starts `flint mcp` with only the given kubeconfig list and config dir, and initializes it.
+    /// Starts `flint-mcp` with only the given kubeconfig list and config dir, and initializes it.
     fn start(kubeconfig: &std::ffi::OsStr, config_dir: &std::path::Path) -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_flint"))
-            .arg("mcp")
+        let mut child = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
             .env("FLINT_LOG", "warn")
@@ -165,6 +165,34 @@ fn exposing(context: &str, server: &str) -> String {
     format!(
         "path = \"/usr/bin:/bin\"\n\n[[ai_exposed_clusters]]\ncontext = \"{context}\"\nserver = \"{server}\"\n"
     )
+}
+
+/// `serve_stdio_main` logs (here a settings warning and debug lines) to stderr only, and ends
+/// when the client closes stdin. No cluster, no network.
+#[test]
+fn logs_stay_off_stdout_and_eof_ends_the_server() {
+    let scratch = tempfile::tempdir().unwrap();
+    let config_dir = scratch.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("settings.toml"), "path = [\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
+        .env("KUBECONFIG", scratch.path().join("none"))
+        .env("FLINT_CONFIG_DIR", &config_dir)
+        .env("FLINT_LOG", "debug")
+        // Invalid settings carry no `path`; with no usable shell, no login shell runs.
+        .env("SHELL", "/nonexistent")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    // EOF before `initialize` ends the server with an error, which is logged too.
+    assert!(
+        out.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("using default settings"), "{stderr}");
+    assert!(stderr.contains("mcp server failed"), "{stderr}");
 }
 
 /// Runs on every `cargo test`: no cluster. The only server named is 127.0.0.1:1, which refuses

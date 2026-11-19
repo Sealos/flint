@@ -63,6 +63,7 @@ crates/
   flint-core/   Kubernetes logic: kubeconfig, connections, discovery, watches, stores, actions,
                 logs, exec, port-forward, metrics, Helm. Depends on tokio and kube. Never on GPUI.
   flint-mcp/    The MCP server (stdio): tool definitions, cluster opt-in checks, redaction. Depends on flint-core.
+                Its `flint-mcp` binary is the same server without GPUI, for Linux CI only; not shipped.
   flint-app/    The `flint` binary: windows, views, the terminal widget, settings UI, the bridge to core.
                 `flint mcp` runs flint-mcp instead of starting the UI.
 ```

@@ -82,8 +82,34 @@ GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API serv
 | `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
-`flint mcp` must be buildable without GPUI for that job. `app-e2e` runs on PRs. `cluster-e2e` runs on PRs that touch
-`flint-core` or `flint-mcp`, on master, and nightly.
+`app-e2e` runs on PRs. `cluster-e2e` runs on PRs that touch `flint-core` or `flint-mcp`, on master, and nightly.
+
+**The MCP server without GPUI.** The `flint-mcp` crate has a binary target, `flint-mcp`, that runs the same
+`flint_mcp::serve_stdio_main` as `flint mcp` and links no GPUI. The MCP e2e tests (`crates/flint-mcp/tests/mcp_stdio.rs`)
+drive that binary, so they run on Linux. A smoke test in `flint-app` checks that `flint mcp` reaches the same server.
+Users still run `flint mcp`; the release ships only `flint`. A separate binary was chosen over a cargo feature on
+`flint-app` because it keeps GPUI out of the Linux build graph entirely, with no feature combinations to test.
+
+**Cluster setup.** `scripts/cluster-fixtures.sh` installs metrics-server and the `demo` fixtures on a kind cluster and
+expires old resourceVersions, as on a cluster that has run for a while: it compacts etcd and restarts the API server, whose
+watch caches on a new cluster still reach back to resourceVersion 1. A watch from an old version then gets 410.
+`scripts/dev-cluster.sh up` and
+the `cluster-e2e` job both use it, so local runs and CI test the same cluster. It refuses any context that is not a
+local kind cluster. To run the cluster tests locally:
+
+```sh
+scripts/dev-cluster.sh up
+KUBECONFIG=.dev/kubeconfig FLINT_TEST_KUBECONFIG=.dev/kubeconfig FLINT_CONFIG_DIR="$(mktemp -d)" \
+  cargo test -p flint-core -p flint-mcp --no-fail-fast -- --include-ignored
+```
+
+The nightly run also sets `FLINT_TEST_SLOW=1`, so the API-server restart test (UP-27) runs there. Under `CI`, the
+live-list latency bound is 5 s instead of 2 s (`FLINT_TEST_LATENCY_MS` overrides it).
+
+**Pinned versions.** The kind node image (`NODE_IMAGE` in `scripts/dev-cluster.sh`, also used by CI), metrics-server
+and the podinfo chart (top of `scripts/cluster-fixtures.sh`) and the kind version in the workflow are pinned. To bump
+one, change it there, recreate the dev cluster (`scripts/dev-cluster.sh down` then `up`), and run the cluster tests. A
+new Kubernetes version also means re-recording the fake API server's fixtures.
 
 ### Screenshots
 
