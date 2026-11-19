@@ -28,6 +28,11 @@ Headless GPUI tests (`#[gpui_kit::test]`, `TestAppContext`/`VisualTestContext`) 
 banners, enabled controls. They don't render pixels and don't need a screen, so they run in normal CI. Every view
 module gets at least one.
 
+Whole-window tests (`ui/workspace_tests.rs`, helpers in `ui/support_tests.rs`) open the workspace over two kubeconfig
+contexts on 127.0.0.1: one whose server never answers (so its views stay up) and one that refuses connections. They
+drive the app through registered actions, clicks and keys, and check that the three agree. Every click handler must
+perform a registered action; `scripts/check-click-actions.sh` enforces this in CI.
+
 ### Automation channel
 
 A test-only control socket lets e2e tests and agents drive the real app.

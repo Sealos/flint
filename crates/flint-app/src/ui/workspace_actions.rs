@@ -1,0 +1,493 @@
+//! The workspace's registered actions ([`crate::ui::registry`]): the sidebar, the header and
+//! the main area, their handlers, and the guards the registry checks before dispatching. The
+//! controls dispatch these actions, and the guards and handlers share their check functions, so
+//! a click, a key, the palette and automation all take one path.
+//!
+//! The workspace also forwards the list's, the detail pane's and the navigation's actions to
+//! them, and installs their guards, so those work and are checked wherever focus is.
+
+use flint_core::settings::AiExposureState;
+use flint_core::{ClusterSummary, ConnectionState, NavEntry, WatchMode};
+use gpui_kit::*;
+
+use super::super::detail::DetailView;
+use super::super::list::ResourceList;
+use super::super::nav::NavPanel;
+use super::super::registry::{
+    ActionError, AddNamespace, Bind, Close, CloseDetail, DefaultWatchAllKinds,
+    DefaultWatchOpenViewsOnly, ExposeToAi, FocusFilter, Forward, Guards, HideFromAi, OnView,
+    OpenView, PaneName, Refresh, RetryConnection, SelectCluster, SelectFirst, SelectLast,
+    SelectNext, SelectPrev, SelectRow, SetNamespaces, SetPaneWidth, ShowAllNamespaces,
+    ShowOverview, ShowYaml, SortBy, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
+    ToggleNamespace, ToggleNavSection, ToggleSecretValue, ToggleWide, UseDefaultWatchMode,
+    WatchAllKinds, WatchOpenViewsOnly,
+};
+use super::super::startup;
+use super::super::ui_state;
+use super::{Pane, Workspace, confirm_expose};
+
+impl Workspace {
+    /// Every workspace action and its handler, for [`Bind`].
+    pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
+        bind.bind::<SelectCluster>(Self::select_cluster)
+            .bind::<ExposeToAi>(Self::expose_to_ai)
+            .bind::<HideFromAi>(Self::hide_from_ai)
+            .bind::<RetryConnection>(Self::retry_connection)
+            .bind::<WatchAllKinds>(|this, _, _, cx| {
+                this.set_watch_mode(true, Some(WatchMode::All), cx)
+            })
+            .bind::<WatchOpenViewsOnly>(|this, _, _, cx| {
+                this.set_watch_mode(true, Some(WatchMode::OnView), cx)
+            })
+            .bind::<UseDefaultWatchMode>(|this, _, _, cx| this.set_watch_mode(true, None, cx))
+            .bind::<DefaultWatchAllKinds>(|this, _, _, cx| {
+                this.set_watch_mode(false, Some(WatchMode::All), cx)
+            })
+            .bind::<DefaultWatchOpenViewsOnly>(|this, _, _, cx| {
+                this.set_watch_mode(false, Some(WatchMode::OnView), cx)
+            })
+            .bind::<OpenView>(Self::open_view)
+            .bind::<SetNamespaces>(Self::set_namespaces)
+            .bind::<ToggleNamespace>(Self::toggle_namespace)
+            .bind::<AddNamespace>(Self::add_namespace)
+            .bind::<ShowAllNamespaces>(|this, _, _, cx| {
+                if this.cluster.is_some() {
+                    this.set_namespace_filter(Vec::new(), cx)
+                }
+            })
+            .bind::<SetPaneWidth>(Self::set_pane_width)
+    }
+
+    /// Registers the workspace's actions on its root element, and forwards the open views'.
+    pub(super) fn register_actions<E: InteractiveElement>(
+        &self,
+        element: E,
+        cx: &Context<Self>,
+    ) -> E {
+        let element = Self::bind_actions(OnView::new(element, cx)).into_element();
+        let element =
+            ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
+        let element =
+            DetailView::bind_actions(Forward::new(element, self.detail.as_ref())).into_element();
+        NavPanel::bind_actions(Forward::new(element, Some(&self.nav))).into_element()
+    }
+
+    /// The guards the registry checks before dispatching: when each action is enabled, and
+    /// whether its arguments would do anything. The handlers use the same checks.
+    pub(super) fn guards(this: WeakEntity<Self>) -> Guards<Self> {
+        Guards::new(this)
+            .add::<SelectCluster>(
+                |_, _| true,
+                |ws, a, cx| ws.check_cluster::<SelectCluster>(&a.cluster, cx),
+            )
+            .add::<ExposeToAi>(Self::settings_ok, |ws, a, cx| ws.check_expose(a, cx))
+            .add::<HideFromAi>(Self::settings_ok, |ws, a, cx| ws.check_hide(a, cx))
+            .when::<RetryConnection>(|ws, cx| ws.retry_enabled(cx))
+            .when::<WatchAllKinds>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
+            .when::<WatchOpenViewsOnly>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
+            .when::<UseDefaultWatchMode>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
+            .when::<DefaultWatchAllKinds>(Self::settings_ok)
+            .when::<DefaultWatchOpenViewsOnly>(Self::settings_ok)
+            .add::<OpenView>(
+                |ws, _| ws.cluster.is_some(),
+                |ws, a, cx| ws.check_open_view(a, cx),
+            )
+            .add::<SetNamespaces>(
+                |ws, _| ws.cluster.is_some(),
+                |_, a, _| match a.namespaces.iter().any(|n| n.trim().is_empty()) {
+                    true => Err(ActionError::rejected::<SetNamespaces>(
+                        "empty namespace name",
+                    )),
+                    false => Ok(()),
+                },
+            )
+            .add::<ToggleNamespace>(
+                |ws, _| ws.cluster.is_some(),
+                |_, a, _| check_name::<ToggleNamespace>(&a.namespace),
+            )
+            .add::<AddNamespace>(
+                |ws, _| ws.cluster.is_some(),
+                |_, a, _| check_name::<AddNamespace>(&a.namespace),
+            )
+            .when::<ShowAllNamespaces>(|ws, _| ws.cluster.is_some())
+            .add::<SetPaneWidth>(|_, _| true, |ws, a, _| ws.check_pane_width(a))
+            .add::<ToggleNavSection>(
+                |ws, cx| ws.nav.read(cx).has_sections(),
+                |ws, a, cx| ws.nav.read(cx).check_section(a),
+            )
+            // The list's.
+            .when::<SelectPrev>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<SelectNext>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<SelectFirst>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<SelectLast>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<CloseDetail>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<FocusFilter>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
+            .add::<SelectRow>(
+                |ws, cx| list_wide(ws, cx).is_some(),
+                |ws, a, cx| match &ws.list {
+                    Some(l) => l.read(cx).check_select_row(a),
+                    None => Err(ActionError::unavailable::<SelectRow>()),
+                },
+            )
+            .add::<SortBy>(
+                |ws, cx| list_wide(ws, cx).is_some(),
+                |ws, a, cx| match &ws.list {
+                    Some(l) => l.read(cx).check_sort(a),
+                    None => Err(ActionError::unavailable::<SortBy>()),
+                },
+            )
+            // The detail pane's.
+            .when::<Refresh>(|ws, _| ws.detail.is_some())
+            .when::<Close>(|ws, _| ws.detail.is_some())
+            .when::<ShowOverview>(|ws, _| ws.detail.is_some())
+            .when::<ShowYaml>(|ws, _| ws.detail.is_some())
+            .when::<ToggleLabels>(|ws, _| ws.detail.is_some())
+            .when::<ToggleAnnotations>(|ws, _| ws.detail.is_some())
+            .when::<ToggleManagedFields>(|ws, cx| {
+                ws.detail
+                    .as_ref()
+                    .is_some_and(|d| d.read(cx).has_managed_fields())
+            })
+            .add::<ToggleSecretValue>(
+                |ws, cx| ws.detail.as_ref().is_some_and(|d| d.read(cx).is_secret()),
+                |ws, a, cx| match &ws.detail {
+                    Some(d) => d.read(cx).check_secret_key(a),
+                    None => Err(ActionError::unavailable::<ToggleSecretValue>()),
+                },
+            )
+    }
+
+    /// Gives focus back after it left with a closed view: to the open list, or the workspace.
+    pub(super) fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = match &self.list {
+            Some(list) => list.read(cx).focus_handle().clone(),
+            None => self.focus.clone(),
+        };
+        window.focus(&focus, cx);
+    }
+
+    fn settings_ok(&self, cx: &App) -> bool {
+        self.model.read(cx).settings_error.is_none()
+    }
+
+    fn cluster_summary<'a>(&self, name: &str, cx: &'a App) -> Option<&'a ClusterSummary> {
+        self.model
+            .read(cx)
+            .clusters
+            .iter()
+            .find(|c| c.info.name == name)
+    }
+
+    fn check_cluster<A: Action>(&self, name: &str, cx: &App) -> Result<(), ActionError> {
+        match self.cluster_summary(name, cx) {
+            Some(_) => Ok(()),
+            None => Err(ActionError::rejected::<A>(format!(
+                "no kubeconfig context named {name}"
+            ))),
+        }
+    }
+
+    /// [`ExposeToAi`]: a context with a server, not exposed already. Returns the server and the
+    /// one exposed before, if the context moved.
+    fn exposure_change(
+        &self,
+        action: &ExposeToAi,
+        cx: &App,
+    ) -> Result<(String, Option<String>), ActionError> {
+        if !self.settings_ok(cx) {
+            return Err(ActionError::rejected::<ExposeToAi>(
+                "settings.toml is invalid",
+            ));
+        }
+        self.check_cluster::<ExposeToAi>(&action.cluster, cx)?;
+        let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
+        let Some(server) = cluster.info.server.clone() else {
+            return Err(ActionError::rejected::<ExposeToAi>(
+                "the context has no API server",
+            ));
+        };
+        match self.model.read(cx).ai_exposure(cluster) {
+            AiExposureState::Exposed => Err(ActionError::rejected::<ExposeToAi>(
+                "the cluster is exposed already",
+            )),
+            AiExposureState::Hidden => Ok((server, None)),
+            AiExposureState::ServerChanged { exposed_server } => Ok((server, Some(exposed_server))),
+        }
+    }
+
+    fn check_expose(&self, action: &ExposeToAi, cx: &App) -> Result<(), ActionError> {
+        self.exposure_change(action, cx).map(|_| ())
+    }
+
+    /// [`HideFromAi`]: an exposed context (or a stale exposure); hiding a hidden one is a no-op.
+    fn check_hide(&self, action: &HideFromAi, cx: &App) -> Result<(), ActionError> {
+        if !self.settings_ok(cx) {
+            return Err(ActionError::rejected::<HideFromAi>(
+                "settings.toml is invalid",
+            ));
+        }
+        self.check_cluster::<HideFromAi>(&action.cluster, cx)?;
+        let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
+        match self.model.read(cx).ai_exposure(cluster) {
+            AiExposureState::Hidden => Err(ActionError::rejected::<HideFromAi>(
+                "the cluster is hidden already",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`RetryConnection`]: the active cluster's connection or discovery failed.
+    fn retry_enabled(&self, cx: &App) -> bool {
+        let model = self.model.read(cx);
+        let failed = model
+            .active_cluster()
+            .is_some_and(|c| matches!(c.state, ConnectionState::Failed(_)));
+        let discovery_failed = model
+            .active
+            .as_ref()
+            .and_then(|c| model.discovery.get(c))
+            .is_some_and(|d| d.error.is_some() && d.discovery.is_none());
+        failed || discovery_failed
+    }
+
+    fn check_open_view(&self, action: &OpenView, cx: &App) -> Result<(), ActionError> {
+        match self.nav_entry(&action.kind, cx) {
+            Some(_) => Ok(()),
+            None => Err(ActionError::rejected::<OpenView>(format!(
+                "the active cluster does not serve {} (or discovery has not finished)",
+                action.kind
+            ))),
+        }
+    }
+
+    fn check_pane_width(&self, action: &SetPaneWidth) -> Result<(), ActionError> {
+        if !action.width.is_finite() || action.width <= 0. {
+            return Err(ActionError::rejected::<SetPaneWidth>(
+                "width must be positive",
+            ));
+        }
+        if action.pane == PaneName::Detail && self.detail.is_none() {
+            return Err(ActionError::rejected::<SetPaneWidth>(
+                "no detail pane is open",
+            ));
+        }
+        Ok(())
+    }
+
+    fn select_cluster(&mut self, action: &SelectCluster, _: &mut Window, cx: &mut Context<Self>) {
+        match self.check_cluster::<SelectCluster>(&action.cluster, cx) {
+            Ok(()) => {
+                let cluster = action.cluster.clone();
+                self.model.update(cx, |m, _| m.activate(cluster));
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// Opens the confirmation naming the context and its server (and the previous server, when
+    /// the context moved); confirming exposes it.
+    fn expose_to_ai(&mut self, action: &ExposeToAi, window: &mut Window, cx: &mut Context<Self>) {
+        match self.exposure_change(action, cx) {
+            Ok((server, previous)) => {
+                let model = self.model.clone();
+                confirm_expose(window, cx, model, action.cluster.clone(), server, previous);
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    fn hide_from_ai(&mut self, action: &HideFromAi, _: &mut Window, cx: &mut Context<Self>) {
+        match self.check_hide(action, cx) {
+            Ok(()) => {
+                let cluster = action.cluster.clone();
+                self.model.update(cx, |m, _| m.hide_from_ai(cluster));
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    fn retry_connection(&mut self, _: &RetryConnection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.retry_enabled(cx) {
+            self.retry(cx);
+        } else {
+            // Not ours to handle: let another binding of the same key (Refresh) have it.
+            cx.propagate();
+        }
+    }
+
+    /// The watch-mode menu: the active cluster's own mode (`None`: follow the default), or the
+    /// default for all clusters.
+    fn set_watch_mode(&mut self, own: bool, mode: Option<WatchMode>, cx: &mut Context<Self>) {
+        if !self.settings_ok(cx) {
+            tracing::warn!("watch mode: settings.toml is invalid");
+            return;
+        }
+        let Some((target, mode)) = watch_mode_change(own, mode, self.cluster.as_deref()) else {
+            tracing::warn!("watch mode: no active cluster");
+            return;
+        };
+        self.model.update(cx, |m, _| m.set_watch_mode(target, mode));
+    }
+
+    /// Opens a kind as clicking it in the navigation does.
+    fn open_view(&mut self, action: &OpenView, window: &mut Window, cx: &mut Context<Self>) {
+        match self.nav_entry(&action.kind, cx) {
+            Some(entry) => self.open_kind(&entry, window, cx),
+            None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
+        }
+    }
+
+    /// The active cluster's navigation entry for `kind`: an exact id, or a plural without its
+    /// group.
+    pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
+        let model = self.model.read(cx);
+        let active = model.active.as_ref()?;
+        let discovery = model.discovery.get(active)?.discovery.as_ref()?;
+        let entries = || {
+            discovery
+                .navigation
+                .sections
+                .iter()
+                .flat_map(|s| s.entries.iter())
+        };
+        entries()
+            .find(|e| e.id.as_str() == kind)
+            .or_else(|| entries().find(|e| startup::kind_matches(e.id.as_str(), kind)))
+            .cloned()
+    }
+
+    fn set_namespaces(&mut self, action: &SetNamespaces, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cluster.is_none() {
+            return;
+        }
+        let names = action
+            .namespaces
+            .iter()
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .collect();
+        self.set_namespace_filter(ui_state::normalize(names), cx);
+    }
+
+    fn toggle_namespace(
+        &mut self,
+        action: &ToggleNamespace,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cluster) = self.cluster.clone() else {
+            return;
+        };
+        let namespace = action.namespace.trim();
+        if namespace.is_empty() {
+            return;
+        }
+        let current = self.ui_state.namespace_filter(&cluster).to_vec();
+        let next = ui_state::toggle_namespace(&current, namespace);
+        self.set_namespace_filter(next, cx);
+    }
+
+    /// Adds a namespace typed by name, as Enter in the filter's field does.
+    pub(super) fn add_namespace(
+        &mut self,
+        action: &AddNamespace,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cluster) = self.cluster.clone() else {
+            return;
+        };
+        let namespace = action.namespace.trim();
+        if namespace.is_empty() {
+            return;
+        }
+        let mut next = self.ui_state.namespace_filter(&cluster).to_vec();
+        next.push(namespace.to_owned());
+        self.set_namespace_filter(ui_state::normalize(next), cx);
+    }
+
+    /// Sets a pane's width, as dragging its edge does (same limits, same delayed save).
+    fn set_pane_width(
+        &mut self,
+        action: &SetPaneWidth,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_pane_width(action) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let pane = match action.pane {
+            PaneName::Clusters => Pane::Clusters,
+            PaneName::Navigation => Pane::Navigation,
+            PaneName::Detail => Pane::Detail,
+        };
+        let window_width = f32::from(window.viewport_size().width);
+        self.resize_pane(pane, action.width, window_width, cx);
+    }
+}
+
+/// Whether a list is open, and whether its kind has `-o wide` columns.
+fn list_wide(ws: &Workspace, cx: &App) -> Option<bool> {
+    ws.list.as_ref().map(|l| l.read(cx).has_wide_columns())
+}
+
+/// A namespace name, trimmed, must not be empty.
+fn check_name<A: Action>(namespace: &str) -> Result<(), ActionError> {
+    if namespace.trim().is_empty() {
+        Err(ActionError::rejected::<A>("empty namespace name"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The settings change a watch-mode choice makes: the cluster (`None`: the default) and the
+/// mode (`None`: follow the default). `None` when it needs an active cluster and there is none,
+/// or asks the default to follow itself.
+fn watch_mode_change(
+    own: bool,
+    mode: Option<WatchMode>,
+    active: Option<&str>,
+) -> Option<(Option<String>, Option<WatchMode>)> {
+    if own {
+        Some((Some(active?.to_owned()), mode))
+    } else {
+        Some((None, Some(mode?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flint_core::WatchMode;
+
+    use super::watch_mode_change;
+    use crate::ui::registry::{Scope, tests::assert_binds_scope};
+
+    #[test]
+    fn every_workspace_action_is_bound() {
+        assert_binds_scope(Scope::Workspace, super::Workspace::bind_actions);
+    }
+
+    #[test]
+    fn watch_mode_choices_match_the_menu() {
+        assert_eq!(
+            watch_mode_change(true, Some(WatchMode::OnView), Some("kind-a")),
+            Some((Some("kind-a".into()), Some(WatchMode::OnView)))
+        );
+        assert_eq!(
+            watch_mode_change(true, None, Some("kind-a")),
+            Some((Some("kind-a".into()), None))
+        );
+        assert_eq!(watch_mode_change(true, Some(WatchMode::All), None), None);
+        assert_eq!(
+            watch_mode_change(false, Some(WatchMode::All), None),
+            Some((None, Some(WatchMode::All)))
+        );
+        assert_eq!(watch_mode_change(false, None, None), None);
+    }
+}
+
+#[cfg(test)]
+#[path = "workspace_tests.rs"]
+mod view_tests;

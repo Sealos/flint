@@ -15,7 +15,10 @@ mod list_model;
 mod nav;
 mod notice;
 mod object;
+mod registry;
 mod startup;
+#[cfg(test)]
+mod support_tests;
 mod theme;
 mod ui_state;
 mod workspace;
@@ -29,19 +32,9 @@ use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
 use clusters::ClustersModel;
+use registry::{AppearanceDark, AppearanceLight, AppearanceSystem, CloseWindow, Quit};
 use ui_state::UiState;
 use workspace::Workspace;
-
-actions!(
-    flint,
-    [
-        Quit,
-        CloseWindow,
-        AppearanceSystem,
-        AppearanceLight,
-        AppearanceDark
-    ]
-);
 
 /// Names a context to activate at startup, exactly as clicking it would. A development and testing
 /// aid (for example for agents taking screenshots); it never selects anything else.
@@ -111,7 +104,7 @@ pub fn run(boot: Bootstrap) {
                 ),
                 cx,
             );
-            list::init(cx);
+            registry::init(cx);
             install_menus(settings.appearance, cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
@@ -146,7 +139,8 @@ pub fn run(boot: Bootstrap) {
         });
 }
 
-/// The app menu with Quit (cmd-q) and Close Window (cmd-w), plus View > Appearance.
+/// The app menu with Quit and Close Window (their keys come from the registry), plus
+/// View > Appearance.
 fn install_menus(appearance: Appearance, cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
@@ -154,18 +148,17 @@ fn install_menus(appearance: Appearance, cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-    ]);
     set_menus(appearance, cx);
 }
 
 fn set_menus(appearance: Appearance, cx: &mut App) {
     cx.set_menus([
-        Menu::new("Flint").items([MenuItem::action("Quit Flint", Quit)]),
+        Menu::new("Flint").items([MenuItem::action(registry::label::<Quit>(), Quit)]),
         appearance_menu(appearance),
-        Menu::new("Window").items([MenuItem::action("Close Window", CloseWindow)]),
+        Menu::new("Window").items([MenuItem::action(
+            registry::label::<CloseWindow>(),
+            CloseWindow,
+        )]),
     ]);
 }
 
@@ -179,9 +172,21 @@ fn appearance_menu(appearance: Appearance) -> Menu {
         disabled: false,
     };
     Menu::new("View").items([MenuItem::submenu(Menu::new("Appearance").items([
-        item("System", Box::new(AppearanceSystem), Appearance::System),
-        item("Light", Box::new(AppearanceLight), Appearance::Light),
-        item("Dark", Box::new(AppearanceDark), Appearance::Dark),
+        item(
+            registry::label::<AppearanceSystem>(),
+            Box::new(AppearanceSystem),
+            Appearance::System,
+        ),
+        item(
+            registry::label::<AppearanceLight>(),
+            Box::new(AppearanceLight),
+            Appearance::Light,
+        ),
+        item(
+            registry::label::<AppearanceDark>(),
+            Box::new(AppearanceDark),
+            Appearance::Dark,
+        ),
     ]))])
 }
 
