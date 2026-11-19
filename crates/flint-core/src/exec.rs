@@ -322,22 +322,21 @@ pub(crate) struct LaunchError {
 
 impl LaunchError {
     fn new(message: String) -> Self {
-        let missing_command = is_missing_command(&message);
         Self {
             message,
-            missing_command,
+            missing_command: false,
         }
     }
 
-    /// A kube error, without exec plugin details (see [`ClusterError::kube`]). Only an error
-    /// status from the API server can say the executable is missing; a local error such as a
-    /// missing auth plugin or certificate file ("No such file or directory") must not make
-    /// the next shell be tried.
-    fn kube(err: kube::Error) -> Self {
+    /// A kube error from starting `executable`, without exec plugin details (see
+    /// [`ClusterError::kube`]). Only an error status from the API server can say the
+    /// executable is missing; a local error such as a missing auth plugin or certificate file
+    /// ("No such file or directory") must not make the next shell be tried.
+    fn kube(err: kube::Error, executable: &str) -> Self {
         let from_server = matches!(err, kube::Error::Api(_));
         let message = ClusterError::kube(err).to_string();
         Self {
-            missing_command: from_server && is_missing_command(&message),
+            missing_command: from_server && is_missing_command(&message, executable),
             message,
         }
     }
@@ -366,10 +365,11 @@ impl Launcher for KubeLauncher {
             params = params.container(container.clone());
         }
         async move {
+            let executable = command.first().cloned().unwrap_or_default();
             let mut attached = api
                 .exec(&pod, command, &params)
                 .await
-                .map_err(LaunchError::kube)?;
+                .map_err(|e| LaunchError::kube(e, &executable))?;
             let missing = || LaunchError::new("the exec connection has no terminal".to_owned());
             let stdin = attached.stdin().ok_or_else(missing)?;
             let stdout = attached.stdout().ok_or_else(missing)?;
@@ -431,7 +431,7 @@ pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels:
         let launched = loop {
             tokio::select! {
                 result = &mut launch => break result,
-                input = session.inputs.recv() => {
+                input = session.next_input() => {
                     if session.handle_offline(input, Some(&mut pending)) == Flow::Close {
                         session.set_state(ExecState::Closed);
                         return;
@@ -453,7 +453,11 @@ pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels:
         session.set_state(ExecState::Running {
             command: command.clone(),
         });
-        match session.drive(process, &mut pending, !last).await {
+        let executable = command.first().map_or("", String::as_str);
+        match session
+            .drive(process, executable, &mut pending, !last)
+            .await
+        {
             Outcome::MissingCommand(_) if !last => {
                 tracing::debug!(?command, "command not in the container; trying the next");
                 // Some runtimes print the error on the TTY: start the next shell on a clean
@@ -546,6 +550,19 @@ impl Session {
             .then(|| self.last_publish.map_or_else(Instant::now, |at| at + FRAME))
     }
 
+    /// The next input, publishing held-back screen changes when their frame is due meanwhile.
+    async fn next_input(&mut self) -> Result<Input, async_channel::RecvError> {
+        loop {
+            let Some(deadline) = self.deadline() else {
+                return self.inputs.recv().await;
+            };
+            tokio::select! {
+                input = self.inputs.recv() => return input,
+                () = tokio::time::sleep_until(deadline) => self.publish(),
+            }
+        }
+    }
+
     /// Handles input that does not need the remote command. `pending` collects keystrokes while
     /// the command starts; `None` drops them (the command has finished).
     fn handle_offline(
@@ -633,6 +650,8 @@ impl Session {
     ) -> Flow {
         match input {
             Ok(Input::Resize(size)) => {
+                // The TTY gets the size the screen really has.
+                let size = size.normalized();
                 if size != self.model.size() {
                     let _ = remote.send(ToRemote::Resize(size));
                 }
@@ -656,11 +675,18 @@ impl Session {
         self.publish();
     }
 
-    /// Streams one started command until it ends or the session is closed. `pending` holds
-    /// keystrokes typed before it started, which are sent first. When another shell would be
-    /// tried if this one turns out not to exist (`fallback`), `pending` keeps them (with what
-    /// is typed next) until the command prints something; otherwise it is emptied at once.
-    async fn drive(&mut self, process: Process, pending: &mut Vec<u8>, fallback: bool) -> Outcome {
+    /// Streams one started command (running `executable`) until it ends or the session is
+    /// closed. `pending` holds keystrokes typed before it started, which are sent first. When
+    /// another shell would be tried if this one turns out not to exist (`fallback`), `pending`
+    /// keeps them (with what is typed next) until the output shows the command started (it
+    /// cannot be a runtime's launch error any more); otherwise it is emptied at once.
+    async fn drive(
+        &mut self,
+        process: Process,
+        executable: &str,
+        pending: &mut Vec<u8>,
+        fallback: bool,
+    ) -> Outcome {
         let Process {
             stdin,
             mut stdout,
@@ -683,23 +709,27 @@ impl Session {
         };
         let mut buf = vec![0; IO_BUFFER];
         let mut saw_output = false;
+        // The command has shown it started: its output cannot be a launch error any more.
+        let mut started = false;
         // The first output, for runtimes that print a missing executable on the TTY.
         let mut early = Vec::new();
         loop {
             let deadline = self.deadline();
+            let sync = self.model.sync_deadline().map(Instant::from_std);
             tokio::select! {
                 read = stdout.read(&mut buf) => match read {
                     // End of output; a read error ends it too, and `finish` says why.
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if !saw_output {
-                            saw_output = true;
+                        saw_output = true;
+                        if early.len() <= EARLY_OUTPUT {
+                            early.extend_from_slice(&buf[..n]);
+                        }
+                        if !started && !could_be_launch_error(&early) {
+                            started = true;
                             if let Some(pending) = pending.as_deref_mut() {
                                 pending.clear();
                             }
-                        }
-                        if early.len() <= EARLY_OUTPUT {
-                            early.extend_from_slice(&buf[..n]);
                         }
                         let reply = self.model.advance(&buf[..n]);
                         if !reply.is_empty() {
@@ -709,20 +739,29 @@ impl Session {
                     }
                 },
                 input = self.inputs.recv() => {
-                    let unconfirmed = pending.as_deref_mut().filter(|_| !saw_output);
+                    let unconfirmed = pending.as_deref_mut().filter(|_| !started);
                     if self.handle_live(input, &remote, unconfirmed) == Flow::Close {
                         return Outcome::Done(ExecState::Closed);
                     }
                 }
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() => self.publish(),
+                // A synchronized update the program never ended (it was interrupted, say).
+                () = tokio::time::sleep_until(sync.unwrap_or_else(Instant::now)),
+                    if sync.is_some() => {
+                    let reply = self.model.end_sync();
+                    if !reply.is_empty() {
+                        let _ = remote.send(ToRemote::Bytes(reply));
+                    }
+                    self.screen_changed();
+                }
             }
         }
         drop(remote);
         drop(writer);
-        if self.dirty {
-            self.publish();
-        }
+        // Output held back for a synchronized update belongs on the final screen.
+        self.model.end_sync();
+        self.publish();
         let ending = async {
             let status = tokio::time::timeout(STATUS_WAIT, status)
                 .await
@@ -740,7 +779,7 @@ impl Session {
         let (status, result) = loop {
             tokio::select! {
                 ended = &mut ending => break ended,
-                input = self.inputs.recv() => {
+                input = self.next_input() => {
                     if self.handle_offline(input, pending.as_deref_mut()) == Flow::Close {
                         return Outcome::Done(ExecState::Closed);
                     }
@@ -748,14 +787,14 @@ impl Session {
             }
         };
         let early = (early.len() <= EARLY_OUTPUT).then_some(early.as_slice());
-        outcome(status.as_ref(), result, saw_output, early)
+        outcome(status.as_ref(), result, executable, saw_output, early)
     }
 
     /// After the command is gone: keeps the screen scrollable and selectable until the front end
     /// closes the session.
     async fn linger(&mut self) {
         loop {
-            let input = self.inputs.recv().await;
+            let input = self.next_input().await;
             if self.handle_offline(input, None) == Flow::Close {
                 if !self.state.is_finished() {
                     self.set_state(ExecState::Closed);
@@ -802,12 +841,13 @@ async fn write_remote(
     let _ = stdin.shutdown().await;
 }
 
-/// How a command that started ended, from the exec status (if the server sent one), the
-/// connection's result, whether the command printed anything, and all it printed if that was
-/// little (`early`).
+/// How a command that started `executable` ended, from the exec status (if the server sent
+/// one), the connection's result, whether the command printed anything, and all it printed if
+/// that was little (`early`).
 fn outcome(
     status: Option<&Status>,
     connection: Result<(), String>,
+    executable: &str,
     saw_output: bool,
     early: Option<&[u8]>,
 ) -> Outcome {
@@ -823,19 +863,21 @@ fn outcome(
     if status.reason.as_deref() == Some("NonZeroExitCode") {
         let code = exit_code(status);
         // Docker prints "OCI runtime exec failed: ... executable file not found" on the TTY
-        // and exits with 126 or 127 instead of reporting it on the status channel.
+        // and exits with 126 or 127 instead of reporting it on the status channel. A command
+        // that ran and printed "No such file or directory" itself keeps its exit code.
         if matches!(code, Some(126 | 127))
             && let Some(early) = early
+            && could_be_launch_error(early)
         {
             let printed = String::from_utf8_lossy(early);
-            if is_missing_command(&printed) {
+            if is_missing_command(&printed, executable) {
                 return Outcome::MissingCommand(printed.trim().to_owned());
             }
         }
         return Outcome::Done(ExecState::Exited { code });
     }
     let message = status_message(status);
-    if !saw_output && is_missing_command(&message) {
+    if !saw_output && is_missing_command(&message, executable) {
         Outcome::MissingCommand(message)
     } else {
         Outcome::Done(ExecState::Failed(message))
@@ -874,13 +916,42 @@ fn status_message(status: &Status) -> String {
     }
 }
 
-/// Whether an exec error says the executable does not exist in the container. The wording is
-/// the container runtime's (runc and crun through containerd or CRI-O, and Docker).
-fn is_missing_command(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("executable file not found")
-        || message.contains("no such file or directory")
-        || message.contains("not found in $path")
+/// Whether an exec error says `executable` does not exist in the container: it says so in
+/// the container runtime's words (runc and crun through containerd or CRI-O, and Docker) and
+/// names that executable, as `exec: "bash": executable file not found in $PATH` or
+/// `stat /bin/sh: no such file or directory`.
+fn is_missing_command(message: &str, executable: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let missing = lower.contains("executable file not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("not found in $path");
+    let named = !executable.is_empty()
+        && [
+            format!("\"{executable}\""),
+            format!("`{executable}`"),
+            format!("stat {executable}:"),
+        ]
+        .iter()
+        .any(|form| message.contains(form.as_str()));
+    missing && named
+}
+
+/// How Docker's launch errors begin when it prints them on the TTY.
+const LAUNCH_ERROR_PREFIX: &[u8] = b"OCI runtime exec failed";
+
+/// Whether `early`, everything the command printed so far, is (or could still turn into) a
+/// launch error printed on the TTY.
+fn could_be_launch_error(early: &[u8]) -> bool {
+    let start = early
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(early.len());
+    let text = &early[start..];
+    if text.len() < LAUNCH_ERROR_PREFIX.len() {
+        LAUNCH_ERROR_PREFIX.starts_with(text)
+    } else {
+        text.starts_with(LAUNCH_ERROR_PREFIX)
+    }
 }
 
 #[cfg(test)]
@@ -1043,6 +1114,16 @@ mod tests {
         }
     }
 
+    /// An error status from the API server, as `Api::exec` returns when the upgrade fails.
+    fn api_error(message: &str) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            code: 500,
+            reason: "InternalError".into(),
+            message: message.into(),
+            ..Default::default()
+        }))
+    }
+
     const NOT_FOUND: &str = "Internal error occurred: error executing command in container: \
         failed to exec in container: OCI runtime exec failed: exec failed: unable to start \
         container process: exec: \"bash\": executable file not found in $PATH";
@@ -1162,7 +1243,7 @@ mod tests {
     async fn a_missing_command_reported_at_connect_also_falls_back() {
         let launcher = FakeLauncher::default();
         let (sh, _sh_remote) = process();
-        launcher.push(Err(LaunchError::new(NOT_FOUND.to_owned())));
+        launcher.push(Err(LaunchError::kube(api_error(NOT_FOUND), "bash")));
         launcher.push(Ok(sh));
         let mut session = open(&launcher, request());
         wait_for(
@@ -1278,7 +1359,7 @@ mod tests {
             }),
         });
         let launcher = FakeLauncher::default();
-        launcher.push(Err(LaunchError::kube(auth)));
+        launcher.push(Err(LaunchError::kube(auth, "bash")));
         let mut session = open(&launcher, request());
         let snap = wait_for(&mut session, "failure", |s| s.state.is_finished()).await;
         let ExecState::Failed(message) = &snap.state else {
@@ -1311,6 +1392,13 @@ mod tests {
         bash_remote
             .print(b"OCI runtime exec failed: exec: \"bash\": executable file not found in $PATH")
             .await;
+        wait_for(&mut session, "the diagnostic", |s| {
+            s.terminal.text().contains("OCI runtime")
+        })
+        .await;
+        // Typed after the diagnostic appeared: still replayed to the shell that starts.
+        session.write(b"y".to_vec());
+        assert_eq!(bash_remote.read_stdin(1).await, b"y");
         bash_remote.exit(exit_status("126"));
         let snap = wait_for(
             &mut session,
@@ -1320,6 +1408,88 @@ mod tests {
         .await;
         assert_eq!(snap.terminal.text().trim(), "", "the error is cleared");
         sh_remote.next_resize().await;
+        assert_eq!(sh_remote.read_stdin(1).await, b"y");
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn a_command_that_ran_keeps_its_exit_code() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(
+            &launcher,
+            request().command(vec!["bash".into(), "-c".into(), "/missing".into()]),
+        );
+        remote.next_resize().await;
+        remote
+            .print(b"bash: line 1: /missing: No such file or directory\r\n")
+            .await;
+        remote.exit(exit_status("127"));
+        let snap = wait_for(&mut session, "exit", |s| s.state.is_finished()).await;
+        assert_eq!(snap.state, ExecState::Exited { code: Some(127) });
+    }
+
+    // covers UP-41
+    #[tokio::test(start_paused = true)]
+    async fn the_last_change_of_a_burst_is_published_after_exit() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        for i in 0..10 {
+            remote.print(format!("l{i}\r\n").as_bytes()).await;
+        }
+        remote.exit(exit_status("1"));
+        wait_for(&mut session, "exit", |s| s.state.is_finished()).await;
+        // Two scrolls within one frame: the second is held back, then published.
+        session.scroll(1);
+        session.scroll(1);
+        tokio::time::sleep(FRAME * 3).await;
+        assert_eq!(session.latest().terminal.display_offset, 2);
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn narrow_sizes_reach_the_tty_normalized() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let session = open(&launcher, request());
+        assert_eq!(remote.next_resize().await, (40, 5));
+        session.resize(TerminalSize { cols: 1, rows: 5 });
+        assert_eq!(remote.next_resize().await, (2, 5));
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn an_unfinished_synchronized_update_is_shown_after_its_timeout() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        // The program began an update and was interrupted before ending it.
+        remote.print(b"\x1b[?2026hprompt$ ").await;
+        wait_for(&mut session, "the held-back prompt", |s| {
+            s.terminal.row_text(0) == "prompt$"
+        })
+        .await;
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn an_unfinished_synchronized_update_is_shown_at_exit() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        remote.print(b"\x1b[?2026hbye").await;
+        remote.exit(status("Success", "", ""));
+        let snap = wait_for(&mut session, "exit", |s| s.state.is_finished()).await;
+        assert_eq!(snap.terminal.row_text(0), "bye");
     }
 
     #[test]
@@ -1328,57 +1498,72 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "No such file or directory (os error 2)",
         )));
-        assert!(!LaunchError::kube(local).missing_command);
-        let server = kube::Error::Api(Box::new(kube::core::Status {
-            code: 500,
-            reason: "InternalError".into(),
-            message: NOT_FOUND.into(),
-            ..Default::default()
-        }));
-        assert!(LaunchError::kube(server).missing_command);
+        assert!(!LaunchError::kube(local, "bash").missing_command);
+        assert!(LaunchError::kube(api_error(NOT_FOUND), "bash").missing_command);
+        assert!(!LaunchError::kube(api_error(NOT_FOUND), "/bin/sh").missing_command);
     }
 
     #[test]
     fn outcomes_follow_the_exec_status() {
         let ok = status("Success", "", "");
         assert_eq!(
-            outcome(Some(&ok), Ok(()), true, None),
+            outcome(Some(&ok), Ok(()), "bash", true, None),
             Outcome::Done(ExecState::Exited { code: Some(0) })
         );
         assert_eq!(
-            outcome(Some(&exit_status("127")), Ok(()), false, None),
+            outcome(Some(&exit_status("127")), Ok(()), "bash", false, None),
             Outcome::Done(ExecState::Exited { code: Some(127) })
         );
         let missing = status("Failure", "InternalError", NOT_FOUND);
         assert!(matches!(
-            outcome(Some(&missing), Ok(()), false, None),
+            outcome(Some(&missing), Ok(()), "bash", false, None),
             Outcome::MissingCommand(_)
         ));
         // Once the command printed something, it ran: no fallback.
         assert!(matches!(
-            outcome(Some(&missing), Ok(()), true, None),
+            outcome(Some(&missing), Ok(()), "bash", true, None),
             Outcome::Done(ExecState::Failed(_))
         ));
         assert_eq!(
-            outcome(None, Ok(()), true, None),
+            outcome(None, Ok(()), "bash", true, None),
             Outcome::Done(ExecState::Exited { code: None })
         );
         // Exit codes 126 and 127 mean a missing command only when the output says so.
-        let printed: &[u8] = b"exec: \"bash\": executable file not found in $PATH";
-        assert!(matches!(
-            outcome(Some(&exit_status("127")), Ok(()), true, Some(printed)),
-            Outcome::MissingCommand(_)
-        ));
+        let printed: &[u8] = b"OCI runtime exec failed: exec failed: exec: \"bash\": \
+            executable file not found in $PATH: unknown\r\n";
+        let exit = |code| {
+            outcome(
+                Some(&exit_status(code)),
+                Ok(()),
+                "bash",
+                true,
+                Some(printed),
+            )
+        };
+        assert!(matches!(exit("127"), Outcome::MissingCommand(_)));
         assert_eq!(
-            outcome(Some(&exit_status("127")), Ok(()), true, Some(b"zsh: oops")),
+            exit("1"),
+            Outcome::Done(ExecState::Exited { code: Some(1) })
+        );
+        // Another executable's launch error is not this one's.
+        assert_eq!(
+            outcome(
+                Some(&exit_status("127")),
+                Ok(()),
+                "zsh",
+                true,
+                Some(printed)
+            ),
+            Outcome::Done(ExecState::Exited { code: Some(127) })
+        );
+        // A command that ran and failed to find a file keeps its exit code.
+        let ran: &[u8] = b"bash: line 1: /missing: No such file or directory\r\n";
+        assert_eq!(
+            outcome(Some(&exit_status("127")), Ok(()), "bash", true, Some(ran)),
             Outcome::Done(ExecState::Exited { code: Some(127) })
         );
         assert_eq!(
-            outcome(Some(&exit_status("1")), Ok(()), true, Some(printed)),
-            Outcome::Done(ExecState::Exited { code: Some(1) })
-        );
-        assert_eq!(
-            outcome(None, Err("reset".into()), true, None),
+            outcome(None, Err("reset".into()), "bash", true, None),
             Outcome::Done(ExecState::Failed(
                 "the exec connection broke: reset".to_owned()
             ))
@@ -1386,15 +1571,41 @@ mod tests {
     }
 
     #[test]
-    fn missing_commands_are_recognised_by_runtime_wording() {
-        assert!(is_missing_command(NOT_FOUND));
+    fn missing_commands_are_recognised_by_runtime_wording_and_name() {
+        assert!(is_missing_command(NOT_FOUND, "bash"));
+        assert!(
+            !is_missing_command(NOT_FOUND, "/bin/sh"),
+            "another executable"
+        );
         assert!(is_missing_command(
-            "exec failed: container_linux.go: starting container process caused: exec: \"bash\": stat bash: no such file or directory"
+            "exec failed: unable to start container process: exec: \"/bin/sh\": stat /bin/sh: no such file or directory",
+            "/bin/sh"
         ));
-        assert!(!is_missing_command("NotFound: pods \"web\" not found"));
+        assert!(is_missing_command(
+            "executable file `bash` not found in $PATH: No such file or directory",
+            "bash"
+        ));
         assert!(!is_missing_command(
-            "BadRequest: container sidecar is not valid for pod web"
+            "NotFound: pods \"web\" not found",
+            "bash"
         ));
+        assert!(!is_missing_command(
+            "BadRequest: container sidecar is not valid for pod web",
+            "bash"
+        ));
+        assert!(!is_missing_command(
+            "bash: /missing: No such file or directory",
+            "bash"
+        ));
+    }
+
+    #[test]
+    fn launch_errors_are_recognised_from_their_first_bytes() {
+        assert!(could_be_launch_error(b""));
+        assert!(could_be_launch_error(b"\r\nOCI run"));
+        assert!(could_be_launch_error(b"OCI runtime exec failed: exec: x"));
+        assert!(!could_be_launch_error(b"root@pod:/# "));
+        assert!(!could_be_launch_error(b"OCI rx"));
     }
 
     #[test]

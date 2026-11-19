@@ -29,7 +29,8 @@ pub use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 /// Lines kept above the screen for scrolling back.
 pub const SCROLLBACK_LINES: usize = 10_000;
 
-/// A terminal's size in character cells. Both sides are at least 1.
+/// A terminal's size in character cells: at least 2 columns (a wide character needs two) and
+/// 1 row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TerminalSize {
     pub cols: u16,
@@ -37,12 +38,17 @@ pub struct TerminalSize {
 }
 
 impl TerminalSize {
-    /// A size of `cols` by `rows`, with zero raised to 1 (a window can be laid out that small).
+    /// A size of `cols` by `rows`, raised to the minimum (a window can be laid out that small).
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
-            cols: cols.max(1),
+            cols: cols.max(2),
             rows: rows.max(1),
         }
+    }
+
+    /// This size raised to the minimum; the fields are public, so a literal can be smaller.
+    pub fn normalized(self) -> Self {
+        Self::new(self.cols, self.rows)
     }
 }
 
@@ -192,8 +198,7 @@ pub struct TerminalModel {
 
 impl TerminalModel {
     pub fn new(size: TerminalSize) -> Self {
-        // The fields are public: a struct literal can hold zeros.
-        let size = TerminalSize::new(size.cols, size.rows);
+        let size = size.normalized();
         let config = Config {
             scrolling_history: SCROLLBACK_LINES,
             // A remote program must not read the user's clipboard, nor fill it unasked.
@@ -224,6 +229,28 @@ impl TerminalModel {
     /// as answers to cursor position and device attribute queries (empty almost always).
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.parser.advance(&mut self.term, bytes);
+        self.take_events()
+    }
+
+    /// When the synchronized update the program started (DECSET 2026) must be ended even if
+    /// the program never ends it. Output is held back until then; call [`Self::end_sync`] at
+    /// that time. `None` without a synchronized update.
+    pub fn sync_deadline(&self) -> Option<std::time::Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Ends a synchronized update now, applying the output held back for it: when its
+    /// deadline passed, or when the output ended. Returns bytes to send back, as `advance`.
+    pub fn end_sync(&mut self) -> Vec<u8> {
+        if self.sync_deadline().is_none() {
+            return Vec::new();
+        }
+        self.parser.stop_sync(&mut self.term);
+        self.take_events()
+    }
+
+    /// Applies what the terminal asked of its host while parsing; returns the replies.
+    fn take_events(&mut self) -> Vec<u8> {
         let events = std::mem::take(&mut *self.events.0.lock().unwrap_or_else(|e| e.into_inner()));
         let mut reply = Vec::new();
         for event in events {
@@ -241,7 +268,7 @@ impl TerminalModel {
     }
 
     pub fn resize(&mut self, size: TerminalSize) {
-        let size = TerminalSize::new(size.cols, size.rows);
+        let size = size.normalized();
         if size != self.size {
             self.size = size;
             self.term.resize(size);
@@ -387,15 +414,44 @@ mod tests {
     }
 
     #[test]
-    fn sizes_are_at_least_one_cell() {
-        assert_eq!(TerminalSize::new(0, 0), TerminalSize { cols: 1, rows: 1 });
+    fn sizes_have_a_minimum() {
+        assert_eq!(TerminalSize::new(0, 0), TerminalSize { cols: 2, rows: 1 });
+        assert_eq!(
+            TerminalSize { cols: 1, rows: 0 }.normalized(),
+            TerminalSize::new(2, 1)
+        );
         assert_eq!(TerminalSize::default(), TerminalSize { cols: 80, rows: 24 });
         // Zeros in a struct literal (a collapsed dock) are raised too.
         let mut term = TerminalModel::new(TerminalSize { cols: 0, rows: 0 });
-        assert_eq!(term.size(), TerminalSize::new(1, 1));
-        term.resize(TerminalSize { cols: 0, rows: 5 });
+        assert_eq!(term.size(), TerminalSize::new(2, 1));
+        term.resize(TerminalSize { cols: 1, rows: 5 });
         term.start_selection(SelectionKind::Simple, 9, 9, Side::Left);
-        assert_eq!(term.snapshot().size, TerminalSize::new(1, 5));
+        assert_eq!(term.snapshot().size, TerminalSize::new(2, 5));
+        // A wide character fits, even in the narrowest terminal.
+        term.advance("日本語".as_bytes());
+        assert!(
+            term.snapshot().row(0)[0]
+                .flags
+                .contains(CellFlags::WIDE_CHAR)
+        );
+    }
+
+    #[test]
+    fn synchronized_updates_are_held_until_ended() {
+        let mut term = model(10, 2);
+        term.advance(b"\x1b[?2026hprompt$ ");
+        assert_eq!(term.snapshot().row_text(0), "", "held back");
+        let deadline = term.sync_deadline().expect("a synchronized update");
+        assert!(deadline > std::time::Instant::now());
+        // The program never ends it (interrupted): ending it applies the output.
+        term.end_sync();
+        assert_eq!(term.snapshot().row_text(0), "prompt$");
+        assert!(term.sync_deadline().is_none());
+        assert!(term.end_sync().is_empty(), "nothing to end");
+        // An update the program ends itself needs nothing more.
+        term.advance(b"\x1b[?2026hx\x1b[?2026l");
+        assert!(term.sync_deadline().is_none());
+        assert_eq!(term.snapshot().row_text(0), "prompt$ x");
     }
 
     #[test]

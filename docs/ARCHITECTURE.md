@@ -201,6 +201,8 @@ opens in a tab in the bottom dock.
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.
 - **OSC 52** (clipboard access by the remote program) is disabled.
+- **Synchronized updates** (DECSET 2026) that a program never ends are applied after alacritty's 150 ms timeout,
+  and at the end of the output.
 
 ### Editing and actions
 
