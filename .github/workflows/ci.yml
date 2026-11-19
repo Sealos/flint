@@ -104,6 +104,10 @@ jobs:
       - name: Clippy
         run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
       - name: Tests
+        # GPUI's leak detector: view tests that check a closed view was released
+        # (`assert_released`, `assert_no_new_leaks`) list each leaked handle on failure.
+        env:
+          GPUI_LEAK_DETECTION: "1"
         run: cargo test -p flint-app --locked
 
   # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
