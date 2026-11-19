@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Flint
+GenericName=Kubernetes Manager
+Comment=Native Kubernetes desktop manager
+Exec=flint
+Icon=flint
+Terminal=false
+Categories=Development;Utility;
+Keywords=kubernetes;k8s;kubectl;cluster;
+StartupWMClass=flint

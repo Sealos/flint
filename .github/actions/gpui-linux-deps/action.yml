@@ -1,0 +1,11 @@
+name: GPUI system libraries
+description: Installs the Ubuntu packages GPUI needs to build and link the app (X11, Wayland, fonts, Vulkan headers).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+          libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libasound2-dev libssl-dev libzstd-dev
