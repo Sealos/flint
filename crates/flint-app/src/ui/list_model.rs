@@ -1,5 +1,6 @@
 //! The resource list's view-model logic, kept free of GPUI so it can be unit tested: which
-//! columns show, how a sort survives column changes, and how wide each column is.
+//! columns show, how a sort survives column changes, how wide each column is, and which cells
+//! are colored as a status.
 
 use std::sync::Arc;
 
@@ -180,12 +181,168 @@ pub fn fit_columns(
     }
 }
 
+/// Narrows the Name column, then the Namespace column, down to their minimums when the drawn
+/// columns are wider than `room`, so the status columns to their right stay in view instead of
+/// scrolling off. Long names truncate and show in full in a tooltip.
+pub fn squeeze_identity(
+    drawn: &mut [(usize, f32)],
+    columns: &[Column],
+    room: f32,
+    name_min: f32,
+    namespace_min: f32,
+) {
+    for (role, min) in [
+        (ColumnRole::Name, name_min),
+        (ColumnRole::Namespace, namespace_min),
+    ] {
+        let total: f32 = drawn.iter().map(|(_, w)| w).sum();
+        if total <= room {
+            return;
+        }
+        if let Some((_, width)) = drawn.iter_mut().find(|(i, _)| columns[*i].role == role)
+            && *width > min
+        {
+            *width = (*width - (total - room)).max(min);
+        }
+    }
+}
+
 /// Whether the rows show something that changes with time alone (ages, timestamps), so the list
 /// needs redrawing every second.
 pub fn has_ticking_columns(columns: &[Column]) -> bool {
     columns
         .iter()
         .any(|c| c.role == ColumnRole::Age || c.ty == ColumnType::Date)
+}
+
+/// How a cell's text is colored, so a failing object stands out from healthy ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Normal,
+    /// Failed or broken: CrashLoopBackOff, Error, NotReady, a failed pull, ...
+    Danger,
+    /// Not there yet, or partly: Pending, ContainerCreating, Terminating, `1/2` ready, restarts.
+    Warning,
+    /// Finished and no longer running: Completed, Succeeded.
+    Muted,
+}
+
+/// Whether `kind` is a built-in kind whose Status, Phase, Ready and Restarts columns mean what
+/// `kubectl` means by them. A CRD's printer column of the same name can mean anything (a
+/// configured `Restarts` limit, say), so CRDs are never colored.
+pub fn has_health_columns(kind: &str) -> bool {
+    matches!(
+        kind,
+        "pods"
+            | "nodes"
+            | "namespaces"
+            | "persistentvolumes"
+            | "persistentvolumeclaims"
+            | "replicationcontrollers"
+            | "deployments.apps"
+            | "statefulsets.apps"
+            | "daemonsets.apps"
+            | "replicasets.apps"
+            | "jobs.batch"
+    )
+}
+
+/// Whether a row has finished for good: its Status or Phase reads Completed or Succeeded. Its
+/// `0/1` ready count is then expected, not a warning.
+pub fn row_finished(columns: &[Column], text_of: impl Fn(usize) -> String) -> bool {
+    columns.iter().enumerate().any(|(i, column)| {
+        let status =
+            column.name.eq_ignore_ascii_case("status") || column.name.eq_ignore_ascii_case("phase");
+        status && status_tone(text_of(i).trim()) == Tone::Muted
+    })
+}
+
+/// The tone of a cell of a kind with [`has_health_columns`], from its column's name and its
+/// text. Only the status-like columns are colored (Status, Phase, Ready, Restarts); every other
+/// cell is normal, so color keeps meaning "look here". In a `finished` row the ready count is
+/// muted along with the status.
+pub fn cell_tone(column: &str, text: &str, finished: bool) -> Tone {
+    let text = text.trim();
+    if column.eq_ignore_ascii_case("restarts") {
+        // `3` or `3 (5m ago)`.
+        let count: u64 = text
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        return if count > 0 {
+            Tone::Warning
+        } else {
+            Tone::Normal
+        };
+    }
+    if column.eq_ignore_ascii_case("ready") {
+        // `ready/total` (pods, deployments, ...); other Ready columns (nodes' True/False) fall
+        // through to the status words.
+        if let Some((ready, total)) = text.split_once('/')
+            && let (Ok(ready), Ok(total)) = (ready.parse::<u32>(), total.parse::<u32>())
+        {
+            return match (ready < total, finished) {
+                (true, true) => Tone::Muted,
+                (true, false) => Tone::Warning,
+                (false, _) => Tone::Normal,
+            };
+        }
+    }
+    let status_column = ["status", "phase", "ready"]
+        .iter()
+        .any(|name| column.eq_ignore_ascii_case(name));
+    if !status_column {
+        return Tone::Normal;
+    }
+    status_tone(text)
+}
+
+/// The tone of a status word, as kubectl prints it. A node's `Ready,SchedulingDisabled` is
+/// judged by its worst part.
+fn status_tone(text: &str) -> Tone {
+    text.split(',')
+        .map(|part| word_tone(part.trim()))
+        .max_by_key(|tone| match tone {
+            Tone::Danger => 3,
+            Tone::Warning => 2,
+            Tone::Muted => 1,
+            Tone::Normal => 0,
+        })
+        .unwrap_or(Tone::Normal)
+}
+
+fn word_tone(word: &str) -> Tone {
+    // Init containers: `Init:0/2` is waiting, `Init:Error` and `Init:CrashLoopBackOff` failed.
+    let word = word.strip_prefix("Init:").unwrap_or(word);
+    match word {
+        "Running" | "Ready" | "Active" | "Bound" | "Available" | "True" | "Healthy" => Tone::Normal,
+        "Completed" | "Succeeded" => Tone::Muted,
+        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" | "Waiting"
+        | "Released" | "SchedulingDisabled" | "Unknown" => Tone::Warning,
+        "Failed"
+        | "Error"
+        | "CrashLoopBackOff"
+        | "ImagePullBackOff"
+        | "ErrImagePull"
+        | "ErrImageNeverPull"
+        | "InvalidImageName"
+        | "OOMKilled"
+        | "Evicted"
+        | "NotReady"
+        | "Lost"
+        | "False"
+        | "ContainerStatusUnknown"
+        | "DeadlineExceeded"
+        | "BackoffLimitExceeded"
+        | "RunContainerError"
+        | "StartError" => Tone::Danger,
+        // `CreateContainerConfigError`, `CreateContainerError`, `PreStopHookError`, ...
+        w if w.ends_with("Error") || w.ends_with("BackOff") => Tone::Danger,
+        // `Init:0/2`: init containers still running.
+        w if w.contains('/') => Tone::Warning,
+        _ => Tone::Normal,
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +513,107 @@ mod tests {
         let columns = pod_columns();
         assert!(has_ticking_columns(&columns));
         assert!(!has_ticking_columns(&columns[..4]));
+    }
+
+    // covers UP-20
+    #[test]
+    fn status_cells_are_toned_by_how_healthy_they_read() {
+        use Tone::*;
+        let cases = [
+            ("Status", "Running", Normal),
+            ("Status", "Completed", Muted),
+            ("Status", "Pending", Warning),
+            ("Status", "ContainerCreating", Warning),
+            ("Status", "Terminating", Warning),
+            ("Status", "Init:0/2", Warning),
+            ("Status", "CrashLoopBackOff", Danger),
+            ("Status", "Init:CrashLoopBackOff", Danger),
+            ("Status", "Error", Danger),
+            ("Status", "ImagePullBackOff", Danger),
+            ("Status", "CreateContainerConfigError", Danger),
+            ("Status", "OOMKilled", Danger),
+            ("Status", "Ready", Normal),
+            ("Status", "Ready,SchedulingDisabled", Warning),
+            ("Status", "NotReady", Danger),
+            ("Status", "Bound", Normal),
+            ("Status", "Lost", Danger),
+            ("Phase", "Failed", Danger),
+            ("Phase", "Succeeded", Muted),
+            ("Ready", "2/2", Normal),
+            ("Ready", "1/2", Warning),
+            ("Ready", "0/1", Warning),
+            ("Ready", "0/0", Normal),
+            ("Ready", "True", Normal),
+            ("Ready", "False", Danger),
+            ("Restarts", "0", Normal),
+            ("Restarts", "3", Warning),
+            ("Restarts", "3 (5m ago)", Warning),
+            // Only status-like columns: a name or label that reads "Error" is not colored.
+            ("Name", "Error", Normal),
+            ("Reason", "BackOff", Normal),
+            ("Up-to-date", "1/2", Normal),
+        ];
+        for (column, text, want) in cases {
+            assert_eq!(cell_tone(column, text, false), want, "{column} = {text}");
+        }
+        // A completed Job pod's 0/1 is expected, not a warning.
+        assert_eq!(cell_tone("Ready", "0/1", true), Muted);
+    }
+
+    // covers UP-20, UP-22
+    #[test]
+    fn only_built_in_kinds_get_health_colors_and_finished_rows_are_recognized() {
+        assert!(has_health_columns("pods"));
+        assert!(has_health_columns("deployments.apps"));
+        assert!(!has_health_columns("widgets.example.com"));
+        assert!(!has_health_columns("configmaps"));
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Ready", 0, ColumnRole::Value, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+        ];
+        let row = |status: &'static str| move |i: usize| ["job-x", "0/1", status][i].to_owned();
+        assert!(row_finished(&columns, row("Completed")));
+        assert!(!row_finished(&columns, row("Running")));
+        assert!(!row_finished(&columns, row("Error")));
+    }
+
+    // covers UP-20, UP-23: a long pod name must not push Status out of the list beside an open
+    // detail pane.
+    #[test]
+    fn long_names_give_way_so_the_status_column_stays_in_view() {
+        // The real pod columns, in kubectl order.
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Namespace", 0, ColumnRole::Namespace, ColumnType::String),
+            col("Ready", 0, ColumnRole::Value, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+            col("Restarts", 0, ColumnRole::Value, ColumnType::Integer),
+            col("Age", 0, ColumnRole::Age, ColumnType::String),
+        ];
+        let (name_min, namespace_min) = (118., 84.);
+        // Name 400, Namespace 170 (local-path-storage), Ready 60, Status 152, Restarts 80, Age 76.
+        let widths = [400., 170., 60., 152., 80., 76.];
+        let drawn = || -> Vec<(usize, f32)> { widths.iter().copied().enumerate().collect() };
+        let status_x = |d: &[(usize, f32)]| d[0].1 + d[1].1 + d[2].1;
+
+        let mut roomy = drawn();
+        squeeze_identity(&mut roomy, &columns, 1000., name_min, namespace_min);
+        assert_eq!(roomy, drawn(), "nothing changes when everything fits");
+
+        // Mid-size: only Name gives way.
+        let mut mid = drawn();
+        squeeze_identity(&mut mid, &columns, 800., name_min, namespace_min);
+        assert_eq!((mid[0].1, mid[1].1), (262., 170.));
+
+        // The list's 360 px minimum beside a detail pane: Status starts well inside the list.
+        let mut tight = drawn();
+        squeeze_identity(&mut tight, &columns, 360., name_min, namespace_min);
+        assert_eq!((tight[0].1, tight[1].1), (name_min, namespace_min));
+        assert!(
+            360. - status_x(&tight) >= 90.,
+            "Status starts at {}",
+            status_x(&tight)
+        );
     }
 }

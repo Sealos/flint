@@ -42,6 +42,9 @@ pub const ROW_HEIGHT: f32 = 24.;
 /// Approximate advance of one character at the table's text size, for column widths.
 const CHAR_WIDTH: f32 = 8.5;
 const CELL_PADDING: f32 = 16.;
+/// How narrow Name and Namespace get in a tight list (characters), so status columns fit.
+const SQUEEZED_NAME_CHARS: usize = 12;
+const SQUEEZED_NAMESPACE_CHARS: usize = 8;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -455,12 +458,23 @@ impl ResourceList {
     /// before the first layout). Wide columns that do not fit are left out.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
-        list_model::fit_columns(
+        let (mut drawn, dropped) = list_model::fit_columns(
             columns,
             |i| self.widths.chars(i, &columns[i]) as f32 * CHAR_WIDTH + CELL_PADDING,
             self.show_wide,
             available,
-        )
+        );
+        if let Some(room) = available {
+            let min = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
+            list_model::squeeze_identity(
+                &mut drawn,
+                columns,
+                room,
+                min(SQUEEZED_NAME_CHARS),
+                min(SQUEEZED_NAMESPACE_CHARS),
+            );
+        }
+        (drawn, dropped)
     }
 
     fn render_rows(
@@ -476,6 +490,7 @@ impl ResourceList {
         // Secret rows show only identity columns, as the MCP server does: a printer column
         // added by an extension could show a value.
         let secrets = self.kind.as_str() == "secrets";
+        let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);
         let mut elements = Vec::with_capacity(range.len());
@@ -512,12 +527,22 @@ impl ResourceList {
                         }
                     })
                 });
+            let finished = health
+                && list_model::row_finished(&self.shown.columns, |i| {
+                    cell_text(row, i, now).to_string()
+                });
             for &(col, width) in &self.drawn {
                 let column = &self.shown.columns[col];
                 let text = if secrets && !is_safe_secret_column(&column.name) {
                     SharedString::new_static(super::object::MASK)
                 } else {
                     cell_text(row, col, now)
+                };
+                // Stale rows are already muted; masked secrets have no status.
+                let tone = if stale || !health {
+                    list_model::Tone::Normal
+                } else {
+                    list_model::cell_tone(&column.name, &text, finished)
                 };
                 let numeric = list_model::is_numeric(column);
                 let is_name = column.role == ColumnRole::Name;
@@ -532,6 +557,12 @@ impl ResourceList {
                     .w(px(width))
                     .flex_none()
                     .when(is_name, |el| el.font_family(theme.mono_font_family.clone()))
+                    .map(|el| match tone {
+                        list_model::Tone::Normal => el,
+                        list_model::Tone::Danger => el.text_color(theme.danger),
+                        list_model::Tone::Warning => el.text_color(theme.warning),
+                        list_model::Tone::Muted => el.text_color(theme.muted_foreground),
+                    })
                     .when(numeric, |el| {
                         el.justify_end().font_features(tabular_figures())
                     })
