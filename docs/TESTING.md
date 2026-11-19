@@ -183,6 +183,43 @@ FLINT_E2E_APP_BIN="$PWD/target/debug/flint" cargo test -p flint-e2e --test app -
 Screenshots are named `upXX-<view>-light.png` and `upXX-<view>-dark.png`; a rerun replaces the previous run's
 files. Without `FLINT_AUTOMATION_SCREENSHOTS` they go to the scratch config directory and are deleted with it.
 
+**In CI.** macOS runners are costly, so app e2e has no job of its own: it is a step of `macos (flint-app)`, after
+that job's tests.
+
+```mermaid
+flowchart LR
+  subgraph macos["macos (flint-app) - macOS, contents: read"]
+    T["cargo test -p flint-app --features automation<br/>(builds target/debug/flint)"] --> C["check the binary has the channel"]
+    C --> E["App e2e: cargo test -p flint-e2e --test app -- --ignored<br/>FLINT_E2E_APP_BIN=target/debug/flint"]
+    E --> U["upload-artifact (always)<br/>app-e2e-screenshots-RUN-ATTEMPT"]
+  end
+  U -- "artifact URL, e2e outcome (job outputs)" --> P
+  subgraph comment["app e2e screenshots comment - Linux, pull-requests: write"]
+    P["post or update one marked PR comment<br/>(same-repo PRs only)"]
+  end
+```
+
+- **No second build.** `cargo test -p flint-app --features automation` already builds `target/debug/flint` with the
+  channel (the `flint mcp` integration test needs the binary). The e2e step points `FLINT_E2E_APP_BIN` at it, after a
+  step that checks the binary contains the channel's socket name. Only the `flint-e2e` test crate is compiled anew.
+- **Gating.** A failing e2e test fails the job. Screenshots never do: they are uploaded with `if: always()` as
+  `app-e2e-screenshots-<run id>-<attempt>` (kept 14 days), so a failed run still has them.
+- **The PR comment.** A separate Linux job, `app e2e screenshots comment`, runs after `macos (flint-app)`. It alone
+  has `pull-requests: write`; the macOS job, which builds and runs PR code, stays read-only. It posts one comment
+  marked `<!-- flint-app-e2e-screenshots -->` and edits it on later pushes, naming the commit, the e2e outcome and the
+  artifact link. It skips PRs from forks (their token cannot write; the artifact is on the run page) and runs only if
+  the e2e step ran.
+- **Display.** The app is the real binary on the real macOS platform, so it opens a window: it needs a logged-in
+  WindowServer session and a Metal device. GitHub's macOS runners auto-log in their user (UI tests run there), so a
+  session is present. Screenshots are rendered offscreen (`render_to_image`), so a hidden or occluded window is fine,
+  but GPUI still draws through Metal. The step before e2e prints `system_profiler SPDisplaysDataType`, which shows the
+  runner's (paravirtual) GPU when a run fails to draw.
+- **One app at a time.** The harness runs one app per test process (a process-wide lock). Two at once would save
+  perhaps 30 s on a 3-core, 7 GB runner but risk memory pressure and timing flakes, so it is not done.
+- **Cost.** About 3 to 4 more minutes per macOS run: 1 to 2 to compile the `flint-e2e` tests (dependencies are
+  shared with the app and cached), and 1.5 to 2 to run 16 tests (about 70 s on an M-series laptop). The job took
+  about 5 minutes before. The comment job takes seconds on Linux.
+
 ### Fake API server
 
 GitHub's macOS runners have no Docker, so app e2e in CI talks to a fake API server instead of kind. It lives in
@@ -306,7 +343,8 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display) |
 | `appimage (x86_64)` | Linux | A release build packaged with `scripts/package-appimage.sh`, then `scripts/smoke-appimage.sh`: `--version` and `mcp` answering `initialize` through the AppImage, without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`). No display, so the window is not opened |
 | `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
-| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server and uploads the screenshots (light and dark) as artifacts ([Sealos/flint#42](https://github.com/Sealos/flint/issues/42)). The only CI job that needs macOS |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job that needs macOS |
+| `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
