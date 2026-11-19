@@ -67,38 +67,104 @@ pub fn is_numeric(column: &Column) -> bool {
         )
 }
 
-/// Width limits in characters. The name column is as wide as its longest name, between
-/// `NAME_MIN_CHARS` and `MAX_CHARS`; a longer name is truncated (with a tooltip). Spare width
-/// goes to a filler after the last column, so the other columns stay next to the names.
+/// Width limits in characters. The name column is as wide as its longest name, at least
+/// `NAME_MIN_CHARS` and at most `MAX_CHARS` while other columns need the room; spare width goes
+/// to the name column first ([`widen_name`]), so long names show in full when the list is wide.
+/// What is left goes to a filler after the last column, so the other columns stay next to the
+/// names.
 const MIN_CHARS: usize = 4;
 const MAX_CHARS: usize = 48;
 pub const NAME_MIN_CHARS: usize = 16;
+/// The longest object name Kubernetes allows (a DNS subdomain), so the name column can grow
+/// into spare width as far as any name needs.
+const NAME_MAX_CHARS: usize = 253;
 const AGE_CHARS: usize = 7;
 /// Rows sampled per column when measuring. Enough to see the widths that matter without
 /// walking 10,000 rows on every update.
 const SAMPLE_ROWS: usize = 2_000;
 
-/// Each column's width in characters: the longest of its header and the sampled cells, within
-/// limits. Runs on a background thread; it is the only per-row work outside `compute_view`.
-pub fn measure_columns(snapshot: &KindSnapshot, now: i64) -> Vec<usize> {
-    let step = (snapshot.rows.len() / SAMPLE_ROWS).max(1);
+/// Each column's width in characters: the longest of its header and the cells of the sampled
+/// `rows` (indexes into `snapshot.rows`: the rows passing the filters, so a namespace filter
+/// leaves out the widths of rows it hides), within limits. The name column is measured up to
+/// the longest name. Runs on a background thread; it is the only per-row work outside
+/// `compute_view`.
+pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<usize> {
+    let step = (rows.len() / SAMPLE_ROWS).max(1);
     snapshot
         .columns
         .iter()
         .enumerate()
         .map(|(i, column)| {
-            let cells = snapshot
-                .rows
+            let cells = rows
                 .iter()
                 .step_by(step)
-                .map(|row| row.cell_text(i, now).chars().count())
+                .map(|&row| {
+                    snapshot.rows[row as usize]
+                        .cell_text(i, now)
+                        .chars()
+                        .count()
+                })
                 .max()
                 .unwrap_or(0);
             // The header also holds the sort arrow.
             let header = column.name.chars().count() + 2;
-            cells.max(header).clamp(MIN_CHARS, MAX_CHARS)
+            let max = if column.role == ColumnRole::Name {
+                NAME_MAX_CHARS
+            } else {
+                MAX_CHARS
+            };
+            cells.max(header).clamp(MIN_CHARS, max)
         })
         .collect()
+}
+
+/// How many rows of `snapshot` are in `namespaces` (all of them when the filter is empty or the
+/// kind is cluster-scoped): what the list counts against.
+pub fn rows_in_namespaces(snapshot: &KindSnapshot, namespaces: &[String]) -> usize {
+    if namespaces.is_empty() || !snapshot.namespaced {
+        snapshot.rows.len()
+    } else {
+        snapshot.in_namespaces(namespaces).count()
+    }
+}
+
+/// The toolbar's row count and its tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowCount {
+    /// "7", or "2 of 7" when the text filter hides some: counted within the namespace filter,
+    /// which the header already names.
+    pub text: String,
+    /// Each count spelled out: what matches the text filter, what is in the selected
+    /// namespaces, and what the cluster has.
+    pub tip: String,
+}
+
+/// The count for a list of `total` rows, `scoped` of them in the selected `namespaces` (empty:
+/// all), and `shown` of those passing the text filter.
+pub fn row_count(shown: usize, scoped: usize, total: usize, namespaces: &[String]) -> RowCount {
+    let text = if shown == scoped {
+        scoped.to_string()
+    } else {
+        format!("{shown} of {scoped}")
+    };
+    let mut tip = Vec::new();
+    if shown != scoped {
+        tip.push(format!("{shown} match the filter"));
+    }
+    if scoped != total || !namespaces.is_empty() {
+        let within = match namespaces {
+            [one] => one.clone(),
+            many => format!("{} namespaces", many.len()),
+        };
+        tip.push(format!("{scoped} in {within}"));
+        tip.push(format!("{total} in all namespaces"));
+    } else {
+        tip.push(format!("{total} in the cluster"));
+    }
+    RowCount {
+        text,
+        tip: tip.join("\n"),
+    }
 }
 
 /// Widths that only grow while the same columns are shown, so columns do not jitter as rows
@@ -110,13 +176,14 @@ pub struct ColumnWidths {
 }
 
 impl ColumnWidths {
-    /// Folds a measurement of `columns` in.
-    pub fn update(&mut self, columns: &Arc<[Column]>, measured: &[usize]) {
+    /// Folds a measurement of `columns` in. `restart` drops the widths so far, for when other
+    /// rows are shown (a filter changed), so columns fit the rows now shown.
+    pub fn update(&mut self, columns: &Arc<[Column]>, measured: &[usize], restart: bool) {
         let same = self
             .columns
             .as_ref()
             .is_some_and(|c| Arc::ptr_eq(c, columns) || **c == **columns);
-        if !same || self.chars.len() != measured.len() {
+        if restart || !same || self.chars.len() != measured.len() {
             self.columns = Some(columns.clone());
             self.chars = measured.to_vec();
             return;
@@ -134,7 +201,7 @@ impl ColumnWidths {
             .copied()
             .unwrap_or_else(|| (column.name.chars().count() + 2).max(8));
         if column.role == ColumnRole::Name {
-            return chars.max(NAME_MIN_CHARS);
+            return chars.clamp(NAME_MIN_CHARS, MAX_CHARS);
         }
         // Ages keep counting without new snapshots (and so without new measurements): leave
         // room for the longest form `kubectl` prints ("5m30s", "3y45d").
@@ -142,6 +209,15 @@ impl ColumnWidths {
             chars.max(AGE_CHARS)
         } else {
             chars
+        }
+    }
+
+    /// Width in characters column `i` would need to show every cell in full. Only the name
+    /// column can need more than [`ColumnWidths::chars`].
+    pub fn wanted(&self, i: usize, column: &Column) -> usize {
+        match (column.role, self.chars.get(i)) {
+            (ColumnRole::Name, Some(&chars)) => chars.max(NAME_MIN_CHARS),
+            _ => self.chars(i, column),
         }
     }
 }
@@ -181,9 +257,11 @@ pub fn fit_columns(
     }
 }
 
-/// Narrows the Name column, then the Namespace column, down to their minimums when the drawn
+/// Narrows the Namespace column, then the Name column, down to their minimums when the drawn
 /// columns are wider than `room`, so the status columns to their right stay in view instead of
-/// scrolling off. Long names truncate and show in full in a tooltip.
+/// scrolling off. Namespaces go first: they repeat down the list and the namespace filter names
+/// them, while the name is what tells rows apart. Long names truncate in the middle and show in
+/// full in a tooltip.
 pub fn squeeze_identity(
     drawn: &mut [(usize, f32)],
     columns: &[Column],
@@ -192,8 +270,8 @@ pub fn squeeze_identity(
     namespace_min: f32,
 ) {
     for (role, min) in [
-        (ColumnRole::Name, name_min),
         (ColumnRole::Namespace, namespace_min),
+        (ColumnRole::Name, name_min),
     ] {
         let total: f32 = drawn.iter().map(|(_, w)| w).sum();
         if total <= room {
@@ -205,6 +283,28 @@ pub fn squeeze_identity(
             *width = (*width - (total - room)).max(min);
         }
     }
+}
+
+/// Widens the Name column into the room the drawn columns leave free, up to `name_wanted`
+/// (the width its longest name needs), so a long name is not cut while the list has room.
+pub fn widen_name(drawn: &mut [(usize, f32)], columns: &[Column], room: f32, name_wanted: f32) {
+    let total: f32 = drawn.iter().map(|(_, w)| w).sum();
+    if total >= room {
+        return;
+    }
+    if let Some((_, width)) = drawn
+        .iter_mut()
+        .find(|(i, _)| columns[*i].role == ColumnRole::Name)
+        && *width < name_wanted
+    {
+        *width = name_wanted.min(*width + (room - total));
+    }
+}
+
+/// `text` cut in the middle to fit `chars` characters, so names that share a long prefix (the
+/// pods of one workload) stay distinguishable by their ends. `None` when it fits as is.
+pub fn fit_name(text: &str, chars: usize) -> Option<String> {
+    (text.chars().count() > chars).then(|| flint_core::display::middle_truncate(text, chars))
 }
 
 /// Whether the rows show something that changes with time alone (ages, timestamps), so the list
@@ -461,13 +561,13 @@ mod tests {
             rows: vec![row("a", "1/1"), row(&"x".repeat(80), "1/1")],
             ..Default::default()
         };
-        let measured = measure_columns(&snapshot, 10);
-        // Capped name, "Namespace" header (+2 for the arrow), and "Ready" header beats "1/1".
-        assert_eq!(measured, vec![MAX_CHARS, 11, 7]);
+        let measured = measure_columns(&snapshot, &[0, 1], 10);
+        // The whole name, "Namespace" header (+2 for the arrow), and "Ready" header beats "1/1".
+        assert_eq!(measured, vec![80, 11, 7]);
 
         let mut widths = ColumnWidths::default();
-        widths.update(&columns, &measured);
-        widths.update(&columns, &[30, 11, 5]);
+        widths.update(&columns, &measured, false);
+        widths.update(&columns, &[30, 11, 5], false);
         assert_eq!(widths.chars(2, &columns[2]), 7, "never shrinks");
         assert_eq!(widths.chars(1, &columns[1]), 11);
         assert_eq!(
@@ -475,10 +575,22 @@ mod tests {
             MAX_CHARS,
             "the name column is as wide as the longest name, capped"
         );
+        assert_eq!(
+            widths.wanted(0, &columns[0]),
+            80,
+            "but it can take spare room up to the longest name"
+        );
+        assert_eq!(widths.wanted(1, &columns[1]), 11);
+
+        // Only the rows shown are measured: "a" alone is narrower than the "Name" header.
+        assert_eq!(measure_columns(&snapshot, &[0], 10)[0], 6);
+        // A restart (another filter) lets columns shrink to the rows now shown.
+        widths.update(&columns, &[6, 11, 5], true);
+        assert_eq!(widths.chars(2, &columns[2]), 5);
 
         // New columns start over; the name column keeps its minimum.
         let other: Arc<[Column]> = pod_columns()[..1].to_vec().into();
-        widths.update(&other, &[5]);
+        widths.update(&other, &[5], false);
         assert_eq!(widths.chars(0, &other[0]), NAME_MIN_CHARS);
     }
 
@@ -601,10 +713,15 @@ mod tests {
         squeeze_identity(&mut roomy, &columns, 1000., name_min, namespace_min);
         assert_eq!(roomy, drawn(), "nothing changes when everything fits");
 
-        // Mid-size: only Name gives way.
+        // A little short: only Namespace gives way, and the names stay whole.
+        let mut close = drawn();
+        squeeze_identity(&mut close, &columns, 900., name_min, namespace_min);
+        assert_eq!((close[0].1, close[1].1), (400., 132.));
+
+        // Mid-size: Namespace is at its minimum, then Name gives way.
         let mut mid = drawn();
         squeeze_identity(&mut mid, &columns, 800., name_min, namespace_min);
-        assert_eq!((mid[0].1, mid[1].1), (262., 170.));
+        assert_eq!((mid[0].1, mid[1].1), (348., 84.));
 
         // The list's 360 px minimum beside a detail pane: Status starts well inside the list.
         let mut tight = drawn();
@@ -615,5 +732,109 @@ mod tests {
             "Status starts at {}",
             status_x(&tight)
         );
+    }
+
+    // covers UP-20, UP-25, UP-27: a long name must not be cut while the list has room.
+    #[test]
+    fn spare_width_goes_to_the_name_column_up_to_its_longest_name() {
+        let columns = pod_columns()[..5].to_vec();
+        let drawn =
+            || -> Vec<(usize, f32)> { vec![(0, 200.), (1, 100.), (2, 60.), (3, 80.), (4, 70.)] };
+        // 510 drawn in 900: Name grows to what its longest name needs, the rest stays a filler.
+        let mut wide = drawn();
+        widen_name(&mut wide, &columns, 900., 330.);
+        assert_eq!(wide[0].1, 330.);
+        assert_eq!(wide[1..], drawn()[1..]);
+        // Less room than it wants: it takes all of it.
+        let mut some = drawn();
+        widen_name(&mut some, &columns, 600., 330.);
+        assert_eq!(some[0].1, 290.);
+        // No room, or a name that already fits: nothing changes.
+        let mut full = drawn();
+        widen_name(&mut full, &columns, 500., 330.);
+        assert_eq!(full, drawn());
+        let mut fits = drawn();
+        widen_name(&mut fits, &columns, 900., 150.);
+        assert_eq!(fits, drawn());
+    }
+
+    // covers UP-23: truncated pod names of one workload must stay distinguishable.
+    #[test]
+    fn names_are_cut_in_the_middle_keeping_their_distinct_ends() {
+        let a = fit_name("podinfo-7b9c8d5f4-abcde", 14).unwrap();
+        let b = fit_name("podinfo-7b9c8d5f4-vwxyz", 14).unwrap();
+        assert_ne!(a, b);
+        assert!(a.ends_with("abcde") && a.contains('…'), "{a}");
+        assert_eq!(a.chars().count(), 14);
+        assert_eq!(fit_name("api", 14), None);
+    }
+
+    // covers UP-21: the count is within the namespace filter, which the header names.
+    #[test]
+    fn the_count_matches_the_namespace_filter() {
+        let none: [String; 0] = [];
+        let demo = ["demo".to_owned()];
+        let two = ["demo".to_owned(), "kube-system".to_owned()];
+        // All namespaces, no text filter.
+        assert_eq!(
+            row_count(17, 17, 17, &none),
+            RowCount {
+                text: "17".into(),
+                tip: "17 in the cluster".into()
+            }
+        );
+        // One namespace selected: 7 of the cluster's 17 are in it.
+        assert_eq!(
+            row_count(7, 7, 17, &demo),
+            RowCount {
+                text: "7".into(),
+                tip: "7 in demo\n17 in all namespaces".into()
+            }
+        );
+        // And a text filter: counted against the namespace, not the cluster (was "2 of 17").
+        assert_eq!(
+            row_count(2, 7, 17, &demo),
+            RowCount {
+                text: "2 of 7".into(),
+                tip: "2 match the filter\n7 in demo\n17 in all namespaces".into()
+            }
+        );
+        assert_eq!(
+            row_count(3, 9, 17, &two).tip,
+            "3 match the filter\n9 in 2 namespaces\n17 in all namespaces"
+        );
+        // A text filter on all namespaces.
+        assert_eq!(row_count(2, 17, 17, &none).text, "2 of 17");
+    }
+
+    // covers UP-21
+    #[test]
+    fn rows_are_counted_within_the_selected_namespaces() {
+        let columns: Arc<[Column]> = pod_columns()[..3].to_vec().into();
+        let in_ns = |ns: &str, name: &str| {
+            let mut r = (*row(name, "1/1")).clone();
+            r.namespace = Some(ns.into());
+            Arc::new(r)
+        };
+        let snapshot = KindSnapshot {
+            columns,
+            namespaced: true,
+            rows: vec![
+                in_ns("a", "x"),
+                in_ns("b", "x"),
+                in_ns("b", "y"),
+                in_ns("c", "z"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(rows_in_namespaces(&snapshot, &[]), 4);
+        assert_eq!(rows_in_namespaces(&snapshot, &["b".into()]), 2);
+        assert_eq!(rows_in_namespaces(&snapshot, &["a".into(), "c".into()]), 2);
+        assert_eq!(rows_in_namespaces(&snapshot, &["gone".into()]), 0);
+        let cluster_scoped = KindSnapshot {
+            namespaced: false,
+            ..snapshot
+        };
+        assert_eq!(rows_in_namespaces(&cluster_scoped, &["b".into()]), 4);
     }
 }

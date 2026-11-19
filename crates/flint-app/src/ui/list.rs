@@ -14,7 +14,7 @@ use flint_core::{
     Cell, ClusterId, ColumnRole, CoreHandle, Feed, KindId, KindSnapshot, ListFormat, Row,
     SyncState, ViewQuery,
 };
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
@@ -43,9 +43,10 @@ pub const ROW_HEIGHT: f32 = 24.;
 /// Approximate advance of one character at the table's text size, for column widths.
 const CHAR_WIDTH: f32 = 8.5;
 const CELL_PADDING: f32 = 16.;
-/// How narrow Name and Namespace get in a tight list (characters), so status columns fit.
+/// How narrow Name and Namespace get in a tight list (characters), so status columns fit. The
+/// Namespace column keeps room for its header and the sort arrow, as measured.
 const SQUEEZED_NAME_CHARS: usize = 12;
-const SQUEEZED_NAMESPACE_CHARS: usize = 8;
+const SQUEEZED_NAMESPACE_CHARS: usize = 11;
 
 /// The object a list has selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +102,12 @@ pub struct ResourceList {
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
+    /// The namespace or text filter changed: the next measurement starts the column widths
+    /// over, so they fit the rows now shown. Live updates under the same filters only grow them.
+    remeasure: bool,
+    /// Rows of the shown snapshot in the selected namespaces (all rows with no filter), which
+    /// the count is out of.
+    scoped: usize,
     scroll: UniformListScrollHandle,
     /// The sideways scroll of the table, when its columns are wider than the pane.
     hscroll: ScrollHandle,
@@ -165,6 +172,7 @@ impl ResourceList {
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
+                this.remeasure = true;
                 this.recompute(cx);
             }
         });
@@ -189,6 +197,8 @@ impl ResourceList {
             pending_select: None,
             computing: false,
             dirty: false,
+            remeasure: false,
+            scoped: 0,
             scroll: UniformListScrollHandle::new(),
             hscroll: ScrollHandle::new(),
             drawn: Vec::new(),
@@ -235,6 +245,7 @@ impl ResourceList {
     pub fn set_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
         if self.query.namespaces != namespaces {
             self.query.namespaces = namespaces;
+            self.remeasure = true;
             self.recompute(cx);
         }
     }
@@ -309,21 +320,26 @@ impl ResourceList {
         };
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
+        let restart = std::mem::take(&mut self.remeasure);
+        let namespaces = self.query.namespaces.clone();
         let job_snapshot = snapshot.clone();
         let job = cx.background_spawn(async move {
             let rows = view.await;
-            let widths = list_model::measure_columns(&job_snapshot, unix_now());
+            let widths = list_model::measure_columns(&job_snapshot, &rows, unix_now());
+            let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
             let position = selected_uid.as_ref().and_then(|uid| {
                 rows.iter()
                     .position(|&i| job_snapshot.rows[i as usize].uid == *uid)
             });
-            (rows, widths, selected_uid, position)
+            (rows, widths, scoped, selected_uid, position)
         });
         self._compute = cx.spawn(async move |this, cx| {
-            let (rows, widths, uid, position) = job.await;
+            let (rows, widths, scoped, uid, position) = job.await;
             let _ = this.update(cx, |list, cx| {
                 list.computing = false;
-                list.apply(snapshot, rows, &widths, uid, position, cx);
+                list.widths.update(&snapshot.columns, &widths, restart);
+                list.scoped = scoped;
+                list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
                 }
@@ -335,12 +351,10 @@ impl ResourceList {
         &mut self,
         snapshot: Arc<KindSnapshot>,
         rows: Arc<[u32]>,
-        widths: &[usize],
         uid: Option<Box<str>>,
         position: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        self.widths.update(&snapshot.columns, widths);
         self.shown = snapshot;
         self.rows = rows;
         match &mut self.selected {
@@ -446,24 +460,29 @@ impl ResourceList {
     }
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
-    /// before the first layout). Wide columns that do not fit are left out.
+    /// before the first layout). Wide columns that do not fit are left out; spare width goes to
+    /// the Name column first.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
+        let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
         let (mut drawn, dropped) = list_model::fit_columns(
             columns,
-            |i| self.widths.chars(i, &columns[i]) as f32 * CHAR_WIDTH + CELL_PADDING,
+            |i| width(self.widths.chars(i, &columns[i])),
             self.show_wide,
             available,
         );
         if let Some(room) = available {
-            let min = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
             list_model::squeeze_identity(
                 &mut drawn,
                 columns,
                 room,
-                min(SQUEEZED_NAME_CHARS),
-                min(SQUEEZED_NAMESPACE_CHARS),
+                width(SQUEEZED_NAME_CHARS),
+                width(SQUEEZED_NAMESPACE_CHARS),
             );
+            if let Some(name) = columns.iter().position(|c| c.role == ColumnRole::Name) {
+                let wanted = width(self.widths.wanted(name, &columns[name]));
+                list_model::widen_name(&mut drawn, columns, room, wanted);
+            }
         }
         (drawn, dropped)
     }
@@ -534,6 +553,13 @@ impl ResourceList {
                 let numeric = list_model::is_numeric(column);
                 let is_name = column.role == ColumnRole::Name;
                 let fits = (text.chars().count() as f32) * CHAR_WIDTH + CELL_PADDING <= width;
+                // Names of one workload share their start: cut them in the middle, so the ends
+                // that tell them apart stay in view. Other cells truncate at the end.
+                let room = ((width - CELL_PADDING) / CHAR_WIDTH).floor().max(0.) as usize;
+                let shown_text = match is_name.then(|| list_model::fit_name(&text, room)) {
+                    Some(Some(cut)) => SharedString::from(cut),
+                    _ => text.clone(),
+                };
                 let cell = div()
                     .id(("cell", ix * ncols + col))
                     .h_full()
@@ -553,7 +579,13 @@ impl ResourceList {
                     .when(numeric, |el| {
                         el.justify_end().font_features(tabular_figures())
                     })
-                    .child(div().min_w_0().truncate().child(text.clone()))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(shown_text.clone())
+                            .test_text(shown_text),
+                    )
                     .when(!fits, |el| {
                         el.tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
                     });
@@ -625,13 +657,7 @@ impl ResourceList {
 
     fn render_toolbar(&self, theme: &Theme, _cx: &Context<Self>) -> impl IntoElement {
         let snapshot = &self.shown;
-        let total = snapshot.rows.len();
-        let shown = self.rows.len();
-        let count = if shown == total {
-            format!("{total}")
-        } else {
-            format!("{shown} of {total}")
-        };
+        let count = self.row_count();
         let wide = list_model::has_wide_columns(&snapshot.columns);
         let dropped = self.dropped_wide;
         h_flex()
@@ -662,7 +688,8 @@ impl ResourceList {
                     .flex_none()
                     .font_features(tabular_figures())
                     .text_color(theme.muted_foreground)
-                    .child(count),
+                    .child(count.text)
+                    .tooltip(move |window, cx| Tooltip::new(count.tip.clone()).build(window, cx)),
             )
             .child(state_chip(&self.latest.state, self.latest.feed, theme))
             .child(div().flex_1())
@@ -701,6 +728,22 @@ impl ResourceList {
                             .prefix(Icon::new(IconName::Search).small()),
                     ),
             )
+    }
+
+    /// The toolbar's count: rows passing the text filter out of those in the selected
+    /// namespaces, with the cluster's total in its tooltip.
+    pub fn row_count(&self) -> list_model::RowCount {
+        let namespaces: &[String] = if self.shown.namespaced {
+            &self.query.namespaces
+        } else {
+            &[]
+        };
+        list_model::row_count(
+            self.rows.len(),
+            self.scoped,
+            self.shown.rows.len(),
+            namespaces,
+        )
     }
 
     /// The message shown instead of rows, if any.

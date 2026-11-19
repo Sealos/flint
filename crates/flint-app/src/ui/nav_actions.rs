@@ -139,4 +139,183 @@ mod tests {
                 .is_err()
         );
     }
+
+    fn entries(group: &str, plurals: &[&str]) -> Vec<flint_core::NavEntry> {
+        plurals
+            .iter()
+            .map(|plural| flint_core::NavEntry {
+                id: flint_core::KindId::new(group, plural),
+                label: (*plural).into(),
+                kind: (*plural).into(),
+                api_version: "v1".into(),
+                namespaced: true,
+                listable: true,
+                watchable: true,
+            })
+            .collect()
+    }
+
+    /// A navigation panel in a window `height` tall, over `sections`.
+    fn open_nav(
+        cx: &mut TestAppContext,
+        height: f32,
+        sections: Vec<NavSection>,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<NavPanel>) {
+        use gpui_kit::{Bounds, Point, WindowBounds, WindowOptions, px, size};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::registry::init(cx);
+        });
+        let discovery = Arc::new(ClusterDiscovery {
+            navigation: Navigation { sections },
+            kinds: Vec::new(),
+        });
+        cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(220.), px(height)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| {
+                    cx.new(|cx| {
+                        let mut nav = NavPanel::new();
+                        nav.set_cluster(Some("a".into()), Some(discovery), None, cx);
+                        nav
+                    })
+                },
+            )
+            .unwrap()
+        })
+    }
+
+    // covers UP-28: with sections open the rows overflow the column; they must keep their height
+    // and scroll, not squeeze together and clip the last header ("OTHER").
+    #[gpui_kit::test]
+    fn rows_keep_their_height_and_scroll_when_sections_overflow(cx: &mut TestAppContext) {
+        use gpui_kit::ScrollDelta;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{point, px};
+
+        let workloads = [
+            "pods",
+            "deployments",
+            "statefulsets",
+            "daemonsets",
+            "replicasets",
+        ];
+        let config = [
+            "configmaps",
+            "secrets",
+            "persistentvolumeclaims",
+            "storageclasses",
+        ];
+        let sections = vec![
+            NavSection {
+                title: "Workloads".into(),
+                kind: SectionKind::BuiltIn,
+                entries: entries("", &workloads),
+            },
+            NavSection {
+                title: "Config & Storage".into(),
+                kind: SectionKind::BuiltIn,
+                entries: entries("", &config),
+            },
+            NavSection {
+                title: "example.com".into(),
+                kind: SectionKind::ApiGroup,
+                entries: entries("example.com", &["widgets"]),
+            },
+            NavSection {
+                title: "Other".into(),
+                kind: SectionKind::Other,
+                entries: entries("", &["bindings", "podtemplates"]),
+            },
+        ];
+        // Room for about eight rows: Workloads and Config & Storage open need twelve.
+        let (window, nav) = open_nav(cx, 200., sections);
+        cx.update_window(window, |_, window, cx| {
+            nav.update(cx, |nav, cx| {
+                nav.toggle_section(
+                    &ToggleNavSection {
+                        section: "Config & Storage".into(),
+                    },
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let other = ("nav-section", 3usize);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let mut ids: Vec<gpui_kit::ElementId> = workloads
+                .iter()
+                .chain(&config)
+                .map(|plural| format!("nav-{plural}").into())
+                .collect();
+            ids.extend((0..4usize).map(|i| ("nav-section", i).into()));
+            for id in ids {
+                let row = window.find(id.clone());
+                assert_eq!(
+                    f32::from(row.bounds().size.height),
+                    24.,
+                    "{id:?} is {:?} tall",
+                    row.bounds().size.height
+                );
+            }
+            // The last header is below the fold, not squeezed into it.
+            let other = window.find(other).bounds();
+            assert!(
+                f32::from(other.origin.y) >= 200.,
+                "OTHER is at {:?}",
+                other.origin.y
+            );
+            window.scroll("nav", ScrollDelta::Pixels(point(px(0.), px(-1000.))), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let header = window.find(other);
+            let bounds = header.bounds();
+            assert!(header.visible(), "OTHER is not in view after scrolling");
+            assert_eq!(f32::from(bounds.size.height), 24.);
+            assert!(
+                f32::from(bounds.origin.y + bounds.size.height) <= 200.,
+                "OTHER ends at {:?}, past the window",
+                bounds.origin.y + bounds.size.height
+            );
+        })
+        .unwrap();
+    }
+
+    // covers UP-04: a failed connection offers Retry once, in the main area, not again here.
+    #[gpui_kit::test]
+    fn retry_shows_here_only_for_a_failed_discovery(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+
+        let (window, nav) = open_nav(cx, 300., Vec::new());
+        let retry_shown = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("nav-retry").is_some()
+            })
+            .unwrap()
+        };
+        nav.update(cx, |nav, cx| {
+            nav.set_cluster(Some("b".into()), None, None, cx);
+            nav.set_connection_failed(true, cx);
+        });
+        assert!(!retry_shown(cx));
+        nav.update(cx, |nav, cx| {
+            nav.set_connection_failed(false, cx);
+            nav.set_cluster(Some("b".into()), None, Some("discovery: 503".into()), cx);
+        });
+        assert!(retry_shown(cx));
+    }
 }

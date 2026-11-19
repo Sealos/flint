@@ -60,6 +60,26 @@ contexts:
         ),
     )
     .unwrap();
+    let (window, workspace, model) = open_window_over(cx, dir, kubeconfig);
+    let loaded = model.clone();
+    cx.wait_for(window, WAIT, move |_, cx| {
+        loaded.read(cx).clusters.len() == 2
+    })
+    .await;
+    TestWorkspace {
+        window,
+        workspace,
+        model,
+        _server: server,
+    }
+}
+
+/// The main window over `kubeconfig`, which may not exist or hold no contexts.
+fn open_window_over(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    kubeconfig: std::path::PathBuf,
+) -> (AnyWindowHandle, Entity<Workspace>, Entity<ClustersModel>) {
     let core = CoreHandle::start(CoreConfig {
         config_dir: dir.to_owned(),
         settings: Settings::default(),
@@ -75,7 +95,7 @@ contexts:
         registry::init(cx);
     });
     let ui_state = UiState::load(dir.to_owned());
-    let (window, workspace, model) = cx.update(|cx| {
+    cx.update(|cx| {
         let model = cx.new(|cx| ClustersModel::new(core, Settings::default(), None, cx));
         let workspace_model = model.clone();
         let (window, workspace) = gpui_kit::open_window(
@@ -93,18 +113,22 @@ contexts:
         )
         .unwrap();
         (window, workspace, model)
-    });
-    let loaded = model.clone();
-    cx.wait_for(window, WAIT, move |_, cx| {
-        loaded.read(cx).clusters.len() == 2
     })
-    .await;
-    TestWorkspace {
-        window,
-        workspace,
-        model,
-        _server: server,
-    }
+}
+
+/// The main window over a kubeconfig file with no contexts, once it is loaded.
+pub async fn open_empty_workspace(
+    cx: &mut TestAppContext,
+    dir: &Path,
+) -> (AnyWindowHandle, Entity<Workspace>, Entity<ClustersModel>) {
+    cx.executor().allow_parking();
+    let kubeconfig = dir.join("kubeconfig");
+    std::fs::write(&kubeconfig, "apiVersion: v1\nkind: Config\n").unwrap();
+    let (window, workspace, model) = open_window_over(cx, dir, kubeconfig);
+    let loaded = model.clone();
+    cx.wait_for(window, WAIT, move |_, cx| loaded.read(cx).loaded)
+        .await;
+    (window, workspace, model)
 }
 
 fn column(name: &str, role: ColumnRole, ty: ColumnType, priority: i32) -> Column {

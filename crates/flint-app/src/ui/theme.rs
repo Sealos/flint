@@ -631,6 +631,121 @@ pub(super) mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// CIELAB (D65) of an opaque color.
+    fn lab(color: Hsla) -> [f32; 3] {
+        let [r, g, b, _] = rgb(color);
+        let lin = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (r, g, b) = (lin(r), lin(g), lin(b));
+        let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+        let f = |t: f32| {
+            if t > 0.008856 {
+                t.cbrt()
+            } else {
+                7.787 * t + 16. / 116.
+            }
+        };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        [116. * fy - 16., 500. * (fx - fy), 200. * (fy - fz)]
+    }
+
+    /// The CIEDE2000 color difference: about 1 is just noticeable side by side; small text
+    /// needs far more to tell two colors apart at a glance.
+    fn delta_e(a: Hsla, b: Hsla) -> f32 {
+        use std::f32::consts::PI;
+        let ([l1, a1, b1], [l2, a2, b2]) = (lab(a), lab(b));
+        let deg = |r: f32| r * 180. / PI;
+        let rad = |d: f32| d * PI / 180.;
+        let c_bar = (a1.hypot(b1) + a2.hypot(b2)) / 2.;
+        let g = 0.5 * (1. - (c_bar.powi(7) / (c_bar.powi(7) + 25f32.powi(7))).sqrt());
+        let (a1, a2) = ((1. + g) * a1, (1. + g) * a2);
+        let (c1, c2) = (a1.hypot(b1), a2.hypot(b2));
+        let hue = |b: f32, a: f32| deg(b.atan2(a)).rem_euclid(360.);
+        let (h1, h2) = (hue(b1, a1), hue(b2, a2));
+        let dl = l2 - l1;
+        let dc = c2 - c1;
+        let mut dh = h2 - h1;
+        if c1 * c2 == 0. {
+            dh = 0.;
+        } else if dh > 180. {
+            dh -= 360.;
+        } else if dh < -180. {
+            dh += 360.;
+        }
+        let dh = 2. * (c1 * c2).sqrt() * (rad(dh) / 2.).sin();
+        let l_bar = (l1 + l2) / 2.;
+        let c_bar = (c1 + c2) / 2.;
+        let h_bar = if c1 * c2 == 0. {
+            h1 + h2
+        } else if (h1 - h2).abs() <= 180. {
+            (h1 + h2) / 2.
+        } else if h1 + h2 < 360. {
+            (h1 + h2 + 360.) / 2.
+        } else {
+            (h1 + h2 - 360.) / 2.
+        };
+        let t = 1. - 0.17 * rad(h_bar - 30.).cos()
+            + 0.24 * rad(2. * h_bar).cos()
+            + 0.32 * rad(3. * h_bar + 6.).cos()
+            - 0.20 * rad(4. * h_bar - 63.).cos();
+        let theta = 30. * (-((h_bar - 275.) / 25.).powi(2)).exp();
+        let rc = 2. * (c_bar.powi(7) / (c_bar.powi(7) + 25f32.powi(7))).sqrt();
+        let sl = 1. + 0.015 * (l_bar - 50.).powi(2) / (20. + (l_bar - 50.).powi(2)).sqrt();
+        let sc = 1. + 0.045 * c_bar;
+        let sh = 1. + 0.015 * c_bar * t;
+        let rt = -rad(2. * theta).sin() * rc;
+        ((dl / sl).powi(2) + (dc / sc).powi(2) + (dh / sh).powi(2) + rt * (dc / sc) * (dh / sh))
+            .sqrt()
+    }
+
+    /// How far apart (CIEDE2000) the YAML view's key and value colors must be: enough to tell
+    /// `name:` from `name` in small monospace text at a glance.
+    const DISTINCT: f32 = 50.;
+
+    /// The YAML view's keys (`property`) and string values must not look alike: in a YAML
+    /// document nearly every line is one of each.
+    // covers UP-23, UP-32
+    #[test]
+    fn yaml_keys_and_strings_are_clearly_different_colors() {
+        let file: serde_json::Value = serde_json::from_str(THEMES).unwrap();
+        let mut failures = Vec::new();
+        for theme in file["themes"].as_array().unwrap() {
+            let name = theme["name"].as_str().unwrap();
+            let syntax = &theme["highlight"]["syntax"];
+            let color =
+                |key: &str| try_parse_color(syntax[key]["color"].as_str().unwrap()).unwrap();
+            let difference = delta_e(color("property"), color("string"));
+            if difference < DISTINCT {
+                failures.push(format!(
+                    "{name}: keys (property) and strings differ by {difference:.1} (CIEDE2000), \
+                     need {DISTINCT}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn delta_e_matches_published_ciede2000_values() {
+        // Black to white is the full lightness range; a step of 2 in 255 is barely visible.
+        let hex = |s: &str| try_parse_color(s).unwrap();
+        assert!(delta_e(hex("#2f5d8a"), hex("#2f5d8a")) < 0.01);
+        let black_white = delta_e(hex("#000000"), hex("#ffffff"));
+        assert!((black_white - 100.).abs() < 0.5, "{black_white}");
+        let near = delta_e(hex("#808080"), hex("#828282"));
+        assert!(near < 1.5, "{near}");
+        // Symmetric.
+        let (a, b) = (hex("#1f5fbf"), hex("#266b0e"));
+        assert!((delta_e(a, b) - delta_e(b, a)).abs() < 0.01);
+    }
+
     #[test]
     fn contrast_matches_known_wcag_ratios() {
         let hex = |s: &str| try_parse_color(s).unwrap();

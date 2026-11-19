@@ -115,6 +115,9 @@ pub struct ClusterState {
     pub active: bool,
     /// `disconnected`, `connecting`, `connected` or `failed`.
     pub connection: &'static str,
+    /// What its dot shows: `not_connected`, `connecting`, `live` (connected and watched),
+    /// `idle` (connected, watches stopped) or `failed`.
+    pub presence: &'static str,
     /// Why the connection failed (a sanitized summary).
     pub error: Option<String>,
     /// `hidden`, `exposed` or `server_changed`.
@@ -127,6 +130,8 @@ pub struct ClusterState {
 pub enum Main {
     /// "Select a cluster".
     NoCluster,
+    /// No kubeconfig file had a context: where Flint looked and what to do.
+    NoContexts,
     Connecting,
     /// Connected, with no list open yet.
     Connected {
@@ -147,10 +152,11 @@ pub struct HeaderState {
     pub breadcrumb: Vec<String>,
     /// The namespace filter; empty for all namespaces.
     pub namespaces: Vec<String>,
-    /// The filter button's text ("All namespaces", "demo", "3 namespaces"), when shown.
+    /// The filter button's text ("All namespaces", "demo", "3 namespaces"), when shown (a
+    /// namespaced kind, and not while the connection failed).
     pub namespace_button: Option<String>,
-    /// The watch mode button's text.
-    pub watch_mode: String,
+    /// The watch mode button's text, when shown (not while the connection failed).
+    pub watch_mode: Option<String>,
     /// Whether the mode is the cluster's own (`cluster`) or the default (`default`).
     pub watch_mode_source: &'static str,
 }
@@ -193,6 +199,9 @@ pub struct ListState {
     /// Rows in the list, and rows passing the filters.
     pub total: usize,
     pub shown: usize,
+    /// The toolbar's count as drawn ("7", "2 of 7"): out of the rows in the selected
+    /// namespaces.
+    pub count: String,
     pub columns: Vec<String>,
     /// The rows passing the filters, in display order, up to [`ListState::ROW_LIMIT`].
     pub rows: Vec<RowState>,
