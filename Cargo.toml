@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/flint-core", "crates/flint-mcp", "crates/flint-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/Sealos/flint"
+publish = false
+
+[workspace.dependencies]
+flint-core = { path = "crates/flint-core" }
+flint-mcp = { path = "crates/flint-mcp" }
+
+# Kubernetes. kube and k8s-openapi versions must move together (see the kube README).
+kube = { version = "5.1.0", default-features = false, features = ["client", "config", "runtime", "ws", "rustls-tls", "ring"] }
+k8s-openapi = { version = "0.29.0", features = ["latest"] }
+
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+async-channel = "2.5.0"
+# Already in the tree through kube; used to read log streams.
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
+libc = "0.2.191"
+notify = "8.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tempfile = "3.27.0"
+serde_json = "1.0.154"
+# kube 5.1 parses kubeconfig with serde-saphyr; reuse the same YAML implementation for output.
+serde-saphyr = "=2.2.0"
+
+# MCP: the official Rust SDK (github.com/modelcontextprotocol/rust-sdk).
+rmcp = { version = "=3.11.0", features = ["server", "macros", "transport-io"] }
+
+# UI. gpui-kit is the single crate upstream (longbridge/gpui-kit) tells applications to depend on.
+# It pins the exact GPUI snapshot (`gpui-pre =0.3.12`) that gpui-component 0.10.0 was built against
+# and re-exports GPUI and gpui-component. Pin exactly: GPUI APIs change between releases.
+gpui-kit = "=0.10.0"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[profile.dev.package]
+# Recommended by gpui-kit: these are very slow unoptimized.
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+gpui-pre = { opt-level = 3 }
