@@ -6,9 +6,30 @@ with [GPUI](https://www.gpui.rs/) so it starts fast, stays light on memory, and 
 It also ships a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, so AI agents can inspect the
 clusters you choose to expose.
 
-Status: early development (milestone M1). The app lists your kubeconfig contexts, connects to the one you select,
+Status: early development (milestone M1.5). The app lists your kubeconfig contexts, connects to the one you select,
 and browses every kind it serves, CRDs included: live lists with the `kubectl get` columns, a namespace and text
-filter, and a detail view with metadata, conditions, events and read-only YAML.
+filter, and a detail view with metadata, conditions, events and read-only YAML. It has a light and a dark theme
+that follow macOS (View > Appearance overrides it). Logs and exec arrive in M2.
+
+## Install from a release
+
+Each [release](https://github.com/Sealos/flint/releases) has a universal binary for Apple Silicon and Intel Macs.
+It is a command-line binary for now (there is no `.app` bundle until M6): run it from a terminal, and it opens the
+Flint window. Replace `v0.1.1` with the newest tag on the releases page.
+
+```sh
+gh release download v0.1.1 -R Sealos/flint -p 'flint-*-macos-universal.tar.gz*'
+shasum -a 256 -c flint-v0.1.1-macos-universal.tar.gz.sha256
+tar -xzf flint-v0.1.1-macos-universal.tar.gz
+sudo install -m 755 flint/flint /usr/local/bin/flint
+flint --version
+flint                                   # opens the window
+```
+
+Until M6 the binary is **not signed or notarized**. Downloaded with `gh` or `curl`, it runs as is. Downloaded with
+a browser, macOS blocks the first run: remove the quarantine flag with
+`xattr -d com.apple.quarantine /usr/local/bin/flint`, or open **System Settings > Privacy & Security** and choose
+**Open Anyway**. Releases are marked pre-release until 1.0, so the releases page has no "Latest" badge yet.
 
 ## Build and run
 
@@ -27,6 +48,7 @@ Settings live in `~/Library/Application Support/Flint/settings.toml` (or in `$FL
 
 ```toml
 kubeconfig_paths = ["~/work/kubeconfig"]
+# appearance = "system"   # or "light" / "dark"; View > Appearance writes it
 # path = "/opt/homebrew/bin:/usr/bin:/bin"   # override the PATH taken from your login shell
 # helm = "/opt/homebrew/bin/helm"
 watch_mode = "all"                # or "on_view"
@@ -143,11 +165,11 @@ badge). Nothing is exposed by default. An exposure is tied to the context's API 
 re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
 Secret values are always redacted, and large outputs are cut short.
 
-Register it with Claude Code:
+Register it with Claude Code, using the installed binary (or `"$PWD/target/release/flint"` after
+`cargo build --release`):
 
 ```sh
-cargo build --release
-claude mcp add flint -- "$PWD/target/release/flint" mcp
+claude mcp add flint -- /usr/local/bin/flint mcp
 ```
 
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
