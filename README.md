@@ -70,7 +70,7 @@ FLINT_CLUSTER=kind-flint-dev FLINT_VIEW=demo/deployments/web#yaml FLINT_APPEARAN
 
 `scripts/dev-cluster.sh` manages a throwaway [kind](https://kind.sigs.k8s.io/) cluster named `flint-dev`, with the
 fixtures the cluster tests expect (`scripts/cluster-fixtures.sh`): metrics-server, a `demo` namespace with a Deployment
-and the `podinfo` Helm release, and a compacted etcd. Its kubeconfig is written to `.dev/kubeconfig` (gitignored), so your own
+and the `podinfo` Helm release, and old resourceVersions expired (etcd compacted, API server restarted). Its kubeconfig is written to `.dev/kubeconfig` (gitignored), so your own
 `~/.kube/config` is never touched.
 
 ```sh

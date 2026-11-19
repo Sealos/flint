@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install what Flint's cluster tests expect on a fresh kind cluster: metrics-server, the demo
-# namespace (Deployment and Service `web`, Helm release `podinfo`), and a compacted etcd. Used by
+# namespace (Deployment and Service `web`, Helm release `podinfo`), and old resourceVersions
+# expired, as on a long-lived cluster (etcd compacted, API server restarted). Used by
 # scripts/dev-cluster.sh and by the cluster-e2e CI job, so local runs and CI test the same cluster.
 #
 #   KUBECONFIG=<kind kubeconfig> scripts/cluster-fixtures.sh
@@ -54,26 +55,15 @@ k -n demo expose deployment web --port=80 --dry-run=client -o yaml | k apply -f 
 helm --kube-context "$context" upgrade --install podinfo oci://ghcr.io/stefanprodan/charts/podinfo \
   --version "$PODINFO_CHART_VERSION" -n demo --wait --timeout 3m
 
-# The cluster tests read pod metrics; metrics-server needs a couple of scrapes before it has any.
 k -n kube-system rollout status deployment/metrics-server --timeout=3m
 k -n demo rollout status deployment/web --timeout=3m
-echo "cluster-fixtures: waiting for pod metrics…"
-metrics_ready=
-for _ in $(seq 60); do
-  metrics="$(k get --raw /apis/metrics.k8s.io/v1beta1/namespaces/demo/pods 2>/dev/null || true)"
-  case "$metrics" in *'"containers"'*) metrics_ready=1 && break ;; esac
-  sleep 5
-done
-if [ -z "$metrics_ready" ]; then
-  echo "cluster-fixtures: metrics-server reported no pod metrics within 5 minutes" >&2
-  k get apiservice v1beta1.metrics.k8s.io -o wide >&2 || true
-  k -n kube-system logs deployment/metrics-server --tail=50 >&2 || true
-  exit 1
-fi
 
-# A new cluster still holds its whole etcd history, so a watch from an old resourceVersion replays
-# it instead of failing with 410 Expired. The API server compacts only every 5 minutes, so compact
-# now: the cluster tests check the 410 path, and CI runs them minutes after creating the cluster.
+# The cluster tests check that a watch from an old resourceVersion fails with 410 Expired, as it
+# does on any cluster that has run for a while. A new one is different twice over: etcd still holds
+# its whole history (the API server compacts only every 5 minutes), and the API server's watch
+# caches started at about resourceVersion 1, so they serve a watch from there out of memory. So
+# compact etcd, then restart the API server: its caches start again at the current revision, and
+# older versions go to etcd, which answers 410.
 etcd_pod="$(k -n kube-system get pod -l component=etcd -o jsonpath='{.items[0].metadata.name}')"
 etcdctl() {
   k -n kube-system exec "$etcd_pod" -- etcdctl \
@@ -88,23 +78,57 @@ if [ -z "$revision" ]; then
 fi
 # Fails only when nothing changed since the last compaction, which is fine on a re-run.
 etcdctl compact "$revision" >/dev/null || true
+
+# The kind node container; the kubelet starts the stopped API server again.
+node="${context#kind-}-control-plane"
+echo "cluster-fixtures: restarting the API server in $node"
+docker exec "$node" sh -c 'crictl stop $(crictl ps -q --name kube-apiserver)' >/dev/null
+sleep 5
+ready=
+for _ in $(seq 60); do
+  if k get --raw /readyz >/dev/null 2>&1; then ready=1 && break; fi
+  sleep 2
+done
+if [ -z "$ready" ]; then
+  echo "cluster-fixtures: the API server did not come back within 2 minutes" >&2
+  exit 1
+fi
+
 # The 410 comes as an ERROR event inside a 200 response. A 410 as the HTTP status would mean the
 # same, but kubectl reports it as a failure, so tell the cases apart.
-if watch="$(k get --raw '/api/v1/pods?watch=1&resourceVersion=1&timeoutSeconds=1' 2>&1)"; then
-  case "$watch" in
-    *'"code":410'*) ;;
-    *)
-      echo "cluster-fixtures: a watch from resourceVersion 1 still replays history after compaction: ${watch:0:200}" >&2
-      exit 1
-      ;;
-  esac
-else
-  case "$watch" in
-    *410* | *Expired* | *Gone*) ;;
-    *)
-      echo "cluster-fixtures: the watch from resourceVersion 1 failed: ${watch:0:200}" >&2
-      exit 1
-      ;;
-  esac
+expired=
+for _ in $(seq 15); do
+  if watch="$(k get --raw '/api/v1/pods?watch=1&resourceVersion=1&timeoutSeconds=1' 2>&1)"; then
+    case "$watch" in
+      *'"code":410'*) expired=1 && break ;;
+      *) problem="a watch from resourceVersion 1 still replays history: ${watch:0:200}" ;;
+    esac
+  else
+    case "$watch" in
+      *410* | *Expired* | *Gone*) expired=1 && break ;;
+      *) problem="the watch from resourceVersion 1 failed: ${watch:0:200}" ;;
+    esac
+  fi
+  sleep 2
+done
+if [ -z "$expired" ]; then
+  echo "cluster-fixtures: $problem" >&2
+  exit 1
+fi
+
+# The cluster tests read pod metrics; metrics-server needs a couple of scrapes before it has any,
+# and its API is briefly unavailable after the restart.
+echo "cluster-fixtures: waiting for pod metrics…"
+metrics_ready=
+for _ in $(seq 60); do
+  metrics="$(k get --raw /apis/metrics.k8s.io/v1beta1/namespaces/demo/pods 2>/dev/null || true)"
+  case "$metrics" in *'"containers"'*) metrics_ready=1 && break ;; esac
+  sleep 5
+done
+if [ -z "$metrics_ready" ]; then
+  echo "cluster-fixtures: metrics-server reported no pod metrics within 5 minutes" >&2
+  k get apiservice v1beta1.metrics.k8s.io -o wide >&2 || true
+  k -n kube-system logs deployment/metrics-server --tail=50 >&2 || true
+  exit 1
 fi
 echo "cluster-fixtures: done"

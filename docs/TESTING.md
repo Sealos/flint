@@ -91,7 +91,9 @@ Users still run `flint mcp`; the release ships only `flint`. A separate binary w
 `flint-app` because it keeps GPUI out of the Linux build graph entirely, with no feature combinations to test.
 
 **Cluster setup.** `scripts/cluster-fixtures.sh` installs metrics-server and the `demo` fixtures on a kind cluster and
-compacts etcd, so a watch from an old resourceVersion gets 410 as on an older cluster. `scripts/dev-cluster.sh up` and
+expires old resourceVersions, as on a cluster that has run for a while: it compacts etcd and restarts the API server, whose
+watch caches on a new cluster still reach back to resourceVersion 1. A watch from an old version then gets 410.
+`scripts/dev-cluster.sh up` and
 the `cluster-e2e` job both use it, so local runs and CI test the same cluster. It refuses any context that is not a
 local kind cluster. To run the cluster tests locally:
 
