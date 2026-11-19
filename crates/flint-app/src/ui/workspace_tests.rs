@@ -9,6 +9,7 @@ use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
 use crate::ui::detail::DetailTab;
+use crate::ui::dock::{DockItem as _, DockTab};
 use crate::ui::registry::{self, ActionError};
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
 use crate::ui::view_state::Focus;
@@ -423,4 +424,215 @@ async fn set_pane_width_keeps_the_width_a_narrow_window_cannot_show(cx: &mut Tes
         ),
         Err(ActionError::Rejected { .. })
     ));
+}
+
+/// Selects pod `name` and shows it in the detail pane as fetched, with containers `app`
+/// (restarted once, so it has previous logs) and `sidecar`.
+async fn show_pod(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
+    dispatch(
+        cx,
+        t,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": name}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    let detail = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    let pod = flint_core::ObjectDetail {
+        object: json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "demo", "uid": format!("uid-{name}")},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 1},
+                {"name": "sidecar", "restartCount": 0}
+            ]}
+        }),
+        yaml: String::new(),
+        managed_fields: None,
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    };
+    detail.update(cx, |d, cx| d.show_fetched(pod, cx));
+    cx.run_until_parked();
+}
+
+/// The dock: whether it shows, and its tabs' titles, left to right.
+fn dock_tabs(cx: &mut TestAppContext, t: &TestWorkspace) -> (bool, Vec<String>) {
+    t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        let titles = dock
+            .tab_ids()
+            .into_iter()
+            .map(|id| dock.tab(id).unwrap().item(cx).tab_title().to_string())
+            .collect();
+        (dock.is_visible(), titles)
+    })
+}
+
+fn press(cx: &mut TestAppContext, t: &TestWorkspace, key: &str) {
+    cx.update_window(t.window, |_, window, cx| window.press(key, cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+// covers UP-40, UP-42: Logs in the detail pane opens a tab in the dock (or shows the open one),
+// the tab keeps running across a cluster switch, and Cmd-W in the dock closes tabs, not the
+// window.
+#[gpui_kit::test]
+async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_pods(cx, &t, &[("demo", "web", 1)]).await;
+    assert_eq!(
+        dispatch(cx, &t, "detail::OpenLogs", Value::Null),
+        Err(ActionError::NotAvailable("detail::OpenLogs".into())),
+        "no pod is shown yet"
+    );
+    show_pod(cx, &t, "web").await;
+
+    // The sidecar never restarted, so it has no previous logs.
+    assert!(matches!(
+        dispatch(
+            cx,
+            &t,
+            "detail::OpenContainerLogs",
+            json!({"container": "sidecar", "previous": true})
+        ),
+        Err(ActionError::Rejected { .. })
+    ));
+    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(dock_tabs(cx, &t), (true, vec!["web · app".to_owned()]));
+    // Opening it again shows the same tab.
+    focus_workspace(cx, &t);
+    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
+    dispatch(cx, &t, "detail::OpenPreviousLogs", Value::Null).unwrap();
+    dispatch(
+        cx,
+        &t,
+        "detail::OpenContainerLogs",
+        json!({"container": "sidecar"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        dock_tabs(cx, &t).1,
+        ["web · app", "web · app (previous)", "web · sidecar"]
+    );
+    let first = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        match dock.tab(dock.tab_ids()[0]).unwrap() {
+            DockTab::Logs(view) => view.downgrade(),
+        }
+    });
+
+    // The new tab has focus; Ctrl-Tab moves through the tabs.
+    press(cx, &t, "ctrl-tab");
+    let active = |cx: &mut TestAppContext| {
+        t.workspace.read_with(cx, |ws, cx| {
+            let dock = ws.dock.read(cx);
+            dock.tab_ids()
+                .iter()
+                .position(|id| Some(*id) == dock.active_id())
+        })
+    };
+    assert_eq!(active(cx), Some(0));
+
+    // A cluster switch closes the list, not the dock: the sessions keep running.
+    activate(cx, &t, "beta").await;
+    cx.run_until_parked();
+    assert_eq!(dock_tabs(cx, &t).1.len(), 3);
+    let alive = first.upgrade().expect("the log tab survives the switch");
+    assert_eq!(
+        alive.read_with(cx, |v, _| v.request().cluster.clone()),
+        "alpha"
+    );
+    drop(alive);
+
+    // The log tab's actions work from the workspace, forwarded to the tab shown.
+    focus_workspace(cx, &t);
+    dispatch(cx, &t, "logs::ToggleTimestamps", Value::Null).unwrap();
+    let names: Vec<&str> = cx
+        .update_window(t.window, |_, window, cx| {
+            registry::available(window, cx).map(|s| s.name).collect()
+        })
+        .unwrap();
+    assert!(names.contains(&"logs::ToggleWrap"), "{names:?}");
+    assert!(names.contains(&"dock::CloseActiveTab"), "{names:?}");
+    assert!(!names.contains(&"logs::CopyLines"), "nothing is selected");
+
+    // Cmd-W in the dock closes its tabs one by one; the window stays.
+    let focus = t.workspace.read_with(cx, |ws, cx| {
+        ws.dock.read(cx).active_log().unwrap().read(cx).tab_focus()
+    });
+    cx.update_window(t.window, |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    press(cx, &t, "cmd-w");
+    assert_eq!(dock_tabs(cx, &t).1.len(), 2);
+    press(cx, &t, "cmd-w");
+    press(cx, &t, "cmd-w");
+    assert_eq!(dock_tabs(cx, &t), (false, Vec::new()));
+    cx.run_until_parked();
+    assert!(first.upgrade().is_none(), "closing a tab ends its session");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        workspace.read(cx).focus.is_focused(window)
+    })
+    .await;
+}
+
+// covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.
+#[gpui_kit::test]
+async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    focus_workspace(cx, &t);
+    press(cx, &t, "cmd-j");
+    assert_eq!(dock_tabs(cx, &t), (true, Vec::new()));
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("dock-empty").is_some()
+    })
+    .await;
+
+    dispatch(cx, &t, "workspace::SetDockHeight", json!({"height": 333})).unwrap();
+    assert!(matches!(
+        dispatch(cx, &t, "workspace::SetDockHeight", json!({"height": -5})),
+        Err(ActionError::Rejected { .. })
+    ));
+    let saved = |cx: &mut TestAppContext| t.workspace.read_with(cx, |ws, _| ws.panes.dock);
+    assert_eq!(saved(cx), Some(333));
+    // Taller than the 700 px window allows: the main area keeps its room.
+    dispatch(cx, &t, "workspace::SetDockHeight", json!({"height": 5000})).unwrap();
+    assert_eq!(saved(cx), Some(540));
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window
+            .try_find("dock-pane")
+            .is_some_and(|p| (f32::from(p.bounds().size.height) - 540.).abs() < 1.)
+    })
+    .await;
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    let path = dir.path().join(flint_core::settings::STATE_FILE);
+    cx.wait_for(t.window, WAIT, |_, _| {
+        std::fs::read_to_string(&path).is_ok_and(|s| s.contains("dock = 540"))
+    })
+    .await;
+    assert_eq!(
+        crate::ui::ui_state::UiState::load(dir.path().to_owned())
+            .panes()
+            .dock,
+        Some(540)
+    );
+
+    focus_workspace(cx, &t);
+    press(cx, &t, "cmd-j");
+    assert_eq!(dock_tabs(cx, &t), (false, Vec::new()));
 }

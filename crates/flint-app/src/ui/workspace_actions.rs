@@ -3,24 +3,32 @@
 //! controls dispatch these actions, and the guards and handlers share their check functions, so
 //! a click, a key, the palette and automation all take one path.
 //!
-//! The workspace also forwards the list's, the detail pane's and the navigation's actions to
-//! them, and installs their guards, so those work and are checked wherever focus is.
+//! The workspace also forwards the list's, the detail pane's, the navigation's, the dock's and
+//! the active log tab's actions to them, and installs their guards, so those work and are
+//! checked wherever focus is.
 
 use flint_core::settings::AiExposureState;
 use flint_core::{ClusterSummary, ConnectionState, NavEntry, WatchMode};
 use gpui_kit::*;
 
 use super::super::detail::DetailView;
+use super::super::dock::Dock;
 use super::super::list::ResourceList;
+use super::super::log_view::LogView;
 use super::super::nav::NavPanel;
 use super::super::registry::{
-    ActionError, AddNamespace, Bind, Close, CloseDetail, DefaultWatchAllKinds,
-    DefaultWatchOpenViewsOnly, ExposeToAi, FocusFilter, Forward, Guards, HideFromAi, OnView,
-    OpenView, PaneName, Refresh, RetryConnection, SelectCluster, SelectFirst, SelectLast,
-    SelectNext, SelectPrev, SelectRow, SetNamespaces, SetPaneWidth, ShowAllNamespaces,
-    ShowOverview, ShowYaml, SortBy, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
-    ToggleNamespace, ToggleNavSection, ToggleSecretValue, ToggleWide, UseDefaultWatchMode,
-    WatchAllKinds, WatchOpenViewsOnly,
+    ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
+    CloseDetail, CloseTab, CopyLines, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
+    DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
+    Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView,
+    OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenView, PaneName, PrevMatch, PrevTab, Refresh,
+    RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
+    SelectPrev, SelectPrevLine, SelectRow, SetDockHeight, SetNamespaces, SetPaneWidth,
+    ShowAllNamespaces, ShowOverview, ShowYaml, SortBy, ToggleAnnotations, ToggleLabels,
+    ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
 use super::super::ui_state;
 use super::{Pane, Workspace, confirm_expose, expose_dialog};
@@ -55,6 +63,13 @@ impl Workspace {
                 }
             })
             .bind::<SetPaneWidth>(Self::set_pane_width)
+            .bind::<SetDockHeight>(|this, action, window, cx| match check_dock_height(action) {
+                Ok(()) => {
+                    let height = f32::from(window.viewport_size().height);
+                    this.resize_dock(action.height, height, cx);
+                }
+                Err(e) => tracing::warn!("{e}"),
+            })
     }
 
     /// Registers the workspace's actions on its root element, and forwards the open views'.
@@ -68,6 +83,9 @@ impl Workspace {
             ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
         let element =
             DetailView::bind_actions(Forward::new(element, self.detail.as_ref())).into_element();
+        let element = Dock::bind_actions(Forward::new(element, Some(&self.dock))).into_element();
+        let log = self.dock.read(cx).active_log().cloned();
+        let element = LogView::bind_actions(Forward::new(element, log.as_ref())).into_element();
         NavPanel::bind_actions(Forward::new(element, Some(&self.nav))).into_element()
     }
 
@@ -155,9 +173,95 @@ impl Workspace {
                     None => Err(ActionError::unavailable::<ToggleSecretValue>()),
                 },
             )
+            .when::<OpenLogs>(|ws, cx| {
+                detail(ws, cx).is_some_and(|d| d.log_request::<OpenLogs>(None, false).is_ok())
+            })
+            .when::<OpenPreviousLogs>(|ws, cx| {
+                detail(ws, cx)
+                    .is_some_and(|d| d.log_request::<OpenPreviousLogs>(None, true).is_ok())
+            })
+            .add::<OpenContainerLogs>(
+                |ws, cx| detail(ws, cx).is_some_and(|d| !d.log_containers().is_empty()),
+                |ws, a, cx| match detail(ws, cx) {
+                    Some(d) => d
+                        .log_request::<OpenContainerLogs>(Some(&a.container), a.previous)
+                        .map(|_| ()),
+                    None => Err(ActionError::unavailable::<OpenContainerLogs>()),
+                },
+            )
+            // The dock's.
+            .when::<CloseActiveTab>(|ws, cx| {
+                let dock = ws.dock.read(cx);
+                dock.is_visible() && dock.active_id().is_some()
+            })
+            .when::<NextTab>(|ws, cx| {
+                let dock = ws.dock.read(cx);
+                dock.is_visible() && dock.tab_count() > 1
+            })
+            .when::<PrevTab>(|ws, cx| {
+                let dock = ws.dock.read(cx);
+                dock.is_visible() && dock.tab_count() > 1
+            })
+            .add::<ActivateTab>(
+                |ws, cx| ws.dock.read(cx).tab_count() > 0,
+                |ws, a, cx| ws.dock.read(cx).check_tab::<ActivateTab>(a.tab),
+            )
+            .add::<CloseTab>(
+                |ws, cx| ws.dock.read(cx).tab_count() > 0,
+                |ws, a, cx| ws.dock.read(cx).check_tab::<CloseTab>(a.tab),
+            )
+            .add::<SetDockHeight>(|_, _| true, |_, a, _| check_dock_height(a))
+            // The active log tab's.
+            .when::<TogglePause>(|ws, cx| log(ws, cx).is_some_and(LogView::follows))
+            .when::<JumpToEnd>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<JumpToStart>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<ToggleTimestamps>(|ws, cx| log(ws, cx).is_some())
+            .when::<ToggleWrap>(|ws, cx| log(ws, cx).is_some())
+            .when::<ToggleSources>(|ws, cx| log(ws, cx).is_some_and(LogView::is_workload))
+            .when::<FocusSearch>(|ws, cx| log(ws, cx).is_some())
+            .when::<NextMatch>(|ws, cx| log(ws, cx).is_some_and(|l| l.match_count() > 0))
+            .when::<PrevMatch>(|ws, cx| log(ws, cx).is_some_and(|l| l.match_count() > 0))
+            .when::<SelectPrevLine>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<SelectNextLine>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<ExtendSelectionUp>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<ExtendSelectionDown>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<SelectAllLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
+            .when::<ClearSelection>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
+            .when::<CopyLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
+            .when::<SaveLogs>(|ws, cx| {
+                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::All).is_ok())
+            })
+            .when::<SaveMatchingLines>(|ws, cx| {
+                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::Matches).is_ok())
+            })
+            .when::<SaveSelectedLines>(|ws, cx| {
+                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::Selection).is_ok())
+            })
+            .add::<SaveLines>(
+                |ws, cx| log(ws, cx).is_some_and(LogView::has_lines),
+                |ws, a, cx| match log(ws, cx) {
+                    Some(l) => l.check_save(a.lines),
+                    None => Err(ActionError::unavailable::<SaveLines>()),
+                },
+            )
+            .add::<SelectLine>(
+                |ws, cx| log(ws, cx).is_some_and(LogView::has_lines),
+                |ws, a, cx| match log(ws, cx) {
+                    Some(l) => l.check_line::<SelectLine>(a.line),
+                    None => Err(ActionError::unavailable::<SelectLine>()),
+                },
+            )
+            .add::<DragSelection>(
+                |ws, cx| log(ws, cx).is_some_and(LogView::has_selection),
+                |ws, a, cx| match log(ws, cx) {
+                    Some(l) => l.check_line::<DragSelection>(a.line),
+                    None => Err(ActionError::unavailable::<DragSelection>()),
+                },
+            )
     }
 
-    /// Gives focus back after it left with a closed view: to the open list, or the workspace.
+    /// Gives focus back after it left with a closed view (or a hidden dock): to the open list,
+    /// or the workspace.
     pub(super) fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focus = match &self.list {
             Some(list) => list.read(cx).focus_handle().clone(),
@@ -416,6 +520,27 @@ impl Workspace {
         };
         let window_width = f32::from(window.viewport_size().width);
         self.resize_pane(pane, action.width, window_width, cx);
+    }
+}
+
+/// The detail pane, if one is open.
+fn detail<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a DetailView> {
+    ws.detail.as_ref().map(|d| d.read(cx))
+}
+
+/// The log tab the dock shows, if it is visible and shows one.
+fn log<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a LogView> {
+    ws.dock.read(cx).active_log().map(|l| l.read(cx))
+}
+
+/// [`SetDockHeight`] takes a positive height.
+fn check_dock_height(action: &SetDockHeight) -> Result<(), ActionError> {
+    if action.height.is_finite() && action.height > 0. {
+        Ok(())
+    } else {
+        Err(ActionError::rejected::<SetDockHeight>(
+            "height must be positive",
+        ))
     }
 }
 

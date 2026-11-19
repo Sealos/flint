@@ -101,6 +101,72 @@ actions!(
     ]
 );
 
+actions!(
+    detail,
+    [
+        /// Open the shown pod's logs (its default container) in the dock.
+        OpenLogs,
+        /// Open the logs of the previous instance of the shown pod's default container.
+        OpenPreviousLogs
+    ]
+);
+actions!(
+    dock,
+    [
+        /// Show or hide the bottom dock.
+        ToggleDock,
+        /// Close the dock's active tab, ending its session.
+        CloseActiveTab,
+        /// Show the dock's next tab.
+        NextTab,
+        /// Show the dock's previous tab.
+        PrevTab
+    ]
+);
+actions!(
+    logs,
+    [
+        /// Pause following (new lines are held back), or resume it.
+        TogglePause,
+        /// Scroll to the newest line and keep following.
+        JumpToEnd,
+        /// Scroll to the oldest line shown.
+        JumpToStart,
+        /// Show or hide each line's timestamp.
+        ToggleTimestamps,
+        /// Wrap long lines, or cut them at the edge.
+        ToggleWrap,
+        /// Show or hide a workload line's pod and container.
+        ToggleSources,
+        /// Move focus to the log search field.
+        FocusSearch,
+        /// Go to the next line matching the search.
+        NextMatch,
+        /// Go to the previous line matching the search.
+        PrevMatch,
+        /// Select the line above (or the newest line).
+        SelectPrevLine,
+        /// Select the line below (or the newest line).
+        SelectNextLine,
+        /// Extend the selection one line up.
+        ExtendSelectionUp,
+        /// Extend the selection one line down.
+        ExtendSelectionDown,
+        /// Select every line shown.
+        SelectAllLines,
+        /// Clear the line selection.
+        ClearSelection,
+        /// Copy the selected lines as shown.
+        CopyLines,
+        /// Save every line shown to a file.
+        SaveLogs,
+        /// Save the lines matching the search to a file.
+        SaveMatchingLines,
+        /// Save the selected lines to a file.
+        SaveSelectedLines
+    ]
+);
+
 /// Make a cluster (kubeconfig context) the active one.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -211,6 +277,82 @@ pub struct ToggleSecretValue {
     pub key: String,
 }
 
+/// Open the logs of one container of the shown pod, or of its previous instance.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = detail, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct OpenContainerLogs {
+    pub container: String,
+    #[serde(default)]
+    pub previous: bool,
+}
+
+/// Set the bottom dock's height in points, as dragging its top edge does (same limits).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SetDockHeight {
+    pub height: f32,
+}
+
+/// Show a dock tab, by its id, as clicking it does.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = dock, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ActivateTab {
+    pub tab: u64,
+}
+
+/// Close a dock tab, by its id, as its close button does.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = dock, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct CloseTab {
+    pub tab: u64,
+}
+
+/// Select a log line by its id, or extend the selection to it (Shift-click).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = logs, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SelectLine {
+    pub line: u64,
+    #[serde(default)]
+    pub extend: bool,
+}
+
+/// Extend a selection being dragged with the mouse to a line.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = logs, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct DragSelection {
+    pub line: u64,
+}
+
+/// Which log lines to save.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveScope {
+    /// Every line shown.
+    #[default]
+    All,
+    /// The lines matching the search.
+    Matches,
+    /// The selected lines.
+    Selection,
+}
+
+/// Save log lines to a file, as shown and not redacted, with or without timestamps (by default
+/// as the timestamp toggle shows them).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = logs, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SaveLines {
+    pub lines: SaveScope,
+    #[serde(default)]
+    pub timestamps: Option<bool>,
+}
+
 /// Which part of the app handles an action, and so where it is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -226,6 +368,10 @@ pub enum Scope {
     Detail,
     /// An open dialog (the Expose to AI confirmation).
     Dialog,
+    /// The bottom dock and its tabs.
+    Dock,
+    /// The log tab shown in the dock.
+    Logs,
 }
 
 /// What a palette groups an action under.
@@ -237,6 +383,7 @@ pub enum Category {
     View,
     List,
     Detail,
+    Logs,
 }
 
 /// Whether a palette offers an action. Hidden ones exist for automation, or for controls that
@@ -252,10 +399,6 @@ pub enum Visibility {
 pub enum ArgKind {
     Text,
     Number,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     Bool,
     /// A list of strings.
     List,
@@ -810,6 +953,12 @@ pub const WORKSPACE: &str = "Workspace";
 const PLAIN: &str = "Workspace && !Input";
 /// The same, for the list: deeper than the workspace, so it wins there.
 const LIST_ALONE: &str = "ResourceList && !Input";
+/// The bottom dock's key context: Cmd-W closes a tab there instead of the window.
+pub const DOCK: &str = "Dock";
+/// A log tab's key context.
+pub const LOG_VIEW: &str = "LogView";
+/// Plain keys in a log tab, but not while typing in its search field.
+const LOG_PLAIN: &str = "LogView && !Input";
 
 fn build_unit<A: Action + Default>(args: Value) -> Result<Box<dyn Action>, String> {
     match args {
@@ -954,6 +1103,40 @@ const COLUMN: &[Arg] = &[arg(
     ArgKind::Column,
 )];
 const KEY: &[Arg] = &[arg("key", "the data key", ArgKind::Text)];
+const CONTAINER: &[Arg] = &[
+    arg("container", "container name", ArgKind::Text),
+    Arg {
+        name: "previous",
+        description: "the previous (terminated) instance",
+        required: false,
+        kind: ArgKind::Bool,
+    },
+];
+const HEIGHT: &[Arg] = &[arg("height", "height in points", ArgKind::Number)];
+const TAB: &[Arg] = &[arg("tab", "tab id", ArgKind::Number)];
+const LINE: &[Arg] = &[
+    arg("line", "line id", ArgKind::Number),
+    Arg {
+        name: "extend",
+        description: "extend the selection instead of starting one",
+        required: false,
+        kind: ArgKind::Bool,
+    },
+];
+const DRAG_LINE: &[Arg] = &[arg("line", "line id", ArgKind::Number)];
+const SAVE: &[Arg] = &[
+    arg(
+        "lines",
+        "which lines",
+        ArgKind::Choice(&["all", "matches", "selection"]),
+    ),
+    Arg {
+        name: "timestamps",
+        description: "include timestamps (default: as shown)",
+        required: false,
+        kind: ArgKind::Bool,
+    },
+];
 
 static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
     use self::Scope as S;
@@ -1140,6 +1323,170 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             KEY,
         )
         .of(C::Detail, S::Detail)
+        .hidden(),
+        Spec::unit::<OpenLogs>("Open Logs", "Open the shown pod's logs in the dock.")
+            .of(C::Logs, S::Detail)
+            .keys(&["cmd-l"], Some(WORKSPACE)),
+        Spec::unit::<OpenPreviousLogs>(
+            "Open Previous Logs",
+            "Open the logs of the previous instance of the shown pod's container.",
+        )
+        .of(C::Logs, S::Detail)
+        .keys(&["cmd-shift-l"], Some(WORKSPACE)),
+        Spec::with_args::<OpenContainerLogs>(
+            "Open Container Logs…",
+            "Open the logs of one container of the shown pod, or of its previous instance.",
+            CONTAINER,
+        )
+        .of(C::Logs, S::Detail),
+        // The dock.
+        Spec::unit::<ToggleDock>("Toggle Dock", "Show or hide the bottom dock.")
+            .of(C::View, S::Dock)
+            .keys(&["cmd-j"], Some(WORKSPACE)),
+        Spec::unit::<CloseActiveTab>(
+            "Close Dock Tab",
+            "Close the dock's active tab, ending its session.",
+        )
+        .of(C::View, S::Dock)
+        .keys(&["cmd-w"], Some(DOCK)),
+        Spec::unit::<NextTab>("Next Dock Tab", "Show the dock's next tab.")
+            .of(C::View, S::Dock)
+            .keys(&["ctrl-tab"], Some(DOCK)),
+        Spec::unit::<PrevTab>("Previous Dock Tab", "Show the dock's previous tab.")
+            .of(C::View, S::Dock)
+            .keys(&["ctrl-shift-tab"], Some(DOCK)),
+        Spec::with_args::<ActivateTab>("Show Dock Tab…", "Show a dock tab by its id.", TAB)
+            .of(C::View, S::Dock)
+            .hidden(),
+        Spec::with_args::<CloseTab>(
+            "Close Dock Tab by Id…",
+            "Close a dock tab by its id, ending its session.",
+            TAB,
+        )
+        .of(C::View, S::Dock)
+        .hidden(),
+        Spec::with_args::<SetDockHeight>("Set Dock Height…", "Resize the bottom dock.", HEIGHT)
+            .of(C::View, S::Workspace)
+            .hidden(),
+        // A log tab.
+        Spec::unit::<TogglePause>(
+            "Toggle Pause",
+            "Pause following (new lines are held back), or resume it.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["space"], Some(LOG_PLAIN)),
+        Spec::unit::<JumpToEnd>(
+            "Jump to Newest Line",
+            "Scroll to the newest line and follow again, resuming a pause.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["end", "cmd-down"], Some(LOG_PLAIN)),
+        Spec::unit::<JumpToStart>("Jump to Oldest Line", "Scroll to the oldest line shown.")
+            .of(C::Logs, S::Logs)
+            .keys(&["home", "cmd-up"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleTimestamps>(
+            "Toggle Timestamps",
+            "Show or hide each line's timestamp, without reloading.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["t"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleSources>(
+            "Toggle Pod Prefix",
+            "Show or hide each workload line's pod and container, without reloading.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["p"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleWrap>("Toggle Line Wrap", "Wrap long lines, or cut them at the edge.")
+            .of(C::Logs, S::Logs)
+            .keys(&["w"], Some(LOG_PLAIN)),
+        Spec::unit::<FocusSearch>("Search Logs", "Move focus to the log search field.")
+            .of(C::Logs, S::Logs)
+            .keys(&["cmd-f"], Some(LOG_VIEW)),
+        Spec::unit::<NextMatch>("Next Match", "Go to the next line matching the search.")
+            .of(C::Logs, S::Logs)
+            .keys(&["cmd-g"], Some(LOG_VIEW)),
+        Spec::unit::<PrevMatch>(
+            "Previous Match",
+            "Go to the previous line matching the search.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-shift-g"], Some(LOG_VIEW)),
+        Spec::unit::<SelectPrevLine>(
+            "Select Previous Line",
+            "Select the line above, or the newest line.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["up"], Some(LOG_PLAIN)),
+        Spec::unit::<SelectNextLine>(
+            "Select Next Line",
+            "Select the line below, or the newest line.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["down"], Some(LOG_PLAIN)),
+        Spec::unit::<ExtendSelectionUp>(
+            "Extend Selection Up",
+            "Extend the line selection one line up.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["shift-up"], Some(LOG_PLAIN)),
+        Spec::unit::<ExtendSelectionDown>(
+            "Extend Selection Down",
+            "Extend the line selection one line down.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["shift-down"], Some(LOG_PLAIN)),
+        Spec::unit::<SelectAllLines>("Select All Lines", "Select every line shown.")
+            .of(C::Logs, S::Logs)
+            .keys(&["cmd-a"], Some(LOG_PLAIN)),
+        Spec::unit::<ClearSelection>(
+            "Clear Line Selection",
+            "Clear the line selection and resume following.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["escape"], Some(LOG_PLAIN)),
+        Spec::unit::<CopyLines>(
+            "Copy Selected Lines",
+            "Copy the selected lines as shown, without redaction.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-c"], Some(LOG_PLAIN)),
+        Spec::unit::<SaveLogs>(
+            "Save Logs",
+            "Save every line shown to a file, as shown and without redaction.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-s"], Some(LOG_VIEW)),
+        Spec::unit::<SaveMatchingLines>(
+            "Save Matching Lines",
+            "Save the lines matching the search to a file, as shown and without redaction.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-shift-s"], Some(LOG_VIEW)),
+        Spec::unit::<SaveSelectedLines>(
+            "Save Selected Lines",
+            "Save the selected lines to a file, as shown and without redaction.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-alt-s"], Some(LOG_VIEW)),
+        Spec::with_args::<SaveLines>(
+            "Save Log Lines…",
+            "Save all lines, the search matches or the selection to a file, as shown and without redaction.",
+            SAVE,
+        )
+        .of(C::Logs, S::Logs),
+        Spec::with_args::<SelectLine>(
+            "Select Log Line…",
+            "Select a log line by id, or extend the selection to it.",
+            LINE,
+        )
+        .of(C::Logs, S::Logs)
+        .hidden(),
+        Spec::with_args::<DragSelection>(
+            "Drag Log Selection…",
+            "Extend a selection being dragged to a line.",
+            DRAG_LINE,
+        )
+        .of(C::Logs, S::Logs)
         .hidden(),
     ];
     specs.into_iter().map(|s| s.0).collect()

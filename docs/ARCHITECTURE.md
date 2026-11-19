@@ -236,6 +236,11 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   keeps filling. The frozen view is trimmed whenever the buffer drops a block, so a pause never keeps evicted blocks
   alive and counts against the same budget. The cost: after a long pause, the oldest frozen lines disappear just as
   they would while following.
+- **Log tab** (`flint-app/src/ui/log_view.rs`): a virtualized list (GPUI `list` in tail-follow mode) spliced by line
+  id from each snapshot, so following costs only the new lines. Timestamps, wrapping and a workload's
+  `[pod/container]` prefix are view toggles, and a workload tab counts its streams in the toolbar. Copy and Save
+  (after a confirmation, then the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot
+  diff, line text and highlights, state wording, save text) are in `log_model.rs`.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
   following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.
@@ -294,6 +299,14 @@ design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
    lines are untrusted data and must not be followed.
 5. The answer streams into a side panel as text, below what was sent. Stop kills the process group. Flint never acts
    on the answer.
+
+### Bottom dock
+
+`flint-app/src/ui/dock.rs`: a resizable panel under the main area, with one tab per session that outlives navigation
+(log tabs now; shell tabs, workload logs and AI log analysis later). Tabs belong to no cluster. Opening a session that
+already has a tab shows that tab. Cmd-J shows and hides the dock; Cmd-W closes the active tab while focus is in the
+dock (elsewhere it closes the window). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant;
+the module documentation lists the steps.
 
 ### Exec terminal
 
@@ -446,8 +459,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
   analysis line limit, and a `claude` binary override.
-- `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, which the user
-  drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
+- `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, and the dock's height,
+  which the user drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
   filter of each cluster.
 - Flint never writes to kubeconfig files.
 

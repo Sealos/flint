@@ -22,6 +22,20 @@ pub struct Overview {
     pub conditions: Vec<Condition>,
     /// Set for Secrets: the keys of `data` (and `stringData`), with decoded values to reveal.
     pub secret: Option<SecretData>,
+    /// For Pods: the containers whose logs can be read, init containers first.
+    pub containers: Vec<PodContainer>,
+}
+
+/// One container of a Pod, for the Logs action and its container picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodContainer {
+    pub name: String,
+    pub init: bool,
+    /// It ran before (it restarted or terminated), so its previous instance has logs.
+    pub has_previous: bool,
+    /// The container `kubectl logs` picks without `-c`: the
+    /// `kubectl.kubernetes.io/default-container` annotation, or the first app container.
+    pub default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +188,73 @@ pub fn overview(object: &Value, is_secret: bool) -> Overview {
         owners,
         conditions,
         secret: is_secret.then(|| secret_data(object)),
+        containers: if text(object, "kind") == "Pod" {
+            pod_containers(object)
+        } else {
+            Vec::new()
+        },
     }
+}
+
+/// A Pod's init and app containers, in spec order, with which one is the default and which
+/// ran before. Ephemeral (debug) containers are left out.
+pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
+    let names = |path: &str| -> Vec<String> {
+        pod.get("spec")
+            .and_then(|s| s.get(path))
+            .and_then(Value::as_array)
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| c.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let ran_before = |status_path: &str, name: &str| -> bool {
+        pod.get("status")
+            .and_then(|s| s.get(status_path))
+            .and_then(Value::as_array)
+            .and_then(|ss| {
+                ss.iter()
+                    .find(|s| s.get("name").and_then(Value::as_str) == Some(name))
+            })
+            .is_some_and(|s| {
+                s.get("restartCount").and_then(Value::as_i64).unwrap_or(0) > 0
+                    || s.get("lastState")
+                        .and_then(|l| l.get("terminated"))
+                        .is_some()
+            })
+    };
+    let apps = names("containers");
+    let annotated = str_at(
+        pod,
+        &[
+            "metadata",
+            "annotations",
+            "kubectl.kubernetes.io/default-container",
+        ],
+    )
+    .filter(|name| apps.iter().any(|a| a == name));
+    let default = annotated
+        .or(apps.first().map(String::as_str))
+        .map(str::to_owned);
+    let mut out: Vec<PodContainer> = names("initContainers")
+        .into_iter()
+        .map(|name| PodContainer {
+            has_previous: ran_before("initContainerStatuses", &name),
+            name,
+            init: true,
+            default: false,
+        })
+        .collect();
+    out.extend(apps.into_iter().map(|name| PodContainer {
+        has_previous: ran_before("containerStatuses", &name),
+        default: default.as_deref() == Some(name.as_str()),
+        name,
+        init: false,
+    }));
+    out
 }
 
 fn secret_data(object: &Value) -> SecretData {
@@ -278,6 +358,55 @@ pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // covers UP-40
+    #[test]
+    fn pod_containers_name_the_default_and_those_with_previous_logs() {
+        let pod = json!({
+            "kind": "Pod",
+            "metadata": {"name": "web-1", "annotations": {
+                "kubectl.kubernetes.io/default-container": "app"
+            }},
+            "spec": {
+                "initContainers": [{"name": "migrate"}],
+                "containers": [{"name": "sidecar"}, {"name": "app"}],
+                "ephemeralContainers": [{"name": "debugger"}]
+            },
+            "status": {
+                "initContainerStatuses": [{"name": "migrate", "restartCount": 0,
+                    "lastState": {}}],
+                "containerStatuses": [
+                    {"name": "sidecar", "restartCount": 0},
+                    {"name": "app", "restartCount": 2}
+                ]
+            }
+        });
+        let containers = overview(&pod, false).containers;
+        let summary: Vec<(&str, bool, bool, bool)> = containers
+            .iter()
+            .map(|c| (c.name.as_str(), c.init, c.has_previous, c.default))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("migrate", true, false, false),
+                ("sidecar", false, false, false),
+                ("app", false, true, true),
+            ]
+        );
+
+        // Without the annotation (or naming no app container), the first app container.
+        let mut plain = pod.clone();
+        plain["metadata"]["annotations"] =
+            json!({"kubectl.kubernetes.io/default-container": "nope"});
+        let first = pod_containers(&plain);
+        assert!(first.iter().find(|c| c.name == "sidecar").unwrap().default);
+        // A terminated last state also means previous logs.
+        plain["status"]["containerStatuses"][0]["lastState"] = json!({"terminated": {}});
+        assert!(pod_containers(&plain)[1].has_previous);
+        // Only Pods have containers here.
+        assert!(overview(&deployment(), false).containers.is_empty());
+    }
 
     // covers UP-23
     #[test]
