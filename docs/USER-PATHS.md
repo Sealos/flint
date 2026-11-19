@@ -165,6 +165,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I switch to another cluster and back.
 - **Then** the old cluster's watches stop. Switching back loads fresh data. Log, exec and port-forward sessions keep
   running across the switch.
+- From M5.5, this holds for clusters that went cold. Recently used clusters stay warm (UP-78).
 - Tests: cluster, ui.
 
 ### UP-25 Change the watch mode
@@ -234,6 +235,18 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them.
 - Tests: ui.
 
+### UP-43 Spot errors in a log stream
+- **When** I follow a pod's logs and turn timestamps on and off.
+- **Then** lines with `ERROR`, `FATAL`, `panic`, `exception` or `Traceback` are marked in the error color, and lines
+  with `WARN` in the warning color, in both themes. Timestamps appear and disappear without reloading the stream.
+  Searching keeps the highlighting.
+- Tests: unit (pattern matching), cluster, ui.
+
+### UP-44 Select and copy log lines
+- **When** I select a range of lines, with the mouse or Shift and the arrow keys, and press Cmd-C.
+- **Then** exactly those lines are copied, with timestamps only if they are shown. Following pauses while I select.
+- Tests: ui.
+
 ---
 
 ## M3: Editing and actions
@@ -264,7 +277,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ---
 
-## M4: Curated views and metrics
+## M4: Curated views, metrics and the resource diagram
 
 ### UP-60 Understand a workload at a glance
 - **When** I open a pod, deployment or node.
@@ -275,6 +288,19 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** pod and node lists show CPU and memory from metrics-server, refreshed about every 15 s. If metrics-server is
   missing, the columns are hidden and a hint is shown.
 - Tests: cluster (with and without metrics-server).
+
+### UP-62 See how a namespace's workloads fit together
+- **When** I open the diagram for the `demo` namespace.
+- **Then** I see each Deployment around its ReplicaSets and their Pods, and StatefulSets, DaemonSets, Jobs and
+  CronJobs around what they own. Each node has its status color. Clicking a node opens its detail view. No API
+  request is made beyond the watches already running.
+- Tests: unit (tree from owner uids), cluster, ui.
+
+### UP-63 The diagram follows the cluster
+- **When** I scale or roll out a deployment while the diagram is open.
+- **Then** pods and ReplicaSets appear, change color and disappear within about a second. Objects whose owner is not
+  in the namespace, or that have no owner, are shown on their own, not hidden.
+- Tests: cluster, ui.
 
 ---
 
@@ -295,6 +321,58 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** each action asks for confirmation and the result is visible. If `helm` is not installed, I see an install
   hint instead of a failure. Works with Helm v3 and v4.
 - Tests: cluster.
+
+### UP-73 Choose the local port
+- **When** I forward a pod or service port and type a local port, or leave it empty.
+- **Then** Flint uses my port, or picks a free one and shows it. A port in use is refused before anything starts.
+  I can forward several ports of the same target at once. Forwards listen on `127.0.0.1` only.
+- Tests: unit (port choice), cluster, ui.
+
+### UP-74 Open a forwarded HTTP port
+- **Given** a forward to a port named `http` or with `appProtocol: http`.
+- **Then** the forwards panel shows its target, local and remote port and state, and an Open in browser action that
+  opens `http://localhost:<port>`. Ports that are not HTTP have no such action. A forward to a service survives
+  the loss of the pod behind it if another pod is ready.
+- Tests: cluster, ui.
+
+---
+
+## M5.5: Multi-cluster and AI
+
+### UP-75 Analyze log lines with my AI CLI
+- **Given** `claude` or `codex` on my login-shell `PATH`, and log analysis allowed for the cluster.
+- **When** I select log lines and click Analyze with Claude (or Codex), then confirm.
+- **Then** the answer streams into a side panel. Stop ends it. Nothing in the answer runs, opens or changes anything.
+  If the cluster was not allowed, a confirmation naming the context and server comes first. A re-pointed context
+  counts as not allowed.
+- Tests: unit (prompt, allow policy), ui (with a fake CLI on `PATH`).
+
+### UP-76 See exactly what leaves my Mac
+- **When** the confirmation opens.
+- **Then** it shows the full prompt and the lines as they will be sent, with Secret values and credential-shaped
+  strings already replaced, and names the CLI and its path. More than the line limit is cut, and it says so. With
+  "Always for this cluster", later sends skip the confirmation but are still redacted. The fake CLI receives byte for
+  byte what the confirmation showed.
+- Tests: unit (redaction patterns), ui (fake CLI).
+
+### UP-77 No AI CLI installed
+- **Given** neither `claude` nor `codex` on the resolved `PATH` or in settings.
+- **Then** the log viewer shows no Analyze button and no error.
+- Tests: unit (CLI lookup), ui.
+
+### UP-78 Switch between recent clusters instantly
+- **When** I use clusters A, B and C, then switch back to A.
+- **Then** A's lists show current data at once, with no loading state. The sidebar marks A as active and B and C as
+  warm. Changes made on a warm cluster while I was away are already there. Relaunching Flint connects nothing
+  until I select a cluster.
+- Tests: unit (warm set), cluster, ui.
+
+### UP-79 Warm clusters stay bounded
+- **When** I use more clusters than `warm_clusters`, or the warm clusters go over `warm_memory_mib`, or a warm
+  cluster's auth expires.
+- **Then** the least recently used cluster goes cold, and the sidebar shows it. A cluster whose auth failed shows the
+  error and does not retry until I select it. Disconnect makes a warm cluster cold by hand.
+- Tests: unit (eviction, budget), cluster.
 
 ---
 
@@ -322,3 +400,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-92 Destructive actions always show the cluster and namespace
 - Tests: ui, review.
+
+### UP-93 Nothing is sent to an AI tool without my action
+- Log lines reach a CLI only after I click and confirm, or after I chose "Always for this cluster" for that cluster.
+  Flint never sends on its own.
+- Tests: unit, review.
