@@ -228,7 +228,7 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
   (on macOS, in a Linux container with `--target aarch64-unknown-linux-gnu`; set `ASAN_SYMBOLIZER_PATH` to an
   `llvm-symbolizer` for readable stacks). The `flint-mcp` tests spawn the instrumented binary and check its exit
   status, so a leak in the server process fails them too. Tests must not leak either: never `Box::leak` a
-  fixture to get a `&'static str`, have the fake own `String`s. Fix a leak rather than suppress it; suppress only
+  fixture to get a `&'static str`; have the fake own `String`s instead. Fix a leak rather than suppress it; suppress only
   a third-party or process-lifetime allocation Flint cannot free, with a narrow `leak:<symbol>` line and a comment
   saying why in `.github/lsan-suppressions.txt` (none is needed today; `memory.yml` would pass it with
   `LSAN_OPTIONS=suppressions=…`), never a wildcard.

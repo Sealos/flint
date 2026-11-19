@@ -39,7 +39,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq llvm
-          echo "ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)" >> "$GITHUB_ENV"
+          symbolizer=$(command -v llvm-symbolizer)
+          echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
       # --no-fail-fast: a leak in one test binary must not hide the others' reports.
       - name: Tests under AddressSanitizer and LeakSanitizer
         run: >
