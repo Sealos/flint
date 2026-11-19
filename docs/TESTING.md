@@ -210,12 +210,39 @@ namespaces left by other tests are not.
   `write_kubeconfigs` puts several servers in one file under their own context names (UP-01, UP-06, UP-24).
 - **Timing:** `CoreConfig::watch_timing` shortens the core's retry waits; e2e tests use 10–50 ms.
 
+### Memory leaks
+
+Rust's ownership rules make classic leaks rare, so Flint checks for the kinds that remain:
+
+- **Views that are never released** (a callback or task holding a strong entity handle, a reference cycle).
+  View tests that close something assert it was freed: take `cx.leak_detector_snapshot()` before opening a list,
+  detail pane, dock tab or terminal, close it, run until parked, then `cx.assert_no_new_leaks(&snapshot)` (or
+  `weak.assert_released()` for one entity). Every view that can be closed gets such a test. CI builds the app
+  tests with `GPUI_LEAK_DETECTION=1`, so a failure lists each leaked handle; locally add `LEAK_BACKTRACE=1` to
+  see where it was created. Never capture `cx.entity()` in a frame, timer or task callback: capture
+  `cx.weak_entity()` and `update` it, so a closed view can be dropped.
+- **Leaks and memory errors in native code** (the C libraries GPUI and kube link, and Flint's few `unsafe`
+  blocks): the nightly `Memory` workflow runs the `flint-core` and `flint-mcp` tests under AddressSanitizer
+  with LeakSanitizer on Linux. Run it by hand with "Run workflow", or locally on Linux with
+  `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p flint-core -p flint-mcp --lib --tests --target x86_64-unknown-linux-gnu`
+  (on macOS, in a Linux container with `--target aarch64-unknown-linux-gnu`; set `ASAN_SYMBOLIZER_PATH` to an
+  `llvm-symbolizer` for readable stacks). The `flint-mcp` tests spawn the instrumented binary and check its exit
+  status, so a leak in the server process fails them too. Tests must not leak either: never `Box::leak` a
+  fixture to get a `&'static str`; have the fake own `String`s instead. Fix a leak rather than suppress it; suppress only
+  a third-party or process-lifetime allocation Flint cannot free, with a narrow `leak:<symbol>` line and a comment
+  saying why in `.github/lsan-suppressions.txt` (none is needed today; `memory.yml` would pass it with
+  `LSAN_OPTIONS=suppressions=…`), never a wildcard.
+- **Memory that keeps growing** (watch caches, log buffers, terminal scrollback, queues): a soak test runs the
+  app against the fake API server with lists, log tabs and an exec session open, samples the process's
+  memory, and fails if it is still climbing after warm-up. It runs nightly, not on PRs.
+
 ### Where things run in CI
 
 | Job | Runner | Runs |
 |---|---|---|
 | `test (<crate>)` | Linux | Unit tests for `flint-core`, `flint-mcp` and `flint-e2e` (the fake API server and its tests), one job per crate |
 | `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display). Flint ships for macOS only; this is a cheap second check |
+| `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
 | `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. The only CI job that needs macOS |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 | `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
