@@ -4,8 +4,8 @@
 //! a click, a key, the palette and automation all take one path.
 //!
 //! The workspace also forwards the list's, the detail pane's, the navigation's, the dock's and
-//! the active log tab's actions to them, and installs their guards, so those work and are
-//! checked wherever focus is.
+//! the active log or shell tab's actions to them, and installs their guards, so those work and
+//! are checked wherever focus is.
 
 use flint_core::settings::AiExposureState;
 use flint_core::{ClusterSummary, ConnectionState, NavEntry, WatchMode};
@@ -18,18 +18,20 @@ use super::super::log_view::LogView;
 use super::super::nav::NavPanel;
 use super::super::registry::{
     ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
-    CloseDetail, CloseTab, CopyLines, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
+    CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
     Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView,
-    OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenView, PaneName, PrevMatch, PrevTab, Refresh,
-    RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
-    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
-    SelectPrev, SelectPrevLine, SelectRow, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAllNamespaces, ShowOverview, ShowYaml, SortBy, ToggleAnnotations, ToggleLabels,
-    ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause, ToggleSecretValue,
-    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
-    WatchOpenViewsOnly,
+    OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell, OpenView,
+    PaneName, PasteText, PrevMatch, PrevTab, Refresh, RetryConnection, SaveLines, SaveLogs,
+    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
+    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
+    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
+    SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview, ShowYaml, SortBy,
+    ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
+    TogglePause, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
 use super::{Pane, Workspace, confirm_expose, expose_dialog};
 
@@ -86,6 +88,9 @@ impl Workspace {
         let element = Dock::bind_actions(Forward::new(element, Some(&self.dock))).into_element();
         let log = self.dock.read(cx).active_log().cloned();
         let element = LogView::bind_actions(Forward::new(element, log.as_ref())).into_element();
+        let shell = self.dock.read(cx).active_terminal().cloned();
+        let element =
+            TerminalView::bind_actions(Forward::new(element, shell.as_ref())).into_element();
         NavPanel::bind_actions(Forward::new(element, Some(&self.nav))).into_element()
     }
 
@@ -189,6 +194,18 @@ impl Workspace {
                     None => Err(ActionError::unavailable::<OpenContainerLogs>()),
                 },
             )
+            .when::<OpenShell>(|ws, cx| {
+                detail(ws, cx).is_some_and(|d| d.shell_request::<OpenShell>(None).is_ok())
+            })
+            .add::<OpenContainerShell>(
+                |ws, cx| detail(ws, cx).is_some_and(|d| d.shell_containers().next().is_some()),
+                |ws, a, cx| match detail(ws, cx) {
+                    Some(d) => d
+                        .shell_request::<OpenContainerShell>(Some(&a.container))
+                        .map(|_| ()),
+                    None => Err(ActionError::unavailable::<OpenContainerShell>()),
+                },
+            )
             // The dock's.
             .when::<CloseActiveTab>(|ws, cx| {
                 let dock = ws.dock.read(cx);
@@ -211,6 +228,24 @@ impl Workspace {
                 |ws, a, cx| ws.dock.read(cx).check_tab::<CloseTab>(a.tab),
             )
             .add::<SetDockHeight>(|_, _| true, |_, a, _| check_dock_height(a))
+            // The active shell tab's.
+            .when::<CopyText>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::has_selection))
+            .when::<PasteText>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::is_live))
+            .when::<ScrollPageUp>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::can_scroll_back))
+            .when::<ScrollToTop>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::can_scroll_back))
+            .when::<ScrollPageDown>(|ws, cx| {
+                shell(ws, cx).is_some_and(TerminalView::is_scrolled_back)
+            })
+            .when::<ScrollToBottom>(|ws, cx| {
+                shell(ws, cx).is_some_and(TerminalView::is_scrolled_back)
+            })
+            .add::<SelectText>(
+                |ws, cx| shell(ws, cx).is_some(),
+                |ws, a, cx| match shell(ws, cx) {
+                    Some(t) => t.check_cells(a),
+                    None => Err(ActionError::unavailable::<SelectText>()),
+                },
+            )
             // The active log tab's.
             .when::<TogglePause>(|ws, cx| log(ws, cx).is_some_and(LogView::follows))
             .when::<JumpToEnd>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
@@ -526,6 +561,11 @@ impl Workspace {
 /// The detail pane, if one is open.
 fn detail<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a DetailView> {
     ws.detail.as_ref().map(|d| d.read(cx))
+}
+
+/// The shell tab the dock shows, if it is visible and shows one.
+fn shell<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a TerminalView> {
+    ws.dock.read(cx).active_terminal().map(|t| t.read(cx))
 }
 
 /// The log tab the dock shows, if it is visible and shows one.

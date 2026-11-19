@@ -14,7 +14,7 @@ use gpui_kit::{App, Div, Hsla, Pixels, SharedString, Styled as _, WindowAppearan
 use super::accent::{ACCENT, Accent, Shades};
 
 /// Both themes, without the accent.
-const THEMES: &str = include_str!("themes/flint.json");
+pub(super) const THEMES: &str = include_str!("themes/flint.json");
 
 /// Flint Light and Flint Dark with `accent` applied.
 pub fn themes(accent: &Accent) -> (ThemeConfig, ThemeConfig) {
@@ -147,7 +147,7 @@ pub fn show(mode: ThemeMode, cx: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
     use super::{THEMES, chrome, log_current_match, log_match, resolve, themes};
     use crate::ui::accent::{ACCENT, CANDIDATES};
@@ -269,7 +269,7 @@ mod tests {
     }
 
     /// The colors a view sees for `config`.
-    fn resolved(config: ThemeConfig) -> Theme {
+    pub(in crate::ui) fn resolved(config: ThemeConfig) -> Theme {
         let mut theme = Theme::default();
         theme.apply_config(&Rc::new(config));
         theme
@@ -301,7 +301,7 @@ mod tests {
 
     /// The WCAG 2 contrast ratio of `fg` over `bg`, both drawn over `base` (the opaque surface
     /// below translucent tokens).
-    fn contrast(fg: Hsla, bg: Hsla, base: Hsla) -> f32 {
+    pub(in crate::ui) fn contrast(fg: Hsla, bg: Hsla, base: Hsla) -> f32 {
         let base = over(base, base);
         let bg = over(
             bg,

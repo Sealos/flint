@@ -3,12 +3,13 @@
 # color written into UI code: rgb()/rgba()/hsla()/hsl() calls, Hsla/Rgba struct literals,
 # 0xRRGGBB literals (underscores allowed), "#rrggbb" strings, GPUI's named colors (red(), black(),
 # opaque_grey(..), ...) and gpui-component's palette (ColorName::...). It also flags such text in
-# comments; reword the comment. The theme module (theme.rs, accent.rs and themes/) is where colors
-# live, so it is exempt. The pattern checks itself against known samples first.
+# comments; reword the comment. The theme modules (theme.rs, accent.rs, terminal_palette.rs and
+# themes/) are where colors live, so they are exempt. The pattern checks itself against known
+# samples first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 UI=crates/flint-app/src/ui
-EXEMPT='^crates/flint-app/src/ui/(theme\.rs|accent\.rs|themes/)'
+EXEMPT='^crates/flint-app/src/ui/(theme\.rs|accent\.rs|terminal_palette\.rs|themes/)'
 pattern='\b(rgba?|hsla?)\(|(^|=>|=|\(|,|\{|return)[[:space:]]*([a-z_]+::)*(Hsla|Rgba)[[:space:]]*\{|\b0x[0-9a-fA-F](_?[0-9a-fA-F]){5}(_?[0-9a-fA-F]){0,2}\b|"#[0-9a-fA-F]{3,8}"|\b(red|green|blue|yellow|black|white|transparent_black|transparent_white)\(\)|\bopaque_grey\(|\bColorName::'
 
 must_match=(

@@ -111,6 +111,30 @@ actions!(
     ]
 );
 actions!(
+    detail,
+    [
+        /// Open a shell in the shown pod's default container, in the dock.
+        OpenShell
+    ]
+);
+actions!(
+    terminal,
+    [
+        /// Copy the text selected in the shell tab.
+        CopyText,
+        /// Paste the clipboard's text into the shell tab, bracketed when the program asked.
+        PasteText,
+        /// Scroll the shell tab up one screen into its history.
+        ScrollPageUp,
+        /// Scroll the shell tab down one screen.
+        ScrollPageDown,
+        /// Scroll the shell tab to the oldest line kept.
+        ScrollToTop,
+        /// Scroll the shell tab back to the bottom, where new output appears.
+        ScrollToBottom
+    ]
+);
+actions!(
     dock,
     [
         /// Show or hide the bottom dock.
@@ -287,6 +311,26 @@ pub struct OpenContainerLogs {
     pub previous: bool,
 }
 
+/// Open a shell in one container of the shown pod.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = detail, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct OpenContainerShell {
+    pub container: String,
+}
+
+/// Select the text of a shell tab's screen from one cell to another (inclusive), as dragging
+/// over them does. Rows and columns count from the top-left cell, 0 and up.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = terminal, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SelectText {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+}
+
 /// Set the bottom dock's height in points, as dragging its top edge does (same limits).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -372,6 +416,8 @@ pub enum Scope {
     Dock,
     /// The log tab shown in the dock.
     Logs,
+    /// The shell tab shown in the dock.
+    Terminal,
 }
 
 /// What a palette groups an action under.
@@ -384,6 +430,7 @@ pub enum Category {
     List,
     Detail,
     Logs,
+    Terminal,
 }
 
 /// Whether a palette offers an action. Hidden ones exist for automation, or for controls that
@@ -780,6 +827,14 @@ pub fn init(cx: &mut App) {
             }
         }
     }
+    // Keys the shell in a shell tab gets instead of the app.
+    let terminal = Some(parse(TERMINAL));
+    for keys in TERMINAL_PASSTHROUGH {
+        match KeyBinding::load(keys, Box::new(NoAction), terminal.clone(), false, None, cx) {
+            Ok(binding) => bindings.push(binding),
+            Err(e) => tracing::error!(keys, "invalid terminal key: {e}"),
+        }
+    }
     cx.bind_keys(bindings);
 }
 
@@ -957,6 +1012,8 @@ const LIST_ALONE: &str = "ResourceList && !Input";
 pub const DOCK: &str = "Dock";
 /// A log tab's key context.
 pub const LOG_VIEW: &str = "LogView";
+/// A shell tab's key context.
+pub const TERMINAL: &str = "Terminal";
 /// Plain keys in a log tab, but not while typing in its search field.
 const LOG_PLAIN: &str = "LogView && !Input";
 
@@ -1111,6 +1168,17 @@ const CONTAINER: &[Arg] = &[
         required: false,
         kind: ArgKind::Bool,
     },
+];
+const SHELL_CONTAINER: &[Arg] = &[arg("container", "container name", ArgKind::Text)];
+const CELLS: &[Arg] = &[
+    arg(
+        "start_row",
+        "first cell's row, from the top",
+        ArgKind::Number,
+    ),
+    arg("start_col", "first cell's column", ArgKind::Number),
+    arg("end_row", "last cell's row", ArgKind::Number),
+    arg("end_col", "last cell's column", ArgKind::Number),
 ];
 const HEIGHT: &[Arg] = &[arg("height", "height in points", ArgKind::Number)];
 const TAB: &[Arg] = &[arg("tab", "tab id", ArgKind::Number)];
@@ -1339,6 +1407,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             CONTAINER,
         )
         .of(C::Logs, S::Detail),
+        Spec::unit::<OpenShell>(
+            "Open Shell",
+            "Open a shell (bash, else sh) in the shown pod's default container, in the dock.",
+        )
+        .of(C::Terminal, S::Detail)
+        .keys(&["secondary-shift-e"], Some(WORKSPACE)),
+        Spec::with_args::<OpenContainerShell>(
+            "Open Container Shell…",
+            "Open a shell (bash, else sh) in one container of the shown pod, in the dock.",
+            SHELL_CONTAINER,
+        )
+        .of(C::Terminal, S::Detail),
         // The dock.
         Spec::unit::<ToggleDock>("Toggle Dock", "Show or hide the bottom dock.")
             .of(C::View, S::Dock)
@@ -1488,9 +1568,132 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .hidden(),
+        // A shell tab.
+        Spec::unit::<CopyText>(
+            "Copy Terminal Selection",
+            "Copy the text selected in the shell tab.",
+        )
+        .of(C::Terminal, S::Terminal)
+        .keys(TERMINAL_COPY, Some(TERMINAL)),
+        Spec::unit::<PasteText>(
+            "Paste in Terminal",
+            "Paste the clipboard's text into the shell, bracketed when the program asked for it.",
+        )
+        .of(C::Terminal, S::Terminal)
+        .keys(TERMINAL_PASTE, Some(TERMINAL)),
+        Spec::unit::<ScrollPageUp>(
+            "Scroll Terminal Up a Page",
+            "Scroll the shell tab up one screen into its history.",
+        )
+        .of(C::Terminal, S::Terminal)
+        .keys(&["shift-pageup"], Some(TERMINAL)),
+        Spec::unit::<ScrollPageDown>(
+            "Scroll Terminal Down a Page",
+            "Scroll the shell tab down one screen.",
+        )
+        .of(C::Terminal, S::Terminal)
+        .keys(&["shift-pagedown"], Some(TERMINAL)),
+        Spec::unit::<ScrollToTop>(
+            "Scroll Terminal to Top",
+            "Scroll the shell tab to the oldest line it keeps.",
+        )
+        .of(C::Terminal, S::Terminal)
+        .keys(&["shift-home"], Some(TERMINAL)),
+        Spec::unit::<ScrollToBottom>(
+            "Scroll Terminal to Bottom",
+            "Scroll the shell tab back to the bottom, where new output appears.",
+        )
+        .of(C::Terminal, S::Terminal)
+        .keys(&["shift-end"], Some(TERMINAL)),
+        Spec::with_args::<SelectText>(
+            "Select Terminal Text…",
+            "Select the shell tab's text from one screen cell to another.",
+            CELLS,
+        )
+        .of(C::Terminal, S::Terminal)
+        .hidden(),
     ];
     specs.into_iter().map(|s| s.0).collect()
 });
+
+/// Copy in a shell tab: Cmd-C on macOS; Ctrl-Shift-C elsewhere, where Ctrl-C interrupts the
+/// program.
+pub(in crate::ui) const TERMINAL_COPY: &[&str] = if cfg!(target_os = "macos") {
+    &["secondary-c"]
+} else {
+    &["secondary-shift-c"]
+};
+/// Paste in a shell tab: Cmd-V on macOS; Ctrl-Shift-V elsewhere, where Ctrl-V quotes the next
+/// key in the shell.
+pub(in crate::ui) const TERMINAL_PASTE: &[&str] = if cfg!(target_os = "macos") {
+    &["secondary-v"]
+} else {
+    &["secondary-shift-v"]
+};
+
+/// Keys a shell tab sends to its program even where the app or gpui-component bind them: Tab
+/// (focus traversal), Esc, Return and the arrows (lists, dialogs), and Ctrl with a letter or
+/// symbol (the app's shortcuts on Linux, where they use Ctrl, and gpui-component's Ctrl-C
+/// there). They are bound to nothing in the terminal's key context, which outranks every
+/// context above it, so they reach its key handler (`terminal_keys`). Cmd shortcuts on macOS
+/// and Ctrl-Shift ones elsewhere stay the app's.
+pub const TERMINAL_PASSTHROUGH: &[&str] = &[
+    "tab",
+    "shift-tab",
+    "escape",
+    "enter",
+    "shift-enter",
+    "backspace",
+    "delete",
+    "space",
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "ctrl-a",
+    "ctrl-b",
+    "ctrl-c",
+    "ctrl-d",
+    "ctrl-e",
+    "ctrl-f",
+    "ctrl-g",
+    "ctrl-h",
+    "ctrl-i",
+    "ctrl-j",
+    "ctrl-k",
+    "ctrl-l",
+    "ctrl-m",
+    "ctrl-n",
+    "ctrl-o",
+    "ctrl-p",
+    "ctrl-q",
+    "ctrl-r",
+    "ctrl-s",
+    "ctrl-t",
+    "ctrl-u",
+    "ctrl-v",
+    "ctrl-w",
+    "ctrl-x",
+    "ctrl-y",
+    "ctrl-z",
+    "ctrl-space",
+    "ctrl-[",
+    "ctrl-]",
+    "ctrl-\\",
+    "ctrl-/",
+    "ctrl-up",
+    "ctrl-down",
+    "ctrl-left",
+    "ctrl-right",
+    "alt-up",
+    "alt-down",
+    "alt-left",
+    "alt-right",
+];
 
 #[cfg(test)]
 pub mod tests {
@@ -1662,6 +1865,47 @@ pub mod tests {
                 );
             }
         }
+    }
+
+    // covers UP-41: the keys a shell needs are not the app's inside a shell tab, and the tab's
+    // own shortcuts are not among them.
+    #[test]
+    fn shell_keys_and_terminal_shortcuts_do_not_overlap() {
+        for spec in actions() {
+            if spec.key_context != Some(super::TERMINAL) {
+                continue;
+            }
+            for key in spec.keys {
+                assert!(
+                    !super::TERMINAL_PASSTHROUGH.contains(key),
+                    "{} binds {key}, which the shell gets",
+                    spec.name
+                );
+            }
+        }
+        for key in [
+            "tab", "escape", "enter", "up", "ctrl-c", "ctrl-d", "ctrl-w", "ctrl-l",
+        ] {
+            assert!(super::TERMINAL_PASSTHROUGH.contains(&key), "{key}");
+        }
+        // Copy and paste use Cmd on macOS; elsewhere Ctrl-C and Ctrl-V are the shell's.
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(
+            super::TERMINAL_COPY,
+            if mac {
+                &["secondary-c"]
+            } else {
+                &["secondary-shift-c"]
+            }
+        );
+        assert_eq!(
+            super::TERMINAL_PASTE,
+            if mac {
+                &["secondary-v"]
+            } else {
+                &["secondary-shift-v"]
+            }
+        );
     }
 
     #[test]

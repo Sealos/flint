@@ -36,6 +36,9 @@ use tokio::time::Instant;
 use crate::cluster::{ClusterError, ClusterId};
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake;
+
 /// Commands tried in order when the request names none.
 pub const DEFAULT_SHELLS: &[&str] = &["bash", "/bin/sh"];
 
@@ -289,6 +292,34 @@ impl ExecSession {
     /// The newest snapshot, without marking it as seen.
     pub fn peek(&self) -> Arc<ExecSnapshot> {
         self.rx.borrow().clone()
+    }
+
+    /// A reader of this session's snapshots that a task can wait on while the session itself
+    /// stays with whoever sends it input (a view). Its first [`ExecUpdates::changed`] resolves
+    /// at once.
+    pub fn updates(&self) -> ExecUpdates {
+        let mut rx = self.rx.clone();
+        rx.mark_changed();
+        ExecUpdates { rx }
+    }
+}
+
+/// Reads an [`ExecSession`]'s snapshots from elsewhere; see [`ExecSession::updates`].
+#[derive(Debug)]
+pub struct ExecUpdates {
+    rx: watch::Receiver<Arc<ExecSnapshot>>,
+}
+
+impl ExecUpdates {
+    /// Waits until a snapshot newer than the last one read with [`ExecUpdates::latest`] is
+    /// published. Returns `false` once the session task has ended. Works on any executor.
+    pub async fn changed(&mut self) -> bool {
+        self.rx.changed().await.is_ok()
+    }
+
+    /// The newest snapshot, marking it as seen.
+    pub fn latest(&mut self) -> Arc<ExecSnapshot> {
+        self.rx.borrow_and_update().clone()
     }
 }
 

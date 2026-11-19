@@ -276,7 +276,8 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 - **Views that are never released** (a callback or task holding a strong entity handle, a reference cycle).
   View tests that close something assert it was freed: take `cx.leak_detector_snapshot()` before opening a list,
   detail pane, dock tab or terminal, close it, run until parked, then `cx.assert_no_new_leaks(&snapshot)` (or
-  `weak.assert_released()` for one entity). Every view that can be closed gets such a test. CI builds the app
+  `weak.assert_released()` for one entity). Every view that can be closed gets such a test; the dock's, the log tab's and the shell
+  tab's are in `ui/dock_tests.rs`. CI builds the app
   tests with `GPUI_LEAK_DETECTION=1`, so a failure lists each leaked handle; locally add `LEAK_BACKTRACE=1` to
   see where it was created. Never capture `cx.entity()` in a frame, timer or task callback: capture
   `cx.weak_entity()` and `update` it, so a closed view can be dropped.

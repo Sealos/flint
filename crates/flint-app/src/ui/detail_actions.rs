@@ -8,10 +8,11 @@ use gpui_kit::*;
 use super::super::log_view::LogRequest;
 use super::super::object::PodContainer;
 use super::super::registry::{
-    ActionError, Bind, Close, OnView, OpenContainerLogs, OpenLogs, OpenPreviousLogs, Refresh,
-    ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
-    ToggleSecretValue,
+    ActionError, Bind, Close, OnView, OpenContainerLogs, OpenContainerShell, OpenLogs,
+    OpenPreviousLogs, OpenShell, Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels,
+    ToggleManagedFields, ToggleSecretValue,
 };
+use super::super::terminal_model::ShellRequest;
 use super::{DetailEvent, DetailTab, DetailView, Fetch};
 
 impl DetailView {
@@ -42,6 +43,58 @@ impl DetailView {
             .bind::<OpenContainerLogs>(|view, action, _, cx| {
                 view.open_logs::<OpenContainerLogs>(Some(&action.container), action.previous, cx)
             })
+            .bind::<OpenShell>(|view, _, _, cx| view.open_shell::<OpenShell>(None, cx))
+            .bind::<OpenContainerShell>(|view, action, _, cx| {
+                view.open_shell::<OpenContainerShell>(Some(&action.container), cx)
+            })
+    }
+
+    /// The containers a shell can open in: the app containers, not init containers.
+    pub(in crate::ui) fn shell_containers(&self) -> impl Iterator<Item = &PodContainer> {
+        self.log_containers().iter().filter(|c| !c.init)
+    }
+
+    /// The shell tab [`OpenShell`] and [`OpenContainerShell`] open: the named container (or the
+    /// default one) of the shown pod.
+    pub(in crate::ui) fn shell_request<A: Action>(
+        &self,
+        container: Option<&str>,
+    ) -> Result<ShellRequest, ActionError> {
+        if self.log_containers().is_empty() {
+            return Err(ActionError::rejected::<A>(
+                "the detail pane shows no pod (or it is still loading)",
+            ));
+        }
+        let found = match container {
+            Some(name) => self.shell_containers().find(|c| c.name == name),
+            None => self
+                .shell_containers()
+                .find(|c| c.default)
+                .or_else(|| self.shell_containers().next()),
+        };
+        let Some(found) = found else {
+            return Err(ActionError::rejected::<A>(match container {
+                Some(name) => format!("the pod has no app container {name}"),
+                None => "the pod has no app container".to_owned(),
+            }));
+        };
+        Ok(ShellRequest {
+            cluster: self.object.cluster.clone(),
+            namespace: self.object.namespace.clone().unwrap_or_default(),
+            pod: self.object.name.clone(),
+            container: Some(found.name.clone()),
+        })
+    }
+
+    pub(super) fn open_shell<A: Action>(
+        &mut self,
+        container: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.shell_request::<A>(container) {
+            Ok(request) => cx.emit(DetailEvent::OpenShell(request)),
+            Err(e) => tracing::warn!("{e}"),
+        }
     }
 
     /// The fetched pod's containers; empty for other kinds or before the fetch.

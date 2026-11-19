@@ -304,7 +304,7 @@ design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
 ### Bottom dock
 
 `flint-app/src/ui/dock.rs`: a resizable panel under the main area, with one tab per session that outlives navigation
-(log tabs now; shell tabs, workload logs and AI log analysis later). Tabs belong to no cluster. Opening a session that
+(log tabs and shell tabs now; AI log analysis later). Tabs belong to no cluster. Opening a session that
 already has a tab shows that tab. Cmd-J shows and hides the dock; Cmd-W closes the active tab while focus is in the
 dock (elsewhere it closes the window). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant;
 the module documentation lists the steps.
@@ -324,6 +324,33 @@ opens in a tab in the bottom dock.
 - **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.
+- **Shell tab** (`flint-app/src/ui/terminal_view.rs`): opened by Shell in a pod's detail pane (`detail::OpenShell`,
+  ⇧⌘E; a container picker when the pod has several app containers, `detail::OpenContainerShell`). While its command
+  runs, Shell on the same container shows the tab; once it ended, Shell opens a new one beside it. The grid is painted
+  from each snapshot with the theme's mono font: one quad per run of equal background, then each row's text shaped
+  with every glyph forced to the cell width (wide characters and combining marks shaped on their own), so columns
+  stay aligned. Colors come from the theme: the default foreground, background, cursor (the accent) and selection are
+  theme tokens, the 16 ANSI colors are a `terminal` palette per theme in `themes/flint.json` (checked for contrast in
+  both themes), 16 to 255 are xterm's table (`terminal_palette.rs`). Bold, italic, underline, strikethrough, dim,
+  hidden and inverse are drawn; the cursor is a block, beam or underline (a hollow block, or a faded beam or underline,
+  without focus); the bell flashes the
+  screen. The grid size comes from the element's size and the font's advance; a change is sent after 80 ms without
+  further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed
+  (reason); after the end the screen stays scrollable and copyable. Closing the tab drops the session.
+- **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,
+  Space, the arrows, Home/End, Page Up/Down and Ctrl with a letter or symbol to nothing
+  (`registry::TERMINAL_PASSTHROUGH`); it is the deepest context, so those keys skip the app's bindings (focus
+  traversal, list keys, and the app's Ctrl shortcuts on Linux) and reach the tab's key handler, which encodes them
+  with the program's modes (`terminal_keys.rs`: application cursor keys, xterm modifier parameters, Ctrl codes,
+  function keys; Alt as Meta except on macOS, where Option composes text). Text, including what an input method
+  composes, arrives through the platform text input. What stays the app's: Cmd shortcuts on macOS; on Linux,
+  Ctrl-Shift ones (copy is Ctrl-Shift-C, paste Ctrl-Shift-V) and Ctrl-Tab for the dock. Known conflicts: on Linux an app
+  shortcut on Ctrl with a letter (without Shift) would not fire while a shell has focus (today's are Cmd/Super or
+  Ctrl-Shift); Shift-Page Up/Down and Shift-Home/End
+  scroll the tab instead of reaching the program; mouse reporting (programs that ask for clicks) is not sent, the
+  mouse always selects.
+- **Mouse in a shell tab.** Dragging selects (double click: words, triple click: lines, Option: a block, Shift-click
+  extends); the wheel scrolls the history, or sends arrow keys to a full-screen program on the alternate screen.
 - **OSC 52** (clipboard access by the remote program) is disabled.
 - **Synchronized updates** (DECSET 2026) that a program never ends are applied after alacritty's 150 ms timeout,
   and at the end of the output.

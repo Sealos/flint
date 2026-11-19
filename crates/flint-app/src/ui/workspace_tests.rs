@@ -9,7 +9,7 @@ use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
 use crate::ui::detail::DetailTab;
-use crate::ui::dock::{DockItem as _, DockTab};
+use crate::ui::dock::{DockItem as _, DockTab, TabStatus};
 use crate::ui::registry::{self, ActionError};
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
 use crate::ui::view_state::Focus;
@@ -529,6 +529,7 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
         let dock = ws.dock.read(cx);
         match dock.tab(dock.tab_ids()[0]).unwrap() {
             DockTab::Logs(view) => view.downgrade(),
+            DockTab::Shell(_) => panic!("a log tab"),
         }
     });
 
@@ -585,6 +586,104 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
         workspace.read(cx).focus.is_focused(window)
     })
     .await;
+}
+
+// covers UP-41, UP-42: Shell in the detail pane opens a shell tab in the dock (or shows the open
+// one), with a container picker; the tab keeps running across a cluster switch, its actions
+// are forwarded from the workspace, and closing it ends the session.
+#[gpui_kit::test]
+async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_pods(cx, &t, &[("demo", "web", 1)]).await;
+    assert_eq!(
+        dispatch(cx, &t, "detail::OpenShell", Value::Null),
+        Err(ActionError::NotAvailable("detail::OpenShell".into())),
+        "no pod is shown yet"
+    );
+    show_pod(cx, &t, "web").await;
+    cx.update_window(t.window, |_, window, _| {
+        assert!(window.try_find("detail-shell").is_some());
+    })
+    .unwrap();
+    assert!(matches!(
+        dispatch(
+            cx,
+            &t,
+            "detail::OpenContainerShell",
+            json!({"container": "nope"})
+        ),
+        Err(ActionError::Rejected { .. })
+    ));
+    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(dock_tabs(cx, &t), (true, vec!["$ web · app".to_owned()]));
+    let first = t.workspace.read_with(cx, |ws, cx| {
+        ws.dock.read(cx).active_terminal().unwrap().downgrade()
+    });
+    // `alpha` never connects, so the shell fails at once and says why; the tab stays.
+    let failed = first.upgrade().unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        failed.read(cx).tab_status() == TabStatus::Failed
+    })
+    .await;
+    // An ended shell does not answer for its container: Shell opens a new one beside it. (A
+    // running one is shown instead; see `terminal_tests.rs`.)
+    focus_workspace(cx, &t);
+    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    dispatch(
+        cx,
+        &t,
+        "detail::OpenContainerShell",
+        json!({"container": "sidecar"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        dock_tabs(cx, &t).1,
+        ["$ web · app", "$ web · app", "$ web · sidecar"]
+    );
+    let shell = t.workspace.read_with(cx, |ws, cx| {
+        ws.dock.read(cx).active_terminal().unwrap().downgrade()
+    });
+
+    // A cluster switch keeps the shells.
+    activate(cx, &t, "beta").await;
+    cx.run_until_parked();
+    assert_eq!(dock_tabs(cx, &t).1.len(), 3);
+    let alive = shell.upgrade().expect("the shell tab survives the switch");
+    assert_eq!(
+        alive.read_with(cx, |v, _| v.request().container.clone()),
+        Some("sidecar".to_owned())
+    );
+    drop(alive);
+
+    // Its actions are forwarded from the workspace, and guarded.
+    focus_workspace(cx, &t);
+    let names: Vec<&str> = cx
+        .update_window(t.window, |_, window, cx| {
+            registry::available(window, cx).map(|s| s.name).collect()
+        })
+        .unwrap();
+    assert!(names.contains(&"terminal::SelectText"), "{names:?}");
+    assert!(
+        !names.contains(&"terminal::CopyText"),
+        "nothing is selected"
+    );
+    assert!(
+        !names.contains(&"terminal::ScrollToBottom"),
+        "not scrolled back"
+    );
+
+    // Closing the tab drops the view, which ends the session.
+    let id = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.dock.read(cx).active_id().unwrap());
+    dispatch(cx, &t, "dock::CloseTab", json!({ "tab": id })).unwrap();
+    cx.run_until_parked();
+    assert_eq!(dock_tabs(cx, &t).1, ["$ web · app", "$ web · app"]);
+    assert!(shell.upgrade().is_none(), "closing a tab ends its session");
 }
 
 // covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.

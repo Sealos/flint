@@ -115,6 +115,9 @@ pub struct TerminalSnapshot {
     pub title: Option<String>,
     /// How many times the bell rang; a front end can flash when it changes.
     pub bells: u64,
+    /// A selection exists, on screen or not (scrolled into the history or below the view).
+    /// The terminal drops it on its own when the program clears or overwrites what it covers.
+    pub has_selection: bool,
 }
 
 impl TerminalSnapshot {
@@ -393,6 +396,7 @@ impl TerminalModel {
             mode: content.mode,
             title: self.title.clone(),
             bells: self.bells,
+            has_selection: self.term.selection.as_ref().is_some_and(|s| !s.is_empty()),
         }
     }
 }
@@ -602,6 +606,19 @@ mod tests {
         term.start_selection(SelectionKind::Simple, 0, 0, Side::Left);
         term.update_selection(0, 1, Side::Right);
         assert_eq!(term.selection_text().as_deref(), Some("l0"));
+        assert!(term.snapshot().has_selection);
+        // Scrolled out of view, it is still there to copy.
+        term.scroll_to_bottom();
+        let snap = term.snapshot();
+        assert!(snap.has_selection && !snap.cells.iter().any(|c| c.selected));
+        assert_eq!(term.selection_text().as_deref(), Some("l0"));
+        // A click without a drag selects nothing; clearing the screen drops a selection.
+        term.start_selection(SelectionKind::Simple, 0, 0, Side::Left);
+        assert!(!term.snapshot().has_selection);
+        term.start_selection(SelectionKind::Lines, 0, 0, Side::Left);
+        assert!(term.snapshot().has_selection);
+        term.advance(b"\x1b[?1049h");
+        assert!(!term.snapshot().has_selection);
     }
 
     #[test]

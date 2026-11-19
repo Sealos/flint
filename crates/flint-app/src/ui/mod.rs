@@ -13,6 +13,8 @@ mod automation;
 mod clusters;
 mod detail;
 mod dock;
+#[cfg(test)]
+mod dock_tests;
 mod list;
 mod list_model;
 mod log_model;
@@ -24,6 +26,10 @@ mod registry;
 mod startup;
 #[cfg(test)]
 mod support_tests;
+mod terminal_keys;
+mod terminal_model;
+mod terminal_palette;
+mod terminal_view;
 mod theme;
 mod ui_state;
 #[cfg(any(test, feature = "automation"))]

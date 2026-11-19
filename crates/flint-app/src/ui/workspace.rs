@@ -38,6 +38,8 @@ use super::registry::{
     WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::startup::StartupView;
+use super::terminal_model::ShellRequest;
+use super::terminal_view::{ShellKey, TerminalView};
 use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
@@ -439,6 +441,33 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens (or shows) the shell tab for `request` in the dock, and focuses it. The session
+    /// starts at the classic 80 by 24; the tab sends its real size once laid out.
+    pub(in crate::ui) fn open_shell(
+        &mut self,
+        request: ShellRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let core = self.model.read(cx).core().clone();
+        let key = TabKey::Shell(ShellKey {
+            request: request.clone(),
+            ended: None,
+        });
+        self.dock.update(cx, |dock, cx| {
+            dock.open(
+                key,
+                |window, cx| {
+                    let session = core.exec(request.exec_request(Default::default()));
+                    DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
+                },
+                window,
+                cx,
+            )
+        });
+        cx.notify();
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -654,6 +683,9 @@ impl Workspace {
                                 }
                                 DetailEvent::OpenLogs(request) => {
                                     this.open_logs(request.clone(), window, cx)
+                                }
+                                DetailEvent::OpenShell(request) => {
+                                    this.open_shell(request.clone(), window, cx)
                                 }
                             }
                         }),
