@@ -349,31 +349,31 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 and uses UP-75 to UP-79.
 
-### UP-75 Analyze log lines with my AI CLI
-- **Given** `claude` or `codex` on my login-shell `PATH`.
-- **When** I select log lines and press Analyze (or its palette action), tick "Allow log analysis on `<context>`
-  (`<server>`)" the first time, and confirm.
+### UP-75 Analyze log lines with Claude Code
+- **Given** `claude` on my login-shell `PATH`.
+- **When** I select log lines and press Analyze with Claude (or its palette action), tick "Allow log analysis on
+  `<context>` (`<server>`)" the first time, and confirm.
 - **Then** the answer streams into a side panel, below what was sent. Stop ends the process and anything it started.
   Nothing in the answer runs, opens or changes anything. The opt-in is checked against the log's own cluster, even
-  if I have switched to another one since. A re-pointed context counts as not allowed. The split button's menu offers
-  the CLI that is not the default.
-- Tests: unit (prompt, allow policy, process environment), ui (with a fake CLI on `PATH`).
+  if I have switched to another one since. A re-pointed context counts as not allowed. If Claude Code's session
+  report shows any tool, MCP server or plugin, nothing is sent.
+- Tests: unit (prompt, allow policy, process environment), ui (with a fake `claude` on `PATH`).
 
 ### UP-76 See exactly what leaves my Mac
 - **When** the confirmation opens.
 - **Then** it shows the full prompt and the lines as they will be sent, with credential shapes, vendor tokens,
   private keys and the values of Secrets, env and ConfigMaps the pod references already replaced. It names the CLI
   and its path. Lines past 1,000, past 4 KiB each or past 256 KiB in total are cut, and it says so. If Flint could
-  not read the pod's Secrets or ConfigMaps, it says those values were not checked. For Codex, it warns that a
-  command Codex starts may run before Flint stops it. With "Always for this cluster", later sends skip the sheet but
-  are still redacted, and the panel shows what was sent. "Always" resets if the CLI or its path changes. The fake CLI
-  receives byte for byte what was shown.
-- Tests: unit (redaction patterns and encodings, limits), ui (fake CLI).
+  not read the pod's Secrets or ConfigMaps, it says those values were not checked. With "Always for this cluster",
+  later sends skip the sheet but are still redacted, and the panel shows what was sent. "Always" resets if the
+  binary path changes. The fake `claude` receives byte for byte what was shown.
+- Tests: unit (redaction patterns and encodings, limits), ui (fake `claude`).
 
-### UP-77 No AI CLI installed
-- **Given** neither `claude` nor `codex` on the resolved `PATH` (relative and empty entries ignored), nor in settings,
-  nor in a supported version.
-- **Then** the log viewer shows no Analyze button, the palette has no Analyze action, and there is no error.
+### UP-77 Claude Code not installed
+- **Given** no `claude` on the resolved `PATH` (relative and empty entries ignored), nor in settings, nor in a
+  supported version. Having only `codex` installed counts as not installed in v1.
+- **Then** the log viewer shows no Analyze with Claude button, the palette has no Analyze action, and there is no
+  error.
 - Tests: unit (CLI lookup), ui.
 
 ### UP-78 Switch between recent clusters instantly

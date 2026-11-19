@@ -19,8 +19,8 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 - Browse every resource kind, including CRDs, with live updates ([ADR-0003](./adr/0003-generic-resource-views.md)).
 - Pod logs: follow, search, pick a container, show previous logs, toggle timestamps, and highlight errors and
   warnings.
-- AI log analysis: send selected log lines, redacted, to the user's own `claude` or `codex` CLI and read the answer
-  in a side panel ([ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md)).
+- AI log analysis: send selected log lines, redacted, to the user's own Claude Code CLI (`claude`) and read the
+  answer in a side panel ([ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md)).
 - Pod exec terminal.
 - Edit YAML in the app. Syntax and schema errors show inline as you type, and a server-side dry-run with a diff runs
   before apply ([ADR-0006](./adr/0006-yaml-validation-by-dry-run.md)).
@@ -98,7 +98,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 │                      ├─ Sessions: log streams, exec, port-forwards          │
 │                      └─ Metrics poller (metrics.k8s.io)                     │
 │  HelmRunner (spawns `helm` subprocesses)                                    │
-│  LogAnalysisRunner (spawns `claude` or `codex`, on a user action only)      │
+│  LogAnalysisRunner (spawns `claude`, on a user action only)                 │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -235,13 +235,13 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
 
 ### AI log analysis
 
-The log viewer has one split **Analyze** button. It runs the default CLI (`log_analysis_cli`), and its menu offers
-the other one. A palette action with a shortcut does the same. The CLIs are found on the resolved `PATH` (relative
-and empty entries ignored) or set in `settings.toml`. If neither is found, the button and the action are hidden. The
-full design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
+The log viewer has an **Analyze with Claude** button. A palette action with a shortcut does the same. `claude` is
+found on the resolved `PATH` (relative and empty entries ignored) or set in `settings.toml`. If it is not found, the
+button and the action are hidden. Codex is not supported in v1, because it has no way to turn its tools off. The full
+design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
 
-1. The user selects lines and clicks Analyze. The opt-in is checked against the log session's own cluster (context
-   name plus server URL), not the active one.
+1. The user selects lines and clicks Analyze with Claude. The opt-in is checked against the log session's own
+   cluster (context name plus server URL), not the active one.
 2. Flint redacts the lines with the log redactor in `flint_core::redact`: credential shapes, vendor tokens, private
    keys, and the values of Secrets, env and ConfigMaps the pod references, read at that moment. It sends at most
    1,000 lines, 4 KiB per line and 256 KiB in total.
@@ -251,9 +251,8 @@ full design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
    revoked from the sidebar context menu or the palette.
 4. Flint starts the CLI in its own process group, with a cleared environment plus an allowlist, `KUBECONFIG` set to
    `/dev/null`, and a private temporary directory. Claude Code runs with its tools, MCP servers, settings and hooks
-   off, and Flint checks its `system/init` event. Codex has no tools-off mode, so Flint kills it at its first command
-   or tool event, and the Codex sheet warns about this. The prompt goes in on stdin. It says the lines are untrusted
-   data and must not be followed.
+   off, and Flint checks its `system/init` event before anything is sent. The prompt goes in on stdin. It says the
+   lines are untrusted data and must not be followed.
 5. The answer streams into a side panel as text, below what was sent. Stop kills the process group. Flint never acts
    on the answer.
 
@@ -392,8 +391,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
-  `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send),
-  `log_analysis_cli` (the default CLI), the log analysis line limit, and `claude` and `codex` binary overrides.
+  `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
+  analysis line limit, and a `claude` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, which the user
   drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
   filter of each cluster.
@@ -411,7 +410,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain |
 | M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram |
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
-| M5.5 | Multi-cluster and AI: warm clusters for instant switching, AI log analysis through the user's `claude` or `codex` CLI |
+| M5.5 | Multi-cluster and AI: warm clusters for instant switching, AI log analysis through the user's Claude Code CLI |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
 
 ## Risks
@@ -429,11 +428,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Exec plugin latency.** Some auth plugins take seconds to run. Cache tokens until they expire (`kube` does this)
   and show connection progress in the UI.
 - **No `helm` installed.** Covered by an install hint. Bundling the binary is a possible follow-up.
-- **AI CLI flags change.** `claude` and `codex` are young, and their flags can change. Keep the flags in one place and
-  refuse to run a CLI that rejects the safety flags.
+- **AI CLI flags change.** `claude` is young, and its flags can change. Keep the flags in one place, and fail
+  closed when the CLI rejects them or its `system/init` check fails.
 - **Log lines leave the machine.** Redaction is pattern-based and can miss a secret. The confirmation shows exactly
   what is sent, so the user is the last check.
 - **Memory with warm clusters.** Covered by the count, the memory budget and the idle limit. Watch storms on a warm
   cluster cost CPU, but no view redraws for them. The target is under 1% CPU with 3 idle warm clusters.
-- **Codex isolation.** Codex has no tools-off mode, so a command it starts can run before Flint kills it. Shipping
-  Codex in M5.5 or Claude only first is an open decision in ADR-0011.
+- **Only one AI CLI.** Codex users get no Analyze button in v1. Support is reconsidered when `codex exec` can turn its
+  tools off (ADR-0011).
