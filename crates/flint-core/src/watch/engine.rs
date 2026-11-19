@@ -101,7 +101,7 @@ impl Backoff {
     fn next(&mut self) -> Duration {
         let base = self.next;
         self.next = (self.next * 2).min(self.max);
-        base + base.mul_f64(jitter_fraction(jitter_entropy()))
+        jittered(base)
     }
 
     fn reset(&mut self) {
@@ -109,14 +109,25 @@ impl Backoff {
     }
 }
 
-/// Fresh bits for one jitter: the clock, hashed with a per-call random key, so two kinds that
-/// back off in the same instant still differ.
+/// `delay` plus up to 25% jitter, so the kinds of a cluster do not retry in lockstep after a
+/// network drop or an API-server restart. Every retry and poll delay goes through this.
+fn jittered(delay: Duration) -> Duration {
+    delay + delay.mul_f64(jitter_fraction(jitter_entropy()))
+}
+
+/// Fresh bits for one jitter: the clock, hashed with a per-call random key.
 fn jitter_entropy() -> u64 {
-    use std::hash::BuildHasher as _;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    std::collections::hash_map::RandomState::new().hash_one(nanos)
+    keyed(nanos)
+}
+
+/// `value` hashed with a new random key, so two kinds that read the same clock value still get
+/// different jitter.
+fn keyed(value: u128) -> u64 {
+    use std::hash::BuildHasher as _;
+    std::collections::hash_map::RandomState::new().hash_one(value)
 }
 
 /// A jitter between 0 and 25%, spread evenly whichever bits of `entropy` vary. (A raw clock
@@ -364,7 +375,7 @@ impl Engine {
                         error: Some(m.clone()),
                     });
                     let n = self.denials.saturating_sub(1).min(8);
-                    self.config.denied_backoff_min * 2u32.pow(n)
+                    jittered(self.config.denied_backoff_min * 2u32.pow(n))
                 }
             }
             other => {
@@ -387,7 +398,7 @@ impl Engine {
                 error: Some(error.to_string()),
             });
             let n = self.watch_denials.saturating_sub(1).min(8);
-            self.pause(self.config.denied_backoff_min * 2u32.pow(n))
+            self.pause(jittered(self.config.denied_backoff_min * 2u32.pow(n)))
                 .await;
             return Some(None);
         }
@@ -721,7 +732,7 @@ impl Engine {
                     if retry_at.is_some_and(|at| Instant::now() >= at) {
                         return Some(rv);
                     }
-                    self.pause(self.config.poll_interval).await;
+                    self.pause(jittered(self.config.poll_interval)).await;
                 }
                 Err(e) => self.fail(e, &mut backoff).await,
             }
@@ -1090,6 +1101,24 @@ mod tests {
             fractions.iter().map(|f| f.to_bits()).collect();
         assert!(distinct.len() > 150, "{} distinct", distinct.len());
         assert!(fractions.iter().any(|f| *f < 0.05) && fractions.iter().any(|f| *f > 0.2));
+    }
+
+    #[test]
+    fn jittered_adds_up_to_a_quarter_and_varies() {
+        let base = Duration::from_millis(500);
+        let delays: std::collections::BTreeSet<Duration> =
+            (0..50).map(|_| jittered(base)).collect();
+        assert!(
+            delays.iter().all(|d| *d >= base && *d < base.mul_f64(1.25)),
+            "{delays:?}"
+        );
+        assert!(delays.len() > 1, "{delays:?}");
+    }
+
+    #[test]
+    fn the_same_clock_value_gets_different_keys() {
+        let keys: std::collections::BTreeSet<u64> = (0..20).map(|_| keyed(42)).collect();
+        assert!(keys.len() > 1, "{keys:?}");
     }
 
     #[test]

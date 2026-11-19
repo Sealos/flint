@@ -251,13 +251,21 @@ fn forbidden() -> FetchError {
     FetchError::Denied("pods is forbidden: User \"dev\" cannot list resource \"pods\"".into())
 }
 
-/// Waits (in paused time) until the newest snapshot satisfies `pred`. The limit is above the
-/// slowest retry these tests wait for: the 30 s all-namespaces recheck plus up to 25% jitter.
+/// Waits (in paused time) up to 30 s until the newest snapshot satisfies `pred`.
 async fn until(
     rx: &mut tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
     pred: impl Fn(&KindSnapshot) -> bool,
 ) -> Arc<KindSnapshot> {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    until_within(rx, Duration::from_secs(30), pred).await
+}
+
+/// [`until`] with another limit.
+async fn until_within(
+    rx: &mut tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
+    limit: Duration,
+    pred: impl Fn(&KindSnapshot) -> bool,
+) -> Arc<KindSnapshot> {
+    tokio::time::timeout(limit, async {
         loop {
             let snap = rx.borrow_and_update().clone();
             if pred(&snap) {
@@ -440,7 +448,8 @@ async fn apis_that_cannot_watch_are_polled() {
     assert_eq!(snap.feed, Feed::Poll);
     assert_eq!(snap.format, crate::table::ListFormat::Fallback);
     assert_eq!(names(&snap), ["p"]);
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // Two more polls: 500 ms each, plus up to 25% jitter.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
     assert!(fake.list_calls("pods") >= 3, "listed again on an interval");
     assert!(fake.watch_requests("pods").is_empty(), "never watched");
     task.abort();
@@ -688,8 +697,9 @@ async fn a_namespace_limited_list_goes_back_to_all_namespaces_when_allowed_again
     })
     .await;
     assert_eq!(names(&snap), ["x"]);
-    // The all-namespaces list is tried again after a while, and taken back once it works.
-    let snap = until(&mut rx, |s| {
+    // The all-namespaces list is tried again after a while (30 s plus up to 25% jitter), and
+    // taken back once it works.
+    let snap = until_within(&mut rx, Duration::from_secs(45), |s| {
         s.state == SyncState::Synced && s.limited_to.is_none()
     })
     .await;
