@@ -17,6 +17,8 @@ mod notice;
 mod object;
 mod registry;
 mod startup;
+#[cfg(test)]
+mod support_tests;
 mod theme;
 mod ui_state;
 mod workspace;
@@ -153,9 +155,12 @@ fn install_menus(appearance: Appearance, cx: &mut App) {
 
 fn set_menus(appearance: Appearance, cx: &mut App) {
     cx.set_menus([
-        Menu::new("Flint").items([MenuItem::action("Quit Flint", Quit)]),
+        Menu::new("Flint").items([MenuItem::action(registry::label::<Quit>(), Quit)]),
         appearance_menu(appearance),
-        Menu::new("Window").items([MenuItem::action("Close Window", CloseWindow)]),
+        Menu::new("Window").items([MenuItem::action(
+            registry::label::<CloseWindow>(),
+            CloseWindow,
+        )]),
     ]);
 }
 

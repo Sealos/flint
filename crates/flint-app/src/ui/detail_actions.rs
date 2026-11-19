@@ -1,22 +1,26 @@
-//! The detail pane's registered actions ([`crate::ui::registry`]) and their handlers, which do
-//! what the pane's buttons, tabs and toggles do.
+//! The detail pane's registered actions ([`crate::ui::registry`]), their handlers, and the
+//! checks the workspace's guards share with them. The pane's buttons, tabs and toggles dispatch
+//! these actions.
 
 use gpui_kit::*;
 
 use super::super::registry::{
-    Bind, Close, OnView, Refresh, ShowTab, TabName, ToggleAnnotations, ToggleLabels,
-    ToggleManagedFields, ToggleSecretValue,
+    ActionError, Bind, Close, OnView, Refresh, ShowOverview, ShowYaml, ToggleAnnotations,
+    ToggleLabels, ToggleManagedFields, ToggleSecretValue,
 };
-use super::{DetailEvent, DetailTab, DetailView};
+use super::{DetailEvent, DetailTab, DetailView, Fetch};
 
 impl DetailView {
     /// Every detail action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<Refresh>(|view, _, window, cx| view.refresh(window, cx))
             .bind::<Close>(|_, _, _, cx| cx.emit(DetailEvent::Close))
-            .bind::<ShowTab>(Self::show_tab)
+            .bind::<ShowOverview>(|view, _, _, cx| view.show_tab(DetailTab::Overview, cx))
+            .bind::<ShowYaml>(|view, _, _, cx| view.show_tab(DetailTab::Yaml, cx))
             .bind::<ToggleManagedFields>(|view, _, window, cx| {
-                view.toggle_managed_fields(window, cx)
+                if view.has_managed_fields() {
+                    view.toggle_managed_fields(window, cx)
+                }
             })
             .bind::<ToggleLabels>(|view, _, _, cx| {
                 view.show_labels = !view.show_labels;
@@ -33,9 +37,43 @@ impl DetailView {
         Self::bind_actions(OnView::new(element, cx)).into_element()
     }
 
-    fn show_tab(&mut self, action: &ShowTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.tab = tab(action.tab);
-        cx.notify();
+    fn show_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            cx.notify();
+        }
+    }
+
+    /// [`ToggleManagedFields`] needs a fetched object that has managedFields.
+    pub(in crate::ui) fn has_managed_fields(&self) -> bool {
+        matches!(&self.fetch, Fetch::Loaded { detail, .. } if detail.managed_fields.is_some())
+    }
+
+    /// [`ToggleSecretValue`] applies to Secrets only.
+    pub(in crate::ui) fn is_secret(&self) -> bool {
+        self.is_secret
+    }
+
+    /// [`ToggleSecretValue`] takes a key of the fetched Secret's data.
+    pub(in crate::ui) fn check_secret_key(
+        &self,
+        action: &ToggleSecretValue,
+    ) -> Result<(), ActionError> {
+        let known = match &self.fetch {
+            Fetch::Loaded { overview, .. } => overview
+                .secret
+                .as_ref()
+                .is_some_and(|s| s.entries.iter().any(|e| e.key == action.key)),
+            _ => false,
+        };
+        if known {
+            Ok(())
+        } else {
+            Err(ActionError::rejected::<ToggleSecretValue>(format!(
+                "the Secret has no key {}",
+                action.key
+            )))
+        }
     }
 
     fn toggle_secret_value(
@@ -44,7 +82,7 @@ impl DetailView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_secret {
+        if !self.is_secret || self.check_secret_key(action).is_err() {
             return;
         }
         if !self.revealed.remove(&action.key) {
@@ -54,27 +92,12 @@ impl DetailView {
     }
 }
 
-fn tab(name: TabName) -> DetailTab {
-    match name {
-        TabName::Overview => DetailTab::Overview,
-        TabName::Yaml => DetailTab::Yaml,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::ui::registry::{Scope, TabName, tests::assert_binds_scope};
-
-    use super::{DetailTab, tab};
+    use crate::ui::registry::{Scope, tests::assert_binds_scope};
 
     #[test]
     fn every_detail_action_is_bound() {
         assert_binds_scope(Scope::Detail, super::DetailView::bind_actions);
-    }
-
-    #[test]
-    fn tab_names_map_to_tabs() {
-        assert_eq!(tab(TabName::Overview), DetailTab::Overview);
-        assert_eq!(tab(TabName::Yaml), DetailTab::Yaml);
     }
 }

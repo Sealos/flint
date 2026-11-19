@@ -10,6 +10,7 @@ use std::sync::Arc;
 use flint_core::read::event_time;
 use flint_core::table::{human_duration, unix_now};
 use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail};
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::spinner::Spinner;
@@ -24,6 +25,10 @@ use gpui_kit::*;
 use super::list::tabular_figures;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, SecretValue};
+use super::registry::{
+    self, Close, Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels,
+    ToggleManagedFields, ToggleSecretValue,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
@@ -225,8 +230,7 @@ impl DetailView {
         cx.notify();
     }
 
-    fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity().downgrade();
+    fn render_header(&self, theme: &Theme, _cx: &mut Context<Self>) -> impl IntoElement {
         let selected = match self.tab {
             DetailTab::Overview => 0,
             DetailTab::Yaml => 1,
@@ -276,7 +280,7 @@ impl DetailView {
                             .xsmall()
                             .ghost()
                             .tooltip("Fetch again")
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                            .on_click(registry::on_click(Refresh)),
                     )
                     .child(
                         Button::new("detail-close")
@@ -284,7 +288,7 @@ impl DetailView {
                             .xsmall()
                             .ghost()
                             .tooltip("Close (Esc)")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DetailEvent::Close))),
+                            .on_click(registry::on_click(Close)),
                     ),
             )
             .child(
@@ -295,16 +299,15 @@ impl DetailView {
                     .selected_index(selected)
                     .child(Tab::new().label("Overview"))
                     .child(Tab::new().label("YAML"))
-                    .on_click(move |ix, _, cx| {
-                        let tab = if *ix == 0 {
-                            DetailTab::Overview
+                    .on_click(|ix, window, cx| {
+                        let shown = if *ix == 0 {
+                            registry::perform(&ShowOverview, window, cx)
                         } else {
-                            DetailTab::Yaml
+                            registry::perform(&ShowYaml, window, cx)
                         };
-                        let _ = this.update(cx, |view, cx| {
-                            view.tab = tab;
-                            cx.notify();
-                        });
+                        if let Err(e) = shown {
+                            tracing::warn!("{e}");
+                        }
                     }),
             )
     }
@@ -343,7 +346,7 @@ impl DetailView {
         &self,
         detail: &ObjectDetail,
         theme: &Theme,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> impl IntoElement {
         let has_managed = detail.managed_fields.is_some();
         h_flex()
@@ -373,9 +376,7 @@ impl DetailView {
                             "Show managedFields"
                         })
                         .tooltip("Which field manager (kubectl, Helm, a controller) set each field")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.toggle_managed_fields(window, cx)
-                        })),
+                        .on_click(registry::on_click(ToggleManagedFields)),
                 )
             })
     }
@@ -427,17 +428,15 @@ impl DetailView {
             "Labels",
             &o.labels,
             self.show_labels,
-            |v| &mut v.show_labels,
+            Box::new(ToggleLabels),
             theme,
-            cx,
         ));
         body = body.child(self.render_pairs(
             "Annotations",
             &o.annotations,
             self.show_annotations,
-            |v| &mut v.show_annotations,
+            Box::new(ToggleAnnotations),
             theme,
-            cx,
         ));
 
         if !o.owners.is_empty() {
@@ -622,9 +621,8 @@ impl DetailView {
         title: &'static str,
         pairs: &[(String, String)],
         open: bool,
-        flag: fn(&mut DetailView) -> &mut bool,
+        toggle: Box<dyn Action>,
         theme: &Theme,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let header = h_flex()
             .id(SharedString::from(format!("toggle-{title}")))
@@ -642,11 +640,11 @@ impl DetailView {
                 .xsmall(),
             )
             .child(format!("{} ({})", title.to_uppercase(), pairs.len()))
-            .on_click(cx.listener(move |view, _, _, cx| {
-                let f = flag(view);
-                *f = !*f;
-                cx.notify();
-            }));
+            .on_click(move |_, window, cx| {
+                if let Err(e) = registry::perform(&*toggle, window, cx) {
+                    tracing::warn!("{e}");
+                }
+            });
         v_flex()
             .gap_1()
             .child(header)
@@ -686,7 +684,7 @@ impl DetailView {
         &self,
         secret: &object::SecretData,
         theme: &Theme,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let rows = secret.entries.iter().enumerate().map(|(i, entry)| {
             let revealed = self.revealed.contains(&entry.key);
@@ -746,12 +744,7 @@ impl DetailView {
                         } else {
                             "Reveal value"
                         })
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if !view.revealed.remove(&key) {
-                                view.revealed.insert(key.clone());
-                            }
-                            cx.notify();
-                        })),
+                        .on_click(registry::on_click(ToggleSecretValue { key })),
                 )
         });
         section(
@@ -895,6 +888,7 @@ impl Render for DetailView {
         v_flex()
             .id("detail")
             .map(|el| Self::register_actions(el, cx))
+            .test_support()
             .size_full()
             .min_w_0()
             .bg(theme.background)

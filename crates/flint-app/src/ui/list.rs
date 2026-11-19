@@ -32,7 +32,10 @@ use flint_core::redact::is_safe_secret_column;
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
 
-use super::registry::{CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev};
+use super::registry::{
+    self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy,
+    ToggleWide,
+};
 
 /// The list's key context; the registry binds the list's keys in it.
 pub const CONTEXT: &str = "ResourceList";
@@ -505,16 +508,12 @@ impl ResourceList {
                 })
                 .when(!is_selected, |el| el.hover(|el| el.bg(theme.table_hover)))
                 .when(stale, |el| el.text_color(theme.muted_foreground))
-                .on_click({
-                    // By uid, not position: rows may have been reordered by the time the
-                    // click is handled.
-                    let uid = row.uid.clone();
-                    cx.listener(move |this, _, window, cx| {
-                        if let Some(ix) = this.position_of(&uid) {
-                            this.select_index(ix, window, cx);
-                        }
-                    })
-                });
+                // By name, not position: rows may have been reordered by the time the click
+                // is handled.
+                .on_click(registry::on_click(SelectRow {
+                    namespace: row.namespace.as_deref().map(str::to_owned),
+                    name: row.name.to_string(),
+                }));
             let finished = health
                 && list_model::row_finished(&self.shown.columns, |i| {
                     cell_text(row, i, now).to_string()
@@ -565,7 +564,7 @@ impl ResourceList {
         elements
     }
 
-    fn render_header(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, theme: &Theme, _cx: &Context<Self>) -> impl IntoElement {
         let mut header = h_flex()
             .h(px(ROW_HEIGHT + 2.))
             .w_full()
@@ -617,16 +616,14 @@ impl ResourceList {
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_sort(&click_name, cx);
-                    }))
+                    .on_click(registry::on_click(SortBy { column: click_name }))
                     .test_support(),
             );
         }
         header.child(div().flex_1())
     }
 
-    fn render_toolbar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, theme: &Theme, _cx: &Context<Self>) -> impl IntoElement {
         let snapshot = &self.shown;
         let total = snapshot.rows.len();
         let shown = self.rows.len();
@@ -685,10 +682,7 @@ impl ResourceList {
                         } else {
                             "Show the extra columns of kubectl get -o wide"
                         })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_wide = !this.show_wide;
-                            cx.notify();
-                        })),
+                        .on_click(registry::on_click(ToggleWide)),
                 )
             })
             .child(

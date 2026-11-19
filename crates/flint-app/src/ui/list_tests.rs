@@ -129,6 +129,14 @@ fn open_sized(
             },
         )
         .unwrap();
+        // The list has focus, as when opened in the app, so clicks have a place to dispatch
+        // their actions from.
+        window
+            .update(cx, |_, window, cx| {
+                let focus = list.read(cx).focus_handle().clone();
+                window.focus(&focus, cx);
+            })
+            .unwrap();
         (window, list)
     })
 }

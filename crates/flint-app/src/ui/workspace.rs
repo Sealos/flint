@@ -28,7 +28,12 @@ use gpui_kit::*;
 use super::clusters::{ClustersModel, state_label};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
 use super::list::{ListEvent, ResourceList};
-use super::nav::{NavEvent, NavPanel};
+use super::nav::NavPanel;
+use super::registry::{
+    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
+    RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
+    WatchAllKinds, WatchOpenViewsOnly,
+};
 use super::startup::{self, StartupView};
 use super::theme;
 use super::ui_state::{self, UiState};
@@ -171,7 +176,8 @@ pub struct Workspace {
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
     _save_panes: Task<()>,
-    /// Holds focus when nothing inside does, so registered actions reach the workspace.
+    /// Focused when nothing inside is, so keys and registered actions reach the workspace. It is
+    /// tracked by an element nothing can click, so clicks elsewhere keep focus where it was.
     focus: FocusHandle,
     _namespaces: Task<()>,
     _tick: Task<()>,
@@ -200,10 +206,6 @@ impl Workspace {
             cx.notify();
         });
         let nav = cx.new(|_| NavPanel::new());
-        let on_nav = cx.subscribe_in(&nav, window, |this, _, event, window, cx| match event {
-            NavEvent::Open(entry) => this.open_kind(entry, window, cx),
-            NavEvent::Retry => this.retry(cx),
-        });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, _| {
             let save = this.ui_state.set_panes(this.panes);
@@ -223,17 +225,11 @@ impl Workspace {
             &namespace_input,
             window,
             |this, input, event, window, cx| {
+                // Enter runs AddNamespace's handler (this listener holds the workspace, so it
+                // cannot go through the registry's guards, which read it).
                 if let InputEvent::PressEnter { .. } = event {
-                    let name = input.read(cx).value().trim().to_owned();
-                    if name.is_empty() {
-                        return;
-                    }
-                    let Some(cluster) = this.cluster.clone() else {
-                        return;
-                    };
-                    let mut next = this.ui_state.namespace_filter(&cluster).to_vec();
-                    next.push(name);
-                    this.set_namespace_filter(ui_state::normalize(next), cx);
+                    let namespace = input.read(cx).value().to_string();
+                    this.add_namespace(&AddNamespace { namespace }, window, cx);
                     input.update(cx, |input, cx| input.set_value("", window, cx));
                 }
             },
@@ -257,6 +253,11 @@ impl Workspace {
         });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // Focus left with a closed view (a cluster switch drops the list): take it back, so keys
+        // and registered actions still reach the workspace.
+        let on_focus_lost =
+            cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
+        registry::install(focus.clone(), Self::guards(cx.entity().downgrade()), cx);
         let mut this = Self {
             model,
             focus,
@@ -279,7 +280,13 @@ impl Workspace {
             _tick: tick,
             _list_subscriptions: Vec::new(),
             _detail_subscriptions: Vec::new(),
-            _subscriptions: vec![observe, appearance, on_nav, on_namespace_input, on_quit],
+            _subscriptions: vec![
+                observe,
+                appearance,
+                on_namespace_input,
+                on_quit,
+                on_focus_lost,
+            ],
         };
         this.show_appearance(window, cx);
         this
@@ -328,10 +335,21 @@ impl Workspace {
         let width = match pane {
             Pane::Clusters => x,
             Pane::Navigation => x - shown.clusters,
+            Pane::Detail => window_width - x,
+        };
+        self.resize_pane(pane, width, window_width, cx);
+    }
+
+    /// Sets a pane's width within its limits, measured against the panes as shown (the detail
+    /// pane leaves the list [`MIN_LIST_WIDTH`]), and saves the widths once changes pause.
+    /// Dragging and `SetPaneWidth` both end here.
+    fn resize_pane(&mut self, pane: Pane, width: f32, window_width: f32, cx: &mut Context<Self>) {
+        let shown = self.layout(window_width, cx);
+        let width = match pane {
             Pane::Detail => {
-                let room = window_width - shown.clusters - shown.navigation - MIN_LIST_WIDTH;
-                (window_width - x).min(room)
+                width.min(window_width - shown.clusters - shown.navigation - MIN_LIST_WIDTH)
             }
+            _ => width,
         };
         let before = self.panes;
         pane.set(&mut self.panes, width);
@@ -731,9 +749,6 @@ impl Workspace {
             ConnectionState::Failed(_) => theme.danger,
         };
 
-        let row_model = self.model.clone();
-        let row_name = name.clone();
-
         h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             .gap_2()
@@ -751,9 +766,9 @@ impl Workspace {
             })
             .when(!is_active, |el| el.hover(|el| el.bg(theme.list_hover)))
             .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
-            .on_click(move |_, _, cx| {
-                row_model.update(cx, |m, _| m.activate(row_name.clone()));
-            })
+            .on_click(registry::on_click(SelectCluster {
+                cluster: name.clone(),
+            }))
             .child(div().size_2().flex_none().rounded_full().bg(dot))
             .child(
                 v_flex()
@@ -804,8 +819,7 @@ impl Workspace {
         exposure: AiExposureState,
         settings_ok: bool,
     ) -> AnyElement {
-        let model = self.model.clone();
-        let context = name.to_owned();
+        let cluster = name.to_owned();
         let button = Button::new(SharedString::from(format!("expose-{name}")))
             .icon(IconName::Bot)
             .xsmall()
@@ -817,16 +831,13 @@ impl Workspace {
                 .tooltip("settings.toml is invalid; fix it to change AI exposure.")
                 .into_any_element();
         }
-        let Some(server) = server else {
+        if server.is_none() {
             if matches!(exposure, AiExposureState::ServerChanged { .. }) {
                 // A stale entry for a context that lost its server: it can only be removed.
                 return button
                     .ghost()
                     .tooltip("Cluster changed: this context has no API server now. Click to remove its old AI exposure.")
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        model.update(cx, |m, _| m.hide_from_ai(context.clone()));
-                    })
+                    .on_click(registry::on_click_contained(HideFromAi { cluster }))
                     .into_any_element();
             }
             return button
@@ -834,17 +845,14 @@ impl Workspace {
                 .disabled(true)
                 .tooltip("This context has no API server, so it cannot be exposed to AI.")
                 .into_any_element();
-        };
+        }
         match exposure {
             AiExposureState::Exposed => button
                 .primary()
-                .tooltip("Exposed to AI agents (flint mcp, read-only). Click to hide.")
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    model.update(cx, |m, _| m.hide_from_ai(context.clone()));
-                })
+                .tooltip("Exposed to AI agents (Flint's MCP server, read-only). Click to hide.")
+                .on_click(registry::on_click_contained(HideFromAi { cluster }))
                 .into_any_element(),
-            AiExposureState::ServerChanged { exposed_server } => {
+            AiExposureState::ServerChanged { .. } => {
                 // Either expose the new server (after confirming) or drop the stale entry. The
                 // wrapper keeps the click from also selecting the cluster row.
                 let menu = button
@@ -854,54 +862,32 @@ impl Workspace {
                          to expose it again or to remove the old exposure.",
                     )
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                        let (expose_model, expose_context, expose_server, previous) = (
-                            model.clone(),
-                            context.clone(),
-                            server.clone(),
-                            exposed_server.clone(),
-                        );
-                        let (remove_model, remove_context) = (model.clone(), context.clone());
                         menu.item(PopupMenuItem::new("Expose at the new server…").on_click(
-                            move |_, window, cx| {
-                                confirm_expose(
-                                    window,
-                                    cx,
-                                    expose_model.clone(),
-                                    expose_context.clone(),
-                                    expose_server.clone(),
-                                    Some(previous.clone()),
-                                );
-                            },
+                            registry::on_click(ExposeToAi {
+                                cluster: cluster.clone(),
+                            }),
                         ))
                         .item(
                             PopupMenuItem::new("Remove the old exposure").on_click(
-                                move |_, _, cx| {
-                                    remove_model
-                                        .update(cx, |m, _| m.hide_from_ai(remove_context.clone()));
-                                },
+                                registry::on_click(HideFromAi {
+                                    cluster: cluster.clone(),
+                                }),
                             ),
                         )
                     });
                 div()
                     .flex_none()
+                    // not-an-action: keeps the click on the menu button from selecting the row.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(menu)
                     .into_any_element()
             }
             AiExposureState::Hidden => button
                 .ghost()
-                .tooltip("Hidden from AI agents. Click to expose it to flint mcp (read-only).")
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    confirm_expose(
-                        window,
-                        cx,
-                        model.clone(),
-                        context.clone(),
-                        server.clone(),
-                        None,
-                    );
-                })
+                .tooltip(
+                    "Hidden from AI agents. Click to expose it to Flint's MCP server (read-only).",
+                )
+                .on_click(registry::on_click_contained(ExposeToAi { cluster }))
                 .into_any_element(),
         }
     }
@@ -1041,7 +1027,6 @@ impl Workspace {
                 } else {
                     "Loading namespaces…"
                 };
-                let all = this.clone();
                 v_flex()
                     .w(px(260.))
                     .gap_1()
@@ -1049,9 +1034,7 @@ impl Workspace {
                         Checkbox::new("ns-all")
                             .label("All namespaces")
                             .checked(filter.is_empty())
-                            .on_click(move |_, _, cx| {
-                                all.update(cx, |ws, cx| ws.set_namespace_filter(Vec::new(), cx))
-                            }),
+                            .on_click(registry::on_click(ShowAllNamespaces)),
                     )
                     .child(div().h_px().bg(theme.border))
                     .child(
@@ -1071,15 +1054,10 @@ impl Workspace {
                             })
                             .children(names.into_iter().map(|ns| {
                                 let checked = filter.contains(&ns);
-                                let ws = this.clone();
-                                let current = filter.clone();
                                 Checkbox::new(SharedString::from(format!("ns-{ns}")))
                                     .label(ns.clone())
                                     .checked(checked)
-                                    .on_click(move |_, _, cx| {
-                                        let next = ui_state::toggle_namespace(&current, &ns);
-                                        ws.update(cx, |ws, cx| ws.set_namespace_filter(next, cx))
-                                    })
+                                    .on_click(registry::on_click(ToggleNamespace { namespace: ns }))
                             })),
                     )
                     .child(div().h_px().bg(theme.border))
@@ -1108,49 +1086,34 @@ impl Workspace {
                 let settings = model.read(cx).settings.clone();
                 let own = settings.cluster_watch_mode.get(&cluster).copied();
                 let global = settings.watch_mode;
-                let item = |label: &str, checked: bool, target: Option<ClusterId>, mode| {
-                    let model = model.clone();
-                    PopupMenuItem::new(label.to_owned())
-                        .checked(checked)
-                        .on_click(move |_, _, cx| {
-                            let target = target.clone();
-                            model.update(cx, |m, _| m.set_watch_mode(target, mode));
-                        })
-                };
-                let this = Some(cluster.clone());
                 menu.label("This cluster")
-                    .item(item(
-                        &format!("Use the default ({})", mode_name(global)),
-                        own.is_none(),
-                        this.clone(),
-                        None,
-                    ))
-                    .item(item(
-                        "All kinds",
-                        own == Some(WatchMode::All),
-                        this.clone(),
-                        Some(WatchMode::All),
-                    ))
-                    .item(item(
-                        "Open views only",
-                        own == Some(WatchMode::OnView),
-                        this,
-                        Some(WatchMode::OnView),
-                    ))
+                    .item(
+                        PopupMenuItem::new(format!("Use the default ({})", mode_name(global)))
+                            .checked(own.is_none())
+                            .on_click(registry::on_click(UseDefaultWatchMode)),
+                    )
+                    .item(
+                        PopupMenuItem::new("All kinds")
+                            .checked(own == Some(WatchMode::All))
+                            .on_click(registry::on_click(WatchAllKinds)),
+                    )
+                    .item(
+                        PopupMenuItem::new("Open views only")
+                            .checked(own == Some(WatchMode::OnView))
+                            .on_click(registry::on_click(WatchOpenViewsOnly)),
+                    )
                     .separator()
                     .label("Default for all clusters")
-                    .item(item(
-                        "All kinds",
-                        global == WatchMode::All,
-                        None,
-                        Some(WatchMode::All),
-                    ))
-                    .item(item(
-                        "Open views only",
-                        global == WatchMode::OnView,
-                        None,
-                        Some(WatchMode::OnView),
-                    ))
+                    .item(
+                        PopupMenuItem::new("All kinds")
+                            .checked(global == WatchMode::All)
+                            .on_click(registry::on_click(DefaultWatchAllKinds)),
+                    )
+                    .item(
+                        PopupMenuItem::new("Open views only")
+                            .checked(global == WatchMode::OnView)
+                            .on_click(registry::on_click(DefaultWatchOpenViewsOnly)),
+                    )
             })
     }
 
@@ -1238,7 +1201,7 @@ impl Workspace {
                                 .small()
                                 .outline()
                                 .label("Retry")
-                                .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                                .on_click(registry::on_click(RetryConnection)),
                         ),
                     ),
             ),
@@ -1404,17 +1367,22 @@ impl Render for Workspace {
         let window_width = f32::from(window.viewport_size().width);
         // Focus left with a closed view: take it back, so registered actions still reach the
         // workspace (GPUI dispatches from the focused element up).
-        if window.focused(cx).is_none() {
-            window.focus(&self.focus, cx);
-        }
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
         let widths = self.layout(window_width, cx);
         h_flex()
             .id("workspace")
-            .track_focus(&self.focus)
+            .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
+            .child(
+                // The fallback focus target: zero-sized, so no click lands on it.
+                div()
+                    .id("workspace-focus")
+                    .absolute()
+                    .size_0()
+                    .track_focus(&self.focus),
+            )
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)

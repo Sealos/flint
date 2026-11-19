@@ -270,10 +270,22 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   onward, so the M1.5 theme work does not mean restyling every view.
 - **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
   switch cluster, change namespace, toggle watch mode, or toggle Expose to AI.
-- **Action registry (`flint-app/src/ui/registry.rs`):** every interactive control is a named GPUI action with a label,
-  description, arguments and default keys. Views own the handlers and list them once (a `bind_actions` function per
-  view); clicks, keys, the palette and the test automation channel all end in those handlers. A new control is not
-  done until it is in the registry; a unit test per view checks that it binds every action of its scope.
+- **Action registry (`flint-app/src/ui/registry.rs`):** every interactive control is a named GPUI action with a Title
+  Case label, a description, a category (Flint, Cluster, Namespace, View, List, Detail), typed arguments (so a palette
+  can offer pickers), default keys, and whether the palette shows it (automation-only actions such as a pane width or
+  a column header are hidden).
+  - Views own the handlers and list them once (a `bind_actions` function per view). The workspace also forwards the
+    list's, the detail pane's and the navigation's actions, so they and their keys work wherever focus is.
+  - The workspace installs guards: when each action is enabled, and whether given arguments would do anything.
+    `registry::dispatch`, `perform` and `dispatch_in` check them first and refuse instead of dispatching a no-op; the
+    handlers call the same checks.
+  - Every click is `registry::on_click(action)`, so clicks, keys, the palette and the test automation channel take
+    one path. `scripts/check-click-actions.sh` (CI) fails on a click handler that is not.
+  - Plain keys (arrows, Esc) are bound in `Workspace && !Input`, so they never fire while typing in a field.
+  - A palette lists `registry::available_in(previous_focus)` with `ActionSpec::shortcut` (the live binding), and
+    dispatches with `registry::dispatch_in(previous_focus, …)`.
+  - A new control is not done until it is in the registry; a unit test per view checks that it binds every action
+    of its scope.
 - **Resource switcher (Cmd-P):** fuzzy search over the kinds and objects of the active cluster, jumping straight to
   a list or a detail view. It searches the in-memory stores, so it never makes network calls.
 

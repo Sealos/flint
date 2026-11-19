@@ -17,13 +17,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-pub enum NavEvent {
-    Open(NavEntry),
-    /// Connect (or discover) again after a failure.
-    Retry,
-}
-
-impl EventEmitter<NavEvent> for NavPanel {}
+use super::registry::{self, OpenView, RetryConnection, ToggleNavSection};
 
 /// Which sections are open, per cluster. Sections the user never toggled follow
 /// [`collapsed_by_default`].
@@ -161,7 +155,7 @@ impl NavPanel {
         cx.notify();
     }
 
-    fn render_entry(&self, entry: &NavEntry, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_entry(&self, entry: &NavEntry, theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
         let is_selected = self.selected.as_ref() == Some(&entry.id);
         let state = self.states.get(&entry.id);
         let mark = state.and_then(marker);
@@ -193,7 +187,7 @@ impl NavPanel {
                 "cannot be listed".to_owned()
             }
         );
-        let open = entry.clone();
+        let open = entry.id.to_string();
         h_flex()
             .id(SharedString::from(format!("nav-{}", entry.id)))
             .pl_5()
@@ -207,7 +201,7 @@ impl NavPanel {
             })
             .when(listable, |el| {
                 el.cursor_pointer()
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(NavEvent::Open(open.clone()))))
+                    .on_click(registry::on_click(OpenView { kind: open }))
             })
             // The open kind is marked with the accent, as selections are.
             .relative()
@@ -303,7 +297,7 @@ impl Render for NavPanel {
                                     .xsmall()
                                     .outline()
                                     .label("Retry")
-                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(NavEvent::Retry))),
+                                    .on_click(registry::on_click(RetryConnection)),
                             )
                         }))
                     .into_any_element(),
@@ -332,8 +326,7 @@ impl Render for NavPanel {
                         rows.push(div().h(px(8.)).into_any_element());
                     }
                     let is_collapsed = collapsed.is_collapsed(section);
-                    let toggle_section = section.clone();
-                    let cluster = cluster.clone();
+                    let toggle_section = section.title.clone();
                     rows.push(
                         (h_flex()
                             .id(("nav-section", i))
@@ -368,12 +361,8 @@ impl Render for NavPanel {
                                         .child(section.entries.len().to_string()),
                                 )
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.collapsed
-                                    .entry(cluster.clone())
-                                    .or_default()
-                                    .toggle(&toggle_section);
-                                cx.notify();
+                            .on_click(registry::on_click(ToggleNavSection {
+                                section: toggle_section,
                             })))
                         .into_any_element(),
                     );
