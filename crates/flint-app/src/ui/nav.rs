@@ -9,6 +9,7 @@ use std::sync::Arc;
 use flint_core::{
     ClusterDiscovery, ClusterId, KindId, NavEntry, NavSection, SectionKind, SyncState,
 };
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -74,6 +75,9 @@ pub fn marker(state: &SyncState) -> Option<Marker> {
         SyncState::Idle | SyncState::Synced | SyncState::Unavailable => None,
     }
 }
+
+/// The height of a section header or kind row.
+const ROW_HEIGHT: f32 = 24.;
 
 pub struct NavPanel {
     cluster: Option<ClusterId>,
@@ -192,7 +196,9 @@ impl NavPanel {
             .id(SharedString::from(format!("nav-{}", entry.id)))
             .pl_5()
             .pr_2()
-            .h(px(24.))
+            .h(px(ROW_HEIGHT))
+            // Rows keep their height in the scrolling column instead of shrinking to fit it.
+            .flex_none()
             .gap_1()
             .rounded(theme.radius)
             .text_sm()
@@ -229,6 +235,7 @@ impl NavPanel {
                 Marker::Failed => dot(theme.danger),
             }))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .test_support()
             .into_any_element()
     }
 }
@@ -276,9 +283,12 @@ impl Render for NavPanel {
         match (&self.cluster, &self.discovery) {
             (None, _) => {}
             (Some(_), None) => {
-                let failed = self.connection_failed || self.error.is_some();
+                // A failed connection has its Retry in the main area; only a failed discovery
+                // (with a connection) offers one here.
+                let retry = !self.connection_failed && self.error.is_some();
                 rows.push(
                     (v_flex()
+                        .flex_none()
                         .px_2()
                         .gap_2()
                         .items_start()
@@ -291,7 +301,7 @@ impl Render for NavPanel {
                         } else {
                             "Discovering resources…"
                         })
-                        .when(failed, |el| {
+                        .when(retry, |el| {
                             el.child(
                                 Button::new("nav-retry")
                                     .xsmall()
@@ -311,6 +321,8 @@ impl Render for NavPanel {
                         first_group = false;
                         rows.push(
                             (div()
+                                .id("nav-custom-resources")
+                                .flex_none()
                                 .px_2()
                                 .pt_3()
                                 .pb_1()
@@ -323,15 +335,16 @@ impl Render for NavPanel {
                     }
                     if section.kind == SectionKind::Other && !first_group {
                         // Set the remaining built-ins apart from the custom resources above.
-                        rows.push(div().h(px(8.)).into_any_element());
+                        rows.push(div().flex_none().h(px(8.)).into_any_element());
                     }
                     let is_collapsed = collapsed.is_collapsed(section);
                     let toggle_section = section.title.clone();
                     rows.push(
                         (h_flex()
                             .id(("nav-section", i))
+                            .flex_none()
                             .px_1()
-                            .h(px(24.))
+                            .h(px(ROW_HEIGHT))
                             .gap_1()
                             .rounded(theme.radius)
                             .cursor_pointer()
@@ -363,7 +376,8 @@ impl Render for NavPanel {
                             })
                             .on_click(registry::on_click(ToggleNavSection {
                                 section: toggle_section,
-                            })))
+                            }))
+                            .test_support())
                         .into_any_element(),
                     );
                     if !is_collapsed {
@@ -382,6 +396,7 @@ impl Render for NavPanel {
             rows.push(
                 (div()
                     .id("discovery-error")
+                    .flex_none()
                     .px_2()
                     .pt_2()
                     .text_xs()
@@ -408,6 +423,7 @@ impl Render for NavPanel {
             .px_1p5()
             .py_1()
             .children(rows)
+            .test_support()
     }
 }
 

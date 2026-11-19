@@ -189,6 +189,132 @@ async fn a_long_kind_name_leaves_the_filter_usable_in_a_narrow_list(cx: &mut Tes
     .unwrap();
 }
 
+/// The drawn width of the header cell of `column`.
+fn header_width(cx: &mut TestAppContext, window: AnyWindowHandle, column: &str) -> f32 {
+    let id = format!("sort-{column}");
+    cx.update_window(window, |_, window, _| {
+        f32::from(window.find(id).bounds().size.width)
+    })
+    .unwrap()
+}
+
+// covers UP-20, UP-25, UP-27: in a wide list a long name shows in full; the room goes to
+// Name, not to a filler after the last column. Narrower, Namespace gives way before Name.
+#[gpui_kit::test]
+async fn the_name_column_takes_the_spare_width(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let long = "podinfo-frontend-canary-7b9c8d5f4-abcde-with-a-long-suffix-xy";
+    assert_eq!(long.chars().count(), 61);
+    let (window, list) = open_sized(cx, core, "Pods", 1000.);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(
+                &[("local-path-storage", long, 0), ("demo", "api", 0)],
+                SyncState::Synced,
+                1,
+            ),
+            cx,
+        )
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window
+            .try_find("sort-Name")
+            .is_some_and(|h| f32::from(h.bounds().size.width) > 500.)
+    })
+    .await;
+    // 61 characters at 8.5 px, plus padding: well past the 48-character cap.
+    let name = header_width(cx, window, "Name");
+    assert!(name >= 61. * 8.5 + 16. - 0.5, "Name is {name} wide");
+}
+
+// covers UP-21: typing a filter fits the columns to the rows it leaves, so a long name it hides
+// no longer holds the Name column wide.
+#[gpui_kit::test]
+async fn a_text_filter_fits_the_columns_to_the_rows_it_shows(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let long = "podinfo-frontend-canary-7b9c8d5f4-abcde-with-a-long-suffix-xy";
+    let (window, list) = open_sized(cx, core, "Pods", 1000.);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(
+                &[("demo", long, 0), ("demo", "api", 0)],
+                SyncState::Synced,
+                1,
+            ),
+            cx,
+        )
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window
+            .try_find("sort-Name")
+            .is_some_and(|h| f32::from(h.bounds().size.width) > 500.)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("list-filter", cx);
+        window.input("api", cx);
+    })
+    .unwrap();
+    // Back to the Name column's minimum (16 characters): "api" is all that is shown.
+    cx.wait_for(window, WAIT, |window, _| {
+        window
+            .try_find("sort-Name")
+            .is_some_and(|h| f32::from(h.bounds().size.width) < 16. * 8.5 + 16. + 0.5)
+    })
+    .await;
+}
+
+// covers UP-23: beside an open detail pane the list is narrow; the names of one workload must
+// stay distinguishable (cut in the middle), and NAMESPACE keeps room for its header.
+#[gpui_kit::test]
+async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 360.);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(
+                &[
+                    ("local-path-storage", "podinfo-7b9c8d5f4-abcde", 0),
+                    ("local-path-storage", "podinfo-7b9c8d5f4-vwxyz", 0),
+                ],
+                SyncState::Synced,
+                1,
+            ),
+            cx,
+        )
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Namespace").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    let namespace = header_width(cx, window, "Namespace");
+    assert!(
+        namespace >= 11. * 8.5 + 16. - 0.5,
+        "Namespace is {namespace} wide"
+    );
+    let state = list.read_with(cx, |list, _| list.view_state());
+    assert_eq!(state.rows.len(), 2);
+    let names = cx
+        .update_window(window, |_, window, _| {
+            gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .map(|t| t.text().to_owned())
+                .filter(|t| t.starts_with("podi"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_ne!(
+        names[0], names[1],
+        "truncated names look the same: {names:?}"
+    );
+    assert!(
+        names.iter().all(|n| n.contains('…')),
+        "names are not cut: {names:?}"
+    );
+}
+
 // covers UP-20, UP-21
 #[gpui_kit::test]
 async fn list_sorts_by_header_and_filters_by_namespace_and_text(cx: &mut TestAppContext) {
@@ -268,6 +394,18 @@ async fn list_sorts_by_header_and_filters_by_namespace_and_text(cx: &mut TestApp
     cx.wait_for(window, WAIT, expect(&["uid-web"])).await;
     let count = list.read_with(cx, |list, _| list.shown().1);
     assert_eq!(count, 1);
+    // UP-21: counted out of the 3 rows in the selected namespaces, not the 4 in the cluster,
+    // which the tooltip adds.
+    let count = list.read_with(cx, |list, _| list.row_count());
+    assert_eq!(count.text, "1 of 3");
+    assert_eq!(
+        count.tip,
+        "1 match the filter\n3 in 2 namespaces\n4 in all namespaces"
+    );
+    assert_eq!(
+        list.read_with(cx, |list, _| list.view_state().count),
+        "1 of 3"
+    );
 
     // Nothing matches: the empty state explains that filters hide the rows.
     cx.update_window(window, |_, window, cx| window.input("zzz", cx))

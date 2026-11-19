@@ -73,6 +73,44 @@ async fn reloads_when_kubeconfig_changes() {
     assert_eq!(second, ["one", "two"]);
 }
 
+// covers UP-02: launched before ~/.kube exists, Flint picks up a kubeconfig created later,
+// without a restart.
+#[tokio::test]
+async fn picks_up_a_kubeconfig_whose_directory_is_created_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".kube").join("config");
+    let core = CoreHandle::start(CoreConfig {
+        config_dir: dir.path().join("config"),
+        settings: Default::default(),
+        settings_error: None,
+        kubeconfig_base: vec![path.clone()],
+        home: None,
+        watch_files: true,
+        watch_timing: Default::default(),
+    })
+    .unwrap();
+    let events = core.events();
+    let first = tokio::time::timeout(Duration::from_secs(5), next_clusters(&events))
+        .await
+        .unwrap();
+    assert!(first.is_empty());
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, kubeconfig(&["late"])).unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let clusters = next_clusters(&events).await;
+            if !clusters.is_empty() {
+                return clusters;
+            }
+        }
+    })
+    .await
+    .expect("the new kubeconfig is loaded");
+    assert_eq!(found, ["late"]);
+}
+
 const SERVER: &str = "https://127.0.0.1:1";
 
 /// The next `SettingsChanged` event that satisfies `pred`.

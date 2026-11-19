@@ -61,6 +61,7 @@ impl ResourceList {
             sync: sync_word(&self.latest.state, self.latest.feed == Feed::Poll),
             total: snapshot.rows.len(),
             shown: self.rows.len(),
+            count: self.row_count().text,
             columns: columns
                 .iter()
                 .map(|&col| snapshot.columns[col].name.to_string())

@@ -179,6 +179,9 @@ enum Internal {
 struct Changed {
     kubeconfig: bool,
     settings: bool,
+    /// A missing directory of a watched file was created: watch it now (UP-02: `~/.kube`
+    /// created after launch).
+    rearm: bool,
 }
 
 pub(crate) struct ClusterManager {
@@ -821,6 +824,11 @@ impl ClusterManager {
                 }
             }
             Internal::FilesChanged(changed) => {
+                if changed.rearm {
+                    // Before reloading, so a file written right after its directory is caught
+                    // either by the reload or by the new watcher.
+                    self.rebuild_watcher();
+                }
                 if changed.settings {
                     // First, since settings can change the kubeconfig file list.
                     self.reload_settings().await;
@@ -1076,6 +1084,22 @@ impl ClusterManager {
             .filter_map(|f| f.parent().map(Path::to_path_buf))
             .collect();
 
+        // A directory that does not exist yet cannot be watched: watch its nearest existing
+        // ancestor instead, and rebuild the watcher once a directory on the way is created.
+        let mut watch_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut pending: HashSet<PathBuf> = HashSet::new();
+        for dir in &dirs {
+            match missing_dirs(dir) {
+                Some((ancestor, missing)) => {
+                    watch_dirs.insert(ancestor);
+                    pending.extend(missing);
+                }
+                None => {
+                    watch_dirs.insert(dir.clone());
+                }
+            }
+        }
+
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
         let (kube_watched, settings_watched) = (kube_files.clone(), settings_files.clone());
         let mut watcher =
@@ -1084,9 +1108,11 @@ impl ClusterManager {
                 if matches!(event.kind, EventKind::Access(_)) {
                     return;
                 }
+                let rearm = event.paths.iter().any(|p| pending.contains(p));
                 let changed = Changed {
-                    kubeconfig: event.paths.iter().any(|p| kube_watched.contains(p)),
+                    kubeconfig: rearm || event.paths.iter().any(|p| kube_watched.contains(p)),
                     settings: event.paths.iter().any(|p| settings_watched.contains(p)),
+                    rearm,
                 };
                 if changed.kubeconfig || changed.settings {
                     let _ = raw_tx.send(changed);
@@ -1099,7 +1125,7 @@ impl ClusterManager {
                 }
             };
         let mut watched_dirs = HashSet::new();
-        for dir in &dirs {
+        for dir in &watch_dirs {
             match watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     watched_dirs.insert(dir.clone());
@@ -1117,6 +1143,26 @@ impl ClusterManager {
             settings_dir_watched,
         })
     }
+}
+
+/// For a directory that does not exist: its nearest existing ancestor, and every directory
+/// from there down to it that is missing (as given and with the ancestor resolved, since
+/// events may name either), whose creation means the watcher should be rebuilt. `None` when
+/// the directory exists.
+fn missing_dirs(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    if dir.is_dir() {
+        return None;
+    }
+    let ancestor = dir.ancestors().skip(1).find(|a| a.is_dir())?.to_path_buf();
+    let resolved = std::fs::canonicalize(&ancestor).ok();
+    let mut missing = Vec::new();
+    for path in dir.ancestors().take_while(|a| *a != ancestor) {
+        missing.push(path.to_path_buf());
+        if let (Some(resolved), Ok(rest)) = (&resolved, path.strip_prefix(&ancestor)) {
+            missing.push(resolved.join(rest));
+        }
+    }
+    Some((ancestor, missing))
 }
 
 /// The paths a file may be reported under: as given, resolved (if it exists), and with its
@@ -1142,6 +1188,7 @@ async fn debounce(mut raw: mpsc::UnboundedReceiver<Changed>, out: mpsc::Unbounde
         while let Ok(more) = raw.try_recv() {
             changed.kubeconfig |= more.kubeconfig;
             changed.settings |= more.settings;
+            changed.rearm |= more.rearm;
         }
         if out.send(Internal::FilesChanged(changed)).is_err() {
             break;
@@ -1446,5 +1493,25 @@ mod tests {
         // What the manager does with it when no watch runs for the kind.
         hubs.release(&cluster, &kind);
         assert!(hubs.states("dev").is_empty(), "no hub left behind");
+    }
+
+    // covers UP-02: with no ~/.kube yet, its parent is watched and creating it re-arms.
+    #[test]
+    fn a_missing_directory_is_watched_through_its_nearest_ancestor() {
+        let home = tempfile::tempdir().unwrap();
+        let kube = home.path().join(".kube");
+        let (ancestor, missing) = missing_dirs(&kube).unwrap();
+        assert_eq!(ancestor, home.path());
+        assert!(missing.contains(&kube), "{missing:?}");
+        let resolved = std::fs::canonicalize(home.path()).unwrap().join(".kube");
+        assert!(missing.contains(&resolved), "{missing:?}");
+        // Two levels missing: both count.
+        let deep = home.path().join("a/b");
+        let (ancestor, missing) = missing_dirs(&deep).unwrap();
+        assert_eq!(ancestor, home.path());
+        assert!(missing.contains(&home.path().join("a")) && missing.contains(&deep));
+        // An existing directory is watched as it is.
+        std::fs::create_dir(&kube).unwrap();
+        assert!(missing_dirs(&kube).is_none());
     }
 }

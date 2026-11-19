@@ -77,10 +77,12 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     At most 4 KiB.
   - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `cmd-w`, `?`).
   - `state`: the visible view tree: `focus`, `dialog` (`{title, text, buttons}` while one is open), `appearance`,
-    `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`), sidebar `banners`, `active_cluster`,
-    `main`, `header` (with `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the entries of open ones),
-    `list` (columns as drawn and up to 500 rows in display order, each with `cells` and `cells_by_column`, Secret cells
-    masked, with its `banners` and `placeholder`) and `detail` (which object, tab, fetch state, and its sections with
+    `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`, `connection`, and `presence`: `live`
+    only for the watched cluster, `idle` for one connected but not watched), sidebar `banners`, `active_cluster`,
+    `main` (`no_contexts` when no kubeconfig file had a context), `header` (`namespace_button` and `watch_mode` are
+    null while hidden, as on a failed cluster; `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the
+    entries of open ones), `list` (`count` as the toolbar shows it, columns as drawn and up to 500 rows in display
+    order, each with `cells` and `cells_by_column`, Secret cells masked, with its `banners` and `placeholder`) and `detail` (which object, tab, fetch state, and its sections with
     entry counts; never values). Errors in it are sanitized summaries.
   - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` every 50 ms, on the app's clock, until the value at a
     JSON Pointer passes one test, and returns that state. Tests: `equals`, `not_equals`, `at_least`, `at_most`

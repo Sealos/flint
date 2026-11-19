@@ -7,11 +7,12 @@ use flint_core::{Appearance, ConnectionState, WatchMode, display};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
+use super::super::clusters::Presence;
 use super::super::view_state::{
     AppState, Banner, ClusterState, DialogState, Focus, HeaderState, KubeconfigPath,
     KubeconfigState, Level, Main, error_text,
 };
-use super::{Workspace, namespace_summary};
+use super::{Workspace, header_controls, namespace_summary};
 
 impl Workspace {
     /// What the window shows now, as data.
@@ -42,11 +43,13 @@ impl Workspace {
                     ConnectionState::Connected(_) => ("connected", None),
                     ConnectionState::Failed(e) => ("failed", Some(error_text(e))),
                 };
+                let is_active = active.as_deref() == Some(cluster.info.name.as_str());
                 ClusterState {
                     name: cluster.info.name.clone(),
                     label: display::short_name(&cluster.info.name).to_string(),
-                    active: active.as_deref() == Some(cluster.info.name.as_str()),
+                    active: is_active,
                     connection,
+                    presence: Presence::of(&cluster.state, is_active).name(),
                     error,
                     ai: match model.ai_exposure(cluster) {
                         AiExposureState::Hidden => "hidden",
@@ -80,6 +83,7 @@ impl Workspace {
         let detail = self.detail.as_ref().map(|d| d.read(cx));
         let active_cluster = model.active_cluster();
         let main = match active_cluster.map(|c| &c.state) {
+            None if model.loaded && model.clusters.is_empty() => Main::NoContexts,
             None => Main::NoCluster,
             Some(ConnectionState::Failed(e)) => Main::Failed {
                 error: error_text(e),
@@ -93,7 +97,7 @@ impl Workspace {
         let header = active_cluster.map(|cluster| {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();
-            let namespaced = list.is_none_or(|l| l.shown().0.namespaced);
+            let controls = header_controls(cluster, list);
             let mut breadcrumb = vec![display::short_name(name).to_string()];
             if let Some(list) = list {
                 breadcrumb.push(list.label().to_owned());
@@ -103,13 +107,15 @@ impl Workspace {
             }
             HeaderState {
                 breadcrumb,
-                namespace_button: namespaced.then(|| namespace_summary(&filter)),
+                namespace_button: controls.namespaces.then(|| namespace_summary(&filter)),
                 namespaces: filter,
-                watch_mode: match model.settings.watch_mode_for(name) {
-                    WatchMode::All => "Live: all kinds",
-                    WatchMode::OnView => "Live: open views only",
-                }
-                .to_owned(),
+                watch_mode: controls.watch_mode.then(|| {
+                    match model.settings.watch_mode_for(name) {
+                        WatchMode::All => "Live: all kinds",
+                        WatchMode::OnView => "Live: open views only",
+                    }
+                    .to_owned()
+                }),
                 watch_mode_source: if model.settings.cluster_watch_mode.contains_key(name) {
                     "cluster"
                 } else {

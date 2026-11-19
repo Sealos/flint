@@ -195,6 +195,46 @@ pub fn startup_cluster(requested: &str, clusters: &[ClusterSummary]) -> Option<C
         .map(|c| c.info.name.clone())
 }
 
+/// What a cluster's sidebar dot shows: its connection, and whether Flint is watching it. Only
+/// the active cluster is watched (UP-24): another one keeps its client and discovery but not
+/// its watches, so it is idle, not live, even though it is still connected. When warm clusters
+/// keep watching in the background (ADR-0012), this should come from the core's watch state
+/// instead of `active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    NotConnected,
+    Connecting,
+    /// Connected and watched.
+    Live,
+    /// Connected, but its watches are stopped (cold).
+    Idle,
+    Failed,
+}
+
+impl Presence {
+    pub fn of(state: &ConnectionState, active: bool) -> Self {
+        match state {
+            ConnectionState::Disconnected => Presence::NotConnected,
+            ConnectionState::Connecting => Presence::Connecting,
+            ConnectionState::Connected(_) if active => Presence::Live,
+            ConnectionState::Connected(_) => Presence::Idle,
+            ConnectionState::Failed(_) => Presence::Failed,
+        }
+    }
+
+    /// Its name in the automation state.
+    #[cfg(any(test, feature = "automation"))]
+    pub fn name(self) -> &'static str {
+        match self {
+            Presence::NotConnected => "not_connected",
+            Presence::Connecting => "connecting",
+            Presence::Live => "live",
+            Presence::Idle => "idle",
+            Presence::Failed => "failed",
+        }
+    }
+}
+
 /// A short label for a connection state.
 pub fn state_label(state: &ConnectionState) -> &'static str {
     match state {
@@ -208,9 +248,9 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
-    use super::startup_cluster;
+    use super::{Presence, startup_cluster};
     use flint_core::kubeconfig::ContextInfo;
-    use flint_core::{ClusterSummary, ConnectionState};
+    use flint_core::{ClusterSummary, ConnectionState, ServerVersion};
     use std::path::PathBuf;
 
     fn cluster(name: &str) -> ClusterSummary {
@@ -239,5 +279,27 @@ mod tests {
         assert_eq!(startup_cluster("KIND-FLINT-DEV", &clusters), None);
         assert_eq!(startup_cluster("", &clusters), None);
         assert_eq!(startup_cluster("prod", &[]), None);
+    }
+
+    // covers UP-24: a cluster switched away from stops its watches, so its dot must not say live.
+    #[test]
+    fn only_the_active_connected_cluster_is_live() {
+        let connected = ConnectionState::Connected(ServerVersion {
+            git_version: "v1.31.0".into(),
+            platform: "linux/arm64".into(),
+        });
+        assert_eq!(Presence::of(&connected, true), Presence::Live);
+        assert_eq!(Presence::of(&connected, false), Presence::Idle);
+        let failed = ConnectionState::Failed("refused".into());
+        assert_eq!(Presence::of(&failed, false), Presence::Failed);
+        assert_eq!(
+            Presence::of(&ConnectionState::Connecting, false),
+            Presence::Connecting
+        );
+        assert_eq!(
+            Presence::of(&ConnectionState::Disconnected, true),
+            Presence::NotConnected
+        );
+        assert_eq!(Presence::Idle.name(), "idle");
     }
 }

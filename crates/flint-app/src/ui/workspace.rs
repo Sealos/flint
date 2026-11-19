@@ -26,7 +26,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::clusters::{ClustersModel, state_label};
+use super::clusters::{ClustersModel, Presence, state_label};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
 use super::list::{ListEvent, ResourceList};
@@ -838,7 +838,12 @@ impl Workspace {
         let server = cluster.info.server.clone();
         let title = display::short_name(&name);
         let subtitle = display::subtitle(&name, cluster.info.server_host());
+        let presence = Presence::of(&cluster.state, is_active);
         let state_text = match &cluster.state {
+            ConnectionState::Connected(v) if presence == Presence::Idle => format!(
+                "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
+                v.git_version
+            ),
             ConnectionState::Connected(v) => format!("Connected, Kubernetes {}", v.git_version),
             ConnectionState::Failed(message) => format!("Connection failed: {message}"),
             other => state_label(other).to_owned(),
@@ -859,12 +864,22 @@ impl Workspace {
             exposure_text,
             cluster.info.source.display()
         );
-        let dot = match cluster.state {
-            ConnectionState::Disconnected => theme.muted_foreground.opacity(0.4),
-            ConnectionState::Connecting => theme.warning,
-            ConnectionState::Connected(_) => theme.success,
-            ConnectionState::Failed(_) => theme.danger,
-        };
+        let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
+        // Filled while live (or failing, or connecting); a ring while idle: connected, but not
+        // watched.
+        let dot = div()
+            .id(SharedString::from(format!("cluster-dot-{name}")))
+            .size_2()
+            .flex_none()
+            .rounded_full()
+            .map(|el| match presence {
+                Presence::NotConnected => el.bg(theme.muted_foreground.opacity(0.4)),
+                Presence::Connecting => el.bg(theme.warning),
+                Presence::Live => el.bg(theme.success),
+                Presence::Idle => el.border_1().border_color(theme.success),
+                Presence::Failed => el.bg(theme.danger),
+            })
+            .test_support();
 
         h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
@@ -886,7 +901,7 @@ impl Workspace {
             .on_click(registry::on_click(SelectCluster {
                 cluster: name.clone(),
             }))
-            .child(div().size_2().flex_none().rounded_full().bg(dot))
+            .child(dot)
             .child(
                 v_flex()
                     .flex_1()
@@ -894,35 +909,37 @@ impl Workspace {
                     .child(div().text_sm().line_height(px(18.)).truncate().child(title))
                     .child(
                         div()
+                            .id(SharedString::from(format!("cluster-server-{name}")))
                             .text_xs()
                             .line_height(px(14.))
                             .truncate()
                             .text_color(theme.muted_foreground)
-                            .child(subtitle),
-                    ),
+                            .child(subtitle)
+                            .test_support(),
+                    )
+                    // On a line of its own, so it never takes the server's room.
+                    .when(changed, |col| {
+                        col.child(
+                            div()
+                                .id(SharedString::from(format!("cluster-changed-{name}")))
+                                .pt_0p5()
+                                .flex()
+                                .child(Tag::warning().outline().xsmall().child("Cluster changed"))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(
+                                        "Cluster changed: this context points at a different \
+                                         server than the one exposed to AI agents.",
+                                    )
+                                    .build(window, cx)
+                                })
+                                .test_support(),
+                        )
+                    }),
             )
             // Neutral: the toggle next to it already shows the exposure in the accent.
             .when(exposure.is_exposed(), |row| {
                 row.child(Tag::secondary().outline().xsmall().flex_none().child("AI"))
             })
-            .when(
-                matches!(exposure, AiExposureState::ServerChanged { .. }),
-                |row| {
-                    row.child(
-                        div()
-                            .id(SharedString::from(format!("cluster-changed-{name}")))
-                            .flex_none()
-                            .child(Tag::warning().outline().xsmall().child("Changed"))
-                            .tooltip(|window, cx| {
-                                Tooltip::new(
-                                    "Cluster changed: this context points at a different server \
-                                     than the one exposed to AI agents.",
-                                )
-                                .build(window, cx)
-                            }),
-                    )
-                },
-            )
             .child(self.render_exposure_toggle(&name, server, exposure, settings_ok))
             .into_any_element()
     }
@@ -1048,7 +1065,7 @@ impl Workspace {
         let name = cluster.info.name.clone();
         let filter = self.ui_state.namespace_filter(&name).to_vec();
         let list = self.list.as_ref().map(|l| l.read(cx));
-        let namespaced = list.is_none_or(|l| l.shown().0.namespaced);
+        let controls = header_controls(cluster, list);
         let ns_summary = namespace_summary(&filter);
 
         let mut crumbs: Vec<(SharedString, String)> = vec![(
@@ -1108,10 +1125,12 @@ impl Workspace {
             .border_b_1()
             .border_color(theme.border)
             .child(breadcrumb)
-            .when(namespaced, |el| {
+            .when(controls.namespaces, |el| {
                 el.child(self.render_namespace_filter(&ns_summary, cx))
             })
-            .child(self.render_watch_mode(&name, cx))
+            .when(controls.watch_mode, |el| {
+                el.child(self.render_watch_mode(&name, cx))
+            })
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
@@ -1248,6 +1267,26 @@ impl Workspace {
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
         let model = self.model.read(cx);
+        if model.loaded && model.clusters.is_empty() {
+            let text = no_contexts_text(
+                model.kubeconfig_env.as_deref(),
+                !model.kubeconfig_errors.is_empty(),
+            );
+            return centered(
+                v_flex()
+                    .id("main-no-contexts")
+                    .gap_2()
+                    .max_w(px(520.))
+                    .child(div().text_lg().child(text.title))
+                    .children(text.lines.into_iter().map(|line| {
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(line)
+                    }))
+                    .test_support(),
+            );
+        }
         let Some(cluster) = model.active_cluster().cloned() else {
             return centered(
                 v_flex()
@@ -1452,25 +1491,111 @@ fn empty_state(model: &ClustersModel, theme: &Theme) -> AnyElement {
         .text_sm()
         .text_color(theme.muted_foreground)
         .child("No contexts found in your kubeconfig files.")
-        .child(
+        .child({
+            let line = format!("KUBECONFIG: {kubeconfig_env}");
+            let tip = line.clone();
             div()
+                .id("kubeconfig-env")
                 .text_xs()
                 .pt_1()
-                .child(format!("KUBECONFIG: {kubeconfig_env}")),
-        )
+                .truncate()
+                .child(line)
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .test_support()
+        })
         .child(div().text_xs().child("Searched:"))
-        .children(model.kubeconfig_paths.iter().map(|(path, exists)| {
-            let exists = *exists;
-            div().text_xs().pl_2().child(format!(
-                "{}{}",
-                path.display(),
-                if exists { "" } else { " (missing)" }
-            ))
-        }))
+        .children(
+            model
+                .kubeconfig_paths
+                .iter()
+                .enumerate()
+                .map(|(i, (path, exists))| {
+                    let line = format!(
+                        "{}{}",
+                        path.display(),
+                        if *exists { "" } else { " (missing)" }
+                    );
+                    let tip = line.clone();
+                    // One line per path, cut at the end with the whole path on hover, instead
+                    // of wrapping mid-name.
+                    div()
+                        .id(("searched-path", i))
+                        .text_xs()
+                        .pl_2()
+                        .truncate()
+                        .child(line)
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .test_support()
+                }),
+        )
         .when(model.kubeconfig_paths.is_empty(), |el| {
             el.child(div().text_xs().pl_2().child("(no paths: HOME is not set)"))
         })
         .into_any_element()
+}
+
+/// What the main area says when no kubeconfig file had a context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoContextsText {
+    title: &'static str,
+    lines: Vec<String>,
+}
+
+/// Where Flint looked for contexts and what to do about it, given `KUBECONFIG` as Flint saw it.
+/// Paths are named the way the user sets them (`~`, `KUBECONFIG`, `kubeconfig_paths`), never
+/// as full local paths: the sidebar lists the files themselves. When a file could not be
+/// read (`unreadable`), that is the likely cause, so it is said first.
+fn no_contexts_text(kubeconfig_env: Option<&std::ffi::OsStr>, unreadable: bool) -> NoContextsText {
+    let searched = match kubeconfig_env {
+        Some(v) if !v.is_empty() => "the files KUBECONFIG names".to_owned(),
+        // An empty KUBECONFIG falls back to the default file, as with kubectl.
+        Some(_) => "~/.kube/config (KUBECONFIG is empty)".to_owned(),
+        None => "~/.kube/config (KUBECONFIG is not set)".to_owned(),
+    };
+    let mut lines = Vec::new();
+    if unreadable {
+        lines.push(
+            "A kubeconfig file could not be read: the sidebar names it and the error. Fix the \
+             file, and Flint reloads it."
+                .to_owned(),
+        );
+    }
+    lines.extend([
+        format!(
+            "Flint looked in {searched}, and in any kubeconfig_paths in settings.toml. None \
+                 of them has a context."
+        ),
+        "Create a context (for example with kind create cluster or aws eks \
+             update-kubeconfig), or add your kubeconfig files to kubeconfig_paths. Flint reloads \
+             these files when they change; a new KUBECONFIG value takes effect when Flint \
+             restarts."
+            .to_owned(),
+        "The sidebar lists every file searched.".to_owned(),
+    ]);
+    NoContextsText {
+        title: "No clusters found",
+        lines,
+    }
+}
+
+/// Which header controls work for the active cluster: none while its connection failed (no
+/// namespaces to pick, nothing to watch; the main area offers Retry), and the namespace
+/// filter only for a namespaced kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeaderControls {
+    namespaces: bool,
+    watch_mode: bool,
+}
+
+fn header_controls(
+    cluster: &ClusterSummary,
+    list: Option<&super::list::ResourceList>,
+) -> HeaderControls {
+    let failed = matches!(cluster.state, ConnectionState::Failed(_));
+    HeaderControls {
+        namespaces: !failed && list.is_none_or(|l| l.shown().0.namespaced),
+        watch_mode: !failed,
+    }
 }
 
 fn centered(content: impl IntoElement) -> AnyElement {
@@ -1591,8 +1716,12 @@ mod actions;
 mod state;
 
 #[cfg(test)]
+#[path = "workspace_view_tests.rs"]
+mod view_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{Layout, MIN_LIST_WIDTH, layout, namespace_summary};
+    use super::{Layout, MIN_LIST_WIDTH, layout, namespace_summary, no_contexts_text};
     use flint_core::settings::PaneWidths;
 
     fn list_width(widths: Layout, window: f32) -> f32 {
@@ -1645,5 +1774,47 @@ mod tests {
         assert_eq!(namespace_summary(&[]), "All namespaces");
         assert_eq!(namespace_summary(&["demo".into()]), "demo");
         assert_eq!(namespace_summary(&["a".into(), "b".into()]), "2 namespaces");
+    }
+
+    // covers UP-02: the empty state names where Flint looked and what to do, without local
+    // paths beyond `~` (the sidebar lists the files).
+    #[test]
+    fn no_contexts_names_the_sources_and_the_fix() {
+        let unset = no_contexts_text(None, false);
+        let set = no_contexts_text(
+            Some(std::ffi::OsStr::new("/Users/someone/private/kube.yaml")),
+            false,
+        );
+        for text in [&unset, &set] {
+            let all = text.lines.join(" ");
+            assert_eq!(text.title, "No clusters found");
+            assert!(all.contains("KUBECONFIG"), "{all}");
+            assert!(all.contains("kubeconfig_paths"), "{all}");
+            assert!(
+                !all.contains("/Users") && !all.contains("someone"),
+                "a local path leaked: {all}"
+            );
+        }
+        assert!(
+            unset.lines[0].contains("~/.kube/config"),
+            "{:?}",
+            unset.lines
+        );
+        assert!(unset.lines[0].contains("KUBECONFIG is not set"));
+        assert!(set.lines[0].contains("the files KUBECONFIG names"));
+        let empty = no_contexts_text(Some(std::ffi::OsStr::new("")), false);
+        assert!(
+            empty.lines[0].contains("~/.kube/config (KUBECONFIG is empty)"),
+            "an empty KUBECONFIG falls back to ~/.kube/config, as with kubectl: {:?}",
+            empty.lines
+        );
+        // A file that failed to parse is the likely cause: said first.
+        let broken = no_contexts_text(None, true);
+        assert!(
+            broken.lines[0].contains("could not be read"),
+            "{:?}",
+            broken.lines
+        );
+        assert_eq!(broken.lines[1..], unset.lines[..]);
     }
 }
