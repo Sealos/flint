@@ -230,6 +230,9 @@ impl Session {
         request
     }
 
+    /// Appends a line unless it repeats one already shown after a reconnect. A new line resets
+    /// the backoff; repeats do not, so a crash-looping container that only replays its last
+    /// lines is polled less and less often.
     fn push(&mut self, raw: RawLine) {
         let line = LogLine::parse(&raw.text, raw.truncated);
         if let Some(resume) = &mut self.resume {
@@ -249,6 +252,7 @@ impl Session {
             };
         }
         self.buffer.push(line);
+        self.attempts = 0;
         self.dirty = true;
     }
 
@@ -282,7 +286,6 @@ impl Session {
     fn handle(&mut self, step: Step) -> Option<Phase> {
         let next = match step {
             Step::Line(Ok(raw)) => {
-                self.attempts = 0;
                 self.push(raw);
                 return None;
             }
@@ -714,6 +717,30 @@ mod tests {
             .await
             .expect("ended")
             .unwrap();
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn replayed_lines_do_not_reset_the_backoff() {
+        let last = "2024-05-01T12:00:00Z crashed";
+        let mut run = start(
+            vec![
+                Script::Lines(vec![last], None),
+                Script::Lines(vec![last], None),
+                Script::Lines(vec![last], None),
+            ],
+            LogOptions::default(),
+            100,
+        );
+        run.fake.after_end.lock().unwrap().extend([
+            AfterEnd::Restarts,
+            AfterEnd::Restarts,
+            AfterEnd::Restarts,
+        ]);
+        let snapshot = run
+            .until(|s| matches!(s.state, LogState::Reconnecting { attempt: 3, .. }))
+            .await;
+        assert_eq!(texts(&snapshot), ["crashed"]);
     }
 
     #[test]
