@@ -144,6 +144,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ---
 
+### UP-17 Agent asks what's wrong
+- **When** an agent calls `get_cluster_summary` for an exposed cluster.
+- **Then** it gets the dashboard's problem counts, usage and recent warnings, limited to the cluster's exposure scope
+  and redacted, and the call appears in the activity log.
+- Tests: unit, mcp.
+
 ## M1: Browsing resources
 
 ### UP-20 Browse a kind with live updates
@@ -355,6 +361,31 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ---
 
+### UP-65 See what's wrong when I connect
+- **When** I connect to a cluster, or pick Overview in the resource tree.
+- **Then** the dashboard shows counts of failing pods, not-ready nodes, recent Warning events, pending PVCs, failed Jobs
+  and workloads short of replicas. Clicking a count opens the list filtered to exactly those objects. Counts update
+  live.
+- Tests: unit (problem rules), ui, e2e (fake API server).
+
+### UP-66 See how full the cluster is
+- **When** metrics-server is installed and I look at the dashboard's usage tiles.
+- **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
+  total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
+  tiles say how to install it.
+- Tests: unit (ring buffer, aggregation), ui.
+
+### UP-67 Set warning thresholds
+- **When** I open the dashboard's Thresholds panel and set CPU warnings at 80% for this cluster only.
+- **Then** this cluster's tiles warn from 80%, other clusters keep the global default, and `settings.toml` holds the
+  typed override.
+- Tests: unit (settings), ui.
+
+### UP-68 Follow recent activity
+- **When** a rollout starts or a Warning event fires while the dashboard is open.
+- **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
+- Tests: ui, e2e.
+
 ## M5: Port-forward and Helm
 
 ### UP-70 Port-forward to a pod or service
@@ -457,6 +488,12 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
   columns that only some clusters return are shown with blank cells for the others. One unreachable member shows a
   note and doesn't block the others' rows.
 - Tests: unit, e2e.
+
+### UP-85 Compare a cluster set at a glance
+- **When** I open the dashboard of a cluster set.
+- **Then** each member has a card with its colour tag, problem counts and usage sparklines, the unhealthiest first,
+  under a totals strip. Clicking a count opens the combined list filtered to it.
+- Tests: unit (ordering, totals), ui, e2e.
 
 ## M6: Install
 
