@@ -37,6 +37,9 @@ http = "1.5.0"
 # kube 5.1 parses kubeconfig with serde-saphyr; reuse the same YAML implementation for output.
 serde-saphyr = "=2.2.0"
 
+# Terminal emulation for exec sessions (the grid model Zed and Alacritty use). No serde.
+alacritty_terminal = { version = "0.26.0", default-features = false }
+
 # MCP: the official Rust SDK (github.com/modelcontextprotocol/rust-sdk).
 rmcp = { version = "=3.11.0", features = ["server", "macros", "transport-io"] }
 

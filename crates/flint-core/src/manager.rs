@@ -393,6 +393,14 @@ impl ClusterManager {
                     task.abort();
                 }
             }
+            Request::Client { cluster, reply } => {
+                let client = self
+                    .clusters
+                    .iter()
+                    .find(|c| c.info.name == cluster)
+                    .and_then(|c| c.client.clone());
+                let _ = reply.send(client);
+            }
             Request::FetchObject {
                 cluster,
                 kind,
