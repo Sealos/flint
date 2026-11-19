@@ -50,15 +50,6 @@ pub fn parse(value: &str) -> Option<StartupView> {
     })
 }
 
-/// Whether `id` (a `KindId` string, `plural` or `plural.group`) is the kind `wanted` names.
-/// `wanted` may leave the group out.
-pub fn kind_matches(id: &str, wanted: &str) -> bool {
-    id == wanted
-        || id
-            .split_once('.')
-            .is_some_and(|(plural, _)| plural == wanted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,14 +88,5 @@ mod tests {
         ] {
             assert_eq!(parse(bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn kinds_match_with_or_without_group() {
-        assert!(kind_matches("pods", "pods"));
-        assert!(kind_matches("deployments.apps", "deployments"));
-        assert!(kind_matches("deployments.apps", "deployments.apps"));
-        assert!(!kind_matches("deployments.apps", "deploy"));
-        assert!(!kind_matches("pods", "pods.metrics.k8s.io"));
     }
 }

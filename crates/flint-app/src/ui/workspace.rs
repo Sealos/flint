@@ -34,7 +34,7 @@ use super::registry::{
     RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
     WatchAllKinds, WatchOpenViewsOnly,
 };
-use super::startup::{self, StartupView};
+use super::startup::StartupView;
 use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
@@ -427,11 +427,15 @@ impl Workspace {
                 .flat_map(|s| s.entries.iter())
         };
         if let Some(view) = self.startup_view.take() {
-            let wanted = &view.kind;
-            let entry = entries()
-                .find(|e| e.id.as_str() == wanted)
-                .or_else(|| entries().find(|e| startup::kind_matches(e.id.as_str(), wanted)))
-                .cloned();
+            // Names as kubectl takes them (`deploy`, `po`, `Deployment.apps`), resolved by the
+            // same core resolver as the MCP server.
+            let entry = match discovery.resolve(&view.kind) {
+                Ok(kind) => entries().find(|e| e.id == kind.id()).cloned(),
+                Err(e) => {
+                    tracing::warn!("FLINT_VIEW: {e}");
+                    None
+                }
+            };
             match entry {
                 Some(entry) => {
                     self.open_kind(&entry, window, cx);
