@@ -685,7 +685,13 @@ impl Workspace {
             .rounded(theme.radius)
             .cursor_pointer()
             // The active cluster is marked with the accent, as selections are.
-            .when(is_active, |el| el.bg(theme.list_active))
+            .relative()
+            .when(is_active, |el| {
+                el.bg(theme.list_active).child(super::theme::selection_edge(
+                    theme.list_active_border,
+                    px(4.),
+                ))
+            })
             .when(!is_active, |el| el.hover(|el| el.bg(theme.list_hover)))
             .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
             .on_click(move |_, _, cx| {

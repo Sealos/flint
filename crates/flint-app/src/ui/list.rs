@@ -492,7 +492,14 @@ impl ResourceList {
                 .border_b_1()
                 .border_color(theme.table_row_border)
                 .when(ix % 2 == 1, |el| el.bg(theme.table_even))
-                .when(is_selected, |el| el.bg(theme.table_active))
+                .relative()
+                .when(is_selected, |el| {
+                    el.bg(theme.table_active)
+                        .child(super::theme::selection_edge(
+                            theme.table_active_border,
+                            px(0.),
+                        ))
+                })
                 .when(!is_selected, |el| el.hover(|el| el.bg(theme.table_hover)))
                 .when(stale, |el| el.text_color(theme.muted_foreground))
                 .on_click({
@@ -620,13 +627,14 @@ impl ResourceList {
             .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
-            // The kind keeps its name (only an unusually long one truncates); the filter gives
-            // way first when the pane is narrow.
+            // When the pane is narrow the filter gives way first, down to its minimum; only then
+            // does the kind's name truncate, so the filter stays usable (UP-21).
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .flex_none()
+                    .flex_shrink(1.)
+                    .min_w(px(40.))
                     .max_w(px(200.))
                     .truncate()
                     .child(self.label.clone()),
@@ -669,7 +677,8 @@ impl ResourceList {
                 div()
                     .w(px(240.))
                     .min_w(px(72.))
-                    .flex_shrink(1.)
+                    // Far more willing to shrink than the title, so it reaches its minimum first.
+                    .flex_shrink(1000.)
                     .overflow_hidden()
                     .child(
                         Input::new(&self.filter)

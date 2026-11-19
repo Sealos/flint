@@ -1,5 +1,6 @@
 //! View test for the appearance setting: the main window on a real core, switched between
-//! System, Light and Dark the way View > Appearance does it, through `settings.toml`.
+//! System, Light and Dark by dispatching the View > Appearance menu actions, with the production
+//! handlers installed.
 
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use super::accent::ACCENT;
 use super::clusters::ClustersModel;
 use super::ui_state::UiState;
 use super::workspace::Workspace;
-use super::{list, theme};
+use super::{AppearanceDark, AppearanceLight, AppearanceSystem, list, theme};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -37,6 +38,8 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ClustersModel>, tem
         theme::init(ThemeMode::Light, cx);
         list::init(cx);
         let model = cx.new(|cx| ClustersModel::new(core, Settings::default(), None, cx));
+        super::install_menus(Appearance::System, cx);
+        super::handle_appearance_menu(&model, cx);
         let ws_model = model.clone();
         let window = gpui_kit::open_window(
             WindowOptions {
@@ -71,6 +74,28 @@ fn shows(name: &'static str, mode: ThemeMode) -> impl FnMut(&mut Window, &mut Ap
     }
 }
 
+/// The View > Appearance item that has the check mark.
+fn checked(cx: &mut TestAppContext) -> Vec<String> {
+    use gpui_kit::OwnedMenuItem;
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let view = menus.iter().find(|menu| menu.name == "View").unwrap();
+    let Some(OwnedMenuItem::Submenu(appearance)) = view.items.first() else {
+        panic!("View has no Appearance submenu");
+    };
+    appearance
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            OwnedMenuItem::Action {
+                name,
+                checked: true,
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn hex(color: &str) -> gpui_kit::Hsla {
     try_parse_color(color).unwrap()
 }
@@ -78,13 +103,14 @@ fn hex(color: &str) -> gpui_kit::Hsla {
 // covers UP-32 (UP-13, following macOS live, needs an appearance change the test platform lacks)
 #[gpui_kit::test]
 async fn switching_appearance_swaps_the_theme_colors(cx: &mut TestAppContext) {
-    let (window, model, dir) = open(cx);
+    let (window, _model, dir) = open(cx);
     // `system` follows the window's appearance, which is light on the test platform.
     cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
         .await;
     let light_text = cx.update(|cx| cx.theme().foreground);
+    assert_eq!(checked(cx), ["System"]);
 
-    model.update(cx, |m, _| m.set_appearance(Appearance::Dark));
+    cx.update(|cx| cx.dispatch_action(&AppearanceDark));
     cx.wait_for(window, WAIT, shows("Flint Dark", ThemeMode::Dark))
         .await;
     cx.update(|cx| {
@@ -92,23 +118,26 @@ async fn switching_appearance_swaps_the_theme_colors(cx: &mut TestAppContext) {
         assert_ne!(theme.foreground, light_text);
         assert_eq!(theme.primary, hex(ACCENT.dark.fill));
     });
+    assert_eq!(checked(cx), ["Dark"]);
     // Persisted: written to settings.toml, so the next start opens dark.
     let saved = flint_core::settings::load_settings(dir.path()).unwrap();
     assert_eq!(saved.appearance, Appearance::Dark);
 
-    model.update(cx, |m, _| m.set_appearance(Appearance::Light));
+    cx.update(|cx| cx.dispatch_action(&AppearanceLight));
     cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
         .await;
     cx.update(|cx| {
         assert_eq!(cx.theme().foreground, light_text);
         assert_eq!(cx.theme().primary, hex(ACCENT.light.fill));
     });
+    assert_eq!(checked(cx), ["Light"]);
 
-    model.update(cx, |m, _| m.set_appearance(Appearance::Dark));
+    cx.update(|cx| cx.dispatch_action(&AppearanceDark));
     cx.wait_for(window, WAIT, shows("Flint Dark", ThemeMode::Dark))
         .await;
     // Back to following the window's own appearance.
-    model.update(cx, |m, _| m.set_appearance(Appearance::System));
+    cx.update(|cx| cx.dispatch_action(&AppearanceSystem));
     cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
         .await;
+    assert_eq!(checked(cx), ["System"]);
 }

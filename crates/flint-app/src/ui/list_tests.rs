@@ -86,6 +86,16 @@ fn pods(rows: &[(&str, &str, i64)], state: SyncState, version: u64) -> Arc<KindS
 }
 
 fn open(cx: &mut TestAppContext, core: CoreHandle) -> (AnyWindowHandle, Entity<ResourceList>) {
+    open_sized(cx, core, "Pods", 900.)
+}
+
+/// A pods list titled `label`, in a window `width` wide.
+fn open_sized(
+    cx: &mut TestAppContext,
+    core: CoreHandle,
+    label: &'static str,
+    width: f32,
+) -> (AnyWindowHandle, Entity<ResourceList>) {
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -94,7 +104,7 @@ fn open(cx: &mut TestAppContext, core: CoreHandle) -> (AnyWindowHandle, Entity<R
     cx.update(|cx| {
         let bounds = Bounds {
             origin: Point::default(),
-            size: size(px(900.), px(600.)),
+            size: size(px(width), px(600.)),
         };
         let (window, list) = gpui_kit::open_window(
             WindowOptions {
@@ -108,7 +118,7 @@ fn open(cx: &mut TestAppContext, core: CoreHandle) -> (AnyWindowHandle, Entity<R
                         core,
                         "test".into(),
                         KindId::pods(),
-                        "Pods".into(),
+                        label.into(),
                         Vec::new(),
                         window,
                         cx,
@@ -140,6 +150,35 @@ fn visible_rows(window: &Window, uids: &[&str]) -> Vec<String> {
 }
 
 const ALL: &[&str] = &["uid-api", "uid-web", "uid-db", "uid-dns"];
+
+// covers UP-21: beside an open detail pane the list is about 280 px wide, and a long kind name
+// must not push the filter out of the toolbar.
+#[gpui_kit::test]
+async fn a_long_kind_name_leaves_the_filter_usable_in_a_narrow_list(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Custom Resource Definitions", 280.);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[("default", "api", 0)], SyncState::Synced, 1), cx)
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("list-filter").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, _| {
+        let filter = window.try_find("list-filter").unwrap().bounds();
+        assert!(
+            f32::from(filter.size.width) >= 72.,
+            "filter is {:?} wide",
+            filter.size.width
+        );
+        assert!(
+            f32::from(filter.origin.x + filter.size.width) <= 280.,
+            "filter ends at {:?}, past the list's edge",
+            filter.origin.x + filter.size.width
+        );
+    })
+    .unwrap();
+}
 
 // covers UP-20, UP-21
 #[gpui_kit::test]

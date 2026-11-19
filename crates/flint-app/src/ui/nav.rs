@@ -210,7 +210,13 @@ impl NavPanel {
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(NavEvent::Open(open.clone()))))
             })
             // The open kind is marked with the accent, as selections are.
-            .when(is_selected, |el| el.bg(theme.list_active))
+            .relative()
+            .when(is_selected, |el| {
+                el.bg(theme.list_active).child(super::theme::selection_edge(
+                    theme.list_active_border,
+                    px(4.),
+                ))
+            })
             .when(!is_selected && listable, |el| {
                 el.hover(|el| el.bg(theme.list_hover))
             })

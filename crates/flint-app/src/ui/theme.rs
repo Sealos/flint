@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use flint_core::Appearance;
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeSet};
-use gpui_kit::{App, SharedString, WindowAppearance};
+use gpui_kit::{App, Div, Hsla, Pixels, SharedString, Styled as _, WindowAppearance, div, px};
 
 use super::accent::{ACCENT, Accent, Shades};
 
@@ -55,9 +55,9 @@ fn apply_accent(colors: &mut ThemeConfigColors, shades: &Shades) {
     colors.caret = c(shades.fill);
     colors.drag_border = c(shades.fill);
     colors.drop_target = a(shades.fill, "33");
-    // Selection: a tint behind normal text. The `*_active_border` tokens are for components
-    // that draw an edge; Flint's own views draw only the tint.
-    colors.selection = a(shades.fill, "4d");
+    // Selection: a tint behind normal text, light enough to keep syntax colors readable, plus
+    // an accent edge (`*_active_border`, see `selection_edge`) on selected rows and items.
+    colors.selection = a(shades.fill, "33");
     colors.list_active = a(shades.fill, "24");
     colors.list_active_border = c(shades.fill);
     colors.table_active = a(shades.fill, "24");
@@ -70,6 +70,20 @@ fn apply_accent(colors: &mut ThemeConfigColors, shades: &Shades) {
     colors.slider_bar = c(shades.fill);
     colors.slider_thumb = c(shades.on_fill);
     colors.chart_1 = c(shades.fill);
+}
+
+/// The accent edge that marks a selected row or item, drawn beside its tint: the tint alone is too
+/// faint to tell selected apart. Put it in a `relative()` element; `inset` keeps it off the
+/// element's top and bottom, so it sits clear of rounded corners.
+pub fn selection_edge(color: Hsla, inset: Pixels) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .top(inset)
+        .bottom(inset)
+        .w(px(2.))
+        .rounded_full()
+        .bg(color)
 }
 
 /// Installs Flint Light and Flint Dark in place of gpui-component's defaults, showing `mode`.
@@ -478,6 +492,16 @@ mod tests {
             base,
             BODY,
         );
+        // Selection is a tint plus an accent edge; the edge is what tells selected apart.
+        need(
+            "selected item edge",
+            t.list_active_border,
+            t.sidebar,
+            base,
+            UI,
+        );
+        need("selected item edge", t.list_active_border, base, base, UI);
+        need("selected row edge", t.table_active_border, base, base, UI);
         need(
             "connected mark on the active cluster",
             t.success,
@@ -509,6 +533,7 @@ mod tests {
         let known = serde_json::to_value(HighlightThemeStyle::default()).unwrap();
         let file: serde_json::Value = serde_json::from_str(THEMES).unwrap();
         let mut failures = Vec::new();
+        let mut selected = Vec::new();
         for theme in file["themes"].as_array().unwrap() {
             let name = theme["name"].as_str().unwrap();
             let highlight = theme["highlight"].as_object().unwrap();
@@ -535,11 +560,33 @@ mod tests {
             };
             need("editor text", color("editor.foreground"), BODY);
             need("line numbers", color("editor.line_number"), UI);
+            // Selected text keeps its syntax color over the selection tint, with every accent.
+            let selections: Vec<(&str, Hsla)> = CANDIDATES
+                .iter()
+                .map(|accent| {
+                    let (light, dark) = themes(accent);
+                    let config = if name == dark.name.as_ref() {
+                        dark
+                    } else {
+                        light
+                    };
+                    (accent.name, resolved(config).selection)
+                })
+                .collect();
             for (key, style) in syntax {
                 let fg = try_parse_color(style["color"].as_str().unwrap()).unwrap();
                 need(&format!("syntax {key}"), fg, BODY);
+                for (accent, selection) in &selections {
+                    let ratio = contrast(fg, *selection, bg);
+                    if ratio < BODY {
+                        selected.push(format!(
+                            "{name} / {accent}: selected syntax {key} is {ratio:.2}:1, needs {BODY}:1"
+                        ));
+                    }
+                }
             }
         }
+        failures.extend(selected);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
