@@ -524,6 +524,47 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
   and the apply runs one cluster at a time as above. Scale and delete follow the same flow.
 - Tests: unit, e2e.
 
+## M8: Recordings (after 1.0)
+
+### UP-110 Record a workload
+- **When** I choose Record on a Deployment, close its log tab and keep working, and its pods restart and get replaced.
+- **Then** the recording keeps every pod's logs, the workload's events and its pods' CPU and memory, with no gaps
+  across restarts, and it survives quitting and relaunching Flint.
+- Tests: unit (store, retention), e2e (fake API server with pod churn), cluster.
+
+### UP-111 Catch trouble I wasn't watching
+- **When** automatic recording is on for a cluster and a pod starts crash-looping.
+- **Then** a recording of its workload starts by itself (at most 10 pods), I get a notification, and it stops 30 minutes
+  after the workload is healthy. On clusters where it is off, nothing records.
+- Tests: unit (triggers, caps, auto-stop), e2e.
+
+### UP-112 Replay what happened
+- **When** I open a recording and click the OOMKilled event on its timeline.
+- **Then** the logs jump to that moment, with the CPU and memory tracks above showing usage leading up to it.
+- Tests: ui, e2e.
+
+### UP-113 Recordings stay within their limits
+- **When** recordings reach their age or size limits.
+- **Then** the oldest data is removed first, starred recordings are kept, and the file is owner-only.
+- Tests: unit.
+
+### UP-114 Credentials expire while recording
+- **When** a recorded cluster's token expires and its exec plugin would need to run.
+- **Then** the recording pauses with a "sign-in needed" badge and a notification, no plugin runs in the background, and
+  signing in resumes it with the gap marked.
+- Tests: unit, ui.
+
+### UP-115 An agent asks what happened
+- **When** an agent queries a recording's time range through MCP on an exposed cluster.
+- **Then** it gets lines, events and metrics for that range, redacted and within the cluster's scope, and the call is
+  in the activity log. Unexposed clusters' recordings are invisible to it.
+- Tests: unit, mcp.
+
+### UP-116 Export a recording
+- **When** I export the last 30 minutes of a recording.
+- **Then** I get the logs as text and the events and metrics as CSV, after a warning that they are not redacted.
+- Tests: unit, ui.
+
 ## Always true
 
 ### UP-90 Flint never writes kubeconfig files
