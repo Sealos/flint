@@ -5,15 +5,15 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
+use flint_core::handle::{Command, ConnectionState, Event};
 use flint_core::{
     LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogSubject, LogTarget, PodSet,
-    SearchQuery, Settings, Severity, WorkloadKind, WorkloadTarget, cluster, kubeconfig,
+    SearchQuery, Settings, Severity, WorkloadKind, WorkloadTarget,
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -21,77 +21,18 @@ use kube::Client;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
-fn test_kubeconfig() -> PathBuf {
-    match std::env::var_os("FLINT_TEST_KUBECONFIG") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => panic!("FLINT_TEST_KUBECONFIG must point at the dev cluster's kubeconfig"),
-    }
-}
+mod support;
 
-/// A copy of the dev kubeconfig with a second context for the same cluster.
-fn two_context_kubeconfig(dir: &Path) -> (PathBuf, String, String) {
-    let mut kc = kube::config::Kubeconfig::read_from(test_kubeconfig()).unwrap();
-    let first = kc.contexts[0].clone();
-    let mut second = first.clone();
-    second.name = format!("{}-second", first.name);
-    kc.contexts.push(second.clone());
-    kc.current_context = Some(first.name.clone());
-    let path = dir.join("kubeconfig");
-    std::fs::write(&path, serde_json::to_string(&kc).unwrap()).unwrap();
-    (path, first.name, second.name)
-}
+use support::{Core, client, init_logging, test_kubeconfig, two_context_kubeconfig};
 
-struct Core {
-    handle: CoreHandle,
-    events: async_channel::Receiver<Event>,
-    _dir: tempfile::TempDir,
-}
-
-fn start(kubeconfig: PathBuf, settings: Settings) -> Core {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
+fn start(kubeconfig: PathBuf, settings: Settings) -> (tempfile::TempDir, Core) {
+    init_logging();
     let dir = tempfile::tempdir().unwrap();
-    let handle = CoreHandle::start(CoreConfig {
-        config_dir: dir.path().join("config"),
-        settings,
-        settings_error: None,
-        kubeconfig_base: vec![kubeconfig],
-        home: None,
-        watch_files: false,
-        watch_timing: Default::default(),
-    })
-    .unwrap();
-    let events = handle.events();
-    Core {
-        handle,
-        events,
-        _dir: dir,
-    }
+    let core = Core::start(kubeconfig, dir.path().join("config"), settings);
+    (dir, core)
 }
 
 impl Core {
-    async fn wait_for<T>(&self, secs: u64, mut pick: impl FnMut(Event) -> Option<T>) -> T {
-        tokio::time::timeout(Duration::from_secs(secs), async {
-            loop {
-                let event = self.events.recv().await.expect("core running");
-                if let Event::ConnectionChanged {
-                    state: ConnectionState::Failed(e),
-                    ..
-                } = &event
-                {
-                    panic!("connection failed: {e}");
-                }
-                if let Some(t) = pick(event) {
-                    return t;
-                }
-            }
-        })
-        .await
-        .expect("event arrived in time")
-    }
-
     async fn activate(&self, name: &str) {
         self.handle.send(Command::Activate(name.to_owned()));
         self.wait_for(60, |e| match e {
@@ -103,12 +44,6 @@ impl Core {
         })
         .await;
     }
-}
-
-async fn admin(path: &Path) -> Client {
-    let loaded = kubeconfig::load(&[path.to_owned()]);
-    let context = &loaded.contexts[0].name;
-    cluster::connect(&loaded.merged, context).await.unwrap()
 }
 
 /// The first snapshot of `session` for which `pred` holds.
@@ -136,7 +71,7 @@ where
     F: FnOnce(Client, String) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let kube = admin(&test_kubeconfig()).await;
+    let kube = client(&test_kubeconfig()).await;
     // The clock may tick in microseconds (macOS), so tests starting together also need the
     // counter to get distinct names.
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -211,7 +146,7 @@ done"#;
 #[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
 async fn follows_a_chatty_pod_within_the_buffer_and_across_cluster_switches() {
     let kc_dir = tempfile::tempdir().unwrap();
-    let (path, first, second) = two_context_kubeconfig(kc_dir.path());
+    let (path, first, second) = two_context_kubeconfig(kc_dir.path(), None);
     in_namespace(move |kube, ns| async move {
         let pods = create_pod(
             &kube,
@@ -228,7 +163,7 @@ async fn follows_a_chatty_pod_within_the_buffer_and_across_cluster_switches() {
             log_buffer_lines: 1000,
             ..Settings::default()
         };
-        let core = start(path, settings);
+        let (_dir, core) = start(path, settings);
         core.wait_for(10, |e| matches!(e, Event::ClustersChanged(_)).then_some(()))
             .await;
         core.activate(&first).await;
@@ -326,7 +261,7 @@ async fn picks_a_container_and_reads_the_previous_instance() {
         })
         .await;
 
-        let core = start(path, Settings::default());
+        let (_dir, core) = start(path, Settings::default());
         let name = core
             .wait_for(10, |e| match e {
                 Event::ClustersChanged(s) => Some(s.clusters[0].info.name.clone()),
@@ -418,7 +353,7 @@ async fn follows_a_deployments_pods_as_they_scale_and_get_replaced() {
             .await
             .unwrap();
 
-        let core = start(path, Settings::default());
+        let (_dir, core) = start(path, Settings::default());
         let name = core
             .wait_for(10, |e| match e {
                 Event::ClustersChanged(s) => Some(s.clusters[0].info.name.clone()),

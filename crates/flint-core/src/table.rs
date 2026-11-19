@@ -17,6 +17,7 @@ use kube::core::Resource;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{self, ClusterError};
 use crate::paging;
 use crate::read::{KindInfo, ListQuery};
@@ -727,21 +728,24 @@ pub(crate) enum FetchError {
 
 impl FetchError {
     pub fn from_kube(err: kube::Error) -> Self {
-        let code = match &err {
-            kube::Error::Api(status) => status.code,
-            _ => 0,
-        };
-        Self::from_code(code, ClusterError::kube(err).to_string())
+        let kind = ApiError::from_kube(&err).map_or(ApiErrorKind::Other, |api| api.kind());
+        Self::from_kind(kind, ClusterError::kube(err).to_string())
     }
 
     pub fn from_code(code: u16, message: String) -> Self {
-        match code {
-            410 => FetchError::Expired(message),
-            405 => FetchError::MethodNotAllowed(message),
-            403 => FetchError::Denied(message),
-            404 => FetchError::NotFound(message),
-            400 | 422 => FetchError::Invalid(message),
-            _ => FetchError::Other(message),
+        Self::from_kind(ApiErrorKind::from_code(code), message)
+    }
+
+    fn from_kind(kind: ApiErrorKind, message: String) -> Self {
+        match kind {
+            ApiErrorKind::Gone => FetchError::Expired(message),
+            ApiErrorKind::MethodNotAllowed => FetchError::MethodNotAllowed(message),
+            ApiErrorKind::Forbidden => FetchError::Denied(message),
+            ApiErrorKind::NotFound => FetchError::NotFound(message),
+            ApiErrorKind::BadRequest | ApiErrorKind::UnprocessableEntity => {
+                FetchError::Invalid(message)
+            }
+            ApiErrorKind::Other => FetchError::Other(message),
         }
     }
 

@@ -399,12 +399,7 @@ impl ClusterManager {
                 }
             }
             Request::Client { cluster, reply } => {
-                let client = self
-                    .clusters
-                    .iter()
-                    .find(|c| c.info.name == cluster)
-                    .and_then(|c| c.client.clone());
-                let _ = reply.send(client);
+                let _ = reply.send(self.client(&cluster));
             }
             Request::FetchObject {
                 cluster,
@@ -413,21 +408,17 @@ impl ClusterManager {
                 name,
                 reply,
             } => {
-                let found = self.clusters.iter().find(|c| c.info.name == cluster);
-                let client = found.and_then(|c| c.client.clone());
-                let info = found
+                let Some(client) = self.client(&cluster) else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
+                    return;
+                };
+                let info = self
+                    .cluster(&cluster)
                     .and_then(|c| c.discovery.as_ref())
                     .and_then(|d| d.kind(&kind).cloned());
-                let (client, info) = match (client, info) {
-                    (Some(c), Some(i)) => (c, i),
-                    (None, _) => {
-                        let _ = reply.send(Err(format!("\"{cluster}\" is not connected")));
-                        return;
-                    }
-                    (_, None) => {
-                        let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
-                        return;
-                    }
+                let Some(info) = info else {
+                    let _ = reply.send(Err(format!("\"{cluster}\" does not serve {kind}")));
+                    return;
                 };
                 tokio::spawn(async move {
                     let result = read::object_detail(&client, &info, namespace.as_deref(), &name)
@@ -847,7 +838,7 @@ impl ClusterManager {
     /// context that now points at another API server than `server` (the one the session was
     /// opened against) ends the session.
     fn log_client(&mut self, cluster: &str, server: Option<&str>) -> Result<Client, LogError> {
-        let Some(slot) = self.clusters.iter().find(|c| c.info.name == cluster) else {
+        let Some(slot) = self.cluster(cluster) else {
             return Err(LogError::cluster(format!(
                 "\"{cluster}\" is no longer in your kubeconfig files"
             )));
@@ -873,6 +864,14 @@ impl ClusterManager {
                 Err(LogError::retry(format!("connecting to \"{cluster}\"")))
             }
         }
+    }
+
+    fn client(&self, cluster: &str) -> Option<Client> {
+        self.cluster(cluster).and_then(|c| c.client.clone())
+    }
+
+    fn cluster(&self, id: &str) -> Option<&Cluster> {
+        self.clusters.iter().find(|c| c.info.name == id)
     }
 
     fn cluster_mut(&mut self, id: &str) -> Option<&mut Cluster> {

@@ -7,6 +7,7 @@ use std::time::Duration;
 use kube::Client;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
+use crate::api_error::ApiError;
 use crate::redact;
 
 /// How long a connection attempt may take, exec auth plugin included. Some plugins (SSO logins)
@@ -95,16 +96,16 @@ impl ClusterError {
     /// other errors keep their full source chain, except auth plugin errors (see
     /// [`error_chain`]).
     pub fn kube(err: kube::Error) -> Self {
-        match &err {
-            kube::Error::Api(status) => ClusterError::Kube(api_status_message(status)),
-            _ if is_exec_not_found(&err) => ClusterError::ExecPluginNotFound { command: None },
+        match ApiError::from_kube(&err) {
+            Some(api) => ClusterError::Kube(api_status_message(api)),
+            None if is_exec_not_found(&err) => ClusterError::ExecPluginNotFound { command: None },
             // kube's own connection timeout: the server did not answer at all.
-            _ if is_transport_timeout(&err) => ClusterError::Timeout {
+            None if is_transport_timeout(&err) => ClusterError::Timeout {
                 after: None,
                 server: None,
                 exec_command: None,
             },
-            _ => ClusterError::Kube(error_chain(&err)),
+            None => ClusterError::Kube(error_chain(&err)),
         }
     }
 
@@ -183,11 +184,11 @@ impl Target {
     }
 }
 
-fn api_status_message(status: &kube::core::Status) -> String {
+fn api_status_message(status: ApiError<'_>) -> String {
     let reason = if status.reason.is_empty() {
         format!("HTTP {}", status.code)
     } else {
-        status.reason.clone()
+        status.reason.to_owned()
     };
     if status.message.is_empty() {
         reason

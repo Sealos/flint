@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
+use flint_core::handle::{Command, Event};
 use flint_core::{
     Cell, ClusterDiscovery, Feed, KindId, KindSnapshot, Settings, Subscription, SyncState,
-    WatchMode, cluster, kubeconfig,
+    WatchMode,
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Namespace;
@@ -20,6 +20,10 @@ use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
+
+mod support;
+
+use support::{Core, client, init_logging, test_kubeconfig, two_context_kubeconfig};
 
 /// How long a change may take to show in a live list: about a second on a laptop. Shared CI
 /// runners are slower and noisier, so 5 s when `CI` is set. `FLINT_TEST_LATENCY_MS` overrides both.
@@ -35,73 +39,22 @@ fn latency_bound() -> Duration {
     Duration::from_millis(ms)
 }
 
-fn test_kubeconfig() -> PathBuf {
-    match std::env::var_os("FLINT_TEST_KUBECONFIG") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => panic!("FLINT_TEST_KUBECONFIG must point at the dev cluster's kubeconfig"),
-    }
-}
-
-struct Core {
-    handle: CoreHandle,
-    events: async_channel::Receiver<Event>,
-    _dir: tempfile::TempDir,
-}
-
-fn start(kubeconfig: PathBuf, settings: Settings) -> Core {
-    // Core logs on stderr, filtered by RUST_LOG.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
+fn start(kubeconfig: PathBuf, settings: Settings) -> (tempfile::TempDir, Core) {
+    init_logging();
     let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
     // On disk too, as the app would have it: settings writes edit the file.
-    std::fs::create_dir_all(dir.path().join("config")).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
-        dir.path().join("config/settings.toml"),
+        config_dir.join("settings.toml"),
         toml::to_string(&settings).unwrap(),
     )
     .unwrap();
-    let handle = CoreHandle::start(CoreConfig {
-        config_dir: dir.path().join("config"),
-        settings,
-        settings_error: None,
-        kubeconfig_base: vec![kubeconfig],
-        home: None,
-        watch_files: false,
-        watch_timing: Default::default(),
-    })
-    .unwrap();
-    let events = handle.events();
-    Core {
-        handle,
-        events,
-        _dir: dir,
-    }
+    let core = Core::start(kubeconfig, config_dir, settings);
+    (dir, core)
 }
 
 impl Core {
-    /// The first event for which `pick` returns something.
-    async fn wait_for<T>(&self, secs: u64, mut pick: impl FnMut(Event) -> Option<T>) -> T {
-        tokio::time::timeout(Duration::from_secs(secs), async {
-            loop {
-                let event = self.events.recv().await.expect("core running");
-                if let Event::ConnectionChanged {
-                    state: ConnectionState::Failed(e),
-                    ..
-                } = &event
-                {
-                    panic!("connection failed: {e}");
-                }
-                if let Some(t) = pick(event) {
-                    return t;
-                }
-            }
-        })
-        .await
-        .expect("event arrived in time")
-    }
-
     /// Activates the first context and waits for its discovery.
     async fn activate_first(&self) -> (String, Arc<ClusterDiscovery>) {
         let name = self
@@ -166,12 +119,6 @@ async fn until(
     .unwrap_or_else(|_| panic!("snapshot condition not reached: {:?}", sub.peek().state))
 }
 
-async fn client(path: &Path) -> Client {
-    let loaded = kubeconfig::load(&[path.to_owned()]);
-    let context = &loaded.contexts[0].name;
-    cluster::connect(&loaded.merged, context).await.unwrap()
-}
-
 fn web_pods(snap: &KindSnapshot) -> usize {
     snap.rows
         .iter()
@@ -195,7 +142,7 @@ async fn scale_web(client: &Client, replicas: i32) {
 #[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
 async fn pods_list_then_live_update_after_scaling() {
     let path = test_kubeconfig();
-    let core = start(path.clone(), Settings::default());
+    let (_dir, core) = start(path.clone(), Settings::default());
     let (cluster, _) = core.activate_first().await;
     let mut pods = core.handle.subscribe(&cluster, &KindId::pods());
     let snap = until(&mut pods, 30, |s| s.state == SyncState::Synced).await;
@@ -328,7 +275,7 @@ async fn crd_with_printer_columns_appears_live() {
     // Leftovers from an interrupted run, or the cleanup of the last one still running.
     remove_crd_leftovers(&kube).await;
 
-    let core = start(path.clone(), Settings::default());
+    let (_dir, core) = start(path.clone(), Settings::default());
     let (cluster, discovery) = core.activate_first().await;
     let widgets_id = KindId::new(CRD_GROUP, "widgets");
     assert!(discovery.kind(&widgets_id).is_none());
@@ -420,30 +367,17 @@ async fn crd_with_printer_columns_appears_live() {
     until(&mut widgets, 30, |s| s.state == SyncState::Unavailable).await;
 }
 
-/// A copy of the dev kubeconfig with a second context for the same cluster.
-fn two_context_kubeconfig(dir: &Path) -> (PathBuf, String, String) {
-    let mut kc = kube::config::Kubeconfig::read_from(test_kubeconfig()).unwrap();
-    let first = kc.contexts[0].clone();
-    let mut second = first.clone();
-    second.name = format!("{}-second", first.name);
-    kc.contexts.push(second.clone());
-    kc.current_context = Some(first.name.clone());
-    let path = dir.join("kubeconfig");
-    std::fs::write(&path, serde_json::to_string(&kc).unwrap()).unwrap();
-    (path, first.name, second.name)
-}
-
 // covers UP-24, UP-25
 #[tokio::test]
 #[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
 async fn on_view_versus_all_and_switching_clusters() {
     let kc_dir = tempfile::tempdir().unwrap();
-    let (path, first, second) = two_context_kubeconfig(kc_dir.path());
+    let (path, first, second) = two_context_kubeconfig(kc_dir.path(), None);
     let settings = Settings {
         watch_mode: WatchMode::OnView,
         ..Default::default()
     };
-    let core = start(path, settings);
+    let (_dir, core) = start(path, settings);
     core.wait_for(10, |e| matches!(e, Event::ClustersChanged(_)).then_some(()))
         .await;
     core.activate(&first).await;
@@ -620,7 +554,7 @@ async fn a_user_allowed_only_some_namespaces_can_still_browse() {
         watch_mode: WatchMode::OnView,
         ..Default::default()
     };
-    let core = start(kubeconfig, settings);
+    let (_dir, core) = start(kubeconfig, settings);
     core.wait_for(10, |e| matches!(e, Event::ClustersChanged(_)).then_some(()))
         .await;
     let (cluster, _) = core.activate(RBAC_USER).await;

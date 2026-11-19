@@ -12,6 +12,7 @@ use kube::api::{Api, LogParams};
 
 use super::line::MAX_LINE_BYTES;
 use super::session::{LogSince, LogTarget};
+use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{ClusterError, error_chain};
 
 /// One request to the log endpoint.
@@ -126,16 +127,13 @@ impl LogError {
     }
 
     pub fn from_kube(err: kube::Error) -> Self {
-        let fatal = match &err {
-            kube::Error::Api(status) => match status.code {
-                403 | 404 => true,
-                // A container that is still starting is worth waiting for; a missing container
-                // or previous instance is not.
-                400 => !is_starting(&status.message),
-                _ => false,
-            },
+        let fatal = ApiError::from_kube(&err).is_some_and(|api| match api.kind() {
+            ApiErrorKind::Forbidden | ApiErrorKind::NotFound => true,
+            // A container that is still starting is worth waiting for; a missing container
+            // or previous instance is not.
+            ApiErrorKind::BadRequest => !is_starting(api.message),
             _ => false,
-        };
+        });
         let message = ClusterError::kube(err).to_string();
         if fatal {
             LogError::fatal(message)
@@ -247,7 +245,11 @@ pub(crate) fn same_pod(
             "the pod was replaced by one of the same name",
         )),
         Ok(None) => Err(LogError::pod_gone("the pod was deleted")),
-        Err(kube::Error::Api(status)) if status.code == 403 => Ok(()),
+        Err(kube::Error::Api(status))
+            if ApiErrorKind::from_code(status.code) == ApiErrorKind::Forbidden =>
+        {
+            Ok(())
+        }
         Err(e) => Err(LogError::from_kube(e)),
     }
 }
@@ -265,7 +267,11 @@ pub(crate) fn fate_of(
             let pod = pod.filter(|p| uid.is_none_or(|uid| p.metadata.uid.as_deref() == Some(uid)));
             Ok(fate(pod.as_ref(), container))
         }
-        Err(kube::Error::Api(status)) if status.code == 403 => Ok(AfterEnd::Restarts),
+        Err(kube::Error::Api(status))
+            if ApiErrorKind::from_code(status.code) == ApiErrorKind::Forbidden =>
+        {
+            Ok(AfterEnd::Restarts)
+        }
         Err(e) => Err(LogError::from_kube(e)),
     }
 }

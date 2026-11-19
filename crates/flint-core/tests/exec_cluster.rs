@@ -3,50 +3,22 @@
 //! kind cluster (`scripts/dev-cluster.sh`). They use that file alone, and create one pod in a
 //! namespace prefixed `exec-test-`, which they delete again.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
-use flint_core::{
-    ExecRequest, ExecSession, ExecSnapshot, ExecState, TerminalSize, cluster, kubeconfig,
-};
+use flint_core::handle::{Command, ConnectionState, Event};
+use flint_core::{ExecRequest, ExecSession, ExecSnapshot, ExecState, TerminalSize};
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::Client;
 use kube::api::{Api, DeleteParams, PostParams};
-use kube::config::{Kubeconfig, NamedContext};
 use serde_json::json;
+
+mod support;
+
+use support::{Core, client, init_logging, two_context_kubeconfig};
 
 /// A second context for the same cluster, to switch the active cluster away and back.
 const ALIAS: &str = "exec-test-alias";
-
-fn test_kubeconfig() -> PathBuf {
-    match std::env::var_os("FLINT_TEST_KUBECONFIG") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => panic!("FLINT_TEST_KUBECONFIG must point at the dev cluster's kubeconfig"),
-    }
-}
-
-/// Writes a copy of the dev cluster's kubeconfig with an [`ALIAS`] context added. Returns the
-/// path and the original context's name.
-fn kubeconfig_with_alias(source: &Path, dir: &Path) -> (PathBuf, String) {
-    let mut config = Kubeconfig::read_from(source).unwrap();
-    let first = config.contexts[0].clone();
-    config.contexts.push(NamedContext {
-        name: ALIAS.to_owned(),
-        ..first.clone()
-    });
-    let path = dir.join("kubeconfig");
-    // JSON is YAML, and kubeconfig is read as YAML.
-    std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
-    (path, first.name)
-}
-
-async fn client(path: &Path) -> Client {
-    let loaded = kubeconfig::load(&[path.to_owned()]);
-    let context = &loaded.contexts[0].name;
-    cluster::connect(&loaded.merged, context).await.unwrap()
-}
 
 /// Creates the namespace and a pod with a `bash` container (nginx, Debian) and an `sh` one
 /// (podinfo, Alpine: no bash), and waits until both run.
@@ -93,40 +65,16 @@ async fn delete_namespace(client: &Client, namespace: &str) {
         .await;
 }
 
-struct Core {
-    handle: CoreHandle,
-    events: async_channel::Receiver<Event>,
-}
-
 impl Core {
-    fn start(kubeconfig: PathBuf, config_dir: &Path) -> Self {
-        let handle = CoreHandle::start(CoreConfig {
-            config_dir: config_dir.to_owned(),
-            settings: Default::default(),
-            settings_error: None,
-            kubeconfig_base: vec![kubeconfig],
-            home: None,
-            watch_files: false,
-            watch_timing: Default::default(),
-        })
-        .unwrap();
-        let events = handle.events();
-        Self { handle, events }
-    }
-
     async fn connect(&self, name: &str) {
         self.handle.send(Command::Activate(name.to_owned()));
-        tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                match self.events.recv().await.expect("core running") {
-                    Event::ConnectionChanged { cluster, state } if cluster == name => match state {
-                        ConnectionState::Connected(_) => return,
-                        ConnectionState::Failed(e) => panic!("connection failed: {e}"),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
+        self.wait_for_event(60, |event| match event {
+            Event::ConnectionChanged { cluster, state } if cluster == name => match state {
+                ConnectionState::Connected(_) => Some(()),
+                ConnectionState::Failed(e) => panic!("connection failed: {e}"),
+                _ => None,
+            },
+            _ => None,
         })
         .await
         .expect("connected within 60 s");
@@ -240,12 +188,9 @@ async fn shell_sessions(core: &Core, context: &str, namespace: &str) {
 #[tokio::test]
 #[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
 async fn shell_into_a_container() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
+    init_logging();
     let dir = tempfile::tempdir().unwrap();
-    let (path, context) = kubeconfig_with_alias(&test_kubeconfig(), dir.path());
+    let (path, context, _) = two_context_kubeconfig(dir.path(), Some(ALIAS));
     let admin = client(&path).await;
     let namespace = format!(
         "exec-test-{}",
@@ -254,7 +199,7 @@ async fn shell_into_a_container() {
             .unwrap()
             .as_millis()
     );
-    let core = Core::start(path, &dir.path().join("config"));
+    let core = Core::start(path, dir.path().join("config"), Default::default());
     // Run the checks on their own task so the namespace is deleted even when one fails.
     let result = tokio::spawn({
         let namespace = namespace.clone();
