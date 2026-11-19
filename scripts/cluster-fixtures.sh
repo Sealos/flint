@@ -82,8 +82,29 @@ etcdctl compact "$revision" >/dev/null || true
 # The kind node container; the kubelet starts the stopped API server again.
 node="${context#kind-}-control-plane"
 echo "cluster-fixtures: restarting the API server in $node"
-docker exec "$node" sh -c 'crictl stop $(crictl ps -q --name kube-apiserver)' >/dev/null
-sleep 5
+apiserver_id() { docker exec "$node" crictl ps -q --name kube-apiserver 2>/dev/null | head -1; }
+old_id="$(apiserver_id)"
+if [ -z "$old_id" ]; then
+  echo "cluster-fixtures: no running kube-apiserver container in $node" >&2
+  exit 1
+fi
+# `crictl stop` can time out on a busy runner (DeadlineExceeded) even though the container stops.
+# So don't trust its exit status: retry it, and count the restart as done once the kubelet runs a
+# new kube-apiserver container.
+restarted=
+for attempt in 1 2 3; do
+  docker exec "$node" crictl --timeout 60s stop "$old_id" >/dev/null 2>&1 ||
+    echo "cluster-fixtures: crictl stop attempt $attempt did not report success; checking the container"
+  for _ in $(seq 30); do
+    new_id="$(apiserver_id)"
+    if [ -n "$new_id" ] && [ "$new_id" != "$old_id" ]; then restarted=1 && break 2; fi
+    sleep 2
+  done
+done
+if [ -z "$restarted" ]; then
+  echo "cluster-fixtures: the API server in $node was not restarted after 3 attempts" >&2
+  exit 1
+fi
 ready=
 for _ in $(seq 60); do
   if k get --raw /readyz >/dev/null 2>&1; then ready=1 && break; fi
