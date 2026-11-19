@@ -1,6 +1,6 @@
 # Flint
 
-Flint is a native Kubernetes desktop manager for macOS, in the space of Lens and Freelens. It is written in Rust
+Flint is a native Kubernetes desktop manager for macOS (and, best effort, Linux), in the space of Lens and Freelens. It is written in Rust
 with [GPUI](https://www.gpui.rs/) so it starts fast, stays light on memory, and keeps up with large clusters.
 
 It also ships a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, so AI agents can inspect the
@@ -9,7 +9,7 @@ clusters you choose to expose.
 Status: early development (milestone M1.5). The app lists your kubeconfig contexts, connects to the one you select,
 and browses every kind it serves, CRDs included: live lists with the `kubectl get` columns, a namespace and text
 filter, and a detail view with metadata, conditions, events and read-only YAML. It has a light and a dark theme
-that follow macOS (View > Appearance overrides it). Logs and exec arrive in M2.
+that follow the system (View > Appearance, or the `appearance` setting, overrides it). Logs and exec arrive in M2.
 
 ## Install from a release
 
@@ -31,9 +31,30 @@ a browser, macOS blocks the first run: remove the quarantine flag with
 `xattr -d com.apple.quarantine /usr/local/bin/flint`, or open **System Settings > Privacy & Security** and choose
 **Open Anyway**. Releases are marked pre-release until 1.0, so the releases page has no "Latest" badge yet.
 
+### Linux (AppImage)
+
+Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
+tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
+needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
+
+```sh
+gh release download v0.1.1 -R Sealos/flint -p 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
+sha256sum -c flint-v0.1.1-linux-x86_64.AppImage.sha256
+chmod +x flint-v0.1.1-linux-x86_64.AppImage
+install -D flint-v0.1.1-linux-x86_64.AppImage ~/.local/bin/flint
+flint --version
+flint                                   # opens the window
+```
+
+AppImages mount themselves with FUSE (`libfuse2` on most distributions). Without it, for example in a container, set
+`APPIMAGE_EXTRACT_AND_RUN=1` to run it without mounting. The AppImage is unsigned; the `.sha256` file is the check.
+On Linux there is no menu bar: Quit is Ctrl-Q, Close Window is Ctrl-W, and every Cmd shortcut is Ctrl. Settings and
+state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
+
 ## Build and run
 
-You need a recent stable Rust toolchain (edition 2024) and macOS with Xcode command line tools.
+You need a recent stable Rust toolchain (edition 2024) and macOS with Xcode command line tools. On Linux, install
+GPUI's system libraries instead; `.github/actions/gpui-linux-deps/action.yml` lists the Ubuntu packages.
 
 ```sh
 cargo build --release
@@ -140,7 +161,9 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
 ### Checks CI runs
 
 - **CI (Linux):** `cargo fmt --check`, and for `flint-core` and `flint-mcp`: clippy with `-D warnings`,
-  `cargo test -p <crate>` as a separate job per crate, and `cargo doc` with `-D warnings`.
+  `cargo test -p <crate>` as a separate job per crate, and `cargo doc` with `-D warnings`. For the app,
+  `linux (flint-app)` runs its clippy and view tests, and `appimage (x86_64)` packages a release build with
+  `scripts/package-appimage.sh` and smoke-tests it with `scripts/smoke-appimage.sh`.
 - **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. macOS
   runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
 - **Cluster e2e (Linux):** a kind cluster set up by `scripts/cluster-fixtures.sh`, then the `flint-core` and
@@ -180,6 +203,12 @@ Register it with Claude Code, using the installed binary (or `"$PWD/target/relea
 claude mcp add flint -- /usr/local/bin/flint mcp
 ```
 
+On Linux, register the AppImage the same way; it passes `mcp` through to `flint`:
+
+```sh
+claude mcp add flint -- "$HOME/.local/bin/flint" mcp
+```
+
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
 
 ## Releases
@@ -193,9 +222,13 @@ format, for example `feat(mcp): …` or `fix(core): …`.
 2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release as a draft. Releases are immutable once
    published, so the draft stage is when files can still be attached.
 3. The same workflow then builds `flint` for Apple Silicon and Intel, combines them into a universal binary, and
-   attaches `flint-vX.Y.Z-macos-universal.tar.gz` and its SHA-256 checksum, then publishes the release.
+   attaches `flint-vX.Y.Z-macos-universal.tar.gz`. In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
+   runners (`scripts/package-appimage.sh`) and attaches `flint-vX.Y.Z-linux-x86_64.AppImage` and
+   `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum.
+4. Once every upload has succeeded, a `publish` job publishes the release and checks that all six files are on it.
 
 Until M6, release binaries are **unsigned** and marked as pre-release. macOS will warn when you first run them.
+AppImages stay unsigned.
 
 After every published release:
 
