@@ -455,12 +455,17 @@ impl ResourceList {
     /// before the first layout). Wide columns that do not fit are left out.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
-        list_model::fit_columns(
+        let (mut drawn, dropped) = list_model::fit_columns(
             columns,
             |i| self.widths.chars(i, &columns[i]) as f32 * CHAR_WIDTH + CELL_PADDING,
             self.show_wide,
             available,
-        )
+        );
+        if let Some(room) = available {
+            let name_min = list_model::NAME_MIN_CHARS as f32 * CHAR_WIDTH + CELL_PADDING;
+            list_model::squeeze_name(&mut drawn, columns, room, name_min);
+        }
+        (drawn, dropped)
     }
 
     fn render_rows(
@@ -519,6 +524,12 @@ impl ResourceList {
                 } else {
                     cell_text(row, col, now)
                 };
+                // Stale rows are already muted; masked secrets have no status.
+                let tone = if stale || secrets {
+                    list_model::Tone::Normal
+                } else {
+                    list_model::cell_tone(&column.name, &text)
+                };
                 let numeric = list_model::is_numeric(column);
                 let is_name = column.role == ColumnRole::Name;
                 let fits = (text.chars().count() as f32) * CHAR_WIDTH + CELL_PADDING <= width;
@@ -532,6 +543,12 @@ impl ResourceList {
                     .w(px(width))
                     .flex_none()
                     .when(is_name, |el| el.font_family(theme.mono_font_family.clone()))
+                    .map(|el| match tone {
+                        list_model::Tone::Normal => el,
+                        list_model::Tone::Danger => el.text_color(theme.danger),
+                        list_model::Tone::Warning => el.text_color(theme.warning),
+                        list_model::Tone::Muted => el.text_color(theme.muted_foreground),
+                    })
                     .when(numeric, |el| {
                         el.justify_end().font_features(tabular_figures())
                     })

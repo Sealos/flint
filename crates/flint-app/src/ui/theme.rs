@@ -416,6 +416,9 @@ mod tests {
                 ("sidebar", t.sidebar, base),
                 ("popover", t.popover, base),
                 ("table even row", t.table_even, base),
+                // Status cells in the resource list (`list_model::cell_tone`).
+                ("table hover", t.table_hover, base),
+                ("selected row", t.table_active, base),
             ] {
                 need(&format!("{name} text on {surface}"), color, bg, under, BODY);
             }

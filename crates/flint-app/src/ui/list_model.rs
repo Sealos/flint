@@ -1,5 +1,6 @@
 //! The resource list's view-model logic, kept free of GPUI so it can be unit tested: which
-//! columns show, how a sort survives column changes, and how wide each column is.
+//! columns show, how a sort survives column changes, how wide each column is, and which cells
+//! are colored as a status.
 
 use std::sync::Arc;
 
@@ -180,12 +181,127 @@ pub fn fit_columns(
     }
 }
 
+/// Narrows the Name column, down to `name_min`, when the drawn columns are wider than `room`, so
+/// the status columns to its right stay in view instead of scrolling off. Long names truncate and
+/// show in full in a tooltip.
+pub fn squeeze_name(drawn: &mut [(usize, f32)], columns: &[Column], room: f32, name_min: f32) {
+    let total: f32 = drawn.iter().map(|(_, w)| w).sum();
+    let Some((_, name)) = drawn
+        .iter_mut()
+        .find(|(i, _)| columns[*i].role == ColumnRole::Name)
+    else {
+        return;
+    };
+    if total > room && *name > name_min {
+        *name = (*name - (total - room)).max(name_min);
+    }
+}
+
 /// Whether the rows show something that changes with time alone (ages, timestamps), so the list
 /// needs redrawing every second.
 pub fn has_ticking_columns(columns: &[Column]) -> bool {
     columns
         .iter()
         .any(|c| c.role == ColumnRole::Age || c.ty == ColumnType::Date)
+}
+
+/// How a cell's text is colored, so a failing object stands out from healthy ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Normal,
+    /// Failed or broken: CrashLoopBackOff, Error, NotReady, a failed pull, ...
+    Danger,
+    /// Not there yet, or partly: Pending, ContainerCreating, Terminating, `1/2` ready, restarts.
+    Warning,
+    /// Finished and no longer running: Completed, Succeeded.
+    Muted,
+}
+
+/// The tone of a cell, from its column's name and its text. Only the status-like columns of the
+/// built-in kinds are colored (Status, Phase, Ready, Restarts); every other cell is normal, so
+/// color keeps meaning "look here".
+pub fn cell_tone(column: &str, text: &str) -> Tone {
+    let text = text.trim();
+    if column.eq_ignore_ascii_case("restarts") {
+        // `3` or `3 (5m ago)`.
+        let count: u64 = text
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        return if count > 0 {
+            Tone::Warning
+        } else {
+            Tone::Normal
+        };
+    }
+    if column.eq_ignore_ascii_case("ready") {
+        // `ready/total` (pods, deployments, ...); other Ready columns (nodes' True/False) fall
+        // through to the status words.
+        if let Some((ready, total)) = text.split_once('/')
+            && let (Ok(ready), Ok(total)) = (ready.parse::<u32>(), total.parse::<u32>())
+        {
+            return if ready < total {
+                Tone::Warning
+            } else {
+                Tone::Normal
+            };
+        }
+    }
+    let status_column = ["status", "phase", "ready"]
+        .iter()
+        .any(|name| column.eq_ignore_ascii_case(name));
+    if !status_column {
+        return Tone::Normal;
+    }
+    status_tone(text)
+}
+
+/// The tone of a status word, as kubectl prints it. A node's `Ready,SchedulingDisabled` is
+/// judged by its worst part.
+fn status_tone(text: &str) -> Tone {
+    text.split(',')
+        .map(|part| word_tone(part.trim()))
+        .max_by_key(|tone| match tone {
+            Tone::Danger => 3,
+            Tone::Warning => 2,
+            Tone::Muted => 1,
+            Tone::Normal => 0,
+        })
+        .unwrap_or(Tone::Normal)
+}
+
+fn word_tone(word: &str) -> Tone {
+    // Init containers: `Init:0/2` is waiting, `Init:Error` and `Init:CrashLoopBackOff` failed.
+    let word = word.strip_prefix("Init:").unwrap_or(word);
+    match word {
+        "Running" | "Ready" | "Active" | "Bound" | "Available" | "True" | "Healthy" => Tone::Normal,
+        "Completed" | "Succeeded" => Tone::Muted,
+        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" | "Waiting"
+        | "Released" | "SchedulingDisabled" | "Unknown" => Tone::Warning,
+        "Failed"
+        | "Error"
+        | "CrashLoopBackOff"
+        | "ImagePullBackOff"
+        | "ErrImagePull"
+        | "ErrImageNeverPull"
+        | "InvalidImageName"
+        | "OOMKilled"
+        | "Evicted"
+        | "NotReady"
+        | "Lost"
+        | "False"
+        | "ContainerStatusUnknown"
+        | "DeadlineExceeded"
+        | "BackoffLimitExceeded"
+        | "RunContainerError"
+        | "StartError" => Tone::Danger,
+        // `CreateContainerConfigError`, `CreateContainerError`, `PreStopHookError`, ...
+        w if w.ends_with("Error") || w.ends_with("BackOff") => Tone::Danger,
+        // `Init:0/2`: init containers still running.
+        w if w.contains('/') => Tone::Warning,
+        _ => Tone::Normal,
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +472,74 @@ mod tests {
         let columns = pod_columns();
         assert!(has_ticking_columns(&columns));
         assert!(!has_ticking_columns(&columns[..4]));
+    }
+
+    // covers UP-20
+    #[test]
+    fn status_cells_are_toned_by_how_healthy_they_read() {
+        use Tone::*;
+        let cases = [
+            ("Status", "Running", Normal),
+            ("Status", "Completed", Muted),
+            ("Status", "Pending", Warning),
+            ("Status", "ContainerCreating", Warning),
+            ("Status", "Terminating", Warning),
+            ("Status", "Init:0/2", Warning),
+            ("Status", "CrashLoopBackOff", Danger),
+            ("Status", "Init:CrashLoopBackOff", Danger),
+            ("Status", "Error", Danger),
+            ("Status", "ImagePullBackOff", Danger),
+            ("Status", "CreateContainerConfigError", Danger),
+            ("Status", "OOMKilled", Danger),
+            ("Status", "Ready", Normal),
+            ("Status", "Ready,SchedulingDisabled", Warning),
+            ("Status", "NotReady", Danger),
+            ("Status", "Bound", Normal),
+            ("Status", "Lost", Danger),
+            ("Phase", "Failed", Danger),
+            ("Phase", "Succeeded", Muted),
+            ("Ready", "2/2", Normal),
+            ("Ready", "1/2", Warning),
+            ("Ready", "0/1", Warning),
+            ("Ready", "0/0", Normal),
+            ("Ready", "True", Normal),
+            ("Ready", "False", Danger),
+            ("Restarts", "0", Normal),
+            ("Restarts", "3", Warning),
+            ("Restarts", "3 (5m ago)", Warning),
+            // Only status-like columns: a name or label that reads "Error" is not colored.
+            ("Name", "Error", Normal),
+            ("Reason", "BackOff", Normal),
+            ("Up-to-date", "1/2", Normal),
+        ];
+        for (column, text, want) in cases {
+            assert_eq!(cell_tone(column, text), want, "{column} = {text}");
+        }
+    }
+
+    // covers UP-20: a long pod name must not push Status and Ready out of a narrow list.
+    #[test]
+    fn a_long_name_column_gives_way_to_the_status_columns() {
+        let columns = pod_columns();
+        let name_min = 100.;
+        // Name 400 + Namespace 100 + Ready 60 + Restarts 80 + Age 60 = 700.
+        let widths = [400., 100., 60., 80., 60.];
+        let drawn = || -> Vec<(usize, f32)> { widths.iter().copied().enumerate().collect() };
+
+        let mut roomy = drawn();
+        squeeze_name(&mut roomy, &columns, 900., name_min);
+        assert_eq!(roomy, drawn(), "nothing changes when everything fits");
+
+        let mut tight = drawn();
+        squeeze_name(&mut tight, &columns, 500., name_min);
+        assert_eq!(tight[0].1, 200.);
+        assert_eq!(tight.iter().map(|(_, w)| w).sum::<f32>(), 500.);
+
+        let mut tiny = drawn();
+        squeeze_name(&mut tiny, &columns, 200., name_min);
+        assert_eq!(
+            tiny[0].1, name_min,
+            "never below the minimum; the table scrolls instead"
+        );
     }
 }

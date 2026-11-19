@@ -94,7 +94,44 @@ impl Render for PaneDrag {
 }
 
 /// The list keeps at least this much room when the detail pane is dragged wider.
-const MIN_LIST_WIDTH: f32 = 280.;
+/// 360 px fits Name, Namespace and a status column of a pods list.
+const MIN_LIST_WIDTH: f32 = 360.;
+/// The pane widths shown in a window `window_width` wide: as saved, but when the window is too
+/// narrow for them and the list's [`MIN_LIST_WIDTH`], the detail pane gives way first (down to
+/// its minimum), then the navigation, then the cluster sidebar. Saved widths are untouched, so a
+/// wider window gets them back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Layout {
+    clusters: f32,
+    navigation: f32,
+    detail: f32,
+}
+
+fn layout(panes: &PaneWidths, window_width: f32, detail_open: bool) -> Layout {
+    let mut widths = Layout {
+        clusters: Pane::Clusters.get(panes),
+        navigation: Pane::Navigation.get(panes),
+        detail: if detail_open {
+            Pane::Detail.get(panes)
+        } else {
+            0.
+        },
+    };
+    let mut over =
+        widths.clusters + widths.navigation + widths.detail + MIN_LIST_WIDTH - window_width;
+    let mut give = |width: &mut f32, min: f32| {
+        let taken = over.clamp(0., (*width - min).max(0.));
+        *width -= taken;
+        over -= taken;
+    };
+    if detail_open {
+        give(&mut widths.detail, Pane::Detail.limits().0);
+    }
+    give(&mut widths.navigation, Pane::Navigation.limits().0);
+    give(&mut widths.clusters, Pane::Clusters.limits().0);
+    widths
+}
+
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
@@ -274,13 +311,13 @@ impl Workspace {
 
     /// Follows a pane-edge drag, and saves the widths once it pauses.
     fn drag_pane(&mut self, pane: Pane, x: f32, window_width: f32, cx: &mut Context<Self>) {
-        let clusters = Pane::Clusters.get(&self.panes);
+        // Measured from the panes as shown, which a narrow window may have shrunk.
+        let shown = layout(&self.panes, window_width, self.detail.is_some());
         let width = match pane {
             Pane::Clusters => x,
-            Pane::Navigation => x - clusters,
+            Pane::Navigation => x - shown.clusters,
             Pane::Detail => {
-                let nav = Pane::Navigation.get(&self.panes);
-                let room = window_width - clusters - nav - MIN_LIST_WIDTH;
+                let room = window_width - shown.clusters - shown.navigation - MIN_LIST_WIDTH;
                 (window_width - x).min(room)
             }
         };
@@ -538,7 +575,12 @@ impl Workspace {
         cx.notify();
     }
 
-    fn render_sidebar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+    fn render_sidebar(
+        &self,
+        widths: &Layout,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let model = self.model.read(cx);
         let active = model.active.clone();
 
@@ -602,7 +644,7 @@ impl Workspace {
         }
 
         v_flex()
-            .w(px(Pane::Clusters.get(&self.panes)))
+            .w(px(widths.clusters))
             .h_full()
             .flex_none()
             .relative()
@@ -849,9 +891,9 @@ impl Workspace {
         }
     }
 
-    fn render_nav_column(&self, theme: &Theme) -> impl IntoElement {
+    fn render_nav_column(&self, width: f32, theme: &Theme) -> impl IntoElement {
         v_flex()
-            .w(px(Pane::Navigation.get(&self.panes)))
+            .w(px(width))
             .h_full()
             .flex_none()
             .relative()
@@ -1035,8 +1077,8 @@ impl Workspace {
         let settings = self.model.read(cx).settings.clone();
         let effective = settings.watch_mode_for(cluster);
         let label = match effective {
-            WatchMode::All => "Watch: all kinds",
-            WatchMode::OnView => "Watch: open views",
+            WatchMode::All => "Live: all kinds",
+            WatchMode::OnView => "Live: open views only",
         };
         let model = self.model.clone();
         let cluster = cluster.to_owned();
@@ -1046,7 +1088,7 @@ impl Workspace {
             .ghost()
             .label(label)
             .disabled(!settings_ok)
-            .tooltip("Which kinds Flint watches on this cluster")
+            .tooltip("Which kinds Flint keeps live (watches) on this cluster")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
                 let own = settings.cluster_watch_mode.get(&cluster).copied();
@@ -1100,13 +1142,7 @@ impl Workspace {
     /// The detail pane's width: as dragged, but narrower when the window is, so the list keeps
     /// [`MIN_LIST_WIDTH`] (a remembered width from a wider window would squeeze it).
     fn detail_width(&self, window_width: f32) -> f32 {
-        let room = window_width
-            - Pane::Clusters.get(&self.panes)
-            - Pane::Navigation.get(&self.panes)
-            - MIN_LIST_WIDTH;
-        Pane::Detail
-            .get(&self.panes)
-            .min(room.max(Pane::Detail.limits().0))
+        layout(&self.panes, window_width, true).detail
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -1348,6 +1384,7 @@ impl Render for Workspace {
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
+        let widths = layout(&self.panes, window_width, self.detail.is_some());
         h_flex()
             .id("workspace")
             .size_full()
@@ -1359,15 +1396,59 @@ impl Render for Workspace {
                 let width = f32::from(e.bounds.size.width);
                 this.drag_pane(pane, x, width, cx);
             }))
-            .child(self.render_sidebar(theme, cx))
-            .when(has_cluster, |el| el.child(self.render_nav_column(theme)))
+            .child(self.render_sidebar(&widths, theme, cx))
+            .when(has_cluster, |el| {
+                el.child(self.render_nav_column(widths.navigation, theme))
+            })
             .child(self.render_main(window_width, theme, cx))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::namespace_summary;
+    use super::{Layout, MIN_LIST_WIDTH, layout, namespace_summary};
+    use flint_core::settings::PaneWidths;
+
+    fn list_width(widths: Layout, window: f32) -> f32 {
+        window - widths.clusters - widths.navigation - widths.detail
+    }
+
+    // covers UP-23: opening an object must leave the list readable in a narrow window.
+    #[test]
+    fn a_narrow_window_shrinks_the_side_panes_before_the_list() {
+        let saved = PaneWidths::default();
+        // Wide enough: every pane as saved (the defaults).
+        let wide = layout(&saved, 1600., true);
+        assert_eq!(
+            wide,
+            Layout {
+                clusters: 200.,
+                navigation: 220.,
+                detail: 460.
+            }
+        );
+        // The detail pane gives way first.
+        let medium = layout(&saved, 1100., true);
+        assert_eq!((medium.clusters, medium.navigation), (200., 220.));
+        assert_eq!(list_width(medium, 1100.), MIN_LIST_WIDTH);
+        // A third of a 2560 px screen: everything at its minimum, and the list gets the rest.
+        let narrow = layout(&saved, 853., true);
+        assert_eq!(
+            narrow,
+            Layout {
+                clusters: 140.,
+                navigation: 150.,
+                detail: 300.
+            }
+        );
+        assert_eq!(list_width(narrow, 853.), 263.);
+        // With the detail pane closed, the side panes keep their widths while the list fits.
+        let closed = layout(&saved, 853., false);
+        assert_eq!(
+            (closed.clusters, closed.navigation, closed.detail),
+            (200., 220., 0.)
+        );
+    }
 
     // covers UP-21
     #[test]
