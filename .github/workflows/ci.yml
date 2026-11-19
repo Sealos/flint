@@ -179,7 +179,7 @@ jobs:
       # integration test needs the binary). Reuse it rather than building again, but check it.
       - name: App binary has the automation channel
         run: |
-          if ! strings -a target/debug/flint | grep -q 'automation\.sock'; then
+          if ! strings -a target/debug/flint | grep -c 'automation\.sock' > /dev/null; then
             echo "::error::target/debug/flint was not built with --features automation"
             exit 1
           fi
