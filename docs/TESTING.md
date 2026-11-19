@@ -111,16 +111,54 @@ echo '{"id":1,"cmd":"open_view","args":{"kind":"pods"}}' | nc -U "$FLINT_CONFIG_
 
 ### E2E harness: `crates/flint-e2e`
 
-A Rust crate of integration tests and helpers. The fake API server (below) is there today; `App` and `Mcp` follow
-in [Sealos/flint#40](https://github.com/Sealos/flint/issues/40).
+A Rust crate of helpers and integration tests: the fake API server (below), and these.
 
-- **`App`:** starts `flint` (built with `--features automation`) with a scratch `FLINT_CONFIG_DIR` and the given
-  `KUBECONFIG`. It connects to the socket and exposes typed calls such as `app.open_view("pods")`,
-  `app.wait_for(rows >= 2)` and `app.screenshot("pods-dark")`.
-- **`Mcp`:** starts `flint mcp` and speaks JSON-RPC over stdio.
-- **Tests are named after user paths** (`up_03_connect`, `up_20_live_list`, …) and tag them with `// covers UP-xx`.
-- **Each test picks its backend:** `Backend::Kind` (`FLINT_TEST_KUBECONFIG`) or `Backend::Fake` (the fake API
-  server).
+- **`App`** (`flint_e2e::app`): finds or builds `flint` with `--features automation` (`FLINT_E2E_APP_BIN` names a
+  prebuilt one; otherwise `cargo build -p flint-app --features automation` runs once per test process), and starts
+  it with a scratch `FLINT_CONFIG_DIR` (mode 0700, under `/tmp` so the socket path stays short), a scratch `HOME`, a
+  `settings.toml` with a fixed `path` (no login shell), and exactly the `KUBECONFIG` the test gives. Inherited
+  `KUBECONFIG` and `FLINT_*` variables are dropped. It waits for the socket, and fails at once with the app's log if
+  the channel refuses to start (exit code 3). Typed calls, one connection each: `select_cluster`, `open_view`,
+  `select_row`, `dispatch` (an action by name), `type_text`, `press_key`, `state`, `actions`,
+  `wait_for(pointer, Test::…, timeout)`, `screenshot(name)` and `screenshot_themes(name)` (light and dark, through
+  the View > Appearance actions). Dropping an `App` quits the app (and kills it after 5 s); if the test is panicking
+  it prints the app's log. `App::quit` keeps the scratch directories so `AppOptions::reuse` can relaunch on them.
+  Only one `App` runs at a time in a test process; `App::launch` waits for the previous one to be dropped.
+- **`Mcp`** (`flint_e2e::mcp`): `Mcp::start` runs `flint-mcp` (`FLINT_E2E_MCP_BIN`, or built once with cargo);
+  `Mcp::flint` runs `flint mcp` from the app binary, for tests that check the app and the server agree. JSON-RPC
+  over stdio: `request`, `tools`, `call`, `call_json`.
+- **`Backend`** (`flint_e2e::backend`): `Backend::Fake` starts a fake API server; `Backend::Kind` uses
+  `FLINT_TEST_KUBECONFIG`, refuses a current context that is not served from this machine, and is skipped with a
+  printed message when the variable is unset. Tests that only browse use `Backend::from_env()`, so
+  `FLINT_E2E_BACKEND=kind` runs them on kind; tests that script watches or inject faults use the fake server.
+- **Tests are named after user paths** (`up_03_connect_to_a_cluster`, `up_20_browse_pods_with_live_updates`, …) and
+  tagged `// covers UP-xx`. `tests/app/` holds the app paths (`m0.rs`, `m1.rs`), `tests/mcp.rs` the MCP paths. Paths
+  left out say why at the top of their file: UP-05 (Finder launch, real cloud auth: manual), UP-14 to UP-16 (not
+  built yet), UP-26 (a load test against kind), and UP-13's live switch with macOS (a test must not change the
+  system appearance; dark mode itself is tested).
+- **Keys:** tests dispatch registered actions by name rather than pressing shortcuts, which differ by platform, and
+  press only plain keys (`escape`, `backspace`).
+
+**Running app e2e locally.** They open a window, so they need macOS and a logged-in GUI session (a locked screen is
+fine: screenshots render offscreen). They are `#[ignore]`d, and the file is `cfg(target_os = "macos")`, so plain
+`cargo test -p flint-e2e` (and Linux CI) runs only the MCP and fake-server tests.
+
+```sh
+# Against the fake API server (about a minute; the first run also builds flint with the automation feature).
+FLINT_AUTOMATION_SCREENSHOTS="$PWD/target/e2e-screenshots" \
+  cargo test -p flint-e2e --test app -- --ignored
+
+# The browsing paths against the kind dev cluster instead (scripts/dev-cluster.sh up).
+FLINT_E2E_BACKEND=kind FLINT_TEST_KUBECONFIG="$PWD/.dev/kubeconfig" \
+  cargo test -p flint-e2e --test app -- --ignored
+
+# CI builds once and points the tests at the binary:
+cargo build -p flint-app --features automation
+FLINT_E2E_APP_BIN="$PWD/target/debug/flint" cargo test -p flint-e2e --test app -- --ignored
+```
+
+Screenshots are named `upXX-<view>-light.png` and `upXX-<view>-dark.png`; a rerun replaces the previous run's
+files. Without `FLINT_AUTOMATION_SCREENSHOTS` they go to the scratch config directory and are deleted with it.
 
 ### Fake API server
 
@@ -240,12 +278,12 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 
 | Job | Runner | Runs |
 |---|---|---|
-| `test (<crate>)` | Linux | Unit tests for `flint-core`, `flint-mcp` and `flint-e2e` (the fake API server and its tests), one job per crate |
+| `test (<crate>)` | Linux | Unit tests for `flint-core`, `flint-mcp` and `flint-e2e` (the fake API server, the harness, and the MCP e2e tests against the fake server), one job per crate |
 | `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display). Flint ships for macOS only; this is a cheap second check |
 | `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
 | `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. The only CI job that needs macOS |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
-| `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
+| `app-e2e` | macOS | `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server. Uploads screenshots (light and dark) as artifacts |
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
 `app-e2e` runs on PRs. `cluster-e2e` runs on PRs that touch `flint-core` or `flint-mcp`, on master, and nightly.
@@ -279,7 +317,8 @@ new Kubernetes version also means re-recording the fake API server's fixtures.
 
 ### Screenshots
 
-App e2e saves a screenshot of every key view in light and dark (`FLINT_APPEARANCE`). CI uploads them as a workflow
+App e2e saves a screenshot of every key view in light and dark (`App::screenshot_themes`, through the View >
+Appearance actions; `FLINT_APPEARANCE` forces one theme at launch). CI uploads them as a workflow
 artifact and links them from a PR comment. They are evidence for reviewers, not a gate: font rendering differs between
 runner images, so pixel diffs would be flaky.
 
