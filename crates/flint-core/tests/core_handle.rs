@@ -225,3 +225,64 @@ async fn unreachable_cluster_fails_with_a_readable_error() {
     .await
     .unwrap();
 }
+
+/// Every file under `dir` with its contents, to compare before and after.
+fn snapshot_files(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            files.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+    }
+    files.sort();
+    files
+}
+
+// covers UP-90
+#[tokio::test]
+async fn commands_never_write_kubeconfig_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let kube_dir = dir.path().join("kube");
+    std::fs::create_dir_all(&kube_dir).unwrap();
+    std::fs::write(kube_dir.join("config"), kubeconfig(&["one", "two"])).unwrap();
+    let before = snapshot_files(&kube_dir);
+    let core = CoreHandle::start(CoreConfig {
+        config_dir: dir.path().join("config"),
+        settings: Default::default(),
+        settings_error: None,
+        kubeconfig_base: vec![kube_dir.join("config")],
+        home: None,
+        watch_files: true,
+    })
+    .unwrap();
+    let events = core.events();
+    tokio::time::timeout(Duration::from_secs(5), next_clusters(&events))
+        .await
+        .unwrap();
+
+    // Everything that writes something: exposure, watch modes, namespace filters, a reload,
+    // and an activation (which fails to connect; the server is unreachable).
+    core.send(Command::SetAiExposed {
+        cluster: "one".into(),
+        server: Some(SERVER.into()),
+    });
+    core.send(Command::SetWatchMode {
+        cluster: Some("one".into()),
+        mode: Some(flint_core::WatchMode::OnView),
+    });
+    core.send(Command::SetNamespaceFilter {
+        cluster: "one".into(),
+        namespaces: vec!["demo".into()],
+    });
+    core.send(Command::ReloadKubeconfig);
+    core.send(Command::Activate("two".into()));
+    settings_where(&events, |s, _| {
+        s.watch_mode_for("one") == flint_core::WatchMode::OnView
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(snapshot_files(&kube_dir), before, "kubeconfig untouched");
+    // The writes went to Flint's own config directory.
+    assert!(dir.path().join("config/settings.toml").exists());
+}

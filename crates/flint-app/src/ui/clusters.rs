@@ -1,12 +1,14 @@
 //! The app's view of the cluster list, updated from core events.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use flint_core::settings::AiExposureState;
 use flint_core::{
-    ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle, Event, Settings,
+    ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle, Event,
+    Settings, WatchMode,
 };
 use gpui_kit::*;
 
@@ -14,8 +16,8 @@ pub struct ClustersModel {
     core: CoreHandle,
     pub clusters: Vec<ClusterSummary>,
     pub kubeconfig_errors: Vec<(PathBuf, String)>,
-    /// Every kubeconfig path the core looked at, for the empty state.
-    pub kubeconfig_paths: Vec<PathBuf>,
+    /// Every kubeconfig path the core looked at, and whether it existed, for the empty state.
+    pub kubeconfig_paths: Vec<(PathBuf, bool)>,
     /// `KUBECONFIG` as this process saw it, for the empty state.
     pub kubeconfig_env: Option<OsString>,
     /// False until the core has loaded kubeconfig once.
@@ -27,6 +29,8 @@ pub struct ClustersModel {
     /// The last error not tied to a cluster connection (for example a settings write). Cleared
     /// when the user issues the next command; if that one fails, its error replaces it.
     pub last_error: Option<String>,
+    /// The latest discovery result per cluster, and why the last discovery failed, if it did.
+    pub discovery: HashMap<ClusterId, Discovered>,
     /// The cluster to activate once kubeconfig is loaded (`FLINT_CLUSTER`). Taken on first load.
     startup_cluster: Option<String>,
     _events: Task<()>,
@@ -53,6 +57,7 @@ impl ClustersModel {
             settings: Arc::default(),
             settings_error: None,
             last_error: None,
+            discovery: HashMap::new(),
             startup_cluster,
             _events: task,
         }
@@ -89,6 +94,14 @@ impl ClustersModel {
                 self.settings = settings;
                 self.settings_error = error;
             }
+            Event::DiscoveryChanged {
+                cluster,
+                discovery,
+                error,
+            } => {
+                self.discovery
+                    .insert(cluster, Discovered { discovery, error });
+            }
             Event::Error(message) => {
                 tracing::warn!("{message}");
                 self.last_error = Some(message);
@@ -116,6 +129,25 @@ impl ClustersModel {
         });
     }
 
+    /// Sets the global watch mode (`cluster: None`), or a cluster's override (`mode: None`
+    /// removes it). Written to `settings.toml`; the change comes back as a settings event.
+    pub fn set_watch_mode(&mut self, cluster: Option<ClusterId>, mode: Option<WatchMode>) {
+        self.send(Command::SetWatchMode { cluster, mode });
+    }
+
+    /// Tells the core which namespaces the user filters `cluster` on, for kinds the user may not
+    /// list in all namespaces.
+    pub fn set_namespace_filter(&mut self, cluster: ClusterId, namespaces: Vec<String>) {
+        self.core.send(Command::SetNamespaceFilter {
+            cluster,
+            namespaces,
+        });
+    }
+
+    pub fn core(&self) -> &CoreHandle {
+        &self.core
+    }
+
     pub fn hide_from_ai(&mut self, cluster: ClusterId) {
         self.send(Command::SetAiExposed {
             cluster,
@@ -132,6 +164,13 @@ impl ClustersModel {
         self.settings
             .ai_exposure(&cluster.info.name, cluster.info.server.as_deref())
     }
+}
+
+/// A cluster's discovery, as the last `DiscoveryChanged` event left it.
+#[derive(Debug, Clone, Default)]
+pub struct Discovered {
+    pub discovery: Option<Arc<ClusterDiscovery>>,
+    pub error: Option<String>,
 }
 
 /// The cluster `FLINT_CLUSTER` selects: the context with exactly that name, or none.

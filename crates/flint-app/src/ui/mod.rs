@@ -6,14 +6,23 @@
 //! only").
 
 mod clusters;
-mod display;
+mod detail;
+mod list;
+mod list_model;
+mod nav;
+mod notice;
+mod object;
+mod startup;
+mod ui_state;
 mod workspace;
 
 use flint_core::CoreHandle;
 use flint_core::bootstrap::Bootstrap;
+use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
 use clusters::ClustersModel;
+use ui_state::UiState;
 use workspace::Workspace;
 
 actions!(flint, [Quit, CloseWindow]);
@@ -45,10 +54,37 @@ pub fn run(boot: Bootstrap) {
         },
     };
 
+    let startup_view = match std::env::var(startup::FLINT_VIEW) {
+        Ok(value) if !value.is_empty() => match startup::parse(&value) {
+            Some(view) if startup_cluster.is_some() => Some(view),
+            Some(_) => {
+                tracing::warn!("FLINT_VIEW is ignored without FLINT_CLUSTER");
+                None
+            }
+            None => {
+                tracing::warn!(
+                    value,
+                    "FLINT_VIEW is not kind, kind/name or namespace/kind/name"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
+    let ui_state = UiState::load(boot.config_dir.clone());
+    // A development and testing aid, for screenshots of both themes: `light` or `dark`
+    // instead of following macOS. The user-facing `appearance` setting comes with M1.5.
+    let forced_appearance = match std::env::var("FLINT_APPEARANCE").as_deref() {
+        Ok("light") => Some(ThemeMode::Light),
+        Ok("dark") => Some(ThemeMode::Dark),
+        _ => None,
+    };
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            list::init(cx);
             install_menus(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
@@ -71,7 +107,9 @@ pub fn run(boot: Bootstrap) {
                 ..Default::default()
             };
             if let Err(e) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Workspace::new(model, window, cx))
+                cx.new(|cx| {
+                    Workspace::new(model, ui_state, startup_view, forced_appearance, window, cx)
+                })
             }) {
                 tracing::error!("could not open the window: {e:#}");
                 cx.quit();

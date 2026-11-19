@@ -61,3 +61,49 @@ pub unsafe fn bootstrap() -> Result<Bootstrap, SettingsError> {
         home: std::env::home_dir(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boot(extra: Vec<PathBuf>) -> Bootstrap {
+        Bootstrap {
+            config_dir: PathBuf::from("/cfg"),
+            settings: Settings {
+                kubeconfig_paths: extra,
+                ..Default::default()
+            },
+            settings_error: Some("bad".into()),
+            path: ResolvedPath {
+                value: "/bin".into(),
+                source: env_path::PathSource::Settings,
+            },
+            kubeconfig_base: vec![PathBuf::from("/home/u/.kube/config")],
+            home: Some(PathBuf::from("/home/u")),
+        }
+    }
+
+    #[test]
+    fn the_core_watches_files_and_gets_the_startup_settings() {
+        let config = boot(Vec::new()).core_config();
+        assert!(config.watch_files);
+        assert_eq!(config.config_dir, PathBuf::from("/cfg"));
+        assert_eq!(config.settings_error.as_deref(), Some("bad"));
+        assert_eq!(
+            config.kubeconfig_base,
+            [PathBuf::from("/home/u/.kube/config")]
+        );
+    }
+
+    #[test]
+    fn extra_kubeconfig_paths_follow_the_base_files() {
+        let paths = boot(vec![PathBuf::from("~/extra.yaml")]).kubeconfig_paths();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/home/u/.kube/config"),
+                PathBuf::from("/home/u/extra.yaml")
+            ]
+        );
+    }
+}

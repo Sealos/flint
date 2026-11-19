@@ -18,7 +18,12 @@ gpui-kit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 flint-mcp.workspace = true
+# Detail view: the object as JSON, its events, and a redacted YAML rendering for Secrets.
+k8s-openapi.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+# Headless GPUI windows for view tests (`#[gpui_kit::test]`).
+gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

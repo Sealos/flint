@@ -1,7 +1,22 @@
 //! Short display forms for long kubeconfig names. The full name always stays available in a
-//! tooltip; these only decide what fits in a row.
+//! tooltip; these only decide what fits in a row. Front ends share them, so the sidebar, the
+//! command palette, and any CLI name clusters the same way.
 
 use std::path::Path;
+
+use crate::kubeconfig::ContextInfo;
+
+impl ContextInfo {
+    /// The name shown in compact lists; see [`short_name`].
+    pub fn short_name(&self) -> String {
+        short_name(&self.name)
+    }
+
+    /// The second line of a compact row; see [`subtitle`].
+    pub fn subtitle(&self) -> String {
+        subtitle(&self.name, self.server_host())
+    }
+}
 
 /// Names longer than this (about what fits in a sidebar row) are shortened in the middle, keeping
 /// both ends, since contexts in one account or project often share a long prefix and differ only

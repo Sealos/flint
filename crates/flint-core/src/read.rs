@@ -11,6 +11,7 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
 use kube::discovery::{ApiCapabilities, Discovery, Scope, verbs};
 
 use crate::cluster::ClusterError;
+use crate::paging;
 
 /// One kind found by discovery, at its group's preferred version.
 #[derive(Debug, Clone)]
@@ -38,6 +39,59 @@ impl KindInfo {
     }
     pub fn is_listable(&self) -> bool {
         self.supports(verbs::LIST)
+    }
+    /// Whether the kind supports `watch` (metrics.k8s.io, for one, does not).
+    pub fn is_watchable(&self) -> bool {
+        self.supports(verbs::WATCH)
+    }
+    /// The kind's stable identity across discovery refreshes: `plural.group` (`pods`,
+    /// `deployments.apps`), as kubectl names resources.
+    pub fn id(&self) -> KindId {
+        KindId::new(self.group(), self.plural())
+    }
+}
+
+/// A kind's identity, independent of the served version: `plural` for the core group, otherwise
+/// `plural.group` (`deployments.apps`, `widgets.example.com`). Cheap to clone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct KindId(std::sync::Arc<str>);
+
+impl KindId {
+    pub fn new(group: &str, plural: &str) -> Self {
+        if group.is_empty() {
+            KindId(plural.into())
+        } else {
+            KindId(format!("{plural}.{group}").into())
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// The plural resource name.
+    pub fn plural(&self) -> &str {
+        self.0.split_once('.').map_or(&self.0, |(p, _)| p)
+    }
+    /// The API group (empty for the core group).
+    pub fn group(&self) -> &str {
+        self.0.split_once('.').map_or("", |(_, g)| g)
+    }
+    pub fn pods() -> Self {
+        Self::new("", "pods")
+    }
+    pub fn namespaces() -> Self {
+        Self::new("", "namespaces")
+    }
+    pub fn events() -> Self {
+        Self::new("", "events")
+    }
+    pub fn custom_resource_definitions() -> Self {
+        Self::new("apiextensions.k8s.io", "customresourcedefinitions")
+    }
+}
+
+impl std::fmt::Display for KindId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -139,6 +193,27 @@ pub struct ListQuery {
     pub continue_token: Option<String>,
 }
 
+impl ListQuery {
+    /// The request parameters for this query (selectors, limit, continue token). The namespace
+    /// is part of the URL, not a parameter.
+    pub fn to_params(&self) -> ListParams {
+        let mut params = ListParams::default();
+        if let Some(s) = &self.label_selector {
+            params = params.labels(s);
+        }
+        if let Some(s) = &self.field_selector {
+            params = params.fields(s);
+        }
+        if let Some(limit) = self.limit {
+            params = params.limit(limit);
+        }
+        if let Some(token) = self.continue_token.as_deref().filter(|t| !t.is_empty()) {
+            params = params.continue_token(token);
+        }
+        params
+    }
+}
+
 /// One page of a list.
 #[derive(Debug, Clone)]
 pub struct ListPage {
@@ -164,36 +239,16 @@ pub async fn list(
     query: &ListQuery,
 ) -> Result<ListPage, ClusterError> {
     let api = dynamic_api(client, kind, query.namespace.as_deref());
-    let mut params = ListParams::default();
-    if let Some(s) = &query.label_selector {
-        params = params.labels(s);
-    }
-    if let Some(s) = &query.field_selector {
-        params = params.fields(s);
-    }
-    if let Some(limit) = query.limit {
-        params = params.limit(limit);
-    }
-    if let Some(token) = query.continue_token.as_deref().filter(|t| !t.is_empty()) {
-        params = params.continue_token(token);
-    }
-    let list = api.list(&params).await.map_err(ClusterError::kube)?;
-    let mut continue_token = list.metadata.continue_.filter(|c| !c.is_empty());
-    let mut more = continue_token.is_some();
+    let list = api
+        .list(&query.to_params())
+        .await
+        .map_err(ClusterError::kube)?;
     let mut items = list.items;
-    // Some aggregated APIs ignore `limit`; enforce it here too. The server's token (if any) would
-    // skip the objects cut here, so it is dropped.
-    if let Some(limit) = query.limit
-        && items.len() > limit as usize
-    {
-        items.truncate(limit as usize);
-        more = true;
-        continue_token = None;
-    }
+    let end = paging::enforce_limit(&mut items, query.limit, list.metadata.continue_);
     Ok(ListPage {
         items,
-        more,
-        continue_token,
+        more: end.more,
+        continue_token: end.continue_token,
     })
 }
 
@@ -214,6 +269,105 @@ pub async fn get(
         .get(name)
         .await
         .map_err(ClusterError::kube)
+}
+
+/// Events fetched for one object's detail view.
+const DETAIL_EVENTS: u32 = 200;
+
+/// One object for a detail view.
+#[derive(Debug, Clone)]
+pub struct ObjectDetail {
+    /// The full object, `metadata.managedFields` removed. `apiVersion` and `kind` are set.
+    pub object: serde_json::Value,
+    /// `object` as YAML.
+    pub yaml: String,
+    /// The `metadata.managedFields` that were removed, if the object had any. Hidden by default;
+    /// a view can put them back on request ([`with_managed_fields`]).
+    pub managed_fields: Option<serde_json::Value>,
+    /// Events whose `involvedObject.uid` is this object, newest first.
+    pub events: Vec<Event>,
+    /// More events existed than were fetched.
+    pub events_truncated: bool,
+    /// Why the events could not be read (for example, the user may get the object but not list
+    /// events). The object is still returned.
+    pub events_error: Option<String>,
+}
+
+/// A copy of `object` with `managed_fields` put back as `metadata.managedFields`.
+pub fn with_managed_fields(
+    object: &serde_json::Value,
+    managed_fields: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut copy = object.clone();
+    if let (Some(fields), Some(meta)) = (
+        managed_fields,
+        copy.get_mut("metadata").and_then(|m| m.as_object_mut()),
+    ) {
+        meta.insert("managedFields".to_owned(), fields.clone());
+    }
+    copy
+}
+
+/// Fetches one object and the events about it (matched by uid, so events of an older object
+/// with the same name are left out). `namespace` is required for namespaced kinds.
+pub async fn object_detail(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<ObjectDetail, ClusterError> {
+    let object = get(client, kind, namespace, name).await?;
+    let uid = object.metadata.uid.clone();
+    let mut value = serde_json::to_value(&object)
+        .map_err(|e| ClusterError::Kube(format!("cannot serialize the object: {e}")))?;
+    let managed_fields = value
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+        .and_then(|m| m.remove("managedFields"));
+    if value.get("apiVersion").is_none() {
+        value["apiVersion"] = kind.api_version().into();
+        value["kind"] = kind.kind().into();
+    }
+    let yaml = serde_saphyr::to_string(&value)
+        .map_err(|e| ClusterError::Kube(format!("cannot render YAML: {e}")))?;
+    let (events, events_truncated, events_error) = match uid {
+        Some(uid) => {
+            let selector = format!("involvedObject.uid={uid}");
+            let found = events(
+                client,
+                &EventQuery {
+                    // Events about cluster-scoped objects (nodes) are in some namespace
+                    // ("default" usually), so those are searched in all of them.
+                    namespace: object.metadata.namespace.clone(),
+                    involved: None,
+                    field_selector: Some(selector),
+                    fetch_limit: Some(DETAIL_EVENTS),
+                },
+            )
+            .await;
+            match found {
+                Ok((events, truncated)) => (events, truncated, None),
+                // Many roles may read an object but not list events: still show the object.
+                Err(e) => (Vec::new(), false, Some(e.to_string())),
+            }
+        }
+        None => (Vec::new(), false, None),
+    };
+    Ok(ObjectDetail {
+        object: value,
+        yaml,
+        managed_fields,
+        events,
+        events_truncated,
+        events_error,
+    })
+}
+
+/// Removes `metadata.managedFields`, which is noise in every view.
+pub fn strip_managed_fields(value: &mut serde_json::Value) {
+    if let Some(meta) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        meta.remove("managedFields");
+    }
 }
 
 /// Filters on the object an event is about, for [`events`].
@@ -243,6 +397,8 @@ pub struct EventQuery {
     /// `None` means all namespaces.
     pub namespace: Option<String>,
     pub involved: Option<InvolvedObject>,
+    /// An extra field selector, combined (AND) with `involved` (for example `involvedObject.uid=...`).
+    pub field_selector: Option<String>,
     /// Maximum events fetched from the server (in pages) before sorting. `None` means all.
     pub fetch_limit: Option<u32>,
 }
@@ -262,12 +418,15 @@ pub async fn events(
         None => Api::all(client.clone()),
     };
     let mut params = ListParams::default().limit(EVENTS_PAGE);
-    if let Some(selector) = query
+    let selectors: Vec<String> = query
         .involved
         .as_ref()
         .and_then(InvolvedObject::field_selector)
-    {
-        params = params.fields(&selector);
+        .into_iter()
+        .chain(query.field_selector.clone())
+        .collect();
+    if !selectors.is_empty() {
+        params = params.fields(&selectors.join(","));
     }
     let cap = query.fetch_limit.map_or(usize::MAX, |l| l as usize);
     let mut items: Vec<Event> = Vec::new();

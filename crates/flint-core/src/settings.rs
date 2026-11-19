@@ -124,8 +124,7 @@ impl Settings {
     }
 }
 
-/// UI state from `state.toml`. Not used by M0 beyond loading; later milestones add window layout
-/// and the last view per cluster.
+/// UI state from `state.toml`: what the window looked like, so the next start looks the same.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -133,6 +132,23 @@ pub struct State {
     pub cluster_order: Vec<String>,
     /// Clusters pinned to the top of the sidebar.
     pub pinned_clusters: BTreeSet<String>,
+    /// The namespace filter last used per cluster (context name). Missing or empty means all
+    /// namespaces.
+    pub namespace_filters: BTreeMap<String, Vec<String>>,
+    /// The kind last open per cluster (context name), as a kind id (`pods`,
+    /// `deployments.apps`). Reopened when the cluster is selected again, after a restart too.
+    pub last_views: BTreeMap<String, String>,
+    /// Pane widths the user dragged, in points. Missing means the default.
+    pub panes: PaneWidths,
+}
+
+/// Widths of the window's resizable panes, in points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneWidths {
+    pub clusters: Option<u32>,
+    pub navigation: Option<u32>,
+    pub detail: Option<u32>,
 }
 
 /// Flint's config directory, from `FLINT_CONFIG_DIR` or the macOS default.
@@ -182,6 +198,77 @@ pub fn set_ai_exposed(
     context: &str,
     server: Option<&str>,
 ) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, path| {
+        let mut current: Vec<AiExposure> = match table.get("ai_exposed_clusters") {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(|source| SettingsError::Parse {
+                    path: path.to_owned(),
+                    source,
+                })?,
+            None => Vec::new(),
+        };
+        current.retain(|e| e.context != context);
+        if let Some(server) = server {
+            current.push(AiExposure {
+                context: context.to_owned(),
+                server: server.to_owned(),
+            });
+        }
+        current.sort();
+        table.insert(
+            "ai_exposed_clusters".into(),
+            toml::Value::try_from(&current)?,
+        );
+        Ok(())
+    })
+}
+
+/// Sets the global watch mode (`cluster` is `None`), or a cluster's override (`mode` `None`
+/// removes it, so the cluster follows the global mode), and writes `settings.toml`. Returns the
+/// settings as written.
+pub fn set_watch_mode(
+    dir: &Path,
+    cluster: Option<&str>,
+    mode: Option<WatchMode>,
+) -> Result<Settings, SettingsError> {
+    let value = |m: WatchMode| toml::Value::try_from(m);
+    edit_settings(dir, |table, _| {
+        match cluster {
+            None => {
+                let mode = mode.unwrap_or_default();
+                table.insert("watch_mode".into(), value(mode)?);
+            }
+            Some(cluster) => {
+                let overrides = table
+                    .entry("cluster_watch_mode")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if !overrides.is_table() {
+                    *overrides = toml::Value::Table(toml::Table::new());
+                }
+                let overrides = overrides.as_table_mut().expect("a table");
+                match mode {
+                    Some(mode) => {
+                        overrides.insert(cluster.to_owned(), value(mode)?);
+                    }
+                    None => {
+                        overrides.remove(cluster);
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Reads `settings.toml` as a TOML table, lets `edit` change it, checks the result still parses
+/// as [`Settings`], and writes it. Keys this version does not know survive; comments and
+/// formatting are not preserved.
+fn edit_settings(
+    dir: &Path,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
+) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let mut table: toml::Table = match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
@@ -191,28 +278,7 @@ pub fn set_ai_exposed(
         Err(e) if e.kind() == io::ErrorKind::NotFound => toml::Table::new(),
         Err(source) => return Err(SettingsError::Read { path, source }),
     };
-    let mut current: Vec<AiExposure> = match table.get("ai_exposed_clusters") {
-        Some(value) => value
-            .clone()
-            .try_into()
-            .map_err(|source| SettingsError::Parse {
-                path: path.clone(),
-                source,
-            })?,
-        None => Vec::new(),
-    };
-    current.retain(|e| e.context != context);
-    if let Some(server) = server {
-        current.push(AiExposure {
-            context: context.to_owned(),
-            server: server.to_owned(),
-        });
-    }
-    current.sort();
-    table.insert(
-        "ai_exposed_clusters".into(),
-        toml::Value::try_from(&current)?,
-    );
+    edit(&mut table, &path)?;
     let text = toml::to_string_pretty(&table)?;
     let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
         path: path.clone(),
@@ -427,7 +493,43 @@ mod tests {
         let state = State {
             cluster_order: vec!["b".into(), "a".into()],
             pinned_clusters: ["a".to_owned()].into(),
+            last_views: [("kind-dev".to_owned(), "deployments.apps".to_owned())].into(),
+            panes: PaneWidths {
+                clusters: Some(180),
+                navigation: None,
+                detail: Some(520),
+            },
+            ..Default::default()
         };
+        save_state(dir.path(), &state).unwrap();
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+    }
+
+    // covers UP-25
+    #[test]
+    fn watch_mode_is_written_globally_and_per_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "future_key = 1\n").unwrap();
+        let s = set_watch_mode(dir.path(), None, Some(WatchMode::OnView)).unwrap();
+        assert_eq!(s.watch_mode, WatchMode::OnView);
+        let s = set_watch_mode(dir.path(), Some("big"), Some(WatchMode::All)).unwrap();
+        assert_eq!(s.watch_mode_for("big"), WatchMode::All);
+        assert_eq!(s.watch_mode_for("other"), WatchMode::OnView);
+        let s = set_watch_mode(dir.path(), Some("big"), None).unwrap();
+        assert_eq!(s.watch_mode_for("big"), WatchMode::OnView);
+        let loaded = load_settings(dir.path()).unwrap();
+        assert_eq!(loaded, s);
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("future_key"), "unknown keys survive: {text}");
+    }
+
+    #[test]
+    fn namespace_filters_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        state
+            .namespace_filters
+            .insert("kind-dev".into(), vec!["demo".into(), "kube-system".into()]);
         save_state(dir.path(), &state).unwrap();
         assert_eq!(load_state(dir.path()).unwrap(), state);
     }

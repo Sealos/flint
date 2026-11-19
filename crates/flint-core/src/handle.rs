@@ -4,14 +4,23 @@
 //! [`Event`]s over `async_channel` channels, which work with any executor, so a GPUI task can
 //! await them directly. Nothing here blocks the caller.
 
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::sync::{oneshot, watch};
 
 use crate::cluster::{ClusterId, ServerVersion};
+use crate::discovery::ClusterDiscovery;
 use crate::kubeconfig::ContextInfo;
 use crate::manager::ClusterManager;
-use crate::settings::Settings;
+use crate::read::{KindId, ObjectDetail};
+use crate::settings::{Settings, WatchMode};
+use crate::store::{Feed, KindSnapshot, SyncState};
+use crate::view::{self, ViewQuery};
+use crate::watch::HubRegistry;
 
 /// What the core needs to start. Usually built from [`crate::bootstrap::Bootstrap`].
 #[derive(Debug, Clone)]
@@ -46,6 +55,48 @@ pub enum Command {
     },
     /// Reload the kubeconfig files now.
     ReloadKubeconfig,
+    /// Set the watch mode and write it to `settings.toml` (ADR-0008). `cluster: None` sets the
+    /// global mode; `Some` sets that cluster's override, and `mode: None` then removes the
+    /// override. The change applies at once and arrives back as `Event::SettingsChanged`.
+    SetWatchMode {
+        cluster: Option<ClusterId>,
+        mode: Option<WatchMode>,
+    },
+    /// The namespaces the user filters `cluster` on (empty: all). When the user may not list a
+    /// kind in all namespaces, it is listed in these one by one; without a filter, in the
+    /// context's default namespace, else in every namespace the user can list. The filter
+    /// itself is applied by the front end and is not stored by the core.
+    SetNamespaceFilter {
+        cluster: ClusterId,
+        namespaces: Vec<String>,
+    },
+}
+
+/// Requests that carry a reply channel or come from a [`Subscription`].
+pub(crate) enum Request {
+    Subscribe {
+        id: u64,
+        cluster: ClusterId,
+        kind: KindId,
+    },
+    Unsubscribe {
+        id: u64,
+    },
+    FetchObject {
+        cluster: ClusterId,
+        kind: KindId,
+        namespace: Option<String>,
+        name: String,
+        reply: oneshot::Sender<Result<Arc<ObjectDetail>, String>>,
+    },
+    Discovery {
+        cluster: ClusterId,
+        reply: oneshot::Sender<Option<Arc<ClusterDiscovery>>>,
+    },
+    WatchedKinds {
+        cluster: ClusterId,
+        reply: oneshot::Sender<Vec<(KindId, Feed)>>,
+    },
 }
 
 /// Connection state of one cluster.
@@ -70,10 +121,11 @@ pub struct ClusterSummary {
 #[derive(Debug, Clone, Default)]
 pub struct ClustersSnapshot {
     pub clusters: Vec<ClusterSummary>,
-    /// Kubeconfig files that could not be read or parsed.
+    /// Kubeconfig files that could not be read or parsed. The error text may quote the file;
+    /// show it through [`crate::redact::safe_error_summary`].
     pub errors: Vec<(PathBuf, String)>,
-    /// Every kubeconfig path considered.
-    pub paths: Vec<PathBuf>,
+    /// Every kubeconfig path considered, and whether it existed when it was loaded.
+    pub paths: Vec<(PathBuf, bool)>,
 }
 
 /// Notifications from the core. Snapshots are shared and read-only.
@@ -92,6 +144,13 @@ pub enum Event {
         settings: Arc<Settings>,
         error: Option<String>,
     },
+    /// Discovery ran for a cluster: at connect, and again when its CRDs change. On failure,
+    /// `error` is set and `discovery` holds the previous result, if any.
+    DiscoveryChanged {
+        cluster: ClusterId,
+        discovery: Option<Arc<ClusterDiscovery>>,
+        error: Option<String>,
+    },
     /// A problem worth showing that is not tied to one cluster's connection.
     Error(String),
 }
@@ -105,7 +164,11 @@ const CORE_WORKER_THREADS: usize = 4;
 #[derive(Clone)]
 pub struct CoreHandle {
     commands: async_channel::Sender<Command>,
+    requests: async_channel::Sender<Request>,
     events: async_channel::Receiver<Event>,
+    hubs: HubRegistry,
+    next_subscription: Arc<AtomicU64>,
+    runtime: tokio::runtime::Handle,
     _runtime: Arc<RuntimeGuard>,
 }
 
@@ -118,13 +181,123 @@ impl CoreHandle {
             .enable_all()
             .build()?;
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (req_tx, req_rx) = async_channel::unbounded();
         let (event_tx, event_rx) = async_channel::unbounded();
-        runtime.spawn(ClusterManager::new(config, event_tx).run(cmd_rx));
+        let hubs = HubRegistry::default();
+        runtime.spawn(ClusterManager::new(config, event_tx, hubs.clone()).run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
+            requests: req_tx,
             events: event_rx,
+            hubs,
+            next_subscription: Arc::new(AtomicU64::new(1)),
+            runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })
+    }
+
+    /// Opens a live list of `kind` on `cluster`. While the subscription lives, the kind is
+    /// watched whenever the cluster is active, in both watch modes. The first
+    /// [`Subscription::changed`] resolves at once; later ones at most about every 100 ms, however
+    /// fast the cluster changes. Dropping the subscription closes it. Never blocks.
+    pub fn subscribe(&self, cluster: &str, kind: &KindId) -> Subscription {
+        let (hub, mut rx) = self.hubs.subscribe(cluster, kind);
+        rx.mark_changed();
+        // A running watch publishes what it held back while nobody listened.
+        hub.wake.notify_one();
+        let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let _ = self.requests.try_send(Request::Subscribe {
+            id,
+            cluster: cluster.to_owned(),
+            kind: kind.clone(),
+        });
+        Subscription {
+            id,
+            cluster: cluster.to_owned(),
+            kind: kind.clone(),
+            rx: Some(rx),
+            requests: self.requests.clone(),
+        }
+    }
+
+    /// Fetches one object (managedFields removed, rendered as YAML too) and the events about
+    /// it, for a detail view. The future works on any executor and fails if the cluster is not
+    /// connected or does not serve `kind`.
+    pub fn fetch_object(
+        &self,
+        cluster: &str,
+        kind: &KindId,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> impl Future<Output = Result<Arc<ObjectDetail>, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::FetchObject {
+            cluster: cluster.to_owned(),
+            kind: kind.clone(),
+            namespace: namespace.map(str::to_owned),
+            name: name.to_owned(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err("the core is not running".to_owned());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
+    }
+
+    /// The cluster's current discovery results (navigation and kinds), if discovery has run.
+    /// The same value also arrives as [`Event::DiscoveryChanged`]; this serves views that open
+    /// later. Works on any executor.
+    pub fn discovery(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Option<Arc<ClusterDiscovery>>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::Discovery {
+            cluster: cluster.to_owned(),
+            reply,
+        });
+        async move { rx.await.ok().flatten() }
+    }
+
+    /// The kinds of `cluster` being watched (or polled) right now, sorted. For status displays
+    /// ("watching 52 kinds") and tests. Works on any executor.
+    pub fn watched_kinds(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Vec<(KindId, Feed)>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::WatchedKinds {
+            cluster: cluster.to_owned(),
+            reply,
+        });
+        async move { rx.await.unwrap_or_default() }
+    }
+
+    /// The sync state of each kind of `cluster` that is watched, polled or subscribed right now,
+    /// sorted by kind, read without subscribing (so it never starts a watch in On view mode).
+    /// For status displays such as the navigation's per-kind markers. Takes a short lock and
+    /// never waits on core work, so the UI thread may call it.
+    pub fn sync_states(&self, cluster: &str) -> Vec<(KindId, SyncState)> {
+        self.hubs.states(cluster)
+    }
+
+    /// Runs [`view::compute`] (namespace filter, text filter, sort) on the core's threads, so a
+    /// list of 10,000 rows never stalls the UI thread. Resolves to indexes into
+    /// `snapshot.rows`. Works on any executor.
+    pub fn compute_view(
+        &self,
+        snapshot: Arc<KindSnapshot>,
+        query: ViewQuery,
+    ) -> impl Future<Output = Arc<[u32]>> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        self.runtime.spawn_blocking(move || {
+            let rows = view::compute(&snapshot, &query, crate::table::unix_now());
+            let _ = tx.send(Arc::<[u32]>::from(rows));
+        });
+        async move { rx.await.unwrap_or_else(|_| Arc::from(Vec::new())) }
     }
 
     /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
@@ -140,6 +313,72 @@ impl CoreHandle {
     }
 }
 
+/// A live list of one kind on one cluster, from [`CoreHandle::subscribe`].
+///
+/// The core publishes immutable snapshots; this only ever holds the newest, so a slow reader
+/// skips intermediate states instead of queueing them. Dropping it unsubscribes.
+pub struct Subscription {
+    id: u64,
+    cluster: ClusterId,
+    kind: KindId,
+    /// `None` only while dropping, so the receiver is gone before the manager hears about it.
+    rx: Option<watch::Receiver<Arc<KindSnapshot>>>,
+    requests: async_channel::Sender<Request>,
+}
+
+impl Subscription {
+    fn rx(&self) -> &watch::Receiver<Arc<KindSnapshot>> {
+        self.rx.as_ref().expect("set until drop")
+    }
+
+    fn rx_mut(&mut self) -> &mut watch::Receiver<Arc<KindSnapshot>> {
+        self.rx.as_mut().expect("set until drop")
+    }
+
+    /// The cluster this subscription lists.
+    pub fn cluster(&self) -> &str {
+        &self.cluster
+    }
+
+    /// The kind this subscription lists.
+    pub fn kind(&self) -> &KindId {
+        &self.kind
+    }
+
+    /// Waits until a snapshot newer than the last one read with [`Subscription::latest`] is
+    /// published. Returns `false` once the core has stopped. Works on any executor.
+    pub async fn changed(&mut self) -> bool {
+        self.rx_mut().changed().await.is_ok()
+    }
+
+    /// The newest snapshot, marking it as seen.
+    pub fn latest(&mut self) -> Arc<KindSnapshot> {
+        self.rx_mut().borrow_and_update().clone()
+    }
+
+    /// The newest snapshot, without marking it as seen.
+    pub fn peek(&self) -> Arc<KindSnapshot> {
+        self.rx().borrow().clone()
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // Drop the receiver first: the manager releases the hub only when nobody listens.
+        self.rx = None;
+        let _ = self.requests.try_send(Request::Unsubscribe { id: self.id });
+    }
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("cluster", &self.cluster)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
 struct RuntimeGuard(Option<tokio::runtime::Runtime>);
 
 impl Drop for RuntimeGuard {
@@ -149,5 +388,68 @@ impl Drop for RuntimeGuard {
         if let Some(rt) = self.0.take() {
             rt.shutdown_background();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn start(dir: &std::path::Path) -> CoreHandle {
+        CoreHandle::start(CoreConfig {
+            config_dir: dir.to_owned(),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_subscription_resolves_at_once_and_releases_its_hub_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let mut sub = core.subscribe("nowhere", &KindId::pods());
+        assert_eq!(sub.cluster(), "nowhere");
+        tokio::time::timeout(Duration::from_secs(5), sub.changed())
+            .await
+            .expect("the first change resolves at once");
+        assert_eq!(sub.latest().state, SyncState::Idle);
+        assert_eq!(core.sync_states("nowhere").len(), 1);
+        drop(sub);
+        // The manager releases the hub once it hears about the drop.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !core.sync_states("nowhere").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("hub released");
+    }
+
+    #[tokio::test]
+    async fn requests_for_an_unknown_cluster_answer_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let err = core
+            .fetch_object("nowhere", &KindId::pods(), Some("ns"), "p")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not connected"), "{err}");
+        assert!(core.discovery("nowhere").await.is_none());
+        assert!(core.watched_kinds("nowhere").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compute_view_runs_off_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let rows = core
+            .compute_view(Arc::new(KindSnapshot::default()), ViewQuery::default())
+            .await;
+        assert!(rows.is_empty());
     }
 }

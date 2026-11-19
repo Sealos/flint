@@ -13,32 +13,9 @@ pub const REDACTED: &str = "<redacted>";
 #[cfg(test)]
 const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
-/// Secret annotations whose values are shown. Every other annotation value on a Secret is
-/// redacted, because tools store whole objects in annotations (kubectl last-applied, kapp,
-/// Rancher), and those copies include the Secret's values.
-const SAFE_SECRET_ANNOTATIONS: &[&str] = &[
-    "kubernetes.io/service-account.name",
-    "kubernetes.io/service-account.uid",
-    "meta.helm.sh/release-name",
-    "meta.helm.sh/release-namespace",
-];
+pub use flint_core::redact::{is_safe_secret_annotation, is_safe_secret_column, redact_quoted};
 
-/// Default and maximum for a caller-supplied size.
-#[derive(Debug, Clone, Copy)]
-pub struct Bound {
-    pub default: u32,
-    pub max: u32,
-}
-
-impl Bound {
-    /// The requested size, or the default, capped at the maximum. Zero means the default.
-    pub fn clamp(self, requested: Option<u32>) -> u32 {
-        match requested {
-            None | Some(0) => self.default,
-            Some(n) => n.min(self.max),
-        }
-    }
-}
+pub use flint_core::paging::Bound;
 
 pub const OBJECTS: Bound = Bound {
     default: 100,
@@ -54,6 +31,9 @@ pub const LOG_LINES: Bound = Bound {
 };
 /// Byte cap on log output, so a few huge lines cannot flood the agent.
 pub const LOG_BYTES: usize = 256 * 1024;
+/// Byte cap on the rows of one list_resources result, so long printer-column cells cannot
+/// flood the agent.
+pub const LIST_BYTES: usize = 256 * 1024;
 /// Byte cap on one object's YAML.
 pub const OBJECT_BYTES: usize = 256 * 1024;
 
@@ -148,33 +128,6 @@ pub fn exposed_cluster<'a>(
         .ok_or_else(|| PolicyError::ClusterNotFound(name.to_owned()))
 }
 
-/// Replaces every double-quoted and backquoted string in `text` with `"…"`. Kubeconfig error
-/// messages can quote a value from the file ("invalid type: string \"...\"", "unknown variant
-/// `...`"), which may be a credential.
-pub fn redact_quoted(text: &str) -> String {
-    redact_between(&redact_between(text, '"'), '`')
-}
-
-fn redact_between(text: &str, quote: char) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut parts = text.split(quote);
-    if let Some(first) = parts.next() {
-        out.push_str(first);
-    }
-    let mut inside = true;
-    for part in parts {
-        if inside {
-            out.push(quote);
-            out.push('…');
-        } else {
-            out.push(quote);
-            out.push_str(part);
-        }
-        inside = !inside;
-    }
-    out
-}
-
 /// Makes an object safe to show: removes `metadata.managedFields` and redacts Secret values.
 /// Works on single objects and on lists (`items`).
 pub fn sanitize(value: &mut Value) {
@@ -183,31 +136,9 @@ pub fn sanitize(value: &mut Value) {
             sanitize(item);
         }
     }
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-    let is_secret = obj.get("kind").and_then(Value::as_str) == Some("Secret")
-        && obj.get("apiVersion").and_then(Value::as_str) == Some("v1");
-    if let Some(meta) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
-        meta.remove("managedFields");
-        if is_secret
-            && let Some(annotations) = meta.get_mut("annotations").and_then(Value::as_object_mut)
-        {
-            for (key, v) in annotations.iter_mut() {
-                if !SAFE_SECRET_ANNOTATIONS.contains(&key.as_str()) {
-                    *v = Value::String(REDACTED.into());
-                }
-            }
-        }
-    }
-    if is_secret {
-        for field in ["data", "stringData"] {
-            if let Some(map) = obj.get_mut(field).and_then(Value::as_object_mut) {
-                for v in map.values_mut() {
-                    *v = Value::String(REDACTED.into());
-                }
-            }
-        }
+    flint_core::read::strip_managed_fields(value);
+    if flint_core::redact::is_secret_object(value) {
+        flint_core::redact::mask_secret(value, REDACTED);
     }
 }
 

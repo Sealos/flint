@@ -341,8 +341,28 @@ fn mcp_over_stdio() {
     assert!(kinds["count"].as_u64().unwrap() > 20);
 
     let pods = server.call_json("list_resources", args(EXPOSED));
-    let items = pods["items"].as_array().unwrap();
+    let items = pods["rows"].as_array().unwrap();
     assert!(items.len() >= 3, "{pods}");
+    // Table columns, as kubectl get prints them, with the age computed.
+    let columns: Vec<&str> = pods["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        &columns[..6],
+        ["Name", "Namespace", "Ready", "Status", "Restarts", "Age"],
+        "{pods}"
+    );
+    assert_eq!(items[0]["cells"][1], "demo", "{pods}");
+    assert!(
+        items[0]["cells"][5]
+            .as_str()
+            .unwrap()
+            .ends_with(['s', 'm', 'h', 'd']),
+        "{pods}"
+    );
     assert_eq!(pods["truncated"], false);
     let web_pod = items
         .iter()
@@ -360,7 +380,7 @@ fn mcp_over_stdio() {
             json!({"cluster": EXPOSED, "kind": "Pod", "namespace": "demo", "limit": 1, "continue": token}),
         );
         assert_eq!(page["count"], 1, "{page}");
-        paged.push(page["items"][0]["name"].as_str().unwrap().to_owned());
+        paged.push(page["rows"][0]["name"].as_str().unwrap().to_owned());
         token = page["continue"].as_str().map(str::to_owned);
         assert_eq!(page["truncated"], token.is_some(), "{page}");
         if token.is_none() {
@@ -382,7 +402,7 @@ fn mcp_over_stdio() {
         "list_resources",
         json!({"cluster": EXPOSED, "kind": "secrets", "namespace": "demo", "label_selector": "owner=helm,name=podinfo"}),
     );
-    let secret_name = secrets["items"]
+    let secret_name = secrets["rows"]
         .as_array()
         .unwrap()
         .iter()
@@ -403,6 +423,22 @@ fn mcp_over_stdio() {
         !yaml.lines().any(|l| l.len() > 200),
         "a long value was not redacted"
     );
+
+    // Secret Table rows: type and key count only, never a value.
+    let all_secrets = server.call_json(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "secrets", "namespace": "demo"}),
+    );
+    let text = all_secrets.to_string();
+    assert!(text.contains(APPLIED_SECRET), "{text}");
+    assert!(!text.contains(APPLIED_VALUE), "{text}");
+    let secret_columns: Vec<&str> = all_secrets["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(secret_columns, ["Name", "Namespace", "Type", "Data", "Age"]);
 
     let (is_error, yaml) = server.call(
         "get_resource",
