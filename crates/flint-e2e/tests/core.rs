@@ -122,7 +122,13 @@ async fn connects_and_discovers_every_recorded_kind() {
         .await
         .unwrap();
     assert_eq!(version.git_version, server.fixtures().version["gitVersion"]);
-    let kinds = read::discover_kinds(&client).await.unwrap();
+    let found = read::discover_kinds(&client).await.unwrap();
+    assert!(
+        found.skipped_groups.is_empty(),
+        "{:?}",
+        found.skipped_groups
+    );
+    let kinds = found.kinds;
     let find = |group: &str, plural: &str| {
         kinds
             .iter()
@@ -140,11 +146,63 @@ async fn connects_and_discovers_every_recorded_kind() {
         assert_eq!(kind.resource.version, gvr.version, "{gvr}");
     }
 
-    // The same through the core, as the app connects.
+    // The same through the core, as the app connects. Short names come from the recorded
+    // aggregated discovery, so what users type resolves.
     let core = Core::start(&server, None).await;
     let discovery = core.handle.discovery(CONTEXT).await.expect("discovery");
     assert!(discovery.kind(&KindId::pods()).is_some());
     assert!(!discovery.navigation.sections.is_empty());
+    let deploy = discovery.resolve("deploy").unwrap();
+    assert_eq!((deploy.group(), deploy.plural()), ("apps", "deployments"));
+    assert_eq!(discovery.resolve("po").unwrap().plural(), "pods");
+    assert_eq!(
+        discovery.resolve("gdg").unwrap().group(),
+        "fixtures.flint.dev"
+    );
+    assert_eq!(
+        discovery.nav_entry("deploy").unwrap().id,
+        KindId::new("apps", "deployments")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_falls_back_per_group_only_when_aggregated_is_unsupported() {
+    let server = FakeApiServer::start().await.unwrap();
+    let client = server.client().await.unwrap();
+    let discovery_requests = |server: &FakeApiServer| {
+        server
+            .requests()
+            .into_iter()
+            .filter(|r| r.verb == Verb::Discovery)
+            .count()
+    };
+    // A server error is not "unsupported": discovery fails, no fallback.
+    server.inject(Fault::status(500).verb(Verb::Discovery).times(1));
+    let err = read::discover_kinds(&client).await.unwrap_err();
+    assert_eq!(err.to_string(), "InternalError: injected fault: 500");
+    assert_eq!(discovery_requests(&server), 1);
+
+    // A 404 for aggregated discovery means "unsupported": the per-group fallback runs. The fake
+    // server records no legacy discovery, so that fails too, but it was reached.
+    server.inject(Fault::status(404).verb(Verb::Discovery).times(1));
+    assert!(read::discover_kinds(&client).await.is_err());
+    let after: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.verb == Verb::Discovery)
+        .skip(1)
+        .collect();
+    assert!(after.len() >= 2, "{after:?}");
+    assert!(after[1..].iter().all(|r| r.status == Some(404)));
+
+    // Without faults aggregated discovery works again.
+    assert!(
+        !read::discover_kinds(&client)
+            .await
+            .unwrap()
+            .kinds
+            .is_empty()
+    );
 }
 
 // covers UP-20, UP-23
@@ -152,7 +210,7 @@ async fn connects_and_discovers_every_recorded_kind() {
 async fn lists_tables_with_columns_and_pages() {
     let server = FakeApiServer::start().await.unwrap();
     let client = server.client().await.unwrap();
-    let kinds = read::discover_kinds(&client).await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap().kinds;
     let kind = |plural: &str| kinds.iter().find(|k| k.plural() == plural).unwrap();
 
     let deployments = table::list_table(
@@ -378,7 +436,7 @@ async fn forbidden_lists_fail_or_fall_back_to_the_default_namespace() {
 
     // A one-shot list reports the refusal.
     let client = server.client().await.unwrap();
-    let kinds = read::discover_kinds(&client).await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap().kinds;
     let node_kind = kinds.iter().find(|k| k.plural() == "nodes").unwrap();
     let err = table::list_table(&client, node_kind, &ListQuery::default())
         .await
@@ -422,7 +480,7 @@ async fn forbidden_lists_fail_or_fall_back_to_the_default_namespace() {
 async fn custom_resources_show_their_printer_columns() {
     let server = FakeApiServer::start().await.unwrap();
     let client = server.client().await.unwrap();
-    let kinds = read::discover_kinds(&client).await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap().kinds;
     let gadgets = kinds
         .iter()
         .find(|k| k.group() == "fixtures.flint.dev" && k.plural() == "gadgets")
