@@ -1972,10 +1972,14 @@ dependencies = [
 name = "flint-app"
 version = "0.1.1"
 dependencies = [
+ "async-channel",
  "flint-core",
  "flint-mcp",
  "gpui-kit",
+ "image",
  "k8s-openapi",
+ "kube",
+ "libc",
  "serde",
  "serde-saphyr 2.2.0",
  "serde_json",

@@ -153,3 +153,43 @@ pub fn pods(rows: &[(&str, &str, i64)]) -> Arc<KindSnapshot> {
         ..Default::default()
     })
 }
+
+/// Gives `alpha` a navigation with Pods, as if its discovery had arrived.
+#[cfg(feature = "automation")]
+pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
+    use flint_core::{ClusterDiscovery, KindInfo};
+
+    use super::clusters::Discovered;
+
+    // Built from a kind, as real discovery is, so the core resolver (`OpenView`, FLINT_VIEW)
+    // finds `pods` and `po` too.
+    let pods = KindInfo {
+        resource: kube::discovery::ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            plural: "pods".into(),
+        },
+        namespaced: true,
+        verbs: ["get", "list", "watch"].map(String::from).to_vec(),
+        singular: "pod".into(),
+        short_names: vec!["po".into()],
+    };
+    let discovery = ClusterDiscovery::new(vec![pods]);
+    assert!(
+        discovery.nav_entry("pods").is_ok(),
+        "stub discovery must list Pods in the navigation"
+    );
+    t.model.update(cx, |model, cx| {
+        model.discovery.insert(
+            "alpha".into(),
+            Discovered {
+                discovery: Some(Arc::new(discovery)),
+                error: None,
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+}

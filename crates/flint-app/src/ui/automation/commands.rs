@@ -1,0 +1,614 @@
+//! Runs automation commands against the window, through the same paths as user input:
+//! registered actions for clicks and menu items, keystrokes for typing. Nothing here calls the
+//! core.
+
+use std::fs::OpenOptions;
+use std::io::{Cursor, Write as _};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use flint_core::redact::safe_error_summary;
+use gpui_kit::*;
+use serde_json::{Value, json};
+
+use super::super::registry::{self, ActionError, Visibility};
+use super::super::workspace::Workspace;
+use super::keys;
+use super::protocol::{self, Command, Error, ErrorCode};
+use super::setup;
+
+/// How often `wait_for` looks at the state again.
+const POLL: Duration = Duration::from_millis(50);
+/// The most text `type_text` takes, and how much it types between yields to the app.
+pub const MAX_TEXT: usize = 4096;
+const TEXT_CHUNK: usize = 64;
+/// Before a screenshot, the window draws this many frames this far apart, so layout settles and
+/// short animations (a tab underline, a dialog) finish: about half a second.
+const SCREENSHOT_FRAMES: u32 = 15;
+const FRAME: Duration = Duration::from_millis(33);
+
+/// The window commands act on.
+#[derive(Clone)]
+pub struct Target {
+    pub window: AnyWindowHandle,
+    pub workspace: Entity<Workspace>,
+    /// Where screenshots are written.
+    pub screenshots: PathBuf,
+}
+
+/// Answers one request line with one response line.
+pub async fn handle_line(line: &str, target: &Target, cx: &mut AsyncApp) -> String {
+    match protocol::parse(line) {
+        Err((id, error)) => protocol::response(id, Err(error)),
+        Ok((id, command)) => protocol::response(id, run(command, target, cx).await),
+    }
+}
+
+async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
+    match command {
+        // The registry's guards refuse an unknown cluster, a kind the cluster does not serve, or
+        // a row not in the list as shown, before anything is dispatched.
+        Command::SelectCluster { cluster } => {
+            dispatch(
+                target,
+                cx,
+                "workspace::SelectCluster",
+                json!({ "cluster": cluster }),
+            )
+            .await
+        }
+        Command::OpenView { kind } => {
+            dispatch(target, cx, "workspace::OpenView", json!({ "kind": kind })).await
+        }
+        Command::SelectRow { namespace, name } => {
+            dispatch(
+                target,
+                cx,
+                "resource_list::SelectRow",
+                json!({ "namespace": namespace, "name": name }),
+            )
+            .await
+        }
+        Command::DispatchAction { name, args } => dispatch(target, cx, &name, args).await,
+        Command::TypeText { text } => type_text(target, cx, &text).await,
+        Command::PressKey { key } => {
+            let handled = in_window(target, cx, |window, cx| {
+                Keystroke::parse_with_os(&key, cx.platform_info().os)
+                    .map(|k| window.dispatch_keystroke(keys::with_shift(k), cx))
+            })?
+            .map_err(|e| Error::new(ErrorCode::InvalidArgs, format!("press_key: {e}")))?;
+            settle(target, cx).await;
+            Ok(json!({"handled": handled}))
+        }
+        Command::State => state(target, cx),
+        Command::Actions => actions(target, cx),
+        Command::WaitFor {
+            predicate,
+            timeout_ms,
+        } => {
+            // The executor's clock, so tests can advance it.
+            let executor = cx.background_executor().clone();
+            let deadline = executor.now() + Duration::from_millis(timeout_ms);
+            loop {
+                let state = state(target, cx)?;
+                if predicate.holds(&state) {
+                    return Ok(state);
+                }
+                if executor.now() >= deadline {
+                    return Err(Error::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "{} did not match within {timeout_ms} ms: {}",
+                            predicate.pointer(),
+                            predicate.observed(&state)
+                        ),
+                    )
+                    .with_data(state));
+                }
+                executor.timer(POLL).await;
+            }
+        }
+        Command::Screenshot { name } => screenshot(target, cx, name).await,
+    }
+}
+
+/// Types `text` one keystroke per character, a chunk at a time, letting the app run between
+/// chunks.
+async fn type_text(target: &Target, cx: &mut AsyncApp, text: &str) -> Result<Value, Error> {
+    if text.len() > MAX_TEXT {
+        return Err(Error::new(
+            ErrorCode::InvalidArgs,
+            format!("type_text takes at most {MAX_TEXT} bytes"),
+        ));
+    }
+    let strokes = keys::keystrokes(text);
+    let mut handled = 0;
+    for chunk in strokes.chunks(TEXT_CHUNK) {
+        handled += in_window(target, cx, |window, cx| {
+            chunk
+                .iter()
+                .filter(|k| window.dispatch_keystroke((*k).clone(), cx))
+                .count()
+        })?;
+        cx.background_executor().timer(Duration::ZERO).await;
+    }
+    settle(target, cx).await;
+    Ok(json!({"keystrokes": strokes.len(), "handled": handled}))
+}
+
+/// Draws the settled window and writes it as a PNG under the screenshots directory: a new file
+/// only (never through a link, never over another file), mode 0600.
+async fn screenshot(
+    target: &Target,
+    cx: &mut AsyncApp,
+    name: Option<String>,
+) -> Result<Value, Error> {
+    let file = match name {
+        Some(name) => {
+            setup::screenshot_file(&name).map_err(|e| Error::new(ErrorCode::InvalidArgs, e))?
+        }
+        None => {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            format!("screenshot-{millis}.png")
+        }
+    };
+    let path = target.screenshots.join(&file);
+    if path.symlink_metadata().is_ok() {
+        return Err(Error::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "{} exists; screenshots never replace a file",
+                path.display()
+            ),
+        ));
+    }
+    for _ in 0..SCREENSHOT_FRAMES {
+        settle(target, cx).await;
+        cx.background_executor().timer(FRAME).await;
+    }
+    settle(target, cx).await;
+    let image = in_window(target, cx, |window, _| window.render_to_image())?
+        .map_err(|e| failed("could not render the window", &e.to_string()))?;
+    let (width, height) = image.dimensions();
+    let job_path = path.clone();
+    cx.background_spawn(async move {
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(std::io::Error::other)?;
+        write_new_file(&job_path, &png)
+    })
+    .await
+    .map_err(|e| failed("could not save the screenshot", &e.to_string()))?;
+    Ok(json!({"path": path, "width": width, "height": height}))
+}
+
+/// Writes a new file, mode 0600: `O_CREAT|O_EXCL|O_NOFOLLOW`, so it never follows a link or
+/// replaces a file already there.
+fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .write_all(bytes)
+}
+
+/// The registered actions, with what they take and whether they would run now.
+fn actions(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
+    in_window(target, cx, |window, cx| {
+        let actions: Vec<Value> = registry::actions()
+            .iter()
+            .map(|spec| {
+                json!({
+                    "name": spec.name,
+                    "label": spec.label,
+                    "description": spec.description,
+                    "category": format!("{:?}", spec.category),
+                    "palette": spec.visibility == Visibility::Palette,
+                    "args": spec.args.iter().map(|a| json!({
+                        "name": a.name,
+                        "description": a.description,
+                        "required": a.required,
+                        "kind": format!("{:?}", a.kind),
+                    })).collect::<Vec<_>>(),
+                    "shortcut": spec.shortcut(cx),
+                    "enabled": spec.is_enabled(cx),
+                    "available": spec.is_available(window, cx),
+                })
+            })
+            .collect();
+        json!({ "actions": actions })
+    })
+}
+
+async fn dispatch(
+    target: &Target,
+    cx: &mut AsyncApp,
+    name: &str,
+    args: Value,
+) -> Result<Value, Error> {
+    in_window(target, cx, |window, cx| {
+        registry::dispatch(name, args, window, cx)
+    })?
+    .map_err(action_error)?;
+    settle(target, cx).await;
+    Ok(json!({"dispatched": name}))
+}
+
+/// Draws the window now, so the next command sees what this one did: an action can move focus
+/// to a view that exists only once drawn, and until then GPUI dispatches from the window's root,
+/// past the views. Drawing here, as GPUI does before handling a key, also works while the window
+/// is hidden or the screen is locked, when no frames come on their own.
+async fn settle(target: &Target, cx: &mut AsyncApp) {
+    let _ = in_window(target, cx, |window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+}
+
+fn action_error(error: ActionError) -> Error {
+    let code = match &error {
+        ActionError::Unknown(_) => ErrorCode::NotFound,
+        ActionError::InvalidArgs { .. } => ErrorCode::InvalidArgs,
+        ActionError::NotAvailable(_) => ErrorCode::NotAvailable,
+        ActionError::Rejected { .. } => ErrorCode::Rejected,
+    };
+    Error::new(code, error.to_string())
+}
+
+/// The visible view tree as JSON.
+fn state(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
+    let state = with_workspace(target, cx, |ws, window, cx| ws.view_state(window, cx))?;
+    serde_json::to_value(state).map_err(|e| failed("could not serialize the state", &e.to_string()))
+}
+
+fn in_window<R>(
+    target: &Target,
+    cx: &mut AsyncApp,
+    f: impl FnOnce(&mut Window, &mut App) -> R,
+) -> Result<R, Error> {
+    target
+        .window
+        .update(cx, |_, window, cx| f(window, cx))
+        .map_err(|_| Error::new(ErrorCode::Failed, "the window is closed"))
+}
+
+fn with_workspace<R>(
+    target: &Target,
+    cx: &mut AsyncApp,
+    f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) -> R,
+) -> Result<R, Error> {
+    let workspace = target.workspace.clone();
+    in_window(target, cx, |window, cx| {
+        workspace.update(cx, |ws, cx| f(ws, window, cx))
+    })
+}
+
+/// An error from outside our own code (I/O, rendering), summarized as the UI would show it.
+fn failed(what: &str, error: &str) -> Error {
+    Error::new(
+        ErrorCode::Failed,
+        format!("{what}: {}", safe_error_summary(error)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestAppContextExt as _;
+    use serde_json::{Value, json};
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    use super::{Target, handle_line, write_new_file};
+    use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods, serve_pods};
+
+    fn target(t: &TestWorkspace, screenshots: &std::path::Path) -> Target {
+        Target {
+            window: t.window,
+            workspace: t.workspace.clone(),
+            screenshots: screenshots.to_owned(),
+        }
+    }
+
+    async fn ask(cx: &mut TestAppContext, target: &Target, request: Value) -> Value {
+        let mut async_cx = cx.to_async();
+        let line = handle_line(&request.to_string(), target, &mut async_cx).await;
+        assert!(!line.contains('\n'));
+        serde_json::from_str(&line).unwrap()
+    }
+
+    // Commands drive the window the way a user does, and `state` shows the result.
+    #[gpui_kit::test]
+    async fn commands_drive_the_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let (window, model) = (t.window, t.model.clone());
+        let target = Target {
+            window,
+            workspace: t.workspace.clone(),
+            screenshots: dir.path().to_owned(),
+        };
+
+        let state = ask(cx, &target, json!({"id": 1, "cmd": "state"})).await;
+        assert_eq!(state["id"], 1);
+        assert_eq!(state["ok"], true);
+        let result = &state["result"];
+        assert_eq!(result["main"], json!({"view": "no_cluster"}));
+        assert_eq!(result["active_cluster"], Value::Null);
+        let names: Vec<&str> = result["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alpha", "beta"]);
+
+        let selected = ask(
+            cx,
+            &target,
+            json!({"id": 2, "cmd": "select_cluster", "args": {"cluster": "beta"}}),
+        )
+        .await;
+        assert_eq!(selected["ok"], true, "{selected}");
+        let active = model.clone();
+        cx.wait_for(window, WAIT, move |_, cx| {
+            active.read(cx).active.as_deref() == Some("beta")
+        })
+        .await;
+        let waited = ask(
+            cx,
+            &target,
+            json!({"id": 3, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "beta"}}),
+        )
+        .await;
+        assert_eq!(waited["ok"], true, "{waited}");
+        assert_eq!(waited["result"]["clusters"][1]["active"], true);
+
+        // Errors name what is wrong, with the request's id.
+        let cases = [
+            (
+                json!({"id": 4, "cmd": "select_cluster", "args": {"cluster": "gamma"}}),
+                "rejected",
+            ),
+            (
+                json!({"id": 5, "cmd": "open_view", "args": {"kind": "pods"}}),
+                "rejected",
+            ),
+            (
+                json!({"id": 6, "cmd": "select_row", "args": {"name": "web"}}),
+                "not_available",
+            ),
+            (
+                json!({"id": 7, "cmd": "dispatch_action", "args": {"name": "detail::Close"}}),
+                "not_available",
+            ),
+            (
+                json!({"id": 8, "cmd": "dispatch_action", "args": {"name": "x::Y"}}),
+                "not_found",
+            ),
+            (
+                json!({"id": 9, "cmd": "press_key", "args": {"key": "not-a-key-"}}),
+                "invalid_args",
+            ),
+            (
+                json!({"id": 10, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "alpha", "timeout_ms": 0}}),
+                "timeout",
+            ),
+        ];
+        for (request, code) in cases {
+            let id = request["id"].clone();
+            let response = ask(cx, &target, request).await;
+            assert_eq!(response["id"], id);
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["error"]["code"], code, "{response}");
+        }
+
+        // Keys go through the window's key handling.
+        let typed = ask(
+            cx,
+            &target,
+            json!({"id": 11, "cmd": "type_text", "args": {"text": "ab"}}),
+        )
+        .await;
+        assert_eq!(typed["result"]["keystrokes"], 2, "{typed}");
+        let pressed = ask(
+            cx,
+            &target,
+            json!({"id": 12, "cmd": "press_key", "args": {"key": "escape"}}),
+        )
+        .await;
+        assert_eq!(pressed["ok"], true, "{pressed}");
+    }
+
+    // open_view, select_row and dispatch_action succeed over the channel, as clicks would.
+    #[gpui_kit::test]
+    async fn view_and_row_commands_succeed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let target = target(&t, dir.path());
+        let ok = |response: &Value| response["ok"] == true;
+
+        let selected = ask(
+            cx,
+            &target,
+            json!({"cmd": "select_cluster", "args": {"cluster": "alpha"}}),
+        )
+        .await;
+        assert!(ok(&selected), "{selected}");
+        // The core reports the activation asynchronously; the guards follow the workspace.
+        let workspace = t.workspace.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            workspace.read(cx).view_state_cluster() == Some("alpha")
+        })
+        .await;
+        serve_pods(cx, &t);
+        let opened = ask(
+            cx,
+            &target,
+            json!({"cmd": "open_view", "args": {"kind": "pods"}}),
+        )
+        .await;
+        assert!(ok(&opened), "{opened}");
+        // Rows by hand: the test cluster never answers.
+        let list = t
+            .workspace
+            .read_with(cx, |ws, _| ws.list().cloned())
+            .unwrap();
+        list.update(cx, |list, cx| {
+            list.stop_watching();
+            list.set_snapshot(pods(&[("demo", "api", 0), ("demo", "web", 1)]), cx);
+        });
+        let shown = ask(
+            cx,
+            &target,
+            json!({"cmd": "wait_for", "args": {"pointer": "/list/rows", "any": {"name": "web", "cells_by_column": {"Restarts": "1"}}}}),
+        )
+        .await;
+        assert!(ok(&shown), "{shown}");
+        let row = ask(
+            cx,
+            &target,
+            json!({"cmd": "select_row", "args": {"namespace": "demo", "name": "web"}}),
+        )
+        .await;
+        assert!(ok(&row), "{row}");
+        let yaml = ask(
+            cx,
+            &target,
+            json!({"cmd": "dispatch_action", "args": {"name": "detail::ShowYaml"}}),
+        )
+        .await;
+        assert!(ok(&yaml), "{yaml}");
+        let state = ask(cx, &target, json!({"cmd": "state"})).await;
+        assert_eq!(state["result"]["detail"]["name"], "web");
+        assert_eq!(state["result"]["detail"]["tab"], "yaml");
+
+        // `actions` says what is available now and why not.
+        let actions = ask(cx, &target, json!({"cmd": "actions"})).await;
+        let find = |name: &str| {
+            actions["result"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(find("detail::Close")["available"], true);
+        assert_eq!(find("resource_list::ToggleWide")["enabled"], false);
+        assert!(find("resource_list::FocusFilter")["shortcut"].is_string());
+    }
+
+    // wait_for polls on the app's clock until the state matches.
+    #[gpui_kit::test]
+    async fn wait_for_polls_until_the_state_matches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let waiting = {
+            let target = target(&t, dir.path());
+            cx.spawn(async move |mut cx| {
+                handle_line(
+                    &json!({"id": 1, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "beta", "timeout_ms": 5000}}).to_string(),
+                    &target,
+                    &mut cx,
+                )
+                .await
+            })
+        };
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        t.model.update(cx, |m, _| m.activate("beta".into()));
+        let workspace = t.workspace.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            workspace.read(cx).view_state_cluster() == Some("beta")
+        })
+        .await;
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let response: Value = serde_json::from_str(&waiting.await).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+    }
+
+    #[gpui_kit::test]
+    async fn screenshot_names_stay_in_the_screenshots_directory(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let target = target(&t, dir.path());
+        for name in ["../escape", "/tmp/x", "a/b"] {
+            let response = ask(
+                cx,
+                &target,
+                json!({"cmd": "screenshot", "args": {"name": name}}),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], "invalid_args", "{response}");
+        }
+        let response = ask(
+            cx,
+            &target,
+            json!({"cmd": "screenshot", "args": {"path": "/tmp/x.png"}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], "invalid_args", "{response}");
+    }
+
+    #[test]
+    fn screenshots_are_new_private_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        write_new_file(&path, b"png").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Never over an existing file, never through a link.
+        assert!(write_new_file(&path, b"again").is_err());
+        let link = dir.path().join("link.png");
+        std::os::unix::fs::symlink(dir.path().join("target.png"), &link).unwrap();
+        assert!(write_new_file(&link, b"x").is_err());
+        assert!(!dir.path().join("target.png").exists());
+    }
+
+    #[gpui_kit::test]
+    async fn text_is_capped(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let target = target(&t, dir.path());
+        let long = "a".repeat(super::MAX_TEXT + 1);
+        let response = ask(
+            cx,
+            &target,
+            json!({"cmd": "type_text", "args": {"text": long}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], "invalid_args", "{response}");
+    }
+
+    // A timeout says what it saw, and carries the state.
+    #[gpui_kit::test]
+    async fn timeouts_explain_a_mistyped_pointer(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        let target = target(&t, dir.path());
+        let response = ask(
+            cx,
+            &target,
+            json!({"cmd": "wait_for", "args": {"pointer": "/kubeconfig/load", "exists": true, "timeout_ms": 0}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], "timeout");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(
+                "no value at /kubeconfig/load; /kubeconfig has keys [env, loaded, paths]"
+            ),
+            "{message}"
+        );
+        assert_eq!(response["error"]["data"]["kubeconfig"]["loaded"], true);
+    }
+}

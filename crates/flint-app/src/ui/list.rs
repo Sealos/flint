@@ -976,6 +976,10 @@ impl Render for ResourceList {
 #[path = "list_actions.rs"]
 mod actions;
 
+#[cfg(any(test, feature = "automation"))]
+#[path = "list_state.rs"]
+mod state;
+
 #[cfg(test)]
 #[path = "list_tests.rs"]
 mod tests;

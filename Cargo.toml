@@ -36,6 +36,8 @@ serde_json = "1.0.154"
 http = "1.5.0"
 # kube 5.1 parses kubeconfig with serde-saphyr; reuse the same YAML implementation for output.
 serde-saphyr = "=2.2.0"
+# Already in the tree through GPUI; writes automation screenshots as PNG (test builds only).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Terminal emulation for exec sessions (the grid model Zed and Alacritty use). No serde.
 alacritty_terminal = { version = "0.26.0", default-features = false }
@@ -69,3 +71,11 @@ lto = "thin"
 resvg = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 gpui-pre = { opt-level = 3 }
+# PNG encoding for automation screenshots (test builds): a 2560x1490 capture takes about 0.4 s
+# instead of 0.9 s.
+image = { opt-level = 3 }
+"png@0.18.1" = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+"miniz_oxide@0.8.9" = { opt-level = 3 }
+crc32fast = { opt-level = 3 }
+simd-adler32 = { opt-level = 3 }

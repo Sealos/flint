@@ -35,24 +35,79 @@ perform a registered action; `scripts/check-click-actions.sh` enforces this in C
 
 ### Automation channel
 
-A test-only control socket lets e2e tests and agents drive the real app.
+A test-only control socket lets e2e tests and agents drive the real app. The code is in
+`crates/flint-app/src/ui/automation/`.
 
-- **Built only with `--features automation`.** Release builds contain no automation code. CI's release-build job checks
-  that the symbol is absent.
-- **Socket location:** a Unix socket in `FLINT_CONFIG_DIR`, readable and writable only by its owner (mode `0600`). The
-  app refuses to start the channel when `FLINT_CONFIG_DIR` is not set, so it never uses the user's real config.
-- **Protocol:** newline-delimited JSON. A request is `{"id", "cmd", "args"}`. Commands:
-  - `select_cluster`
-  - `open_view`
-  - `select_row`
-  - `dispatch_action` (any registered action, such as menu items or palette commands)
-  - `type_text`
-  - `press_key`
-  - `state` (returns the visible view tree as JSON: views, rows, banners, focus)
-  - `wait_for` (a predicate on `state`, with a timeout)
-  - `screenshot` (captures the app window)
+- **Test builds only.** Built only with `--features automation`, and only without `--release` (a `compile_error!`
+  refuses both together). CI's `macos (flint-app)` job runs flint-app's clippy and tests with the feature, and checks
+  that its release binary has none of the channel's strings (the binary is stripped, so there are no symbols to look
+  for).
+- **Where it may run.** Before anything starts, the app checks, and exits with code 3 and a reason if any check fails,
+  so a harness fails fast instead of waiting for a socket:
+  - `FLINT_CONFIG_DIR` is set, is not the real config directory, belongs to the user and is not writable by group or
+    others. It is created with mode `0700` when missing.
+  - `KUBECONFIG` is set, so the app never falls back to `~/.kube/config`.
+  - The socket path, `$FLINT_CONFIG_DIR/automation.sock`, fits macOS's limit of 103 bytes (`sun_path` is 104 with its
+    NUL), so keep `FLINT_CONFIG_DIR` short (`mktemp -d` is fine).
+  - No other Flint is serving on that socket. A stale socket nobody answers on is replaced.
+- **The socket.** Mode `0600`. It is bound in a fresh private directory (`mkdtemp`, `0700`) and moved into place with
+  link and unlink, so nobody can connect before its mode is set and an existing file is never replaced. Connections from
+  another user are refused. On quit the app removes it, if it is still the one it made.
+- **Protocol:** newline-delimited JSON. A request is `{"id", "cmd", "args"}`; `id` is echoed back and `args` may be
+  left out when a command takes none. A response is `{"id", "ok": true, "result"}` or
+  `{"id", "ok": false, "error": {"code", "message", "data"?}}`, with `code` one of `bad_request`, `unknown_command`,
+  `invalid_args`, `not_found` (no such action), `not_available` (nothing handles it now, or it is disabled),
+  `rejected` (available, but the arguments would do nothing: an unknown cluster, kind, row or column), `timeout`,
+  `failed`. At most 16 requests are in flight at once; more get `failed` at once. Commands:
+  - `select_cluster {cluster}`: the sidebar click.
+  - `open_view {kind}`: the navigation click. `kind` matches like `FLINT_VIEW`: `pods`, `deployments.apps`.
+  - `select_row {namespace?, name}`: the row click, among the rows passing the filters.
+  - These three dispatch `workspace::SelectCluster`, `workspace::OpenView` and `resource_list::SelectRow`, so the
+    registry's guards check them exactly as they check a click.
+  - `dispatch_action {name, args?}`: any registered action by name (`workspace::SetNamespaces`, `detail::ShowYaml`,
+    `flint::AppearanceDark`), and any other GPUI action, such as the dialog's `ui::Confirm`. With nothing focused it
+    dispatches from the workspace, as a click would.
+  - `actions`: every registered action with its label, arguments (and their kinds), shortcut, and whether it is
+    `enabled` and `available` now. Ask it when a dispatch says `not_available`.
+  - `type_text {text}`: one keystroke per character (Shift for capitals and shifted symbols), to the focused element.
+    At most 4 KiB.
+  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `cmd-w`, `?`).
+  - `state`: the visible view tree: `focus`, `dialog` (`{title, text, buttons}` while one is open), `appearance`,
+    `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`), sidebar `banners`, `active_cluster`,
+    `main`, `header` (with `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the entries of open ones),
+    `list` (columns as drawn and up to 500 rows in display order, each with `cells` and `cells_by_column`, Secret cells
+    masked, with its `banners` and `placeholder`) and `detail` (which object, tab, fetch state, and its sections with
+    entry counts; never values). Errors in it are sanitized summaries.
+  - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` every 50 ms, on the app's clock, until the value at a
+    JSON Pointer passes one test, and returns that state. Tests: `equals`, `not_equals`, `at_least`, `at_most`
+    (numbers, or an array's length), `exists`, `contains` (a substring, or an array element matching), and `any` (an
+    array element matching an object). An object matches when every field it gives matches, so
+    `{"pointer": "/list/rows", "any": {"name": "web-1", "cells_by_column": {"Status": "Running"}}}` waits for a running
+    row. Default timeout 5 s, at most 120 s. A timeout says what it saw (for a pointer that leads nowhere, the keys
+    where it stopped) and carries the last state in `error.data`. A `wait_for` holds its connection until it ends: to
+    act meanwhile, use a second connection.
+  - `screenshot {name?}`: draws the window for about half a second (so layout and short animations settle), renders
+    it offscreen to a PNG named `name` (a plain file name; `.png` is added; a timestamp when left out), and returns
+    its path and size in pixels. It goes in `$FLINT_AUTOMATION_SCREENSHOTS` when set (an absolute, existing directory
+    the harness owns), else in `$FLINT_CONFIG_DIR/screenshots/`. The file is new (never replacing one, never through
+    a link) and mode `0600`. Offscreen rendering needs no screen-recording permission and works while the screen is
+    locked.
+- Commands that act draw the window before they return (as GPUI does before handling a key), so the next command
+  sees the new focus and views even while the window is hidden. They do not wait for data: follow them with
+  `wait_for`.
 - The automation channel calls the same code paths as clicks and keys, never shortcuts into the core. Otherwise a
-  passing e2e test proves nothing about the UI.
+  passing e2e test proves nothing about the UI. It reaches controls through the action registry
+  (`crates/flint-app/src/ui/registry.rs`), where every interactive control is a named action; the command palette
+  uses the same registry. Test builds open dialogs without their entrance animation.
+
+Try it by hand:
+
+```sh
+cargo build -p flint-app --features automation
+export FLINT_CONFIG_DIR=$(mktemp -d)
+KUBECONFIG=.dev/kubeconfig FLINT_CLUSTER=kind-flint-dev target/debug/flint &
+echo '{"id":1,"cmd":"open_view","args":{"kind":"pods"}}' | nc -U "$FLINT_CONFIG_DIR/automation.sock"
+```
 
 ### E2E harness: `crates/flint-e2e`
 
@@ -161,7 +216,7 @@ namespaces left by other tests are not.
 |---|---|---|
 | `test (<crate>)` | Linux | Unit tests for `flint-core`, `flint-mcp` and `flint-e2e` (the fake API server and its tests), one job per crate |
 | `linux (flint-app)` | Linux | The app's clippy and view tests on GPUI's Linux backend (headless test platform, no display). Flint ships for macOS only; this is a cheap second check |
-| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, and a release build. The only CI job that needs macOS |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. The only CI job that needs macOS |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 | `app-e2e` | macOS | `flint-e2e` app tests against the fake API server. Uploads screenshots (light and dark) as artifacts |
 

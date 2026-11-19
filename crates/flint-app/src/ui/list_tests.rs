@@ -480,6 +480,50 @@ async fn registered_actions_drive_the_list(cx: &mut TestAppContext) {
     );
 }
 
+// The list's part of the automation `state`: rows as drawn, in order, with the selection.
+#[gpui_kit::test]
+async fn view_state_reports_the_rows_as_drawn(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let state = list.read_with(cx, |list, _| list.view_state());
+    assert_eq!(state.placeholder, Some("loading"));
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(
+                &[("demo", "api", 0), ("demo", "web", 2)],
+                SyncState::Synced,
+                1,
+            ),
+            cx,
+        )
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-web").is_some()
+    })
+    .await;
+    list.update(cx, |list, cx| {
+        list.select_when_listed(Some("demo".into()), "web".into(), cx)
+    });
+    cx.run_until_parked();
+    let state = list.read_with(cx, |list, _| list.view_state());
+    assert_eq!(state.sync, "live");
+    assert_eq!((state.total, state.shown), (2, 2));
+    assert_eq!(state.placeholder, None);
+    assert_eq!(state.columns, ["Name", "Namespace", "Restarts"]);
+    let rows: Vec<(&str, bool, &str)> = state
+        .rows
+        .iter()
+        .map(|r| (r.name.as_str(), r.selected, r.cells[2].as_str()))
+        .collect();
+    assert_eq!(rows, [("api", false, "0"), ("web", true, "2")]);
+    let row = |name: &str| crate::ui::registry::SelectRow {
+        namespace: Some("demo".into()),
+        name: name.into(),
+    };
+    assert!(list.read_with(cx, |list, _| list.check_select_row(&row("api")).is_ok()));
+    assert!(list.read_with(cx, |list, _| list.check_select_row(&row("nope")).is_err()));
+}
+
 /// A quick measure of what one frame of a 10,000-row list costs on the UI thread (layout and
 /// paint of the visible rows, in the headless test window). Ignored: run it in release mode
 /// with `--ignored --nocapture` to compare changes to the row rendering.
