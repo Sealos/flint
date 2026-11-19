@@ -16,7 +16,7 @@ use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
 use crate::exec::{ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
-use crate::logs::{LogLines, LogOptions, LogSearch, LogSnapshot, LogTarget};
+use crate::logs::{LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget};
 use crate::manager::ClusterManager;
 use crate::read::{KindId, ObjectDetail};
 use crate::settings::{Appearance, Settings, WatchMode};
@@ -111,7 +111,7 @@ pub(crate) enum Request {
     OpenLogs {
         id: u64,
         cluster: ClusterId,
-        target: LogTarget,
+        subject: LogSubject,
         options: LogOptions,
         snapshots: watch::Sender<Arc<LogSnapshot>>,
         paused: watch::Receiver<bool>,
@@ -327,12 +327,23 @@ impl CoreHandle {
         async move { rx.await.unwrap_or_else(|_| Arc::from(Vec::new())) }
     }
 
-    /// Opens a log session: streams `target`'s log on `cluster` into a ring buffer of
+    /// Opens a log session: streams the log of `subject` on `cluster` into a ring buffer of
     /// [`crate::Settings::log_buffer_limit`] lines and [`crate::Settings::log_buffer_bytes`]
     /// bytes, reconnecting when the stream drops. The
     /// session keeps running when another cluster becomes active, until the returned
     /// [`LogSession`] is dropped. Snapshots arrive at most about every 100 ms. Never blocks.
-    pub fn open_logs(&self, cluster: &str, target: LogTarget, options: LogOptions) -> LogSession {
+    ///
+    /// `subject` is a pod's container ([`LogTarget`]) or a workload's pods
+    /// ([`crate::WorkloadTarget`]): every container of every matching pod, merged into one
+    /// buffer with each line tagged by pod and container, following pods as they come and go
+    /// (see [`crate::PodSetStatus`] for the streams' states).
+    pub fn open_logs(
+        &self,
+        cluster: &str,
+        subject: impl Into<LogSubject>,
+        options: LogOptions,
+    ) -> LogSession {
+        let subject = subject.into();
         let (snapshots, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
         rx.mark_changed();
         let (paused, paused_rx) = watch::channel(false);
@@ -340,7 +351,7 @@ impl CoreHandle {
         let _ = self.requests.try_send(Request::OpenLogs {
             id,
             cluster: cluster.to_owned(),
-            target: target.clone(),
+            subject: subject.clone(),
             options: options.clone(),
             snapshots,
             paused: paused_rx,
@@ -348,7 +359,7 @@ impl CoreHandle {
         LogSession {
             id,
             cluster: cluster.to_owned(),
-            target,
+            subject,
             options,
             rx,
             paused,
@@ -482,7 +493,7 @@ impl std::fmt::Debug for Subscription {
 pub struct LogSession {
     id: u64,
     cluster: ClusterId,
-    target: LogTarget,
+    subject: LogSubject,
     options: LogOptions,
     rx: watch::Receiver<Arc<LogSnapshot>>,
     paused: watch::Sender<bool>,
@@ -495,8 +506,17 @@ impl LogSession {
         &self.cluster
     }
 
-    pub fn target(&self) -> &LogTarget {
-        &self.target
+    /// What the session reads.
+    pub fn subject(&self) -> &LogSubject {
+        &self.subject
+    }
+
+    /// The pod container a pod session reads; `None` for a workload session.
+    pub fn target(&self) -> Option<&LogTarget> {
+        match &self.subject {
+            LogSubject::Pod(target) => Some(target),
+            LogSubject::Workload(_) => None,
+        }
     }
 
     pub fn options(&self) -> &LogOptions {
@@ -542,7 +562,7 @@ impl std::fmt::Debug for LogSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogSession")
             .field("cluster", &self.cluster)
-            .field("target", &self.target)
+            .field("subject", &self.subject)
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
@@ -624,7 +644,8 @@ mod tests {
         };
         let mut session = core.open_logs("nowhere", target.clone(), LogOptions::default());
         assert_eq!(session.cluster(), "nowhere");
-        assert_eq!(session.target(), &target);
+        assert_eq!(session.target(), Some(&target));
+        assert_eq!(session.subject(), &LogSubject::Pod(target.clone()));
         assert!(session.options().follow);
         let ended = tokio::time::timeout(Duration::from_secs(5), async {
             loop {

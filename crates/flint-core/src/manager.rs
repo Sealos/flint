@@ -19,7 +19,7 @@ use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
-use crate::logs::{self, KubeLogSource, LogError, SessionConfig};
+use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::read::{self, KindId, KindInfo};
 use crate::settings::{self, Settings};
 use crate::store::{KindSnapshot, SyncState};
@@ -352,7 +352,7 @@ impl ClusterManager {
             Request::OpenLogs {
                 id,
                 cluster,
-                target,
+                subject,
                 options,
                 snapshots,
                 paused,
@@ -381,10 +381,14 @@ impl ClusterManager {
                     self.settings.log_buffer_limit(),
                     self.settings.log_buffer_bytes(),
                 );
-                let source = Arc::new(KubeLogSource::new(lookup));
-                let task = tokio::spawn(logs::run(
-                    source, target, options, config, snapshots, paused,
-                ));
+                let feed = logs::feed(
+                    subject,
+                    options,
+                    &config,
+                    Arc::new(KubeLogSource::new(lookup.clone())),
+                    Arc::new(KubePodSource::new(lookup)),
+                );
+                let task = tokio::spawn(logs::run(feed, config, snapshots, paused));
                 self.log_sessions.retain(|_, t| !t.is_finished());
                 self.log_sessions.insert(id, task);
             }
@@ -843,12 +847,12 @@ impl ClusterManager {
     /// opened against) ends the session.
     fn log_client(&mut self, cluster: &str, server: Option<&str>) -> Result<Client, LogError> {
         let Some(slot) = self.clusters.iter().find(|c| c.info.name == cluster) else {
-            return Err(LogError::fatal(format!(
+            return Err(LogError::cluster(format!(
                 "\"{cluster}\" is no longer in your kubeconfig files"
             )));
         };
         if slot.info.server.as_deref() != server {
-            return Err(LogError::fatal(format!(
+            return Err(LogError::cluster(format!(
                 "\"{cluster}\" now points to a different API server; open the logs again to read \
                  from it"
             )));
@@ -1376,7 +1380,7 @@ mod tests {
         );
     }
 
-    // covers UP-06, UP-40
+    // covers UP-06, UP-40, UP-45
     #[test]
     fn a_log_session_never_reconnects_to_a_re_pointed_context() {
         let (events, _rx) = async_channel::unbounded();
@@ -1398,19 +1402,23 @@ mod tests {
             .log_client("dev", Some("https://dev"))
             .err()
             .expect("no client");
-        assert!(!same.fatal, "the same server is retried: {}", same.message);
+        assert!(
+            !same.is_fatal(),
+            "the same server is retried: {}",
+            same.message
+        );
         let moved = manager
             .log_client("dev", Some("https://old"))
             .err()
             .expect("no client");
-        assert!(moved.fatal);
+        assert!(moved.is_cluster(), "it ends a workload session too");
         assert!(
             moved.message.contains("different API server"),
             "{}",
             moved.message
         );
         let gone = manager.log_client("other", None).err().expect("no client");
-        assert!(gone.fatal);
+        assert!(gone.is_cluster());
     }
 
     // covers UP-24
