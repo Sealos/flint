@@ -27,3 +27,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused clocks for timeout tests (`Builder::start_paused`).
+tokio = { workspace = true, features = ["test-util"] }
