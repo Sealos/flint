@@ -24,7 +24,7 @@ async fn dev_source() -> (Arc<KubeSource>, Vec<KindInfo>) {
         cluster::connect_and_check(&loaded.merged, context, Duration::from_secs(30))
             .await
             .unwrap();
-    let kinds = read::discover_kinds(&client).await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap().kinds;
     (KubeSource::new(client, Some(&version)), kinds)
 }
 

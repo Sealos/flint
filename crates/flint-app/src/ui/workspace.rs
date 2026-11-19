@@ -34,7 +34,7 @@ use super::registry::{
     RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
     WatchAllKinds, WatchOpenViewsOnly,
 };
-use super::startup::{self, StartupView};
+use super::startup::StartupView;
 use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
@@ -427,24 +427,26 @@ impl Workspace {
                 .flat_map(|s| s.entries.iter())
         };
         if let Some(view) = self.startup_view.take() {
-            let wanted = &view.kind;
-            let entry = entries()
-                .find(|e| e.id.as_str() == wanted)
-                .or_else(|| entries().find(|e| startup::kind_matches(e.id.as_str(), wanted)))
-                .cloned();
-            match entry {
-                Some(entry) => {
-                    self.open_kind(&entry, window, cx);
-                    if let (Some(list), Some(name)) = (&self.list, view.name) {
-                        list.update(cx, |list, cx| {
-                            list.select_when_listed(view.namespace, name, cx)
-                        });
-                    }
+            // Names as kubectl takes them (`deploy`, `po`, `Deployment.apps`), resolved by the
+            // same core resolver as the MCP server.
+            let entry = match discovery.nav_entry(&view.kind) {
+                Ok(entry) => Some(entry.clone()),
+                Err(e @ flint_core::NavEntryError::Unresolved(_)) => {
+                    tracing::warn!(kind = view.kind, "FLINT_VIEW names no kind: {e}");
+                    None
                 }
-                None => tracing::warn!(
-                    kind = view.kind,
-                    "FLINT_VIEW names a kind this cluster does not serve"
-                ),
+                Err(e @ flint_core::NavEntryError::NotInNavigation(_)) => {
+                    tracing::warn!(kind = view.kind, "FLINT_VIEW cannot be opened: {e}");
+                    None
+                }
+            };
+            if let Some(entry) = entry {
+                self.open_kind(&entry, window, cx);
+                if let (Some(list), Some(name)) = (&self.list, view.name) {
+                    list.update(cx, |list, cx| {
+                        list.select_when_listed(view.namespace, name, cx)
+                    });
+                }
             }
         } else if let Some(entry) = self
             .ui_state

@@ -22,7 +22,6 @@ use super::super::registry::{
     ToggleNamespace, ToggleNavSection, ToggleSecretValue, ToggleWide, UseDefaultWatchMode,
     WatchAllKinds, WatchOpenViewsOnly,
 };
-use super::super::startup;
 use super::super::ui_state;
 use super::{Pane, Workspace, confirm_expose};
 
@@ -338,23 +337,13 @@ impl Workspace {
         }
     }
 
-    /// The active cluster's navigation entry for `kind`: an exact id, or a plural without its
-    /// group.
+    /// The active cluster's navigation entry for `kind`, named as `kubectl get` takes it (Kind,
+    /// plural, singular or short name, optionally `.group`), through the core resolver.
     pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
         let model = self.model.read(cx);
         let active = model.active.as_ref()?;
         let discovery = model.discovery.get(active)?.discovery.as_ref()?;
-        let entries = || {
-            discovery
-                .navigation
-                .sections
-                .iter()
-                .flat_map(|s| s.entries.iter())
-        };
-        entries()
-            .find(|e| e.id.as_str() == kind)
-            .or_else(|| entries().find(|e| startup::kind_matches(e.id.as_str(), kind)))
-            .cloned()
+        discovery.nav_entry(kind).ok().cloned()
     }
 
     fn set_namespaces(&mut self, action: &SetNamespaces, _: &mut Window, cx: &mut Context<Self>) {

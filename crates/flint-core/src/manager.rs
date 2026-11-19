@@ -146,7 +146,7 @@ enum Internal {
     Discovered {
         cluster: ClusterId,
         attempt: u64,
-        result: Result<Vec<KindInfo>, String>,
+        result: Result<read::DiscoveredKinds, String>,
     },
     CrdsChanged {
         cluster: ClusterId,
@@ -495,6 +495,7 @@ impl ClusterManager {
     /// Runs discovery for a connected cluster unless it is already running.
     fn start_discovery(&mut self, id: &str) {
         let internal = self.internal_tx.clone();
+        let target = cluster::Target::of(&self.kubeconfig.merged, id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
@@ -512,7 +513,7 @@ impl ClusterManager {
         tokio::spawn(async move {
             let result = read::discover_kinds(&client)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.for_target(&target).to_string());
             let _ = internal.send(Internal::Discovered {
                 cluster,
                 attempt,
@@ -698,8 +699,25 @@ impl ClusterManager {
                 slot.discovering = false;
                 let again = std::mem::take(&mut slot.rediscover);
                 let mut retry = false;
+                let mut partial = false;
                 let error = match result {
-                    Ok(kinds) => {
+                    Ok(found) => {
+                        // Groups that failed this time keep the kinds (and watches) they had,
+                        // and discovery is retried with backoff until they answer again.
+                        let mut kinds = found.kinds;
+                        if !found.skipped_groups.is_empty() {
+                            partial = true;
+                            tracing::warn!(
+                                cluster,
+                                groups = ?found.skipped_groups,
+                                "discovery skipped API groups; keeping their previous kinds"
+                            );
+                            kinds = keep_skipped_groups(
+                                kinds,
+                                slot.discovery.as_deref(),
+                                &found.skipped_groups,
+                            );
+                        }
                         let served: HashSet<KindId> = kinds.iter().map(KindInfo::id).collect();
                         let behind = slot.crds.iter().any(|k| !served.contains(k))
                             || slot.removed_crds.iter().any(|k| served.contains(k));
@@ -719,7 +737,7 @@ impl ClusterManager {
                 };
                 // A failed discovery is retried with backoff while the cluster is active;
                 // selecting the cluster again also retries it (see `activate`).
-                let failed_retry = if error.is_some() {
+                let failed_retry = if error.is_some() || partial {
                     let delay = DISCOVERY_RETRY
                         .saturating_mul(2u32.saturating_pow(slot.discovery_failures.min(6)))
                         .min(DISCOVERY_RETRY_MAX);
@@ -1246,9 +1264,79 @@ fn crd_fingerprint(snapshot: &KindSnapshot) -> u64 {
     hasher.finish()
 }
 
+/// `kinds` plus, for each group in `skipped`, the kinds `previous` discovery had in it, so a
+/// group that failed once (a flapping aggregated API) does not lose its navigation and watches.
+fn keep_skipped_groups(
+    mut kinds: Vec<KindInfo>,
+    previous: Option<&ClusterDiscovery>,
+    skipped: &[String],
+) -> Vec<KindInfo> {
+    if let Some(previous) = previous {
+        kinds.extend(
+            previous
+                .kinds
+                .iter()
+                .filter(|k| skipped.iter().any(|g| g == k.group()))
+                .cloned(),
+        );
+        // Same order as discovery: core first, then by group and kind.
+        kinds.sort_by(|a, b| {
+            (!a.group().is_empty(), a.group(), a.kind()).cmp(&(
+                !b.group().is_empty(),
+                b.group(),
+                b.kind(),
+            ))
+        });
+    }
+    kinds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // covers UP-20, UP-22
+    #[test]
+    fn skipped_groups_keep_their_previous_kinds() {
+        use crate::discovery::tests::kind;
+        let lw = &["get", "list", "watch"];
+        let previous = ClusterDiscovery::new(vec![
+            kind("", "Pod", "pods", true, lw),
+            kind(
+                "metrics.k8s.io",
+                "PodMetrics",
+                "pods",
+                true,
+                &["get", "list"],
+            ),
+            kind("example.com", "Widget", "widgets", true, lw),
+        ]);
+        let now = vec![
+            kind("", "Pod", "pods", true, lw),
+            kind("example.com", "Gadget", "gadgets", true, lw),
+        ];
+        let ids = |kinds: Vec<KindInfo>| -> Vec<String> {
+            kinds.iter().map(|k| k.id().to_string()).collect()
+        };
+        assert_eq!(
+            ids(keep_skipped_groups(
+                now.clone(),
+                Some(&previous),
+                &["metrics.k8s.io".to_owned()]
+            )),
+            ["pods", "gadgets.example.com", "pods.metrics.k8s.io"]
+        );
+        // A group that answered replaces its old kinds (widgets is gone), and without an
+        // earlier discovery nothing is added.
+        assert_eq!(
+            ids(keep_skipped_groups(
+                now,
+                None,
+                &["metrics.k8s.io".to_owned()]
+            )),
+            ["pods", "gadgets.example.com"]
+        );
+    }
 
     fn context(namespace: Option<&str>) -> ContextInfo {
         ContextInfo {

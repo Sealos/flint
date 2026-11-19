@@ -4,11 +4,16 @@
 //! These functions apply no policy. Callers decide limits, redaction, and who may see what (the
 //! MCP server does this in `flint-mcp`; the UI will use these directly).
 
-use futures::AsyncReadExt as _;
+use std::future::Future;
+use std::time::Duration;
+
+use futures::{AsyncReadExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::{Event, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResourceList;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
-use kube::discovery::{ApiCapabilities, Discovery, Scope, verbs};
+use kube::core::discovery::v2::APIGroupDiscovery;
+use kube::discovery::verbs;
 
 use crate::cluster::ClusterError;
 use crate::paging;
@@ -19,6 +24,10 @@ pub struct KindInfo {
     pub resource: ApiResource,
     pub namespaced: bool,
     pub verbs: Vec<String>,
+    /// The singular resource name (`deployment`). Empty when discovery did not give one.
+    pub singular: String,
+    /// The short names discovery suggests (`deploy`, `po`, `svc`), as kubectl accepts them.
+    pub short_names: Vec<String>,
 }
 
 impl KindInfo {
@@ -95,54 +104,260 @@ impl std::fmt::Display for KindId {
     }
 }
 
+/// How long each discovery request may take. A server that does not answer fails discovery
+/// after this, instead of after kube's 30 s connection timeout.
+pub const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the whole of discovery may take (many groups on a slow server, without aggregated
+/// discovery).
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Group discovery requests in flight at once, without aggregated discovery.
+const DISCOVERY_CONCURRENCY: usize = 8;
+
+/// What [`discover_kinds`] found.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredKinds {
+    /// Every kind found, core kinds first, then by group and kind.
+    pub kinds: Vec<KindInfo>,
+    /// API groups whose discovery failed and that are missing from `kinds` (an aggregated API
+    /// whose backend is down, often metrics.k8s.io). Sorted. Only servers without aggregated
+    /// discovery report these; aggregated discovery lists such groups as stale instead.
+    pub skipped_groups: Vec<String>,
+}
+
 /// Runs API discovery and returns every kind, CRDs included, at each group's preferred version.
-/// Core kinds come first. Uses aggregated discovery when the server supports it (1.30+), which
-/// needs two requests instead of one per group version.
-pub async fn discover_kinds(client: &Client) -> Result<Vec<KindInfo>, ClusterError> {
-    let discovery = match Discovery::new(client.clone()).run_aggregated().await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::debug!(error = %e, "aggregated discovery failed, falling back");
-            Discovery::new(client.clone())
-                .run()
-                .await
-                .map_err(ClusterError::kube)?
+/// Uses aggregated discovery when the server supports it (1.30+, beta from 1.26), which needs two
+/// requests instead of one per group.
+///
+/// Falls back to one request per group only when the server does not support aggregated
+/// discovery, never because the server could not be reached. Each request is bounded by
+/// [`DISCOVERY_REQUEST_TIMEOUT`] and the whole by [`DISCOVERY_TIMEOUT`]; a timeout is a
+/// [`ClusterError::Timeout`] (pass it through [`ClusterError::for_target`] to name the server).
+///
+/// Discovery is read here rather than through `kube::Discovery`, which drops the singular and
+/// short names that [`resolve_kind`] matches (`deploy`, `po`, `svc`).
+pub async fn discover_kinds(client: &Client) -> Result<DiscoveredKinds, ClusterError> {
+    discover_kinds_within(client, DISCOVERY_REQUEST_TIMEOUT, DISCOVERY_TIMEOUT).await
+}
+
+async fn discover_kinds_within(
+    client: &Client,
+    per_request: Duration,
+    overall: Duration,
+) -> Result<DiscoveredKinds, ClusterError> {
+    let discover = async {
+        match discover_aggregated(client, per_request).await? {
+            Some(kinds) => Ok(DiscoveredKinds {
+                kinds,
+                skipped_groups: Vec::new(),
+            }),
+            None => {
+                tracing::debug!("no aggregated discovery, discovering each group");
+                discover_per_group(client, per_request).await
+            }
         }
     };
-    let mut kinds: Vec<KindInfo> = discovery
-        .groups()
-        .flat_map(|g| g.recommended_resources())
-        .map(|(resource, caps)| kind_info(resource, &caps))
-        .collect();
-    // `Discovery` keeps groups in a map; put the core group first, then sort by group and kind.
-    kinds.sort_by(|a, b| {
+    let mut found = tokio::time::timeout(overall, discover)
+        .await
+        .unwrap_or_else(|_| Err(ClusterError::timeout(overall, None)))?;
+    // Put the core group first, then sort by group and kind.
+    found.kinds.sort_by(|a, b| {
         (!a.group().is_empty(), a.group(), a.kind()).cmp(&(
             !b.group().is_empty(),
             b.group(),
             b.kind(),
         ))
     });
-    Ok(kinds)
+    Ok(found)
 }
 
-fn kind_info(resource: ApiResource, caps: &ApiCapabilities) -> KindInfo {
-    KindInfo {
-        resource,
-        namespaced: caps.scope == Scope::Namespaced,
-        verbs: caps.operations.clone(),
+/// One discovery request, bounded by `limit`. The outer error is the timeout; the inner one is
+/// kube's, kept so the caller can tell "not supported" from "failed".
+async fn bounded<T>(
+    limit: Duration,
+    request: impl Future<Output = Result<T, kube::Error>>,
+) -> Result<Result<T, kube::Error>, ClusterError> {
+    tokio::time::timeout(limit, request)
+        .await
+        .map_err(|_| ClusterError::timeout(limit, None))
+}
+
+/// [`bounded`], with kube's error converted too.
+async fn bounded_request<T>(
+    limit: Duration,
+    request: impl Future<Output = Result<T, kube::Error>>,
+) -> Result<T, ClusterError> {
+    bounded(limit, request).await?.map_err(ClusterError::kube)
+}
+
+/// Whether an aggregated discovery request failed because the server does not offer it: no such
+/// path (404), the media type refused (406), or a body that is not the aggregated document.
+fn aggregated_not_supported(err: &kube::Error) -> bool {
+    match err {
+        kube::Error::Api(status) => matches!(status.code, 404 | 406),
+        kube::Error::SerdeError(_) => true,
+        _ => false,
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+/// Aggregated discovery: `/api` and `/apis`, each in one request. `None` when the server does
+/// not support it.
+async fn discover_aggregated(
+    client: &Client,
+    limit: Duration,
+) -> Result<Option<Vec<KindInfo>>, ClusterError> {
+    let core = match bounded(limit, client.list_core_api_versions_aggregated()).await? {
+        // A server without aggregated discovery answers with the plain document, which parses
+        // as an empty list. The core group is always served, so empty means "not supported".
+        Ok(core) if core.items.is_empty() => return Ok(None),
+        Ok(core) => core,
+        Err(e) if aggregated_not_supported(&e) => return Ok(None),
+        Err(e) => return Err(ClusterError::kube(e)),
+    };
+    let apis = match bounded(limit, client.list_api_groups_aggregated()).await? {
+        Ok(apis) => apis,
+        Err(e) if aggregated_not_supported(&e) => return Ok(None),
+        Err(e) => return Err(ClusterError::kube(e)),
+    };
+    Ok(Some(
+        core.items
+            .into_iter()
+            .take(1)
+            .chain(apis.items)
+            .flat_map(kinds_from_aggregated)
+            .collect(),
+    ))
+}
+
+/// The kinds of one group at its preferred version, which aggregated discovery lists first.
+fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
+    let name = group.metadata.and_then(|m| m.name).unwrap_or_default();
+    let Some(preferred) = group.versions.into_iter().next() else {
+        return Vec::new();
+    };
+    let version = preferred.version.unwrap_or_default();
+    preferred
+        .resources
+        .into_iter()
+        .map(|r| KindInfo {
+            resource: api_resource(
+                &name,
+                &version,
+                r.response_kind.and_then(|k| k.kind).unwrap_or_default(),
+                r.resource.unwrap_or_default(),
+            ),
+            namespaced: r.scope.as_deref() == Some("Namespaced"),
+            verbs: r.verbs,
+            singular: r.singular_resource.unwrap_or_default(),
+            short_names: r.short_names,
+        })
+        .collect()
+}
+
+/// Discovery for servers without aggregated discovery: one request per group at its preferred
+/// version, [`DISCOVERY_CONCURRENCY`] at a time. A group whose request fails or times out is
+/// left out and named in [`DiscoveredKinds::skipped_groups`] instead of failing the whole
+/// cluster. The core group and the group list must succeed.
+async fn discover_per_group(
+    client: &Client,
+    limit: Duration,
+) -> Result<DiscoveredKinds, ClusterError> {
+    let mut kinds = Vec::new();
+    let core = bounded_request(limit, client.list_core_api_versions()).await?;
+    if let Some(version) = core.versions.first() {
+        let list = bounded_request(limit, client.list_core_api_resources(version)).await?;
+        kinds.extend(kinds_from_resource_list("", version, list));
+    }
+    let groups = bounded_request(limit, client.list_api_groups())
+        .await?
+        .groups;
+    let mut found: Vec<(String, Result<Vec<KindInfo>, ClusterError>)> =
+        futures::stream::iter(groups.into_iter().filter_map(|group| {
+            let gv = group
+                .preferred_version
+                .or_else(|| group.versions.into_iter().next())?;
+            Some((group.name, gv))
+        }))
+        .map(|(name, gv)| async move {
+            let result = bounded_request(limit, client.list_api_group_resources(&gv.group_version))
+                .await
+                .map(|list| kinds_from_resource_list(&name, &gv.version, list));
+            (name, result)
+        })
+        .buffer_unordered(DISCOVERY_CONCURRENCY)
+        .collect()
+        .await;
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut skipped_groups = Vec::new();
+    for (name, result) in found {
+        match result {
+            Ok(group_kinds) => kinds.extend(group_kinds),
+            Err(e) => {
+                tracing::warn!(group = name, error = %e, "discovery failed for an API group; leaving it out");
+                skipped_groups.push(name);
+            }
+        }
+    }
+    Ok(DiscoveredKinds {
+        kinds,
+        skipped_groups,
+    })
+}
+
+fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -> Vec<KindInfo> {
+    list.resources
+        .into_iter()
+        // `pods/log` and the like are subresources, not kinds.
+        .filter(|r| !r.name.contains('/'))
+        .map(|r| KindInfo {
+            resource: api_resource(group, version, r.kind, r.name),
+            namespaced: r.namespaced,
+            verbs: r.verbs,
+            singular: r.singular_name,
+            short_names: r.short_names.unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn api_resource(group: &str, version: &str, kind: String, plural: String) -> ApiResource {
+    let api_version = if group.is_empty() {
+        version.to_owned()
+    } else {
+        format!("{group}/{version}")
+    };
+    ApiResource {
+        group: group.to_owned(),
+        version: version.to_owned(),
+        api_version,
+        kind,
+        plural,
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ResolveKindError {
     #[error("no resource kind matches \"{0}\"")]
     NotFound(String),
+    /// Several kinds match equally well. `candidates` are their ids (`plural.group`).
+    #[error(
+        "\"{query}\" matches several resource kinds. Pass one of these as kind: {}",
+        candidates.join(", ")
+    )]
+    Ambiguous {
+        query: String,
+        candidates: Vec<String>,
+    },
 }
 
-/// Finds a kind by name the way people type it: `Pod`, `pods`, `pod`, `deployments.apps`, or
-/// `Deployment.apps`. Matching is case-insensitive. `api_version` (`apps/v1`, `v1`, or a bare
-/// group like `apps`) narrows the match when a kind exists in several groups. Without it, the
-/// first match in discovery order wins, so core kinds beat same-named kinds in other groups.
+/// Finds a kind by name the way `kubectl get` accepts it, ignoring case: the Kind (`Deployment`),
+/// the plural (`deployments`), the singular (`deployment`), or a short name (`deploy`), each
+/// optionally followed by `.group` (`deploy.apps`) or `.version.group` (`deployments.v1.apps`).
+/// `api_version` (`apps/v1`, `v1`, or a bare group like `apps`) narrows the match the same way.
+///
+/// When several kinds match, a Kind, plural or singular match beats a short-name match. Among the
+/// rest, the core group beats the built-in Kubernetes groups (`apps`, `*.k8s.io`), which beat
+/// everything else (CRDs, aggregated APIs): `pods` is the core Pod, not metrics.k8s.io's
+/// PodMetrics, as in kubectl. If more than one kind is left, the result is
+/// [`ResolveKindError::Ambiguous`], listing them.
 pub fn resolve_kind<'a>(
     kinds: &'a [KindInfo],
     query: &str,
@@ -153,16 +368,19 @@ pub fn resolve_kind<'a>(
         Some((n, g)) => (n, Some(g)),
         None => (query, None),
     };
-    let matches_name = |k: &KindInfo| {
-        k.kind().eq_ignore_ascii_case(name)
-            || k.plural().eq_ignore_ascii_case(name)
-            || (name.len() > 1
-                && name.ends_with(['s', 'S'])
-                && k.kind().eq_ignore_ascii_case(&name[..name.len() - 1]))
-    };
     let matches_group = |k: &KindInfo| match group_suffix {
-        Some(g) => k.group().eq_ignore_ascii_case(g),
         None => true,
+        Some(g) => {
+            k.group().eq_ignore_ascii_case(g)
+                || g.split_once('.').map_or(
+                    // `pods.v1`: a core kind with its version.
+                    k.group().is_empty() && k.resource.version.eq_ignore_ascii_case(g),
+                    |(v, g)| {
+                        k.resource.version.eq_ignore_ascii_case(v)
+                            && k.group().eq_ignore_ascii_case(g)
+                    },
+                )
+        }
     };
     let matches_version = |k: &KindInfo| match api_version.map(str::trim).filter(|v| !v.is_empty())
     {
@@ -174,10 +392,61 @@ pub fn resolve_kind<'a>(
                 || k.group().eq_ignore_ascii_case(v)
         }
     };
-    kinds
+    let in_scope: Vec<&KindInfo> = kinds
         .iter()
-        .find(|k| matches_name(k) && matches_group(k) && matches_version(k))
-        .ok_or_else(|| ResolveKindError::NotFound(query.to_owned()))
+        .filter(|k| !name.is_empty() && matches_group(k) && matches_version(k))
+        .collect();
+    let by_name: Vec<&KindInfo> = in_scope
+        .iter()
+        .copied()
+        .filter(|k| {
+            k.kind().eq_ignore_ascii_case(name)
+                || k.plural().eq_ignore_ascii_case(name)
+                || k.singular.eq_ignore_ascii_case(name)
+        })
+        .collect();
+    let matched = if by_name.is_empty() {
+        in_scope
+            .into_iter()
+            .filter(|k| k.short_names.iter().any(|s| s.eq_ignore_ascii_case(name)))
+            .collect()
+    } else {
+        by_name
+    };
+    let Some(best) = matched.iter().map(|k| group_rank(k.group())).min() else {
+        return Err(ResolveKindError::NotFound(query.to_owned()));
+    };
+    let mut winners = matched
+        .into_iter()
+        .filter(|k| group_rank(k.group()) == best);
+    match (winners.next(), winners.next()) {
+        (Some(only), None) => Ok(only),
+        (Some(first), Some(second)) => {
+            let mut candidates: Vec<String> = [first, second]
+                .into_iter()
+                .chain(winners)
+                .map(|k| k.id().to_string())
+                .collect();
+            candidates.sort();
+            Err(ResolveKindError::Ambiguous {
+                query: query.to_owned(),
+                candidates,
+            })
+        }
+        (None, _) => Err(ResolveKindError::NotFound(query.to_owned())),
+    }
+}
+
+/// How strongly a group is preferred when a name matches kinds in several groups: the core
+/// group, then the groups Kubernetes itself serves (`apps`, `batch`, `*.k8s.io`), then the rest.
+fn group_rank(group: &str) -> u8 {
+    if group.is_empty() {
+        0
+    } else if !group.contains('.') || group.ends_with(".k8s.io") {
+        1
+    } else {
+        2
+    }
 }
 
 /// Filters for [`list`].
@@ -500,74 +769,204 @@ mod tests {
     use super::*;
 
     fn kind(group: &str, version: &str, kind: &str, plural: &str) -> KindInfo {
-        let api_version = if group.is_empty() {
-            version.to_owned()
-        } else {
-            format!("{group}/{version}")
-        };
         KindInfo {
-            resource: ApiResource {
-                group: group.into(),
-                version: version.into(),
-                api_version,
-                kind: kind.into(),
-                plural: plural.into(),
-            },
+            resource: api_resource(group, version, kind.into(), plural.into()),
             namespaced: true,
             verbs: vec!["list".into()],
+            singular: kind.to_ascii_lowercase(),
+            short_names: Vec::new(),
         }
+    }
+
+    fn with_short(mut kind: KindInfo, names: &[&str]) -> KindInfo {
+        kind.short_names = names.iter().map(|n| (*n).to_owned()).collect();
+        kind
     }
 
     fn kinds() -> Vec<KindInfo> {
         vec![
-            kind("", "v1", "Pod", "pods"),
-            kind("", "v1", "Event", "events"),
-            kind("apps", "v1", "Deployment", "deployments"),
-            kind("events.k8s.io", "v1", "Event", "events"),
-            kind("networking.k8s.io", "v1", "Ingress", "ingresses"),
+            with_short(kind("", "v1", "Pod", "pods"), &["po"]),
+            with_short(kind("", "v1", "Event", "events"), &["ev"]),
+            with_short(kind("", "v1", "Service", "services"), &["svc"]),
+            with_short(kind("apps", "v1", "Deployment", "deployments"), &["deploy"]),
+            with_short(kind("events.k8s.io", "v1", "Event", "events"), &["ev"]),
+            kind("metrics.k8s.io", "v1beta1", "PodMetrics", "pods"),
+            with_short(
+                kind("networking.k8s.io", "v1", "Ingress", "ingresses"),
+                &["ing"],
+            ),
+            kind(
+                "networking.internal.knative.dev",
+                "v1alpha1",
+                "Ingress",
+                "ingresses",
+            ),
+            with_short(kind("example.com", "v1", "Widget", "widgets"), &["wd"]),
+            with_short(
+                kind("other.example.org", "v1", "Gadget", "gadgets"),
+                &["wd"],
+            ),
         ]
     }
 
+    fn id(kinds: &[KindInfo], query: &str, api_version: Option<&str>) -> String {
+        match resolve_kind(kinds, query, api_version) {
+            Ok(k) => k.id().to_string(),
+            Err(e) => panic!("{query}: {e}"),
+        }
+    }
+
     // covers UP-10
     #[test]
-    fn resolves_by_kind_plural_and_singular() {
+    fn resolves_kind_plural_singular_and_short_names_ignoring_case() {
         let kinds = kinds();
-        for q in ["Pod", "pod", "pods", "PODS"] {
-            assert_eq!(resolve_kind(&kinds, q, None).unwrap().kind(), "Pod", "{q}");
+        for q in ["Pod", "pod", "pods", "PODS", "po", "PO", " po "] {
+            assert_eq!(id(&kinds, q, None), "pods", "{q}");
         }
+        for q in [
+            "deploy",
+            "deployment",
+            "deployments",
+            "Deployment",
+            "DEPLOY",
+        ] {
+            assert_eq!(id(&kinds, q, None), "deployments.apps", "{q}");
+        }
+        assert_eq!(id(&kinds, "svc", None), "services");
+        assert_eq!(id(&kinds, "ingresses", None), "ingresses.networking.k8s.io");
+        assert_eq!(id(&kinds, "wd.example.com", None), "widgets.example.com");
+    }
+
+    // covers UP-10
+    #[test]
+    fn group_and_version_suffixes_narrow_the_match() {
+        let kinds = kinds();
+        for q in [
+            "deployments.apps",
+            "Deployment.apps",
+            "deploy.apps",
+            "deployment.APPS",
+            "deployments.v1.apps",
+        ] {
+            assert_eq!(id(&kinds, q, None), "deployments.apps", "{q}");
+        }
+        assert_eq!(id(&kinds, "pods.v1", None), "pods");
         assert_eq!(
-            resolve_kind(&kinds, "ingresses", None).unwrap().kind(),
-            "Ingress"
+            id(&kinds, "pods.metrics.k8s.io", None),
+            "pods.metrics.k8s.io"
         );
         assert_eq!(
-            resolve_kind(&kinds, "deployments.apps", None)
-                .unwrap()
-                .group(),
-            "apps"
+            id(&kinds, "ingress.networking.internal.knative.dev", None),
+            "ingresses.networking.internal.knative.dev"
+        );
+        assert!(resolve_kind(&kinds, "deploy.batch", None).is_err());
+        assert!(resolve_kind(&kinds, "deployments.v2.apps", None).is_err());
+    }
+
+    // covers UP-10
+    #[test]
+    fn core_then_builtin_groups_win_unless_a_group_is_given() {
+        let kinds = kinds();
+        // Core beats events.k8s.io and metrics.k8s.io, as in kubectl.
+        assert_eq!(id(&kinds, "Event", None), "events");
+        assert_eq!(id(&kinds, "ev", None), "events");
+        assert_eq!(id(&kinds, "pods", None), "pods");
+        // A built-in group beats a CRD with the same kind.
+        assert_eq!(id(&kinds, "ingress", None), "ingresses.networking.k8s.io");
+        assert_eq!(
+            id(&kinds, "Event", Some("events.k8s.io/v1")),
+            "events.events.k8s.io"
+        );
+        assert_eq!(
+            id(&kinds, "events.events.k8s.io", None),
+            "events.events.k8s.io"
+        );
+        assert_eq!(id(&kinds, "Event", Some("v1")), "events");
+        assert_eq!(id(&kinds, "deploy", Some("apps")), "deployments.apps");
+    }
+
+    // covers UP-10
+    #[test]
+    fn a_name_beats_a_short_name() {
+        let mut kinds = kinds();
+        // A CRD whose short name is another kind's plural does not hijack it.
+        kinds.push(with_short(
+            kind("example.com", "v1", "Thing", "things"),
+            &["pods"],
+        ));
+        assert_eq!(id(&kinds, "pods", None), "pods");
+        assert_eq!(id(&kinds, "things", None), "things.example.com");
+    }
+
+    // covers UP-10
+    #[test]
+    fn ambiguous_names_list_the_candidates() {
+        let err = resolve_kind(&kinds(), "wd", None).unwrap_err();
+        assert_eq!(
+            err,
+            ResolveKindError::Ambiguous {
+                query: "wd".into(),
+                candidates: vec![
+                    "gadgets.other.example.org".into(),
+                    "widgets.example.com".into()
+                ],
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "\"wd\" matches several resource kinds. Pass one of these as kind: \
+             gadgets.other.example.org, widgets.example.com"
         );
     }
 
     // covers UP-10
     #[test]
-    fn core_wins_unless_group_given() {
-        let kinds = kinds();
-        assert_eq!(resolve_kind(&kinds, "Event", None).unwrap().group(), "");
-        assert_eq!(
-            resolve_kind(&kinds, "Event", Some("events.k8s.io/v1"))
-                .unwrap()
-                .group(),
-            "events.k8s.io"
-        );
-        assert_eq!(
-            resolve_kind(&kinds, "events.events.k8s.io", None)
-                .unwrap()
-                .group(),
-            "events.k8s.io"
-        );
-        assert_eq!(
-            resolve_kind(&kinds, "Event", Some("v1")).unwrap().group(),
-            ""
-        );
+    fn aggregated_discovery_keeps_singular_and_short_names() {
+        let group: APIGroupDiscovery = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "apps"},
+            "versions": [
+                {"version": "v1", "resources": [{
+                    "resource": "deployments",
+                    "responseKind": {"group": "apps", "version": "v1", "kind": "Deployment"},
+                    "scope": "Namespaced",
+                    "singularResource": "deployment",
+                    "shortNames": ["deploy"],
+                    "verbs": ["get", "list", "watch"]
+                }]},
+                {"version": "v1beta2", "resources": [{"resource": "old"}]}
+            ]
+        }))
+        .unwrap();
+        let kinds = kinds_from_aggregated(group);
+        assert_eq!(kinds.len(), 1, "only the preferred (first) version");
+        let deploy = &kinds[0];
+        assert_eq!(deploy.id().as_str(), "deployments.apps");
+        assert_eq!(deploy.api_version(), "apps/v1");
+        assert_eq!(deploy.kind(), "Deployment");
+        assert!(deploy.namespaced && deploy.is_watchable());
+        assert_eq!(deploy.singular, "deployment");
+        assert_eq!(deploy.short_names, ["deploy"]);
+    }
+
+    // covers UP-10
+    #[test]
+    fn resource_lists_skip_subresources_and_keep_short_names() {
+        let list: APIResourceList = serde_json::from_value(serde_json::json!({
+            "groupVersion": "v1",
+            "resources": [
+                {"name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod",
+                 "verbs": ["list"], "shortNames": ["po"]},
+                {"name": "pods/log", "singularName": "", "namespaced": true, "kind": "Pod",
+                 "verbs": ["get"]}
+            ]
+        }))
+        .unwrap();
+        let kinds = kinds_from_resource_list("", "v1", list);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].id().as_str(), "pods");
+        assert_eq!(kinds[0].api_version(), "v1");
+        assert_eq!(kinds[0].short_names, ["po"]);
+        assert_eq!(kinds[0].singular, "pod");
     }
 
     // covers UP-10
@@ -596,9 +995,210 @@ mod tests {
     #[test]
     fn unknown_kind_is_not_found() {
         assert_eq!(
-            resolve_kind(&kinds(), "Widget", None).unwrap_err(),
-            ResolveKindError::NotFound("Widget".into())
+            resolve_kind(&kinds(), "Sprocket", None).unwrap_err(),
+            ResolveKindError::NotFound("Sprocket".into())
         );
+        assert!(resolve_kind(&kinds(), "", None).is_err());
+        assert!(resolve_kind(&kinds(), ".apps", None).is_err());
         assert!(resolve_kind(&kinds(), "Pod", Some("apps/v1")).is_err());
+    }
+
+    /// A fake API server: answers each path in `routes` with its status and JSON body, anything
+    /// else with 404, and counts connections. Plain HTTP on 127.0.0.1, one request per
+    /// connection.
+    async fn fake_api(
+        routes: Vec<(&'static str, u16, serde_json::Value)>,
+    ) -> (Client, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        let routes = std::sync::Arc::new(routes);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let path = text
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/")
+                        .to_owned();
+                    let (code, body) = routes
+                        .iter()
+                        .find(|(p, _, _)| *p == path)
+                        .map(|(_, code, body)| (*code, body.to_string()))
+                        .unwrap_or_else(|| {
+                            (
+                                404,
+                                serde_json::json!({"kind": "Status", "code": 404}).to_string(),
+                            )
+                        });
+                    let response = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let config = kube::Config::new(url.parse().unwrap());
+        (Client::try_from(config).unwrap(), connections)
+    }
+
+    fn resource(name: &str, kind: &str, short: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "singularName": kind.to_ascii_lowercase(), "namespaced": true,
+            "kind": kind, "verbs": ["get", "list", "watch"], "shortNames": short,
+        })
+    }
+
+    // covers UP-10, UP-22
+    #[tokio::test]
+    async fn without_aggregated_discovery_each_group_is_read_and_failures_are_skipped() {
+        use serde_json::json;
+        // The plain `/api` document parses as an empty aggregated list: "not supported".
+        let (client, _) = fake_api(vec![
+            ("/api", 200, json!({"kind": "APIVersions", "versions": ["v1"]})),
+            (
+                "/api/v1",
+                200,
+                json!({"groupVersion": "v1", "resources": [
+                    resource("pods", "Pod", &["po"]),
+                    resource("pods/log", "Pod", &[]),
+                ]}),
+            ),
+            (
+                "/apis",
+                200,
+                json!({"kind": "APIGroupList", "groups": [
+                    {"name": "apps", "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
+                     "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}},
+                    {"name": "metrics.k8s.io",
+                     "versions": [{"groupVersion": "metrics.k8s.io/v1beta1", "version": "v1beta1"}]},
+                    {"name": "broken.example.com",
+                     "versions": [{"groupVersion": "broken.example.com/v1", "version": "v1"}]},
+                ]}),
+            ),
+            (
+                "/apis/apps/v1",
+                200,
+                json!({"groupVersion": "apps/v1", "resources": [
+                    resource("deployments", "Deployment", &["deploy"]),
+                ]}),
+            ),
+            (
+                "/apis/metrics.k8s.io/v1beta1",
+                503,
+                json!({"kind": "Status", "code": 503, "message": "service unavailable"}),
+            ),
+            (
+                "/apis/broken.example.com/v1",
+                500,
+                json!({"kind": "Status", "code": 500, "message": "internal error"}),
+            ),
+        ])
+        .await;
+        // kube retries a 503 until the per-request limit; a 500 fails at once. Both skip.
+        let found =
+            discover_kinds_within(&client, Duration::from_millis(500), Duration::from_secs(5))
+                .await
+                .unwrap();
+        let ids: Vec<String> = found.kinds.iter().map(|k| k.id().to_string()).collect();
+        assert_eq!(ids, ["pods", "deployments.apps"]);
+        assert_eq!(
+            found.skipped_groups,
+            ["broken.example.com", "metrics.k8s.io"]
+        );
+        assert_eq!(id(&found.kinds, "deploy", None), "deployments.apps");
+        assert_eq!(id(&found.kinds, "po", None), "pods");
+    }
+
+    // covers UP-10
+    #[tokio::test]
+    async fn aggregated_discovery_is_used_when_served() {
+        use serde_json::json;
+        let group = |name: &str, kind: &str, plural: &str| {
+            json!({"metadata": {"name": name}, "versions": [{"version": "v1", "resources": [{
+                "resource": plural, "responseKind": {"kind": kind}, "scope": "Namespaced",
+                "verbs": ["list"], "shortNames": ["x"],
+            }]}]})
+        };
+        let (client, _) = fake_api(vec![
+            ("/api", 200, json!({"items": [group("", "Pod", "pods")]})),
+            (
+                "/apis",
+                200,
+                json!({"items": [group("apps", "Deployment", "deployments")]}),
+            ),
+        ])
+        .await;
+        let found = discover_kinds(&client).await.unwrap();
+        let ids: Vec<String> = found.kinds.iter().map(|k| k.id().to_string()).collect();
+        assert_eq!(ids, ["pods", "deployments.apps"]);
+        assert!(found.skipped_groups.is_empty());
+    }
+
+    // covers UP-04
+    #[tokio::test]
+    async fn an_unreachable_server_fails_fast_without_the_fallback() {
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        let client = Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
+        let limit = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = discover_kinds_within(&client, limit, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.is_timeout(), "{err}");
+        assert_eq!(err.to_string(), "timed out after 300ms connecting");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // One request, no per-group fallback after it.
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // covers UP-10
+    #[test]
+    fn only_missing_aggregated_discovery_means_not_supported() {
+        let status = |code| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            }))
+        };
+        assert!(aggregated_not_supported(&status(404)));
+        assert!(aggregated_not_supported(&status(406)));
+        assert!(!aggregated_not_supported(&status(403)));
+        assert!(!aggregated_not_supported(&status(503)));
+        let parse = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert!(aggregated_not_supported(&kube::Error::SerdeError(parse)));
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline has elapsed");
+        assert!(!aggregated_not_supported(&kube::Error::Service(Box::new(
+            io
+        ))));
     }
 }

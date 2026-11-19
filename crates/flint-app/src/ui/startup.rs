@@ -8,8 +8,10 @@ pub const FLINT_VIEW: &str = "FLINT_VIEW";
 /// What `FLINT_VIEW` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupView {
-    /// A kind as `plural` (core group) or `plural.group`, matched like `kubectl get` would
-    /// match the plural: `pods`, `deployments`, `deployments.apps`, `widgets.example.com`.
+    /// A kind as `kubectl get` takes it, ignoring case: Kind, plural, singular or short name,
+    /// optionally with `.group` (`po`, `deploy`, `Deployment.apps`, `widgets.example.com`).
+    /// Resolved by the core resolver once discovery arrives
+    /// ([`flint_core::ClusterDiscovery::nav_entry`]).
     pub kind: String,
     pub namespace: Option<String>,
     pub name: Option<String>,
@@ -50,15 +52,6 @@ pub fn parse(value: &str) -> Option<StartupView> {
     })
 }
 
-/// Whether `id` (a `KindId` string, `plural` or `plural.group`) is the kind `wanted` names.
-/// `wanted` may leave the group out.
-pub fn kind_matches(id: &str, wanted: &str) -> bool {
-    id == wanted
-        || id
-            .split_once('.')
-            .is_some_and(|(plural, _)| plural == wanted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,14 +90,5 @@ mod tests {
         ] {
             assert_eq!(parse(bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn kinds_match_with_or_without_group() {
-        assert!(kind_matches("pods", "pods"));
-        assert!(kind_matches("deployments.apps", "deployments"));
-        assert!(kind_matches("deployments.apps", "deployments.apps"));
-        assert!(!kind_matches("deployments.apps", "deploy"));
-        assert!(!kind_matches("pods", "pods.metrics.k8s.io"));
     }
 }

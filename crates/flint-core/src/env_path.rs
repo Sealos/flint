@@ -31,6 +31,29 @@ pub enum PathSource {
     Fallback(String),
 }
 
+impl PathSource {
+    /// Where the `PATH` came from, for messages such as "not found on PATH (PATH from login
+    /// shell)". The fallback's reason is left out: it can quote the shell's output.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            PathSource::Settings => "PATH from settings.toml",
+            PathSource::LoginShell => "PATH from login shell",
+            PathSource::Fallback(_) => "fallback PATH: the login shell could not be read",
+        }
+    }
+}
+
+/// The source of the `PATH` [`apply_process_path`] installed.
+static INSTALLED: std::sync::OnceLock<PathSource> = std::sync::OnceLock::new();
+
+/// Where this process's `PATH` came from: [`PathSource::describe`] of what
+/// [`apply_process_path`] installed, or "inherited PATH" if it was not called.
+pub fn process_path_origin() -> &'static str {
+    INSTALLED
+        .get()
+        .map_or("inherited PATH", PathSource::describe)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
     pub value: String,
@@ -111,6 +134,7 @@ pub unsafe fn apply_process_path(settings_override: Option<&str>) -> ResolvedPat
     let resolved = resolve_path(settings_override);
     // SAFETY: the caller guarantees no other thread reads the environment (see above).
     unsafe { std::env::set_var("PATH", &resolved.value) };
+    let _ = INSTALLED.set(resolved.source.clone());
     resolved
 }
 
@@ -190,6 +214,19 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // covers UP-04, UP-05
+    #[test]
+    fn path_sources_describe_themselves() {
+        assert_eq!(PathSource::LoginShell.describe(), "PATH from login shell");
+        assert_eq!(PathSource::Settings.describe(), "PATH from settings.toml");
+        assert_eq!(
+            PathSource::Fallback("timeout".into()).describe(),
+            "fallback PATH: the login shell could not be read"
+        );
+        // Tests never install a PATH.
+        assert_eq!(process_path_origin(), "inherited PATH");
+    }
 
     // covers UP-05
     #[test]
