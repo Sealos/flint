@@ -86,6 +86,23 @@ FLINT_TEST_KUBECONFIG=$PWD/.dev/kubeconfig KUBECONFIG=$PWD/.dev/kubeconfig \
 
 CI (`.github/workflows/ci.yml`, macOS) runs format, clippy and the tests above without a cluster.
 
+### Checks CI runs
+
+- **CI (macOS):** `cargo fmt --check`, clippy with `-D warnings`, `cargo test -p <crate>` for each crate as a separate
+  job, `cargo doc` with `-D warnings`, and a release build.
+- **Lint (Linux):**
+  - `cargo deny check` (advisories, licenses, bans, sources; config in `deny.toml`);
+  - `cargo machete` (unused dependencies);
+  - `typos`;
+  - `actionlint`;
+  - `scripts/check-module-tests.sh`.
+- **PR title:** must be a Conventional Commit, because PRs are squash-merged and release-please reads the subject.
+- **Dependabot:** weekly Cargo and GitHub Actions updates. `gpui-kit` is excluded because it is pinned on purpose.
+
+**Unit tests per module:** every source module has unit tests, either a `#[cfg(test)] mod tests` or a
+`// module-tests: <file>` line pointing to its test file. `lib.rs`, `main.rs` and `mod.rs` are wiring and are exempt.
+`scripts/module-tests-allowlist.txt` lists the modules that predate this rule. The list may only shrink.
+
 ## MCP server for AI agents
 
 `flint mcp` serves the Model Context Protocol over stdio. It is read-only: it can list clusters, resource kinds,

@@ -1,0 +1,7 @@
+# Modules that existed without unit tests when the per-module rule was introduced.
+# This list may only shrink. New modules must ship with tests.
+crates/flint-app/src/ui/workspace.rs
+crates/flint-core/src/bootstrap.rs
+crates/flint-core/src/handle.rs
+crates/flint-core/src/manager.rs
+crates/flint-mcp/src/server.rs
