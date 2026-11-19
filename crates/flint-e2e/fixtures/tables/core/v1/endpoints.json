@@ -38,7 +38,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "endpointslice.kubernetes.io/skip-mirror": "true"
           },
@@ -46,6 +46,31 @@
           "namespace": "default",
           "resourceVersion": "1",
           "uid": "f81c312b-a1ca-d1cb-34c6-eed5facf5240"
+        }
+      }
+    },
+    {
+      "cells": [
+        "fixture-db",
+        "10.244.0.14:5432",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "endpoints.kubernetes.io/managed-by": "endpoint-controller",
+            "service.kubernetes.io/headless": ""
+          },
+          "name": "fixture-db",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "e9a569aa-1947-7211-d700-57bec2e68931"
         }
       }
     },
@@ -60,9 +85,9 @@
         "kind": "PartialObjectMetadata",
         "metadata": {
           "annotations": {
-            "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "app.kubernetes.io/managed-by": "Helm",
             "app.kubernetes.io/name": "podinfo",
@@ -88,9 +113,9 @@
         "kind": "PartialObjectMetadata",
         "metadata": {
           "annotations": {
-            "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "app": "web",
             "endpoints.kubernetes.io/managed-by": "endpoint-controller"
@@ -105,7 +130,7 @@
     {
       "cells": [
         "kube-dns",
-        "10.244.0.3:9153,10.244.0.4:9153,10.244.0.3:53 + 3 more...",
+        "10.244.0.2:9153,10.244.0.3:9153,10.244.0.2:53 + 3 more...",
         "1d"
       ],
       "object": {
@@ -113,9 +138,9 @@
         "kind": "PartialObjectMetadata",
         "metadata": {
           "annotations": {
-            "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "endpoints.kubernetes.io/managed-by": "endpoint-controller",
             "k8s-app": "kube-dns",
@@ -139,7 +164,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "endpoints.kubernetes.io/managed-by": "endpoint-controller",
             "k8s-app": "metrics-server"

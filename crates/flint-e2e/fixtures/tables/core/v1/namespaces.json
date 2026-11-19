@@ -38,7 +38,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/metadata.name": "default"
           },
@@ -61,33 +61,13 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"annotations\":{},\"name\":\"demo\"},\"spec\":{},\"status\":{}}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/metadata.name": "demo"
           },
           "name": "demo",
           "resourceVersion": "1",
           "uid": "87be3041-54bb-209d-ee22-9c94e8d59aff"
-        }
-      }
-    },
-    {
-      "cells": [
-        "flint-automation-test",
-        "Active",
-        "1d"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "labels": {
-            "kubernetes.io/metadata.name": "flint-automation-test"
-          },
-          "name": "flint-automation-test",
-          "resourceVersion": "1",
-          "uid": "b8d058ec-c180-c0f4-2bd0-c450264fd47d"
         }
       }
     },
@@ -101,7 +81,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/metadata.name": "kube-node-lease"
           },
@@ -121,7 +101,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/metadata.name": "kube-public"
           },
@@ -141,7 +121,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/metadata.name": "kube-system"
           },
@@ -164,7 +144,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"annotations\":{},\"name\":\"local-path-storage\"}}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/metadata.name": "local-path-storage"
           },

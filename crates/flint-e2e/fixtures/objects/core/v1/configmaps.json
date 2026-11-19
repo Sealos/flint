@@ -9,7 +9,7 @@
         "annotations": {
           "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "managedFields": [
           {
             "apiVersion": "v1",
@@ -28,7 +28,7 @@
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "kube-root-ca.crt",

@@ -70,7 +70,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "component": "apiserver",
             "provider": "kubernetes"
@@ -84,9 +84,34 @@
     },
     {
       "cells": [
+        "fixture-db",
+        "ClusterIP",
+        "None",
+        "<none>",
+        "5432/TCP",
+        "1d",
+        "app=fixture-db"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"clusterIP\":\"None\",\"ports\":[{\"port\":5432}],\"selector\":{\"app\":\"fixture-db\"}}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "a5cb9a7b-fb30-aca3-40f9-ff850ce53f09"
+        }
+      }
+    },
+    {
+      "cells": [
         "podinfo",
         "ClusterIP",
-        "10.96.100.18",
+        "10.96.46.117",
         "<none>",
         "9898/TCP,9999/TCP",
         "1d",
@@ -100,7 +125,7 @@
             "meta.helm.sh/release-name": "podinfo",
             "meta.helm.sh/release-namespace": "demo"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "app.kubernetes.io/managed-by": "Helm",
             "app.kubernetes.io/name": "podinfo",
@@ -118,7 +143,7 @@
       "cells": [
         "web",
         "ClusterIP",
-        "10.96.20.234",
+        "10.96.135.99",
         "<none>",
         "80/TCP",
         "1d",
@@ -131,7 +156,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"web\"},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"ports\":[{\"port\":80,\"protocol\":\"TCP\",\"targetPort\":80}],\"selector\":{\"app\":\"web\"}},\"status\":{\"loadBalancer\":{}}}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "app": "web"
           },
@@ -160,7 +185,7 @@
             "prometheus.io/port": "9153",
             "prometheus.io/scrape": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "k8s-app": "kube-dns",
             "kubernetes.io/cluster-service": "true",
@@ -177,7 +202,7 @@
       "cells": [
         "metrics-server",
         "ClusterIP",
-        "10.96.46.98",
+        "10.96.56.213",
         "<none>",
         "443/TCP",
         "1d",
@@ -190,7 +215,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"metrics-server\",\"namespace\":\"kube-system\"},\"spec\":{\"ports\":[{\"appProtocol\":\"https\",\"name\":\"https\",\"port\":443,\"protocol\":\"TCP\",\"targetPort\":\"https\"}],\"selector\":{\"k8s-app\":\"metrics-server\"}}}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "k8s-app": "metrics-server"
           },

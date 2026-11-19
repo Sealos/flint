@@ -8,7 +8,7 @@
           "meta.helm.sh/release-name": "podinfo",
           "meta.helm.sh/release-namespace": "demo"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "generation": 1,
         "labels": {
           "app.kubernetes.io/managed-by": "Helm",
@@ -136,7 +136,7 @@
             },
             "manager": "helm",
             "operation": "Apply",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "apps/v1",
@@ -180,7 +180,7 @@
             "manager": "kube-controller-manager",
             "operation": "Update",
             "subresource": "status",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "podinfo",
@@ -319,16 +319,16 @@
         "availableReplicas": 1,
         "conditions": [
           {
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
-            "lastUpdateTime": "2026-01-01T00:00:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
+            "lastUpdateTime": "2025-12-31T23:54:00Z",
             "message": "Deployment has minimum availability.",
             "reason": "MinimumReplicasAvailable",
             "status": "True",
             "type": "Available"
           },
           {
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
-            "lastUpdateTime": "2026-01-01T00:00:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
+            "lastUpdateTime": "2025-12-31T23:54:00Z",
             "message": "ReplicaSet \"podinfo-c6497595d\" has successfully progressed.",
             "reason": "NewReplicaSetAvailable",
             "status": "True",
@@ -348,24 +348,12 @@
           "deployment.kubernetes.io/revision": "1",
           "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"web\"},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"replicas\":2,\"selector\":{\"matchLabels\":{\"app\":\"web\"}},\"strategy\":{},\"template\":{\"metadata\":{\"labels\":{\"app\":\"web\"}},\"spec\":{\"containers\":[{\"image\":\"nginx:1.27\",\"name\":\"nginx\",\"resources\":{}}]}}},\"status\":{}}\n"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
-        "generation": 5,
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generation": 1,
         "labels": {
           "app": "web"
         },
         "managedFields": [
-          {
-            "apiVersion": "apps/v1",
-            "fieldsType": "FieldsV1",
-            "fieldsV1": {
-              "f:spec": {
-                "f:replicas": {}
-              }
-            },
-            "manager": "unknown",
-            "operation": "Update",
-            "subresource": "scale"
-          },
           {
             "apiVersion": "apps/v1",
             "fieldsType": "FieldsV1",
@@ -382,6 +370,7 @@
               },
               "f:spec": {
                 "f:progressDeadlineSeconds": {},
+                "f:replicas": {},
                 "f:revisionHistoryLimit": {},
                 "f:selector": {},
                 "f:strategy": {
@@ -422,7 +411,7 @@
             },
             "manager": "kubectl-client-side-apply",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "apps/v1",
@@ -466,7 +455,7 @@
             "manager": "kube-controller-manager",
             "operation": "Update",
             "subresource": "status",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "web",
@@ -519,23 +508,23 @@
         "availableReplicas": 2,
         "conditions": [
           {
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
-            "lastUpdateTime": "2026-01-01T00:00:00Z",
-            "message": "ReplicaSet \"web-69c6f74b8b\" has successfully progressed.",
-            "reason": "NewReplicaSetAvailable",
-            "status": "True",
-            "type": "Progressing"
-          },
-          {
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
-            "lastUpdateTime": "2026-01-01T00:00:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
+            "lastUpdateTime": "2025-12-31T23:54:00Z",
             "message": "Deployment has minimum availability.",
             "reason": "MinimumReplicasAvailable",
             "status": "True",
             "type": "Available"
+          },
+          {
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
+            "lastUpdateTime": "2025-12-31T23:54:00Z",
+            "message": "ReplicaSet \"web-69c6f74b8b\" has successfully progressed.",
+            "reason": "NewReplicaSetAvailable",
+            "status": "True",
+            "type": "Progressing"
           }
         ],
-        "observedGeneration": 5,
+        "observedGeneration": 1,
         "readyReplicas": 2,
         "replicas": 2,
         "terminatingReplicas": 0,

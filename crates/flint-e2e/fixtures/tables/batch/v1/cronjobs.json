@@ -76,5 +76,35 @@
   "metadata": {
     "resourceVersion": "1"
   },
-  "rows": []
+  "rows": [
+    {
+      "cells": [
+        "fixture-cron",
+        "17 3 * * *",
+        "<none>",
+        "False",
+        0,
+        "<none>",
+        "1d",
+        "job",
+        "busybox:1.37.0",
+        "<none>"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"batch/v1\",\"kind\":\"CronJob\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-cron\",\"namespace\":\"demo\"},\"spec\":{\"failedJobsHistoryLimit\":1,\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"echo nightly\"],\"image\":\"busybox:1.37.0\",\"name\":\"job\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}}}],\"restartPolicy\":\"Never\"}}}},\"schedule\":\"17 3 * * *\",\"successfulJobsHistoryLimit\":1}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "fixture-cron",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "6a5169ed-38cd-6163-817b-74d7e9bafd8c"
+        }
+      }
+    }
+  ]
 }

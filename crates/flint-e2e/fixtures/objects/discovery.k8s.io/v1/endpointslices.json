@@ -6,6 +6,94 @@
       "endpoints": [
         {
           "addresses": [
+            "10.244.0.14"
+          ],
+          "conditions": {
+            "ready": true,
+            "serving": true,
+            "terminating": false
+          },
+          "hostname": "fixture-db-0",
+          "nodeName": "flint-dev-control-plane",
+          "targetRef": {
+            "kind": "Pod",
+            "name": "fixture-db-0",
+            "namespace": "demo",
+            "uid": "81815473-f6b5-a029-9f4e-f42984c2a973"
+          }
+        }
+      ],
+      "metadata": {
+        "annotations": {
+          "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generateName": "fixture-db-",
+        "generation": 2,
+        "labels": {
+          "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+          "kubernetes.io/service-name": "fixture-db",
+          "service.kubernetes.io/headless": ""
+        },
+        "managedFields": [
+          {
+            "apiVersion": "discovery.k8s.io/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:addressType": {},
+              "f:endpoints": {},
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:endpoints.kubernetes.io/last-change-trigger-time": {}
+                },
+                "f:generateName": {},
+                "f:labels": {
+                  ".": {},
+                  "f:endpointslice.kubernetes.io/managed-by": {},
+                  "f:kubernetes.io/service-name": {},
+                  "f:service.kubernetes.io/headless": {}
+                },
+                "f:ownerReferences": {
+                  ".": {},
+                  "k:{\"uid\":\"a8ec3419-1dc2-4f9f-b7f1-b32de657bce6\"}": {}
+                }
+              },
+              "f:ports": {}
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "fixture-db-f28bt",
+        "namespace": "demo",
+        "ownerReferences": [
+          {
+            "apiVersion": "v1",
+            "blockOwnerDeletion": true,
+            "controller": true,
+            "kind": "Service",
+            "name": "fixture-db",
+            "uid": "a5cb9a7b-fb30-aca3-40f9-ff850ce53f09"
+          }
+        ],
+        "resourceVersion": "1",
+        "uid": "8fb137e1-d9cf-77ca-81e1-ec52e45b43bf"
+      },
+      "ports": [
+        {
+          "name": "",
+          "port": 5432,
+          "protocol": "TCP"
+        }
+      ]
+    },
+    {
+      "addressType": "IPv4",
+      "endpoints": [
+        {
+          "addresses": [
             "10.244.0.9"
           ],
           "conditions": {
@@ -16,17 +104,17 @@
           "nodeName": "flint-dev-control-plane",
           "targetRef": {
             "kind": "Pod",
-            "name": "podinfo-c6497595d-b5r9c",
+            "name": "podinfo-c6497595d-b8chj",
             "namespace": "demo",
-            "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+            "uid": "c3b27c86-4272-8a51-8580-4dbdb249fffc"
           }
         }
       ],
       "metadata": {
         "annotations": {
-          "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+          "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "generateName": "podinfo-",
         "generation": 3,
         "labels": {
@@ -61,17 +149,17 @@
                 },
                 "f:ownerReferences": {
                   ".": {},
-                  "k:{\"uid\":\"0ac7ceaf-2e9b-4f40-83f4-691a9302c86d\"}": {}
+                  "k:{\"uid\":\"aba6de97-b77b-4942-b204-3185f35e4b15\"}": {}
                 }
               },
               "f:ports": {}
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
-        "name": "podinfo-dkjrb",
+        "name": "podinfo-t8q78",
         "namespace": "demo",
         "ownerReferences": [
           {
@@ -84,7 +172,7 @@
           }
         ],
         "resourceVersion": "1",
-        "uid": "f1023005-8225-a1c4-ca8f-fb479e38ca5e"
+        "uid": "6351c12e-27d4-e0ac-7e91-c7c881805df3"
       },
       "ports": [
         {
@@ -114,9 +202,9 @@
           "nodeName": "flint-dev-control-plane",
           "targetRef": {
             "kind": "Pod",
-            "name": "web-69c6f74b8b-pjhg5",
+            "name": "web-69c6f74b8b-x4gss",
             "namespace": "demo",
-            "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+            "uid": "05229db0-0345-b5f2-389f-ec561c1358b8"
           }
         },
         {
@@ -131,19 +219,19 @@
           "nodeName": "flint-dev-control-plane",
           "targetRef": {
             "kind": "Pod",
-            "name": "web-69c6f74b8b-x9t6b",
+            "name": "web-69c6f74b8b-qv4xv",
             "namespace": "demo",
-            "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+            "uid": "e6c7fb26-842c-b861-8154-46419a35eb4a"
           }
         }
       ],
       "metadata": {
         "annotations": {
-          "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+          "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "generateName": "web-",
-        "generation": 7,
+        "generation": 3,
         "labels": {
           "app": "web",
           "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
@@ -170,17 +258,17 @@
                 },
                 "f:ownerReferences": {
                   ".": {},
-                  "k:{\"uid\":\"022650b5-f903-4519-b30c-c88b783271c5\"}": {}
+                  "k:{\"uid\":\"9cfd3ea0-39a2-4f8a-ace6-77a7ab033855\"}": {}
                 }
               },
               "f:ports": {}
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
-        "name": "web-nsfs5",
+        "name": "web-8wjpf",
         "namespace": "demo",
         "ownerReferences": [
           {
@@ -193,7 +281,7 @@
           }
         ],
         "resourceVersion": "1",
-        "uid": "cf34d251-4ed3-93f4-0c08-5a25a58937fa"
+        "uid": "386fd5e4-94d2-897b-7c24-0f98179f3d91"
       },
       "ports": [
         {

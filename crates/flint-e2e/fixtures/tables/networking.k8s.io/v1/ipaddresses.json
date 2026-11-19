@@ -25,13 +25,13 @@
       "cells": [
         "10.96.0.1",
         "services/default/kubernetes",
-        "24m"
+        "6m22s"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "ipaddress.kubernetes.io/ip-family": "IPv4",
             "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
@@ -46,13 +46,13 @@
       "cells": [
         "10.96.0.10",
         "services/kube-system/kube-dns",
-        "24m"
+        "6m21s"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "ipaddress.kubernetes.io/ip-family": "IPv4",
             "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
@@ -65,64 +65,64 @@
     },
     {
       "cells": [
-        "10.96.100.18",
-        "services/demo/podinfo",
-        "23m"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "labels": {
-            "ipaddress.kubernetes.io/ip-family": "IPv4",
-            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
-          },
-          "name": "10.96.100.18",
-          "resourceVersion": "1",
-          "uid": "9a570615-89e0-3110-33ef-3c7e4becf668"
-        }
-      }
-    },
-    {
-      "cells": [
-        "10.96.20.234",
+        "10.96.135.99",
         "services/demo/web",
-        "23m"
+        "6m1s"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "ipaddress.kubernetes.io/ip-family": "IPv4",
             "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
           },
-          "name": "10.96.20.234",
+          "name": "10.96.135.99",
           "resourceVersion": "1",
-          "uid": "1f6cc87a-5e2b-620e-847f-d7ce34a6ac2e"
+          "uid": "18879b6d-7a64-485a-d2f6-728104056a08"
         }
       }
     },
     {
       "cells": [
-        "10.96.46.98",
-        "services/kube-system/metrics-server",
-        "23m"
+        "10.96.46.117",
+        "services/demo/podinfo",
+        "6m"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "ipaddress.kubernetes.io/ip-family": "IPv4",
             "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
           },
-          "name": "10.96.46.98",
+          "name": "10.96.46.117",
           "resourceVersion": "1",
-          "uid": "abd33ee4-4371-9bd3-a56d-1fe70b6750e0"
+          "uid": "900022cd-2574-d90c-70a8-03fcae6fe041"
+        }
+      }
+    },
+    {
+      "cells": [
+        "10.96.56.213",
+        "services/kube-system/metrics-server",
+        "6m1s"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "labels": {
+            "ipaddress.kubernetes.io/ip-family": "IPv4",
+            "ipaddress.kubernetes.io/managed-by": "ipallocator.k8s.io"
+          },
+          "name": "10.96.56.213",
+          "resourceVersion": "1",
+          "uid": "2efbe112-0beb-8d37-6b21-09bb5145e742"
         }
       }
     }

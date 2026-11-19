@@ -1,0 +1,51 @@
+{
+  "apiVersion": "fixtures.flint.dev/v1",
+  "items": [
+    {
+      "apiVersion": "fixtures.flint.dev/v1",
+      "kind": "Gadget",
+      "metadata": {
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"fixtures.flint.dev/v1\",\"kind\":\"Gadget\",\"metadata\":{\"annotations\":{},\"name\":\"gadget-1\",\"namespace\":\"demo\"},\"spec\":{\"color\":\"teal\",\"size\":3}}\n"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generation": 1,
+        "managedFields": [
+          {
+            "apiVersion": "fixtures.flint.dev/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:kubectl.kubernetes.io/last-applied-configuration": {}
+                }
+              },
+              "f:spec": {
+                ".": {},
+                "f:color": {},
+                "f:size": {}
+              }
+            },
+            "manager": "kubectl-client-side-apply",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "gadget-1",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "21507d6b-c8ad-a661-2efd-df85df70cb75"
+      },
+      "spec": {
+        "color": "teal",
+        "size": 3
+      }
+    }
+  ],
+  "kind": "GadgetList",
+  "metadata": {
+    "continue": "",
+    "resourceVersion": "1"
+  }
+}

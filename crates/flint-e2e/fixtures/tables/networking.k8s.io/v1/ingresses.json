@@ -48,5 +48,31 @@
   "metadata": {
     "resourceVersion": "1"
   },
-  "rows": []
+  "rows": [
+    {
+      "cells": [
+        "web",
+        "<none>",
+        "web.demo.flint.test",
+        "",
+        "80",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"networking.k8s.io/v1\",\"kind\":\"Ingress\",\"metadata\":{\"annotations\":{},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"rules\":[{\"host\":\"web.demo.flint.test\",\"http\":{\"paths\":[{\"backend\":{\"service\":{\"name\":\"web\",\"port\":{\"number\":80}}},\"path\":\"/\",\"pathType\":\"Prefix\"}]}}]}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "web",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "27717356-29c4-313c-1f1a-f170c1219d7a"
+        }
+      }
+    }
+  ]
 }

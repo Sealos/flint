@@ -65,7 +65,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -88,7 +88,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kindnet",
           "resourceVersion": "1",
           "uid": "2ec4d54c-55ef-c3c8-8e30-179018473f15"
@@ -108,7 +108,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:apiserver-kubelet-client",
           "resourceVersion": "1",
           "uid": "78473717-6a6d-b848-35e3-eb28960b78e7"
@@ -128,7 +128,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:cluster-admins",
           "resourceVersion": "1",
           "uid": "e618aaad-0aa6-a97a-2383-d4996d3df84d"
@@ -148,7 +148,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:get-nodes",
           "resourceVersion": "1",
           "uid": "5368e4dc-0a33-e9f5-b440-4f2f2626b2e9"
@@ -168,7 +168,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:kubelet-bootstrap",
           "resourceVersion": "1",
           "uid": "50b93b77-a112-b172-251d-52e14f110fa9"
@@ -188,7 +188,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:node-autoapprove-bootstrap",
           "resourceVersion": "1",
           "uid": "872f8da8-bcd9-7715-47df-3a8223080cc7"
@@ -208,7 +208,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:node-autoapprove-certificate-rotation",
           "resourceVersion": "1",
           "uid": "c835bd6b-c2e7-1d2f-a30d-b23160ae291f"
@@ -228,7 +228,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:node-proxier",
           "resourceVersion": "1",
           "uid": "0400444d-493b-e941-3cd2-c938ac376b70"
@@ -251,7 +251,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"annotations\":{},\"name\":\"local-path-provisioner-bind\"},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"local-path-provisioner-role\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"local-path-provisioner-service-account\",\"namespace\":\"local-path-storage\"}]}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "local-path-provisioner-bind",
           "resourceVersion": "1",
           "uid": "bc8e568a-12e8-d213-05cd-35b5da14877a"
@@ -274,7 +274,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"metrics-server:system:auth-delegator\"},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"system:auth-delegator\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"metrics-server\",\"namespace\":\"kube-system\"}]}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "k8s-app": "metrics-server"
           },
@@ -300,7 +300,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -326,7 +326,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -352,7 +352,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -378,7 +378,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -404,7 +404,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -430,7 +430,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -456,7 +456,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -482,7 +482,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -508,7 +508,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -534,7 +534,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -560,7 +560,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -586,7 +586,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -612,7 +612,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -638,7 +638,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -664,7 +664,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -690,7 +690,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -716,7 +716,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -742,7 +742,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -768,7 +768,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -794,7 +794,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -820,7 +820,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -846,7 +846,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -872,7 +872,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -898,7 +898,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -924,7 +924,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -950,7 +950,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -976,7 +976,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1002,7 +1002,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1028,7 +1028,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1054,7 +1054,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1080,7 +1080,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1106,7 +1106,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1132,7 +1132,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1158,7 +1158,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1184,7 +1184,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1210,7 +1210,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1236,7 +1236,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1262,7 +1262,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1288,7 +1288,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1314,7 +1314,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1340,7 +1340,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1366,7 +1366,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1392,7 +1392,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1415,7 +1415,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "system:coredns",
           "resourceVersion": "1",
           "uid": "06f5ed28-6e60-16a6-b999-a250c07eab92"
@@ -1438,7 +1438,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1464,7 +1464,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1490,7 +1490,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1516,7 +1516,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1542,7 +1542,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"annotations\":{},\"labels\":{\"k8s-app\":\"metrics-server\"},\"name\":\"system:metrics-server\"},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"system:metrics-server\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"metrics-server\",\"namespace\":\"kube-system\"}]}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "k8s-app": "metrics-server"
           },
@@ -1568,7 +1568,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1594,7 +1594,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1620,7 +1620,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1646,7 +1646,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1672,7 +1672,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -1698,7 +1698,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },

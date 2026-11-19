@@ -79,1201 +79,1451 @@
   "rows": [
     {
       "cells": [
-        "1d",
-        "Normal",
-        "NodeHasSufficientMemory",
-        "node/flint-dev-control-plane",
-        "",
-        "kubelet, flint-dev-control-plane",
-        "Node flint-dev-control-plane status is now: NodeHasSufficientMemory",
-        "1d",
-        8,
-        "flint-dev-control-plane.18e98718ace40503"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e98718ace40503",
-          "namespace": "default",
-          "resourceVersion": "1",
-          "uid": "ab9b4b07-1190-d892-4c5b-cf2653e433cb"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "NodeHasNoDiskPressure",
-        "node/flint-dev-control-plane",
-        "",
-        "kubelet, flint-dev-control-plane",
-        "Node flint-dev-control-plane status is now: NodeHasNoDiskPressure",
-        "1d",
-        8,
-        "flint-dev-control-plane.18e98718ace43919"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e98718ace43919",
-          "namespace": "default",
-          "resourceVersion": "1",
-          "uid": "ba6dbbe9-0ddc-a7e7-d762-11f14879ae05"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "NodeHasSufficientPID",
-        "node/flint-dev-control-plane",
-        "",
-        "kubelet, flint-dev-control-plane",
-        "Node flint-dev-control-plane status is now: NodeHasSufficientPID",
-        "1d",
-        7,
-        "flint-dev-control-plane.18e98718ace45472"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e98718ace45472",
-          "namespace": "default",
-          "resourceVersion": "1",
-          "uid": "e7bdb1ce-b99c-91fe-d164-6c95c24bbb9e"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "NodeAllocatableEnforced",
-        "node/flint-dev-control-plane",
-        "",
-        "kubelet, flint-dev-control-plane",
-        "Updated Node Allocatable limit across pods",
-        "1d",
-        1,
-        "flint-dev-control-plane.18e98718b1adccaf"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e98718b1adccaf",
-          "namespace": "default",
-          "resourceVersion": "1",
-          "uid": "0047d166-d839-198e-a3ff-1b4729842ebf"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Starting",
         "node/flint-dev-control-plane",
         "",
         "kubelet, flint-dev-control-plane",
         "Starting kubelet.",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871c36e55850"
+        "flint-dev-control-plane.18e98a37c791062c"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871c36e55850",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a37c791062c",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "b4d0fc54-5921-1bbc-714b-854233027c12"
+          "uid": "e33bee2c-ccc8-104e-8788-5f236568bfab"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "NodeAllocatableEnforced",
         "node/flint-dev-control-plane",
         "",
         "kubelet, flint-dev-control-plane",
         "Updated Node Allocatable limit across pods",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871c4a25a854"
+        "flint-dev-control-plane.18e98a37cbdc0873"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871c4a25a854",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a37cbdc0873",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "aaa1ea73-de7a-185b-f5f5-f579756c2bfe"
+          "uid": "0f13f473-b1be-9fb9-c819-f35a9f0a2c58"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "NodeHasSufficientMemory",
         "node/flint-dev-control-plane",
         "",
         "kubelet, flint-dev-control-plane",
         "Node flint-dev-control-plane status is now: NodeHasSufficientMemory",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871c50b3656a"
+        "flint-dev-control-plane.18e98a37d1ed96f2"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871c50b3656a",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a37d1ed96f2",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "70697045-bfe7-9a78-99a9-a5805e29de38"
+          "uid": "59c0c370-7c83-c9a5-1ff2-c3c2947acdb0"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "NodeHasNoDiskPressure",
         "node/flint-dev-control-plane",
         "",
         "kubelet, flint-dev-control-plane",
         "Node flint-dev-control-plane status is now: NodeHasNoDiskPressure",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871c50b3a65c"
+        "flint-dev-control-plane.18e98a37d1edde66"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871c50b3a65c",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a37d1edde66",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "b624adb3-22d1-834a-c4c9-12305ff0ee2e"
+          "uid": "a539b6ff-4443-37ae-a14d-2ff9af99e871"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "NodeHasSufficientPID",
         "node/flint-dev-control-plane",
         "",
         "kubelet, flint-dev-control-plane",
         "Node flint-dev-control-plane status is now: NodeHasSufficientPID",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871c50b3b197"
+        "flint-dev-control-plane.18e98a37d1edee82"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871c50b3b197",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a37d1edee82",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "bd412ace-5636-a4fa-0b37-8cac65ba433d"
+          "uid": "f4fb9161-cde3-2941-37f8-cf024c7824d3"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "RegisteredNode",
         "node/flint-dev-control-plane",
         "",
         "node-controller",
         "Node flint-dev-control-plane event: Registered Node flint-dev-control-plane in Controller",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871db506d807"
+        "flint-dev-control-plane.18e98a39549e5ce9"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871db506d807",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a39549e5ce9",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "ca7f18d9-3a38-655d-2455-e65179c4cfa2"
+          "uid": "eec8dbfd-2edc-7587-fc31-83579651ca32"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Starting",
         "node/flint-dev-control-plane",
         "",
         "kube-proxy, kube-proxy-flint-dev-control-plane",
         "",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e9871e985b6942"
+        "flint-dev-control-plane.18e98a39d2b89cfc"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e9871e985b6942",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a39d2b89cfc",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "5acc0f34-9d44-28ce-5096-73621c4fb532"
+          "uid": "3fe2790d-28a5-f0a3-b5c4-07e5857e3a29"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "NodeReady",
         "node/flint-dev-control-plane",
         "",
         "kubelet, flint-dev-control-plane",
         "Node flint-dev-control-plane status is now: NodeReady",
-        "1d",
+        "6m",
         1,
-        "flint-dev-control-plane.18e987212b48abf6"
+        "flint-dev-control-plane.18e98a3c30b7a59b"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "flint-dev-control-plane.18e987212b48abf6",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "flint-dev-control-plane.18e98a3c30b7a59b",
           "namespace": "default",
           "resourceVersion": "1",
-          "uid": "83eb5a23-c451-8797-bcd2-b86b16487885"
+          "uid": "df13f20c-955a-5b2d-8078-e6c73720a8d6"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Scheduled",
-        "pod/podinfo-c6497595d-b5r9c",
+        "pod/broken-image",
         "",
         "default-scheduler",
-        "Successfully assigned demo/podinfo-c6497595d-b5r9c to flint-dev-control-plane",
-        "1d",
+        "Successfully assigned demo/broken-image to flint-dev-control-plane",
+        "6m",
         1,
-        "podinfo-c6497595d-b5r9c.18e987229fd872bd"
+        "broken-image.18e98a42804ad4c0"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo-c6497595d-b5r9c.18e987229fd872bd",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "broken-image.18e98a42804ad4c0",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "942a6e88-4f20-6356-a61a-bb877903c63c"
+          "uid": "affdc9b9-7a6a-6670-a8bd-faa514be592c"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "10s",
         "Normal",
         "Pulling",
-        "pod/podinfo-c6497595d-b5r9c",
+        "pod/broken-image",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Pulling image \"registry.invalid/flint/missing:1.0\"",
+        "6m",
+        6,
+        "broken-image.18e98a42a2435957"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "broken-image.18e98a42a2435957",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "4c472156-7e12-b11d-d1c9-1b72c684f0e9"
+        }
+      }
+    },
+    {
+      "cells": [
+        "3m",
+        "Warning",
+        "Failed",
+        "pod/broken-image",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Failed to pull image \"registry.invalid/flint/missing:1.0\": failed to pull and unpack image \"registry.invalid/flint/missing:1.0\": failed to resolve reference \"registry.invalid/flint/missing:1.0\": failed to do request: Head \"https://registry.invalid/v2/flint/missing/manifests/1.0\": dial tcp: lookup registry.invalid on 192.168.5.2:53: no such host",
+        "6m",
+        5,
+        "broken-image.18e98a42a4c34eed"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "broken-image.18e98a42a4c34eed",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "17a9f048-9ab7-e689-982b-4340e0a3268a"
+        }
+      }
+    },
+    {
+      "cells": [
+        "3m",
+        "Warning",
+        "Failed",
+        "pod/broken-image",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Error: ErrImagePull",
+        "6m",
+        5,
+        "broken-image.18e98a42a4d5c50a"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "broken-image.18e98a42a4d5c50a",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "4e66cdbd-5602-3938-60b7-909ee44febea"
+        }
+      }
+    },
+    {
+      "cells": [
+        "20s",
+        "Normal",
+        "BackOff",
+        "pod/broken-image",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Back-off pulling image \"registry.invalid/flint/missing:1.0\"",
+        "6m",
+        20,
+        "broken-image.18e98a42c55464bc"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "broken-image.18e98a42c55464bc",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "c489fe4b-d1a7-fdaa-8a03-ec7bbef72fe0"
+        }
+      }
+    },
+    {
+      "cells": [
+        "30s",
+        "Warning",
+        "Failed",
+        "pod/broken-image",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Error: ImagePullBackOff",
+        "6m",
+        19,
+        "broken-image.18e98a42c555130c"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "broken-image.18e98a42c555130c",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "76fc9daf-a7fb-1d9b-03d4-cfe2ce304775"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Scheduled",
+        "pod/crash-loop",
+        "",
+        "default-scheduler",
+        "Successfully assigned demo/crash-loop to flint-dev-control-plane",
+        "6m",
+        1,
+        "crash-loop.18e98a428179ae92"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "crash-loop.18e98a428179ae92",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "11cbbd6d-a53a-e681-1749-fd4415659d18"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Pulling",
+        "pod/crash-loop",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Pulling image \"busybox:1.37.0\"",
+        "6m",
+        1,
+        "crash-loop.18e98a42a2bcf481"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "crash-loop.18e98a42a2bcf481",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "3038f509-bbbb-a851-1418-9a614b5594af"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Pulled",
+        "pod/crash-loop",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Successfully pulled image \"busybox:1.37.0\" in 2.097s (2.131s including waiting). Image size: 1911395 bytes.",
+        "6m",
+        1,
+        "crash-loop.18e98a4321c8cfd5"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "crash-loop.18e98a4321c8cfd5",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "4fbbc481-a256-572e-741d-f139b86efaca"
+        }
+      }
+    },
+    {
+      "cells": [
+        "3m",
+        "Normal",
+        "Created",
+        "pod/crash-loop",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Container created",
+        "6m",
+        6,
+        "crash-loop.18e98a4322a6c346"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "crash-loop.18e98a4322a6c346",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "eec5c532-cca9-8e28-ff51-c615fa266bf3"
+        }
+      }
+    },
+    {
+      "cells": [
+        "3m",
+        "Normal",
+        "Started",
+        "pod/crash-loop",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Container started",
+        "6m",
+        6,
+        "crash-loop.18e98a4325aab86f"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "crash-loop.18e98a4325aab86f",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "79e05fa5-0916-6ef0-1f82-e1af03d7e92d"
+        }
+      }
+    },
+    {
+      "cells": [
+        "3m",
+        "Normal",
+        "Pulled",
+        "pod/crash-loop",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Container image \"busybox:1.37.0\" already present on machine and can be accessed by the pod",
+        "6m",
+        5,
+        "crash-loop.18e98a43b54fb3c7"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "crash-loop.18e98a43b54fb3c7",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "c4456ecb-6fcd-8408-b7a2-ff6425a2b5d3"
+        }
+      }
+    },
+    {
+      "cells": [
+        "20s",
+        "Warning",
+        "BackOff",
+        "pod/crash-loop",
+        "spec.containers{app}",
+        "kubelet, flint-dev-control-plane",
+        "Back-off restarting failed container app in pod crash-loop_demo(6693fb2f-5611-ec9b-08fd-7e18595ff74a)",
+        "5m",
+        7,
+        "crash-loop.18e98a4468b803c1"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:55:00Z",
+          "name": "crash-loop.18e98a4468b803c1",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "49793d12-4481-bda5-4eab-b9886e4d25c5"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "WaitForFirstConsumer",
+        "persistentvolumeclaim/data-fixture-db-0",
+        "",
+        "persistentvolume-controller",
+        "waiting for first consumer to be created before binding",
+        "6m",
+        1,
+        "data-fixture-db-0.18e98a42876b3259"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "data-fixture-db-0.18e98a42876b3259",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "87ea9d96-833b-d969-0875-e3a2aea0f256"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "ExternalProvisioning",
+        "persistentvolumeclaim/data-fixture-db-0",
+        "",
+        "persistentvolume-controller",
+        "Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.",
+        "6m",
+        2,
+        "data-fixture-db-0.18e98a4288ec497a"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "data-fixture-db-0.18e98a4288ec497a",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "744d0f5c-1d3e-ef32-e831-f821edd0bb6e"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Provisioning",
+        "persistentvolumeclaim/data-fixture-db-0",
+        "",
+        "rancher.io/local-path_local-path-provisioner-75f7fc7dc5-x624n_4a2d63af-4d5b-fa26-ddd3-94f09cc2bae9",
+        "External provisioner is provisioning volume for claim \"demo/data-fixture-db-0\"",
+        "6m",
+        1,
+        "data-fixture-db-0.18e98a4289b5833b"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "data-fixture-db-0.18e98a4289b5833b",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "a8025bf5-7af2-7a52-7f8a-45e96081970f"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "ProvisioningSucceeded",
+        "persistentvolumeclaim/data-fixture-db-0",
+        "",
+        "rancher.io/local-path_local-path-provisioner-75f7fc7dc5-x624n_4a2d63af-4d5b-fa26-ddd3-94f09cc2bae9",
+        "Successfully provisioned volume pvc-09aae925-1931-cdcf-d093-3f7dbc8458c2",
+        "6m",
+        1,
+        "data-fixture-db-0.18e98a43407fe3c7"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "data-fixture-db-0.18e98a43407fe3c7",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "568847b0-45f2-72df-4907-f89eb1094bce"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Scheduled",
+        "pod/fixture-db-0",
+        "",
+        "default-scheduler",
+        "Successfully assigned demo/fixture-db-0 to flint-dev-control-plane",
+        "6m",
+        1,
+        "fixture-db-0.18e98a43785b8547"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db-0.18e98a43785b8547",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "468048c2-2ad6-f376-b2d0-df5d8761f53b"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Pulled",
+        "pod/fixture-db-0",
+        "spec.containers{db}",
+        "kubelet, flint-dev-control-plane",
+        "Container image \"busybox:1.37.0\" already present on machine and can be accessed by the pod",
+        "6m",
+        1,
+        "fixture-db-0.18e98a4393982b74"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db-0.18e98a4393982b74",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "598dfc24-8e88-611a-d5fc-58f99681af51"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Created",
+        "pod/fixture-db-0",
+        "spec.containers{db}",
+        "kubelet, flint-dev-control-plane",
+        "Container created",
+        "6m",
+        1,
+        "fixture-db-0.18e98a4394923f62"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db-0.18e98a4394923f62",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "433667d7-fc87-e24b-d01a-d43b2feec839"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Started",
+        "pod/fixture-db-0",
+        "spec.containers{db}",
+        "kubelet, flint-dev-control-plane",
+        "Container started",
+        "6m",
+        1,
+        "fixture-db-0.18e98a4397f886ee"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db-0.18e98a4397f886ee",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "3f4f9ab9-1052-3dae-4b1f-e556ef5f0592"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "SuccessfulCreate",
+        "statefulset/fixture-db",
+        "",
+        "statefulset-controller",
+        "Create Claim data-fixture-db-0 Pod fixture-db-0 in StatefulSet fixture-db success",
+        "6m",
+        1,
+        "fixture-db.18e98a4287721c28"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db.18e98a4287721c28",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "4c19b9d5-eaf9-c0a1-d82a-c7c96172ddd8"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "SuccessfulCreate",
+        "statefulset/fixture-db",
+        "",
+        "statefulset-controller",
+        "Create Pod fixture-db-0 in StatefulSet fixture-db successful",
+        "6m",
+        1,
+        "fixture-db.18e98a42880dd83a"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-db.18e98a42880dd83a",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "d57bd2db-abe7-5b01-1d5e-6792e3ac350c"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Scheduled",
+        "pod/fixture-job-qd9jf",
+        "",
+        "default-scheduler",
+        "Successfully assigned demo/fixture-job-qd9jf to flint-dev-control-plane",
+        "6m",
+        1,
+        "fixture-job-qd9jf.18e98a428474a72d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-job-qd9jf.18e98a428474a72d",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "e24be996-f0f4-7b0a-834a-a8868ddbeabe"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Pulling",
+        "pod/fixture-job-qd9jf",
+        "spec.containers{job}",
+        "kubelet, flint-dev-control-plane",
+        "Pulling image \"busybox:1.37.0\"",
+        "6m",
+        1,
+        "fixture-job-qd9jf.18e98a42a4a6f114"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-job-qd9jf.18e98a42a4a6f114",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "fb982c1c-ffbb-70eb-714f-9b3acb37e4b7"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Pulled",
+        "pod/fixture-job-qd9jf",
+        "spec.containers{job}",
+        "kubelet, flint-dev-control-plane",
+        "Successfully pulled image \"busybox:1.37.0\" in 586ms (2.686s including waiting). Image size: 1911395 bytes.",
+        "6m",
+        1,
+        "fixture-job-qd9jf.18e98a4344c14093"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-job-qd9jf.18e98a4344c14093",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "46ebdadb-b6ee-bd11-39d2-699408afd4a5"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Created",
+        "pod/fixture-job-qd9jf",
+        "spec.containers{job}",
+        "kubelet, flint-dev-control-plane",
+        "Container created",
+        "6m",
+        1,
+        "fixture-job-qd9jf.18e98a43455372a7"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-job-qd9jf.18e98a43455372a7",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "a39cf5fe-b9a5-2838-7749-7e7841a2d0dd"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Started",
+        "pod/fixture-job-qd9jf",
+        "spec.containers{job}",
+        "kubelet, flint-dev-control-plane",
+        "Container started",
+        "6m",
+        1,
+        "fixture-job-qd9jf.18e98a43493a2f10"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-job-qd9jf.18e98a43493a2f10",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "61d36e0d-f973-70b4-ee65-4879b8a45db8"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "SuccessfulCreate",
+        "job/fixture-job",
+        "",
+        "job-controller",
+        "Created pod: fixture-job-qd9jf",
+        "6m",
+        1,
+        "fixture-job.18e98a42840028bc"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "fixture-job.18e98a42840028bc",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "ab2e5802-5a82-cca0-f7a1-e4cf078e9e42"
+        }
+      }
+    },
+    {
+      "cells": [
+        "5m",
+        "Normal",
+        "Completed",
+        "job/fixture-job",
+        "",
+        "job-controller",
+        "Job completed",
+        "5m",
+        1,
+        "fixture-job.18e98a43f3af7e0d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:55:00Z",
+          "name": "fixture-job.18e98a43f3af7e0d",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "1daab302-7219-55a1-60b9-3658ea2f9a14"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Scheduled",
+        "pod/podinfo-c6497595d-b8chj",
+        "",
+        "default-scheduler",
+        "Successfully assigned demo/podinfo-c6497595d-b8chj to flint-dev-control-plane",
+        "6m",
+        1,
+        "podinfo-c6497595d-b8chj.18e98a3cbd4de1fe"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo-c6497595d-b8chj.18e98a3cbd4de1fe",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "5367287b-471d-e9bf-dcaf-2e32f58d4d87"
+        }
+      }
+    },
+    {
+      "cells": [
+        "6m",
+        "Normal",
+        "Pulling",
+        "pod/podinfo-c6497595d-b8chj",
         "spec.containers{podinfo}",
         "kubelet, flint-dev-control-plane",
         "Pulling image \"ghcr.io/stefanprodan/podinfo:6.17.0\"",
-        "1d",
+        "6m",
         1,
-        "podinfo-c6497595d-b5r9c.18e98722c5c4a1cb"
+        "podinfo-c6497595d-b8chj.18e98a3cd5c69ff9"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo-c6497595d-b5r9c.18e98722c5c4a1cb",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo-c6497595d-b8chj.18e98a3cd5c69ff9",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "91886f54-8e29-b72c-2f74-0e268eebcdcd"
+          "uid": "90b44a52-f693-5892-fc83-054901546b45"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Pulled",
-        "pod/podinfo-c6497595d-b5r9c",
+        "pod/podinfo-c6497595d-b8chj",
         "spec.containers{podinfo}",
         "kubelet, flint-dev-control-plane",
-        "Successfully pulled image \"ghcr.io/stefanprodan/podinfo:6.17.0\" in 3.433s (10.902s including waiting). Image size: 33594805 bytes.",
-        "1d",
+        "Successfully pulled image \"ghcr.io/stefanprodan/podinfo:6.17.0\" in 3.529s (9.83s including waiting). Image size: 33594805 bytes.",
+        "6m",
         1,
-        "podinfo-c6497595d-b5r9c.18e987254fab9cb7"
+        "podinfo-c6497595d-b8chj.18e98a3f1fb2b6b9"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo-c6497595d-b5r9c.18e987254fab9cb7",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo-c6497595d-b8chj.18e98a3f1fb2b6b9",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "bf7a83ba-fb0a-d20d-f600-c3ecee6d4b5a"
+          "uid": "accc156e-5e2c-95d0-9566-32cbb24dbfbf"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Created",
-        "pod/podinfo-c6497595d-b5r9c",
+        "pod/podinfo-c6497595d-b8chj",
         "spec.containers{podinfo}",
         "kubelet, flint-dev-control-plane",
         "Container created",
-        "1d",
+        "6m",
         1,
-        "podinfo-c6497595d-b5r9c.18e9872550346332"
+        "podinfo-c6497595d-b8chj.18e98a3f2034fc40"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo-c6497595d-b5r9c.18e9872550346332",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo-c6497595d-b8chj.18e98a3f2034fc40",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "f752d820-b7f7-f794-a9af-b600b8569467"
+          "uid": "caf0954a-f06f-8e96-5044-3705b35f5507"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Started",
-        "pod/podinfo-c6497595d-b5r9c",
+        "pod/podinfo-c6497595d-b8chj",
         "spec.containers{podinfo}",
         "kubelet, flint-dev-control-plane",
         "Container started",
-        "1d",
+        "6m",
         1,
-        "podinfo-c6497595d-b5r9c.18e9872553e74b03"
+        "podinfo-c6497595d-b8chj.18e98a3f2331e00c"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo-c6497595d-b5r9c.18e9872553e74b03",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo-c6497595d-b8chj.18e98a3f2331e00c",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "7af59afc-b3b5-5e48-dc5a-7e21c1b4cfeb"
+          "uid": "778f6797-e528-e6d6-32c8-e32e6dc55991"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "SuccessfulCreate",
         "replicaset/podinfo-c6497595d",
         "",
         "replicaset-controller",
-        "Created pod: podinfo-c6497595d-b5r9c",
-        "1d",
+        "Created pod: podinfo-c6497595d-b8chj",
+        "6m",
         1,
-        "podinfo-c6497595d.18e987229c4771b0"
+        "podinfo-c6497595d.18e98a3cbd213068"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo-c6497595d.18e987229c4771b0",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo-c6497595d.18e98a3cbd213068",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "333b1760-6368-912a-e5f1-e0ed6a8e7dd7"
+          "uid": "6ad6d393-674d-25a2-5f2b-ed8f9428286d"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "ScalingReplicaSet",
         "deployment/podinfo",
         "",
         "deployment-controller",
         "Scaled up replica set podinfo-c6497595d from 0 to 1",
-        "1d",
+        "6m",
         1,
-        "podinfo.18e987229a032824"
+        "podinfo.18e98a3cbcd663ab"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "podinfo.18e987229a032824",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "podinfo.18e98a3cbcd663ab",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "8f256368-7fed-1ee5-48ec-e9eedabb0c31"
+          "uid": "4c706217-5bcf-dc3d-0e57-f5510b241c9f"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Scheduled",
-        "pod/web-69c6f74b8b-fshvp",
+        "pod/web-69c6f74b8b-qv4xv",
         "",
         "default-scheduler",
-        "Successfully assigned demo/web-69c6f74b8b-fshvp to flint-dev-control-plane",
-        "1d",
+        "Successfully assigned demo/web-69c6f74b8b-qv4xv to flint-dev-control-plane",
+        "6m",
         1,
-        "web-69c6f74b8b-fshvp.18e988011bfb441a"
+        "web-69c6f74b8b-qv4xv.18e98a3c7ccbbb3a"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-fshvp.18e988011bfb441a",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-qv4xv.18e98a3c7ccbbb3a",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "c5b04c57-88a9-7900-8eae-7e347fc6ce92"
+          "uid": "922bedeb-762f-2fa1-cc41-902c3d184e5c"
         }
       }
     },
     {
       "cells": [
-        "1d",
-        "Normal",
-        "Pulled",
-        "pod/web-69c6f74b8b-fshvp",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Container image \"nginx:1.27\" already present on machine and can be accessed by the pod",
-        "1d",
-        1,
-        "web-69c6f74b8b-fshvp.18e9880139c96bd9"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-fshvp.18e9880139c96bd9",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "6356559d-fe2c-299c-6cc6-3f9816d62226"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Created",
-        "pod/web-69c6f74b8b-fshvp",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Container created",
-        "1d",
-        1,
-        "web-69c6f74b8b-fshvp.18e988013ad6f0fd"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-fshvp.18e988013ad6f0fd",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "829798e9-4b6e-9894-1eb5-d14a093f754a"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Started",
-        "pod/web-69c6f74b8b-fshvp",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Container started",
-        "1d",
-        1,
-        "web-69c6f74b8b-fshvp.18e988013f0aebce"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-fshvp.18e988013f0aebce",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "da7a6113-5ffd-3a63-9689-327593577f45"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Killing",
-        "pod/web-69c6f74b8b-fshvp",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Stopping container nginx",
-        "1d",
-        1,
-        "web-69c6f74b8b-fshvp.18e988013f2df74c"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-fshvp.18e988013f2df74c",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "0bd478e3-d608-6b24-a975-db76815f3478"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Scheduled",
-        "pod/web-69c6f74b8b-glf4m",
-        "",
-        "default-scheduler",
-        "Successfully assigned demo/web-69c6f74b8b-glf4m to flint-dev-control-plane",
-        "1d",
-        1,
-        "web-69c6f74b8b-glf4m.18e987c90976686b"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-glf4m.18e987c90976686b",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "423c03c7-a90d-554e-1c40-ebc46ec0aa9d"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Pulled",
-        "pod/web-69c6f74b8b-glf4m",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Container image \"nginx:1.27\" already present on machine and can be accessed by the pod",
-        "1d",
-        1,
-        "web-69c6f74b8b-glf4m.18e987c92de91cf4"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-glf4m.18e987c92de91cf4",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "89130ef8-a3e5-2ec6-5d5f-511d22c4e361"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Created",
-        "pod/web-69c6f74b8b-glf4m",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Container created",
-        "1d",
-        1,
-        "web-69c6f74b8b-glf4m.18e987c9320f7175"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-glf4m.18e987c9320f7175",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "f698f8fc-64f5-46fc-d5c6-4af23c7d0498"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Started",
-        "pod/web-69c6f74b8b-glf4m",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Container started",
-        "1d",
-        1,
-        "web-69c6f74b8b-glf4m.18e987c93ad7d754"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-glf4m.18e987c93ad7d754",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "3d066720-0be6-ae54-617d-21b30bf5560c"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Killing",
-        "pod/web-69c6f74b8b-glf4m",
-        "spec.containers{nginx}",
-        "kubelet, flint-dev-control-plane",
-        "Stopping container nginx",
-        "1d",
-        1,
-        "web-69c6f74b8b-glf4m.18e987c93b54e664"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-glf4m.18e987c93b54e664",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "acf2b80d-1d21-1f8a-eb70-d4ab2e096b06"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "Scheduled",
-        "pod/web-69c6f74b8b-pjhg5",
-        "",
-        "default-scheduler",
-        "Successfully assigned demo/web-69c6f74b8b-pjhg5 to flint-dev-control-plane",
-        "1d",
-        1,
-        "web-69c6f74b8b-pjhg5.18e98721f8b5a50f"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-pjhg5.18e98721f8b5a50f",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "4a9afdf4-63b6-43f8-6d7f-3735459ff8d0"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Pulling",
-        "pod/web-69c6f74b8b-pjhg5",
+        "pod/web-69c6f74b8b-qv4xv",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
         "Pulling image \"nginx:1.27\"",
-        "1d",
+        "6m",
         1,
-        "web-69c6f74b8b-pjhg5.18e98722371076c9"
+        "web-69c6f74b8b-qv4xv.18e98a3c9ff5a97a"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-pjhg5.18e98722371076c9",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-qv4xv.18e98a3c9ff5a97a",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "cb830df6-5607-1db9-6499-e6daf31285e8"
+          "uid": "441704c6-7b0e-93f5-84fa-03cecdd75668"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Pulled",
-        "pod/web-69c6f74b8b-pjhg5",
+        "pod/web-69c6f74b8b-qv4xv",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
-        "Successfully pulled image \"nginx:1.27\" in 6.376s (9.126s including waiting). Image size: 68857691 bytes.",
-        "1d",
+        "Successfully pulled image \"nginx:1.27\" in 595ms (7.203s including waiting). Image size: 68857691 bytes.",
+        "6m",
         1,
-        "web-69c6f74b8b-pjhg5.18e98724570b59f7"
+        "web-69c6f74b8b-qv4xv.18e98a3e4d4c743e"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-pjhg5.18e98724570b59f7",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-qv4xv.18e98a3e4d4c743e",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "9b2065c8-f573-8b16-b7bb-5a03976e0ef7"
+          "uid": "050ac1c0-4f45-cd9b-2df1-903b37bcac6f"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Created",
-        "pod/web-69c6f74b8b-pjhg5",
+        "pod/web-69c6f74b8b-qv4xv",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
         "Container created",
-        "1d",
+        "6m",
         1,
-        "web-69c6f74b8b-pjhg5.18e9872459165c26"
+        "web-69c6f74b8b-qv4xv.18e98a3e4ea52175"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-pjhg5.18e9872459165c26",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-qv4xv.18e98a3e4ea52175",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "de10e706-c636-1073-bc14-09417a9bbb56"
+          "uid": "dba2b9d9-e0ed-7cbf-8a38-c95c7eb41568"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Started",
-        "pod/web-69c6f74b8b-pjhg5",
+        "pod/web-69c6f74b8b-qv4xv",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
         "Container started",
-        "1d",
+        "6m",
         1,
-        "web-69c6f74b8b-pjhg5.18e9872465c89abd"
+        "web-69c6f74b8b-qv4xv.18e98a3e52631c62"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-pjhg5.18e9872465c89abd",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-qv4xv.18e98a3e52631c62",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "ff6fd8ab-3d5f-9bec-5138-1efdba31a8d6"
+          "uid": "f6d124ec-48b0-8f80-a140-85cba56d1ca3"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Scheduled",
-        "pod/web-69c6f74b8b-x9t6b",
+        "pod/web-69c6f74b8b-x4gss",
         "",
         "default-scheduler",
-        "Successfully assigned demo/web-69c6f74b8b-x9t6b to flint-dev-control-plane",
-        "1d",
+        "Successfully assigned demo/web-69c6f74b8b-x4gss to flint-dev-control-plane",
+        "6m",
         1,
-        "web-69c6f74b8b-x9t6b.18e9872201538435"
+        "web-69c6f74b8b-x4gss.18e98a3c7af56930"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-x9t6b.18e9872201538435",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-x4gss.18e98a3c7af56930",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "aa62a798-8cda-ae24-1196-9484a10447f2"
+          "uid": "20d31632-6ca0-1b55-abe1-94f0918e9ce9"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Pulling",
-        "pod/web-69c6f74b8b-x9t6b",
+        "pod/web-69c6f74b8b-x4gss",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
         "Pulling image \"nginx:1.27\"",
-        "1d",
+        "6m",
         1,
-        "web-69c6f74b8b-x9t6b.18e987223a90bd61"
+        "web-69c6f74b8b-x4gss.18e98a3c9d47ec7b"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-x9t6b.18e987223a90bd61",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-x4gss.18e98a3c9d47ec7b",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "a3284287-8561-db29-bae7-af330dcc6828"
+          "uid": "284182e7-3172-8e92-32c5-4884c686d6dd"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Pulled",
-        "pod/web-69c6f74b8b-x9t6b",
+        "pod/web-69c6f74b8b-x4gss",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
-        "Successfully pulled image \"nginx:1.27\" in 738ms (9.805s including waiting). Image size: 68857691 bytes.",
-        "1d",
+        "Successfully pulled image \"nginx:1.27\" in 4.623s (6.652s including waiting). Image size: 68857691 bytes.",
+        "6m",
         1,
-        "web-69c6f74b8b-x9t6b.18e987248309ac80"
+        "web-69c6f74b8b-x4gss.18e98a3e29cd2429"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-x9t6b.18e987248309ac80",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-x4gss.18e98a3e29cd2429",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "71fcdb9a-ac5e-e64b-aa56-18967ecf2572"
+          "uid": "882b4dce-e6a4-8739-d2b4-42f883a51185"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Created",
-        "pod/web-69c6f74b8b-x9t6b",
+        "pod/web-69c6f74b8b-x4gss",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
         "Container created",
-        "1d",
+        "6m",
         1,
-        "web-69c6f74b8b-x9t6b.18e9872484f6fdab"
+        "web-69c6f74b8b-x4gss.18e98a3e2a674887"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-x9t6b.18e9872484f6fdab",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-x4gss.18e98a3e2a674887",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "64cd22de-f9c5-1195-59a7-045eeaeddfd0"
+          "uid": "389df279-0304-5b43-2a38-e05113d37b89"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "Started",
-        "pod/web-69c6f74b8b-x9t6b",
+        "pod/web-69c6f74b8b-x4gss",
         "spec.containers{nginx}",
         "kubelet, flint-dev-control-plane",
         "Container started",
-        "1d",
+        "6m",
         1,
-        "web-69c6f74b8b-x9t6b.18e987248ec79e65"
+        "web-69c6f74b8b-x4gss.18e98a3e2d4493ad"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b-x9t6b.18e987248ec79e65",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b-x4gss.18e98a3e2d4493ad",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "81aa43cb-76de-a829-c82b-6c6869e38710"
+          "uid": "79f49b4d-d265-8277-0f59-d57015a036c6"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "SuccessfulCreate",
         "replicaset/web-69c6f74b8b",
         "",
         "replicaset-controller",
-        "Created pod: web-69c6f74b8b-pjhg5",
-        "1d",
+        "Created pod: web-69c6f74b8b-x4gss",
+        "6m",
         1,
-        "web-69c6f74b8b.18e98721f4b94b1d"
+        "web-69c6f74b8b.18e98a3c78dd37ab"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b.18e98721f4b94b1d",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b.18e98a3c78dd37ab",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "30dbe3a1-3738-0d63-969c-fa3b0bc44395"
+          "uid": "d3957ea4-4c7b-e17a-f281-88fff79f6c49"
         }
       }
     },
     {
       "cells": [
-        "1d",
+        "6m",
         "Normal",
         "SuccessfulCreate",
         "replicaset/web-69c6f74b8b",
         "",
         "replicaset-controller",
-        "Created pod: web-69c6f74b8b-x9t6b",
-        "1d",
+        "Created pod: web-69c6f74b8b-qv4xv",
+        "6m",
         1,
-        "web-69c6f74b8b.18e98721f9b1d20d"
+        "web-69c6f74b8b.18e98a3c79c98a5e"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b.18e98721f9b1d20d",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web-69c6f74b8b.18e98a3c79c98a5e",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "581793fb-6296-f193-c1e1-629f53a41cb0"
+          "uid": "2ba0e6b4-ae53-2d7a-8ee0-67fea8cf68f8"
         }
       }
     },
     {
       "cells": [
-        "1d",
-        "Normal",
-        "SuccessfulCreate",
-        "replicaset/web-69c6f74b8b",
-        "",
-        "replicaset-controller",
-        "Created pod: web-69c6f74b8b-glf4m",
-        "1d",
-        1,
-        "web-69c6f74b8b.18e987c905e04e98"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b.18e987c905e04e98",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "f9b8c44a-edd3-7b35-4d78-df17cc129986"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "SuccessfulDelete",
-        "replicaset/web-69c6f74b8b",
-        "",
-        "replicaset-controller",
-        "Deleted pod: web-69c6f74b8b-glf4m",
-        "1d",
-        1,
-        "web-69c6f74b8b.18e987c92fe432ed"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b.18e987c92fe432ed",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "a5527e19-332a-fa5d-95df-b4d7295c7600"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "SuccessfulCreate",
-        "replicaset/web-69c6f74b8b",
-        "",
-        "replicaset-controller",
-        "Created pod: web-69c6f74b8b-fshvp",
-        "1d",
-        1,
-        "web-69c6f74b8b.18e9880117125109"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b.18e9880117125109",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "a9122f04-0a7a-256d-a452-f1c743f3b4a1"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "SuccessfulDelete",
-        "replicaset/web-69c6f74b8b",
-        "",
-        "replicaset-controller",
-        "Deleted pod: web-69c6f74b8b-fshvp",
-        "1d",
-        1,
-        "web-69c6f74b8b.18e988013c844450"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web-69c6f74b8b.18e988013c844450",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "830f83b9-1120-e2cf-43aa-45caf70a87f8"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
+        "6m",
         "Normal",
         "ScalingReplicaSet",
         "deployment/web",
         "",
         "deployment-controller",
         "Scaled up replica set web-69c6f74b8b from 0 to 2",
-        "1d",
+        "6m",
         1,
-        "web.18e98721f36ca44a"
+        "web.18e98a3c781b268c"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web.18e98721f36ca44a",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "web.18e98a3c781b268c",
           "namespace": "demo",
           "resourceVersion": "1",
-          "uid": "2693794b-0c68-c2fc-3350-97f53019e600"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "ScalingReplicaSet",
-        "deployment/web",
-        "",
-        "deployment-controller",
-        "Scaled up replica set web-69c6f74b8b from 2 to 3",
-        "1d",
-        2,
-        "web.18e987c8fcca4fd1"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web.18e987c8fcca4fd1",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "f946f986-6465-ca09-ca11-a7798db02480"
-        }
-      }
-    },
-    {
-      "cells": [
-        "1d",
-        "Normal",
-        "ScalingReplicaSet",
-        "deployment/web",
-        "",
-        "deployment-controller",
-        "Scaled down replica set web-69c6f74b8b from 3 to 2",
-        "1d",
-        2,
-        "web.18e987c92c7b4ef7"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "web.18e987c92c7b4ef7",
-          "namespace": "demo",
-          "resourceVersion": "1",
-          "uid": "2c0787ed-abe1-b651-840d-5313a85d2cb4"
+          "uid": "4b43ff99-8ce0-8df9-7bb9-a2b7076e207d"
         }
       }
     }

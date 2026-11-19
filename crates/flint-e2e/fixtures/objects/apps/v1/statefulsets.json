@@ -1,0 +1,226 @@
+{
+  "apiVersion": "apps/v1",
+  "items": [
+    {
+      "metadata": {
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"StatefulSet\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"fixture-db\"}},\"serviceName\":\"fixture-db\",\"template\":{\"metadata\":{\"labels\":{\"app\":\"fixture-db\"}},\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"while true; do sleep 3600; done\"],\"image\":\"busybox:1.37.0\",\"name\":\"db\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}},\"volumeMounts\":[{\"mountPath\":\"/data\",\"name\":\"data\"}]}]}},\"volumeClaimTemplates\":[{\"metadata\":{\"name\":\"data\"},\"spec\":{\"accessModes\":[\"ReadWriteOnce\"],\"resources\":{\"requests\":{\"storage\":\"16Mi\"}}}}]}}\n"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generation": 1,
+        "managedFields": [
+          {
+            "apiVersion": "apps/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:kubectl.kubernetes.io/last-applied-configuration": {}
+                }
+              },
+              "f:spec": {
+                "f:persistentVolumeClaimRetentionPolicy": {
+                  ".": {},
+                  "f:whenDeleted": {},
+                  "f:whenScaled": {}
+                },
+                "f:podManagementPolicy": {},
+                "f:replicas": {},
+                "f:revisionHistoryLimit": {},
+                "f:selector": {},
+                "f:serviceName": {},
+                "f:template": {
+                  "f:metadata": {
+                    "f:labels": {
+                      ".": {},
+                      "f:app": {}
+                    }
+                  },
+                  "f:spec": {
+                    "f:containers": {
+                      "k:{\"name\":\"db\"}": {
+                        ".": {},
+                        "f:command": {},
+                        "f:image": {},
+                        "f:imagePullPolicy": {},
+                        "f:name": {},
+                        "f:resources": {
+                          ".": {},
+                          "f:limits": {
+                            ".": {},
+                            "f:memory": {}
+                          },
+                          "f:requests": {
+                            ".": {},
+                            "f:cpu": {},
+                            "f:memory": {}
+                          }
+                        },
+                        "f:terminationMessagePath": {},
+                        "f:terminationMessagePolicy": {},
+                        "f:volumeMounts": {
+                          ".": {},
+                          "k:{\"mountPath\":\"/data\"}": {
+                            ".": {},
+                            "f:mountPath": {},
+                            "f:name": {}
+                          }
+                        }
+                      }
+                    },
+                    "f:dnsPolicy": {},
+                    "f:restartPolicy": {},
+                    "f:schedulerName": {},
+                    "f:securityContext": {},
+                    "f:terminationGracePeriodSeconds": {}
+                  }
+                },
+                "f:updateStrategy": {
+                  "f:rollingUpdate": {
+                    ".": {},
+                    "f:maxUnavailable": {},
+                    "f:partition": {}
+                  },
+                  "f:type": {}
+                },
+                "f:volumeClaimTemplates": {}
+              }
+            },
+            "manager": "kubectl-client-side-apply",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          },
+          {
+            "apiVersion": "apps/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:status": {
+                "f:availableReplicas": {},
+                "f:collisionCount": {},
+                "f:currentReplicas": {},
+                "f:currentRevision": {},
+                "f:observedGeneration": {},
+                "f:readyReplicas": {},
+                "f:replicas": {},
+                "f:updateRevision": {},
+                "f:updatedReplicas": {}
+              }
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "subresource": "status",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "fixture-db",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "3b367991-95a0-3e83-123c-352c48089ced"
+      },
+      "spec": {
+        "persistentVolumeClaimRetentionPolicy": {
+          "whenDeleted": "Retain",
+          "whenScaled": "Retain"
+        },
+        "podManagementPolicy": "OrderedReady",
+        "replicas": 1,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "fixture-db"
+          }
+        },
+        "serviceName": "fixture-db",
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "fixture-db"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "command": [
+                  "sh",
+                  "-c",
+                  "while true; do sleep 3600; done"
+                ],
+                "image": "busybox:1.37.0",
+                "imagePullPolicy": "IfNotPresent",
+                "name": "db",
+                "resources": {
+                  "limits": {
+                    "memory": "32Mi"
+                  },
+                  "requests": {
+                    "cpu": "10m",
+                    "memory": "16Mi"
+                  }
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/data",
+                    "name": "data"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {},
+            "terminationGracePeriodSeconds": 30
+          }
+        },
+        "updateStrategy": {
+          "rollingUpdate": {
+            "maxUnavailable": 1,
+            "partition": 0
+          },
+          "type": "RollingUpdate"
+        },
+        "volumeClaimTemplates": [
+          {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+              "name": "data"
+            },
+            "spec": {
+              "accessModes": [
+                "ReadWriteOnce"
+              ],
+              "resources": {
+                "requests": {
+                  "storage": "16Mi"
+                }
+              },
+              "volumeMode": "Filesystem"
+            },
+            "status": {
+              "phase": "Pending"
+            }
+          }
+        ]
+      },
+      "status": {
+        "availableReplicas": 1,
+        "collisionCount": 0,
+        "currentReplicas": 1,
+        "currentRevision": "fixture-db-7969d685c4",
+        "observedGeneration": 1,
+        "readyReplicas": 1,
+        "replicas": 1,
+        "updateRevision": "fixture-db-7969d685c4",
+        "updatedReplicas": 1
+      }
+    }
+  ],
+  "kind": "StatefulSetList",
+  "metadata": {
+    "resourceVersion": "1"
+  }
+}

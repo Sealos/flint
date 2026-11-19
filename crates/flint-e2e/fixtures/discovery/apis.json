@@ -1837,6 +1837,42 @@
     },
     {
       "metadata": {
+        "name": "fixtures.flint.dev"
+      },
+      "versions": [
+        {
+          "freshness": "Current",
+          "resources": [
+            {
+              "resource": "gadgets",
+              "responseKind": {
+                "group": "fixtures.flint.dev",
+                "kind": "Gadget",
+                "version": "v1"
+              },
+              "scope": "Namespaced",
+              "shortNames": [
+                "gdg"
+              ],
+              "singularResource": "gadget",
+              "verbs": [
+                "delete",
+                "deletecollection",
+                "get",
+                "list",
+                "patch",
+                "create",
+                "update",
+                "watch"
+              ]
+            }
+          ],
+          "version": "v1"
+        }
+      ]
+    },
+    {
+      "metadata": {
         "name": "metrics.k8s.io"
       },
       "versions": [

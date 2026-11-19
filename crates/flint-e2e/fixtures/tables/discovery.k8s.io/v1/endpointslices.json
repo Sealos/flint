@@ -54,7 +54,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "labels": {
             "kubernetes.io/service-name": "kubernetes"
@@ -68,7 +68,47 @@
     },
     {
       "cells": [
-        "podinfo-dkjrb",
+        "fixture-db-f28bt",
+        "IPv4",
+        "5432",
+        "10.244.0.14",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generateName": "fixture-db-",
+          "generation": 2,
+          "labels": {
+            "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+            "kubernetes.io/service-name": "fixture-db",
+            "service.kubernetes.io/headless": ""
+          },
+          "name": "fixture-db-f28bt",
+          "namespace": "demo",
+          "ownerReferences": [
+            {
+              "apiVersion": "v1",
+              "blockOwnerDeletion": true,
+              "controller": true,
+              "kind": "Service",
+              "name": "fixture-db",
+              "uid": "a5cb9a7b-fb30-aca3-40f9-ff850ce53f09"
+            }
+          ],
+          "resourceVersion": "1",
+          "uid": "8fb137e1-d9cf-77ca-81e1-ec52e45b43bf"
+        }
+      }
+    },
+    {
+      "cells": [
+        "podinfo-t8q78",
         "IPv4",
         "9898,9999",
         "10.244.0.9",
@@ -79,9 +119,9 @@
         "kind": "PartialObjectMetadata",
         "metadata": {
           "annotations": {
-            "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generateName": "podinfo-",
           "generation": 3,
           "labels": {
@@ -92,7 +132,7 @@
             "helm.sh/chart": "podinfo-6.17.0",
             "kubernetes.io/service-name": "podinfo"
           },
-          "name": "podinfo-dkjrb",
+          "name": "podinfo-t8q78",
           "namespace": "demo",
           "ownerReferences": [
             {
@@ -105,13 +145,13 @@
             }
           ],
           "resourceVersion": "1",
-          "uid": "f1023005-8225-a1c4-ca8f-fb479e38ca5e"
+          "uid": "6351c12e-27d4-e0ac-7e91-c7c881805df3"
         }
       }
     },
     {
       "cells": [
-        "web-nsfs5",
+        "web-8wjpf",
         "IPv4",
         "80",
         "10.244.0.7,10.244.0.8",
@@ -122,17 +162,17 @@
         "kind": "PartialObjectMetadata",
         "metadata": {
           "annotations": {
-            "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generateName": "web-",
-          "generation": 7,
+          "generation": 3,
           "labels": {
             "app": "web",
             "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
             "kubernetes.io/service-name": "web"
           },
-          "name": "web-nsfs5",
+          "name": "web-8wjpf",
           "namespace": "demo",
           "ownerReferences": [
             {
@@ -145,16 +185,16 @@
             }
           ],
           "resourceVersion": "1",
-          "uid": "cf34d251-4ed3-93f4-0c08-5a25a58937fa"
+          "uid": "386fd5e4-94d2-897b-7c24-0f98179f3d91"
         }
       }
     },
     {
       "cells": [
-        "kube-dns-w9qqz",
+        "kube-dns-pnw28",
         "IPv4",
         "53,53,9153",
-        "10.244.0.4,10.244.0.3",
+        "10.244.0.3,10.244.0.2",
         "1d"
       ],
       "object": {
@@ -162,9 +202,9 @@
         "kind": "PartialObjectMetadata",
         "metadata": {
           "annotations": {
-            "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+            "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generateName": "kube-dns-",
           "generation": 5,
           "labels": {
@@ -174,7 +214,7 @@
             "kubernetes.io/name": "CoreDNS",
             "kubernetes.io/service-name": "kube-dns"
           },
-          "name": "kube-dns-w9qqz",
+          "name": "kube-dns-pnw28",
           "namespace": "kube-system",
           "ownerReferences": [
             {
@@ -187,13 +227,13 @@
             }
           ],
           "resourceVersion": "1",
-          "uid": "3eb5efbc-940a-c893-29a4-d1d63fe3f17b"
+          "uid": "b8830d10-0f47-e6d6-f378-b3056bf40667"
         }
       }
     },
     {
       "cells": [
-        "metrics-server-6j9d9",
+        "metrics-server-c8sxv",
         "IPv4",
         "10250",
         "10.244.0.6",
@@ -203,7 +243,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generateName": "metrics-server-",
           "generation": 6,
           "labels": {
@@ -211,7 +251,7 @@
             "k8s-app": "metrics-server",
             "kubernetes.io/service-name": "metrics-server"
           },
-          "name": "metrics-server-6j9d9",
+          "name": "metrics-server-c8sxv",
           "namespace": "kube-system",
           "ownerReferences": [
             {
@@ -224,7 +264,7 @@
             }
           ],
           "resourceVersion": "1",
-          "uid": "27df9ca7-83fe-e482-467e-9b779a22e5e1"
+          "uid": "2c5351bd-a4fd-df74-f37c-44531c04233f"
         }
       }
     }

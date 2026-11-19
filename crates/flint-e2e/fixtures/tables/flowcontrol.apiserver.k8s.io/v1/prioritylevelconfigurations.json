@@ -73,7 +73,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "catch-all",
           "resourceVersion": "1",
@@ -98,7 +98,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "exempt",
           "resourceVersion": "1",
@@ -123,7 +123,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "global-default",
           "resourceVersion": "1",
@@ -148,7 +148,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "leader-election",
           "resourceVersion": "1",
@@ -173,7 +173,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "node-high",
           "resourceVersion": "1",
@@ -198,7 +198,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "system",
           "resourceVersion": "1",
@@ -223,7 +223,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "workload-high",
           "resourceVersion": "1",
@@ -248,7 +248,7 @@
           "annotations": {
             "apf.kubernetes.io/autoupdate-spec": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "name": "workload-low",
           "resourceVersion": "1",

@@ -24,13 +24,13 @@
     {
       "cells": [
         "kubeadm:bootstrap-signer-clusterinfo",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:bootstrap-signer-clusterinfo",
           "namespace": "kube-public",
           "resourceVersion": "1",
@@ -41,7 +41,7 @@
     {
       "cells": [
         "system:controller:bootstrap-signer",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -50,7 +50,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -64,7 +64,7 @@
     {
       "cells": [
         "extension-apiserver-authentication-reader",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -73,7 +73,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -87,13 +87,13 @@
     {
       "cells": [
         "kube-proxy",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-proxy",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -104,13 +104,13 @@
     {
       "cells": [
         "kubeadm:kubelet-config",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:kubelet-config",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -121,13 +121,13 @@
     {
       "cells": [
         "kubeadm:nodes-kubeadm-config",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm:nodes-kubeadm-config",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -138,7 +138,7 @@
     {
       "cells": [
         "system::leader-locking-kube-controller-manager",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -147,7 +147,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -161,7 +161,7 @@
     {
       "cells": [
         "system::leader-locking-kube-scheduler",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -170,7 +170,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -184,7 +184,7 @@
     {
       "cells": [
         "system:controller:bootstrap-signer",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -193,7 +193,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -207,7 +207,7 @@
     {
       "cells": [
         "system:controller:cloud-provider",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -216,7 +216,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -230,7 +230,7 @@
     {
       "cells": [
         "system:controller:token-cleaner",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -239,7 +239,7 @@
           "annotations": {
             "rbac.authorization.kubernetes.io/autoupdate": "true"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "kubernetes.io/bootstrapping": "rbac-defaults"
           },
@@ -253,7 +253,7 @@
     {
       "cells": [
         "local-path-provisioner-role",
-        "2026-01-01T00:00:00Z"
+        "2025-12-31T23:54:00Z"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
@@ -262,7 +262,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"Role\",\"metadata\":{\"annotations\":{},\"name\":\"local-path-provisioner-role\",\"namespace\":\"local-path-storage\"},\"rules\":[{\"apiGroups\":[\"\"],\"resources\":[\"pods\"],\"verbs\":[\"get\",\"list\",\"watch\",\"create\",\"patch\",\"update\",\"delete\"]}]}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "local-path-provisioner-role",
           "namespace": "local-path-storage",
           "resourceVersion": "1",

@@ -85,7 +85,7 @@
             "meta.helm.sh/release-name": "podinfo",
             "meta.helm.sh/release-namespace": "demo"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "labels": {
             "app.kubernetes.io/name": "podinfo",
@@ -128,8 +128,8 @@
             "deployment.kubernetes.io/max-replicas": "3",
             "deployment.kubernetes.io/revision": "1"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "generation": 5,
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
           "labels": {
             "app": "web",
             "pod-template-hash": "69c6f74b8b"
@@ -153,49 +153,6 @@
     },
     {
       "cells": [
-        "web-86d8686cfb",
-        2,
-        2,
-        2,
-        "1d",
-        "pause",
-        "registry.k8s.io/pause:3.10",
-        "app=web,pod-template-hash=86d8686cfb"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "annotations": {
-            "deployment.kubernetes.io/desired-replicas": "2",
-            "deployment.kubernetes.io/max-replicas": "3",
-            "deployment.kubernetes.io/revision": "1"
-          },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "generation": 1,
-          "labels": {
-            "app": "web",
-            "pod-template-hash": "86d8686cfb"
-          },
-          "name": "web-86d8686cfb",
-          "namespace": "flint-automation-test",
-          "ownerReferences": [
-            {
-              "apiVersion": "apps/v1",
-              "blockOwnerDeletion": true,
-              "controller": true,
-              "kind": "Deployment",
-              "name": "web",
-              "uid": "c257c162-273f-3b06-52a0-71260d6ef1cd"
-            }
-          ],
-          "resourceVersion": "1",
-          "uid": "02923d46-20ba-7612-82af-31d3facc8c9c"
-        }
-      }
-    },
-    {
-      "cells": [
         "coredns-559f6c778d",
         2,
         2,
@@ -214,7 +171,7 @@
             "deployment.kubernetes.io/max-replicas": "3",
             "deployment.kubernetes.io/revision": "1"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "labels": {
             "k8s-app": "kube-dns",
@@ -255,11 +212,11 @@
           "annotations": {
             "deployment.kubernetes.io/desired-replicas": "1",
             "deployment.kubernetes.io/max-replicas": "2",
-            "deployment.kubernetes.io/revision": "5",
-            "deployment.kubernetes.io/revision-history": "1,3"
+            "deployment.kubernetes.io/revision": "3",
+            "deployment.kubernetes.io/revision-history": "1"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "generation": 6,
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 4,
           "labels": {
             "k8s-app": "metrics-server",
             "pod-template-hash": "6694d85c44"
@@ -299,10 +256,10 @@
           "annotations": {
             "deployment.kubernetes.io/desired-replicas": "1",
             "deployment.kubernetes.io/max-replicas": "2",
-            "deployment.kubernetes.io/revision": "6",
-            "deployment.kubernetes.io/revision-history": "2,4"
+            "deployment.kubernetes.io/revision": "4",
+            "deployment.kubernetes.io/revision-history": "2"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "labels": {
             "k8s-app": "metrics-server",
@@ -345,7 +302,7 @@
             "deployment.kubernetes.io/max-replicas": "2",
             "deployment.kubernetes.io/revision": "1"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generation": 1,
           "labels": {
             "app": "local-path-provisioner",

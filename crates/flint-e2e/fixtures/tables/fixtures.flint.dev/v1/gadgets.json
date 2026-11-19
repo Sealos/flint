@@ -1,0 +1,62 @@
+{
+  "apiVersion": "meta.k8s.io/v1",
+  "columnDefinitions": [
+    {
+      "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+      "format": "name",
+      "name": "Name",
+      "priority": 0,
+      "type": "string"
+    },
+    {
+      "description": "Custom resource definition column (in JSONPath format): .spec.size",
+      "format": "",
+      "name": "Size",
+      "priority": 0,
+      "type": "integer"
+    },
+    {
+      "description": "Custom resource definition column (in JSONPath format): .spec.color",
+      "format": "",
+      "name": "Color",
+      "priority": 1,
+      "type": "string"
+    },
+    {
+      "description": "Custom resource definition column (in JSONPath format): .metadata.creationTimestamp",
+      "format": "",
+      "name": "Age",
+      "priority": 0,
+      "type": "date"
+    }
+  ],
+  "kind": "Table",
+  "metadata": {
+    "resourceVersion": "1"
+  },
+  "rows": [
+    {
+      "cells": [
+        "gadget-1",
+        3,
+        "teal",
+        "1d"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"fixtures.flint.dev/v1\",\"kind\":\"Gadget\",\"metadata\":{\"annotations\":{},\"name\":\"gadget-1\",\"namespace\":\"demo\"},\"spec\":{\"color\":\"teal\",\"size\":3}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "gadget-1",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "21507d6b-c8ad-a661-2efd-df85df70cb75"
+        }
+      }
+    }
+  ]
+}

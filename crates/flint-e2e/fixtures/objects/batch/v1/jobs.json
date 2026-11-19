@@ -1,0 +1,185 @@
+{
+  "apiVersion": "batch/v1",
+  "items": [
+    {
+      "metadata": {
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-job\",\"namespace\":\"demo\"},\"spec\":{\"backoffLimit\":1,\"template\":{\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"echo done\"],\"image\":\"busybox:1.37.0\",\"name\":\"job\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}}}],\"restartPolicy\":\"Never\"}}}}\n"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generation": 1,
+        "labels": {
+          "batch.kubernetes.io/controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+          "batch.kubernetes.io/job-name": "fixture-job",
+          "controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+          "job-name": "fixture-job"
+        },
+        "managedFields": [
+          {
+            "apiVersion": "batch/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:kubectl.kubernetes.io/last-applied-configuration": {}
+                }
+              },
+              "f:spec": {
+                "f:backoffLimit": {},
+                "f:completionMode": {},
+                "f:completions": {},
+                "f:manualSelector": {},
+                "f:parallelism": {},
+                "f:podReplacementPolicy": {},
+                "f:suspend": {},
+                "f:template": {
+                  "f:spec": {
+                    "f:containers": {
+                      "k:{\"name\":\"job\"}": {
+                        ".": {},
+                        "f:command": {},
+                        "f:image": {},
+                        "f:imagePullPolicy": {},
+                        "f:name": {},
+                        "f:resources": {
+                          ".": {},
+                          "f:limits": {
+                            ".": {},
+                            "f:memory": {}
+                          },
+                          "f:requests": {
+                            ".": {},
+                            "f:cpu": {},
+                            "f:memory": {}
+                          }
+                        },
+                        "f:terminationMessagePath": {},
+                        "f:terminationMessagePolicy": {}
+                      }
+                    },
+                    "f:dnsPolicy": {},
+                    "f:restartPolicy": {},
+                    "f:schedulerName": {},
+                    "f:securityContext": {},
+                    "f:terminationGracePeriodSeconds": {}
+                  }
+                }
+              }
+            },
+            "manager": "kubectl-client-side-apply",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          },
+          {
+            "apiVersion": "batch/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:status": {
+                "f:completionTime": {},
+                "f:conditions": {},
+                "f:ready": {},
+                "f:startTime": {},
+                "f:succeeded": {},
+                "f:terminating": {},
+                "f:uncountedTerminatedPods": {}
+              }
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "subresource": "status",
+            "time": "2025-12-31T23:55:00Z"
+          }
+        ],
+        "name": "fixture-job",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8"
+      },
+      "spec": {
+        "backoffLimit": 1,
+        "completionMode": "NonIndexed",
+        "completions": 1,
+        "manualSelector": false,
+        "parallelism": 1,
+        "podReplacementPolicy": "TerminatingOrFailed",
+        "selector": {
+          "matchLabels": {
+            "batch.kubernetes.io/controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8"
+          }
+        },
+        "suspend": false,
+        "template": {
+          "metadata": {
+            "labels": {
+              "batch.kubernetes.io/controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+              "batch.kubernetes.io/job-name": "fixture-job",
+              "controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+              "job-name": "fixture-job"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "command": [
+                  "sh",
+                  "-c",
+                  "echo done"
+                ],
+                "image": "busybox:1.37.0",
+                "imagePullPolicy": "IfNotPresent",
+                "name": "job",
+                "resources": {
+                  "limits": {
+                    "memory": "32Mi"
+                  },
+                  "requests": {
+                    "cpu": "10m",
+                    "memory": "16Mi"
+                  }
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File"
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "restartPolicy": "Never",
+            "schedulerName": "default-scheduler",
+            "securityContext": {},
+            "terminationGracePeriodSeconds": 30
+          }
+        }
+      },
+      "status": {
+        "completionTime": "2025-12-31T23:55:00Z",
+        "conditions": [
+          {
+            "lastProbeTime": "2025-12-31T23:55:00Z",
+            "lastTransitionTime": "2025-12-31T23:55:00Z",
+            "message": "Reached expected number of succeeded pods",
+            "reason": "CompletionsReached",
+            "status": "True",
+            "type": "SuccessCriteriaMet"
+          },
+          {
+            "lastProbeTime": "2025-12-31T23:55:00Z",
+            "lastTransitionTime": "2025-12-31T23:55:00Z",
+            "message": "Reached expected number of succeeded pods",
+            "reason": "CompletionsReached",
+            "status": "True",
+            "type": "Complete"
+          }
+        ],
+        "ready": 0,
+        "startTime": "2025-12-31T23:54:00Z",
+        "succeeded": 1,
+        "terminating": 0,
+        "uncountedTerminatedPods": {}
+      }
+    }
+  ],
+  "kind": "JobList",
+  "metadata": {
+    "resourceVersion": "1"
+  }
+}

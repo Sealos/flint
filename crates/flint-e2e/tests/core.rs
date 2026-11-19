@@ -416,3 +416,30 @@ async fn forbidden_lists_fail_or_fall_back_to_the_default_namespace() {
             .all(|r| r.namespace.as_deref() == Some("demo"))
     );
 }
+
+// covers UP-22
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_resources_show_their_printer_columns() {
+    let server = FakeApiServer::start().await.unwrap();
+    let client = server.client().await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap();
+    let gadgets = kinds
+        .iter()
+        .find(|k| k.group() == "fixtures.flint.dev" && k.plural() == "gadgets")
+        .expect("the fixture CRD is discovered");
+    let page = table::list_table(&client, gadgets, &ListQuery::default())
+        .await
+        .unwrap();
+    let columns: Vec<&str> = page.columns.iter().map(|c| &*c.name).collect();
+    assert!(
+        columns.contains(&"Size") && columns.contains(&"Color"),
+        "{columns:?}"
+    );
+    let size = page
+        .columns
+        .iter()
+        .position(|c| &*c.name == "Size")
+        .unwrap();
+    let gadget = page.rows.iter().find(|r| &*r.name == "gadget-1").unwrap();
+    assert_eq!(gadget.cell_text(size, 0), "3");
+}

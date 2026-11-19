@@ -38,7 +38,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "flint-dev-control-plane",
           "namespace": "kube-node-lease",
           "ownerReferences": [
@@ -57,7 +57,7 @@
     {
       "cells": [
         "apiserver-d6rayzowl6k7omg2ch3vj2f3pe",
-        "apiserver-d6rayzowl6k7omg2ch3vj2f3pe_819e14c2-9488-6db0-ef0e-cf4e9ba8a1be",
+        "apiserver-d6rayzowl6k7omg2ch3vj2f3pe_61220e0d-4597-c578-fb5a-2807084f60c1",
         "1d"
       ],
       "object": {
@@ -67,7 +67,7 @@
           "annotations": {
             "kubernetes.io/peer-advertise-address": "172.18.0.2:6443"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "apiserver.kubernetes.io/identity": "kube-apiserver",
             "kubernetes.io/hostname": "flint-dev-control-plane"
@@ -82,14 +82,14 @@
     {
       "cells": [
         "kube-controller-manager",
-        "flint-dev-control-plane_998f4263-9ab9-97a1-9d63-94116085adab",
+        "flint-dev-control-plane_56a5de30-279c-5633-e093-c9682c05c6d0",
         "1d"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-controller-manager",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -100,14 +100,14 @@
     {
       "cells": [
         "kube-scheduler",
-        "flint-dev-control-plane_0bde9dcb-3272-ee22-8343-eed4df3188c9",
+        "flint-dev-control-plane_cbaf9812-a36e-855e-4d1c-c252bfe1a17f",
         "1d"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-scheduler",
           "namespace": "kube-system",
           "resourceVersion": "1",

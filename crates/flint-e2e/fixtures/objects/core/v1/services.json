@@ -4,10 +4,81 @@
     {
       "metadata": {
         "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"clusterIP\":\"None\",\"ports\":[{\"port\":5432}],\"selector\":{\"app\":\"fixture-db\"}}}\n"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "managedFields": [
+          {
+            "apiVersion": "v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:kubectl.kubernetes.io/last-applied-configuration": {}
+                }
+              },
+              "f:spec": {
+                "f:clusterIP": {},
+                "f:internalTrafficPolicy": {},
+                "f:ports": {
+                  ".": {},
+                  "k:{\"port\":5432,\"protocol\":\"TCP\"}": {
+                    ".": {},
+                    "f:port": {},
+                    "f:protocol": {},
+                    "f:targetPort": {}
+                  }
+                },
+                "f:selector": {},
+                "f:sessionAffinity": {},
+                "f:type": {}
+              }
+            },
+            "manager": "kubectl-client-side-apply",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "fixture-db",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "a5cb9a7b-fb30-aca3-40f9-ff850ce53f09"
+      },
+      "spec": {
+        "clusterIP": "None",
+        "clusterIPs": [
+          "None"
+        ],
+        "internalTrafficPolicy": "Cluster",
+        "ipFamilies": [
+          "IPv4"
+        ],
+        "ipFamilyPolicy": "SingleStack",
+        "ports": [
+          {
+            "port": 5432,
+            "protocol": "TCP",
+            "targetPort": 5432
+          }
+        ],
+        "selector": {
+          "app": "fixture-db"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      },
+      "status": {
+        "loadBalancer": {}
+      }
+    },
+    {
+      "metadata": {
+        "annotations": {
           "meta.helm.sh/release-name": "podinfo",
           "meta.helm.sh/release-namespace": "demo"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "labels": {
           "app.kubernetes.io/managed-by": "Helm",
           "app.kubernetes.io/name": "podinfo",
@@ -54,7 +125,7 @@
             },
             "manager": "helm",
             "operation": "Apply",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "podinfo",
@@ -63,9 +134,9 @@
         "uid": "3b6dc04e-dd25-d199-49c0-2b477b0b45d4"
       },
       "spec": {
-        "clusterIP": "10.96.100.18",
+        "clusterIP": "10.96.46.117",
         "clusterIPs": [
-          "10.96.100.18"
+          "10.96.46.117"
         ],
         "internalTrafficPolicy": "Cluster",
         "ipFamilies": [
@@ -101,7 +172,7 @@
         "annotations": {
           "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"web\"},\"name\":\"web\",\"namespace\":\"demo\"},\"spec\":{\"ports\":[{\"port\":80,\"protocol\":\"TCP\",\"targetPort\":80}],\"selector\":{\"app\":\"web\"}},\"status\":{\"loadBalancer\":{}}}\n"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "labels": {
           "app": "web"
         },
@@ -138,7 +209,7 @@
             },
             "manager": "kubectl-client-side-apply",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "web",
@@ -147,9 +218,9 @@
         "uid": "5a1bbd4f-e9bc-731c-bae4-80e2c4390d73"
       },
       "spec": {
-        "clusterIP": "10.96.20.234",
+        "clusterIP": "10.96.135.99",
         "clusterIPs": [
-          "10.96.20.234"
+          "10.96.135.99"
         ],
         "internalTrafficPolicy": "Cluster",
         "ipFamilies": [

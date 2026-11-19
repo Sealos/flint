@@ -7,7 +7,7 @@
           "node.alpha.kubernetes.io/ttl": "0",
           "volumes.kubernetes.io/controller-managed-attach-detach": "true"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "labels": {
           "beta.kubernetes.io/arch": "arm64",
           "beta.kubernetes.io/os": "linux",
@@ -41,7 +41,7 @@
             },
             "manager": "kubelet",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "v1",
@@ -55,7 +55,7 @@
             },
             "manager": "kubeadm",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "v1",
@@ -76,7 +76,7 @@
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "v1",
@@ -107,7 +107,7 @@
             "manager": "kubelet",
             "operation": "Update",
             "subresource": "status",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:58:00Z"
           }
         ],
         "name": "flint-dev-control-plane",
@@ -154,32 +154,32 @@
         },
         "conditions": [
           {
-            "lastHeartbeatTime": "2026-01-01T00:00:00Z",
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
+            "lastHeartbeatTime": "2025-12-31T23:58:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
             "message": "kubelet has sufficient memory available",
             "reason": "KubeletHasSufficientMemory",
             "status": "False",
             "type": "MemoryPressure"
           },
           {
-            "lastHeartbeatTime": "2026-01-01T00:00:00Z",
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
+            "lastHeartbeatTime": "2025-12-31T23:58:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
             "message": "kubelet has no disk pressure",
             "reason": "KubeletHasNoDiskPressure",
             "status": "False",
             "type": "DiskPressure"
           },
           {
-            "lastHeartbeatTime": "2026-01-01T00:00:00Z",
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
+            "lastHeartbeatTime": "2025-12-31T23:58:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
             "message": "kubelet has sufficient PID available",
             "reason": "KubeletHasSufficientPID",
             "status": "False",
             "type": "PIDPressure"
           },
           {
-            "lastHeartbeatTime": "2026-01-01T00:00:00Z",
-            "lastTransitionTime": "2026-01-01T00:00:00Z",
+            "lastHeartbeatTime": "2025-12-31T23:58:00Z",
+            "lastTransitionTime": "2025-12-31T23:54:00Z",
             "message": "kubelet is posting ready status",
             "reason": "KubeletReady",
             "status": "True",
@@ -283,6 +283,13 @@
               "docker.io/kindest/local-path-helper:v20260131-7181c60a"
             ],
             "sizeBytes": 2740462
+          },
+          {
+            "names": [
+              "docker.io/library/busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec",
+              "docker.io/library/busybox:1.37.0"
+            ],
+            "sizeBytes": 1911395
           },
           {
             "names": [

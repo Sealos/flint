@@ -100,7 +100,11 @@ server.send_watch(&configmaps, WatchStep::Expired);            // 410: the core 
 | `tables/<group>/<version>/<resource>.json` | The Table list (`includeObject=Metadata`) of every listable kind at its preferred version, all namespaces, row `managedFields` dropped |
 | `objects/<group>/<version>/<resource>.json` | Full objects: namespace `demo`, namespaces, nodes, and core events in `default` and `demo` (Table events are limited the same way) |
 
-Objects that are listed but not recorded (a kube-system pod) are served as a minimal object built from the row.
+The `demo` namespace (`scripts/cluster-fixtures.sh`) gives the views variety: running, ImagePullBackOff,
+CrashLoopBackOff and Completed pods with their Warning events, Deployments, a ReplicaSet history, a Job and a CronJob, a
+StatefulSet with a PVC, Services, an Ingress, the podinfo Helm release Secrets, and the CRD `gadgets.fixtures.flint.dev`
+(printer columns Size, Color, Age) with one instance. Objects that are listed but not recorded (a kube-system pod) are
+served as a minimal object built from the row.
 
 **Recording:** `KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh`. It refuses to run unless `KUBECONFIG` names
 exactly one file whose current context is `kind-flint-dev` on an `https://` server at 127.0.0.1, localhost or ::1,
@@ -119,11 +123,11 @@ no credentials, so a failed run changes nothing.
   server-rendered ages (`Last Seen`) are fixed.
 - `tests/fixtures.rs` checks the committed fixtures for credentials, local paths and Secret values.
 
-**Bumping Kubernetes:** set the kind node image (`kind create cluster --image kindest/node:<version>`) in
-`scripts/dev-cluster.sh`, recreate the cluster
-(`scripts/dev-cluster.sh down && scripts/dev-cluster.sh up`), wait for metrics-server to serve, re-record, then run
-`cargo test -p flint-e2e`. Review the fixture diff: new columns or kinds are expected, Secret values or local paths are
-not.
+**Re-recording** (after bumping `NODE_IMAGE`, see "Pinned versions" below, or changing `scripts/cluster-fixtures.sh`):
+recreate the dev cluster (`scripts/dev-cluster.sh down` then `up`), wait until `crash-loop` is in CrashLoopBackOff
+with a few restarts, `broken-image` in ImagePullBackOff and `fixture-job` complete, re-record, then run
+`cargo test -p flint-e2e`. Review the fixture diff: new columns or kinds are expected; Secret values, local paths and
+namespaces left by other tests are not.
 
 **Replay:** `FakeApiServer::start()` (or `start_blocking` without a runtime) serves the fixtures over HTTPS on
 `127.0.0.1` with a CA generated per server.

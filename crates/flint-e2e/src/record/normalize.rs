@@ -30,7 +30,7 @@ const AGE_COLUMNS: &[&str] = &[
     "Duration",
 ];
 
-/// What an age cell becomes. The fake server renders `Age` cells itself from the creation time.
+/// What an `Age` cell becomes. The fake server renders `Age` cells itself from the creation time.
 const FIXED_AGE: &str = "1d";
 
 /// Node fields that identify the machine the cluster ran on.
@@ -209,7 +209,35 @@ fn looks_like_credential(s: &str) -> bool {
         .any(|m| s.contains(m))
 }
 
-/// In a Table, replaces server-rendered ages with a fixed one, and "(2m ago)" in restart counts.
+/// A kubectl-style duration (`81s`, `2m3s`, `5h`, `3d`), rounded like timestamps
+/// ([`clock::round_age`]) and rendered the same way again, so it stays stable across recordings.
+fn rounded_duration(text: &str) -> Option<String> {
+    let mut seconds = 0i64;
+    let mut number = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            number.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            'y' => 365 * 86_400,
+            _ => return None,
+        };
+        seconds += number.parse::<i64>().ok()? * unit;
+        number.clear();
+    }
+    if !number.is_empty() || text.is_empty() {
+        return None;
+    }
+    Some(flint_core::table::human_duration(clock::round_age(seconds)))
+}
+
+/// In a Table, replaces the server-rendered `Age` with a placeholder (the fake server renders
+/// it), and rounds other ages (`Last Seen`, "(2m ago)" in restart counts).
 fn normalize_age_cells(table: &mut Map<String, Value>) {
     let Some(columns) = table.get("columnDefinitions").and_then(Value::as_array) else {
         return;
@@ -224,6 +252,7 @@ fn normalize_age_cells(table: &mut Map<String, Value>) {
         })
         .map(|(i, _)| i)
         .collect();
+    let age = columns.iter().position(|c| c["name"] == "Age");
     let Some(rows) = table.get_mut("rows").and_then(Value::as_array_mut) else {
         return;
     };
@@ -233,12 +262,20 @@ fn normalize_age_cells(table: &mut Map<String, Value>) {
     {
         for (i, cell) in cells.iter_mut().enumerate() {
             let Value::String(text) = cell else { continue };
-            if ages.contains(&i) && !text.is_empty() && text != "<unknown>" {
-                *cell = FIXED_AGE.into();
-            } else if let Some((count, _)) = text.split_once(" (")
-                && text.ends_with(" ago)")
+            if ages.contains(&i) {
+                if Some(i) == age {
+                    // The fake server renders Age from the creation time.
+                    if !text.is_empty() && text != "<unknown>" {
+                        *cell = FIXED_AGE.into();
+                    }
+                } else if let Some(rounded) = rounded_duration(text) {
+                    *cell = rounded.into();
+                }
+            } else if let Some((count, rest)) = text.split_once(" (")
+                && let Some(ago) = rest.strip_suffix(" ago)")
+                && let Some(rounded) = rounded_duration(ago)
             {
-                *cell = format!("{count} ({FIXED_AGE} ago)").into();
+                *cell = format!("{count} ({rounded} ago)").into();
             }
         }
     }
@@ -475,9 +512,19 @@ mod tests {
         map.normalize(&mut table);
         assert_eq!(
             table["rows"][0]["cells"],
-            json!(["web", "1 (1d ago)", "1d"])
+            json!(["web", "1 (2m ago)", "1d"])
         );
         assert_eq!(table["rows"][1]["cells"], json!(["x", "0", "<unknown>"]));
+        let mut events = json!({
+            "columnDefinitions": [{"name": "Last Seen"}, {"name": "Message"}],
+            "rows": [{"cells": ["14s", "x"]}, {"cells": ["<unknown>", "y"]}],
+        });
+        map.normalize(&mut events);
+        assert_eq!(events["rows"][0]["cells"], json!(["10s", "x"]));
+        assert_eq!(events["rows"][1]["cells"], json!(["<unknown>", "y"]));
+        assert_eq!(rounded_duration("3h25m"), Some("3h".into()));
+        assert_eq!(rounded_duration("5"), None);
+        assert_eq!(rounded_duration(""), None);
     }
 
     #[test]

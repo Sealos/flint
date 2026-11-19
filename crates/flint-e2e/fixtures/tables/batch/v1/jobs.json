@@ -62,5 +62,39 @@
   "metadata": {
     "resourceVersion": "1"
   },
-  "rows": []
+  "rows": [
+    {
+      "cells": [
+        "fixture-job",
+        "Complete",
+        "1/1",
+        "10s",
+        "1d",
+        "job",
+        "busybox:1.37.0",
+        "batch.kubernetes.io/controller-uid=ebd9c464-3bae-ab81-e1d0-52b2398bb2c8"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-job\",\"namespace\":\"demo\"},\"spec\":{\"backoffLimit\":1,\"template\":{\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"echo done\"],\"image\":\"busybox:1.37.0\",\"name\":\"job\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}}}],\"restartPolicy\":\"Never\"}}}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "labels": {
+            "batch.kubernetes.io/controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+            "batch.kubernetes.io/job-name": "fixture-job",
+            "controller-uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8",
+            "job-name": "fixture-job"
+          },
+          "name": "fixture-job",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "ebd9c464-3bae-ab81-e1d0-52b2398bb2c8"
+        }
+      }
+    }
+  ]
 }

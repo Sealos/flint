@@ -41,7 +41,7 @@
           "annotations": {
             "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-root-ca.crt",
           "namespace": "default",
           "resourceVersion": "1",
@@ -62,7 +62,7 @@
           "annotations": {
             "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-root-ca.crt",
           "namespace": "demo",
           "resourceVersion": "1",
@@ -83,28 +83,7 @@
           "annotations": {
             "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "kube-root-ca.crt",
-          "namespace": "flint-automation-test",
-          "resourceVersion": "1",
-          "uid": "4e47da5a-f940-ad1a-5b51-0e2e37c63226"
-        }
-      }
-    },
-    {
-      "cells": [
-        "kube-root-ca.crt",
-        1,
-        "1d"
-      ],
-      "object": {
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": {
-          "annotations": {
-            "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
-          },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-root-ca.crt",
           "namespace": "kube-node-lease",
           "resourceVersion": "1",
@@ -122,7 +101,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "cluster-info",
           "namespace": "kube-public",
           "resourceVersion": "1",
@@ -143,7 +122,7 @@
           "annotations": {
             "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-root-ca.crt",
           "namespace": "kube-public",
           "resourceVersion": "1",
@@ -161,7 +140,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "coredns",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -179,7 +158,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "extension-apiserver-authentication",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -197,7 +176,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-apiserver-legacy-service-account-token-tracking",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -215,7 +194,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "labels": {
             "app": "kube-proxy"
           },
@@ -239,7 +218,7 @@
           "annotations": {
             "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-root-ca.crt",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -257,7 +236,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubeadm-config",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -275,7 +254,7 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kubelet-config",
           "namespace": "kube-system",
           "resourceVersion": "1",
@@ -296,7 +275,7 @@
           "annotations": {
             "kubernetes.io/description": "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters."
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "kube-root-ca.crt",
           "namespace": "local-path-storage",
           "resourceVersion": "1",
@@ -317,7 +296,7 @@
           "annotations": {
             "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"data\":{\"config.json\":\"{\\n        \\\"nodePathMap\\\":[\\n        {\\n                \\\"node\\\":\\\"DEFAULT_PATH_FOR_NON_LISTED_NODES\\\",\\n                \\\"paths\\\":[\\\"/var/local-path-provisioner\\\"]\\n        }\\n        ]\\n}\",\"helperPod.yaml\":\"apiVersion: v1\\nkind: Pod\\nmetadata:\\n  name: helper-pod\\nspec:\\n  priorityClassName: system-node-critical\\n  tolerations:\\n    - operator: Exists\\n      effect: NoSchedule\\n    - operator: Exists\\n      effect: NoExecute\\n  containers:\\n  - name: helper-pod\\n    image: docker.io/kindest/local-path-helper:v20260131-7181c60a\\n    imagePullPolicy: IfNotPresent\",\"setup\":\"#!/bin/sh\\nset -eu\\nmkdir -m 0777 -p \\\"$VOL_DIR\\\"\",\"teardown\":\"#!/bin/sh\\nset -eu\\nrm -rf \\\"$VOL_DIR\\\"\"},\"kind\":\"ConfigMap\",\"metadata\":{\"annotations\":{},\"name\":\"local-path-config\",\"namespace\":\"local-path-storage\"}}\n"
           },
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "name": "local-path-config",
           "namespace": "local-path-storage",
           "resourceVersion": "1",

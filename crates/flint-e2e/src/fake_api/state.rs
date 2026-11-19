@@ -676,9 +676,7 @@ mod tests {
             ..Query::default()
         };
         let deployments = Gvr::new("apps", "v1", "deployments");
-        let table = state
-            .list_table(&deployments, Some("demo"), &by_name)
-            .unwrap();
+        let table = state.list_table(&deployments, None, &by_name).unwrap();
         assert_eq!(table["rows"].as_array().unwrap().len(), 1);
         let by_phase = Query {
             field_selector: Some("status.phase=Running".into()),

@@ -4,9 +4,71 @@
     {
       "metadata": {
         "annotations": {
-          "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+          "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "labels": {
+          "endpoints.kubernetes.io/managed-by": "endpoint-controller",
+          "service.kubernetes.io/headless": ""
+        },
+        "managedFields": [
+          {
+            "apiVersion": "v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:endpoints.kubernetes.io/last-change-trigger-time": {}
+                },
+                "f:labels": {
+                  ".": {},
+                  "f:endpoints.kubernetes.io/managed-by": {},
+                  "f:service.kubernetes.io/headless": {}
+                }
+              },
+              "f:subsets": {}
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "fixture-db",
+        "namespace": "demo",
+        "resourceVersion": "1",
+        "uid": "e9a569aa-1947-7211-d700-57bec2e68931"
+      },
+      "subsets": [
+        {
+          "addresses": [
+            {
+              "hostname": "fixture-db-0",
+              "ip": "10.244.0.14",
+              "nodeName": "flint-dev-control-plane",
+              "targetRef": {
+                "kind": "Pod",
+                "name": "fixture-db-0",
+                "namespace": "demo",
+                "uid": "81815473-f6b5-a029-9f4e-f42984c2a973"
+              }
+            }
+          ],
+          "ports": [
+            {
+              "port": 5432,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "metadata": {
+        "annotations": {
+          "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "labels": {
           "app.kubernetes.io/managed-by": "Helm",
           "app.kubernetes.io/name": "podinfo",
@@ -37,7 +99,7 @@
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "podinfo",
@@ -53,9 +115,9 @@
               "nodeName": "flint-dev-control-plane",
               "targetRef": {
                 "kind": "Pod",
-                "name": "podinfo-c6497595d-b5r9c",
+                "name": "podinfo-c6497595d-b8chj",
                 "namespace": "demo",
-                "uid": "a16036f1-2e40-77e3-155b-e854e90e8487"
+                "uid": "c3b27c86-4272-8a51-8580-4dbdb249fffc"
               }
             }
           ],
@@ -77,9 +139,9 @@
     {
       "metadata": {
         "annotations": {
-          "endpoints.kubernetes.io/last-change-trigger-time": "2026-01-01T00:00:00Z"
+          "endpoints.kubernetes.io/last-change-trigger-time": "2025-12-31T23:54:00Z"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "labels": {
           "app": "web",
           "endpoints.kubernetes.io/managed-by": "endpoint-controller"
@@ -104,7 +166,7 @@
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "web",
@@ -120,9 +182,9 @@
               "nodeName": "flint-dev-control-plane",
               "targetRef": {
                 "kind": "Pod",
-                "name": "web-69c6f74b8b-pjhg5",
+                "name": "web-69c6f74b8b-x4gss",
                 "namespace": "demo",
-                "uid": "16449581-b7e7-f9a6-b466-abc1a6a74ceb"
+                "uid": "05229db0-0345-b5f2-389f-ec561c1358b8"
               }
             },
             {
@@ -130,9 +192,9 @@
               "nodeName": "flint-dev-control-plane",
               "targetRef": {
                 "kind": "Pod",
-                "name": "web-69c6f74b8b-x9t6b",
+                "name": "web-69c6f74b8b-qv4xv",
                 "namespace": "demo",
-                "uid": "196e6bb9-19b7-c744-6043-7234ef7f629d"
+                "uid": "e6c7fb26-842c-b861-8154-46419a35eb4a"
               }
             }
           ],

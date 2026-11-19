@@ -23,17 +23,17 @@
   "rows": [
     {
       "cells": [
-        "kubernetes.io:kube-apiserver-serving:31e7c569449706d6f321b387",
+        "kubernetes.io:kube-apiserver-serving:69958b28955739cc028c417b",
         "kubernetes.io/kube-apiserver-serving"
       ],
       "object": {
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
-          "name": "kubernetes.io:kube-apiserver-serving:31e7c569449706d6f321b387",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "name": "kubernetes.io:kube-apiserver-serving:69958b28955739cc028c417b",
           "resourceVersion": "1",
-          "uid": "8c68bf4a-d2c3-b628-bf3e-608bd251308e"
+          "uid": "d4583435-e854-7ee6-70df-5b8d03d6eae9"
         }
       }
     }

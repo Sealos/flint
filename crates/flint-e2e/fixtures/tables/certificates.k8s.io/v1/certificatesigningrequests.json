@@ -51,7 +51,7 @@
   "rows": [
     {
       "cells": [
-        "csr-n5ksw",
+        "csr-h5vl8",
         "1d",
         "kubernetes.io/kube-apiserver-client-kubelet",
         "system:node:flint-dev-control-plane",
@@ -62,11 +62,11 @@
         "apiVersion": "meta.k8s.io/v1",
         "kind": "PartialObjectMetadata",
         "metadata": {
-          "creationTimestamp": "2026-01-01T00:00:00Z",
+          "creationTimestamp": "2025-12-31T23:54:00Z",
           "generateName": "csr-",
-          "name": "csr-n5ksw",
+          "name": "csr-h5vl8",
           "resourceVersion": "1",
-          "uid": "c070aa00-1a35-52ca-0ee4-bb7110791b1b"
+          "uid": "122d0ad6-ea8f-1ed7-59fd-cde71c6b0cb9"
         }
       }
     }

@@ -83,5 +83,38 @@
   "metadata": {
     "resourceVersion": "1"
   },
-  "rows": []
+  "rows": [
+    {
+      "cells": [
+        "pvc-09aae925-1931-cdcf-d093-3f7dbc8458c2",
+        "16Mi",
+        "RWO",
+        "Delete",
+        "Bound",
+        "demo/data-fixture-db-0",
+        "standard",
+        "<unset>",
+        "",
+        "1d",
+        "Filesystem"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "local.path.provisioner/selected-node": "flint-dev-control-plane",
+            "pv.kubernetes.io/provisioned-by": "rancher.io/local-path"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "finalizers": [
+            "kubernetes.io/pv-protection"
+          ],
+          "name": "pvc-09aae925-1931-cdcf-d093-3f7dbc8458c2",
+          "resourceVersion": "1",
+          "uid": "10d5bec1-dda6-1693-e54c-ffc688f47e50"
+        }
+      }
+    }
+  ]
 }

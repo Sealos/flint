@@ -10,7 +10,7 @@
           "meta.helm.sh/release-name": "podinfo",
           "meta.helm.sh/release-namespace": "demo"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
+        "creationTimestamp": "2025-12-31T23:54:00Z",
         "generation": 1,
         "labels": {
           "app.kubernetes.io/name": "podinfo",
@@ -37,7 +37,7 @@
                 },
                 "f:ownerReferences": {
                   ".": {},
-                  "k:{\"uid\":\"bef48916-c343-42ce-8ab7-40b4652bd224\"}": {}
+                  "k:{\"uid\":\"31738201-a26b-4e51-860f-ef3d6e48ba6c\"}": {}
                 }
               },
               "f:spec": {
@@ -156,7 +156,7 @@
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "apps/v1",
@@ -174,7 +174,7 @@
             "manager": "kube-controller-manager",
             "operation": "Update",
             "subresource": "status",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "podinfo-c6497595d",
@@ -328,8 +328,8 @@
           "deployment.kubernetes.io/max-replicas": "3",
           "deployment.kubernetes.io/revision": "1"
         },
-        "creationTimestamp": "2026-01-01T00:00:00Z",
-        "generation": 5,
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "generation": 1,
         "labels": {
           "app": "web",
           "pod-template-hash": "69c6f74b8b"
@@ -353,7 +353,7 @@
                 },
                 "f:ownerReferences": {
                   ".": {},
-                  "k:{\"uid\":\"e5a4e330-0771-46ec-9696-ef746e571e1e\"}": {}
+                  "k:{\"uid\":\"21ca7e01-8dbf-4494-a2a2-ed40e0bf3b04\"}": {}
                 }
               },
               "f:spec": {
@@ -390,7 +390,7 @@
             },
             "manager": "kube-controller-manager",
             "operation": "Update",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           },
           {
             "apiVersion": "apps/v1",
@@ -408,7 +408,7 @@
             "manager": "kube-controller-manager",
             "operation": "Update",
             "subresource": "status",
-            "time": "2026-01-01T00:00:00Z"
+            "time": "2025-12-31T23:54:00Z"
           }
         ],
         "name": "web-69c6f74b8b",
@@ -463,7 +463,7 @@
       "status": {
         "availableReplicas": 2,
         "fullyLabeledReplicas": 2,
-        "observedGeneration": 5,
+        "observedGeneration": 1,
         "readyReplicas": 2,
         "replicas": 2,
         "terminatingReplicas": 0

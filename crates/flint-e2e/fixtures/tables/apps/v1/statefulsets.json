@@ -41,5 +41,30 @@
   "metadata": {
     "resourceVersion": "1"
   },
-  "rows": []
+  "rows": [
+    {
+      "cells": [
+        "fixture-db",
+        "1/1",
+        "1d",
+        "db",
+        "busybox:1.37.0"
+      ],
+      "object": {
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": {
+          "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"StatefulSet\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"fixture-db\"}},\"serviceName\":\"fixture-db\",\"template\":{\"metadata\":{\"labels\":{\"app\":\"fixture-db\"}},\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"while true; do sleep 3600; done\"],\"image\":\"busybox:1.37.0\",\"name\":\"db\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}},\"volumeMounts\":[{\"mountPath\":\"/data\",\"name\":\"data\"}]}]}},\"volumeClaimTemplates\":[{\"metadata\":{\"name\":\"data\"},\"spec\":{\"accessModes\":[\"ReadWriteOnce\"],\"resources\":{\"requests\":{\"storage\":\"16Mi\"}}}}]}}\n"
+          },
+          "creationTimestamp": "2025-12-31T23:54:00Z",
+          "generation": 1,
+          "name": "fixture-db",
+          "namespace": "demo",
+          "resourceVersion": "1",
+          "uid": "3b367991-95a0-3e83-123c-352c48089ced"
+        }
+      }
+    }
+  ]
 }

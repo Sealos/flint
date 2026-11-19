@@ -1,0 +1,112 @@
+{
+  "apiVersion": "apps/v1",
+  "items": [
+    {
+      "data": {
+        "spec": {
+          "template": {
+            "$patch": "replace",
+            "metadata": {
+              "labels": {
+                "app": "fixture-db"
+              }
+            },
+            "spec": {
+              "containers": [
+                {
+                  "command": [
+                    "sh",
+                    "-c",
+                    "while true; do sleep 3600; done"
+                  ],
+                  "image": "busybox:1.37.0",
+                  "imagePullPolicy": "IfNotPresent",
+                  "name": "db",
+                  "resources": {
+                    "limits": {
+                      "memory": "32Mi"
+                    },
+                    "requests": {
+                      "cpu": "10m",
+                      "memory": "16Mi"
+                    }
+                  },
+                  "terminationMessagePath": "/dev/termination-log",
+                  "terminationMessagePolicy": "File",
+                  "volumeMounts": [
+                    {
+                      "mountPath": "/data",
+                      "name": "data"
+                    }
+                  ]
+                }
+              ],
+              "dnsPolicy": "ClusterFirst",
+              "restartPolicy": "Always",
+              "schedulerName": "default-scheduler",
+              "securityContext": {},
+              "terminationGracePeriodSeconds": 30
+            }
+          }
+        }
+      },
+      "metadata": {
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"StatefulSet\",\"metadata\":{\"annotations\":{},\"name\":\"fixture-db\",\"namespace\":\"demo\"},\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"fixture-db\"}},\"serviceName\":\"fixture-db\",\"template\":{\"metadata\":{\"labels\":{\"app\":\"fixture-db\"}},\"spec\":{\"containers\":[{\"command\":[\"sh\",\"-c\",\"while true; do sleep 3600; done\"],\"image\":\"busybox:1.37.0\",\"name\":\"db\",\"resources\":{\"limits\":{\"memory\":\"32Mi\"},\"requests\":{\"cpu\":\"10m\",\"memory\":\"16Mi\"}},\"volumeMounts\":[{\"mountPath\":\"/data\",\"name\":\"data\"}]}]}},\"volumeClaimTemplates\":[{\"metadata\":{\"name\":\"data\"},\"spec\":{\"accessModes\":[\"ReadWriteOnce\"],\"resources\":{\"requests\":{\"storage\":\"16Mi\"}}}}]}}\n"
+        },
+        "creationTimestamp": "2025-12-31T23:54:00Z",
+        "labels": {
+          "app": "fixture-db",
+          "controller.kubernetes.io/hash": "7969d685c4"
+        },
+        "managedFields": [
+          {
+            "apiVersion": "apps/v1",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {
+              "f:data": {},
+              "f:metadata": {
+                "f:annotations": {
+                  ".": {},
+                  "f:kubectl.kubernetes.io/last-applied-configuration": {}
+                },
+                "f:labels": {
+                  ".": {},
+                  "f:app": {},
+                  "f:controller.kubernetes.io/hash": {}
+                },
+                "f:ownerReferences": {
+                  ".": {},
+                  "k:{\"uid\":\"db795987-22c9-487d-80c0-0e3ef78a99d0\"}": {}
+                }
+              },
+              "f:revision": {}
+            },
+            "manager": "kube-controller-manager",
+            "operation": "Update",
+            "time": "2025-12-31T23:54:00Z"
+          }
+        ],
+        "name": "fixture-db-7969d685c4",
+        "namespace": "demo",
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "blockOwnerDeletion": true,
+            "controller": true,
+            "kind": "StatefulSet",
+            "name": "fixture-db",
+            "uid": "3b367991-95a0-3e83-123c-352c48089ced"
+          }
+        ],
+        "resourceVersion": "1",
+        "uid": "0e7a6500-0a8c-8140-7a0a-706ca3fe1e2d"
+      },
+      "revision": 1
+    }
+  ],
+  "kind": "ControllerRevisionList",
+  "metadata": {
+    "resourceVersion": "1"
+  }
+}
