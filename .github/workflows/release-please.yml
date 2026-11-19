@@ -93,8 +93,12 @@ jobs:
           tar -czf "$ARCHIVE" -C dist flint
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
-      # Unsigned until M6 (Developer ID signing and notarization); mark 0.x releases as pre-release.
-      - name: Upload to the release
+      # Releases are immutable once published, so release-please creates a draft (with the tag) and
+      # this step attaches the binaries before publishing it. Unsigned until M6; 0.x is a pre-release.
+      - name: Upload and publish the release
         run: |
           gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
-          case "$VERSION" in 0.*) gh release edit "$TAG" --prerelease ;; esac
+          case "$VERSION" in
+            0.*) gh release edit "$TAG" --draft=false --prerelease ;;
+            *) gh release edit "$TAG" --draft=false ;;
+          esac
