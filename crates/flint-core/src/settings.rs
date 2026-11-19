@@ -222,7 +222,8 @@ pub fn config_dir() -> Result<PathBuf, SettingsError> {
     )
 }
 
-fn config_dir_from(
+/// The config directory: `override_dir` if set and not empty, else the macOS default under `home`.
+pub fn config_dir_from(
     override_dir: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Result<PathBuf, SettingsError> {

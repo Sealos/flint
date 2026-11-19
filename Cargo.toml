@@ -60,3 +60,11 @@ lto = "thin"
 resvg = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 gpui-pre = { opt-level = 3 }
+# PNG encoding for automation screenshots (test builds): a 2560x1490 capture takes about 0.4 s
+# instead of 0.9 s.
+image = { opt-level = 3 }
+"png@0.18.1" = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+"miniz_oxide@0.8.9" = { opt-level = 3 }
+crc32fast = { opt-level = 3 }
+simd-adler32 = { opt-level = 3 }

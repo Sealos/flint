@@ -184,6 +184,8 @@ pub struct Workspace {
     _list_subscriptions: Vec<Subscription>,
     _detail_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
+    /// The confirmation last opened, which the automation state shows while it is open.
+    dialog: Option<DialogText>,
 }
 
 impl Workspace {
@@ -280,6 +282,7 @@ impl Workspace {
             _tick: tick,
             _list_subscriptions: Vec::new(),
             _detail_subscriptions: Vec::new(),
+            dialog: None,
             _subscriptions: vec![
                 observe,
                 appearance,
@@ -1231,31 +1234,54 @@ fn confirm_expose(
     model: Entity<ClustersModel>,
     context: String,
     server: String,
-    previous: Option<String>,
+    dialog: &DialogText,
 ) {
+    let dialog = dialog.clone();
     window.open_alert_dialog(cx, move |alert, _, _| {
-        let mut description = format!(
-            "AI agents using flint mcp will be able to read this cluster: resources, events and \
-             pod logs. They cannot change anything, and Secret values stay redacted.\n\n\
-             Context: {context}\nServer: {server}"
-        );
-        if let Some(previous) = &previous {
-            description.push_str(&format!(
-                "\n\nThis context was exposed at {previous}, which is a different server."
-            ));
-        }
         let (model, context, server) = (model.clone(), context.clone(), server.clone());
+        // Test builds open it at once, so automation sees it without waiting for an animation.
+        #[cfg(feature = "automation")]
+        let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
         alert
             .confirm()
-            .title("Expose to AI agents?")
-            .description(description)
-            .ok_text("Expose")
-            .cancel_text("Cancel")
+            .title(dialog.title)
+            .description(dialog.text.clone())
+            .ok_text(dialog.ok)
+            .cancel_text(dialog.cancel)
             .on_ok(move |_, _, cx| {
                 model.update(cx, |m, _| m.expose_to_ai(context.clone(), server.clone()));
                 true
             })
     });
+}
+
+/// What a confirmation dialog says; the workspace keeps the open one for the automation state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DialogText {
+    pub title: &'static str,
+    pub text: String,
+    pub ok: &'static str,
+    pub cancel: &'static str,
+}
+
+/// The Expose to AI confirmation, naming the context and the server it points at.
+fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let mut text = format!(
+        "AI agents using Flint's MCP server will be able to read this cluster: resources, events \
+         and pod logs. They cannot change anything, and Secret values stay redacted.\n\n\
+         Context: {context}\nServer: {server}"
+    );
+    if let Some(previous) = previous {
+        text.push_str(&format!(
+            "\n\nThis context was exposed at {previous}, which is a different server."
+        ));
+    }
+    DialogText {
+        title: "Expose to AI agents?",
+        text,
+        ok: "Expose",
+        cancel: "Cancel",
+    }
 }
 
 /// An error card at the top of the sidebar. Only a sanitized summary of `error` is shown, in the

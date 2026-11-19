@@ -45,6 +45,9 @@ use workspace::Workspace;
 const FLINT_CLUSTER: &str = "FLINT_CLUSTER";
 
 pub fn run(boot: Bootstrap) {
+    // Before the core starts: a test build refuses unsafe places, and exits instead.
+    #[cfg(feature = "automation")]
+    let automation = automation::prepare();
     let core = match CoreHandle::start(boot.core_config()) {
         Ok(core) => core,
         Err(e) => {
@@ -137,7 +140,9 @@ pub fn run(boot: Bootstrap) {
                 })
             }) {
                 #[cfg(feature = "automation")]
-                Ok((window, workspace)) => automation::start(window, workspace, cx),
+                Ok((window, workspace)) => {
+                    automation::start(automation.clone(), window, workspace, cx)
+                }
                 #[cfg(not(feature = "automation"))]
                 Ok(_) => {}
                 Err(e) => {

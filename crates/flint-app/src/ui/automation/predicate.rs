@@ -20,18 +20,21 @@ enum Test {
     AtMost(f64),
     /// The value is there and not null (`true`), or missing or null (`false`).
     Exists(bool),
-    /// A string contains this text, or an array contains this element.
+    /// A string contains this text, or an array has an element matching this (see `matches`).
     Contains(Value),
+    /// An array has an element matching this object: every field given, recursively.
+    Any(Value),
 }
 
 /// The tests `wait_for` takes, as its arguments name them.
-pub const TESTS: [&str; 6] = [
+pub const TESTS: [&str; 7] = [
     "equals",
     "not_equals",
     "at_least",
     "at_most",
     "exists",
     "contains",
+    "any",
 ];
 
 impl Predicate {
@@ -69,6 +72,8 @@ impl Predicate {
             "at_most" => Test::AtMost(number(&value)?),
             "exists" => Test::Exists(value.as_bool().ok_or("exists takes true or false")?),
             "contains" => Test::Contains(value),
+            "any" if value.is_object() => Test::Any(value),
+            "any" => return Err("any takes an object: the fields an element must have".to_owned()),
             other => return Err(format!("unknown test \"{other}\"")),
         };
         Ok(Self { pointer, test })
@@ -88,20 +93,62 @@ impl Predicate {
             (Test::Contains(needle), Some(Value::String(text))) => {
                 needle.as_str().is_some_and(|n| text.contains(n))
             }
-            (Test::Contains(needle), Some(Value::Array(items))) => {
-                items.iter().any(|item| same(item, needle))
+            (Test::Contains(needle) | Test::Any(needle), Some(Value::Array(items))) => {
+                items.iter().any(|item| matches(item, needle))
             }
-            (Test::Contains(_), Some(_)) => false,
+            (Test::Contains(_) | Test::Any(_), Some(_)) => false,
         }
     }
 
-    /// The value the predicate looks at, for a timeout message.
-    pub fn observed<'a>(&self, state: &'a Value) -> Option<&'a Value> {
-        state.pointer(&self.pointer)
+    /// What the predicate saw, for a timeout message: the value (shortened to about
+    /// [`SHOWN`] characters), or, for a pointer that leads nowhere, the deepest part of it that
+    /// exists and its keys.
+    pub fn observed(&self, state: &Value) -> String {
+        if let Some(value) = state.pointer(&self.pointer) {
+            return format!("it is {}", shorten(&value.to_string()));
+        }
+        let mut found = "";
+        for (i, _) in self.pointer.match_indices('/').skip(1) {
+            if state.pointer(&self.pointer[..i]).is_some() {
+                found = &self.pointer[..i];
+            }
+        }
+        let keys = match state.pointer(found) {
+            Some(Value::Object(map)) => {
+                let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                format!("has keys [{}]", keys.join(", "))
+            }
+            Some(Value::Array(items)) => format!("has {} elements", items.len()),
+            _ => "is not an object".to_owned(),
+        };
+        let at = if found.is_empty() { "the state" } else { found };
+        format!("no value at {}; {at} {keys}", self.pointer)
     }
 
     pub fn pointer(&self) -> &str {
         &self.pointer
+    }
+}
+
+/// How much of a value a timeout message shows.
+pub const SHOWN: usize = 300;
+
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(SHOWN) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
+/// Whether `item` matches `needle`: an object matches when every field of `needle` matches the
+/// same field of `item` (so `{"name": "web"}` matches a row); anything else by value.
+fn matches(item: &Value, needle: &Value) -> bool {
+    match (item, needle) {
+        (Value::Object(item), Value::Object(needle)) => needle
+            .iter()
+            .all(|(key, want)| item.get(key).is_some_and(|got| matches(got, want))),
+        _ => same(item, needle),
     }
 }
 
@@ -129,7 +176,10 @@ mod tests {
 
     fn check(pointer: &str, test: &str, value: serde_json::Value) -> bool {
         let state = json!({
-            "list": {"shown": 3, "rows": [{"name": "a"}, {"name": "b"}], "filter": "web-1"},
+            "list": {"shown": 3, "rows": [
+                {"name": "a", "cells_by_column": {"Status": "Running", "Ready": "1/1"}},
+                {"name": "b"}
+            ], "filter": "web-1"},
             "detail": null,
             "active_cluster": "kind-flint-dev",
         });
@@ -150,6 +200,18 @@ mod tests {
         assert!(check("/list/rows/1/name", "equals", json!("b")));
         assert!(check("/list/filter", "contains", json!("web")));
         assert!(check("/list/rows", "contains", json!({"name": "a"})));
+        assert!(check("/list/rows", "contains", json!({"name": "b"})));
+        assert!(!check("/list/rows", "contains", json!({"name": "c"})));
+        assert!(check(
+            "/list/rows",
+            "any",
+            json!({"name": "a", "cells_by_column": {"Status": "Running"}})
+        ));
+        assert!(!check(
+            "/list/rows",
+            "any",
+            json!({"name": "a", "cells_by_column": {"Status": "Pending"}})
+        ));
         assert!(check("/active_cluster", "exists", json!(true)));
         assert!(check("/detail", "exists", json!(false)));
         assert!(check("/nothing", "exists", json!(false)));
@@ -164,5 +226,26 @@ mod tests {
         assert!(Predicate::from_args("/x".into(), "at_least", json!("2")).is_err());
         assert!(Predicate::from_args("/x".into(), "exists", json!(1)).is_err());
         assert!(Predicate::from_args("/x".into(), "near", json!(1)).is_err());
+        assert!(Predicate::from_args("/x".into(), "any", json!("a")).is_err());
+    }
+
+    #[test]
+    fn says_what_it_saw() {
+        let state = json!({"list": {"shown": 3, "rows": []}, "name": "x".repeat(400)});
+        let seen = |pointer: &str| {
+            Predicate::from_args(pointer.into(), "exists", json!(true))
+                .unwrap()
+                .observed(&state)
+        };
+        assert_eq!(seen("/list/shown"), "it is 3");
+        assert_eq!(
+            seen("/list/row"),
+            "no value at /list/row; /list has keys [rows, shown]"
+        );
+        assert_eq!(
+            seen("/lsit/shown"),
+            "no value at /lsit/shown; the state has keys [list, name]"
+        );
+        assert!(seen("/name").chars().count() < 320);
     }
 }

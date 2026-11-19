@@ -4,8 +4,6 @@
 //! back; `args` may be left out for commands without arguments. A response is
 //! `{"id": …, "ok": true, "result": …}` or `{"id": …, "ok": false, "error": {"code", "message"}}`.
 
-use std::path::PathBuf;
-
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,8 +35,12 @@ pub enum Command {
         predicate: Predicate,
         timeout_ms: u64,
     },
-    /// Capture the window as a PNG at `path` (default: under `FLINT_CONFIG_DIR/screenshots`).
-    Screenshot { path: Option<PathBuf> },
+    /// Capture the window as a PNG named `name` in the screenshots directory (a timestamp when
+    /// left out). Only a plain file name: see [`super::setup::screenshot_file`].
+    Screenshot { name: Option<String> },
+    /// The registered actions, with whether each is available now: for finding out why a
+    /// dispatch says `not_available`.
+    Actions,
 }
 
 /// How long `wait_for` waits by default, and at most.
@@ -130,7 +132,7 @@ fn wait_args(args: Value) -> Result<(Predicate, u64), Error> {
 #[serde(deny_unknown_fields)]
 struct ScreenshotArgs {
     #[serde(default)]
-    path: Option<PathBuf>,
+    name: Option<String>,
 }
 
 /// What went wrong, for the response's `error.code`.
@@ -155,10 +157,13 @@ pub enum ErrorCode {
 }
 
 /// A failed request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
+    /// More about the failure, as data: `wait_for` puts the last state here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Box<Value>>,
 }
 
 impl Error {
@@ -166,19 +171,32 @@ impl Error {
         Self {
             code,
             message: message.into(),
+            data: None,
         }
     }
+
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(Box::new(data));
+        self
+    }
+}
+
+/// The request's id, if the line is JSON with one (for answering a request not run).
+pub fn request_id(line: &str) -> Value {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(Value::Null)
 }
 
 /// Parses one request line into its id and command. On failure the id is still returned when
 /// it could be read, so the error response can carry it.
 pub fn parse(line: &str) -> Result<(Value, Command), (Value, Error)> {
     let request: Request = serde_json::from_str(line).map_err(|e| {
-        let id = serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|v| v.get("id").cloned())
-            .unwrap_or(Value::Null);
-        (id, Error::new(ErrorCode::BadRequest, e.to_string()))
+        (
+            request_id(line),
+            Error::new(ErrorCode::BadRequest, e.to_string()),
+        )
     })?;
     let id = request.id;
     match command(&request.cmd, request.args) {
@@ -223,6 +241,10 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
             no_args(cmd, &args)?;
             Command::State
         }
+        "actions" => {
+            no_args(cmd, &args)?;
+            Command::Actions
+        }
         "wait_for" => {
             let (predicate, timeout_ms) = wait_args(args)?;
             Command::WaitFor {
@@ -232,11 +254,11 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
         }
         "screenshot" => {
             let a: ScreenshotArgs = if args.is_null() {
-                ScreenshotArgs { path: None }
+                ScreenshotArgs { name: None }
             } else {
                 args_of(cmd, args)?
             };
-            Command::Screenshot { path: a.path }
+            Command::Screenshot { name: a.name }
         }
         other => {
             return Err(Error::new(
@@ -345,6 +367,7 @@ mod tests {
             }
         );
         assert_eq!(ok(r#"{"id":"s","cmd":"state"}"#), Command::State);
+        assert_eq!(ok(r#"{"cmd":"actions"}"#), Command::Actions);
         assert_eq!(
             ok(r#"{"cmd":"wait_for","args":{"pointer":"/list/shown","at_least":2}}"#),
             Command::WaitFor {
@@ -353,14 +376,14 @@ mod tests {
             }
         );
         assert_eq!(
-            ok(r#"{"cmd":"screenshot","args":{"path":"/tmp/x.png"}}"#),
+            ok(r#"{"cmd":"screenshot","args":{"name":"pods-dark"}}"#),
             Command::Screenshot {
-                path: Some("/tmp/x.png".into())
+                name: Some("pods-dark".into())
             }
         );
         assert_eq!(
             ok(r#"{"cmd":"screenshot"}"#),
-            Command::Screenshot { path: None }
+            Command::Screenshot { name: None }
         );
     }
 
@@ -388,6 +411,10 @@ mod tests {
         assert_eq!(
             err(r#"{"id":"a","cmd":"open_view","args":{}}"#),
             (json!("a"), ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            err(r#"{"id":2,"cmd":"screenshot","args":{"path":"/tmp/x.png"}}"#),
+            (json!(2), ErrorCode::InvalidArgs)
         );
         assert_eq!(
             err(r#"{"id":1,"cmd":"state","args":{"x":1}}"#),

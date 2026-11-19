@@ -23,7 +23,7 @@ use super::super::registry::{
     WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::ui_state;
-use super::{Pane, Workspace, confirm_expose};
+use super::{Pane, Workspace, confirm_expose, expose_dialog};
 
 impl Workspace {
     /// Every workspace action and its handler, for [`Bind`].
@@ -290,7 +290,9 @@ impl Workspace {
         match self.exposure_change(action, cx) {
             Ok((server, previous)) => {
                 let model = self.model.clone();
-                confirm_expose(window, cx, model, action.cluster.clone(), server, previous);
+                let dialog = expose_dialog(&action.cluster, &server, previous.as_deref());
+                confirm_expose(window, cx, model, action.cluster.clone(), server, &dialog);
+                self.dialog = Some(dialog);
             }
             Err(e) => tracing::warn!("{e}"),
         }

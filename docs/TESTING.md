@@ -38,44 +38,67 @@ perform a registered action; `scripts/check-click-actions.sh` enforces this in C
 A test-only control socket lets e2e tests and agents drive the real app. The code is in
 `crates/flint-app/src/ui/automation/`.
 
-- **Built only with `--features automation`.** Release builds contain no automation code. CI's `macos (flint-app)`
-  job runs flint-app's clippy and tests with the feature too, and checks that its release binary has none of the
-  channel's strings (the binary is stripped, so there are no symbols to look for).
-- **Socket location:** `$FLINT_CONFIG_DIR/automation.sock`, mode `0600`. It is created in a private directory and
-  moved into place, so nobody can connect before its mode is set, and connections from another user are refused.
-  The app refuses to start the channel (it logs an error and runs on without it) when `FLINT_CONFIG_DIR` is not set,
-  so it never uses the user's real config. The socket is removed when the app quits.
+- **Test builds only.** Built only with `--features automation`, and only without `--release` (a `compile_error!`
+  refuses both together). CI's `macos (flint-app)` job runs flint-app's clippy and tests with the feature, and checks
+  that its release binary has none of the channel's strings (the binary is stripped, so there are no symbols to look
+  for).
+- **Where it may run.** Before anything starts, the app checks, and exits with code 3 and a reason if any check fails,
+  so a harness fails fast instead of waiting for a socket:
+  - `FLINT_CONFIG_DIR` is set, is not the real config directory, belongs to the user and is not writable by group or
+    others. It is created with mode `0700` when missing.
+  - `KUBECONFIG` is set, so the app never falls back to `~/.kube/config`.
+  - The socket path, `$FLINT_CONFIG_DIR/automation.sock`, fits macOS's limit of 103 bytes (`sun_path` is 104 with its
+    NUL), so keep `FLINT_CONFIG_DIR` short (`mktemp -d` is fine).
+  - No other Flint is serving on that socket. A stale socket nobody answers on is replaced.
+- **The socket.** Mode `0600`. It is bound in a fresh private directory (`mkdtemp`, `0700`) and moved into place with
+  link and unlink, so nobody can connect before its mode is set and an existing file is never replaced. Connections from
+  another user are refused. On quit the app removes it, if it is still the one it made.
 - **Protocol:** newline-delimited JSON. A request is `{"id", "cmd", "args"}`; `id` is echoed back and `args` may be
   left out when a command takes none. A response is `{"id", "ok": true, "result"}` or
-  `{"id", "ok": false, "error": {"code", "message"}}`, with `code` one of `bad_request`, `unknown_command`,
+  `{"id", "ok": false, "error": {"code", "message", "data"?}}`, with `code` one of `bad_request`, `unknown_command`,
   `invalid_args`, `not_found` (no such action), `not_available` (nothing handles it now, or it is disabled),
   `rejected` (available, but the arguments would do nothing: an unknown cluster, kind, row or column), `timeout`,
-  `failed`. Commands:
+  `failed`. At most 16 requests are in flight at once; more get `failed` at once. Commands:
   - `select_cluster {cluster}`: the sidebar click.
   - `open_view {kind}`: the navigation click. `kind` matches like `FLINT_VIEW`: `pods`, `deployments.apps`.
   - `select_row {namespace?, name}`: the row click, among the rows passing the filters.
   - These three dispatch `workspace::SelectCluster`, `workspace::OpenView` and `resource_list::SelectRow`, so the
     registry's guards check them exactly as they check a click.
-  - `dispatch_action {name, args?}`: any registered action by name (`workspace::SetNamespaces`,
-    `detail::ShowTab`), and any other GPUI action, such as a dialog's.
-  - `type_text {text}`: one keystroke per character, to the focused element.
-  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `cmd-w`).
-  - `state`: the visible view tree: `focus`, `dialog`, `clusters`, sidebar `banners`, `active_cluster`, `main`,
-    `header`, `nav` (sections, and the entries of open ones), `list` (columns as drawn and up to 500 rows in display
-    order, Secret cells masked, with its `banners` and `placeholder`) and `detail` (which object, tab and fetch
-    state; never its content). Errors in it are sanitized summaries.
-  - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` until the value at a JSON Pointer passes one test
-    (`equals`, `not_equals`, `at_least`, `at_most` (numbers, or an array's length), `exists`, `contains`), and returns
-    that state. Default timeout 5 s, at most 120 s.
-  - `screenshot {path?}`: renders the window to a PNG (default `$FLINT_CONFIG_DIR/screenshots/`) and returns its path
-    and size in pixels. It renders the last drawn frame offscreen, so it needs no screen-recording permission.
+  - `dispatch_action {name, args?}`: any registered action by name (`workspace::SetNamespaces`, `detail::ShowYaml`,
+    `flint::AppearanceDark`), and any other GPUI action, such as the dialog's `ui::Confirm`. With nothing focused it
+    dispatches from the workspace, as a click would.
+  - `actions`: every registered action with its label, arguments (and their kinds), shortcut, and whether it is
+    `enabled` and `available` now. Ask it when a dispatch says `not_available`.
+  - `type_text {text}`: one keystroke per character (Shift for capitals and shifted symbols), to the focused element.
+    At most 4 KiB.
+  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `cmd-w`, `?`).
+  - `state`: the visible view tree: `focus`, `dialog` (`{title, text, buttons}` while one is open), `appearance`,
+    `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`), sidebar `banners`, `active_cluster`,
+    `main`, `header` (with `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the entries of open ones),
+    `list` (columns as drawn and up to 500 rows in display order, each with `cells` and `cells_by_column`, Secret cells
+    masked, with its `banners` and `placeholder`) and `detail` (which object, tab, fetch state, and its sections with
+    entry counts; never values). Errors in it are sanitized summaries.
+  - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` every 50 ms, on the app's clock, until the value at a
+    JSON Pointer passes one test, and returns that state. Tests: `equals`, `not_equals`, `at_least`, `at_most`
+    (numbers, or an array's length), `exists`, `contains` (a substring, or an array element matching), and `any` (an
+    array element matching an object). An object matches when every field it gives matches, so
+    `{"pointer": "/list/rows", "any": {"name": "web-1", "cells_by_column": {"Status": "Running"}}}` waits for a running
+    row. Default timeout 5 s, at most 120 s. A timeout says what it saw (for a pointer that leads nowhere, the keys
+    where it stopped) and carries the last state in `error.data`. A `wait_for` holds its connection until it ends: to
+    act meanwhile, use a second connection.
+  - `screenshot {name?}`: draws the window for about half a second (so layout and short animations settle), renders
+    it offscreen to a PNG named `name` (a plain file name; `.png` is added; a timestamp when left out), and returns
+    its path and size in pixels. It goes in `$FLINT_AUTOMATION_SCREENSHOTS` when set (an absolute, existing directory
+    the harness owns), else in `$FLINT_CONFIG_DIR/screenshots/`. The file is new (never replacing one, never through
+    a link) and mode `0600`. Offscreen rendering needs no screen-recording permission and works while the screen is
+    locked.
 - Commands that act draw the window before they return (as GPUI does before handling a key), so the next command
-  sees the new focus and views even while the window is hidden or the screen is locked. They do not wait for data:
-  follow them with `wait_for`. `screenshot` draws first too.
+  sees the new focus and views even while the window is hidden. They do not wait for data: follow them with
+  `wait_for`.
 - The automation channel calls the same code paths as clicks and keys, never shortcuts into the core. Otherwise a
   passing e2e test proves nothing about the UI. It reaches controls through the action registry
   (`crates/flint-app/src/ui/registry.rs`), where every interactive control is a named action; the command palette
-  uses the same registry.
+  uses the same registry. Test builds open dialogs without their entrance animation.
 
 Try it by hand:
 

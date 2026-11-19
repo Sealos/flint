@@ -16,8 +16,12 @@ use serde::Serialize;
 pub struct AppState {
     /// What has keyboard focus.
     pub focus: Focus,
-    /// A dialog (such as the Expose to AI confirmation) is open over the window.
-    pub dialog: bool,
+    /// The dialog open over the window (the Expose to AI confirmation), if any.
+    pub dialog: Option<DialogState>,
+    /// The `appearance` setting: `system`, `light` or `dark`.
+    pub appearance: &'static str,
+    /// Where the contexts come from.
+    pub kubeconfig: KubeconfigState,
     pub clusters: Vec<ClusterState>,
     /// The sidebar's error cards and messages (settings, kubeconfig files, the last error).
     pub banners: Vec<Banner>,
@@ -78,10 +82,36 @@ impl Banner {
     }
 }
 
+/// An open dialog: what it says and the buttons it offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DialogState {
+    pub title: String,
+    pub text: String,
+    pub buttons: Vec<String>,
+}
+
+/// The kubeconfig files read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KubeconfigState {
+    /// The core has read them once.
+    pub loaded: bool,
+    pub paths: Vec<KubeconfigPath>,
+    /// `KUBECONFIG` as the app saw it.
+    pub env: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KubeconfigPath {
+    pub path: String,
+    pub exists: bool,
+}
+
 /// One kubeconfig context in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClusterState {
     pub name: String,
+    /// The name as the sidebar shows it (shortened for cloud contexts).
+    pub label: String,
     pub active: bool,
     /// `disconnected`, `connecting`, `connected` or `failed`.
     pub connection: &'static str,
@@ -121,6 +151,8 @@ pub struct HeaderState {
     pub namespace_button: Option<String>,
     /// The watch mode button's text.
     pub watch_mode: String,
+    /// Whether the mode is the cluster's own (`cluster`) or the default (`default`).
+    pub watch_mode_source: &'static str,
 }
 
 /// The resource navigation.
@@ -186,6 +218,8 @@ pub struct RowState {
     pub selected: bool,
     /// Cell text as drawn (Secret cells masked), one per column.
     pub cells: Vec<String>,
+    /// The same cells by column name, for `wait_for`'s `any`: `{"Status": "Running"}`.
+    pub cells_by_column: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -209,9 +243,19 @@ pub struct DetailState {
     pub labels_open: bool,
     pub annotations_open: bool,
     pub managed_fields_shown: bool,
+    /// The overview's sections and how many entries each has (labels, owners, conditions,
+    /// events; a Secret's data keys), never their values. Empty until the object is fetched.
+    pub sections: Vec<SectionCount>,
     /// Secret keys whose value is revealed (never the values).
     pub revealed: Vec<String>,
     pub banners: Vec<Banner>,
+}
+
+/// A detail-pane section and how many entries it has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SectionCount {
+    pub name: &'static str,
+    pub count: usize,
 }
 
 /// The state chip's word for a list's sync state.

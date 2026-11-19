@@ -32,20 +32,26 @@ impl ResourceList {
             .take(ListState::ROW_LIMIT)
             .map(|&i| {
                 let row = &snapshot.rows[i as usize];
+                let cells: Vec<String> = columns
+                    .iter()
+                    .map(|&col| {
+                        if secrets && !is_safe_secret_column(&snapshot.columns[col].name) {
+                            MASK.to_owned()
+                        } else {
+                            cell_text(row, col, now).to_string()
+                        }
+                    })
+                    .collect();
                 RowState {
                     namespace: row.namespace.as_deref().map(str::to_owned),
                     name: row.name.to_string(),
                     selected: selected == Some(&*row.uid),
-                    cells: columns
+                    cells_by_column: columns
                         .iter()
-                        .map(|&col| {
-                            if secrets && !is_safe_secret_column(&snapshot.columns[col].name) {
-                                MASK.to_owned()
-                            } else {
-                                cell_text(row, col, now).to_string()
-                            }
-                        })
+                        .zip(&cells)
+                        .map(|(&col, cell)| (snapshot.columns[col].name.to_string(), cell.clone()))
                         .collect(),
+                    cells,
                 }
             })
             .collect();

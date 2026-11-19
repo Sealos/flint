@@ -17,7 +17,7 @@ pub fn keystrokes(text: &str) -> Vec<Keystroke> {
             },
             c => Keystroke {
                 modifiers: Modifiers {
-                    shift: c.is_uppercase(),
+                    shift: shifted(c),
                     ..Modifiers::default()
                 },
                 key: c.to_lowercase().collect(),
@@ -25,6 +25,26 @@ pub fn keystrokes(text: &str) -> Vec<Keystroke> {
             },
         })
         .collect()
+}
+
+/// Whether typing `c` on a US keyboard takes Shift: capitals and the shifted symbols.
+pub fn shifted(c: char) -> bool {
+    c.is_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(c)
+}
+
+/// A key pressed by name (`press_key`): a single shifted character gets Shift, as a keyboard
+/// would send it.
+pub fn with_shift(mut keystroke: Keystroke) -> Keystroke {
+    let mut chars = keystroke.key.chars();
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && shifted(c)
+    {
+        keystroke.modifiers.shift = true;
+        if keystroke.key_char.is_none() && !keystroke.modifiers.platform {
+            keystroke.key_char = Some(c.to_string());
+        }
+    }
+    keystroke
 }
 
 fn named(key: &str) -> Keystroke {
@@ -56,5 +76,23 @@ mod tests {
             ]
         );
         assert!(keystrokes("").is_empty());
+        assert!(keystrokes("?")[0].modifiers.shift);
+        assert!(!keystrokes("/")[0].modifiers.shift);
+    }
+
+    #[test]
+    fn named_shifted_symbols_get_shift() {
+        use gpui_kit::Keystroke;
+        let key = |k: &str| {
+            super::with_shift(Keystroke {
+                modifiers: Default::default(),
+                key: k.into(),
+                key_char: None,
+            })
+        };
+        assert!(key("?").modifiers.shift);
+        assert_eq!(key("?").key_char.as_deref(), Some("?"));
+        assert!(!key("a").modifiers.shift);
+        assert!(!key("escape").modifiers.shift);
     }
 }

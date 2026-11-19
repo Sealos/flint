@@ -128,9 +128,9 @@ jobs:
         run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
       - name: Clippy (automation channel)
         run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
-      - name: Tests
-        run: cargo test -p flint-app --locked
-      - name: Tests (automation channel)
+      # One test run: the automation build compiles every test, the channel's too. The plain
+      # build is still checked by clippy above.
+      - name: Tests (with the automation channel)
         run: cargo test -p flint-app --features automation --locked
       - name: Docs
         run: cargo doc -p flint-app --no-deps --document-private-items --locked
@@ -141,7 +141,7 @@ jobs:
       # must not be in what ships. The release binary is stripped, so look for its strings.
       - name: Release binary has no automation channel
         run: |
-          if strings -a ./target/release/flint | grep -E 'automation\.sock|automation channel'; then
+          if strings -a ./target/release/flint | grep -E 'automation\.sock|automation channel|flint::ui::automation'; then
             echo "::error::the release binary contains the automation channel"
             exit 1
           fi

@@ -342,7 +342,7 @@ pub struct ActionSpec {
     /// A Title Case name for menus and the palette; it ends in "…" when it takes arguments.
     pub label: &'static str,
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     pub description: &'static str,
@@ -398,7 +398,7 @@ impl ActionSpec {
     /// Whether the action is enabled now, whatever its arguments: its guard, if the workspace
     /// installed one (a list action with no list open is not).
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     pub fn is_enabled(&self, cx: &App) -> bool {
@@ -416,7 +416,7 @@ impl ActionSpec {
 
     /// Whether the action would be handled from the focused element up, and is enabled.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     pub fn is_available(&self, window: &Window, cx: &App) -> bool {
@@ -444,7 +444,7 @@ impl ActionSpec {
     /// The live key binding to show next to the action ("⌘F"), if any: the one added last to
     /// the keymap (the highest precedence), so later or user bindings win over the defaults.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
     )]
     pub fn shortcut(&self, cx: &App) -> Option<String> {
@@ -466,7 +466,7 @@ impl ActionSpec {
 
 /// Every action, in menu order.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "automation")),
     expect(dead_code, reason = "used by the command palette (#29) and automation")
 )]
 pub fn actions() -> &'static [ActionSpec] {
@@ -518,7 +518,8 @@ pub fn available_in<'a>(
 }
 
 /// Builds the action `name` from JSON `args` and dispatches it from the focused element, as
-/// its key binding would, after the availability and guard checks. Names outside the registry
+/// its key binding would (from the workspace's target when nothing is focused), after the
+/// availability and guard checks. Names outside the registry
 /// are built by GPUI, so library actions work too (without guards).
 #[cfg_attr(
     not(any(test, feature = "automation")),
@@ -544,7 +545,9 @@ pub fn dispatch(
                 })?
         }
     };
-    match window.focused(cx) {
+    // With nothing focused, from the workspace's target, as a click would.
+    let focus = window.focused(cx).or_else(|| installed_target(cx));
+    match focus {
         Some(focus) => dispatch_in(&focus, &*action, window, cx),
         None => Err(ActionError::NotAvailable(name.to_owned())),
     }
@@ -576,10 +579,7 @@ pub fn dispatch_in(
 /// Checks and dispatches `action` from the workspace's focus target (see [`install`]), or from
 /// the focused element in a window without one.
 pub fn perform(action: &dyn Action, window: &mut Window, cx: &mut App) -> Result<(), ActionError> {
-    let target = cx
-        .try_global::<Installed>()
-        .and_then(|i| i.target.clone())
-        .or_else(|| window.focused(cx));
+    let target = installed_target(cx).or_else(|| window.focused(cx));
     match target {
         Some(focus) => dispatch_in(&focus, action, window, cx),
         None => Err(ActionError::NotAvailable(action.name().to_owned())),
@@ -658,6 +658,10 @@ struct Installed {
 }
 
 impl Global for Installed {}
+
+fn installed_target(cx: &App) -> Option<FocusHandle> {
+    cx.try_global::<Installed>()?.target.clone()
+}
 
 fn guard(type_id: TypeId, cx: &App) -> Option<&Guard> {
     cx.try_global::<Installed>()?.guards.get(&type_id)

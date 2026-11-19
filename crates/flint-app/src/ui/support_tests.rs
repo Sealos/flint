@@ -152,3 +152,41 @@ pub fn pods(rows: &[(&str, &str, i64)]) -> Arc<KindSnapshot> {
         ..Default::default()
     })
 }
+
+/// Gives `alpha` a navigation with Pods, as if its discovery had arrived.
+#[cfg(feature = "automation")]
+pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
+    use flint_core::{ClusterDiscovery, NavEntry, NavSection, Navigation, SectionKind};
+
+    use super::clusters::Discovered;
+
+    let discovery = ClusterDiscovery {
+        kinds: Vec::new(),
+        navigation: Navigation {
+            sections: vec![NavSection {
+                title: "Workloads".into(),
+                kind: SectionKind::BuiltIn,
+                entries: vec![NavEntry {
+                    id: KindId::pods(),
+                    label: "Pods".into(),
+                    kind: "Pod".into(),
+                    api_version: "v1".into(),
+                    namespaced: true,
+                    listable: true,
+                    watchable: true,
+                }],
+            }],
+        },
+    };
+    t.model.update(cx, |model, cx| {
+        model.discovery.insert(
+            "alpha".into(),
+            Discovered {
+                discovery: Some(Arc::new(discovery)),
+                error: None,
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+}

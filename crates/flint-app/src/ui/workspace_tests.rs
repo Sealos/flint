@@ -127,7 +127,7 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
     assert_eq!(state.active_cluster.as_deref(), Some("beta"));
     assert!(state.clusters.iter().any(|c| c.name == "beta" && c.active));
     assert_eq!(state.focus, Focus::Workspace);
-    assert!(state.list.is_none() && state.detail.is_none() && !state.dialog);
+    assert!(state.list.is_none() && state.detail.is_none() && state.dialog.is_none());
     assert!(state.header.is_some());
 
     let offered = names(cx);
@@ -340,6 +340,17 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
     dispatch(cx, &t, "workspace::ExposeToAi", json!({"cluster": "alpha"})).unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
+    // The automation state says what the dialog asks.
+    let workspace = t.workspace.clone();
+    let dialog = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).dialog)
+        })
+        .unwrap()
+        .expect("the dialog is in the state");
+    assert_eq!(dialog.title, "Expose to AI agents?");
+    assert!(dialog.text.contains("Context: alpha"), "{}", dialog.text);
+    assert_eq!(dialog.buttons, ["Expose", "Cancel"]);
     dispatch(cx, &t, "ui::Cancel", Value::Null).unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
         .await;

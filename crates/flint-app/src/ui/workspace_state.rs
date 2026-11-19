@@ -3,12 +3,13 @@
 // module-tests: workspace_actions.rs
 
 use flint_core::settings::AiExposureState;
-use flint_core::{ConnectionState, WatchMode, display};
+use flint_core::{Appearance, ConnectionState, WatchMode, display};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 use super::super::view_state::{
-    AppState, Banner, ClusterState, Focus, HeaderState, Level, Main, error_text,
+    AppState, Banner, ClusterState, DialogState, Focus, HeaderState, KubeconfigPath,
+    KubeconfigState, Level, Main, error_text,
 };
 use super::{Workspace, namespace_summary};
 
@@ -16,7 +17,18 @@ impl Workspace {
     /// What the window shows now, as data.
     pub fn view_state(&self, window: &mut Window, cx: &mut Context<Self>) -> AppState {
         let focus = self.focus_state(window, cx);
-        let dialog = window.has_active_dialog(cx);
+        let dialog = window.has_active_dialog(cx).then(|| match &self.dialog {
+            Some(d) => DialogState {
+                title: d.title.to_owned(),
+                text: d.text.clone(),
+                buttons: vec![d.ok.to_owned(), d.cancel.to_owned()],
+            },
+            None => DialogState {
+                title: String::new(),
+                text: String::new(),
+                buttons: Vec::new(),
+            },
+        });
         let model = self.model.read(cx);
         let active = model.active.clone();
 
@@ -32,6 +44,7 @@ impl Workspace {
                 };
                 ClusterState {
                     name: cluster.info.name.clone(),
+                    label: display::short_name(&cluster.info.name).to_string(),
                     active: active.as_deref() == Some(cluster.info.name.as_str()),
                     connection,
                     error,
@@ -93,16 +106,42 @@ impl Workspace {
                 namespace_button: namespaced.then(|| namespace_summary(&filter)),
                 namespaces: filter,
                 watch_mode: match model.settings.watch_mode_for(name) {
-                    WatchMode::All => "Watch: all kinds",
-                    WatchMode::OnView => "Watch: open views",
+                    WatchMode::All => "Live: all kinds",
+                    WatchMode::OnView => "Live: open views only",
                 }
                 .to_owned(),
+                watch_mode_source: if model.settings.cluster_watch_mode.contains_key(name) {
+                    "cluster"
+                } else {
+                    "default"
+                },
             }
         });
 
+        let kubeconfig = KubeconfigState {
+            loaded: model.loaded,
+            paths: model
+                .kubeconfig_paths
+                .iter()
+                .map(|(path, exists)| KubeconfigPath {
+                    path: path.display().to_string(),
+                    exists: *exists,
+                })
+                .collect(),
+            env: model
+                .kubeconfig_env
+                .as_ref()
+                .map(|v| v.to_string_lossy().into_owned()),
+        };
         AppState {
             focus,
             dialog,
+            appearance: match model.settings.appearance {
+                Appearance::System => "system",
+                Appearance::Light => "light",
+                Appearance::Dark => "dark",
+            },
+            kubeconfig,
             clusters,
             banners,
             active_cluster: active,
@@ -112,6 +151,18 @@ impl Workspace {
             list: list.map(|l| l.view_state()),
             detail: detail.map(|d| d.view_state()),
         }
+    }
+
+    /// The cluster the workspace shows, for the automation tests.
+    #[cfg(all(test, feature = "automation"))]
+    pub fn view_state_cluster(&self) -> Option<&str> {
+        self.cluster.as_deref()
+    }
+
+    /// The open list, for the automation tests.
+    #[cfg(all(test, feature = "automation"))]
+    pub fn list(&self) -> Option<&Entity<super::super::list::ResourceList>> {
+        self.list.as_ref()
     }
 
     fn focus_state(&self, window: &Window, cx: &App) -> Focus {

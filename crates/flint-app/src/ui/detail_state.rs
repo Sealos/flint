@@ -3,7 +3,7 @@
 
 use gpui_kit::*;
 
-use super::super::view_state::{Banner, DetailState, Level, error_text};
+use super::super::view_state::{Banner, DetailState, Level, SectionCount, error_text};
 use super::{DetailTab, DetailView, Fetch};
 
 impl DetailView {
@@ -24,6 +24,25 @@ impl DetailView {
                 error_text(error),
             ));
         }
+        let sections = match &self.fetch {
+            Fetch::Loaded { detail, overview } => {
+                let mut sections = vec![
+                    ("Labels", overview.labels.len()),
+                    ("Annotations", overview.annotations.len()),
+                    ("Owners", overview.owners.len()),
+                    ("Conditions", overview.conditions.len()),
+                    ("Events", detail.events.len()),
+                ];
+                if let Some(secret) = &overview.secret {
+                    sections.push(("Data", secret.entries.len()));
+                }
+                sections
+                    .into_iter()
+                    .map(|(name, count)| SectionCount { name, count })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let mut revealed: Vec<String> = self.revealed.iter().cloned().collect();
         revealed.sort_unstable();
         DetailState {
@@ -37,6 +56,7 @@ impl DetailView {
             labels_open: self.show_labels,
             annotations_open: self.show_annotations,
             managed_fields_shown: self.show_managed_fields,
+            sections,
             revealed,
             banners,
         }
