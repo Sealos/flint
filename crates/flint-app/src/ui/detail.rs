@@ -28,9 +28,10 @@ use super::log_view::LogRequest;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
-    self, Close, OpenContainerLogs, OpenLogs, Refresh, ShowOverview, ShowYaml, ToggleAnnotations,
-    ToggleLabels, ToggleManagedFields, ToggleSecretValue,
+    self, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenShell, Refresh, ShowOverview,
+    ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleSecretValue,
 };
+use super::terminal_model::ShellRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
@@ -64,6 +65,8 @@ pub enum DetailEvent {
     Close,
     /// Open (or show) a log tab for one of the pod's containers.
     OpenLogs(LogRequest),
+    /// Open (or show) a shell tab in one of the pod's containers.
+    OpenShell(ShellRequest),
 }
 
 impl EventEmitter<DetailEvent> for DetailView {}
@@ -301,6 +304,7 @@ impl DetailView {
                     )
                     .when(self.fetching, |el| el.child(Spinner::new().xsmall()))
                     .children(self.render_logs_button())
+                    .children(self.render_shell_button())
                     .child(
                         Button::new("detail-refresh")
                             .icon(IconName::RefreshCw)
@@ -382,6 +386,39 @@ impl DetailView {
                                     }),
                                 ));
                             }
+                        }
+                        menu
+                    })
+                    .into_any_element(),
+            ),
+        }
+    }
+
+    /// For pods: Shell, with a container picker when the pod has several app containers.
+    fn render_shell_button(&self) -> Option<AnyElement> {
+        let containers: Vec<String> = self.shell_containers().map(|c| c.name.clone()).collect();
+        let button = Button::new("detail-shell")
+            .xsmall()
+            .ghost()
+            .label("Shell")
+            .tooltip("Open a shell in the dock (⇧⌘E)");
+        match containers.as_slice() {
+            [] => None,
+            [_] => Some(
+                button
+                    .on_click(registry::on_click(OpenShell))
+                    .into_any_element(),
+            ),
+            _ => Some(
+                button
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let mut menu = menu.label("Container");
+                        for name in &containers {
+                            menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                registry::on_click(OpenContainerShell {
+                                    container: name.clone(),
+                                }),
+                            ));
                         }
                         menu
                     })

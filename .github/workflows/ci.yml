@@ -109,6 +109,12 @@ jobs:
         env:
           GPUI_LEAK_DETECTION: "1"
         run: cargo test -p flint-app --locked
+      # GPUI tracks entity handles only when built with this set, so the leak tests
+      # (docs/TESTING.md, "Memory leaks") check something only here.
+      - name: Tests (leak detection)
+        run: cargo test -p flint-app --locked
+        env:
+          GPUI_LEAK_DETECTION: "1"
 
   # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
   # and docs (also with the test-only automation channel), and a release build that catches

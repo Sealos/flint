@@ -33,6 +33,24 @@ contexts on 127.0.0.1: one whose server never answers (so its views stay up) and
 drive the app through registered actions, clicks and keys, and check that the three agree. Every click handler must
 perform a registered action; `scripts/check-click-actions.sh` enforces this in CI.
 
+### Memory leaks
+
+A closed view must free every entity it made: a timer, task or frame callback that captured the view strongly keeps
+it (and its session) alive. Callbacks capture `cx.weak_entity()` and `update` it; views forwarded by the workspace are
+held weakly (`registry::Forward`), and a shell tab's text input handler holds its view weakly too.
+
+Leak tests (`ui/dock_tests.rs`) take `cx.leak_detector_snapshot()`, open a tab (log, shell, or both in one dock), close
+it, run until parked and call `cx.assert_no_new_leaks(&snapshot)`, which names each leaked entity
+(`LEAK_BACKTRACE=1` adds where it was made). GPUI tracks handles only when built with `GPUI_LEAK_DETECTION=1`;
+without it the checks pass trivially, so CI's `linux (flint-app)` job runs the app's tests a second time with it set.
+Run them locally with:
+
+```sh
+GPUI_LEAK_DETECTION=1 cargo test -p flint-app --locked
+```
+
+A new view that opens and closes (a tab, a sheet, a panel) gets a leak test.
+
 ### Automation channel
 
 A test-only control socket lets e2e tests and agents drive the real app. The code is in

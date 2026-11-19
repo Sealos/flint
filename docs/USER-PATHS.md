@@ -242,15 +242,19 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: cluster, ui.
 
 ### UP-41 Shell into a container
-- **When** I open a shell on a pod.
-- **Then** I get an interactive terminal that resizes with the window and supports copy and paste. Images without `bash`
-  fall back to `sh`. When the command exits, its exit code is shown and the output stays readable until I close the
-  tab.
-- Tests: unit (terminal model, session logic), cluster, ui.
+- **When** I open a shell on a pod (Shell in its detail pane, or Shift-Cmd-E; a container picker when it has several).
+- **Then** a tab opens in the bottom dock with an interactive terminal that resizes with the dock and the window.
+  Colors, bold, italic, underline, inverse and wide characters show as in other terminals, in both themes, and
+  full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and
+  Cmd-V (Ctrl-Shift-C and Ctrl-Shift-V on Linux) copy the mouse selection and paste. The wheel scrolls back through
+  the output. Images without `bash` fall back to `sh`. The tab says whether the shell is connecting, running, exited
+  (with its exit code) or failed (and why), and the output stays readable and copyable until I close the tab.
+- Tests: unit (terminal model, session logic, key encoding, colors, grid size), cluster, ui.
 
 ### UP-42 Sessions outlive navigation
 - **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them (the tab's
-  close button, or Cmd-W while the dock has focus; elsewhere Cmd-W still closes the window). Cmd-J shows and hides the
+  close button, or Cmd-W while the dock has focus; elsewhere Cmd-W still closes the window). A closed tab frees
+  everything it held. Cmd-J shows and hides the
   dock, and its height is remembered.
 - Tests: ui.
 

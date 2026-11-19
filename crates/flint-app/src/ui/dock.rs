@@ -1,6 +1,5 @@
 //! The bottom dock (#13): a resizable panel under the main area with one tab per session that
-//! outlives navigation (UP-42). Log tabs today; shell tabs (#14), workload logs (#62) and AI log
-//! analysis (#56) next. Tabs belong to no cluster, so they keep running when the user switches
+//! outlives navigation (UP-42): log tabs and shell tabs (#14); AI log analysis (#56) next. Tabs belong to no cluster, so they keep running when the user switches
 //! clusters or views, and end only when closed. The dock's height is kept in `state.toml`
 //! (`[panes] dock`); its tabs are not, since their sessions end with the app.
 //!
@@ -17,7 +16,7 @@
 //!    tabs on the detail pane's `OpenLogs`).
 //! 4. Give its controls a registry scope and a `bind_actions`, and have the workspace forward
 //!    them to the active tab of that kind (see `Workspace::register_actions`, which does it for
-//!    [`Dock::active_log`]) and guard them, as for any view.
+//!    [`Dock::active_log`] and [`Dock::active_terminal`]) and guard them, as for any view.
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -31,6 +30,7 @@ use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
     ToggleDock,
 };
+use super::terminal_view::{ShellKey, TerminalView};
 
 /// The dock's height before the user drags it.
 pub const DEFAULT_HEIGHT: f32 = 280.;
@@ -55,6 +55,7 @@ pub fn dock_height(saved: Option<u32>, window_height: f32) -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TabKey {
     Logs(LogRequest),
+    Shell(ShellKey),
 }
 
 /// How a tab's session is doing, shown as a dot on the tab.
@@ -81,18 +82,21 @@ pub trait DockItem {
 #[derive(Clone)]
 pub enum DockTab {
     Logs(Entity<LogView>),
+    Shell(Entity<TerminalView>),
 }
 
 impl DockTab {
     pub fn item<'a>(&self, cx: &'a App) -> &'a dyn DockItem {
         match self {
             DockTab::Logs(view) => view.read(cx),
+            DockTab::Shell(view) => view.read(cx),
         }
     }
 
     fn view(&self) -> AnyView {
         match self {
             DockTab::Logs(view) => view.clone().into(),
+            DockTab::Shell(view) => view.clone().into(),
         }
     }
 }
@@ -169,6 +173,15 @@ impl Dock {
     pub fn active_log(&self) -> Option<&Entity<LogView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Logs(view) => Some(view),
+            DockTab::Shell(_) => None,
+        }
+    }
+
+    /// The shell tab shown, if the dock is visible and showing one: where terminal actions go.
+    pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
+        match self.active_tab().filter(|_| self.visible)? {
+            DockTab::Shell(view) => Some(view),
+            DockTab::Logs(_) => None,
         }
     }
 
@@ -206,6 +219,7 @@ impl Dock {
         self.next_id += 1;
         let observe = match &tab {
             DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+            DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         };
         let shown = tab_shown(&tab, cx);
         self.tabs.push(Tab {
@@ -423,11 +437,9 @@ impl Render for Dock {
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child("No sessions.")
-                .child(
-                    div()
-                        .text_xs()
-                        .child("Open a pod's logs from its detail pane (Logs, ⌘L)."),
-                )
+                .child(div().text_xs().child(
+                    "Open a pod's logs (Logs, ⌘L) or a shell (Shell, ⇧⌘E) from its detail pane.",
+                ))
                 .test_support()
                 .into_any_element(),
         };

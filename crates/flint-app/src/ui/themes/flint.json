@@ -139,6 +139,24 @@
         "base.cyan": "#1b7c83",
         "base.cyan.light": "#3fb8c3"
       },
+      "terminal": {
+        "black": "#1f1f1f",
+        "red": "#bf1d29",
+        "green": "#17702f",
+        "yellow": "#865a00",
+        "blue": "#0862c8",
+        "magenta": "#8250df",
+        "cyan": "#1b7c83",
+        "white": "#6e6e6e",
+        "bright_black": "#5e5e5e",
+        "bright_red": "#d1242f",
+        "bright_green": "#1a7f37",
+        "bright_yellow": "#9a6700",
+        "bright_blue": "#0969da",
+        "bright_magenta": "#8a63d2",
+        "bright_cyan": "#0e7c86",
+        "bright_white": "#858585"
+      },
       "highlight": {
         "editor.background": "#ffffff",
         "editor.foreground": "#1f1f1f",
@@ -313,6 +331,24 @@
         "base.magenta.light": "#dcc2ff",
         "base.cyan": "#4fc8d1",
         "base.cyan.light": "#8edfe5"
+      },
+      "terminal": {
+        "black": "#3b3b3b",
+        "red": "#f87171",
+        "green": "#4ade80",
+        "yellow": "#e5b400",
+        "blue": "#60a5fa",
+        "magenta": "#c297ff",
+        "cyan": "#4fc8d1",
+        "white": "#d6d6d6",
+        "bright_black": "#8a8a8a",
+        "bright_red": "#fca5a5",
+        "bright_green": "#86efac",
+        "bright_yellow": "#f5d75a",
+        "bright_blue": "#93c5fd",
+        "bright_magenta": "#dcc2ff",
+        "bright_cyan": "#8edfe5",
+        "bright_white": "#ffffff"
       },
       "highlight": {
         "editor.background": "#1b1b1b",
