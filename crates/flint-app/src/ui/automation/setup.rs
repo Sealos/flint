@@ -26,6 +26,8 @@ pub struct Env {
     pub home: Option<PathBuf>,
     /// The account's own home directory (from the user database, not `HOME`).
     pub account_home: Option<PathBuf>,
+    /// `XDG_CONFIG_HOME`, which places the real config directory on Linux.
+    pub xdg_config_home: Option<PathBuf>,
     pub kubeconfig: Option<OsString>,
     pub screenshots: Option<OsString>,
 }
@@ -36,6 +38,7 @@ impl Env {
             config_dir: std::env::var_os("FLINT_CONFIG_DIR"),
             home: std::env::home_dir(),
             account_home: account_home(),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
             kubeconfig: std::env::var_os("KUBECONFIG"),
             screenshots: std::env::var_os(SCREENSHOTS_ENV),
         }
@@ -69,7 +72,9 @@ pub fn prepare(env: &Env) -> Result<Places, String> {
     }
     let config_dir =
         fs::canonicalize(&dir).map_err(|e| format!("could not resolve {}: {e}", dir.display()))?;
-    if let Ok(real) = flint_core::settings::config_dir_from(None, env.home.clone()) {
+    if let Ok(real) =
+        flint_core::settings::default_config_dir(env.xdg_config_home.clone(), env.home.clone())
+    {
         let real = fs::canonicalize(&real).unwrap_or(real);
         if real == config_dir {
             return Err(format!(
@@ -225,6 +230,7 @@ mod tests {
             config_dir: Some(config.as_os_str().to_owned()),
             home: Some(home.to_owned()),
             account_home: Some("/Users/someone".into()),
+            xdg_config_home: None,
             kubeconfig: Some("/tmp/kubeconfig".into()),
             screenshots: None,
         }
@@ -246,7 +252,8 @@ mod tests {
     #[test]
     fn refuses_the_real_config_directory_and_missing_variables() {
         let home = tempfile::tempdir().unwrap();
-        let real = home.path().join("Library/Application Support/Flint");
+        let real =
+            flint_core::settings::default_config_dir(None, Some(home.path().to_owned())).unwrap();
         fs::create_dir_all(&real).unwrap();
         fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
         let error = prepare(&env(&real, home.path())).unwrap_err();

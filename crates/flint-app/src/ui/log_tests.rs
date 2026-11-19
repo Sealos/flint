@@ -337,7 +337,7 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
     })
     .await;
 
-    press(cx, window, "cmd-f");
+    press(cx, window, "secondary-f");
     cx.update_window(window, |_, window, cx| window.input("error", cx))
         .unwrap();
     cx.wait_for(window, WAIT, |window, cx| {
@@ -363,10 +363,10 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
     let focus = view.read_with(cx, |v, _| v.focus.clone());
     cx.update_window(window, |_, window, cx| window.focus(&focus, cx))
         .unwrap();
-    press(cx, window, "cmd-g");
-    press(cx, window, "cmd-g");
+    press(cx, window, "secondary-g");
+    press(cx, window, "secondary-g");
     assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(14));
-    press(cx, window, "cmd-shift-g");
+    press(cx, window, "secondary-shift-g");
     assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(9));
     assert_eq!(
         view.read_with(cx, |v, _| crate::ui::log_model::match_text(
@@ -381,7 +381,7 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
     assert_eq!(view.read_with(cx, |v, _| v.search.count()), 6);
     // Wrapping around: next from the last match is the first.
     view.update(cx, |v, _| v.current_match = Some(29));
-    press(cx, window, "cmd-g");
+    press(cx, window, "secondary-g");
     assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(4));
 }
 
@@ -420,12 +420,12 @@ async fn selecting_pauses_and_copies_the_lines_as_shown(cx: &mut TestAppContext)
     })
     .await;
 
-    press(cx, window, "cmd-c");
+    press(cx, window, "secondary-c");
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
     assert_eq!(copied, "line 2\nline 3\nERROR line 4\nline 5");
     // With timestamps shown, they are copied too.
     press(cx, window, "t");
-    press(cx, window, "cmd-c");
+    press(cx, window, "secondary-c");
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
     assert!(
         copied.starts_with("2024-05-01T12:00:00Z line 2\n"),
@@ -469,7 +469,7 @@ async fn selecting_pauses_and_copies_the_lines_as_shown(cx: &mut TestAppContext)
         view.read_with(cx, |v, _| v.selection),
         Some(LineSelection::line(10))
     );
-    press(cx, window, "cmd-a");
+    press(cx, window, "secondary-a");
     assert_eq!(
         view.read_with(cx, |v, _| v.selection),
         Some(LineSelection::new(0, 11))
@@ -636,8 +636,8 @@ async fn a_workload_tab_shows_sources_and_stream_counts(cx: &mut TestAppContext)
     })
     .await;
 
-    press(cx, window, "cmd-a");
-    press(cx, window, "cmd-c");
+    press(cx, window, "secondary-a");
+    press(cx, window, "secondary-c");
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
     assert_eq!(
         copied,
@@ -645,7 +645,7 @@ async fn a_workload_tab_shows_sources_and_stream_counts(cx: &mut TestAppContext)
     );
     // P hides the prefix without reloading; copy follows what is shown.
     press(cx, window, "p");
-    press(cx, window, "cmd-c");
+    press(cx, window, "secondary-c");
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
     assert_eq!(copied, "GET /a\nERROR boom\nGET /b");
 
@@ -697,7 +697,7 @@ async fn a_far_match_is_scrolled_into_view(cx: &mut TestAppContext) {
         !v.searching && v.search.count() == 1
     })
     .await;
-    press(cx, window, "cmd-g");
+    press(cx, window, "secondary-g");
     assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(2500));
     cx.wait_for(window, WAIT, |window, _| {
         window.try_find(line_id(2500)).is_some_and(|line| {
@@ -738,7 +738,7 @@ async fn a_narrow_toolbar_keeps_save_reachable(cx: &mut TestAppContext) {
         let spec = registry::find(name).unwrap();
         assert!(!spec.keys.is_empty(), "{name} has a key");
     }
-    press(cx, window, "cmd-shift-s");
+    press(cx, window, "secondary-shift-s");
     cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
 }

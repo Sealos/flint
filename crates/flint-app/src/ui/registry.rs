@@ -44,7 +44,7 @@ actions!(
         Quit,
         /// Close the front window.
         CloseWindow,
-        /// Follow macOS light and dark mode (the `appearance` setting).
+        /// Follow the system light and dark mode (the `appearance` setting).
         AppearanceSystem,
         /// Always use Flint Light.
         AppearanceLight,
@@ -540,8 +540,8 @@ pub struct ActionSpec {
     pub scope: Scope,
     pub visibility: Visibility,
     pub args: &'static [Arg],
-    /// Default keys, in GPUI keystroke syntax ("cmd-q", "down"), and the key context they
-    /// apply in (`None`: everywhere).
+    /// Default keys, in GPUI keystroke syntax ("secondary-q", "down"), and the key context they
+    /// apply in (`None`: everywhere). `secondary` is Cmd on macOS and Ctrl on Linux.
     pub keys: &'static [&'static str],
     pub key_context: Option<&'static str>,
     type_id: TypeId,
@@ -651,6 +651,20 @@ impl ActionSpec {
                 .collect::<Vec<_>>()
                 .join(" "),
         )
+    }
+}
+
+/// A chord in GPUI syntax (`secondary-shift-g`) written the way this OS shows it: "⌘⇧G" on
+/// macOS, Ctrl and Shift spelled out on Linux. For key hints in tooltips and notes.
+pub fn key_hint(keys: &str) -> String {
+    let os = if cfg!(target_os = "macos") {
+        OperatingSystem::Mac
+    } else {
+        OperatingSystem::Linux
+    };
+    match Keystroke::parse_with_os(keys, os) {
+        Ok(keystroke) => keystroke.display(os).to_string(),
+        Err(_) => keys.to_owned(),
     }
 }
 
@@ -1213,13 +1227,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // Flint.
         Spec::unit::<Quit>("Quit Flint", "Quit the app.")
             .of(C::Flint, S::App)
-            .keys(&["cmd-q"], None),
+            .keys(&["secondary-q"], None),
         Spec::unit::<CloseWindow>("Close Window", "Close the front window.")
             .of(C::Flint, S::App)
-            .keys(&["cmd-w"], None),
+            .keys(&["secondary-w"], None),
         Spec::unit::<AppearanceSystem>(
             "Use System Appearance",
-            "Follow macOS light and dark mode.",
+            "Follow the system light and dark mode.",
         )
         .of(C::Flint, S::App),
         Spec::unit::<AppearanceLight>("Use Light Appearance", "Always use Flint Light.")
@@ -1252,7 +1266,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Connect to the active cluster again after a failure.",
         )
         .of(C::Cluster, S::Workspace)
-        .keys(&["cmd-r"], Some(WORKSPACE)),
+        .keys(&["secondary-r"], Some(WORKSPACE)),
         Spec::unit::<WatchAllKinds>("Watch All Kinds", "Watch every kind on the active cluster.")
             .of(C::Cluster, S::Workspace),
         Spec::unit::<WatchOpenViewsOnly>(
@@ -1321,7 +1335,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // Resource list.
         Spec::unit::<FocusFilter>("Focus Filter", "Move focus to the list's text filter.")
             .of(C::List, S::List)
-            .keys(&["cmd-f"], Some(WORKSPACE)),
+            .keys(&["secondary-f"], Some(WORKSPACE)),
         Spec::unit::<SelectPrev>("Select Previous Row", "Move the selection up.")
             .of(C::List, S::List)
             .keys(&["up"], Some(PLAIN)),
@@ -1366,13 +1380,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(&["escape"], Some(PLAIN)),
         Spec::unit::<ShowOverview>("Show Overview", "Show the object's overview.")
             .of(C::Detail, S::Detail)
-            .keys(&["cmd-1"], Some(WORKSPACE)),
+            .keys(&["secondary-1"], Some(WORKSPACE)),
         Spec::unit::<ShowYaml>("Show YAML", "Show the object as YAML.")
             .of(C::Detail, S::Detail)
-            .keys(&["cmd-2"], Some(WORKSPACE)),
+            .keys(&["secondary-2"], Some(WORKSPACE)),
         Spec::unit::<Refresh>("Refresh Object", "Fetch the shown object again.")
             .of(C::Detail, S::Detail)
-            .keys(&["cmd-r"], Some(WORKSPACE)),
+            .keys(&["secondary-r"], Some(WORKSPACE)),
         Spec::unit::<ToggleManagedFields>(
             "Toggle Managed Fields",
             "Show or hide metadata.managedFields in the YAML.",
@@ -1394,13 +1408,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .hidden(),
         Spec::unit::<OpenLogs>("Open Logs", "Open the shown pod's logs in the dock.")
             .of(C::Logs, S::Detail)
-            .keys(&["cmd-l"], Some(WORKSPACE)),
+            .keys(&["secondary-l"], Some(WORKSPACE)),
         Spec::unit::<OpenPreviousLogs>(
             "Open Previous Logs",
             "Open the logs of the previous instance of the shown pod's container.",
         )
         .of(C::Logs, S::Detail)
-        .keys(&["cmd-shift-l"], Some(WORKSPACE)),
+        .keys(&["secondary-shift-l"], Some(WORKSPACE)),
         Spec::with_args::<OpenContainerLogs>(
             "Open Container Logs…",
             "Open the logs of one container of the shown pod, or of its previous instance.",
@@ -1422,13 +1436,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         // The dock.
         Spec::unit::<ToggleDock>("Toggle Dock", "Show or hide the bottom dock.")
             .of(C::View, S::Dock)
-            .keys(&["cmd-j"], Some(WORKSPACE)),
+            .keys(&["secondary-j"], Some(WORKSPACE)),
         Spec::unit::<CloseActiveTab>(
             "Close Dock Tab",
             "Close the dock's active tab, ending its session.",
         )
         .of(C::View, S::Dock)
-        .keys(&["cmd-w"], Some(DOCK)),
+        .keys(&["secondary-w"], Some(DOCK)),
         Spec::unit::<NextTab>("Next Dock Tab", "Show the dock's next tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-tab"], Some(DOCK)),
@@ -1460,10 +1474,10 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Scroll to the newest line and follow again, resuming a pause.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["end", "cmd-down"], Some(LOG_PLAIN)),
+        .keys(&["end", "secondary-down"], Some(LOG_PLAIN)),
         Spec::unit::<JumpToStart>("Jump to Oldest Line", "Scroll to the oldest line shown.")
             .of(C::Logs, S::Logs)
-            .keys(&["home", "cmd-up"], Some(LOG_PLAIN)),
+            .keys(&["home", "secondary-up"], Some(LOG_PLAIN)),
         Spec::unit::<ToggleTimestamps>(
             "Toggle Timestamps",
             "Show or hide each line's timestamp, without reloading.",
@@ -1481,16 +1495,16 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(&["w"], Some(LOG_PLAIN)),
         Spec::unit::<FocusSearch>("Search Logs", "Move focus to the log search field.")
             .of(C::Logs, S::Logs)
-            .keys(&["cmd-f"], Some(LOG_VIEW)),
+            .keys(&["secondary-f"], Some(LOG_VIEW)),
         Spec::unit::<NextMatch>("Next Match", "Go to the next line matching the search.")
             .of(C::Logs, S::Logs)
-            .keys(&["cmd-g"], Some(LOG_VIEW)),
+            .keys(&["secondary-g"], Some(LOG_VIEW)),
         Spec::unit::<PrevMatch>(
             "Previous Match",
             "Go to the previous line matching the search.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-shift-g"], Some(LOG_VIEW)),
+        .keys(&["secondary-shift-g"], Some(LOG_VIEW)),
         Spec::unit::<SelectPrevLine>(
             "Select Previous Line",
             "Select the line above, or the newest line.",
@@ -1517,7 +1531,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .keys(&["shift-down"], Some(LOG_PLAIN)),
         Spec::unit::<SelectAllLines>("Select All Lines", "Select every line shown.")
             .of(C::Logs, S::Logs)
-            .keys(&["cmd-a"], Some(LOG_PLAIN)),
+            .keys(&["secondary-a"], Some(LOG_PLAIN)),
         Spec::unit::<ClearSelection>(
             "Clear Line Selection",
             "Clear the line selection and resume following.",
@@ -1529,25 +1543,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Copy the selected lines as shown, without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-c"], Some(LOG_PLAIN)),
+        .keys(&["secondary-c"], Some(LOG_PLAIN)),
         Spec::unit::<SaveLogs>(
             "Save Logs",
             "Save every line shown to a file, as shown and without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-s"], Some(LOG_VIEW)),
+        .keys(&["secondary-s"], Some(LOG_VIEW)),
         Spec::unit::<SaveMatchingLines>(
             "Save Matching Lines",
             "Save the lines matching the search to a file, as shown and without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-shift-s"], Some(LOG_VIEW)),
+        .keys(&["secondary-shift-s"], Some(LOG_VIEW)),
         Spec::unit::<SaveSelectedLines>(
             "Save Selected Lines",
             "Save the selected lines to a file, as shown and without redaction.",
         )
         .of(C::Logs, S::Logs)
-        .keys(&["cmd-alt-s"], Some(LOG_VIEW)),
+        .keys(&["secondary-alt-s"], Some(LOG_VIEW)),
         Spec::with_args::<SaveLines>(
             "Save Log Lines…",
             "Save all lines, the search matches or the selection to a file, as shown and without redaction.",
@@ -1704,7 +1718,8 @@ pub mod tests {
 
     use super::ArgKind;
     use super::{
-        ActionError, Bind, Category, Handler, OpenView, Scope, SelectRow, Visibility, actions, find,
+        ActionError, Bind, Category, Handler, OpenView, Scope, SelectRow, Visibility, actions,
+        find, key_hint,
     };
 
     /// Collects the names of the actions a view binds.
@@ -1783,6 +1798,17 @@ pub mod tests {
     }
 
     #[test]
+    fn key_hints_use_the_platform_modifier() {
+        let hint = key_hint("secondary-shift-g");
+        if cfg!(target_os = "macos") {
+            assert_eq!(hint, "⌘⇧G");
+        } else {
+            assert!(hint.to_lowercase().contains("ctrl"), "{hint}");
+            assert!(!hint.contains('⌘'), "{hint}");
+        }
+    }
+
+    #[test]
     fn the_palette_hides_automation_only_actions() {
         let hidden: Vec<&str> = actions()
             .iter()
@@ -1856,6 +1882,14 @@ pub mod tests {
             } else {
                 assert!(spec.build(Value::Null).is_ok(), "{}", spec.name);
             }
+            // Cmd exists only on macOS; on Linux it is the Super key, which the desktop owns.
+            for key in spec.keys {
+                assert!(
+                    !key.to_lowercase().split('-').any(|m| m == "cmd"),
+                    "{} binds {key}: use secondary- (Cmd on macOS, Ctrl on Linux)",
+                    spec.name
+                );
+            }
             // Plain keys never fire while typing in a field.
             if spec.keys.iter().any(|k| !k.contains('-')) {
                 assert!(
@@ -1863,6 +1897,43 @@ pub mod tests {
                     "{} binds a plain key outside the text-field guard",
                     spec.name
                 );
+            }
+        }
+    }
+
+    // covers UP-41: on Linux, `secondary-` app shortcuts become Ctrl ones. Every one that is
+    // Ctrl with a plain letter (what a shell uses: Ctrl-W, Ctrl-R, Ctrl-L, ...) must be in the
+    // terminal's passthrough, so it reaches the shell inside a shell tab. Checked for Linux on
+    // every host, since the keys are written once for both.
+    #[test]
+    fn linux_ctrl_letter_shortcuts_reach_the_shell() {
+        use gpui_kit::{Keystroke, OperatingSystem};
+        let linux = |k: &str| Keystroke::parse_with_os(k, OperatingSystem::Linux).unwrap();
+        let passthrough: Vec<Keystroke> = super::TERMINAL_PASSTHROUGH
+            .iter()
+            .map(|k| linux(k))
+            .collect();
+        for spec in actions() {
+            if spec.key_context == Some(super::TERMINAL) {
+                continue;
+            }
+            for key in spec.keys {
+                let k = linux(key);
+                let m = k.modifiers;
+                let ctrl_letter = m.control
+                    && !m.shift
+                    && !m.alt
+                    && !m.platform
+                    && k.key.len() == 1
+                    && k.key.chars().all(|c| c.is_ascii_alphabetic());
+                if ctrl_letter {
+                    assert!(
+                        passthrough.contains(&k),
+                        "{} binds {key} (Ctrl-{} on Linux), which a shell tab must pass through",
+                        spec.name,
+                        k.key
+                    );
+                }
             }
         }
     }

@@ -351,7 +351,10 @@ impl DetailView {
             .xsmall()
             .ghost()
             .label("Logs")
-            .tooltip("Open the logs in the dock (⌘L)");
+            .tooltip(format!(
+                "Open the logs in the dock ({})",
+                registry::key_hint("secondary-l")
+            ));
         match containers.as_slice() {
             [] => None,
             [only] if !only.has_previous => Some(
@@ -401,7 +404,10 @@ impl DetailView {
             .xsmall()
             .ghost()
             .label("Shell")
-            .tooltip("Open a shell in the dock (⇧⌘E)");
+            .tooltip(format!(
+                "Open a shell in the dock ({})",
+                registry::key_hint("secondary-shift-e")
+            ));
         match containers.as_slice() {
             [] => None,
             [_] => Some(

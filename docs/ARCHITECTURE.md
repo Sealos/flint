@@ -12,7 +12,8 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 
 ### v1 goals
 
-- macOS only. The core stays portable so Linux and Windows can follow ([ADR-0001](./adr/0001-rust-and-gpui.md)).
+- macOS first ([ADR-0001](./adr/0001-rust-and-gpui.md)), plus a best-effort Linux AppImage for x86_64 and aarch64
+  ([ADR-0016](./adr/0016-linux-appimage.md)). The core stays portable so Windows can follow.
 - Multiple clusters, loaded from the user's kubeconfig files, shown in one window with a cluster sidebar. The
   clusters used most recently stay warm, so switching between them is instant
   ([ADR-0012](./adr/0012-keep-recently-used-clusters-warm.md)).
@@ -37,7 +38,7 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 
 ### v1 non-goals
 
-- Linux and Windows builds.
+- Windows builds, and Linux packages other than the AppImage (deb, rpm, Flatpak, Snap).
 - Prometheus charts or stored metric history. Dashboards keep an hour of their own samples in memory
   ([ADR-0017](./adr/0017-cluster-dashboards.md)).
 - Local terminal tabs and node shells (shells into a node through a privileged pod).
@@ -63,10 +64,10 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 | Terminal emulation | `alacritty_terminal` |
 | YAML and diff | `serde-saphyr`, `tree-sitter-yaml` (syntax errors, path-to-position mapping), `similar` |
 | Schema validation | The cluster's OpenAPI v3 schema, cached per cluster, checked by a JSON Schema validator in Rust |
-| Settings | TOML in `~/Library/Application Support/Flint/` |
+| Settings | TOML in `~/Library/Application Support/Flint/` on macOS, `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux |
 | Helm | The user's `helm` CLI, called as a subprocess |
-| Packaging | `cargo-packager` (or `cargo-bundle`), universal binary via `lipo`, `codesign` with hardened runtime for both app and DMG, `notarytool` and `stapler`, GitHub Actions on macOS |
-| Distribution | Signed, notarized DMG on GitHub Releases, plus a Homebrew cask |
+| Packaging | macOS: `cargo-packager` (or `cargo-bundle`), universal binary via `lipo`, `codesign` with hardened runtime for both app and DMG, `notarytool` and `stapler`, GitHub Actions on macOS. Linux: an AppImage per architecture built by `scripts/package-appimage.sh` (linuxdeploy and appimagetool), GitHub Actions on Ubuntu ([ADR-0016](./adr/0016-linux-appimage.md)) |
+| Distribution | Signed, notarized DMG on GitHub Releases, plus a Homebrew cask; unsigned Linux AppImages with SHA-256 files on the same releases |
 
 ## Workspace layout
 
@@ -121,8 +122,8 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   and any extra paths the user adds in settings. Flint watches those files and reloads when they change.
 - Connecting runs the context's auth: client certificates, tokens, and exec plugins (`aws`,
   `gke-gcloud-auth-plugin`, `kubelogin`, …). `kube` handles all of these.
-- **PATH:** apps started from Finder do not get the user's shell `PATH`, so exec plugins and `helm` would not be
-  found. When Flint starts, it runs the user's shell once as an interactive login shell (`$SHELL -ilc env`), so that
+- **PATH:** apps started from Finder (or from some Linux desktop launchers) do not get the user's shell `PATH`, so
+  exec plugins and `helm` would not be found. When Flint starts, it runs the user's shell once as an interactive login shell (`$SHELL -ilc env`), so that
   both `.zprofile` and `.zshrc` are read. The call has a timeout. If it fails, Flint falls back to the current `PATH`
   plus `/opt/homebrew/bin:/usr/local/bin`. A `path` value in `settings.toml` overrides all of this. Flint sets the
   result as its own process `PATH` before starting the tokio runtime or any threads, because `kube` starts exec
@@ -482,6 +483,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   User theme files are not supported in v1, but because themes are data, they could be added later.
 - **Theme tokens only:** views take every color from theme tokens and never hard-code one. This applies from M0
   onward, so the M1.5 theme work does not mean restyling every view.
+- **Keys:** default keys use GPUI's `secondary-` modifier, which is Cmd on macOS and Ctrl on Linux, so the shortcuts
+  below read Ctrl-… on Linux. Linux has no menu bar: Quit and Close Window work by their keys, and View > Appearance only through the
+  `appearance` setting until the palette exists; then the palette reaches every menu item.
 - **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
   switch cluster, change namespace, toggle watch mode, toggle Expose to AI, disconnect a cluster, open the diagram,
   or analyze the selected log lines.
@@ -506,6 +510,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 ## Settings and state
 
+- Both files live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
+  on macOS and `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux. `state.toml` stays beside
+  `settings.toml` on Linux too, rather than in `$XDG_STATE_HOME`, so one directory and one override hold everything
+  ([ADR-0016](./adr/0016-linux-appimage.md)).
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log

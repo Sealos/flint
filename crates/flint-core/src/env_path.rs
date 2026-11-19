@@ -1,7 +1,8 @@
 //! Resolving the process `PATH` at startup.
 //!
-//! Apps started from Finder inherit launchd's minimal `PATH`, so exec auth plugins (`aws`,
-//! `gke-gcloud-auth-plugin`, `kubelogin`, ...) and `helm` would not be found. Flint runs the
+//! Apps started from Finder inherit launchd's minimal `PATH` (and Linux desktop launchers may
+//! skip the user's shell rc files), so exec auth plugins (`aws`, `gke-gcloud-auth-plugin`,
+//! `kubelogin`, ...) and `helm` would not be found. Flint runs the
 //! user's shell once as an interactive login shell, reads its `PATH`, and installs it as the
 //! process `PATH` before any other thread starts. See ARCHITECTURE.md, "Clusters".
 
