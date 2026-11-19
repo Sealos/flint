@@ -127,6 +127,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Release build
         run: cargo build --release --locked -p flint-app
+      # On the ELF binary: the AppImage compresses it, so its strings cannot be searched.
+      - name: Release binary has no automation channel
+        run: scripts/check-no-automation.sh ./target/release/flint
       - name: Package
         run: |
           VERSION=$(./target/release/flint --version | cut -d' ' -f2)

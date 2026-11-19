@@ -180,11 +180,8 @@ fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
 /// The peer's user id: `SO_PEERCRED` on Linux, which has no `getpeereid`.
 #[cfg(target_os = "linux")]
 fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
+    // SAFETY: ucred is plain integers; all zeroes is a valid value.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: getsockopt writes at most `len` bytes into `cred`, a ucred we own, for a socket fd
     // we own.

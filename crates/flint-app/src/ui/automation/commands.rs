@@ -171,16 +171,8 @@ async fn screenshot(
         cx.background_executor().timer(FRAME).await;
     }
     settle(target, cx).await;
-    // Platforms whose renderer cannot draw offscreen (GPUI's Linux backend, for one) say so.
-    let image = in_window(target, cx, |window, _| window.render_to_image())?.map_err(|e| {
-        Error::new(
-            ErrorCode::NotAvailable,
-            format!(
-                "screenshots are not available here: {}",
-                safe_error_summary(&e.to_string())
-            ),
-        )
-    })?;
+    let image = in_window(target, cx, |window, _| window.render_to_image())?
+        .map_err(|e| render_error(&e.to_string()))?;
     let (width, height) = image.dimensions();
     let job_path = path.clone();
     cx.background_spawn(async move {
@@ -193,6 +185,25 @@ async fn screenshot(
     .await
     .map_err(|e| failed("could not save the screenshot", &e.to_string()))?;
     Ok(json!({"path": path, "width": width, "height": height}))
+}
+
+/// A failed render: `not_available` where GPUI cannot render offscreen at all (its Linux
+/// backend, and the headless test platform), `failed` for anything else.
+fn render_error(error: &str) -> Error {
+    // GPUI's messages: the platform default and the test platform's.
+    let unsupported = error.contains("not implemented for this platform")
+        || error.contains("no HeadlessRenderer");
+    if unsupported {
+        Error::new(
+            ErrorCode::NotAvailable,
+            format!(
+                "screenshots are not available on this platform: {}",
+                safe_error_summary(error)
+            ),
+        )
+    } else {
+        failed("could not render the window", error)
+    }
 }
 
 /// Writes a new file, mode 0600: `O_CREAT|O_EXCL|O_NOFOLLOW`, so it never follows a link or
@@ -580,21 +591,31 @@ mod tests {
         )
         .await;
         assert_eq!(response["error"]["code"], "invalid_args", "{response}");
-        // A plain name is written under the directory, or the platform says it cannot render.
+        // GPUI's test platform has no headless renderer, so a valid name ends in `not_available`
+        // here. Writing the file (new, 0600, no links) is tested on `write_new_file` below, and a
+        // real screenshot by the flint-e2e app tests on macOS CI.
         let response = ask(
             cx,
             &target,
             json!({"cmd": "screenshot", "args": {"name": "view"}}),
         )
         .await;
-        if response["ok"] == true {
-            let path = dir.path().join("view.png");
-            assert_eq!(response["result"]["path"], path.display().to_string());
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        } else {
-            assert_eq!(response["error"]["code"], "not_available", "{response}");
-        }
+        assert_eq!(response["error"]["code"], "not_available", "{response}");
+        assert!(!dir.path().join("view.png").exists());
+    }
+
+    #[test]
+    fn only_a_missing_renderer_is_not_available() {
+        let code = |message: &str| super::render_error(message).code;
+        assert_eq!(
+            code("render_to_image not implemented for this platform"),
+            super::ErrorCode::NotAvailable
+        );
+        assert_eq!(
+            code("render_to_image not available: no HeadlessRenderer configured"),
+            super::ErrorCode::NotAvailable
+        );
+        assert_eq!(code("Metal device lost"), super::ErrorCode::Failed);
     }
 
     #[test]

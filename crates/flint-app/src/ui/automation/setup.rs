@@ -1,8 +1,8 @@
 //! Where the channel may live, checked before the app starts: a scratch config directory that is
 //! not the user's real one and that only the user can write, an explicit `KUBECONFIG` (or, without
 //! one, a scratch `HOME` with no `.kube/config`, so the app never falls back to the user's
-//! `~/.kube/config`), a socket path the platform can bind, and a screenshots directory. Any failure stops
-//! the app with a reason, so a test harness fails fast.
+//! `~/.kube/config`), a socket path the platform can bind, and a screenshots directory. Any
+//! failure stops the app with a reason, so a test harness fails fast.
 
 use std::ffi::OsString;
 use std::fs;

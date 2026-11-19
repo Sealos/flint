@@ -41,13 +41,16 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
 - **Test builds only.** Built only with `--features automation`, and only without `--release` (a `compile_error!`
   refuses both together). CI's `linux (flint-app)` and `macos (flint-app)` jobs run flint-app's clippy and tests with
   the feature, and `scripts/check-no-automation.sh <binary>` checks that a release binary has none of the channel's
-  strings (release binaries are stripped, so there are no symbols to look for); every job that builds a release
-  binary runs it. The channel builds on Linux too (peer credentials through `SO_PEERCRED`, a 107-byte socket path),
-  where screenshots answer `not_available` if GPUI's renderer cannot draw offscreen.
+  strings (release binaries are stripped, so there are no symbols to look for). Every job that builds a release
+  binary runs it on the executable, before an AppImage or archive compresses it: `macos (flint-app)`,
+  `appimage (x86_64)` and both release builds. It fails closed (on an empty, compressed or non-Flint file too), and
+  the `no-automation-check` lint job tests that (`scripts/check-no-automation-test.sh`). The channel builds on Linux
+  too (peer credentials through `SO_PEERCRED`, a 107-byte socket path), where screenshots answer `not_available`:
+  GPUI's Linux backend cannot render offscreen.
 - **Where it may run.** Before anything starts, the app checks, and exits with code 3 and a reason if any check fails,
   so a harness fails fast instead of waiting for a socket:
-  - `FLINT_CONFIG_DIR` is set, is not the real config directory (flint-core's platform default), belongs to the user and is not writable by group or
-    others. It is created with mode `0700` when missing.
+  - `FLINT_CONFIG_DIR` is set, is not the real config directory (flint-core's platform default, XDG on Linux),
+    belongs to the user and is not writable by group or others. It is created with mode `0700` when missing.
   - `KUBECONFIG` is set, so the app never falls back to `~/.kube/config`. Without it, `HOME` must be a scratch
     directory (not the account's home, from the user database) with no `.kube/config`, so there is nothing to fall
     back to (UP-02's "no kubeconfig" test).
@@ -77,7 +80,8 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     `enabled` and `available` now. Ask it when a dispatch says `not_available`.
   - `type_text {text}`: one keystroke per character (Shift for capitals and shifted symbols), to the focused element.
     At most 4 KiB.
-  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `secondary-w`, `?`; `secondary` is Cmd on macOS, Ctrl on Linux).
+  - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `secondary-w`, `?`; `secondary` is Cmd on
+    macOS, Ctrl on Linux).
   - `state`: the visible view tree: `focus`, `dialog` (`{title, text, buttons}` while one is open), `appearance`,
     `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`, `connection`, and `presence`: `live`
     only for the watched cluster, `idle` for one connected but not watched), sidebar `banners`, `active_cluster`,
@@ -348,6 +352,10 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job that needs macOS |
 | `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
+
+**Required checks.** As of now, merging into master requires `fmt`, `clippy`, `test (flint-core)`, `test (flint-mcp)`,
+`docs`, `cargo-deny (bans licenses sources)`, `unused-deps`, `module-tests`, `typos` and `actionlint`. The other jobs,
+`linux (flint-app)` and `macos (flint-app)` included, run on every PR but do not block a merge.
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
 App e2e runs on PRs, inside `macos (flint-app)`. `cluster-e2e` runs on PRs that touch `flint-core` or `flint-mcp`, on master, and nightly.
