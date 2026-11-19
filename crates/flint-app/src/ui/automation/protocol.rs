@@ -26,7 +26,7 @@ pub enum Command {
     DispatchAction { name: String, args: Value },
     /// Type text into the focused element, one keystroke per character.
     TypeText { text: String },
-    /// Press a key or chord, in GPUI syntax: `enter`, `escape`, `cmd-w`, `down`.
+    /// Press a key or chord, in GPUI syntax: `enter`, `escape`, `secondary-w`, `down`.
     PressKey { key: String },
     /// The visible view tree.
     State,
