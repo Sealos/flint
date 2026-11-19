@@ -250,7 +250,9 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   the one named container. Streams start when a container has started, reopen at once when the watch sees it
   restart (a stream that had ended reads on from where it stopped), and stop when the pod is deleted (after reading
   what the server still sends, for at most 10 s). Pods are told apart by uid, so a pod recreated under the same
-  name gets a new stream and the old one never reads it. Each stream is a state machine polled by the session's one
+  name gets a new stream and the old one never reads it: every open checks the pod by that name is still the
+  stream's uid. Restarted streams queue for a slot like new ones. To resume without repeats, a stream remembers
+  fingerprints of its newest lines, not their text, so ended streams hold no lines outside the budget. Each stream is a state machine polled by the session's one
   task, with the same reconnect, backoff and dedup as a pod session.
   - Lines carry their source (`pod/container`, one shared `Arc` per stream). `display`, copy (`text_as`) and
     search (`SearchQuery::sources`) can include or leave out the `[pod/container]` prefix.
@@ -264,7 +266,8 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   - A failing stream does not end the session. `LogSnapshot::pods` (`PodSetStatus`) lists each stream's state and
     counts live, connecting, failed, waiting and capped ones. The session's own state covers the pod watch: a
     broken watch reconnects and re-lists while streams keep running. An error retrying cannot fix (the workload is
-    missing, access is denied) or a context that now points at another server ends the whole session.
+    missing, access is denied) or a context that now points at another server ends the whole session. kube's
+    watcher keeps its client across re-watches, so a following session also rechecks its context every 30 s.
 
 ### AI log analysis
 

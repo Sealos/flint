@@ -19,7 +19,7 @@ use tokio::time::Sleep;
 
 use super::line::{LineSource, LogLine};
 use super::session::{LogOptions, LogSince, LogState, LogTarget};
-use super::source::{AfterEnd, LogError, LogRequest, LogSource, RawLine, RawLines};
+use super::source::{AfterEnd, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines};
 
 /// Reconnect delays: `first`, doubling up to `max`.
 #[derive(Debug, Clone, Copy)]
@@ -54,8 +54,19 @@ const RESUME_GROUP: usize = 64;
 #[derive(Debug, Clone)]
 struct Resume {
     last: Timestamp,
-    shown: Vec<Arc<str>>,
+    shown: Vec<u64>,
     held: Vec<LogLine>,
+}
+
+/// A line text's fingerprint, what resuming compares. Keeping fingerprints instead of the texts
+/// means a stream never keeps lines alive after the buffer evicted them: an ended stream that may
+/// be revived holds [`RESUME_GROUP`] numbers, not up to that many 64 KiB lines, outside the
+/// session's budget.
+fn fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 enum Phase {
@@ -92,10 +103,10 @@ pub(crate) struct Stream {
     changed: bool,
     /// Failed attempts in a row, for the backoff. Reset when a line arrives.
     attempts: u32,
-    /// The newest timestamp shown, and the texts of the newest lines shown with it (at most
+    /// The newest timestamp shown, and the fingerprints of the newest lines shown with it (at most
     /// [`RESUME_GROUP`]).
     last_ts: Option<Timestamp>,
-    last_group: Vec<Arc<str>>,
+    last_group: Vec<u64>,
     resume: Option<Resume>,
     /// The container finished: one last request without following picks up anything it wrote
     /// after the followed stream ended (it may have restarted and finished again meanwhile).
@@ -173,6 +184,7 @@ impl Stream {
     fn first_request(&self) -> LogRequest {
         LogRequest {
             target: self.target.clone(),
+            uid: self.member.as_ref().map(|m| m.uid.clone()),
             follow: self.options.follow && !self.options.previous && !self.draining,
             tail_lines: Some(self.tail),
             since: self.options.since,
@@ -232,6 +244,8 @@ impl Stream {
                 self.cluster_error = true;
                 self.end(Some(e.message))
             }
+            // The pod by this name is not the stream's pod any more: nothing of it is read.
+            Step::Opened(Err(e)) if e.kind == ErrorKind::PodGone => self.end(None),
             // A deleted pod's stream ends at whatever comes next.
             Step::Expired
             | Step::Eof
@@ -329,7 +343,7 @@ impl Stream {
                         && held[held.len() - resume.shown.len()..]
                             .iter()
                             .zip(&resume.shown)
-                            .all(|(l, s)| l.text == *s)
+                            .all(|(l, s)| fingerprint(&l.text) == *s)
                     {
                         // The shown lines are replayed: the rest is new.
                         self.resume = None;
@@ -341,7 +355,7 @@ impl Stream {
                     // changed under us): keep the held lines that were not shown.
                     let resume = self.resume.take().expect("checked above");
                     for held in resume.held {
-                        if !resume.shown.contains(&held.text) {
+                        if !resume.shown.contains(&fingerprint(&held.text)) {
                             self.append(held, out);
                         }
                     }
@@ -360,7 +374,7 @@ impl Stream {
             if self.last_group.len() == RESUME_GROUP {
                 self.last_group.remove(0);
             }
-            self.last_group.push(line.text.clone());
+            self.last_group.push(fingerprint(&line.text));
         }
         line.source = self.tag().cloned();
         self.attempts = 0;
@@ -390,6 +404,8 @@ impl Stream {
 
     fn end(&mut self, error: Option<String>) -> Phase {
         self.deadline = None;
+        // Lines held for a resume are not kept past the end.
+        self.resume = None;
         self.set_state(LogState::Ended { error });
         Phase::Done
     }
@@ -598,6 +614,41 @@ mod tests {
         d.handle(Step::Opened(Err(LogError::fatal("gone"))), &mut |_| {});
         assert_eq!(d.state(), &LogState::Ended { error: None });
         assert!(!d.ended_on_cluster_error());
+    }
+
+    // covers UP-45
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_never_reads_a_pod_recreated_under_the_name() {
+        let tag = Arc::new(LineSource::new("db-0", "db"));
+        let mut s = stream(vec![], Some(tag));
+        // Every open (the first and each reconnect) names the pod's uid for the source to check.
+        assert_eq!(s.first_request().uid.as_deref(), Some("u1"));
+        assert_eq!(s.resume_request().uid.as_deref(), Some("u1"));
+        assert_eq!(stream(vec![], None).first_request().uid, None);
+        // The source found another pod by that name: the stream ends without reading it.
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
+        let changed = s.handle(
+            Step::Opened(Err(LogError::pod_gone("replaced"))),
+            &mut |_| {},
+        );
+        assert!(changed && s.is_done());
+        assert_eq!(s.state(), &LogState::Ended { error: None });
+    }
+
+    // covers UP-45
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_stream_keeps_no_line_text_alive() {
+        let long: &'static str =
+            Box::leak(format!("2024-05-01T12:00:00Z {}", "x".repeat(1000)).into_boxed_str());
+        let mut s = stream_on(
+            fixed(vec![long, long], true),
+            Some(Arc::new(LineSource::new("p", "c"))),
+        );
+        let lines = drain(&mut s).await;
+        assert!(s.is_done());
+        // Only the caller's copies hold the texts: resuming remembers fingerprints.
+        assert!(lines.iter().all(|l| Arc::strong_count(&l.text) == 1));
+        assert_eq!(s.last_group.len(), 2);
     }
 
     // covers UP-45

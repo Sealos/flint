@@ -130,6 +130,10 @@ struct Entry {
 /// Most outcomes taken from one ready stream in a row.
 const STEP_BATCH: usize = 256;
 
+/// How often a following session checks its context still points at the server it was opened
+/// on, while the pod watch stays open (see [`PodSource::check`]).
+pub(crate) const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) struct WorkloadFeed {
     logs: Arc<dyn LogSource>,
     pods: Arc<dyn PodSource>,
@@ -154,6 +158,9 @@ pub(crate) struct WorkloadFeed {
     /// the others.
     cursor: usize,
     status_dirty: bool,
+    /// When to check the context next, and the check in flight.
+    recheck: Pin<Box<Sleep>>,
+    checking: Option<BoxFuture<'static, Result<(), LogError>>>,
 }
 
 impl WorkloadFeed {
@@ -182,6 +189,8 @@ impl WorkloadFeed {
             queue: VecDeque::new(),
             cursor: 0,
             status_dirty: true,
+            recheck: Box::pin(tokio::time::sleep(RECHECK_EVERY)),
+            checking: None,
         };
         match &feed.target.pods {
             PodSet::Selector(selector) if selector.trim().is_empty() => {
@@ -349,7 +358,6 @@ impl WorkloadFeed {
         let before = self.known.insert(pod.name.clone(), pod.clone());
         let container = self.target.container.clone();
         let following = self.following();
-        let mut live = self.live();
         for c in pod.selected(container.as_deref()) {
             let key = Key {
                 pod: pod.name.clone(),
@@ -364,29 +372,39 @@ impl WorkloadFeed {
                 if !c.running || !following {
                     continue;
                 }
-                if entry.stream.is_done() {
-                    // It ended (failed, or finished) and the container ran again: read on.
-                    if restarted && live < self.config.max_streams {
-                        entry.stream.revive();
-                        live += 1;
+                if !entry.stream.is_done() {
+                    if restarted || was.is_none_or(|w| !w.running) {
+                        // Restarted: reopen now instead of at the end of the backoff.
+                        entry.stream.nudge();
                     }
-                } else if restarted || was.is_none_or(|w| !w.running) {
-                    // Restarted: reopen now instead of at the end of the backoff.
-                    entry.stream.nudge();
+                } else if restarted {
+                    // It ended (failed, or finished) and the container ran again: read on, as
+                    // soon as there is room.
+                    self.admit(key);
                 }
                 continue;
             }
-            if self.queue.contains(&key) || !self.readable(c) {
-                continue;
+            if self.readable(c) {
+                self.admit(key);
             }
-            self.start(key);
         }
         self.status_dirty = true;
     }
 
-    fn start(&mut self, key: Key) {
+    /// Starts reading `key`: a new stream, or an ended one revived. At the cap, it waits in the
+    /// queue instead; the one queue serves both, so a revival is never lost or over the cap.
+    fn admit(&mut self, key: Key) {
+        if self.queue.contains(&key) {
+            return;
+        }
         if self.live() >= self.config.max_streams {
             self.queue.push_back(key);
+            self.status_dirty = true;
+            return;
+        }
+        if let Some(entry) = self.streams.iter_mut().find(|e| e.key == key) {
+            entry.stream.revive();
+            self.status_dirty = true;
             return;
         }
         let target = LogTarget {
@@ -431,7 +449,7 @@ impl WorkloadFeed {
             let Some(key) = self.queue.pop_front() else {
                 break;
             };
-            self.start(key);
+            self.admit(key);
         }
         self.status_dirty = true;
     }
@@ -509,8 +527,37 @@ impl WorkloadFeed {
     }
 }
 
+impl WorkloadFeed {
+    /// Checks the context every [`RECHECK_EVERY`] while the pod watch is open. Ready with the
+    /// error that ends the session, or `None` when a check finished without one.
+    fn poll_recheck(&mut self, cx: &mut Context<'_>) -> Poll<Option<String>> {
+        if !matches!(self.watch, Watch::Events(_)) {
+            return Poll::Pending;
+        }
+        if self.checking.is_none() {
+            std::task::ready!(self.recheck.as_mut().poll(cx));
+            let next = tokio::time::Instant::now() + RECHECK_EVERY;
+            self.recheck.as_mut().reset(next);
+            self.checking = Some(self.pods.check());
+        }
+        let checking = self.checking.as_mut().expect("set above");
+        let result = std::task::ready!(checking.poll_unpin(cx));
+        self.checking = None;
+        // Only a cluster error is about the session; a cluster that is reconnecting is the
+        // streams' and the watch's business.
+        Poll::Ready(result.err().filter(LogError::is_cluster).map(|e| e.message))
+    }
+}
+
 impl Feed for WorkloadFeed {
     fn poll(&mut self, cx: &mut Context<'_>, out: &mut Output) -> Poll<()> {
+        if let Poll::Ready(error) = self.poll_recheck(cx) {
+            if let Some(error) = error {
+                self.fail(error);
+            }
+            self.finish(out);
+            return Poll::Ready(());
+        }
         if let Poll::Ready(step) = self.watch.poll_step(cx) {
             self.handle_watch(step);
             self.finish(out);
@@ -578,6 +625,9 @@ mod tests {
         selector: Mutex<Option<Result<String, LogError>>>,
         watches: Mutex<VecDeque<mpsc::UnboundedReceiver<Result<PodEvent, LogError>>>>,
         selectors: Mutex<Vec<String>>,
+        /// What `check` answers (`None`: fine), and how often it was asked.
+        check: Mutex<Option<LogError>>,
+        checks: Mutex<u32>,
     }
 
     impl PodSource for FakePods {
@@ -610,6 +660,12 @@ mod tests {
                 }
             }
             .boxed()
+        }
+
+        fn check(&self) -> BoxFuture<'static, Result<(), LogError>> {
+            let result = self.check.lock().unwrap().clone().map_or(Ok(()), Err);
+            *self.checks.lock().unwrap() += 1;
+            async move { result }.boxed()
         }
     }
 
@@ -1055,6 +1111,43 @@ mod tests {
         assert!(run.pods.selectors.lock().unwrap().is_empty());
     }
 
+    // covers UP-45, UP-06
+    #[tokio::test(start_paused = true)]
+    async fn an_open_pod_watch_still_notices_a_re_pointed_context() {
+        let mut run = start(32);
+        run.list(vec![pod("web-a", "a", &[("app", true)])]);
+        run.opened("web-a/app").await;
+        // Checks pass while the context is unchanged; a cluster that is only reconnecting does
+        // not end anything.
+        // A passing check publishes nothing, so wait on the clock rather than on snapshots.
+        let checks = |run: &Running| *run.pods.checks.lock().unwrap();
+        while checks(&run) < 2 {
+            tokio::time::sleep(RECHECK_EVERY).await;
+        }
+        *run.pods.check.lock().unwrap() = Some(LogError::retry("connecting to \"dev\""));
+        while checks(&run) < 3 {
+            tokio::time::sleep(RECHECK_EVERY).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(run.rx.borrow().state, LogState::Streaming);
+
+        // Re-pointed while the old server still answers: the watch never errors, the check ends
+        // the session within one interval.
+        *run.pods.check.lock().unwrap() = Some(LogError::cluster(
+            "\"dev\" now points to a different API server",
+        ));
+        let s = run
+            .until(|s| matches!(s.state, LogState::Ended { .. }))
+            .await;
+        assert_eq!(
+            s.state,
+            LogState::Ended {
+                error: Some("\"dev\" now points to a different API server".into())
+            }
+        );
+        assert!(pods_of(&s).streams.is_empty());
+    }
+
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn a_re_pointed_context_ends_the_whole_session() {
@@ -1158,6 +1251,44 @@ mod tests {
             requests.iter().all(|r| r.tail_lines == Some(25)),
             "{requests:?}"
         );
+    }
+
+    // covers UP-45
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_at_the_cap_waits_in_the_queue_for_a_slot() {
+        let mut run = start(1);
+        run.logs.fail.lock().unwrap().insert(
+            "web-a/app".into(),
+            LogError::fatal("BadRequest: container \"app\" is terminated"),
+        );
+        run.list(vec![
+            pod("web-a", "a", &[("app", true)]),
+            pod("web-b", "b", &[("app", true)]),
+        ]);
+        // web-a failed, which let web-b take the one slot.
+        run.opened("web-b/app").await;
+        run.until(|s| pods_of(s).failed() == 1 && pods_of(s).live() == 1)
+            .await;
+
+        // web-a restarts while the slot is taken: it queues instead of going over the cap.
+        run.logs.fail.lock().unwrap().clear();
+        let mut restarted = pod("web-a", "a", &[("app", true)]);
+        restarted.containers[0].restarts = 1;
+        run.event(PodEvent::Apply(restarted));
+        let s = run.until(|s| pods_of(s).capped == 1).await;
+        assert_eq!(pods_of(&s).live(), 1);
+        assert_eq!(run.logs.opened(), ["web-a/app", "web-b/app"]);
+
+        // web-b finishes: web-a reads on in its slot.
+        run.logs.close("web-b/app");
+        run.opened("web-a/app").await;
+        let s = run
+            .until(|s| pods_of(s).capped == 0 && pods_of(s).live() == 1)
+            .await;
+        assert_eq!(pods_of(&s).failed(), 0);
+        run.logs.send("web-a/app", "back");
+        let s = run.until(|s| s.lines.len() == 1).await;
+        assert_eq!(texts(&s), ["[web-a/app] back"]);
     }
 
     // covers UP-45

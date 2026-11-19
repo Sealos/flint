@@ -193,6 +193,12 @@ pub(crate) trait PodSource: Send + Sync + 'static {
         namespace: &str,
         selector: &str,
     ) -> BoxFuture<'static, Result<PodEvents, LogError>>;
+
+    /// Checks the session's cluster is still the one it was opened on (see
+    /// [`ClientLookup`]), without a request to the server. kube's watcher keeps its client across
+    /// its own re-watches, so an open watch would otherwise never notice a context that was
+    /// removed or re-pointed.
+    fn check(&self) -> BoxFuture<'static, Result<(), LogError>>;
 }
 
 /// A label selector as the API takes it. An empty one would select every pod in the namespace,
@@ -297,6 +303,11 @@ impl PodSource for KubePodSource {
             Ok(events)
         }
         .boxed()
+    }
+
+    fn check(&self) -> BoxFuture<'static, Result<(), LogError>> {
+        let client = self.client.clone();
+        async move { client().await.map(drop) }.boxed()
     }
 }
 

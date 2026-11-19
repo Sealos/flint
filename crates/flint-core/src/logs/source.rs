@@ -18,6 +18,9 @@ use crate::cluster::{ClusterError, error_chain};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogRequest {
     pub target: LogTarget,
+    /// The pod's uid, when the stream belongs to a pod set: opening checks the pod by that name
+    /// is still the same pod, so a stream never reads a pod recreated under its name.
+    pub uid: Option<String>,
     pub follow: bool,
     pub tail_lines: Option<i64>,
     pub since: Option<LogSince>,
@@ -77,6 +80,8 @@ pub(crate) enum ErrorKind {
     /// About the cluster, not one stream (it left the kubeconfig files, or the context now
     /// points at another API server): the whole session ends, a workload's included.
     Cluster,
+    /// The pod is gone: deleted, or replaced by another pod of the same name.
+    PodGone,
 }
 
 impl LogError {
@@ -91,6 +96,14 @@ impl LogError {
         LogError {
             message: message.into(),
             kind: ErrorKind::Fatal,
+        }
+    }
+
+    /// See [`ErrorKind::PodGone`].
+    pub fn pod_gone(message: impl Into<String>) -> Self {
+        LogError {
+            message: message.into(),
+            kind: ErrorKind::PodGone,
         }
     }
 
@@ -190,6 +203,9 @@ impl LogSource for KubeLogSource {
         async move {
             let client = client().await?;
             let api: Api<Pod> = Api::namespaced(client, &request.target.namespace);
+            if let Some(uid) = &request.uid {
+                same_pod(api.get_opt(&request.target.pod).await, uid)?;
+            }
             let reader = api
                 .log_stream(&request.target.pod, &request.params())
                 .await
@@ -214,6 +230,25 @@ impl LogSource for KubeLogSource {
             fate_of(pod, target.container.as_deref(), uid.as_deref())
         }
         .boxed()
+    }
+}
+
+/// Whether the pod found by name is still the pod with `uid`, checked before its log is opened
+/// (the log endpoint takes only a name). A 403 means the user may read logs but not get pods:
+/// the check is skipped. The pod may still be replaced between this check and the open; that
+/// window is one round trip, against a reconnect that would otherwise read the new pod for good.
+pub(crate) fn same_pod(
+    lookup: Result<Option<Pod>, kube::Error>,
+    uid: &str,
+) -> Result<(), LogError> {
+    match lookup {
+        Ok(Some(pod)) if pod.metadata.uid.as_deref() == Some(uid) => Ok(()),
+        Ok(Some(_)) => Err(LogError::pod_gone(
+            "the pod was replaced by one of the same name",
+        )),
+        Ok(None) => Err(LogError::pod_gone("the pod was deleted")),
+        Err(kube::Error::Api(status)) if status.code == 403 => Ok(()),
+        Err(e) => Err(LogError::from_kube(e)),
     }
 }
 
@@ -392,6 +427,7 @@ mod tests {
         let since: Timestamp = "2024-05-01T12:00:00Z".parse().unwrap();
         let request = LogRequest {
             target: target(),
+            uid: None,
             follow: true,
             tail_lines: Some(10),
             since: Some(LogSince::Time(since)),
@@ -548,6 +584,22 @@ mod tests {
         let forbidden = Err(api_error(403, "pods \"p\" is forbidden"));
         assert_eq!(fate_of(forbidden, None, None), Ok(AfterEnd::Restarts));
         assert_eq!(fate_of(Ok(None), None, None), Ok(AfterEnd::Gone));
+        // Before opening a pod set's stream, the pod by that name must still be the same pod.
+        let named = |uid: &str| Ok(Some(pod(json!({"metadata": {"uid": uid}}))));
+        assert_eq!(same_pod(named("u1"), "u1"), Ok(()));
+        let replaced = same_pod(named("u2"), "u1").unwrap_err();
+        assert_eq!(replaced.kind, ErrorKind::PodGone);
+        assert!(replaced.is_fatal());
+        assert_eq!(
+            same_pod(Ok(None), "u1").unwrap_err().kind,
+            ErrorKind::PodGone
+        );
+        assert_eq!(same_pod(Err(api_error(403, "forbidden")), "u1"), Ok(()));
+        assert!(
+            !same_pod(Err(api_error(500, "boom")), "u1")
+                .unwrap_err()
+                .is_fatal()
+        );
         // A pod recreated under the same name is another pod.
         let running = || Ok(Some(pod(json!({"metadata": {"uid": "new"}}))));
         assert_eq!(fate_of(running(), None, Some("old")), Ok(AfterEnd::Gone));
