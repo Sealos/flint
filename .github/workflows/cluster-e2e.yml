@@ -24,9 +24,6 @@ permissions:
   contents: read
 
 # Only PR runs replace each other; master and nightly runs always finish.
-concurrency:
-  group: cluster-e2e-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
