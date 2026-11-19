@@ -159,7 +159,11 @@ actions!(
         /// Copy the selected lines as shown.
         CopyLines,
         /// Save every line shown to a file.
-        SaveLogs
+        SaveLogs,
+        /// Save the lines matching the search to a file.
+        SaveMatchingLines,
+        /// Save the selected lines to a file.
+        SaveSelectedLines
     ]
 );
 
@@ -1452,6 +1456,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .keys(&["cmd-s"], Some(LOG_VIEW)),
+        Spec::unit::<SaveMatchingLines>(
+            "Save Matching Lines",
+            "Save the lines matching the search to a file, as shown and without redaction.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-shift-s"], Some(LOG_VIEW)),
+        Spec::unit::<SaveSelectedLines>(
+            "Save Selected Lines",
+            "Save the selected lines to a file, as shown and without redaction.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["cmd-alt-s"], Some(LOG_VIEW)),
         Spec::with_args::<SaveLines>(
             "Save Log Lines…",
             "Save all lines, the search matches or the selection to a file, as shown and without redaction.",

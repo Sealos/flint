@@ -118,6 +118,16 @@ fn open_request(
     core: CoreHandle,
     request: LogRequest,
 ) -> (AnyWindowHandle, Entity<LogView>) {
+    open_sized(cx, core, request, 1000.)
+}
+
+/// A log tab alone in a window `width` wide.
+fn open_sized(
+    cx: &mut TestAppContext,
+    core: CoreHandle,
+    request: LogRequest,
+    width: f32,
+) -> (AnyWindowHandle, Entity<LogView>) {
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -128,7 +138,7 @@ fn open_request(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: Point::default(),
-                    size: size(px(1000.), px(400.)),
+                    size: size(px(width), px(400.)),
                 })),
                 ..Default::default()
             },
@@ -173,13 +183,15 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
     let (core, _dir) = core();
     let (window, view) = open(cx, core);
     let status = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.tab_status());
+    // Fed by hand: the real session (on no cluster) may already have ended.
+    let mut lines = Feed::new(50);
+    feed(cx, &view, lines.snapshot(LogState::Connecting, false, 0));
     assert_eq!(status(cx), TabStatus::Starting);
     cx.wait_for(window, WAIT, |window, _| {
         window.try_find("log-empty").is_some()
     })
     .await;
 
-    let mut lines = Feed::new(50);
     feed(cx, &view, lines.push(0, 3).streaming());
     cx.wait_for(window, WAIT, |window, _| {
         (0..3).all(|id| window.try_find(line_id(id)).is_some())
@@ -644,4 +656,88 @@ async fn a_workload_tab_shows_sources_and_stream_counts(cx: &mut TestAppContext)
         !v.searching && v.search.count() == 1
     })
     .await;
+}
+
+// covers UP-40: moving to a match far below the lines on screen shows it, though the rows in
+// between were never drawn (so the list has not measured them).
+#[gpui_kit::test]
+async fn a_far_match_is_scrolled_into_view(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut buffer = LogBuffer::new(5000);
+    for n in 0..3000 {
+        let text = if n == 2500 {
+            "needle here".to_owned()
+        } else {
+            format!("line {n}")
+        };
+        buffer.push(LogLine::parse(&text, false));
+    }
+    feed(
+        cx,
+        &view,
+        Arc::new(LogSnapshot {
+            lines: buffer.view(),
+            state: LogState::Streaming,
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: None,
+        }),
+    );
+    press(cx, window, "home");
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(0)).is_some()
+    })
+    .await;
+    view.update(cx, |v, cx| v.set_query("needle".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 1
+    })
+    .await;
+    press(cx, window, "cmd-g");
+    assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(2500));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(2500)).is_some_and(|line| {
+            let y = f32::from(line.bounds().origin.y);
+            (0. ..400.).contains(&y)
+        })
+    })
+    .await;
+}
+
+// covers UP-46: in a narrow dock, with a search and a pause showing, the toolbar wraps instead
+// of clipping, so Save stays on screen; Save Matching Lines and Save Selected Lines also have
+// keys and palette entries.
+#[gpui_kit::test]
+async fn a_narrow_toolbar_keeps_save_reachable(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open_sized(cx, core, request(), 420.);
+    let mut lines = Feed::new(100);
+    feed(
+        cx,
+        &view,
+        lines.push(0, 10).snapshot(LogState::Streaming, true, 7),
+    );
+    view.update(cx, |v, cx| {
+        v.user_paused = true;
+        v.set_query("error".into(), cx);
+    });
+    cx.wait_for(window, WAIT, |window, cx| {
+        !view.read(cx).searching
+            && window.try_find("log-matches").is_some()
+            && window.try_find("log-save").is_some_and(|save| {
+                let b = save.bounds();
+                f32::from(b.origin.x + b.size.width) <= 420. && f32::from(b.size.width) > 0.
+            })
+    })
+    .await;
+    for name in ["logs::SaveMatchingLines", "logs::SaveSelectedLines"] {
+        let spec = registry::find(name).unwrap();
+        assert!(!spec.keys.is_empty(), "{name} has a key");
+    }
+    press(cx, window, "cmd-shift-s");
+    cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
 }

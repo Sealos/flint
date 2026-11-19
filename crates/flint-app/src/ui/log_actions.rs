@@ -8,8 +8,9 @@ use gpui_kit::*;
 use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
     ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, NextMatch, OnView, PrevMatch,
-    SaveLines, SaveLogs, SaveScope, SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine,
-    TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
+    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, SelectAllLines,
+    SelectLine, SelectNextLine, SelectPrevLine, TogglePause, ToggleSources, ToggleTimestamps,
+    ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
@@ -92,6 +93,12 @@ impl LogView {
                     view.save(SaveScope::All, None, window, cx);
                 }
             })
+            .bind::<SaveMatchingLines>(|view, _, window, cx| {
+                view.save_scope(SaveScope::Matches, window, cx)
+            })
+            .bind::<SaveSelectedLines>(|view, _, window, cx| {
+                view.save_scope(SaveScope::Selection, window, cx)
+            })
             .bind::<SaveLines>(
                 |view, action, window, cx| match view.check_save(action.lines) {
                     Ok(()) => view.save(action.lines, action.timestamps, window, cx),
@@ -100,6 +107,14 @@ impl LogView {
             )
             .bind::<SelectLine>(Self::select_line)
             .bind::<DragSelection>(Self::drag_selection)
+    }
+
+    /// Saves the lines of `scope` with timestamps as shown, if it has any.
+    fn save_scope(&mut self, scope: SaveScope, window: &mut Window, cx: &mut Context<Self>) {
+        match self.check_save(scope) {
+            Ok(()) => self.save(scope, None, window, cx),
+            Err(e) => tracing::warn!("{e}"),
+        }
     }
 
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {

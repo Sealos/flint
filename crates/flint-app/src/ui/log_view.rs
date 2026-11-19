@@ -51,6 +51,8 @@ use super::theme;
 
 /// The height of one unwrapped log line.
 pub const LINE_HEIGHT: f32 = 18.;
+/// Lines kept above a line scrolled into view (a match, the selection's head).
+const REVEAL_CONTEXT: usize = 3;
 /// How long a search query must stay unchanged before the buffer is scanned for it.
 const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
@@ -362,14 +364,25 @@ impl LogView {
     }
 
     /// Scrolls `id` into view and stops following, so the next frame does not snap back.
+    ///
+    /// By index, not by `scroll_to_reveal_item`: that measures the way by the heights of the rows
+    /// in between, and rows never drawn have none yet, so a far jump could stop short.
     fn reveal(&mut self, id: LineId) {
         let lines = &self.snapshot.lines;
         if !lines.contains(id) {
             return;
         }
+        let ix = (id - lines.first_id()) as usize;
         self.list.pause_following_tail();
-        self.list
-            .scroll_to_reveal_item((id - lines.first_id()) as usize);
+        let shown = self.list.item_is_above_viewport(ix) == Some(false)
+            && self.list.item_is_below_viewport(ix) == Some(false);
+        if !shown {
+            // A few lines of context above the target.
+            self.list.scroll_to(ListOffset {
+                item_ix: ix.saturating_sub(REVEAL_CONTEXT),
+                offset_in_item: px(0.),
+            });
+        }
     }
 
     /// The selected lines as shown, without redaction: what copy, save and AI log analysis
@@ -612,12 +625,15 @@ impl LogView {
         let timestamps = self.timestamps;
         h_flex()
             .id("log-toolbar")
-            .h(px(super::workspace::HEADER_HEIGHT))
+            // A narrow dock wraps the controls onto a second row rather than clipping the last
+            // ones (Save among them).
+            .flex_wrap()
+            .min_h(px(super::workspace::HEADER_HEIGHT))
+            .py_0p5()
             .px_2()
-            .gap_1p5()
+            .gap_x_1p5()
             .flex_none()
             .min_w_0()
-            .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
             .text_xs()

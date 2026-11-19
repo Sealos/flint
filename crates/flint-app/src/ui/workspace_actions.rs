@@ -22,12 +22,13 @@ use super::super::registry::{
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
     Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView,
     OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenView, PaneName, PrevMatch, PrevTab, Refresh,
-    RetryConnection, SaveLines, SaveLogs, SaveScope, SelectAllLines, SelectCluster, SelectFirst,
-    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
-    SetDockHeight, SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview, ShowYaml, SortBy,
-    ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
-    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
+    SelectPrev, SelectPrevLine, SelectRow, SetDockHeight, SetNamespaces, SetPaneWidth,
+    ShowAllNamespaces, ShowOverview, ShowYaml, SortBy, ToggleAnnotations, ToggleLabels,
+    ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause, ToggleSecretValue,
+    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
 use super::super::ui_state;
 use super::{Pane, Workspace, confirm_expose, expose_dialog};
@@ -229,6 +230,12 @@ impl Workspace {
             .when::<CopyLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
             .when::<SaveLogs>(|ws, cx| {
                 log(ws, cx).is_some_and(|l| l.check_save(SaveScope::All).is_ok())
+            })
+            .when::<SaveMatchingLines>(|ws, cx| {
+                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::Matches).is_ok())
+            })
+            .when::<SaveSelectedLines>(|ws, cx| {
+                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::Selection).is_ok())
             })
             .add::<SaveLines>(
                 |ws, cx| log(ws, cx).is_some_and(LogView::has_lines),
