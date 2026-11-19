@@ -239,8 +239,15 @@ Rules:
   user toggles exposure from the cluster sidebar. The list is read again on every call, and calls naming any other
   cluster fail as if it did not exist.
 - **Read-only:** there are no tools that create, change, or delete anything, and no exec or port-forward.
+- **Scope:** an exposed cluster may also list the namespaces and kinds an agent may read
+  ([ADR-0013](./adr/0013-agent-trust-model.md)). Empty means everything. Requests outside the scope fail like an
+  unexposed cluster. With a namespace scope, cluster-scoped kinds are hidden unless the kinds scope names them.
 - **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept.
-  `metadata.managedFields` is removed from all output.
+  `metadata.managedFields` is removed from all output. Pod logs and event messages go through a shared redactor that
+  replaces values that look like credentials (auth headers, JWTs, private keys, cloud access keys, `password=`-style
+  pairs), and the result says how many were replaced.
+- **Activity log:** every call is recorded (time, cluster, tool, what it named, result size, cut short or denied),
+  never the returned content. The app shows it per cluster.
 - **Bounded output:** lists and logs have default and maximum sizes (for example 200 objects and 500 log lines). When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
 - **stdout is the protocol channel:** all logging goes to stderr.
