@@ -47,7 +47,8 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 - MCP write tools, an MCP server over HTTP, and a built-in AI chat panel. The log analysis panel shows one answer
   per request and takes no follow-up prompts.
 - LLM API keys or provider clients in Flint. AI features go through the user's own tools.
-- Views that show several clusters side by side. Several clusters can be connected, but views show one at a time.
+- Fleets of dozens of clusters. Combined views cover sets of 2 to 5 clusters
+  ([ADR-0014](./adr/0014-cluster-sets-and-combined-views.md)).
 - Network edges in the resource diagram (Service to Pod, Ingress to Service).
 
 ## Stack
@@ -137,6 +138,16 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 - The sidebar shows each cluster as active, warm or cold, with a badge for reconnecting, sign-in needed or error.
   Clicking a row with a badge makes it active and retries auth in the foreground. Disconnect makes a warm cluster
   cold.
+- **Cluster sets (super mode):** Cmd-click clusters, or open a saved named set, to combine 2 to 5 clusters in one
+  view ([ADR-0014](./adr/0014-cluster-sets-and-combined-views.md)). Lists interleave the members' rows with a
+  sortable, filterable Cluster column, or group them by cluster with a toggle. Columns are the union by name; the
+  resource tree lists every kind any member serves, with a `2/3` badge when only some do. Every member of an open set
+  is connected and watched like the active cluster. Rows keep their cluster: details and actions act on the row's
+  own cluster. Each cluster may have an optional colour tag, shown in the sidebar, the Cluster column and the detail
+  header.
+- **Protection:** every cluster is protected (read-only in Flint) by default, except clusters on the user's machine
+  and clusters marked trusted. A session unlock (one confirmation naming the cluster and server) lasts until Flint
+  quits ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)).
 - Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
   another cluster, warm or cold. They end only when the user closes them or quits Flint.
 
@@ -289,7 +300,8 @@ opens in a tab in the bottom dock.
    Helm and controllers.
 
 Delete, scale, rollout restart, cordon, and drain are typed actions in `flint-core`, each with a confirmation in the
-UI. Destructive actions show the cluster and namespace in the confirmation. Kubernetes has no drain API, so drain
+UI. Every write refuses on a protected cluster ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)), and
+the UI offers a session unlock in its place. Destructive actions show the cluster and namespace in the confirmation. Kubernetes has no drain API, so drain
 works like `kubectl drain`: cordon the node, then evict its pods through the Eviction API. Pods blocked by a
 PodDisruptionBudget are reported back to the user instead of being retried forever.
 
@@ -420,11 +432,12 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | T | Test foundation: unit tests for every module, headless view tests, automation channel (test builds only), `flint-e2e` harness, recorded fake API server, Linux kind e2e, e2e screenshots ([TESTING.md](./TESTING.md)) |
 | M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
 | M2 | Log viewer with streaming, search, timestamps and error highlighting; exec terminal |
-| M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain |
+| M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain, clusters protected by default |
 | M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram |
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
-| M5.5 | Multi-cluster and AI: warm clusters for instant switching, AI log analysis through the user's Claude Code CLI |
+| M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets and colour tags, AI log analysis through the user's Claude Code CLI |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
+| M7 | Fleet actions on a cluster set: rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
 
 ## Risks
 
