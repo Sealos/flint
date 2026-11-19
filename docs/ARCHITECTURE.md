@@ -6,7 +6,7 @@ and low memory**. Native look and feel comes second.
 
 This document describes the shape of the system. The reasons behind the hard-to-reverse choices are recorded as ADRs
 in [`docs/adr/`](./adr/). The journeys every release must keep working, with stable IDs for tests, are in
-[`docs/USER-PATHS.md`](./USER-PATHS.md).
+[`docs/USER-PATHS.md`](./USER-PATHS.md). How they are tested is in [`docs/TESTING.md`](./TESTING.md).
 
 ## Scope
 
@@ -271,6 +271,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 |---|---|
 | M0 | Cargo workspace, GPUI window, kubeconfig loading, cluster sidebar, connect and health check, PATH resolution, read-only `flint mcp` server with Expose to AI toggle |
 | M1 | Discovery-driven navigation, Table lists (spike first), watch manager with both modes, generic detail and YAML view, namespace filter |
+| T | Test foundation: unit tests for every module, headless view tests, automation channel (test builds only), `flint-e2e` harness, recorded fake API server, Linux kind e2e, e2e screenshots ([TESTING.md](./TESTING.md)) |
 | M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
 | M2 | Log viewer, exec terminal |
 | M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain |

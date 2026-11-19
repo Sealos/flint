@@ -9,6 +9,8 @@ change.
 
 ## How paths are tested
 
+The full strategy is in [`TESTING.md`](./TESTING.md).
+
 | Level | Tool | Used for |
 |---|---|---|
 | **unit** | `cargo test` in `flint-core` / `flint-mcp` | Pure logic: parsing, merging, policy, redaction, validation |
