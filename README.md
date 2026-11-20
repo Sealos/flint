@@ -277,7 +277,9 @@ Releases after v0.2.1 also have the MCP server on its own, for x86_64 and aarch6
 `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`. It is
 the same read-only server as `flint mcp`, without the desktop app. It is a static binary that needs no system
 libraries, not even glibc, so it runs where the AppImage does not: Ubuntu 22.04 and other older distributions, minimal
-containers and devcontainers. CI runs it in a bare `ubuntu:22.04`.
+containers and devcontainers. CI runs it in a bare `ubuntu:22.04`. A kubeconfig without `certificate-authority-data`
+relies on the system's CA certificates, so a minimal image needs `ca-certificates` installed (or the cluster's CA in
+the kubeconfig). The archive includes musl's license (`LICENSE-MUSL`), since the binary links it statically.
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-mcp-*-x86_64-unknown-linux-musl.tar.gz*'   # or aarch64

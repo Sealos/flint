@@ -3,7 +3,7 @@
 #
 #   scripts/smoke-mcp-linux.sh <archive> <version>
 #
-# The archive must hold flint-mcp/flint-mcp with LICENSE and README.md, `--version` must print
+# The archive must hold flint-mcp/flint-mcp with LICENSE, LICENSE-MUSL and README.md, `--version` must print
 # "flint-mcp <version>", and the server must answer `initialize`; the kubeconfig points at a port
 # that refuses connections. It needs only bash, coreutils, grep and tar, so it runs in a bare
 # `ubuntu:22.04` container, which is how CI checks that the binary needs nothing from the host.
@@ -19,14 +19,14 @@ version=${2#v}
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 tar -xzf "$archive" -C "$scratch"
-for file in flint-mcp LICENSE README.md; do
+for file in flint-mcp LICENSE LICENSE-MUSL README.md; do
   if [ ! -s "$scratch/flint-mcp/$file" ]; then
     echo "error: the archive has no flint-mcp/$file" >&2
     exit 1
   fi
 done
 binary=$scratch/flint-mcp/flint-mcp
-echo "archive: flint-mcp, LICENSE, README.md"
+echo "archive: flint-mcp, LICENSE, LICENSE-MUSL, README.md"
 
 got=$("$binary" --version)
 if [ "$got" != "flint-mcp $version" ]; then

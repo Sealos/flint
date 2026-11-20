@@ -7,8 +7,8 @@
 # directory, and prints the archive's name last. <version> is X.Y.Z (a leading "v" is accepted)
 # and must be the workspace version; <arch> is x86_64 or aarch64 and must be the host's: the
 # build is native, with the host's musl-gcc (Debian and Ubuntu: musl-tools) and the Rust target
-# <arch>-unknown-linux-musl installed. The archive holds flint-mcp/flint-mcp, LICENSE and
-# README.md.
+# <arch>-unknown-linux-musl installed. The archive holds flint-mcp/flint-mcp, LICENSE,
+# LICENSE-MUSL (the notice for the musl libc linked into the binary) and README.md.
 #
 # Static means no system library at run time, not even libc: the binary runs on any Linux of its
 # architecture, however old its glibc. rustls with ring is the only C code in its tree; musl-gcc
@@ -40,7 +40,9 @@ out=$PWD
 # is the one to use on both architectures.
 export "CC_${target//-/_}=${CC_MUSL:-musl-gcc}"
 (cd "$repo" && cargo build --release --locked -p flint-mcp --bin flint-mcp --target "$target")
-binary=${CARGO_TARGET_DIR:-$repo/target}/$target/release/flint-mcp
+# Cargo resolves a relative CARGO_TARGET_DIR against the repo, where it ran; so does this.
+target_dir=$(cd "$repo" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)
+binary=$target_dir/$target/release/flint-mcp
 
 # No program interpreter and no shared libraries: what makes it run without the host's libc.
 headers=$(readelf -lW "$binary")
@@ -65,6 +67,7 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 mkdir "$stage/flint-mcp"
 cp "$binary" "$repo/LICENSE" "$repo/README.md" "$stage/flint-mcp/"
+cp "$repo/packaging/linux/musl-LICENSE" "$stage/flint-mcp/LICENSE-MUSL"
 archive=flint-mcp-v$version-$target.tar.gz
 tar -czf "$out/$archive" -C "$stage" flint-mcp
 (cd "$out" && sha256sum "$archive" >"$archive.sha256")
