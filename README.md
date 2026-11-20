@@ -8,7 +8,7 @@ clusters you choose to expose.
 
 ## Status
 
-Flint is in early development: every release is a pre-release until 1.0.
+Flint is in early development.
 
 **Works today:**
 
@@ -35,13 +35,9 @@ Flint is in early development: every release is a pre-release until 1.0.
 
 ## Install from a release
 
-Releases are on the [releases page](https://github.com/Sealos/flint/releases). They are marked pre-release until
-1.0, so GitHub's "latest release" links and `gh release download` without a tag find nothing yet. The commands below
-look up the newest tag first:
-
-```sh
-tag=$(gh release list -R Sealos/flint --exclude-drafts -L 1 --json tagName -q '.[0].tagName')
-```
+Download from the [latest release](https://github.com/Sealos/flint/releases/latest), or with `gh release download`,
+which takes the latest release when given no tag. Run the commands below in an empty directory, so each pattern
+matches only the files you just downloaded.
 
 ### macOS app (DMG)
 
@@ -49,14 +45,14 @@ Releases after v0.2.0 have `Flint.app` in a disk image, `flint-vX.Y.Z-macos-univ
 Intel Macs on macOS 13 or later. v0.2.0 itself has the [command-line archive](#macos-command-line-archive) and the
 AppImages only.
 
-1. Download the DMG from the releases page, or with `gh` (after setting `tag` as above), and check it:
+1. Download the DMG from the latest release, or with `gh`, and check it:
 
    ```sh
-   gh release download "$tag" -R Sealos/flint -p 'flint-*-macos-universal.dmg*'
-   shasum -a 256 -c "flint-$tag-macos-universal.dmg.sha256"
+   gh release download -R Sealos/flint --pattern 'flint-*-macos-universal.dmg*'
+   shasum -a 256 -c flint-*-macos-universal.dmg.sha256
    ```
 
-   If `gh` finds no matching asset, the newest release predates the DMG: use the
+   If `gh` finds no matching asset, the latest release is still v0.2.0: use the
    [command-line archive](#macos-command-line-archive) instead.
 
 2. Open the DMG and drag **Flint** onto **Applications**, then eject the DMG.
@@ -101,9 +97,9 @@ Each release also has the same universal binary without the app bundle, `flint-v
 from a terminal and it opens the Flint window:
 
 ```sh
-gh release download "$tag" -R Sealos/flint -p 'flint-*-macos-universal.tar.gz*'   # tag as above
-shasum -a 256 -c "flint-$tag-macos-universal.tar.gz.sha256"
-tar -xzf "flint-$tag-macos-universal.tar.gz"
+gh release download -R Sealos/flint --pattern 'flint-*-macos-universal.tar.gz*'
+shasum -a 256 -c flint-*-macos-universal.tar.gz.sha256
+tar -xzf flint-*-macos-universal.tar.gz
 sudo install -m 755 flint/flint /usr/local/bin/flint
 flint --version
 flint                                   # opens the window
@@ -120,9 +116,9 @@ tests it, but it is not tested on every desktop and distribution ([ADR-0016](doc
 needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
 
 ```sh
-gh release download "$tag" -R Sealos/flint -p 'flint-*-linux-x86_64.AppImage*'   # tag as above; or linux-aarch64
-sha256sum -c "flint-$tag-linux-x86_64.AppImage.sha256"
-install -D -m 755 "flint-$tag-linux-x86_64.AppImage" ~/.local/bin/flint
+gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
+sha256sum -c flint-*-linux-x86_64.AppImage.sha256
+install -D -m 755 flint-*-linux-x86_64.AppImage ~/.local/bin/flint
 flint --version
 flint                                   # opens the window
 ```
@@ -340,9 +336,9 @@ format, for example `feat(mcp): …` or `fix(core): …`.
    `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum.
 4. Once every upload has succeeded, a `publish` job publishes the release and checks that all eight files are on it.
 
-Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed) and marked as
-pre-release. macOS blocks the first launch of a browser download until you allow it
-([Install from a release](#install-from-a-release)). AppImages stay unsigned.
+Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed). macOS blocks the
+first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)). AppImages
+stay unsigned.
 
 After every published release:
 
