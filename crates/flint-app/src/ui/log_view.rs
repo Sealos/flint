@@ -14,8 +14,16 @@
 //!   keeps up with new lines snapshot by snapshot; matches are highlighted with
 //!   [`flint_core::SearchQuery::match_ranges`].
 //! - **Selection** is a [`LineSelection`] of line ids: copy and save write its lines as shown
-//!   (timestamps only when shown), without redaction. AI log analysis (#56) reads the same
-//!   selection ([`LogView::selection_text`]).
+//!   (timestamps only when shown, in full), without redaction. AI log analysis (#56) reads the
+//!   same selection ([`LogView::selection_text`]).
+//! - **Toolbar** is one row at any width ([`log_model::toolbar_fit`]): the status has a slot that
+//!   truncates, and in a narrow tab the toggles and Save move into a "⋯" menu. Under it, one
+//!   strip says the last transient thing (the selection, a copy, a save); a copy or save note
+//!   times out. An ended session's error has its own banner, in plain words
+//!   ([`log_model::explain`]).
+//! - **Lines** show a fixed-width local timestamp and, in a workload, a short pod prefix in the
+//!   pod's colour; wrapped text hangs past both. The full values are in tooltips, copies and
+//!   saves ([`log_model`]).
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -29,7 +37,7 @@ use flint_core::{
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -40,9 +48,11 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use jiff::tz::TimeZone;
+
 use super::dock::{DockItem, TabKey, TabStatus};
-use super::log_model::{self, ListChange, Tone};
-use super::notice::{notice, notice_with};
+use super::log_model::{self, ListChange, SourceLabels, Tone};
+use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
     SelectLine, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
@@ -55,6 +65,8 @@ pub const LINE_HEIGHT: f32 = 18.;
 const REVEAL_CONTEXT: usize = 3;
 /// How long a search query must stay unchanged before the buffer is scanned for it.
 const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+/// How long a copy or save note stays under the toolbar.
+pub const NOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What a log tab shows: a pod's container or a workload's pods on a cluster, and whether it is
 /// the previous (terminated) instance. Opening the same request again shows the existing tab.
@@ -86,7 +98,8 @@ struct PendingSave {
     selection: Option<LineSelection>,
 }
 
-/// A line under the toolbar after a copy or a save.
+/// A line under the toolbar after a copy or a save. A muted one times out
+/// ([`NOTE_TIMEOUT`]); any one goes when the selection changes or another note comes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub tone: Tone,
@@ -121,6 +134,20 @@ pub struct LogView {
     current_match: Option<LineId>,
     search_input: Entity<InputState>,
     note: Option<Note>,
+    /// Clears a muted note after [`NOTE_TIMEOUT`]; replaced with every note.
+    _note_timer: Task<()>,
+    /// Short pod prefixes and their colours (workload sessions).
+    labels: SourceLabels,
+    /// The time zone timestamps show in: the system's, else UTC.
+    tz: TimeZone,
+    /// What the timestamps toggle calls that zone: "local time (Europe/Rome)", or UTC said as
+    /// such when the system's could not be read.
+    tz_name: String,
+    /// Tracks the tab's bounds, so the toolbar knows how much fits.
+    bounds: ScrollHandle,
+    /// The width the toolbar was laid out for; it is known only after layout, so a change
+    /// draws again.
+    laid_out_width: Option<f32>,
     focus: FocusHandle,
     _pump: Task<()>,
     _search: Task<()>,
@@ -134,19 +161,7 @@ impl LogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let session = core.open_logs(&request.cluster, request.subject.clone(), request.options());
-        let mut updates = session.updates();
-        let pump = cx.spawn(async move |this, cx| {
-            while updates.changed().await {
-                let snapshot = updates.latest();
-                if this
-                    .update(cx, |view, cx| view.set_snapshot(snapshot, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let (session, pump) = Self::open_session(&core, &request, cx);
         let list = ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 20.));
         list.set_follow_mode(FollowMode::Tail);
         // Redraw the toolbar's Jump button when scrolling starts or stops following.
@@ -180,6 +195,7 @@ impl LogView {
                 },
             );
         let snapshot = session.peek();
+        let (tz, tz_name) = log_model::system_zone();
         LogView {
             request,
             core,
@@ -203,11 +219,39 @@ impl LogView {
             current_match: None,
             search_input,
             note: None,
+            _note_timer: Task::ready(()),
+            labels: SourceLabels::default(),
+            tz,
+            tz_name,
+            bounds: ScrollHandle::new(),
+            laid_out_width: None,
             focus: cx.focus_handle(),
             _pump: pump,
             _search: Task::ready(()),
             _subscriptions: vec![on_search],
         }
+    }
+
+    /// Opens the session `request` names, and the task that hands its snapshots to the view.
+    fn open_session(
+        core: &CoreHandle,
+        request: &LogRequest,
+        cx: &mut Context<Self>,
+    ) -> (LogSession, Task<()>) {
+        let session = core.open_logs(&request.cluster, request.subject.clone(), request.options());
+        let mut updates = session.updates();
+        let pump = cx.spawn(async move |this, cx| {
+            while updates.changed().await {
+                let snapshot = updates.latest();
+                if this
+                    .update(cx, |view, cx| view.set_snapshot(snapshot, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (session, pump)
     }
 
     #[cfg(test)]
@@ -236,6 +280,10 @@ impl LogView {
             ListChange::Splice { evicted, appended } => {
                 if evicted > 0 {
                     self.list.splice(0..evicted, 0);
+                    // The new first line may gain a day separator.
+                    if self.timestamps && self.list.item_count() > 0 {
+                        self.list.remeasure_items(0..1);
+                    }
                 }
                 if appended > 0 {
                     let end = self.list.item_count();
@@ -245,6 +293,18 @@ impl LogView {
             ListChange::Reset(count) => self.list.reset(count),
         }
         self.snapshot = snapshot;
+        if let Some(pods) = &self.snapshot.pods
+            && self.labels.learn(pods)
+            && self.wrap
+        {
+            self.list.remeasure();
+        }
+        // An ended session has nothing to hold back: show every line, and drop the pause.
+        if log_model::has_ended(&self.snapshot.state) && self.is_paused() {
+            self.user_paused = false;
+            self.selection_paused = false;
+            self.sync_pause();
+        }
         let lines = self.snapshot.lines.clone();
         if let Some(selection) = self.selection {
             self.selection = selection.clamp(&lines);
@@ -332,6 +392,25 @@ impl LogView {
         self.request.options().follow
     }
 
+    /// Whether Pause applies: the session follows and has not ended.
+    pub fn can_pause(&self) -> bool {
+        self.follows() && !self.has_ended()
+    }
+
+    /// Nothing more will come.
+    pub fn has_ended(&self) -> bool {
+        log_model::has_ended(&self.snapshot.state)
+    }
+
+    /// How lines are drawn now.
+    fn line_view(&self) -> log_model::LineView<'_> {
+        log_model::LineView {
+            format: self.format(),
+            labels: &self.labels,
+            tz: &self.tz,
+        }
+    }
+
     /// Selects `selection`, pausing when a selection starts, and focuses the tab.
     fn select(
         &mut self,
@@ -345,6 +424,9 @@ impl LogView {
             self.selection_paused = true;
             self.sync_pause();
         }
+        if self.selection != Some(selection) {
+            self.clear_note();
+        }
         self.selection = Some(selection);
         if reveal {
             self.reveal(selection.head);
@@ -355,6 +437,9 @@ impl LogView {
 
     /// Drops the selection, and resumes if only the selection paused.
     fn end_selection(&mut self) {
+        if self.selection.is_some() {
+            self.clear_note();
+        }
         self.selection = None;
         self.drag_selecting = false;
         if self.selection_paused {
@@ -431,7 +516,7 @@ impl LogView {
              pod logged, secrets included.",
             log_model::line_count(count),
             if save.format.timestamps {
-                ", with timestamps"
+                ", with full timestamps (UTC)"
             } else {
                 ", without timestamps"
             },
@@ -469,7 +554,11 @@ impl LogView {
                 Ok(Ok(Some(path))) => path,
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.set_note(Tone::Danger, format!("Could not open the save dialog: {e}"));
+                        view.set_note(
+                            Tone::Danger,
+                            format!("Could not open the save dialog: {e}"),
+                            cx,
+                        );
                         cx.notify();
                     });
                     return;
@@ -496,8 +585,11 @@ impl LogView {
                             log_model::line_count(count as u64),
                             path.display()
                         ),
+                        cx,
                     ),
-                    Err(e) => view.set_note(Tone::Danger, format!("Could not save the logs: {e}")),
+                    Err(e) => {
+                        view.set_note(Tone::Danger, format!("Could not save the logs: {e}"), cx)
+                    }
                 }
                 cx.notify();
             });
@@ -505,8 +597,29 @@ impl LogView {
         .detach();
     }
 
-    fn set_note(&mut self, tone: Tone, text: String) {
-        self.note = Some(Note { tone, text });
+    /// Shows `text` in the strip under the toolbar, in place of what was there. A muted note
+    /// goes after [`NOTE_TIMEOUT`]; an error stays until the next change.
+    fn set_note(&mut self, tone: Tone, text: String, cx: &mut Context<Self>) {
+        let note = Note { tone, text };
+        self.note = Some(note.clone());
+        self._note_timer = if tone == Tone::Muted {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(NOTE_TIMEOUT).await;
+                let _ = this.update(cx, |view, cx| {
+                    if view.note.as_ref() == Some(&note) {
+                        view.clear_note();
+                        cx.notify();
+                    }
+                });
+            })
+        } else {
+            Task::ready(())
+        };
+    }
+
+    fn clear_note(&mut self) {
+        self.note = None;
+        self._note_timer = Task::ready(());
     }
 
     fn tone_color(tone: Tone, theme: &Theme) -> Hsla {
@@ -518,48 +631,91 @@ impl LogView {
         }
     }
 
+    /// How a run of a line is drawn: the prefix in its pod's colour, the timestamp muted, and
+    /// matches over the match tint; the current match over a stronger tint, bold and underlined
+    /// in the warning colour, so it stands out from the other matches.
+    fn highlight(
+        part: log_model::Part,
+        current: bool,
+        source_color: Hsla,
+        theme: &Theme,
+    ) -> HighlightStyle {
+        match part {
+            log_model::Part::Source => HighlightStyle {
+                color: Some(source_color),
+                ..Default::default()
+            },
+            log_model::Part::Timestamp => HighlightStyle {
+                color: Some(theme.muted_foreground),
+                ..Default::default()
+            },
+            log_model::Part::Match if current => HighlightStyle {
+                color: Some(theme.foreground),
+                background_color: Some(theme::log_current_match(theme)),
+                font_weight: Some(FontWeight::BOLD),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(theme.warning),
+                    wavy: false,
+                }),
+                ..Default::default()
+            },
+            log_model::Part::Match => HighlightStyle {
+                color: Some(theme.foreground),
+                background_color: Some(theme::log_match(theme)),
+                ..Default::default()
+            },
+        }
+    }
+
     fn render_line(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let Some((id, line)) = self.snapshot.lines.at(ix) else {
             return div().into_any_element();
         };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
-        let shown = log_model::shown_line(line, self.format(), &self.query, max);
+        let shown = log_model::shown_line(line, self.line_view(), &self.query, max);
         let selected = self.selection.is_some_and(|s| s.contains(id));
         let color = match line.severity {
             Severity::Error => theme.danger,
             Severity::Warning => theme.warning,
             Severity::Normal => theme.foreground,
         };
-        let match_bg = if self.current_match == Some(id) {
-            theme::log_current_match(theme)
-        } else {
-            theme::log_match(theme)
+        let current = self.current_match == Some(id);
+        let palette = theme::log_source_colors(theme);
+        let source_color = shown
+            .color
+            .map_or(theme.info, |c| palette[c % palette.len()]);
+        let style = |part| Self::highlight(part, current, source_color, theme);
+        // The runs once, then the text split into its three parts without copying it again.
+        let parts = log_model::line_parts(&shown);
+        let runs = |range: std::ops::Range<usize>| {
+            log_model::parts_in(&parts, range)
+                .into_iter()
+                .map(|(r, part)| (r, style(part)))
+                .collect::<Vec<_>>()
         };
-        // The source prefix in the info color, so it reads apart from the line, the timestamp
-        // muted, and matches in the foreground color over the match tint.
-        let highlights = log_model::line_parts(&shown)
-            .into_iter()
-            .map(|(range, part)| {
-                let style = match part {
-                    log_model::Part::Source => HighlightStyle {
-                        color: Some(theme.info),
-                        ..Default::default()
-                    },
-                    log_model::Part::Timestamp => HighlightStyle {
-                        color: Some(theme.muted_foreground),
-                        ..Default::default()
-                    },
-                    log_model::Part::Match => HighlightStyle {
-                        color: Some(theme.foreground),
-                        background_color: Some(match_bg),
-                        ..Default::default()
-                    },
-                };
-                (range, style)
-            });
-        let text = StyledText::new(shown.text).with_highlights(highlights);
-        h_flex()
+        let (source_runs, time_runs, body_runs) = (
+            runs(0..shown.source),
+            runs(shown.source..shown.prefix),
+            runs(shown.prefix..shown.text.len()),
+        );
+        let mut text = shown.text;
+        let body = text.split_off(shown.prefix);
+        let time = text.split_off(shown.source);
+        let (source_text, has_source, has_time) =
+            (text, shown.source > 0, shown.prefix > shown.source);
+        let source = line.source.clone().filter(|_| has_source);
+        let timestamp = has_time.then_some(line.timestamp).flatten();
+        let day = has_time
+            .then(|| {
+                let lines = &self.snapshot.lines;
+                let before = (0..ix).rev().filter_map(|p| lines.at(p).map(|(_, l)| l));
+                log_model::day_separator(before, line, &self.tz)
+            })
+            .flatten();
+        let tz = self.tz.clone();
+        let row = h_flex()
             .id(("log-line", id as usize))
             .w_full()
             .px_2()
@@ -574,6 +730,7 @@ impl LogView {
                 }
             })
             .when(selected, |el| el.bg(theme.table_active))
+            .when(current, |el| el.bg(theme::log_current_line(theme)))
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 let extend = event.modifiers.shift;
                 if let Err(e) = registry::perform(&SelectLine { line: id, extend }, window, cx) {
@@ -585,12 +742,47 @@ impl LogView {
                     let _ = registry::perform(&DragSelection { line: id }, window, cx);
                 }
             })
+            // The prefix and the timestamp keep their width; wrapped text hangs past them.
+            .when(has_source, |el| {
+                el.child(
+                    div()
+                        .id(("log-source", id as usize))
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .child(StyledText::new(source_text).with_highlights(source_runs))
+                        .when_some(source, |el, source| {
+                            el.tooltip(move |window, cx| {
+                                Tooltip::new(format!(
+                                    "Pod {}, container {}",
+                                    source.pod(),
+                                    source.container()
+                                ))
+                                .build(window, cx)
+                            })
+                        }),
+                )
+            })
+            .when(has_time, |el| {
+                el.child(
+                    div()
+                        .id(("log-time", id as usize))
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .child(StyledText::new(time).with_highlights(time_runs))
+                        .when_some(timestamp, |el, ts| {
+                            el.tooltip(move |window, cx| {
+                                Tooltip::new(log_model::full_time(ts, &tz)).build(window, cx)
+                            })
+                        })
+                        .test_support(),
+                )
+            })
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .when(!self.wrap, |el| el.truncate())
-                    .child(text),
+                    .child(StyledText::new(body).with_highlights(body_runs)),
             )
             .when(shown.cut, |el| {
                 el.child(
@@ -608,276 +800,388 @@ impl LogView {
                         }),
                 )
             })
-            .test_support()
-            .into_any_element()
+            .test_support();
+        match day {
+            None => row.into_any_element(),
+            Some(day) => v_flex()
+                .w_full()
+                .child(
+                    div()
+                        .id(("log-day", id as usize))
+                        .h(px(LINE_HEIGHT))
+                        .px_2()
+                        .flex_none()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_color(theme.muted_foreground)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(day)
+                        .test_support(),
+                )
+                .child(row)
+                .into_any_element(),
+        }
     }
 
+    /// The toolbar: one row at any width ([`log_model::toolbar_fit`]). The status has its own
+    /// slot that truncates (the full text is in its tooltip); the toggles and icons are one
+    /// group that never wraps, and in a narrow tab the toggles and Save fold into a "⋯" menu.
     fn render_toolbar(&self, theme: &Theme) -> impl IntoElement {
-        let (tone, state) = log_model::state_text(&self.snapshot.state);
-        let state_color = Self::tone_color(tone, theme);
-        let full_state = state.clone();
+        let fit = log_model::toolbar_fit(self.laid_out_width);
+        let status = log_model::state_text(&self.snapshot.state, !self.is_workload());
+        let state_color = Self::tone_color(status.tone, theme);
         let lines = &self.snapshot.lines;
-        let paused = self.snapshot.paused || self.is_paused();
+        let ended = self.has_ended();
+        let paused = !ended && (self.snapshot.paused || self.is_paused());
+        let pause_text = paused.then(|| {
+            log_model::pause_text(
+                self.snapshot.held_back,
+                self.selection_paused && !self.user_paused,
+            )
+        });
         let following = self.list.is_following_tail();
         let has_query = !self.query.text.is_empty();
         let has_matches = self.search.count() > 0;
         let has_selection = self.selection.is_some();
         let timestamps = self.timestamps;
+        let workload = self.is_workload();
+        let sources = self.sources;
+        let wrap = self.wrap;
+        let count = log_model::line_count(lines.len() as u64);
+        let streams = self
+            .snapshot
+            .pods
+            .as_ref()
+            .map(|p| log_model::streams_text(p));
+        // The status's tooltip says everything the slot may cut, and what the toolbar left out.
+        let tooltip = {
+            let mut parts = vec![status.tooltip.clone().unwrap_or(status.text.clone())];
+            parts.extend(pause_text.clone());
+            parts.push(count.clone());
+            parts.extend(streams.clone());
+            if let Some(selector) = self.snapshot.pods.as_ref().and_then(|p| p.selector.clone()) {
+                parts.push(format!("Pods matching {selector}"));
+            }
+            parts.join("\n")
+        };
+        let save_menu = move |menu: PopupMenu| {
+            let item = |label: &str, lines, enabled: bool| {
+                PopupMenuItem::new(label.to_owned())
+                    .disabled(!enabled)
+                    .on_click(registry::on_click(SaveLines {
+                        lines,
+                        timestamps: Some(timestamps),
+                    }))
+            };
+            menu.label(if timestamps {
+                "As shown, with full timestamps. Not redacted."
+            } else {
+                "As shown, without timestamps. Not redacted."
+            })
+            .item(item("Save All Lines…", SaveScope::All, true))
+            .item(item(
+                "Save Matching Lines…",
+                SaveScope::Matches,
+                has_matches,
+            ))
+            .item(item(
+                "Save Selected Lines…",
+                SaveScope::Selection,
+                has_selection,
+            ))
+        };
+        let has_lines = !lines.is_empty();
         h_flex()
             .id("log-toolbar")
-            // A narrow dock wraps the controls onto a second row rather than clipping the last
-            // ones (Save among them).
-            .flex_wrap()
-            .min_h(px(super::workspace::HEADER_HEIGHT))
-            .py_0p5()
+            .h(px(super::workspace::HEADER_HEIGHT))
             .px_2()
             .gap_x_1p5()
             .flex_none()
             .min_w_0()
+            .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
             .text_xs()
+            .whitespace_nowrap()
+            // Everything but the controls: it gives way (and is cut) first, so the controls,
+            // "⋯" included, stay on screen.
             .child(
                 h_flex()
-                    .id("log-state")
-                    .gap_1()
-                    .flex_shrink(1.)
-                    .min_w(px(60.))
-                    .max_w(px(260.))
-                    .text_color(state_color)
-                    .child(div().size_1p5().flex_none().rounded_full().bg(state_color))
-                    .child(div().min_w_0().truncate().child(state))
-                    .tooltip(move |window, cx| Tooltip::new(full_state.clone()).build(window, cx))
-                    .test_support(),
-            )
-            .child(
-                div()
-                    .id("log-count")
-                    .flex_none()
-                    .font_features(super::list::tabular_figures())
-                    .text_color(theme.muted_foreground)
-                    .child(log_model::line_count(lines.len() as u64))
-                    .test_support(),
-            )
-            .when_some(self.snapshot.pods.clone(), |el, pods| {
-                let selector = pods.selector.clone();
-                el.child(
-                    div()
-                        .id("log-streams")
-                        .flex_none()
-                        .text_color(if pods.failed() > 0 {
-                            theme.warning
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(log_model::streams_text(&pods))
-                        .when_some(selector, |el, selector| {
-                            el.tooltip(move |window, cx| {
-                                Tooltip::new(format!("Pods matching {selector}")).build(window, cx)
-                            })
-                        })
-                        .test_support(),
-                )
-            })
-            .when(paused, |el| {
-                el.child(
-                    div()
-                        .id("log-paused")
-                        .flex_none()
-                        .text_color(theme.warning)
-                        .child(log_model::pause_text(
-                            self.snapshot.held_back,
-                            self.selection_paused && !self.user_paused,
-                        ))
-                        .test_support(),
-                )
-            })
-            .child(div().flex_1())
-            .child(
-                div()
-                    .w(px(220.))
-                    .min_w(px(80.))
-                    .flex_shrink(1000.)
+                    .id("log-main")
+                    .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
+                    .gap_x_1p5()
+                    // The status slot: the state, and the pause, cut to fit.
                     .child(
-                        Input::new(&self.search_input)
-                            .id("log-search")
-                            .xsmall()
-                            .cleanable(true)
-                            .prefix(Icon::new(IconName::Search).xsmall()),
-                    ),
-            )
-            .when(has_query, |el| {
-                el.child(
-                    div()
-                        .id("log-matches")
-                        .flex_none()
-                        .font_features(super::list::tabular_figures())
-                        .text_color(theme.muted_foreground)
-                        .child(if self.searching {
-                            "Searching…".to_owned()
-                        } else {
-                            log_model::match_text(&self.search, self.current_match)
+                        h_flex()
+                            .id("log-state")
+                            .gap_1()
+                            .flex_shrink(1.)
+                            .min_w(px(56.))
+                            .max_w(px(300.))
+                            .overflow_hidden()
+                            .text_color(state_color)
+                            .child(div().size_1p5().flex_none().rounded_full().bg(state_color))
+                            .child(
+                                div()
+                                    .id("log-state-text")
+                                    .flex_shrink(1.)
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(status.text)
+                                    .test_support(),
+                            )
+                            .when_some(pause_text, |el, text| {
+                                el.child(
+                                    div()
+                                        .id("log-paused")
+                                        .flex_shrink(0.5)
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.warning)
+                                        .child(format!("· {text}"))
+                                        .test_support(),
+                                )
+                            })
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tooltip.clone()).build(window, cx)
+                            })
+                            .test_support(),
+                    )
+                    .when(fit.counts, |el| {
+                        el.child(
+                            div()
+                                .id("log-count")
+                                .flex_none()
+                                .font_features(super::list::tabular_figures())
+                                .text_color(theme.muted_foreground)
+                                .child(count)
+                                .test_support(),
+                        )
+                        .when_some(
+                            self.snapshot.pods.clone(),
+                            |el, pods| {
+                                el.child(
+                                    div()
+                                        .id("log-streams")
+                                        .min_w_0()
+                                        .flex_shrink(1.)
+                                        .truncate()
+                                        .text_color(if pods.failed() > 0 {
+                                            theme.warning
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(log_model::streams_text(&pods))
+                                        .test_support(),
+                                )
+                            },
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .w(px(220.))
+                            .min_w(px(72.))
+                            .flex_shrink(1000.)
+                            .overflow_hidden()
+                            .child(
+                                Input::new(&self.search_input)
+                                    .id("log-search")
+                                    .xsmall()
+                                    .cleanable(true)
+                                    .prefix(Icon::new(IconName::Search).xsmall()),
+                            ),
+                    )
+                    .when(has_query, |el| {
+                        el.when(fit.match_count, |el| {
+                            el.child(
+                                div()
+                                    .id("log-matches")
+                                    .flex_none()
+                                    .font_features(super::list::tabular_figures())
+                                    .text_color(theme.muted_foreground)
+                                    .child(if self.searching {
+                                        "Searching…".to_owned()
+                                    } else {
+                                        log_model::match_text(&self.search, self.current_match)
+                                    })
+                                    .test_support(),
+                            )
                         })
-                        .test_support(),
-                )
-                .child(
-                    Button::new("log-prev-match")
-                        .icon(IconName::ChevronUp)
-                        .xsmall()
-                        .ghost()
-                        .disabled(!has_matches)
-                        .tooltip(format!(
-                            "Previous match ({})",
-                            registry::key_hint("secondary-shift-g")
-                        ))
-                        .on_click(registry::on_click(PrevMatch)),
-                )
-                .child(
-                    Button::new("log-next-match")
-                        .icon(IconName::ChevronDown)
-                        .xsmall()
-                        .ghost()
-                        .disabled(!has_matches)
-                        .tooltip(format!(
-                            "Next match ({})",
-                            registry::key_hint("secondary-g")
-                        ))
-                        .on_click(registry::on_click(NextMatch)),
-                )
-            })
+                        // Beside the count while it shows; else among the controls, which
+                        // are never cut.
+                        .when(fit.match_count, |el| {
+                            el.children(Self::match_buttons(has_matches))
+                        })
+                    })
+                    .test_support(),
+            )
+            // The controls: one group that never wraps.
             .child(
-                Button::new("log-timestamps")
-                    .xsmall()
-                    .ghost()
-                    .label("Timestamps")
-                    .selected(timestamps)
-                    .tooltip("Show or hide timestamps (T)")
-                    .on_click(registry::on_click(ToggleTimestamps)),
-            )
-            .when(self.is_workload(), |el| {
-                el.child(
-                    Button::new("log-sources")
-                        .xsmall()
-                        .ghost()
-                        .label("Pods")
-                        .selected(self.sources)
-                        .tooltip("Show or hide each line's pod and container (P)")
-                        .on_click(registry::on_click(ToggleSources)),
-                )
-            })
-            .child(
-                Button::new("log-wrap")
-                    .xsmall()
-                    .ghost()
-                    .label("Wrap")
-                    .selected(self.wrap)
-                    .tooltip("Wrap long lines (W)")
-                    .on_click(registry::on_click(ToggleWrap)),
-            )
-            .when(self.follows(), |el| {
-                el.child(
-                    Button::new("log-pause")
-                        .icon(if paused {
-                            IconName::Play
-                        } else {
-                            IconName::Pause
+                h_flex()
+                    .id("log-controls")
+                    .flex_none()
+                    .gap_x_1()
+                    .when(has_query && !fit.match_count, |el| {
+                        el.children(Self::match_buttons(has_matches))
+                    })
+                    .when(fit.toggles, |el| {
+                        el.child(
+                            Button::new("log-timestamps")
+                                .xsmall()
+                                .ghost()
+                                .label("Timestamps")
+                                .selected(timestamps)
+                                .tooltip(format!(
+                                    "Show or hide timestamps (T), shown in {}",
+                                    self.tz_name
+                                ))
+                                .on_click(registry::on_click(ToggleTimestamps)),
+                        )
+                        .when(workload, |el| {
+                            el.child(
+                                Button::new("log-sources")
+                                    .xsmall()
+                                    .ghost()
+                                    .label("Pods")
+                                    .selected(sources)
+                                    .tooltip("Show or hide each line's pod (P)")
+                                    .on_click(registry::on_click(ToggleSources)),
+                            )
                         })
-                        .xsmall()
-                        .ghost()
-                        .tooltip(if paused {
-                            "Resume following (Space)"
-                        } else {
-                            "Pause following (Space)"
+                        .child(
+                            Button::new("log-wrap")
+                                .xsmall()
+                                .ghost()
+                                .label("Wrap")
+                                .selected(wrap)
+                                .tooltip("Wrap long lines (W)")
+                                .on_click(registry::on_click(ToggleWrap)),
+                        )
+                    })
+                    .when(self.can_pause(), |el| {
+                        el.child(
+                            Button::new("log-pause")
+                                .icon(if paused {
+                                    IconName::Play
+                                } else {
+                                    IconName::Pause
+                                })
+                                .xsmall()
+                                .ghost()
+                                .tooltip(if paused {
+                                    "Resume following (Space)"
+                                } else {
+                                    "Pause following (Space)"
+                                })
+                                .on_click(registry::on_click(TogglePause)),
+                        )
+                    })
+                    .when(!following && has_lines, |el| {
+                        // Only a live, followed read has anything to follow.
+                        el.when(self.follows() && !ended, |el| {
+                            el.child(
+                                div()
+                                    .id("log-not-following")
+                                    .text_color(theme.muted_foreground)
+                                    .child("Not following")
+                                    .test_support(),
+                            )
                         })
-                        .on_click(registry::on_click(TogglePause)),
-                )
-            })
-            .when(!following && !lines.is_empty(), |el| {
-                el.child(
-                    Button::new("log-jump")
-                        .icon(IconName::ArrowDown)
-                        .xsmall()
-                        .ghost()
-                        .tooltip("Jump to the newest line and follow (End)")
-                        .on_click(registry::on_click(JumpToEnd)),
-                )
-            })
-            .child(
-                Button::new("log-save")
-                    .icon(IconName::FileText)
-                    .xsmall()
-                    .ghost()
-                    .tooltip("Save to a file")
-                    .disabled(lines.is_empty())
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                        let item = |label: &str, lines, enabled: bool| {
-                            PopupMenuItem::new(label.to_owned())
-                                .disabled(!enabled)
-                                .on_click(registry::on_click(SaveLines {
-                                    lines,
-                                    timestamps: Some(timestamps),
-                                }))
-                        };
-                        menu.label(if timestamps {
-                            "As shown, with timestamps. Not redacted."
+                        .child(
+                            Button::new("log-jump")
+                                .icon(IconName::ArrowDown)
+                                .xsmall()
+                                .ghost()
+                                .when(fit.jump_label, |b| b.label("Jump to newest"))
+                                .tooltip("Jump to the newest line and follow (End)")
+                                .on_click(registry::on_click(JumpToEnd)),
+                        )
+                    })
+                    .map(|el| {
+                        if fit.toggles {
+                            el.child(
+                                Button::new("log-save")
+                                    .icon(IconName::FileText)
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip("Save to a file")
+                                    .disabled(!has_lines)
+                                    .dropdown_menu_with_anchor(
+                                        Anchor::TopRight,
+                                        move |menu, _, _| save_menu(menu),
+                                    ),
+                            )
                         } else {
-                            "As shown, without timestamps. Not redacted."
-                        })
-                        .item(item("Save All Lines…", SaveScope::All, true))
-                        .item(item(
-                            "Save Matching Lines…",
-                            SaveScope::Matches,
-                            has_matches,
-                        ))
-                        .item(item(
-                            "Save Selected Lines…",
-                            SaveScope::Selection,
-                            has_selection,
-                        ))
-                    }),
+                            el.child(
+                                Button::new("log-more")
+                                    .icon(IconName::Ellipsis)
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip("View options and Save")
+                                    .dropdown_menu_with_anchor(
+                                        Anchor::TopRight,
+                                        move |menu, _, _| {
+                                            let menu = menu
+                                                .item(toggle_item(
+                                                    "Timestamps",
+                                                    timestamps,
+                                                    ToggleTimestamps,
+                                                ))
+                                                .when(workload, |menu| {
+                                                    menu.item(toggle_item(
+                                                        "Pod Prefix",
+                                                        sources,
+                                                        ToggleSources,
+                                                    ))
+                                                })
+                                                .item(toggle_item("Wrap Lines", wrap, ToggleWrap))
+                                                .separator();
+                                            if has_lines { save_menu(menu) } else { menu }
+                                        },
+                                    ),
+                            )
+                        }
+                    })
+                    .test_support(),
             )
+            .test_support()
     }
 
-    /// The strips under the toolbar: the selection, an ended session's error, and the last
-    /// copy or save.
-    fn render_notes(&self, theme: &Theme) -> Vec<AnyElement> {
-        let mut notes = Vec::new();
-        if let Some(selection) = self.selection {
-            let lines = &self.snapshot.lines;
-            let count = selection.lines(lines).count() as u64;
-            let mut text = format!(
-                "{} selected. {} copies and Save writes them as shown, not redacted. Esc clears.",
-                log_model::line_count(count),
-                registry::key_hint("secondary-c")
-            );
-            if selection.is_cut(lines) {
-                text.push_str(" Some selected lines left the buffer.");
-            }
-            notes.push(
-                notice("log-selection", text, theme.muted_foreground)
-                    .test_support()
-                    .into_any_element(),
-            );
-        }
-        // A failure, or a followed stream that stopped on its own; a deleted pod's end shows in
-        // the status ("Ended · pod deleted").
-        if let LogState::Ended { error, pod_deleted } = &self.snapshot.state
-            && !self.snapshot.lines.is_empty()
-            && (error.is_some() || !(self.request.previous || *pod_deleted))
-        {
-            let (text, color) = match error {
-                Some(error) => (format!("The stream ended: {error}"), theme.danger),
-                None => ("The stream ended.".to_owned(), theme.muted_foreground),
-            };
-            notes.push(
-                notice_with("log-ended", text, color, reconnect_button())
-                    .test_support()
-                    .into_any_element(),
-            );
-        }
+    /// The search's previous and next buttons.
+    fn match_buttons(has_matches: bool) -> [Button; 2] {
+        [
+            Button::new("log-prev-match")
+                .icon(IconName::ChevronUp)
+                .xsmall()
+                .ghost()
+                .disabled(!has_matches)
+                .tooltip(format!(
+                    "Previous match ({})",
+                    registry::key_hint("secondary-shift-g")
+                ))
+                .on_click(registry::on_click(PrevMatch)),
+            Button::new("log-next-match")
+                .icon(IconName::ChevronDown)
+                .xsmall()
+                .ghost()
+                .disabled(!has_matches)
+                .tooltip(format!(
+                    "Next match ({})",
+                    registry::key_hint("secondary-g")
+                ))
+                .on_click(registry::on_click(NextMatch)),
+        ]
+    }
+
+    /// The strip under the toolbar: the last transient thing said (a copy or save note, else
+    /// the selection), one at a time.
+    fn render_notice(&self, theme: &Theme) -> Option<AnyElement> {
         if let Some(note) = &self.note {
-            notes.push(
+            return Some(
                 notice(
                     "log-note",
                     note.text.clone(),
@@ -887,47 +1191,159 @@ impl LogView {
                 .into_any_element(),
             );
         }
-        notes
+        let selection = self.selection?;
+        let lines = &self.snapshot.lines;
+        let count = selection.lines(lines).count() as u64;
+        let mut text = format!(
+            "{} selected. {} copies and Save writes them as shown, not redacted. Esc clears.",
+            log_model::line_count(count),
+            registry::key_hint("secondary-c")
+        );
+        if selection.is_cut(lines) {
+            text.push_str(" Some selected lines left the buffer.");
+        }
+        Some(
+            notice("log-selection", text, theme.muted_foreground)
+                .test_support()
+                .into_any_element(),
+        )
+    }
+
+    /// An ended session's error, over lines it read: what it means in plain words, and the
+    /// server's text under it, wrapped. (Without lines, the empty state says it.)
+    fn render_banner(&self, theme: &Theme) -> Option<AnyElement> {
+        let LogState::Ended { error, pod_deleted } = &self.snapshot.state else {
+            return None;
+        };
+        // A failure, or a followed stream that stopped on its own; a deleted pod's end shows in
+        // the status ("Ended · pod deleted"), and an empty tab says it in its body.
+        if self.snapshot.lines.is_empty()
+            || (error.is_none() && (self.request.previous || *pod_deleted))
+        {
+            return None;
+        }
+        let (color, headline, detail) = match (error, self.snapshot.state.previous_not_available())
+        {
+            (_, Some(said)) => (
+                theme.warning,
+                log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
+                Some(said.to_owned()),
+            ),
+            (Some(error), None) => {
+                let explained = log_model::explain(error, !self.is_workload());
+                (
+                    theme.danger,
+                    format!("The stream ended. {}", explained.headline),
+                    explained.detail,
+                )
+            }
+            (None, None) => (theme.muted_foreground, "The stream ended.".to_owned(), None),
+        };
+        Some(
+            h_flex()
+                .id("log-ended")
+                .px_3()
+                .py_1()
+                .gap_2()
+                .items_start()
+                .flex_none()
+                .text_xs()
+                .bg(color.opacity(0.08))
+                .border_b_1()
+                .border_color(color.opacity(0.3))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(div().text_color(color).child(headline))
+                        .when_some(detail, |el, detail| {
+                            el.child(
+                                div()
+                                    .id("log-ended-detail")
+                                    .text_color(theme.muted_foreground)
+                                    .child(detail)
+                                    .test_support(),
+                            )
+                        }),
+                )
+                .when(self.can_restart(), |el| {
+                    el.child(div().flex_none().child(reconnect_button()))
+                })
+                .test_support()
+                .into_any_element(),
+        )
     }
 
     /// What to show instead of lines, while there are none.
     fn render_empty(&self, theme: &Theme) -> AnyElement {
-        let (spinner, color, text, detail): (bool, Hsla, &str, Option<String>) =
-            match &self.snapshot.state {
-                LogState::Connecting => (true, theme.muted_foreground, "Connecting…", None),
-                LogState::Streaming if self.follows() => (
-                    false,
-                    theme.muted_foreground,
-                    "Waiting for log lines…",
-                    None,
+        let pod = !self.is_workload();
+        let (spinner, color, text, detail): (bool, Hsla, String, Option<String>) = match &self
+            .snapshot
+            .state
+        {
+            LogState::Connecting => (true, theme.muted_foreground, "Connecting…".into(), None),
+            LogState::Streaming if self.follows() => (
+                false,
+                theme.muted_foreground,
+                "Waiting for log lines…".into(),
+                None,
+            ),
+            LogState::Streaming => (false, theme.muted_foreground, "Reading…".into(), None),
+            LogState::Reconnecting { back_off: true, .. } => (
+                true,
+                theme.warning,
+                format!("{}…", log_model::BACK_OFF),
+                Some(
+                    "The container keeps crashing; the kubelet restarts it after a delay \
+                         that grows with each crash."
+                        .to_owned(),
                 ),
-                LogState::Streaming => (false, theme.muted_foreground, "Reading…", None),
-                LogState::Reconnecting { error, attempt } => (
-                    true,
-                    theme.warning,
-                    "Reconnecting…",
-                    Some(match error {
-                        Some(e) => format!("Attempt {attempt}: {e}"),
-                        None => format!("Attempt {attempt}"),
-                    }),
-                ),
-                LogState::Ended { error: Some(e), .. } => (
-                    false,
-                    theme.danger,
-                    "Could not read the logs.",
-                    Some(e.clone()),
-                ),
-                // The log was read; the pod just logged nothing before it was deleted.
-                LogState::Ended {
-                    pod_deleted: true, ..
-                } => (
-                    false,
-                    theme.muted_foreground,
-                    "No log lines.",
-                    Some("The pod was deleted.".to_owned()),
-                ),
-                LogState::Ended { .. } => (false, theme.muted_foreground, "No log lines.", None),
-            };
+            ),
+            LogState::Reconnecting { error, attempt, .. } => (
+                true,
+                theme.warning,
+                "Reconnecting…".into(),
+                Some(match error {
+                    Some(e) => {
+                        let explained = log_model::explain(e, pod);
+                        format!(
+                            "Attempt {attempt}. {} {}",
+                            explained.headline,
+                            explained.detail.unwrap_or_default()
+                        )
+                    }
+                    None => format!("Attempt {attempt}"),
+                }),
+            ),
+            state @ LogState::Ended { error: Some(e), .. } => {
+                match state.previous_not_available() {
+                    Some(kubelet) => (
+                        false,
+                        theme.warning,
+                        log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
+                        Some(format!(
+                            "The container may still be restarting. {} said: {kubelet}",
+                            log_model::previous_speaker(kubelet)
+                        )),
+                    ),
+                    None => {
+                        let explained = log_model::explain(e, pod);
+                        (false, theme.danger, explained.headline, explained.detail)
+                    }
+                }
+            }
+            // The log was read; the pod just logged nothing before it was deleted.
+            LogState::Ended {
+                pod_deleted: true, ..
+            } => (
+                false,
+                theme.muted_foreground,
+                "No log lines.".into(),
+                Some("The pod was deleted.".to_owned()),
+            ),
+            LogState::Ended { .. } => (false, theme.muted_foreground, "No log lines.".into(), None),
+        };
         v_flex()
             .id("log-empty")
             .flex_1()
@@ -946,23 +1362,16 @@ impl LogView {
             .when_some(detail, |el, detail| {
                 el.child(
                     div()
+                        .id("log-empty-detail")
                         .max_w(px(640.))
                         .text_xs()
+                        .text_center()
                         .text_color(theme.muted_foreground)
-                        .child(detail),
+                        .child(detail)
+                        .test_support(),
                 )
             })
-            // Not for a deleted pod: there is nothing to reconnect to.
-            .when(
-                matches!(
-                    self.snapshot.state,
-                    LogState::Ended {
-                        pod_deleted: false,
-                        ..
-                    }
-                ),
-                |el| el.child(reconnect_button()),
-            )
+            .when(self.can_restart(), |el| el.child(reconnect_button()))
             .test_support()
             .into_any_element()
     }
@@ -979,6 +1388,13 @@ fn reconnect_button() -> Button {
             registry::key_hint("secondary-r")
         ))
         .on_click(registry::on_click(ReconnectLogs))
+}
+
+/// A checked entry of the "⋯" menu that performs `action`.
+fn toggle_item<A: Action>(label: &str, on: bool, action: A) -> PopupMenuItem {
+    PopupMenuItem::new(label.to_owned())
+        .checked(on)
+        .on_click(registry::on_click(action))
 }
 
 impl DockItem for LogView {
@@ -1034,8 +1450,20 @@ impl DockItem for LogView {
 }
 
 impl Render for LogView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // The toolbar needs the tab's width, known only after layout: when it changed, draw
+        // again with the new one.
+        let width = f32::from(self.bounds.bounds().size.width);
+        let measured = (width > 0.).then_some(width);
+        if measured != self.laid_out_width {
+            self.laid_out_width = measured;
+            // Weak: a closed tab must not live on until the next frame.
+            let this = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
+        }
         let body = if self.snapshot.lines.is_empty() {
             self.render_empty(&theme)
         } else {
@@ -1078,8 +1506,10 @@ impl Render for LogView {
             .size_full()
             .min_h_0()
             .bg(theme.background)
+            .track_scroll(&self.bounds)
             .child(self.render_toolbar(&theme))
-            .children(self.render_notes(&theme))
+            .children(self.render_banner(&theme))
+            .children(self.render_notice(&theme))
             .child(body)
             .test_support()
     }

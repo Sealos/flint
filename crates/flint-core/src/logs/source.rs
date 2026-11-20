@@ -170,6 +170,9 @@ fn is_starting(message: &str) -> bool {
 pub(crate) enum AfterEnd {
     /// The container may run again (it restarts, or the pod is still running): reconnect.
     Restarts,
+    /// As [`AfterEnd::Restarts`], but the pod's status says the container is waiting in
+    /// `CrashLoopBackOff`: the kubelet restarts it after its back-off, which can take minutes.
+    BackOff,
     /// The container finished for good.
     Finished,
     /// The pod is being deleted (it has a `deletionTimestamp`) but the container has not
@@ -340,7 +343,7 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         (None, Some(c)) => c.restart_policy.as_deref().unwrap_or("Once"),
         (None, None) => pod_policy,
     };
-    let exit_code = status
+    let container_status = status
         .into_iter()
         .flat_map(|s| {
             s.container_statuses
@@ -348,9 +351,12 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
                 .flatten()
                 .chain(s.init_container_statuses.iter().flatten())
         })
-        .find(|c| Some(&c.name) == name.as_ref())
+        .find(|c| Some(&c.name) == name.as_ref());
+    let exit_code = container_status
         .and_then(|c| c.state.as_ref()?.terminated.as_ref())
         .map(|t| t.exit_code);
+    let waiting_reason =
+        container_status.and_then(|c| c.state.as_ref()?.waiting.as_ref()?.reason.as_deref());
     if deleting {
         return if exit_code.is_some() {
             AfterEnd::Deleting
@@ -362,8 +368,28 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         (Some(_), "Never") | (Some(0), "OnFailure" | "Once") => AfterEnd::Finished,
         // A failed init container is retried unless the pod never restarts anything.
         (Some(_), "Once") if pod_policy == "Never" => AfterEnd::Finished,
+        _ if waiting_reason == Some(CRASH_LOOP) => AfterEnd::BackOff,
         _ => AfterEnd::Restarts,
     }
+}
+
+/// The waiting reason of a container the kubelet restarts after a back-off.
+pub(crate) const CRASH_LOOP: &str = "CrashLoopBackOff";
+
+/// A line the kubelet sends as the whole log when it cannot read a container's log file: `unable
+/// to retrieve container logs for containerd://…` (early in a restart, or the container was
+/// removed) or `failed to try resolving symlinks in path "/var/log/pods/…": … no such file or
+/// directory` (the file is gone). A real log line always starts with a timestamp (Flint asks
+/// for them), so one without, saying this, is the kubelet speaking.
+pub(crate) fn is_unavailable_notice(line: &str) -> bool {
+    line.starts_with("unable to retrieve container logs for ")
+        || line.starts_with("failed to try resolving symlinks in path ")
+}
+
+/// Whether an error opening the previous instance's log says there is no such instance (its
+/// container is gone): `previous terminated container "app" in pod "p" not found`.
+pub(crate) fn is_previous_missing(message: &str) -> bool {
+    message.contains("previous terminated container")
 }
 
 /// Splits a byte stream into lines. Invalid UTF-8 is replaced rather than ending the stream, and
@@ -613,6 +639,46 @@ mod tests {
             AfterEnd::Restarts,
             "the sidecar still runs"
         );
+    }
+
+    // covers UP-40: a crash-looping container is waited for as the kubelet's back-off, not as a
+    // broken connection; the kubelet's "unable to retrieve" answer is told apart from a line.
+    #[test]
+    fn a_crash_looping_container_is_in_back_off() {
+        let waiting = |reason: &str| {
+            pod(json!({
+                "spec": {"restartPolicy": "Always", "containers": [{"name": "app"}]},
+                "status": {"phase": "Running", "containerStatuses": [
+                    {"name": "app", "image": "i", "imageID": "", "ready": false, "restartCount": 4,
+                     "state": {"waiting": {"reason": reason}},
+                     "lastState": {"terminated": {"exitCode": 1}}}]},
+            }))
+        };
+        assert_eq!(
+            fate(Some(&waiting("CrashLoopBackOff")), Some("app")),
+            AfterEnd::BackOff
+        );
+        assert_eq!(
+            fate(Some(&waiting("CrashLoopBackOff")), None),
+            AfterEnd::BackOff
+        );
+        assert_eq!(
+            fate(Some(&waiting("ContainerCreating")), Some("app")),
+            AfterEnd::Restarts
+        );
+        assert!(is_unavailable_notice(
+            "unable to retrieve container logs for containerd://c54f232e5b"
+        ));
+        assert!(!is_unavailable_notice(
+            "2024-05-01T12:00:00Z unable to retrieve container logs for x"
+        ));
+        assert!(is_unavailable_notice(
+            "failed to try resolving symlinks in path \"/var/log/pods/demo_p_1/app/0.log\": \
+             lstat /var/log/pods/demo_p_1/app/0.log: no such file or directory"
+        ));
+        assert!(is_previous_missing(
+            "BadRequest: previous terminated container \"app\" in pod \"p\" not found"
+        ));
     }
 
     fn with_init(pod_policy: &str, sidecar: bool, code: i32) -> Pod {

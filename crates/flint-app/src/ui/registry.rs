@@ -195,7 +195,9 @@ actions!(
         /// Save the lines matching the search to a file.
         SaveMatchingLines,
         /// Save the selected lines to a file.
-        SaveSelectedLines
+        SaveSelectedLines,
+        /// Esc in the log search field: clear the search, or (when empty) go back to the lines.
+        LeaveSearch
     ]
 );
 
@@ -1187,6 +1189,8 @@ pub const LOG_VIEW: &str = "LogView";
 pub const TERMINAL: &str = "Terminal";
 /// Plain keys in a log tab, but not while typing in its search field.
 const LOG_PLAIN: &str = "LogView && !Input";
+/// Keys meant for the log tab's search field itself (Esc), which the field passes on.
+const LOG_SEARCH: &str = "LogView > Input";
 
 fn build_unit<A: Action + Default>(args: Value) -> Result<Box<dyn Action>, String> {
     match args {
@@ -1734,6 +1738,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .keys(&["escape"], Some(LOG_PLAIN)),
+        Spec::unit::<LeaveSearch>(
+            "Leave Log Search",
+            "Clear the log search; when it is empty, move focus back to the lines.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["escape"], Some(LOG_SEARCH))
+        .hidden(),
         Spec::unit::<CopyLines>(
             "Copy Selected Lines",
             "Copy the selected lines as shown, without redaction.",
@@ -2124,15 +2135,33 @@ pub mod tests {
                     spec.name
                 );
             }
-            // Plain keys never fire while typing in a field.
-            if spec.keys.iter().any(|k| !k.contains('-')) {
+            for key in spec.keys {
                 assert!(
-                    spec.key_context.is_some_and(|c| c.contains("!Input")),
-                    "{} binds a plain key outside the text-field guard",
+                    plain_key_allowed(key, spec.key_context),
+                    "{} binds the plain key {key} outside the text-field guard",
                     spec.name
                 );
             }
         }
+    }
+
+    /// Plain keys never fire while typing in a field, except Esc meant for the log search field
+    /// itself (which the field passes on). Keys with a modifier are not plain.
+    fn plain_key_allowed(key: &str, context: Option<&str>) -> bool {
+        key.contains('-')
+            || context.is_some_and(|c| c.contains("!Input"))
+            || (key == "escape" && context == Some(super::LOG_SEARCH))
+    }
+
+    #[test]
+    fn only_esc_may_reach_the_log_search_field() {
+        let search = Some(super::LOG_SEARCH);
+        assert!(plain_key_allowed("escape", search));
+        assert!(!plain_key_allowed("t", search));
+        assert!(!plain_key_allowed("enter", search));
+        assert!(plain_key_allowed("secondary-f", search));
+        assert!(plain_key_allowed("t", Some("LogView && !Input")));
+        assert!(!plain_key_allowed("escape", Some("Workspace")));
     }
 
     // covers UP-41: on Linux, `secondary-` app shortcuts become Ctrl ones. Every one that is

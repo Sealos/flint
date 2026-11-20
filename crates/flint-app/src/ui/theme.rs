@@ -92,9 +92,36 @@ pub fn log_match(theme: &Theme) -> Hsla {
     theme.warning.opacity(0.16)
 }
 
-/// The background of the current search match (where next and previous move).
+/// The background of the current search match (where next and previous move): a stronger
+/// tint than the other matches; the view also draws it bold and underlined in the warning color.
 pub fn log_current_match(theme: &Theme) -> Hsla {
-    theme.warning.opacity(0.3)
+    // Dark's warning is bright: a stronger tint would wash out the light text over it.
+    theme
+        .warning
+        .opacity(if theme.mode.is_dark() { 0.3 } else { 0.42 })
+}
+
+/// The background of the line holding the current search match, so it stands out from the
+/// other matching lines at a glance.
+pub fn log_current_line(theme: &Theme) -> Hsla {
+    theme.warning.opacity(0.07)
+}
+
+/// The colours of workload pod prefixes in a log tab, one per pod in the order pods are first
+/// seen (#62). Red and yellow are left out: they mark error and warning lines.
+pub fn log_source_colors(theme: &Theme) -> [Hsla; 4] {
+    // In the light theme a shade darker, so a prefix stays readable on a selected line's tint.
+    let shade = |c: Hsla| {
+        if theme.mode.is_dark() {
+            c
+        } else {
+            Hsla {
+                l: (c.l - 0.06).max(0.),
+                ..c
+            }
+        }
+    };
+    [theme.blue, theme.magenta, theme.cyan, theme.green].map(shade)
 }
 
 /// Installs Flint Light and Flint Dark in place of gpui-component's defaults, showing `mode`.
@@ -149,7 +176,10 @@ pub fn show(mode: ThemeMode, cx: &mut App) {
 #[cfg(test)]
 pub(super) mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
-    use super::{THEMES, chrome, log_current_match, log_match, resolve, themes};
+    use super::{
+        THEMES, chrome, log_current_line, log_current_match, log_match, log_source_colors, resolve,
+        themes,
+    };
     use crate::ui::accent::{ACCENT, CANDIDATES};
     use flint_core::Appearance;
     use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, try_parse_color};
@@ -528,9 +558,15 @@ pub(super) mod tests {
         // row). Matched text is drawn in the foreground color over the match tint, also inside
         // a selected line.
         let selected_line = base.blend(t.table_active);
+        let current_line = base.blend(log_current_line(t));
         for (bg_name, bg, under) in [
             ("search match", log_match(t), base),
-            ("current match", log_current_match(t), base),
+            ("current match", log_current_match(t), current_line),
+            (
+                "search match on the current line",
+                log_match(t),
+                current_line,
+            ),
             (
                 "search match in a selected line",
                 log_match(t),
@@ -549,6 +585,30 @@ pub(super) mod tests {
                 under,
                 BODY,
             );
+        }
+        // Lines on the current match's line, and workload pod prefixes (one colour per pod) on
+        // the background, the current line and a selected line.
+        need(
+            "log text on the current match's line",
+            t.foreground,
+            log_current_line(t),
+            base,
+            BODY,
+        );
+        for (i, color) in log_source_colors(t).into_iter().enumerate() {
+            for (bg_name, bg) in [
+                ("the background", base),
+                ("a selected line", selected_line),
+                ("the current match's line", current_line),
+            ] {
+                need(
+                    &format!("log pod prefix {i} on {bg_name}"),
+                    color,
+                    bg,
+                    base,
+                    BODY,
+                );
+            }
         }
         failures
     }
@@ -703,6 +763,32 @@ pub(super) mod tests {
         let rt = -rad(2. * theta).sin() * rc;
         ((dl / sl).powi(2) + (dc / sc).powi(2) + (dh / sh).powi(2) + rt * (dc / sc) * (dh / sh))
             .sqrt()
+    }
+
+    /// Workload pod prefixes in a log tab must tell pods apart (#62): every pair of prefix
+    /// colours differs clearly, in both themes.
+    // covers UP-45
+    #[test]
+    fn log_pod_prefix_colors_tell_pods_apart() {
+        // Clearly told apart at a glance in small text (10 is already plainly visible).
+        const APART: f32 = 15.;
+        let (light, dark) = themes(&ACCENT);
+        let mut failures = Vec::new();
+        for t in [resolved(light), resolved(dark)] {
+            let colors = log_source_colors(&t);
+            for (i, a) in colors.iter().enumerate() {
+                for (j, b) in colors.iter().enumerate().skip(i + 1) {
+                    let difference = delta_e(*a, *b);
+                    if difference < APART {
+                        failures.push(format!(
+                            "{}: prefix colours {i} and {j} differ by {difference:.1}, need {APART}",
+                            t.theme_name()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// How far apart (CIEDE2000) the YAML view's key and value colors must be: enough to tell
