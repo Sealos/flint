@@ -488,3 +488,27 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
             .all(|r| r.outcome == flint_core::activity::Outcome::Failed)
     );
 }
+
+// covers UP-16: a `list_clusters` call ended by its deadline while it probes is still recorded
+// with the clusters it read about, so it shows in their activity.
+#[tokio::test(start_paused = true)]
+async fn a_probe_past_the_deadline_keeps_its_clusters() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        deadline: Duration::from_secs(7),
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let mut client = Client::start(&server, 64 * 1024).await;
+    client.call(1, "list_clusters", json!({})).await;
+    let reply = client.next().await;
+    assert_eq!(reply["id"], json!(1), "{reply}");
+    assert!(text(&reply).starts_with("timed out after 7s"), "{reply}");
+    let records = || flint_core::activity::read(dir.path());
+    wait_for("the call is recorded", || records().len() == 1).await;
+    let record = records().remove(0);
+    assert_eq!(record.tool, "list_clusters");
+    assert_eq!(record.outcome, flint_core::activity::Outcome::Failed);
+    assert_eq!(record.probed.len(), 1, "{record:?}");
+}

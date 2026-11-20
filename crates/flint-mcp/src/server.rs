@@ -639,16 +639,16 @@ impl ServerHandler for FlintMcp {
             () = cancelled.cancelled() => None,
         };
         let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
-        // The reply, the record its tool left when it is the outcome, and the cluster's server.
-        let (result, record, server, endpoint) = match turn {
+        // The reply, the record its tool left when it is the outcome, and what the call learned
+        // on its way (for a record of its own otherwise).
+        let (result, record, note) = match turn {
             // Cancelled while it waited for a turn.
             None => (
                 Err(rmcp::ErrorData::internal_error("cancelled", None)),
                 None,
-                None,
-                None,
+                CallNote::default(),
             ),
-            Some(Err(busy)) => (failed(&busy.to_string()), None, None, None),
+            Some(Err(busy)) => (failed(&busy.to_string()), None, CallNote::default()),
             Some(Ok(turn)) => {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -669,15 +669,12 @@ impl ServerHandler for FlintMcp {
                         }
                     };
                     drop(turn);
-                    let (record, server, endpoint) = CALL.with(|c| {
+                    let (record, note) = CALL.with(|c| {
                         let mut c = c.borrow_mut();
-                        (
-                            c.record.take().filter(|_| finished),
-                            c.server.clone(),
-                            c.endpoint.clone(),
-                        )
+                        let record = c.record.take().filter(|_| finished);
+                        (record, std::mem::take(&mut *c))
                     });
-                    (result, record, server, endpoint)
+                    (result, record, note)
                 })
                 .await
             }
@@ -693,14 +690,16 @@ impl ServerHandler for FlintMcp {
                 Ok(_) => 0,
                 Err(error) => error.message.len(),
             };
+            // A call that ended early is still shown with the clusters it read about
+            // (`list_clusters`' probes).
             let reached = activity::Reached {
-                server: endpoint.filter(|_| names_cluster),
-                probed: Vec::new(),
+                server: note.endpoint.filter(|_| names_cluster),
+                probed: note.probed,
             };
             let record = activity::ActivityRecord {
                 at_ms: activity::now_ms(),
                 tool,
-                server: server.filter(|_| names_cluster),
+                server: note.server.filter(|_| names_cluster),
                 cluster: named.cluster,
                 kind: named.kind,
                 namespace: named.namespace,
