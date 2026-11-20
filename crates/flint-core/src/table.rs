@@ -490,14 +490,6 @@ impl Interner {
         }
     }
 
-    /// Prunes, and prunes again after [`PRUNE_MIN`] new strings: for a relist, whose old rows
-    /// the snapshot published last still holds, so their strings survive this prune and would
-    /// otherwise count as kept until the next one.
-    pub fn prune_soon_again(&mut self) {
-        self.prune();
-        self.kept = 0;
-    }
-
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.set.len()
