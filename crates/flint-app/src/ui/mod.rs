@@ -13,6 +13,7 @@ mod automation;
 mod clusters;
 mod detail;
 mod dock;
+mod dock_model;
 #[cfg(test)]
 mod dock_tests;
 mod list;

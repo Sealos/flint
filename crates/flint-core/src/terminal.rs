@@ -328,7 +328,17 @@ impl TerminalModel {
     /// program knows it was pasted, with any escape character removed so the paste cannot end
     /// itself early; otherwise line breaks become carriage returns, as typed Return keys would.
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
-        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+        self.paste_bytes_in(text, self.bracketed_paste())
+    }
+
+    /// Whether the program asked for bracketed paste, so a paste reaches it marked as one
+    /// instead of as typed lines that each run.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    fn paste_bytes_in(&self, text: &str, bracketed: bool) -> Vec<u8> {
+        if bracketed {
             let mut out = b"\x1b[200~".to_vec();
             out.extend(text.replace('\x1b', "").bytes());
             out.extend_from_slice(b"\x1b[201~");
@@ -625,8 +635,9 @@ mod tests {
     fn paste_follows_bracketed_paste_mode() {
         let mut term = model(10, 2);
         assert_eq!(term.paste_bytes("a\nb\r\nc"), b"a\rb\rc");
+        assert!(!term.bracketed_paste());
         term.advance(b"\x1b[?2004h");
-        assert!(term.mode().contains(TermMode::BRACKETED_PASTE));
+        assert!(term.bracketed_paste());
         assert_eq!(
             term.paste_bytes("x\x1b[201~y"),
             b"\x1b[200~x[201~y\x1b[201~".to_vec()

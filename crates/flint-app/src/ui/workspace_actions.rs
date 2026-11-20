@@ -24,14 +24,15 @@ use super::super::registry::{
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
     Forward, ForwardCurrent, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab,
     OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenSelectorLogs,
-    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, Refresh, RetryConnection,
-    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown,
-    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
-    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
-    SelectText, SetDockHeight, SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview,
-    ShowYaml, SortBy, ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleNamespace,
-    ToggleNavSection, TogglePause, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide,
-    ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
+    RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope,
+    SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
+    SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
+    SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
+    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
+    ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause,
+    ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
@@ -237,6 +238,9 @@ impl Workspace {
                 let dock = ws.dock.read(cx);
                 dock.is_visible() && dock.tab_count() > 1
             })
+            .when::<ShowTabList>(|ws, cx| ws.dock.read(cx).tab_count() > 0)
+            .when::<ReconnectLogs>(|ws, cx| ws.dock.read(cx).restartable(true, cx).is_some())
+            .when::<RestartShell>(|ws, cx| ws.dock.read(cx).restartable(false, cx).is_some())
             .add::<ActivateTab>(
                 |ws, cx| ws.dock.read(cx).tab_count() > 0,
                 |ws, a, cx| ws.dock.read(cx).check_tab::<ActivateTab>(a.tab),
@@ -327,7 +331,11 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
-    fn cluster_summary<'a>(&self, name: &str, cx: &'a App) -> Option<&'a ClusterSummary> {
+    pub(super) fn cluster_summary<'a>(
+        &self,
+        name: &str,
+        cx: &'a App,
+    ) -> Option<&'a ClusterSummary> {
         self.model
             .read(cx)
             .clusters

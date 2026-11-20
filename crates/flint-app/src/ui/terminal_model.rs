@@ -3,7 +3,7 @@
 //! splits into runs of text to shape, and the state's wording. No GPUI types, so all of it is
 //! testable without a window; the view (`terminal_view.rs`) draws with them.
 
-use flint_core::terminal::{Cell, CellFlags, SelectionKind, Side, TerminalSize};
+use flint_core::terminal::{Cell, CellFlags, CursorShape, SelectionKind, Side, TerminalSize};
 use flint_core::{ClusterId, ExecRequest, ExecState};
 
 use super::log_model::Tone;
@@ -35,11 +35,11 @@ impl ShellRequest {
         request
     }
 
-    /// `web-1 · app`, the tab's title after the prompt sign.
+    /// `Shell: web-1 · app`, the tab's title: the pod and container, as a log tab names them.
     pub fn title(&self) -> String {
         match &self.container {
-            Some(container) => format!("$ {} · {container}", self.pod),
-            None => format!("$ {}", self.pod),
+            Some(container) => format!("Shell: {} · {container}", self.pod),
+            None => format!("Shell: {}", self.pod),
         }
     }
 
@@ -137,6 +137,103 @@ impl WheelLines {
 
     pub fn reset(&mut self) {
         self.remainder = 0.;
+    }
+}
+
+/// The most a single paste sends to a shell. The session's input queue is unbounded (#152), and
+/// a shell reads a paste as typed input, so a huge clipboard is refused instead of queued.
+pub const MAX_PASTE_BYTES: usize = 256 * 1024;
+
+/// What pasting a text into a shell takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteCheck {
+    /// Send it: one line.
+    Paste,
+    /// Send it only if the program takes pastes bracketed (the core checks its live mode,
+    /// `ExecSession::paste_if_bracketed`); otherwise ask first, since each of its `lines`
+    /// lines would run as it arrives.
+    Lines { lines: usize },
+    /// Refuse it: it holds `bytes` bytes, more than [`MAX_PASTE_BYTES`].
+    TooLarge { bytes: usize },
+}
+
+/// What pasting `text` takes. A line break at the very end does not count as another line.
+pub fn paste_check(text: &str) -> PasteCheck {
+    if text.len() > MAX_PASTE_BYTES {
+        return PasteCheck::TooLarge { bytes: text.len() };
+    }
+    let lines = text
+        .trim_end_matches(['\r', '\n'])
+        .split("\r\n")
+        .flat_map(|line| line.split(['\r', '\n']))
+        .count();
+    if lines > 1 {
+        PasteCheck::Lines { lines }
+    } else {
+        PasteCheck::Paste
+    }
+}
+
+/// What the paste confirmation says.
+pub fn paste_question(lines: usize) -> (String, String) {
+    (
+        format!("Paste {lines} lines?"),
+        "Each line runs as it is pasted: this shell did not ask for bracketed paste, so it \
+         cannot tell a paste from typing."
+            .to_owned(),
+    )
+}
+
+/// Why a paste was refused.
+pub fn paste_too_large(bytes: usize) -> String {
+    format!(
+        "Not pasted: the clipboard holds {}, more than the {} a shell tab pastes at once.",
+        byte_size(bytes),
+        byte_size(MAX_PASTE_BYTES)
+    )
+}
+
+/// `512 bytes`, `256 KB`, `3.2 MB`.
+fn byte_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// How the cursor is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorLook {
+    /// A filled block, its character in the cursor's text color.
+    Block,
+    /// A block's outline.
+    Hollow,
+    Beam {
+        faded: bool,
+    },
+    Underline {
+        faded: bool,
+    },
+}
+
+/// The cursor for the program's `shape`: solid while the tab has focus, a hollow block or a
+/// faded beam or underline without it, and none once the session ended (nothing more can be
+/// typed, so a cursor would only suggest otherwise).
+pub fn cursor_look(shape: CursorShape, focused: bool, live: bool) -> Option<CursorLook> {
+    if !live {
+        return None;
+    }
+    match shape {
+        CursorShape::Block if focused => Some(CursorLook::Block),
+        CursorShape::Block | CursorShape::HollowBlock => Some(CursorLook::Hollow),
+        CursorShape::Beam => Some(CursorLook::Beam { faded: !focused }),
+        CursorShape::Underline => Some(CursorLook::Underline { faded: !focused }),
+        CursorShape::Hidden => None,
     }
 }
 
@@ -273,7 +370,7 @@ mod tests {
             pod: "web-1".into(),
             container: Some("app".into()),
         };
-        assert_eq!(request.title(), "$ web-1 · app");
+        assert_eq!(request.title(), "Shell: web-1 · app");
         assert_eq!(
             request.tooltip(),
             "Shell in demo/web-1, container app\non kind"
@@ -286,7 +383,7 @@ mod tests {
             container: None,
             ..request
         };
-        assert_eq!(any.title(), "$ web-1");
+        assert_eq!(any.title(), "Shell: web-1");
         assert_eq!(any.exec_request(TerminalSize::default()).container, None);
     }
 
@@ -318,6 +415,48 @@ mod tests {
         // Off the grid: clamped to the nearest edge cell.
         assert_eq!(cell_at(-5., -5., CELL, size), (0, 0, Side::Left));
         assert_eq!(cell_at(500., 500., CELL, size), (4, 9, Side::Right));
+    }
+
+    #[test]
+    fn the_cursor_follows_focus_and_goes_once_the_session_ends() {
+        use CursorShape::*;
+        assert_eq!(cursor_look(Block, true, true), Some(CursorLook::Block));
+        assert_eq!(cursor_look(Block, false, true), Some(CursorLook::Hollow));
+        assert_eq!(
+            cursor_look(Beam, false, true),
+            Some(CursorLook::Beam { faded: true })
+        );
+        assert_eq!(cursor_look(Hidden, true, true), None);
+        for shape in [Block, HollowBlock, Beam, Underline] {
+            assert_eq!(cursor_look(shape, true, false), None, "{shape:?}");
+        }
+    }
+
+    // covers UP-41: several lines pasted into a shell without bracketed paste would each run,
+    // so they are confirmed first; a huge clipboard is refused.
+    #[test]
+    fn pastes_are_checked_before_they_run() {
+        assert_eq!(paste_check("ls -la"), PasteCheck::Paste);
+        assert_eq!(paste_check("ls -la\n"), PasteCheck::Paste);
+        assert_eq!(
+            paste_check("echo a\necho b\r\necho c\n"),
+            PasteCheck::Lines { lines: 3 }
+        );
+        assert_eq!(paste_check("a\rb"), PasteCheck::Lines { lines: 2 });
+        let huge = "x".repeat(MAX_PASTE_BYTES + 1);
+        assert_eq!(
+            paste_check(&huge),
+            PasteCheck::TooLarge {
+                bytes: MAX_PASTE_BYTES + 1
+            }
+        );
+        assert_eq!(paste_question(3).0, "Paste 3 lines?");
+        assert_eq!(
+            paste_too_large(3 * 1024 * 1024 + 200 * 1024),
+            "Not pasted: the clipboard holds 3.2 MB, more than the 256 KB a shell tab pastes at \
+             once."
+        );
+        assert_eq!(byte_size(512), "512 bytes");
     }
 
     #[test]

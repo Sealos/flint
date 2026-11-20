@@ -143,10 +143,16 @@ actions!(
         ToggleDock,
         /// Close the dock's active tab, ending its session.
         CloseActiveTab,
+        /// List every dock tab, with its cluster and status, to show one.
+        ShowTabList,
         /// Show the dock's next tab.
         NextTab,
         /// Show the dock's previous tab.
-        PrevTab
+        PrevTab,
+        /// Open the active log tab's stream again once it ended or failed, in a new tab beside it.
+        ReconnectLogs,
+        /// Start a new shell once the active shell tab's exited or failed, in a new tab beside it.
+        RestartShell
     ]
 );
 actions!(
@@ -642,7 +648,7 @@ impl ActionSpec {
         handled && self.is_enabled(cx)
     }
 
-    /// The live key binding to show next to the action ("⌘F"), if any: the one added last to
+    /// The live key binding to show next to the action ("⌘F", [`keystroke_hint`]), if any: the one added last to
     /// the keymap (the highest precedence), so later or user bindings win over the defaults.
     #[cfg_attr(
         not(any(test, feature = "automation")),
@@ -658,25 +664,83 @@ impl ActionSpec {
             binding
                 .keystrokes()
                 .iter()
-                .map(|k| k.display(os).to_string())
+                .map(|k| keystroke_hint(k.modifiers(), k.key(), os))
                 .collect::<Vec<_>>()
                 .join(" "),
         )
     }
 }
 
-/// A chord in GPUI syntax (`secondary-shift-g`) written the way this OS shows it: "⌘⇧G" on
-/// macOS, Ctrl and Shift spelled out on Linux. For key hints in tooltips and notes.
+/// A chord in GPUI syntax (`secondary-shift-g`) written the way this OS shows it: "⇧⌘G" on
+/// macOS, "Ctrl+Shift+G" on Linux ([`keystroke_hint`]). For key hints in tooltips and notes.
 pub fn key_hint(keys: &str) -> String {
     let os = if cfg!(target_os = "macos") {
         OperatingSystem::Mac
     } else {
         OperatingSystem::Linux
     };
+    key_hint_for(keys, os)
+}
+
+/// [`key_hint`] for `os`.
+fn key_hint_for(keys: &str, os: OperatingSystem) -> String {
     match Keystroke::parse_with_os(keys, os) {
-        Ok(keystroke) => keystroke.display(os).to_string(),
+        Ok(keystroke) => keystroke_hint(&keystroke.modifiers, &keystroke.key, os),
         Err(_) => keys.to_owned(),
     }
+}
+
+/// A keystroke as the OS's own menus write it. macOS: the modifier glyphs in Apple's order
+/// (⌃⌥⇧⌘) and glyphs for named keys (⇞ ⇟ ↖ ↘ ␣ ⏎ ⎋ ⌫ ⌦ ⇥ and the arrows), with nothing between
+/// them. Linux: modifier and key names joined by "+" (`Ctrl+Shift+PageUp`).
+pub fn keystroke_hint(modifiers: &Modifiers, key: &str, os: OperatingSystem) -> String {
+    let mac = os == OperatingSystem::Mac;
+    let mut parts: Vec<&str> = Vec::new();
+    for (on, glyph, name) in [
+        (modifiers.control, "⌃", "Ctrl"),
+        (modifiers.alt, "⌥", "Alt"),
+        (modifiers.shift, "⇧", "Shift"),
+        (modifiers.platform, "⌘", "Super"),
+        (modifiers.function, "fn", "Fn"),
+    ] {
+        if on {
+            parts.push(if mac { glyph } else { name });
+        }
+    }
+    let named = match (key, mac) {
+        ("pageup", true) => Some("⇞"),
+        ("pagedown", true) => Some("⇟"),
+        ("home", true) => Some("↖"),
+        ("end", true) => Some("↘"),
+        ("space", true) => Some("␣"),
+        ("enter", true) => Some("⏎"),
+        ("escape", true) => Some("⎋"),
+        ("backspace", true) => Some("⌫"),
+        ("delete", true) => Some("⌦"),
+        ("tab", true) => Some("⇥"),
+        ("up", true) => Some("↑"),
+        ("down", true) => Some("↓"),
+        ("left", true) => Some("←"),
+        ("right", true) => Some("→"),
+        ("pageup", false) => Some("PageUp"),
+        ("pagedown", false) => Some("PageDown"),
+        ("escape", false) => Some("Esc"),
+        _ => None,
+    };
+    let key = match named {
+        Some(name) => name.to_owned(),
+        None => {
+            // A letter or symbol in capitals (as on the keycap); a named key capitalized
+            // (`Home`, `Enter`, `F5`).
+            let mut chars = key.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        }
+    };
+    parts.push(&key);
+    parts.join(if mac { "" } else { "+" })
 }
 
 /// Every action, in menu order.
@@ -1561,6 +1625,26 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<PrevTab>("Previous Dock Tab", "Show the dock's previous tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-shift-tab"], Some(DOCK)),
+        Spec::unit::<ShowTabList>(
+            "Show Dock Tabs",
+            "List every dock tab, with its cluster and status, and show the one picked.",
+        )
+        .of(C::View, S::Dock)
+        .keys(&["secondary-shift-j"], Some(WORKSPACE)),
+        Spec::unit::<ReconnectLogs>(
+            "Reconnect Logs",
+            "Open the active log tab's stream again once it ended or failed, in a new tab beside \
+             it (the ended tab keeps its lines), on the API server its context points at now.",
+        )
+        .of(C::Logs, S::Dock)
+        .keys(&["secondary-r"], Some(DOCK)),
+        Spec::unit::<RestartShell>(
+            "Restart Shell",
+            "Start a new shell once the active shell tab's exited or failed, in a new tab beside \
+             it (the ended tab keeps its output), on the API server its context points at now.",
+        )
+        .of(C::Terminal, S::Dock)
+        .keys(RESTART_SHELL, Some(DOCK)),
         Spec::with_args::<ActivateTab>("Show Dock Tab…", "Show a dock tab by its id.", TAB)
             .of(C::View, S::Dock)
             .hidden(),
@@ -1742,6 +1826,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
     specs.into_iter().map(|s| s.0).collect()
 });
 
+/// Restart Shell: Cmd-R on macOS; Ctrl-Shift-R elsewhere, since a shell tab hands Ctrl-R to
+/// the shell (reverse search).
+pub(in crate::ui) const RESTART_SHELL: &[&str] = restart_shell_keys(cfg!(target_os = "macos"));
+
+/// [`RESTART_SHELL`] on macOS (`mac`) or elsewhere.
+const fn restart_shell_keys(mac: bool) -> &'static [&'static str] {
+    if mac {
+        &["secondary-r"]
+    } else {
+        &["secondary-shift-r"]
+    }
+}
+
 /// Copy in a shell tab: Cmd-C on macOS; Ctrl-Shift-C elsewhere, where Ctrl-C interrupts the
 /// program.
 pub(in crate::ui) const TERMINAL_COPY: &[&str] = if cfg!(target_os = "macos") {
@@ -1831,7 +1928,7 @@ pub mod tests {
     use super::ArgKind;
     use super::{
         ActionError, Bind, Category, Handler, OpenView, Scope, SelectRow, Visibility, actions,
-        find, key_hint,
+        find, key_hint, key_hint_for,
     };
 
     /// Collects the names of the actions a view binds.
@@ -1913,10 +2010,35 @@ pub mod tests {
     fn key_hints_use_the_platform_modifier() {
         let hint = key_hint("secondary-shift-g");
         if cfg!(target_os = "macos") {
-            assert_eq!(hint, "⌘⇧G");
+            assert_eq!(hint, "⇧⌘G");
         } else {
-            assert!(hint.to_lowercase().contains("ctrl"), "{hint}");
-            assert!(!hint.contains('⌘'), "{hint}");
+            assert_eq!(hint, "Ctrl+Shift+G");
+        }
+    }
+
+    // Key hints follow each OS's own menus: Apple's modifier order and key glyphs on macOS,
+    // spelled-out names joined by "+" on Linux.
+    #[test]
+    fn key_hints_read_like_the_os_menus() {
+        use gpui_kit::OperatingSystem::{Linux, Mac};
+        let cases = [
+            ("secondary-shift-e", "⇧⌘E", "Ctrl+Shift+E"),
+            ("ctrl-alt-shift-cmd-k", "⌃⌥⇧⌘K", "Ctrl+Alt+Shift+Super+K"),
+            ("shift-pageup", "⇧⇞", "Shift+PageUp"),
+            ("shift-pagedown", "⇧⇟", "Shift+PageDown"),
+            ("shift-home", "⇧↖", "Shift+Home"),
+            ("shift-end", "⇧↘", "Shift+End"),
+            ("space", "␣", "Space"),
+            ("enter", "⏎", "Enter"),
+            ("escape", "⎋", "Esc"),
+            ("secondary-down", "⌘↓", "Ctrl+Down"),
+            ("ctrl-shift-tab", "⌃⇧⇥", "Ctrl+Shift+Tab"),
+            ("t", "T", "T"),
+            ("f5", "F5", "F5"),
+        ];
+        for (keys, mac, linux) in cases {
+            assert_eq!(key_hint_for(keys, Mac), mac, "{keys} on macOS");
+            assert_eq!(key_hint_for(keys, Linux), linux, "{keys} on Linux");
         }
     }
 
@@ -2070,6 +2192,20 @@ pub mod tests {
             "tab", "escape", "enter", "up", "ctrl-c", "ctrl-d", "ctrl-w", "ctrl-l",
         ] {
             assert!(super::TERMINAL_PASSTHROUGH.contains(&key), "{key}");
+        }
+        // Restart Shell's key reaches the dock from a shell tab on both systems: on Linux,
+        // where Cmd is Ctrl, Ctrl-R would go to the shell.
+        for (mac, os) in [
+            (true, gpui_kit::OperatingSystem::Mac),
+            (false, gpui_kit::OperatingSystem::Linux),
+        ] {
+            for key in super::restart_shell_keys(mac) {
+                let keystroke = gpui_kit::Keystroke::parse_with_os(key, os).unwrap();
+                let passed = super::TERMINAL_PASSTHROUGH
+                    .iter()
+                    .any(|p| gpui_kit::Keystroke::parse_with_os(p, os).unwrap() == keystroke);
+                assert!(!passed, "{key} on {os:?} goes to the shell");
+            }
         }
         // Copy and paste use Cmd on macOS; elsewhere Ctrl-C and Ctrl-V are the shell's.
         let mac = cfg!(target_os = "macos");

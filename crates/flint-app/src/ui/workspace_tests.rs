@@ -541,6 +541,56 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
     .await;
 }
 
+// covers UP-42: a tab is pinned to its context and the API server it pointed at. Once the
+// context is re-pointed, Logs opens a new tab on the new server instead of showing the old
+// server's, and each tab names its cluster.
+#[gpui_kit::test]
+async fn tabs_are_pinned_to_their_server(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    let labels = |cx: &mut TestAppContext| {
+        t.workspace.read_with(cx, |ws, cx| {
+            let dock = ws.dock.read(cx);
+            dock.tab_ids()
+                .into_iter()
+                .map(|id| dock.full_title(id, cx).unwrap())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(labels(cx), ["web · app on alpha"]);
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(labels(cx).len(), 1, "the same server: the same tab");
+
+    // `alpha` now points at another server (as after editing kubeconfig).
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "alpha")
+            .unwrap();
+        alpha.info.server = Some("https://10.0.0.9:6443".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(labels(cx), ["web · app on alpha", "web · app on alpha"]);
+    let active = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        dock.tab_ids()
+            .iter()
+            .position(|id| Some(*id) == dock.active_id())
+    });
+    assert_eq!(active, Some(1), "the new server's tab is shown");
+}
+
 // covers UP-41, UP-42: Shell in the detail pane opens a shell tab in the dock (or shows the open
 // one), with a container picker; the tab keeps running across a cluster switch, its actions
 // are forwarded from the workspace, and closing it ends the session.
@@ -569,7 +619,10 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     ));
     t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
     cx.run_until_parked();
-    assert_eq!(dock_tabs(cx, &t), (true, vec!["$ web · app".to_owned()]));
+    assert_eq!(
+        dock_tabs(cx, &t),
+        (true, vec!["Shell: web · app".to_owned()])
+    );
     let first = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
     });
@@ -592,7 +645,11 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     cx.run_until_parked();
     assert_eq!(
         dock_tabs(cx, &t).1,
-        ["$ web · app", "$ web · app", "$ web · sidecar"]
+        [
+            "Shell: web · app",
+            "Shell: web · app",
+            "Shell: web · sidecar"
+        ]
     );
     let shell = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
@@ -633,8 +690,369 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     t.dispatch(cx, "dock::CloseTab", json!({ "tab": id }))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(dock_tabs(cx, &t).1, ["$ web · app", "$ web · app"]);
+    assert_eq!(
+        dock_tabs(cx, &t).1,
+        ["Shell: web · app", "Shell: web · app"]
+    );
     assert!(shell.upgrade().is_none(), "closing a tab ends its session");
+}
+
+// covers UP-41: Restart Shell starts a new shell in a tab beside the failed one and shows it,
+// on the server the context points at now; the failed tab keeps its output.
+#[gpui_kit::test]
+async fn a_failed_shell_restarts_beside_itself(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    let (id, first) = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        (
+            dock.active_id().unwrap(),
+            dock.active_terminal().unwrap().downgrade(),
+        )
+    });
+    let failed = first.upgrade().unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        failed.read(cx).tab_status() == TabStatus::Failed
+    })
+    .await;
+    assert_eq!(
+        t.dispatch(cx, "dock::ReconnectLogs", Value::Null),
+        Err(ActionError::NotAvailable("dock::ReconnectLogs".into())),
+        "a shell tab"
+    );
+    t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    let (ids, active, now) = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        (
+            dock.tab_ids(),
+            dock.active_id(),
+            dock.active_terminal().unwrap().downgrade(),
+        )
+    });
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], id, "the failed tab stays");
+    assert_eq!(active, Some(ids[1]), "the new shell is shown, beside it");
+    assert!(first.upgrade().is_some(), "the failed tab keeps its output");
+    assert_ne!(now.entity_id(), first.entity_id(), "a new session");
+}
+
+// covers UP-42: the tab list opens from the keyboard (Shift-Cmd-J) and the palette, wherever
+// focus is, and shows the tab picked.
+#[gpui_kit::test]
+async fn the_tab_list_opens_from_the_keyboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    assert_eq!(
+        t.dispatch(cx, "dock::ShowTabList", Value::Null),
+        Err(ActionError::NotAvailable("dock::ShowTabList".into())),
+        "no tab yet"
+    );
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    t.dispatch(
+        cx,
+        "detail::OpenContainerLogs",
+        json!({"container": "sidecar"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    t.focus_workspace(cx);
+    press(cx, &t, "secondary-shift-j");
+    let entries = cx
+        .update_window(t.window, |_, window, _| {
+            let menu = window.within("popup-menu");
+            (0usize..)
+                .map_while(|ix| menu.try_find(ix))
+                .map(|item| item.label().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries[0].starts_with("web · app — alpha · "),
+        "{entries:?}"
+    );
+    assert!(
+        entries[1].starts_with("web · sidecar — alpha · "),
+        "{entries:?}"
+    );
+    cx.update_window(t.window, |_, window, cx| {
+        window.within("popup-menu").click(0usize, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (first, active) = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        (dock.tab_ids()[0], dock.active_id())
+    });
+    assert_eq!(active, Some(first));
+    cx.update_window(t.window, |_, window, _| {
+        assert!(window.try_find("popup-menu").is_none(), "the list closed");
+    })
+    .unwrap();
+}
+
+/// Opens a running shell on `alpha` in the dock, over a session the test drives.
+fn open_fake_shell(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+) -> (u64, flint_core::exec::fake::FakeExec) {
+    use crate::ui::dock_model::TabCluster;
+    use crate::ui::terminal_model::ShellRequest;
+    use crate::ui::terminal_view::TerminalView;
+    let request = ShellRequest {
+        cluster: "alpha".into(),
+        namespace: "demo".into(),
+        pod: "web".into(),
+        container: Some("app".into()),
+    };
+    let (session, mut fake) = flint_core::exec::fake::FakeExec::open(
+        request.exec_request(flint_core::TerminalSize::default()),
+    );
+    let server = t.server.clone();
+    let id = cx
+        .update_window(t.window, |_, window, cx| {
+            let dock = t.workspace.read(cx).dock.clone();
+            dock.update(cx, |dock, cx| {
+                dock.open(
+                    crate::ui::dock::TabKey::Shell(request.clone()),
+                    TabCluster::new("alpha", Some(&server)),
+                    |window, cx| {
+                        DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
+                    },
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    fake.set_state(flint_core::ExecState::Running {
+        command: vec!["bash".into()],
+    });
+    fake.pump();
+    cx.run_until_parked();
+    (id, fake)
+}
+
+fn tab_status(cx: &mut TestAppContext, t: &TestWorkspace, id: u64) -> TabStatus {
+    t.workspace.read_with(cx, |ws, cx| {
+        ws.dock.read(cx).tab(id).unwrap().item(cx).tab_status()
+    })
+}
+
+/// Points `context` at another server, or sets its connection, as a kubeconfig reload or the
+/// core would.
+fn change_cluster(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    context: &str,
+    change: impl FnOnce(&mut flint_core::ClusterSummary),
+) {
+    t.model.update(cx, |model, cx| {
+        let cluster = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == context)
+            .unwrap();
+        change(cluster);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+// covers UP-41: when a kubeconfig reload re-points a context, the workspace ends the running
+// shells on it (the model's change reaches the dock), and says why.
+#[gpui_kit::test]
+async fn a_re_pointed_context_ends_its_shells(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (id, mut fake) = open_fake_shell(cx, &t);
+    assert_eq!(tab_status(cx, &t, id), TabStatus::Live);
+    // Another change to the context (its connection) leaves the shell alone.
+    change_cluster(cx, &t, "alpha", |c| {
+        c.state = flint_core::ConnectionState::Disconnected
+    });
+    assert_eq!(tab_status(cx, &t, id), TabStatus::Live);
+    assert!(!fake.is_closed());
+    change_cluster(cx, &t, "alpha", |c| {
+        c.info.server = Some("https://10.0.0.9:6443".into())
+    });
+    assert!(fake.is_closed(), "the shell's session ends");
+    assert_eq!(tab_status(cx, &t, id), TabStatus::Ended);
+}
+
+// covers UP-41, UP-45: Restart Shell and Reconnect Logs are refused, saying why, while the
+// tab's cluster is not connected; no tab opens.
+#[gpui_kit::test]
+async fn restarting_waits_for_a_connected_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (id, mut fake) = open_fake_shell(cx, &t);
+    fake.set_state(flint_core::ExecState::Exited { code: Some(0) });
+    fake.pump();
+    cx.run_until_parked();
+    change_cluster(cx, &t, "alpha", |c| {
+        c.state = flint_core::ConnectionState::Disconnected
+    });
+    t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
+    let (ids, refused) = t.workspace.read_with(cx, |ws, cx| {
+        (
+            ws.dock.read(cx).tab_ids(),
+            ws.action_error().map(str::to_owned),
+        )
+    });
+    assert_eq!(ids, [id], "no new tab");
+    assert_eq!(refused.as_deref(), Some("Shell: alpha is not connected"));
+
+    // A failed log tab whose context is gone from kubeconfig: Reconnect is refused the same way.
+    let core = t.model.read_with(cx, |m, _| m.core().clone());
+    let request = crate::ui::log_view::LogRequest {
+        cluster: "gone".into(),
+        subject: flint_core::LogSubject::Pod(flint_core::LogTarget {
+            namespace: "demo".into(),
+            pod: "web".into(),
+            container: Some("app".into()),
+        }),
+        previous: false,
+    };
+    let server = t.server.clone();
+    let logs = cx
+        .update_window(t.window, |_, window, cx| {
+            let dock = t.workspace.read(cx).dock.clone();
+            dock.update(cx, |dock, cx| {
+                dock.open(
+                    crate::ui::dock::TabKey::Logs(request.clone()),
+                    crate::ui::dock_model::TabCluster::new("gone", Some(&server)),
+                    |window, cx| {
+                        DockTab::Logs(
+                            cx.new(|cx| {
+                                crate::ui::log_view::LogView::new(core, request, window, cx)
+                            }),
+                        )
+                    },
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let ws = workspace.read(cx);
+        ws.dock.read(cx).tab(logs).unwrap().item(cx).can_restart()
+    })
+    .await;
+    t.dispatch(cx, "dock::ReconnectLogs", Value::Null).unwrap();
+    let (count, refused) = t.workspace.read_with(cx, |ws, cx| {
+        (
+            ws.dock.read(cx).tab_count(),
+            ws.action_error().map(str::to_owned),
+        )
+    });
+    assert_eq!(count, 2, "no new tab");
+    assert_eq!(
+        refused.as_deref(),
+        Some("Logs: no kubeconfig context named gone")
+    );
+}
+
+// covers UP-04, UP-42: Cmd-R in a tab whose session runs is not Restart or Reconnect: it falls
+// through to Refresh, which fetches the shown object again.
+#[gpui_kit::test]
+async fn the_refresh_key_reaches_refresh_from_a_running_tab(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    // A log tab whose stream is still starting (`alpha` never answers), focused.
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    let focus = t.workspace.read_with(cx, |ws, cx| {
+        let log = ws.dock.read(cx).active_log().unwrap().read(cx);
+        assert!(!log.can_restart());
+        log.tab_focus()
+    });
+    cx.update_window(t.window, |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    press(cx, &t, "secondary-r");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).detail.as_ref().is_some_and(|d| {
+            d.read(cx)
+                .view_state()
+                .banners
+                .iter()
+                .any(|b| b.id == "detail-refresh-error")
+        })
+    })
+    .await;
+    assert_eq!(
+        t.workspace
+            .read_with(cx, |ws, cx| ws.dock.read(cx).tab_count()),
+        1,
+        "no restart"
+    );
+}
+
+// covers UP-42: dismissing the tab list with Escape gives focus back to where it was; a click
+// elsewhere leaves focus where the click put it, never on the closed list.
+#[gpui_kit::test]
+async fn dismissing_the_tab_list_gives_focus_back(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    let menu_open = |cx: &mut TestAppContext| {
+        cx.update_window(t.window, |_, window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .unwrap()
+    };
+    let workspace_focused = |cx: &mut TestAppContext| {
+        cx.update_window(t.window, |_, window, cx| {
+            t.workspace.read(cx).focus.is_focused(window)
+        })
+        .unwrap()
+    };
+    for dismiss in ["escape", "click"] {
+        t.focus_workspace(cx);
+        assert!(workspace_focused(cx));
+        press(cx, &t, "secondary-shift-j");
+        assert!(menu_open(cx), "{dismiss}: the list opened");
+        assert!(!workspace_focused(cx), "the list has focus");
+        if dismiss == "escape" {
+            press(cx, &t, "escape");
+        } else {
+            cx.update_window(t.window, |_, window, cx| {
+                // Plain text in the log tab's toolbar: a click there takes no focus itself.
+                window.click("log-count", cx)
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        assert!(!menu_open(cx), "{dismiss}: the list closed");
+        if dismiss == "escape" {
+            assert!(workspace_focused(cx), "escape: focus is back");
+        } else {
+            // The click went to the log tab, which keeps the focus it took.
+            let log = cx
+                .update_window(t.window, |_, window, cx| {
+                    let ws = t.workspace.read(cx);
+                    let log = ws.dock.read(cx).active_log().unwrap().read(cx).tab_focus();
+                    log.is_focused(window)
+                })
+                .unwrap();
+            assert!(log, "click: focus stays where the click put it");
+        }
+    }
 }
 
 // covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.

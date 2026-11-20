@@ -5,7 +5,8 @@
 use flint_core::exec::fake::FakeExec;
 use flint_core::terminal::TerminalSize;
 use flint_core::{ExecState, TerminalSnapshot};
-use gpui_kit::test::{ClickOptions, TestWindowExt as _};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::{ClickOptions, TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, ClipboardItem, Entity, InputHandler as _, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, ScrollDelta,
@@ -16,7 +17,8 @@ use serde_json::json;
 use super::{RESIZE_DELAY, TerminalInput, TerminalView};
 use crate::ui::dock::{DockItem as _, TabKey, TabStatus};
 use crate::ui::registry::{self, SelectText, TERMINAL_COPY, TERMINAL_PASTE};
-use crate::ui::terminal_model::{PADDING, ShellRequest};
+use crate::ui::support_tests::WAIT;
+use crate::ui::terminal_model::{MAX_PASTE_BYTES, PADDING, ShellRequest};
 
 fn request() -> ShellRequest {
     ShellRequest {
@@ -115,6 +117,11 @@ impl Shell {
     fn screen(&self, cx: &mut TestAppContext) -> TerminalSnapshot {
         self.view
             .read_with(cx, |v, _| v.snapshot().terminal.clone())
+    }
+
+    fn has_dialog(&self, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.window, |_, window, cx| window.has_active_dialog(cx))
+            .unwrap()
     }
 
     fn dispatch(
@@ -294,12 +301,66 @@ async fn copy_and_paste(cx: &mut TestAppContext) {
     shell.print(cx, b"\x1b[H\x1b[2J");
     assert!(!shell.view.read_with(cx, |v, _| v.has_selection()));
 
+    // One line goes at once.
+    cx.write_to_clipboard(ClipboardItem::new_string("echo one\n".into()));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"echo one\r");
+    // Several lines would each run as they arrive: they wait for a confirmation.
     cx.write_to_clipboard(ClipboardItem::new_string("echo a\necho b".into()));
     shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"", "nothing before the confirmation");
+    cx.wait_for(shell.window, WAIT, |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
+    shell.dispatch(cx, "ui::Cancel", json!(null)).unwrap();
+    assert_eq!(shell.sent(cx), b"", "cancelled");
+    let view = shell.view.clone();
+    cx.wait_for(shell.window, WAIT, move |window, cx| {
+        !window.has_active_dialog(cx) && view.read(cx).focus.is_focused(window)
+    })
+    .await;
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"");
+    cx.wait_for(shell.window, WAIT, |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
+    shell.dispatch(cx, "ui::Confirm", json!(null)).unwrap();
     assert_eq!(shell.sent(cx), b"echo a\recho b");
+    // Focus goes back to the shell once the question closes.
+    let view = shell.view.clone();
+    cx.wait_for(shell.window, WAIT, move |window, cx| {
+        !window.has_active_dialog(cx) && view.read(cx).focus.is_focused(window)
+    })
+    .await;
+    // A clipboard too large to paste is refused, saying why.
+    cx.write_to_clipboard(ClipboardItem::new_string("x".repeat(MAX_PASTE_BYTES + 1)));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"");
+    let note = shell
+        .view
+        .read_with(cx, |v, _| v.note.as_ref().map(|n| n.text.clone()));
+    assert!(
+        note.as_deref()
+            .is_some_and(|n| n.starts_with("Not pasted: the clipboard holds")),
+        "{note:?}"
+    );
+    // A program that asked for bracketed paste gets every line at once, marked as a paste.
     shell.print(cx, b"\x1b[?2004h");
+    cx.write_to_clipboard(ClipboardItem::new_string("echo a\necho b".into()));
     shell.press(cx, TERMINAL_PASTE[0]);
     assert_eq!(shell.sent(cx), b"\x1b[200~echo a\necho b\x1b[201~");
+    assert!(!shell.has_dialog(cx));
+    // The program turns bracketed paste off (as bash does while it runs a command) before the
+    // tab has drawn that: the shell's live mode decides, so the paste still waits for a yes.
+    shell.fake.print(b"\x1b[?2004l");
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"", "not pasted as typed lines");
+    cx.wait_for(shell.window, WAIT, |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
 }
 
 // covers UP-41: the wheel scrolls back through the output; typing returns to the bottom. In a
@@ -351,11 +412,10 @@ async fn an_exited_shell_shows_its_code_and_keeps_its_screen(cx: &mut TestAppCon
         shell.view.read_with(cx, |v, _| v.tab_status()),
         TabStatus::Live
     );
-    // While it runs, its tab answers for its container (Shell shows it instead of a new one).
+    // Its tab answers for its container (the dock shows it instead of a new one while it
+    // runs; see `dock_model::reopens`).
     let running = shell.view.read_with(cx, |v, _| v.tab_key());
-    assert!(
-        matches!(running, TabKey::Shell(ref key) if key.ended.is_none() && key.request == request())
-    );
+    assert!(matches!(running, TabKey::Shell(ref key) if *key == request()));
     shell.print(cx, b"$ exit 3\r\n");
     shell.fake.set_state(ExecState::Exited { code: Some(3) });
     shell.settle(cx);
@@ -388,12 +448,11 @@ async fn an_exited_shell_shows_its_code_and_keeps_its_screen(cx: &mut TestAppCon
         Some("exit 3")
     );
 
-    // An ended shell's tab no longer answers for its container: Shell opens a new one.
-    let key = shell.view.read_with(cx, |v, _| v.tab_key());
-    let TabKey::Shell(key) = key else {
-        panic!("a shell key")
-    };
-    assert!(key.ended.is_some());
+    // An ended shell offers to start again, in a new tab beside it.
+    cx.update_window(shell.window, |_, window, _| {
+        assert!(window.try_find("terminal-restart").is_some());
+    })
+    .unwrap();
 
     shell
         .fake

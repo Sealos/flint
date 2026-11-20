@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use flint_core::{
     LineFormat, LineId, LineSelection, LogLine, LogLines, LogSearch, LogState, LogSubject, PodSet,
-    PodSetStatus, SearchQuery,
+    PodSetStatus, SearchQuery, WorkloadTarget,
 };
 
 use super::registry::SaveScope;
@@ -268,7 +268,15 @@ fn subject_name(subject: &LogSubject) -> (String, Option<&str>) {
 /// A tab's title: the pod (or workload), the container when named, and "previous" for a
 /// terminated instance.
 pub fn tab_title(subject: &LogSubject, previous: bool) -> String {
-    let (name, container) = subject_name(subject);
+    let (name, container) = match subject {
+        // `web (Deployment)`: the name first, as for a pod; the kind after it.
+        LogSubject::Workload(WorkloadTarget {
+            pods: PodSet::Workload { kind, name },
+            container,
+            ..
+        }) => (format!("{name} ({})", kind.name()), container.as_deref()),
+        _ => subject_name(subject),
+    };
     let mut title = match container {
         Some(container) => format!("{name} · {container}"),
         None => name,
@@ -587,7 +595,7 @@ mod tests {
             },
             container: None,
         });
-        assert_eq!(tab_title(&workload, false), "deployment/web");
+        assert_eq!(tab_title(&workload, false), "web (Deployment)");
         assert_eq!(suggested_file_name(&workload, false), "deployment_web.log");
         let selector = LogSubject::Workload(WorkloadTarget {
             namespace: "demo".into(),

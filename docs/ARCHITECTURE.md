@@ -316,11 +316,43 @@ design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
 
 ### Bottom dock
 
-`flint-app/src/ui/dock.rs`: a resizable panel under the main area, with one tab per session that outlives navigation
-(log tabs and shell tabs now; AI log analysis later). Tabs belong to no cluster. Opening a session that
-already has a tab shows that tab. Cmd-J shows and hides the dock; Cmd-W closes the active tab while focus is in the
-dock (elsewhere it closes the window). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant;
-the module documentation lists the steps.
+`flint-app/src/ui/dock.rs` (pure parts in `dock_model.rs`): a resizable panel under the main area, with one tab per
+session that outlives navigation (log tabs and shell tabs now; AI log analysis later). Tabs keep running across
+cluster switches. Cmd-J shows and hides the dock; Cmd-W closes the active tab while focus is in the dock (elsewhere it
+closes the window). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant; the module
+documentation lists the steps.
+
+- **Titles.** One pattern for every kind: `chatty · app`, `chatty · app (previous)`, `api (Deployment)`,
+  `-l app=web`, `Shell: web-1 · app`, cut in the middle past 26 characters. Every tab shows its cluster in a chip
+  before the title, always, so a shell on production never passes for one on a dev cluster after a switch; the tab's
+  tooltip adds the API server. Showing it only when several clusters are in play was rejected: tabs would change
+  shape when a second cluster connects, and one cluster is no guarantee the tab's cluster is the one shown.
+- **Chips** (`dock_model::chip_labels`) name the cluster briefly: an EKS ARN's cluster name (no `cluster/`), a GKE
+  context's cluster, else the context, cut in the middle past 16 characters. No two contexts in kubeconfig share a
+  chip: where two would read alike, the chip adds what tells them apart (the differing part of the account or
+  region for EKS, of the project or location for GKE, else of the context names), and anything still alike is
+  numbered. Contexts with an open tab count too, so a tab whose context left kubeconfig keeps a distinct chip,
+  marked, with a tooltip saying so. A shell's toolbar shows the same chip, with the full context and server in its tooltip; both mark a
+  re-pointed context alike. With the longest chip and title, about two and a half tabs fit in 860 points.
+- **Identity.** A tab is its `TabKey` (what it reads or runs) on a `TabCluster`: the context name and the API server
+  URL it pointed at when the tab opened, as AI exposure (ADR-0009) and trusted clusters (ADR-0015) pin a cluster.
+  Opening a request on the same cluster shows its tab while the tab answers for it (`dock_model::reopens`): while its
+  session starts, runs or retries, and for previous logs read to their end. A tab that failed, or a stream or shell
+  that ended, keeps its output, and a fresh tab opens beside it. When a context is re-pointed at another server, a
+  shell on it ends and says why (exec sessions do not recheck their context; log sessions do, every 30 s, and end on
+  their own), and its tab stops answering for its request, so Logs or Shell opens on the new server.
+- **Restarting.** Reconnect Logs and Restart Shell (`dock::ReconnectLogs`, Cmd-R in the dock;
+  `dock::RestartShell`, Cmd-R, or Ctrl+Shift+R on Linux, where a shell tab hands Ctrl-R to the shell) start the
+  active tab's ended or failed session again, on the server its context points at now, in a new tab right after it
+  (`Dock::open_beside`), which is shown. The ended tab keeps its lines or scrollback until it is closed, so starting
+  again never discards output. A deleted pod's log tab cannot be reconnected (`DockItem::can_restart`). The dock
+  emits `DockEvent::Restart` and the workspace builds the session, refusing, saying why, while the cluster is not
+  connected. On a tab whose session runs, Cmd-R falls through to Refresh. The ended banners of log and shell tabs
+  carry Reconnect and Restart shell buttons.
+- **Many tabs.** The strip scrolls the active tab into view whenever a tab opens, is shown or closes, and on the
+  frame after the tab bar changes width (the window or a pane was resized) or a kubeconfig reload changes chips. Show Dock Tabs (`dock::ShowTabList`,
+  Shift-Cmd-J, or the button at the strip's end) lists every tab with its cluster and status and shows the one
+  picked (`dock::ActivateTab`). With no tab, the strip is hidden and the dock says how to open logs or a shell.
 
 **From rows** (UP-47): Logs (`detail::OpenLogs`, ⌘L), Previous Logs (`detail::OpenPreviousLogs`, ⇧⌘L) and Shell
 (`detail::OpenShell`, ⇧⌘E) act on the selected row, which the detail pane shows, so the keys, the palette, the pane's
@@ -375,14 +407,16 @@ opens in a tab in the bottom dock.
 - **Shell tab** (`flint-app/src/ui/terminal_view.rs`): opened by Shell on a pod or workload, in its detail pane or
   its row's menu (`detail::OpenShell`, ⇧⌘E; a container picker when the pod has several app containers,
   `detail::OpenContainerShell`; see "From rows" above). While its command
-  runs, Shell on the same container shows the tab; once it ended, Shell opens a new one beside it. The grid is painted
+  runs, Shell on the same container of the same cluster (context and server) shows the tab; once it ended, Shell
+  opens a new one beside it, and Restart Shell starts a new shell in a tab beside it (see "Bottom dock"). Its
+  toolbar shows the cluster's chip beside the state. The grid is painted
   from each snapshot with the theme's mono font: one quad per run of equal background, then each row's text shaped
   with every glyph forced to the cell width (wide characters and combining marks shaped on their own), so columns
   stay aligned. Colors come from the theme: the default foreground, background, cursor (the accent) and selection are
   theme tokens, the 16 ANSI colors are a `terminal` palette per theme in `themes/flint.json` (checked for contrast in
   both themes), 16 to 255 are xterm's table (`terminal_palette.rs`). Bold, italic, underline, strikethrough, dim,
   hidden and inverse are drawn; the cursor is a block, beam or underline (a hollow block, or a faded beam or underline,
-  without focus); the bell flashes the
+  without focus; none once the session ended); the bell flashes the
   screen. The grid size comes from the element's size and the font's advance; a change is sent after 80 ms without
   further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed
   (reason); after the end the screen stays scrollable and copyable. Closing the tab drops the session.
@@ -398,6 +432,11 @@ opens in a tab in the bottom dock.
   Ctrl-Shift); Shift-Page Up/Down and Shift-Home/End
   scroll the tab instead of reaching the program; mouse reporting (programs that ask for clicks) is not sent, the
   mouse always selects.
+- **Pasting.** A paste of more than one line into a program that did not ask for bracketed paste (BusyBox `sh`
+  never does) would run each line as it arrives, so the tab asks first ("Paste 3 lines?"). Whether the program has
+  bracketed paste on is the core's call when the paste arrives (`ExecSession::paste_if_bracketed`), not the tab's
+  last snapshot: bash turns it off while it runs a command. A clipboard over 256 KB is refused with a note rather
+  than queued: the session's input channel is unbounded (#152).
 - **Mouse in a shell tab.** Dragging selects (double click: words, triple click: lines, Option: a block, Shift-click
   extends); the wheel scrolls the history, or sends arrow keys to a full-screen program on the alternate screen.
 - **OSC 52** (clipboard access by the remote program) is disabled.

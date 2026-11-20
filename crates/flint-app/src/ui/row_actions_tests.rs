@@ -475,7 +475,7 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     })
     .unwrap();
     draw(cx, &t);
-    assert_eq!(dock_tabs(cx, &t).0[2], "$ web · sidecar");
+    assert_eq!(dock_tabs(cx, &t).0[2], "Shell: web · sidecar");
 
     // Logs again from the menu shows the open tab, not a second one; so does Previous Logs
     // (Shift-Cmd-L) from the list.
@@ -554,7 +554,7 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     // Shift-Cmd-E opens a shell in the only container.
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-e");
-    assert_eq!(dock_tabs(cx, &t).0, ["api · app", "$ api · app"]);
+    assert_eq!(dock_tabs(cx, &t).0, ["api · app", "Shell: api · app"]);
     // Keys reach the action even when it cannot run: it says why.
     assert_eq!(refusal(cx, &t), None);
     focus_list(cx, &t);
@@ -585,7 +585,7 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
     click_entry(cx, &t, 0);
     assert_eq!(
         dock_tabs(cx, &t),
-        (vec!["deployment/web".to_owned()], Some(0))
+        (vec!["web (Deployment)".to_owned()], Some(0))
     );
 
     // The tab's session, fed by hand: two pods' lines, merged.
@@ -646,7 +646,7 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
     press(cx, &t, "secondary-l");
     assert_eq!(
         dock_tabs(cx, &t),
-        (vec!["deployment/web".to_owned()], Some(0))
+        (vec!["web (Deployment)".to_owned()], Some(0))
     );
     // A workload has no previous logs of its own.
     assert_eq!(
@@ -726,7 +726,7 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
         &t,
         Ok(vec![workload_pod("web-c", true, &["app", "proxy"])]),
     );
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web-c · app"]);
+    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web-c · app"]);
     let request = t.workspace.read_with(cx, |ws, cx| {
         ws.dock
             .read(cx)
@@ -755,7 +755,10 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
         &t,
         Ok(vec![workload_pod("web-c", true, &["app", "proxy"])]),
     );
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web-c · app", "$ web-c · proxy"]);
+    assert_eq!(
+        dock_tabs(cx, &t).0,
+        ["Shell: web-c · app", "Shell: web-c · proxy"]
+    );
     // One the pod lacks is refused at once.
     assert_eq!(
         dispatch(
@@ -886,7 +889,7 @@ async fn a_container_shell_waits_for_the_pod(cx: &mut TestAppContext) {
     .unwrap();
     assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
     show_fetched(cx, &t, pod_detail("web"));
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web · sidecar"]);
+    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web · sidecar"]);
 
     feed(cx, &t, pods(&[])).await;
     assert_eq!(
@@ -1168,7 +1171,7 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
         reason.as_deref(),
         Some("alpha is not connected: connection refused")
     );
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web · app"]);
+    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web · app"]);
     // Every entry is unavailable, saying why.
     let why = "alpha is not connected: connection refused";
     assert_eq!(
@@ -1438,7 +1441,7 @@ async fn a_shell_that_gave_up_drops_its_list(cx: &mut TestAppContext) {
     dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
     assert_eq!(pods.waiting(), [Freshness::Current], "a list of its own");
     pods.answer(cx, &t, Ok(vec![workload_pod("web-a", true, &["app"])]));
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web-a · app"]);
+    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web-a · app"]);
 }
 
 // covers UP-47, UP-40: the reason an action did not open goes once it no longer applies: when
@@ -1510,7 +1513,7 @@ async fn a_late_tab_opens_behind_the_dock_tab_in_use(cx: &mut TestAppContext) {
     draw(cx, &t);
     show_fetched(cx, &t, pod_detail("web"));
     let (titles, _) = dock_tabs(cx, &t);
-    assert_eq!(titles, ["$ api · app", "web · app"], "opened");
+    assert_eq!(titles, ["Shell: api · app", "web · app"], "opened");
     let active = t
         .workspace
         .read_with(cx, |ws, cx| ws.dock.read(cx).active_id());

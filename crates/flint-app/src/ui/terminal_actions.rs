@@ -2,6 +2,7 @@
 //! the workspace's guards share with them. The toolbar's buttons dispatch these actions; mouse
 //! selection and keystrokes for the shell are not actions (they are the program's input).
 
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 use super::super::registry::{
@@ -10,17 +11,17 @@ use super::super::registry::{
 };
 use super::TerminalView;
 use crate::ui::log_model::Tone;
+use crate::ui::terminal_model::{self, PasteCheck};
 
 impl TerminalView {
     /// Every shell tab action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<CopyText>(Self::copy_text)
-            .bind::<PasteText>(|view, _, _, cx| {
+            .bind::<PasteText>(|view, _, window, cx| {
                 let text = cx.read_from_clipboard().and_then(|item| item.text());
                 match text {
                     Some(text) if view.is_live() && !text.is_empty() => {
-                        view.session.paste(text);
-                        cx.notify();
+                        view.paste(text, window, cx)
                     }
                     _ => {}
                 }
@@ -47,6 +48,73 @@ impl TerminalView {
                 ),
                 Err(e) => tracing::warn!("{e}"),
             })
+    }
+
+    /// Pastes `text` into the shell: one line at once; several lines at once only if the
+    /// program takes pastes bracketed when they reach it (the core checks its live mode), else
+    /// after asking, since each line would run as it arrives; never when it is larger than
+    /// [`terminal_model::MAX_PASTE_BYTES`] (the tab says so).
+    fn paste(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        match terminal_model::paste_check(&text) {
+            PasteCheck::Paste => {
+                self.session.paste(text);
+                cx.notify();
+            }
+            PasteCheck::TooLarge { bytes } => {
+                self.set_note(Tone::Warning, terminal_model::paste_too_large(bytes));
+                cx.notify();
+            }
+            PasteCheck::Lines { lines } => {
+                let pasted = self.session.paste_if_bracketed(text.clone());
+                cx.spawn_in(window, async move |this, cx| {
+                    if pasted.await {
+                        return;
+                    }
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        view.ask_to_paste(text, lines, window, cx)
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Asks before pasting `lines` lines that would each run as they arrive.
+    fn ask_to_paste(
+        &mut self,
+        text: String,
+        lines: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_live() {
+            return;
+        }
+        let (title, description) = terminal_model::paste_question(lines);
+        let view = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (view, text) = (view.clone(), text.clone());
+            // Test builds open it at once, so automation sees it without waiting.
+            #[cfg(feature = "automation")]
+            let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
+            alert
+                .confirm()
+                .title(title.clone())
+                .description(description.clone())
+                .ok_text("Paste")
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    let text = text.clone();
+                    let _ = view.update(cx, |view, cx| {
+                        // The shell may have ended while the question was open.
+                        if view.is_live() {
+                            view.session.paste(text);
+                            cx.notify();
+                        }
+                    });
+                    true
+                })
+        });
     }
 
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {
