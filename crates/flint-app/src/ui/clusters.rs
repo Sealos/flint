@@ -72,8 +72,7 @@ impl ClustersModel {
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::ClustersChanged(snapshot) => {
-                forget_removed(&mut self.discovery, &self.clusters, &snapshot.clusters);
-                self.clusters = snapshot.clusters.clone();
+                replace_clusters(&mut self.discovery, &mut self.clusters, &snapshot.clusters);
                 self.kubeconfig_errors = snapshot.errors.clone();
                 self.kubeconfig_paths = snapshot.paths.clone();
                 self.loaded = true;
@@ -213,6 +212,17 @@ fn forget_removed(
     });
 }
 
+/// Replaces the cluster list with `now`, first forgetting the discovery its changes make stale
+/// ([`forget_removed`]). One step, so the old list is always the one compared against.
+fn replace_clusters(
+    discovery: &mut HashMap<ClusterId, Discovered>,
+    clusters: &mut Vec<ClusterSummary>,
+    now: &[ClusterSummary],
+) {
+    forget_removed(discovery, clusters, now);
+    *clusters = now.to_vec();
+}
+
 /// The cluster `FLINT_CLUSTER` selects: the context with exactly that name, or none.
 pub fn startup_cluster(requested: &str, clusters: &[ClusterSummary]) -> Option<ClusterId> {
     clusters
@@ -274,7 +284,7 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
-    use super::{Discovered, Presence, forget_removed, startup_cluster};
+    use super::{Discovered, Presence, forget_removed, replace_clusters, startup_cluster};
     use flint_core::kubeconfig::ContextInfo;
     use flint_core::{ClusterSummary, ConnectionState, ServerVersion};
     use std::collections::HashMap;
@@ -319,6 +329,30 @@ mod tests {
         let mut left: Vec<&str> = discovery.keys().map(String::as_str).collect();
         left.sort();
         assert_eq!(left, ["kept"]);
+    }
+
+    // Reloads one after another, as `ClustersChanged` applies them: each compares against the
+    // list the previous one left.
+    #[test]
+    fn each_reload_forgets_against_the_list_before_it() {
+        let at = |name: &str, server: &str| {
+            let mut c = cluster(name);
+            c.info.server = Some(server.into());
+            c
+        };
+        let mut discovery: HashMap<String, Discovered> = HashMap::new();
+        let mut clusters = Vec::new();
+        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://one")]);
+        discovery.insert("a".into(), Discovered::default());
+        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://one")]);
+        assert!(discovery.contains_key("a"), "an unchanged reload keeps it");
+        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://two")]);
+        assert!(discovery.is_empty(), "a re-pointed context is forgotten");
+        assert_eq!(clusters[0].info.server.as_deref(), Some("https://two"));
+        discovery.insert("a".into(), Discovered::default());
+        replace_clusters(&mut discovery, &mut clusters, &[]);
+        assert!(discovery.is_empty(), "a removed context is forgotten");
+        assert!(clusters.is_empty());
     }
 
     // covers UP-03, UP-91
