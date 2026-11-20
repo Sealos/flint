@@ -470,6 +470,9 @@ impl CoreHandle {
     /// when it is closed or dropped. When the cluster is not connected, it fails at once. Never
     /// blocks.
     pub fn exec(&self, request: ExecRequest) -> ExecSession {
+        // Someone opened or restarted a shell: as a retry, it may run the cluster's resting exec
+        // auth plugin again (the cached client may hold it back after a timed-out refresh).
+        crate::auth_plugin::retry_now(&request.cluster);
         let (session, channels) = ExecSession::new(request.clone());
         let client = self.write_client(&request.cluster);
         self.runtime.spawn(async move {
@@ -844,6 +847,17 @@ mod tests {
         })
         .await
         .expect("hub released");
+    }
+
+    // covers UP-44: opening or restarting a shell is a retry: it ends the rest of the cluster's
+    // exec auth plugin, as Retry does.
+    #[tokio::test]
+    async fn a_shell_ends_the_rest_of_its_clusters_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let before = crate::auth_plugin::retry_epoch("shell-rest");
+        let _session = core.exec(crate::exec::ExecRequest::shell("shell-rest", "ns", "p"));
+        assert_eq!(crate::auth_plugin::retry_epoch("shell-rest"), before + 1);
     }
 
     #[tokio::test]

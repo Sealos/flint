@@ -1057,6 +1057,9 @@ impl ClusterManager {
     }
 
     fn activate(&mut self, id: ClusterId) {
+        // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
+        // refresh may run again now.
+        crate::auth_plugin::retry_now(&id);
         if self.cluster_mut(&id).is_none() {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
             return;
@@ -1704,6 +1707,51 @@ mod tests {
         );
         let gone = manager.log_client("other", None).err().expect("no client");
         assert!(gone.is_cluster());
+    }
+
+    // covers UP-04: selecting or reconnecting a cluster while its exec auth plugin still runs
+    // waits for that attempt; it does not start a second plugin.
+    #[tokio::test]
+    async fn a_retry_while_connecting_starts_no_second_plugin() {
+        let plugin = crate::auth_plugin::tests::FakePlugin::hanging();
+        let path = plugin.dir.path().join("kubeconfig");
+        let yaml = format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: \
+             http://127.0.0.1:1\nusers:\n- name: u\n  user:\n{}contexts:\n- name: dev\n  \
+             context:\n    cluster: c\n    user: u\n",
+            plugin.user_yaml()
+        );
+        std::fs::write(&path, yaml).unwrap();
+        let (events, _rx) = async_channel::unbounded();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let hubs = HubRegistry::default();
+        let mut manager =
+            ClusterManager::new(config, events, hubs.clone(), SessionUnlocks::default());
+        let loaded = kubeconfig::load(&[path]);
+        let slot = Cluster::new(
+            loaded.contexts[0].clone(),
+            None,
+            &hubs,
+            &manager.engine_config,
+        );
+        manager.kubeconfig = Arc::new(loaded);
+        manager.clusters.push(slot);
+
+        manager.ensure_connected("dev");
+        let (leader, _) = plugin.wait_started().await;
+        for _ in 0..3 {
+            manager.ensure_connected("dev");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(plugin.starts(), [leader]);
     }
 
     // covers UP-54, UP-55: the one gate for actions that change a cluster refuses while it is

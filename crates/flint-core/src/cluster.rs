@@ -56,6 +56,14 @@ pub enum ClusterError {
     /// ([`redact::command_name`]), filled in by [`ClusterError::for_target`].
     #[error("{}", exec_not_found_message(command.as_deref()))]
     ExecPluginNotFound { command: Option<String> },
+    /// An exec auth plugin Flint ran gave no credential for a reason Flint words itself
+    /// ([`PluginProblem`]). `command` is its file name only ([`redact::command_name`]), so the
+    /// app can say which plugin to run again.
+    #[error("{}", plugin_problem_message(command, problem))]
+    ExecPlugin {
+        command: String,
+        problem: PluginProblem,
+    },
     /// The network failed below HTTP: refused, DNS, TLS, reset, dropped ([`Transport`]).
     /// `server` is filled in by [`ClusterError::for_target`].
     #[error("{}", problem.message(server.as_deref()))]
@@ -98,8 +106,44 @@ fn exec_not_found_message(command: Option<&str>) -> String {
     )
 }
 
+/// Why an exec auth plugin Flint ran (`auth_plugin`) gave no credential, other than failing
+/// on its own (an exit status, unreadable output: kube's [`kube::client::AuthError`]s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginProblem {
+    /// A token refresh did not finish within [`CONNECT_TIMEOUT`]: it may wait for a login.
+    TimedOut,
+    /// It timed out before and may prompt, so it is not run again until `until` (local
+    /// `HH:MM`), unless the cluster is selected or retried.
+    Resting { until: String },
+    /// The token refresh's task ended unexpectedly.
+    Stopped,
+    /// It printed more than a credential takes, and was killed.
+    TooLarge,
+}
+
+fn plugin_problem_message(command: &str, problem: &PluginProblem) -> String {
+    let plugin = format!("the exec auth plugin `{command}`");
+    match problem {
+        PluginProblem::TimedOut => format!(
+            "authentication failed: {plugin} did not finish within {}; it may be waiting for a \
+             login. Run it in a terminal (for example, log in again) and retry.",
+            go_duration(CONNECT_TIMEOUT)
+        ),
+        PluginProblem::Resting { until } => format!(
+            "authentication failed: {plugin} timed out, so it is not run again until {until}; \
+             retry to try now"
+        ),
+        PluginProblem::Stopped => format!(
+            "authentication failed: refreshing the token of {plugin} stopped unexpectedly; retry"
+        ),
+        PluginProblem::TooLarge => {
+            format!("authentication failed: {plugin} printed more output than a credential takes")
+        }
+    }
+}
+
 /// A duration as Go (and so kubectl) prints it: `500ms`, `10s`, `1.5s`, `1m0s`.
-fn go_duration(d: Duration) -> String {
+pub(crate) fn go_duration(d: Duration) -> String {
     let millis = d.as_millis();
     if millis < 1000 {
         return format!("{millis}ms");
@@ -131,6 +175,11 @@ impl ClusterError {
 
     /// [`ClusterError::kube`] without taking the error, for a caller that still reads it.
     pub(crate) fn kube_ref(err: &kube::Error) -> Self {
+        if let Some(kube::client::AuthError::AuthExec(text)) = find_auth_error(err)
+            && let Some((command, problem)) = crate::auth_plugin::problem(text)
+        {
+            return ClusterError::ExecPlugin { command, problem };
+        }
         match ApiError::from_kube(err) {
             Some(api) => match api.explanation() {
                 Some(message) => ClusterError::Api(message),
@@ -327,9 +376,10 @@ pub struct ServerVersion {
 /// Builds a client for `context` from the merged kubeconfig. Auth (certificates, tokens, exec
 /// plugins) is handled by kube. Must be called inside a tokio runtime.
 ///
-/// kube runs exec auth plugins synchronously while building the client, so that step runs on a
-/// blocking thread. This keeps the async caller cancellable: a timeout around `connect` fires even
-/// while a plugin waits for a login that never comes (the plugin's thread is left to finish).
+/// An exec auth plugin is run by Flint (`auth_plugin`), not by kube, so `connect` stays
+/// cancellable: a timeout around it, or dropping it, kills a plugin that waits for a login that
+/// never comes. The rest of the client setup (reading certificate files) runs on a blocking
+/// thread.
 pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, ClusterError> {
     if !kubeconfig.contexts.iter().any(|c| c.name == context) {
         return Err(ClusterError::UnknownContext(context.to_owned()));
@@ -339,14 +389,25 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
         cluster: None,
         user: None,
     };
-    let config = kube::Config::from_custom_kubeconfig(kubeconfig.clone(), &options)
+    let mut config = kube::Config::from_custom_kubeconfig(kubeconfig.clone(), &options)
         .await
         .map_err(|e| ClusterError::Config {
             context: context.to_owned(),
             message: error_chain(&e),
         })?;
     let target = Target::of(kubeconfig, context);
-    tokio::task::spawn_blocking(move || build_client(config))
+    // kube's builder refuses a proxy (`proxy-url`, or `HTTPS_PROXY` and the like) before it runs
+    // an exec plugin: so does this, with kube's own error, so no login opens for nothing.
+    if config.proxy_url.is_some() {
+        return tokio::task::spawn_blocking(move || Client::try_from(config))
+            .await
+            .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+            .map_err(|e| ClusterError::kube(e).for_target(&target));
+    }
+    let token = crate::auth_plugin::resolve(&mut config, context)
+        .await
+        .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
+    tokio::task::spawn_blocking(move || build_client(config, token))
         .await
         .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
         .map_err(|e| ClusterError::kube(e).for_target(&target))
@@ -370,16 +431,18 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// timeouts, base URI, retries, auth, and extra headers. Left out: kube's debug-level HTTP
 /// tracing spans, and the client's `valid_until` (an exec plugin certificate's expiry, which
 /// kube only records and Flint never reads). A kubeconfig with a proxy goes through kube's own
-/// builder, which reports that proxies are not supported, as before.
-fn build_client(config: kube::Config) -> Result<Client, kube::Error> {
+/// builder in [`connect`], before any exec plugin runs, which reports that proxies are not
+/// supported, as before. `token` is the refreshing
+/// token of an exec auth plugin ([`crate::auth_plugin::resolve`]), set after kube's auth layer.
+fn build_client(
+    config: kube::Config,
+    token: Option<crate::auth_plugin::TokenLayer>,
+) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
     use kube::client::retry::RetryPolicy;
     use tower::ServiceBuilder;
     use tower::retry::RetryLayer;
 
-    if config.proxy_url.is_some() {
-        return Client::try_from(config);
-    }
     let https = config.rustls_https_connector_with_connector(http_connector())?;
     let mut connector = hyper_timeout::TimeoutConnector::new(https);
     connector.set_connect_timeout(config.connect_timeout);
@@ -397,6 +460,7 @@ fn build_client(config: kube::Config) -> Result<Client, kube::Error> {
                 .then(|| RetryLayer::new(RetryPolicy::server_retry())),
         )
         .option_layer(config.auth_layer()?)
+        .option_layer(token)
         .layer(config.extra_headers_layer()?)
         .map_err(tower::BoxError::from)
         .service(http);
@@ -453,9 +517,14 @@ pub fn context_fingerprint(kubeconfig: &Kubeconfig, context: &str) -> Option<u64
     let user = ctx
         .and_then(|c| c.user.as_ref())
         .and_then(|u| kubeconfig.auth_infos.iter().find(|n| &n.name == u));
-    // The kube types are not `Hash`; their serialized form is a stable stand-in. The string holds
-    // credentials, so it is hashed right away and never stored.
-    let text = serde_json::to_string(&(named, cluster, user)).ok()?;
+    // The kube types are not `Hash`; their serialized form is a stable stand-in, with object keys
+    // sorted: exec `env` items are `HashMap`s, serialized in a different order at each load, which
+    // would make every load look like a change (and the MCP server connect again, and run the
+    // plugin again, at every call). The sort is explicit because the app builds serde_json with
+    // `preserve_order`. The string holds credentials, so it is hashed right away and never stored.
+    let mut value = serde_json::to_value((named, cluster, user)).ok()?;
+    value.sort_all_objects();
+    let text = value.to_string();
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     Some(hasher.finish())
@@ -534,9 +603,10 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
         A::AuthExecParse(_) => {
             "authentication failed: the exec auth plugin's output could not be parsed".to_owned()
         }
-        A::AuthExec(_) => {
-            "authentication failed: the exec auth plugin reported an error".to_owned()
-        }
+        A::AuthExec(text) => match crate::auth_plugin::problem(text) {
+            Some((command, problem)) => plugin_problem_message(&command, &problem),
+            None => "authentication failed: the exec auth plugin reported an error".to_owned(),
+        },
         A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => {
             exec_not_found_message(None)
         }
@@ -592,6 +662,28 @@ mod tests {
         assert_eq!(a, a2);
         assert_ne!(a, b);
         assert_eq!(context_fingerprint(&kubeconfig("https://a"), "nope"), None);
+    }
+
+    // covers UP-06: exec `env` items are maps, read in a different order at each load; the
+    // fingerprint must not see that as a change.
+    #[test]
+    fn fingerprint_ignores_the_order_of_exec_env_items() {
+        let env: String = (0..8)
+            .map(|i| format!("      - name: N{i}\n        value: v{i}\n"))
+            .collect();
+        let load = || {
+            Kubeconfig::from_yaml(&format!(
+                "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: \
+                 https://a\nusers:\n- name: u\n  user:\n    exec:\n      apiVersion: \
+                 client.authentication.k8s.io/v1\n      command: aws\n      env:\n{env}\
+                 contexts:\n- name: ctx\n  context:\n    cluster: c\n    user: u\n"
+            ))
+            .unwrap()
+        };
+        let first = context_fingerprint(&load(), "ctx").unwrap();
+        for _ in 0..20 {
+            assert_eq!(context_fingerprint(&load(), "ctx"), Some(first));
+        }
     }
 
     // covers UP-09
