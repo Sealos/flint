@@ -194,16 +194,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Publish the release
+      # Publish only a complete release: every binary and its checksum must be on the draft first.
+      - name: Check the draft has every binary
         run: |
-          case "$VERSION" in
-            0.*) gh release edit "$TAG" --draft=false --prerelease ;;
-            *) gh release edit "$TAG" --draft=false ;;
-          esac
-      # Never leave a published release that nobody can install.
-      - name: Check the published release has its binaries
-        run: |
-          names=$(gh release view "$TAG" --json isDraft,assets --jq 'select(.isDraft == false) | .assets[].name')
+          names=$(gh release view "$TAG" --json assets --jq '.assets[].name')
           for file in \
             "flint-${TAG}-macos-universal.tar.gz" \
             "flint-${TAG}-macos-universal.dmg" \
@@ -213,3 +207,10 @@ jobs:
               grep -qxF "$want" <<<"$names" || { echo "::error::release $TAG is missing $want"; exit 1; }
             done
           done
+      # A complete release is a full release, marked Latest, not a pre-release.
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false --prerelease=false --latest
+      - name: Check the release is published
+        run: |
+          gh release view "$TAG" --json isDraft,isPrerelease \
+            --jq 'if .isDraft or .isPrerelease then error("release \(env.TAG) is not a full release") else "ok" end'
