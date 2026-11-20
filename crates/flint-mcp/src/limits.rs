@@ -199,8 +199,14 @@ impl Work {
 }
 
 /// What [`ReplyBytes`] tells of a dropped tool call.
-pub(crate) type DroppedCall =
-    Box<dyn Fn(String, Option<serde_json::Map<String, serde_json::Value>>) + Send + Sync>;
+pub(crate) type DroppedCall = Box<
+    dyn Fn(
+            String,
+            Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl ReplyBytes {
     /// Sets what is told of a dropped tool call; only the first one set counts.
@@ -208,11 +214,13 @@ impl ReplyBytes {
         let _ = self.dropped_call.set(tell);
     }
 
-    fn dropped(&self, message: &RxJsonRpcMessage<RoleServer>) {
+    /// Tells of a tool call that never reaches a handler (cancelled while it waited, refused
+    /// at the transport), so it is recorded; awaited, so a slow activity log slows reading.
+    async fn dropped(&self, message: &RxJsonRpcMessage<RoleServer>) {
         if let (JsonRpcMessage::Request(request), Some(tell)) = (message, self.dropped_call.get())
             && let ClientRequest::CallToolRequest(call) = &request.request
         {
-            tell(call.params.name.to_string(), call.params.arguments.clone());
+            tell(call.params.name.to_string(), call.params.arguments.clone()).await;
         }
     }
 
@@ -433,6 +441,9 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
             loop {
                 let free = || replies.unanswered_count() < most;
                 if *eof && deferred.is_empty() {
+                    // rmcp stops waiting for handlers soon after the stream ends: it ends once
+                    // every request read has its answer (or is done with).
+                    replies.until(|| replies.unanswered_count() == 0).await;
                     return None;
                 }
                 if free()
@@ -466,8 +477,10 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                         if in_flight {
                             refuse(inner, &replies, id.clone(), DUPLICATE);
                         } else if !free() && deferred.len() >= most {
-                            // As many wait here already: refused, its reply counted.
+                            // As many wait here already: refused, its reply counted, and a
+                            // tool call recorded.
                             refuse(inner, &replies, id.clone(), BUSY);
+                            replies.dropped(&message).await;
                         } else if free() {
                             replies.unanswered().insert(id.clone(), work(request));
                             return Some(message);
@@ -478,13 +491,12 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                     _ => {
                         if let Some(id) = cancels(&message) {
                             // One still waiting here never reaches rmcp: told of here.
-                            deferred.retain(|d| {
-                                let ours = request_id(d) == Some(&id);
-                                if ours {
-                                    replies.dropped(d);
-                                }
-                                !ours
-                            });
+                            if let Some(at) =
+                                deferred.iter().position(|d| request_id(d) == Some(&id))
+                            {
+                                let dropped = deferred.remove(at).expect("found");
+                                replies.dropped(&dropped).await;
+                            }
                             replies.cancelled(&id);
                         }
                         return Some(message);

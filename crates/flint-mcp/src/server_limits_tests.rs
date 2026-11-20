@@ -551,3 +551,148 @@ async fn connections_are_made_a_few_at_a_time() {
     })
     .await;
 }
+
+// covers UP-08: a call still running when the client closes its end (longer than rmcp waits for
+// handlers then) is still answered: the transport ends the stream only once every request read
+// is answered. The real deadline path, on a paused clock.
+#[tokio::test(start_paused = true)]
+async fn a_call_outliving_the_close_is_still_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        deadline: Duration::from_secs(7),
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let client = Client::start(&server, 64 * 1024).await;
+    let Client {
+        mut write,
+        mut read,
+    } = client;
+    let line = format!(
+        "{}\n",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "list_resource_kinds", "arguments": {"cluster": "silent"}}})
+    );
+    write.write_all(line.as_bytes()).await.unwrap();
+    write.shutdown().await.unwrap();
+    let mut answer = String::new();
+    tokio::time::timeout(Duration::from_secs(30), read.read_line(&mut answer))
+        .await
+        .expect("answered")
+        .unwrap();
+    let reply: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(reply["id"], json!(1), "{reply}");
+    assert!(text(&reply).starts_with("timed out after 7s"), "{reply}");
+}
+
+// covers UP-08: a tool call refused at the transport (too many waiting) is recorded.
+#[tokio::test]
+async fn a_call_refused_at_the_transport_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        unanswered: 1,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for id in 1..=3 {
+        client
+            .call(
+                id,
+                "list_resource_kinds",
+                json!({"cluster": "silent", "kind": "pods"}),
+            )
+            .await;
+    }
+    let refused = client.next().await;
+    assert_eq!(refused["id"], json!(3), "{refused}");
+    let records = || flint_core::activity::read(dir.path());
+    wait_for("the refused call is recorded", || records().len() == 1).await;
+    let record = &records()[0];
+    assert_eq!(record.tool, "list_resource_kinds");
+    assert_eq!(record.cluster.as_deref(), Some("silent"));
+    assert_eq!(record.outcome, flint_core::activity::Outcome::Failed);
+}
+
+// covers UP-08: with every connect turn taken (plugins that never answer), list_clusters says a
+// cluster whose connection never got a turn was not checked, not that it cannot be reached; and
+// that connection does not start later once nobody waits for it.
+#[tokio::test(start_paused = true)]
+async fn clusters_whose_connection_never_started_are_not_checked() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let traces = dir.path().join("traces");
+    std::fs::create_dir(&traces).unwrap();
+    let plugin = dir.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\necho $1 >> \"$PLUGIN_DIR/starts\"\nexec sleep 600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let names: Vec<String> = (0..super::CONNECTS_AT_ONCE + 1)
+        .map(|n| format!("c{n}"))
+        .collect();
+    let mut kubeconfig = String::from("apiVersion: v1\nkind: Config\nclusters:\n");
+    let mut settings = String::new();
+    let mut users = String::from("users:\n");
+    let mut contexts = String::from("contexts:\n");
+    for name in &names {
+        kubeconfig += &format!("- name: {name}\n  cluster:\n    server: http://127.0.0.1:1\n");
+        settings += &format!(
+            "[[ai_exposed_clusters]]\ncontext = \"{name}\"\nserver = \"http://127.0.0.1:1\"\n"
+        );
+        users += &format!(
+            "- name: {name}\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+             command: {}\n      args: [{name}]\n      interactiveMode: Never\n      env:\n      \
+             - name: PLUGIN_DIR\n        value: {}\n",
+            plugin.display(),
+            traces.display()
+        );
+        contexts += &format!("- name: {name}\n  context:\n    cluster: {name}\n    user: {name}\n");
+    }
+    kubeconfig += &users;
+    kubeconfig += &contexts;
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig).unwrap();
+    std::fs::write(dir.path().join("settings.toml"), settings).unwrap();
+    let server = FlintMcp::with_limits(
+        dir.path().to_owned(),
+        vec![dir.path().join("kubeconfig")],
+        None,
+        Limits::default(),
+    );
+    let mut client = Client::start(&server, 64 * 1024).await;
+    client.call(1, "list_clusters", json!({})).await;
+    // Its probes take their full 10 s.
+    let mut answer = String::new();
+    tokio::time::timeout(Duration::from_secs(60), client.read.read_line(&mut answer))
+        .await
+        .expect("listed")
+        .unwrap();
+    let reply: Value = serde_json::from_str(&answer).unwrap();
+    let listed: Value = serde_json::from_str(text(&reply)).unwrap();
+    let rows = listed["clusters"].as_array().unwrap();
+    let not_checked: Vec<&Value> = rows.iter().filter(|r| r["reachable"].is_null()).collect();
+    assert_eq!(not_checked.len(), 1, "{listed}");
+    assert!(
+        not_checked[0]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("not checked"),
+        "{listed}"
+    );
+    let started = || {
+        std::fs::read_to_string(traces.join("starts"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let skipped = not_checked[0]["name"].as_str().unwrap().to_owned();
+    // The others' connections time out and free their turns; nobody waits for the skipped one.
+    tokio::time::sleep(super::TOOL_CONNECT_TIMEOUT * 2).await;
+    assert_eq!(started().len(), super::CONNECTS_AT_ONCE);
+    assert!(!started().contains(&skipped), "{:?}", started());
+}

@@ -916,14 +916,15 @@ Rules:
   no more requests and no admitted call starts its work. A client that stops reading stdout therefore holds about
   that budget plus those replies, however many calls it keeps sending (refusals and replies to other requests
   included). A request read at that limit waits at the transport (up to as many again; past that it is refused
-  there) while reading goes on, so a cancellation always gets through; when the client closes its end, what waits
-  still runs. A request counts until its reply reaches the transport (where its bytes count), or, once cancelled,
+  there, and a refused tool call recorded) while reading goes on, so a cancellation always gets through; when the
+  client closes its end, what waits still runs, and the stream ends only once every request read is answered. A request counts until its reply reaches the transport (where its bytes count), or, once cancelled,
   until nothing works on it (a tool call's handler has ended). A request whose id is still in flight is refused at
   the transport. A cluster's connection (and its exec auth plugin) is made in a task of its own that later calls
-  join; at most 4 run at once, each holding its turn until it ends, and a finished one keeps its client cached and
-  leaves nothing behind. Each call writes one activity record once its outcome is settled (refused, cancelled,
-  timed-out and cancelled-while-waiting calls as failed), through one writer task with a bounded queue, so no reply
-  waits for the file; the server flushes it when the client disconnects. The timeout reply is redacted like every
+  join; at most 4 run at once. A connection waits for its turn only while some call waits for it, then holds it until
+  it ends; the task alone caches the client, then leaves the map. `list_clusters` reports a cluster whose connection
+  never got a turn as not checked (`reachable: null`), not unreachable. Each call writes one activity record once its outcome is settled (refused, cancelled,
+  timed-out and cancelled-while-waiting calls as failed), through one writer task with a bounded queue (capped as written, and awaited: a writer
+  that falls behind slows calls rather than losing records), so no reply waits for the file; the server flushes it when the client disconnects. The timeout reply is redacted like every
   other.
 - **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
   `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
