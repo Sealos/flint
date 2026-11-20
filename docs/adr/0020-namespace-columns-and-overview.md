@@ -6,29 +6,42 @@ itself, and a row opens a dashboard scoped to that namespace.
 
 - **New columns on the Namespaces list**, computed by Flint:
   - **Problems:** failing or crash-looping pods, and Deployments, StatefulSets or DaemonSets short of their desired
-    replicas, with the same definitions as the dashboard's "Problems now"
-    ([ADR-0017](./0017-cluster-dashboards.md)).
+    replicas that are not rolling out. These are the pod and workload rules of the dashboard's "Problems now"
+    ([ADR-0017](./0017-cluster-dashboards.md)), shared in one place, so the two counts agree. The dashboard's other
+    problems (not-ready nodes, Warning events, pending PVCs, failed Jobs) are not in this column, and its hover says
+    "failing pods and stalled workloads".
   - **Pods:** a count.
-  - **CPU** and **Memory:** each "used / requested". Usage comes from metrics-server, and the used part is blank
-    without it ([ADR-0005](./0005-metrics-server-only.md)). Requests are summed from the pod specs of pods that have
-    not finished, counted as the scheduler counts them (the larger of the init containers and the sum of the
-    containers, plus pod overhead).
+  - **CPU** and **Memory:** each "used / requested", for example "120m / 500m". Usage comes from metrics-server
+    ([ADR-0005](./0005-metrics-server-only.md)). Requests are each pod's effective request, as the scheduler computes
+    it, summed over the pods that have not finished.
+- **Empty cells say why:** with nothing requested the cell shows the usage alone, with "no requests" on hover. Without
+  metrics-server the used part is blank, with "metrics-server is not installed" on hover; when RBAC forbids reading
+  metrics, it is blank with "metrics not allowed" instead.
+- **Unavailable, not zero:** a namespace whose pods or workloads Flint does not watch (namespace-limited access) shows
+  "unavailable" in these columns, not 0.
 - **Sort:** the default stays by name. A column click changes it, and the choice is remembered per cluster.
-- **Namespace overview:** a row click opens the cluster dashboard scoped to the namespace. It shows problem counts
-  that open filtered lists, CPU and memory usage against requests with sparklines of the last hour, recent Warning
-  events and rollouts, and ResourceQuota use and LimitRange limits when the namespace has them. A **YAML** tab shows the
-  namespace object, and the row's context menu also has **Show YAML**.
-- **Sequencing:** the columns ship first. They need only the pod and workload watches and the metrics-server poll. The
-  overview lands right after the cluster dashboard, built from its components. Until then a row click keeps opening
-  the detail pane.
+- **Namespace overview:** a row click opens the cluster dashboard scoped to the namespace, in the main view in place
+  of the list, as the cluster dashboard opens; Back returns to the list. It shows problem counts, recent Warning
+  events and rollouts, CPU and memory usage against requests with sparklines, and ResourceQuota use and LimitRange
+  limits when the namespace has them. A **YAML** tab shows the namespace object, and the row's context menu also has
+  **Show YAML**.
+- **Counts open lists filtered to the namespace** with a filter of the opened list's own, shown in its header and
+  dropped when the user leaves it. The cluster's namespace filter does not change.
+- **Sparklines start when someone looks:** Flint records a namespace's usage samples while its overview, or the
+  Namespaces list, is open, and the sparkline fills in from then, up to an hour. A namespace's samples are dropped
+  when neither is open. Nothing is kept for namespaces nobody looks at.
+- **Sequencing:** the columns ship first. They need only the workload watches, the Pods list, and the metrics-server
+  poll. The overview lands right after the cluster dashboard, built from its components. Until then a row click keeps
+  opening the detail pane.
 - **Agents:** nothing now. Later, the dashboard's `get_cluster_summary` MCP tool takes an optional namespace, within
   the cluster's exposure scope and redaction ([ADR-0013](./0013-agent-trust-model.md)).
-- **Cluster sets** ([ADR-0014](./0014-cluster-sets-and-combined-views.md)): namespaces with the same name merge into
-  one row. Its columns are summed across members, and a member count shows ("3 clusters"). The status shown is the
-  worst across members (Terminating beats Active), and the age is the oldest. A chevron expands one child row per
-  member cluster, each with its colour tag. Clicking a merged row opens a set-scoped namespace overview: one card per
-  member for that namespace (problems, usage, sparklines) under a totals strip. A card opens that member's namespace
-  overview.
+- **Cluster sets (deferred until cluster sets are scheduled)** ([ADR-0014](./0014-cluster-sets-and-combined-views.md)):
+  namespaces with the same name merge into one row. Its columns are summed across members, and a member count shows
+  ("3 clusters"). The status shown is the worst across members (Terminating beats Active), and the age is the oldest.
+  When a member has no metrics, the merged usage is marked partial and compared only against the requests of the
+  members that have usage. A chevron expands one child row per member cluster, each with its colour tag. Clicking a
+  merged row opens a set-scoped namespace overview: one card per member for that namespace (problems, usage,
+  sparklines) under a totals strip. A card opens that member's namespace overview.
 
 ## Considered Options
 
@@ -45,6 +58,10 @@ itself, and a row opens a dashboard scoped to that namespace.
 - **Ship everything with the dashboards:** one release, but delays columns that need nothing from the dashboard.
 - **A namespace MCP tool now:** agents can already list pods and events per namespace. A summary belongs with
   `get_cluster_summary` once it exists.
+- **Always sample every namespace:** every overview would open with a full hour, but a cluster with hundreds of
+  namespaces would keep hundreds of series nobody reads.
+- **Keep the top N namespaces:** bounds the memory, but which namespaces have history would depend on a ranking the
+  user cannot see.
 - **One row per member namespace in a cluster set:** keeps each row's cluster, but hides that `payments` is the same
   namespace on three clusters, and triples the list.
 - **Expand only, when a merged row is clicked:** no new view, but leaves no place to compare one namespace across
@@ -52,18 +69,25 @@ itself, and a row opens a dashboard scoped to that namespace.
 
 ## Consequences
 
-- The Namespaces list counts as an open view of Pods, the replica workloads and pod metrics, so it watches and polls
-  them while it shows, in either watch mode, as the dashboard does. The overview also needs Events, ResourceQuotas
-  and LimitRanges.
-- Rows keep only metadata and Table cells today (lists ask for `includeObject=Metadata`). The problem rules and summed
-  requests need a few typed fields from each pod and workload (phase, waiting reasons, readiness, resource requests,
-  replica status). These kinds are asked for with `includeObject=Object`, and only the typed fields are kept per row,
-  not the whole object. That costs bandwidth on every list and watch event of these kinds, and some memory per row,
-  which the memory budgets and the kwok measurements must include.
+- The Namespaces list counts as an open view of the replica workloads and pod metrics, so it watches and polls them
+  while it shows, in either watch mode, as the dashboard does. The overview also needs Events, ResourceQuotas and
+  LimitRanges.
+- Pod problems come from the Pod Table's cells (Status, Ready, Restarts), which Flint already keeps. Pod requests
+  are not in the Table, and Pods stay on `includeObject=Metadata` for every other view and for the MCP server. Flint
+  reads pod specs only while the Namespaces list or a namespace overview is open, and keeps only the summed requests.
+  The kwok measurements that would size this are still planned, and #27 proposes deferring the nightly memory soak
+  (#126).
+- Workload problems use the typed replica status of [ADR-0021](./0021-replica-ready-column.md). The dashboard's
+  "short of replicas" count leaves out rolling-out workloads too, so a healthy rollout is never a problem.
+- The effective request follows Kubernetes: pod-level requests when the pod sets them; otherwise the app containers
+  plus the restartable init (sidecar) containers, or the largest init container plus the sidecars started before it
+  when that is larger; plus pod overhead.
 - Lists do not remember their sort today. This adds a remembered sort per cluster to `state.toml`, which every list
   can use.
 - The dashboard's components take a namespace scope, so the cluster and namespace overviews share one
   implementation.
-- In a cluster set, the merged row and its set-scoped overview follow the set dashboard's card layout.
-- This amends [ADR-0014](./0014-cluster-sets-and-combined-views.md): in the Namespaces list, a merged row stands for
-  several clusters' objects. Its child rows, and every other list's rows, still keep their cluster.
+- Namespaces becomes the only list whose row click opens a view instead of the detail pane. The overview's YAML tab
+  and the row's Show YAML cover what the pane showed.
+- This amends [ADR-0014](./0014-cluster-sets-and-combined-views.md), once the deferred part is built: in the
+  Namespaces list, a merged row stands for several clusters' objects. Its child rows, and every other list's rows,
+  still keep their cluster.
