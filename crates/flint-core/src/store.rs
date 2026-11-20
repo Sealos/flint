@@ -188,7 +188,9 @@ impl Store {
             if self.pending_layout.is_some() {
                 self.layout = self.pending_layout.take();
             }
-            self.interner.prune();
+            // The snapshot published last still holds the old rows' strings: prune again soon,
+            // once a new one has replaced it.
+            self.interner.prune_soon_again();
         }
     }
 
@@ -375,6 +377,33 @@ mod tests {
             );
         }
         assert_eq!(store.len(), 50);
+    }
+
+    // covers UP-20, UP-27: strings of rows a relist replaced go soon after, even though the
+    // snapshot published before the relist held them when it ended (#257).
+    #[test]
+    fn strings_of_relisted_rows_go_once_the_old_snapshot_does() {
+        let mut store = Store::new(true);
+        for i in 0..5_000 {
+            let uid = format!("old-{i}");
+            let status = format!("old-status-{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "1"), false, 0);
+        }
+        let published = store.snapshot(KindSnapshot::default());
+        store.begin_resync();
+        store.apply(obj(&[("new", "demo", "new", "Running")], "2"), false, 0);
+        store.finish_resync();
+        // The old snapshot is still out: its strings survive the relist's prune.
+        assert!(store.interned() > 5_000, "{}", store.interned());
+        drop(published);
+        // The next prune comes after PRUNE_MIN new strings, not after another 5,000.
+        for i in 0..4_096 {
+            let uid = format!("u{i}");
+            let status = format!("s{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "3"), false, 0);
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "3"), true, 0);
+        }
+        assert!(store.interned() < 100, "{}", store.interned());
     }
 
     // covers UP-27
