@@ -406,8 +406,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** one Ready column shows "ready/desired" with a dot: green when all are ready (also "4/3" during a surge),
   amber when some are not or when none are yet while it rolls out, red when none are and it is not rolling out, grey
   and dimmed at 0/0. "· 3 current" shows only when current differs, and hover shows the kind's details (up-to-date
-  and available for Deployments). Sorting by Ready puts red first, then amber, green and grey, each by the share ready,
-  then by name. During a rollout the cell shows a static ↻ and "rolling out", with no animation; a paused Deployment
+  and available for Deployments). Sorting by Ready puts red first, then amber, green and grey, each by the share ready
+  (grey by name alone), then by name. During a rollout the cell shows a static ↻ and "rolling out", with no animation; a paused Deployment
   says "paused"; a Deployment past its progress deadline turns red with the condition's message on hover. Wide adds
   the server's raw columns next to Ready. Jobs and CronJobs keep their own columns. An agent's `list_resources` still
   gets the server's columns.
@@ -488,7 +488,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   With nothing requested the cell shows usage alone and says "no requests" on hover. Without metrics-server the used
   part is blank and says so on hover; when I may not read metrics, the hover says that instead. A namespace Flint
   cannot watch shows "unavailable", not 0. The list is sorted by name; clicking a column sorts by it, and the choice is
-  remembered per cluster. Counts update live.
+  remembered per cluster (#205). Counts update live.
 - Tests: unit (aggregation, problem rules, effective requests), ui, e2e (fake API server with full pod objects and
   metrics, #129).
 

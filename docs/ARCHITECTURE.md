@@ -235,9 +235,13 @@ aggregates ([ADR-0020](./adr/0020-namespace-columns-and-overview.md), #195, #198
 
 - **Problems and Pods** are updated from the Pods store (its Table cells) and the replica workloads' typed status as
   their snapshots change. The pod and workload problem rules live in one place, shared with the dashboard.
-- **Usage** is summed by namespace from each metrics-server poll. **Requests** come from a Pods list with
-  `includeObject=Object` that runs only while the Namespaces list or a namespace overview is open; each pod's
-  effective request (as the scheduler computes it) is summed and the object is dropped.
+- **Usage** is summed by namespace from each metrics-server poll.
+- **Requests** come from a second Pods watch with `includeObject=Object`, beside the Metadata one, that runs while
+  the Namespaces list or a namespace overview is open. Each pod's effective request (as the scheduler computes it) is
+  summed by namespace and the object is dropped. Starting it re-lists every pod in full: tens of MB on a cluster with
+  10,000 pods, on each start. It therefore stays alive for 2 minutes after the last of the list and the overviews
+  closes, so moving between the list, an overview and back, or a short detour, does not pay that again. After the
+  grace period it stops and its sums are dropped.
 - **Coverage:** with namespace-limited access, Pods and workloads are watched only in some namespaces. The aggregate
   records which namespaces its watches cover, and a namespace outside them shows "unavailable", not 0. Metrics that
   RBAC forbids and a missing metrics-server are told apart.

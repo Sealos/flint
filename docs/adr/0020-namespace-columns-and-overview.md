@@ -69,12 +69,16 @@ itself, and a row opens a dashboard scoped to that namespace.
 
 ## Consequences
 
-- The Namespaces list counts as an open view of the replica workloads and pod metrics, so it watches and polls them
-  while it shows, in either watch mode, as the dashboard does. The overview also needs Events, ResourceQuotas and
+- The Namespaces list counts as an open view of Pods (the Metadata watch, for Problems and Pods), the replica
+  workloads and pod metrics, so it watches and polls them while it shows, in either watch mode, as the dashboard
+  does. The overview also needs Events, ResourceQuotas and
   LimitRanges.
 - Pod problems come from the Pod Table's cells (Status, Ready, Restarts), which Flint already keeps. Pod requests
   are not in the Table, and Pods stay on `includeObject=Metadata` for every other view and for the MCP server. Flint
-  reads pod specs only while the Namespaces list or a namespace overview is open, and keeps only the summed requests.
+  reads pod specs through a second Pods watch with `includeObject=Object`, only while the Namespaces list or a
+  namespace overview is open, and keeps only the summed requests. Each start re-lists every pod in full (tens of MB
+  on a cluster with 10,000 pods), so the watch stays alive for 2 minutes after the last of them closes, which keeps
+  moving between the list and an overview from paying that again.
   The kwok measurements that would size this are still planned, and #27 proposes deferring the nightly memory soak
   (#126).
 - Workload problems use the typed replica status of [ADR-0021](./0021-replica-ready-column.md). The dashboard's

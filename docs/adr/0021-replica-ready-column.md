@@ -17,8 +17,9 @@ by default.
   rolling out, so a new Deployment that is starting is amber, not red. Red when none are ready, some are wanted, and
   it is not rolling out, or when its rollout is stuck. At 0/0 it is grey and the row is dimmed. During a surge, ready
   can exceed desired: the cell shows the real numbers ("4/3") and the dot is green.
-- **Sort by health:** worst first is red, then amber, then green, then grey. Within each, rows sort by the share
-  ready (ready divided by desired) from lowest, then by namespace and name. A second click reverses the order.
+- **Sort by health:** worst first is red, then amber, then green, then grey. Within red, amber and green, rows sort
+  by the share ready (ready divided by desired) from lowest, then by namespace and name. Grey 0/0 rows have no share,
+  so they sort by namespace and name. A second click reverses the order.
 - **Rollout marker:** for Deployments, StatefulSets and DaemonSets, when fewer replicas are updated than desired, old
   pods still run, or the controller has not yet seen the latest spec, the cell shows a static ↻ glyph and "rolling
   out" ("2/3 ↻ rolling out"). There is no spinner and no animation. A stuck rollout (a Progressing condition with
