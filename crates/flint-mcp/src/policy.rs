@@ -3,6 +3,7 @@
 
 use flint_core::Settings;
 use flint_core::kubeconfig::{ContextInfo, LoadedKubeconfig};
+use flint_core::read::{is_dns1123_label, is_dns1123_subdomain, is_path_segment};
 use flint_core::settings::AiExposureState;
 use serde_json::Value;
 
@@ -127,40 +128,6 @@ pub fn exposed_cluster<'a>(
         .ok_or_else(|| PolicyError::ClusterNotFound(name.to_owned()))
 }
 
-/// Whether `name` can be sent as one segment of a request path, as client-go's
-/// `IsValidPathSegmentName` requires: not `.` or `..`, and no `/` or `%`. `?`, `#`, whitespace
-/// and control characters are refused as well, so a name can never end the path or add to it.
-fn is_path_segment(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name
-            .chars()
-            .any(|c| matches!(c, '/' | '%' | '?' | '#') || c.is_whitespace() || c.is_control())
-}
-
-/// Lowercase letters, digits and `-`, starting and ending with a letter or digit, of any
-/// non-zero length.
-fn is_dns1123_part(part: &str) -> bool {
-    let bytes = part.as_bytes();
-    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    bytes.first().is_some_and(alnum)
-        && bytes.last().is_some_and(alnum)
-        && bytes.iter().all(|b| alnum(b) || *b == b'-')
-}
-
-/// A DNS-1123 label: at most 63 lowercase letters, digits and `-`, starting and ending with a
-/// letter or digit.
-fn is_dns1123_label(name: &str) -> bool {
-    name.len() <= 63 && is_dns1123_part(name)
-}
-
-/// A DNS-1123 subdomain as Kubernetes checks it: at most 253 characters, parts as in a label
-/// joined by `.`, with no limit on the length of one part.
-fn is_dns1123_subdomain(name: &str) -> bool {
-    name.len() <= 253 && name.split('.').all(is_dns1123_part)
-}
-
 /// Whether a caller may name a namespace or a container with `name`: a DNS-1123 label.
 pub fn is_label_name(name: &str) -> bool {
     is_path_segment(name) && is_dns1123_label(name)
@@ -199,10 +166,12 @@ pub fn sanitize_secret(value: &mut Value) -> usize {
     redact_object_text(value)
 }
 
-/// Whether `value` is a list of Secrets. The items of a `SecretList` carry no `kind` or
-/// `apiVersion` of their own, so they are redacted as Secrets because of the list.
+/// Whether `value` is a core v1 list of Secrets. The items of a `SecretList` carry no `kind` or
+/// `apiVersion` of their own, so they are redacted as Secrets because of the list. A CRD's
+/// `SecretList` in another group is not one.
 fn is_secret_list(value: &Value) -> bool {
     value.get("kind").and_then(Value::as_str) == Some("SecretList")
+        && value.get("apiVersion").and_then(Value::as_str) == Some("v1")
 }
 
 /// The structural part of [`sanitize`]: managed fields and Secret values. `secret` says the
@@ -997,6 +966,14 @@ mod tests {
         let mut list = json!({"kind": "List", "items": [{"data": {"a": "c2VjcmV0"}}]});
         sanitize_secret(&mut list);
         assert_eq!(list["items"][0]["data"]["a"], REDACTED);
+        // A CRD's SecretList in another group is not core Secrets.
+        let mut custom = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "SecretList",
+            "items": [{"metadata": {"name": "x"}, "data": {"a": "b"}}]
+        });
+        sanitize(&mut custom);
+        assert_eq!(custom["items"][0]["data"]["a"], "b");
         // Without the hint, a kindless item outside a SecretList is not a Secret.
         let mut plain = json!({"kind": "ConfigMapList", "items": [{"data": {"a": "b"}}]});
         sanitize(&mut plain);

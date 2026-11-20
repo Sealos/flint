@@ -228,6 +228,50 @@ async fn discover_aggregated(
     ))
 }
 
+/// Whether `name` can be sent as one segment of a request path, as client-go's
+/// `IsValidPathSegmentName` requires: not `.` or `..`, and no `/` or `%`. `?`, `#`, whitespace
+/// and control characters are refused as well, so a name can never end the path or add to it.
+pub fn is_path_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '%' | '?' | '#') || c.is_whitespace() || c.is_control())
+}
+
+/// Lowercase letters, digits and `-`, starting and ending with a letter or digit, of any
+/// non-zero length.
+fn is_dns1123_part(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    bytes.first().is_some_and(alnum)
+        && bytes.last().is_some_and(alnum)
+        && bytes.iter().all(|b| alnum(b) || *b == b'-')
+}
+
+/// A DNS-1123 label: at most 63 lowercase letters, digits and `-`, starting and ending with a
+/// letter or digit.
+pub fn is_dns1123_label(name: &str) -> bool {
+    name.len() <= 63 && is_dns1123_part(name)
+}
+
+/// A DNS-1123 subdomain as Kubernetes checks it: at most 253 characters, parts as in a label
+/// joined by `.`, with no limit on the length of one part.
+pub fn is_dns1123_subdomain(name: &str) -> bool {
+    name.len() <= 253 && name.split('.').all(is_dns1123_part)
+}
+
+/// Whether a discovered group, version and plural can be put into a request path as they are:
+/// a DNS-1123 subdomain group (or the empty core group), a DNS-1123 label version, and a
+/// plural that is one path segment. A server, or an extension API server, that advertises
+/// anything else (`x/../../api/v1/secrets`) has that resource left out.
+fn is_routable(group: &str, version: &str, plural: &str) -> bool {
+    (group.is_empty() || is_dns1123_subdomain(group))
+        && is_dns1123_label(version)
+        && is_path_segment(plural)
+}
+
 /// The kinds of one group at its preferred version, which aggregated discovery lists first.
 fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
     let name = group.metadata.and_then(|m| m.name).unwrap_or_default();
@@ -238,6 +282,7 @@ fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
     preferred
         .resources
         .into_iter()
+        .filter(|r| is_routable(&name, &version, r.resource.as_deref().unwrap_or_default()))
         .map(|r| KindInfo {
             resource: api_resource(
                 &name,
@@ -307,7 +352,7 @@ fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -
     list.resources
         .into_iter()
         // `pods/log` and the like are subresources, not kinds.
-        .filter(|r| !r.name.contains('/'))
+        .filter(|r| is_routable(group, version, &r.name))
         .map(|r| KindInfo {
             resource: api_resource(group, version, r.kind, r.name),
             namespaced: r.namespaced,
@@ -990,6 +1035,66 @@ mod tests {
         assert_eq!(kinds[0].api_version(), "v1");
         assert_eq!(kinds[0].short_names, ["po"]);
         assert_eq!(kinds[0].singular, "pod");
+    }
+
+    // covers UP-10
+    #[test]
+    fn aggregated_discovery_leaves_out_resources_that_are_not_one_path_segment() {
+        let group = |name: &str, version: &str, plural: &str| -> APIGroupDiscovery {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name},
+                "versions": [{"version": version, "resources": [
+                    {"resource": plural, "responseKind": {"kind": "Widget"}, "verbs": ["get"]},
+                    {"resource": "widgets", "responseKind": {"kind": "Widget"}, "verbs": ["get"]}
+                ]}]
+            }))
+            .unwrap()
+        };
+        let plurals = |g| -> Vec<String> {
+            kinds_from_aggregated(g)
+                .iter()
+                .map(|k| k.plural().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            plurals(group("example.com", "v1", "x/../../api/v1/secrets")),
+            ["widgets"]
+        );
+        for plural in ["..", "a%2Fb", "a?b", ""] {
+            assert_eq!(plurals(group("example.com", "v1", plural)), ["widgets"]);
+        }
+        assert!(plurals(group("example.com/../api", "v1", "gadgets")).is_empty());
+        assert!(plurals(group("example.com", "v1/../../api/v1", "gadgets")).is_empty());
+        assert_eq!(plurals(group("", "v1", "gadgets")), ["gadgets", "widgets"]);
+    }
+
+    // covers UP-10
+    #[test]
+    fn resource_lists_leave_out_resources_that_are_not_one_path_segment() {
+        let list = || -> APIResourceList {
+            serde_json::from_value(serde_json::json!({
+                "groupVersion": "example.com/v1",
+                "resources": [
+                    {"name": "x/../../api/v1/secrets", "singularName": "", "namespaced": true,
+                     "kind": "Secret", "verbs": ["get"]},
+                    {"name": "..", "singularName": "", "namespaced": true, "kind": "X",
+                     "verbs": ["get"]},
+                    {"name": "widgets", "singularName": "widget", "namespaced": true,
+                     "kind": "Widget", "verbs": ["get"]}
+                ]
+            }))
+            .unwrap()
+        };
+        let plurals = |group: &str, version: &str| -> Vec<String> {
+            kinds_from_resource_list(group, version, list())
+                .iter()
+                .map(|k| k.plural().to_owned())
+                .collect()
+        };
+        assert_eq!(plurals("example.com", "v1"), ["widgets"]);
+        assert!(plurals("example.com/../api", "v1").is_empty());
+        assert!(plurals("example.com", "v1/../..").is_empty());
+        assert!(plurals("Example.com", "v1").is_empty());
     }
 
     // covers UP-10

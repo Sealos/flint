@@ -723,8 +723,10 @@ Rules:
 - **Read-only:** there are no tools that create, change, or delete anything, and no exec or port-forward.
 - **Names:** object, pod, namespace and container names are validated as single path segments before any request
   (DNS-1123 names, or for other objects letters, digits and `-._:@`; never `.`, `..`, `/`, `%`, `?` or `#`), so a
-  name cannot reach another API path. One that fails gets a not-found error shaped like the API server's, naming
-  only what the caller sent. RBAC names that are not DNS-1123 and use other characters (spaces, `+`, `~`, non-ASCII)
+  name cannot reach another API path. The check runs before discovery, so a name that fails sends no request at
+  all; it gets a not-found error (a bad container name, the server's "not valid for pod") shaped like the API
+  server's, naming only what the caller sent. Discovery likewise leaves out any resource whose group, version or
+  plural is not a valid single path segment. RBAC names that are not DNS-1123 and use other characters (spaces, `+`, `~`, non-ASCII)
   cannot be read this way.
 - **Scope (planned, M5.5, #67):** an exposed cluster will also be able to list the namespaces and kinds an agent may
   read ([ADR-0013](./adr/0013-agent-trust-model.md)). Empty will mean everything. Requests outside the scope will fail

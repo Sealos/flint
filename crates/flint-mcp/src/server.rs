@@ -135,21 +135,12 @@ fn kind_error(e: ResolveKindError) -> ToolError {
 }
 
 /// What the API server answers for an object that does not exist (`NotFound: pods "x" not
-/// found`), where `resource` is the plural, with `.group` outside the core group. A name or
+/// found`), where `resource` is the plural, or the kind as the caller named it. A name or
 /// namespace that is not a single valid path segment gets this answer without any request, so
 /// it can never reach another path, and the caller learns nothing it would not from a missing
 /// object.
 fn not_found(resource: &str, name: &str) -> ToolError {
     ToolError(format!("NotFound: {resource} {name:?} not found"))
-}
-
-/// [`not_found`] for an object of `kind`.
-fn object_not_found(kind: &KindInfo, name: &str) -> ToolError {
-    if kind.group().is_empty() {
-        not_found(kind.plural(), name)
-    } else {
-        not_found(&format!("{}.{}", kind.plural(), kind.group()), name)
-    }
 }
 
 /// Refuses a namespace that is not a DNS-1123 label, as [`not_found`] for the namespace.
@@ -407,14 +398,18 @@ impl FlintMcp {
         Ok(kinds.clone())
     }
 
+    /// The connection and the resolved kind. `check` runs once the cluster is known to be
+    /// exposed and before discovery, so a call it refuses sends no request at all.
     async fn resolve(
         &self,
         cluster: &str,
         kind: &str,
         api_version: Option<&str>,
+        check: impl FnOnce() -> Result<(), ToolError>,
     ) -> Result<(Conn, KindInfo), ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, cluster).await?;
+        check()?;
         let kinds = self.kinds(cluster, &conn).await?;
         let kind = read::resolve_kind(&kinds, kind, api_version)
             .map_err(kind_error)?
@@ -520,9 +515,10 @@ impl FlintMcp {
 
     async fn do_list_resources(&self, p: ListResourcesParams) -> Result<String, ToolError> {
         let (conn, kind) = self
-            .resolve(&p.cluster, &p.kind, p.api_version.as_deref())
+            .resolve(&p.cluster, &p.kind, p.api_version.as_deref(), || {
+                check_namespace(p.namespace.as_deref())
+            })
             .await?;
-        check_namespace(p.namespace.as_deref())?;
         if !kind.is_listable() {
             return Err(ToolError(format!("{} cannot be listed", kind.kind())));
         }
@@ -569,17 +565,20 @@ impl FlintMcp {
     }
 
     async fn do_get_resource(&self, p: GetResourceParams) -> Result<String, ToolError> {
+        // The name and namespace go into the request path: one segment each, or not found,
+        // checked before discovery, so the kind is named as the caller gave it.
         let (conn, kind) = self
-            .resolve(&p.cluster, &p.kind, p.api_version.as_deref())
+            .resolve(&p.cluster, &p.kind, p.api_version.as_deref(), || {
+                let bad_namespace = p
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|ns| !policy::is_label_name(ns));
+                if bad_namespace || !policy::is_object_name(&p.name) {
+                    return Err(not_found(&p.kind, &p.name));
+                }
+                Ok(())
+            })
             .await?;
-        // The name and namespace go into the request path: one segment each, or not found.
-        if !policy::is_object_name(&p.name)
-            || p.namespace
-                .as_deref()
-                .is_some_and(|ns| !policy::is_label_name(ns))
-        {
-            return Err(object_not_found(&kind, &p.name));
-        }
         let object = read::get(&conn.client, &kind, p.namespace.as_deref(), &p.name)
             .await
             .map_err(|e| conn.fail(e))?;
@@ -669,13 +668,15 @@ impl FlintMcp {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
         // The namespace and pod go into the request path, the container into its query.
-        if !policy::is_label_name(&p.namespace)
-            || !policy::is_pod_name(&p.pod)
-            || p.container
-                .as_deref()
-                .is_some_and(|c| !policy::is_label_name(c))
-        {
+        if !policy::is_label_name(&p.namespace) || !policy::is_pod_name(&p.pod) {
             return Err(not_found("pods", &p.pod));
+        }
+        if let Some(c) = p.container.as_deref().filter(|c| !policy::is_label_name(c)) {
+            // As the API server words a container the pod does not have.
+            return Err(ToolError(format!(
+                "BadRequest: container {c:?} is not valid for pod {:?}",
+                p.pod
+            )));
         }
         let lines = policy::LOG_LINES.clamp(p.tail_lines);
         // Ask for one extra line to learn whether older lines exist.

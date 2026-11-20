@@ -525,63 +525,85 @@ fn up_10_names_that_are_not_single_path_segments_are_never_sent() -> Result<()> 
     );
     let mut mcp = two.mcp()?;
 
-    // What a missing object looks like, from the server itself.
-    let missing = |mcp: &mut Mcp, args: Value| -> Result<String> {
-        let got = mcp.call("get_resource", args)?;
-        assert!(got.is_error, "{}", got.text);
-        Ok(got.text)
-    };
-    let missing_ns = missing(
-        &mut mcp,
-        json!({"cluster": EXPOSED, "kind": "namespaces", "name": "nope"}),
-    )?;
-    let missing_pod = missing(
-        &mut mcp,
-        json!({"cluster": EXPOSED, "kind": "pods", "namespace": "demo", "name": "nope"}),
-    )?;
-    assert_eq!(missing_ns, "NotFound: namespaces \"nope\" not found");
-    assert_eq!(missing_pod, "NotFound: pods \"nope\" not found");
-    let sent_before = two.a.arrivals().len();
-
-    let quoted = |name: &str| format!("{name:?}");
+    // Each bad call, with what it answers and the not-found answer it must match: `ns` or
+    // `pod`, with the name it quotes. Made first, on a cold discovery cache.
     let get = |kind: &str, namespace: Option<&str>, name: &str| json!({"cluster": EXPOSED, "kind": kind, "namespace": namespace, "name": name});
-    for (args, name, expected) in [
+    let logs = |namespace: &str, pod: &str, container: Option<&str>| json!({"cluster": EXPOSED, "namespace": namespace, "pod": pod, "container": container});
+    let calls = [
         (
+            "get_resource",
             get("namespaces", None, "demo/secrets"),
+            "ns",
             "demo/secrets",
-            &missing_ns,
         ),
         (
+            "get_resource",
             get("namespaces", None, "demo%2Fsecrets"),
+            "ns",
             "demo%2Fsecrets",
-            &missing_ns,
         ),
         (
+            "get_resource",
             get("namespaces", None, "demo/secrets?x=1"),
+            "ns",
             "demo/secrets?x=1",
-            &missing_ns,
         ),
-        (get("namespaces", None, ".."), "..", &missing_ns),
+        ("get_resource", get("namespaces", None, ".."), "ns", ".."),
         (
+            "get_resource",
             get("pods", Some("demo"), "x/../db"),
+            "pod",
             "x/../db",
-            &missing_pod,
         ),
         (
+            "get_resource",
             get("pods", Some("demo"), "web#frag"),
+            "pod",
             "web#frag",
-            &missing_pod,
         ),
-        (get("pods", Some("demo/secrets"), "db"), "db", &missing_pod),
-        (get("pods", Some(".."), "db"), "db", &missing_pod),
-    ] {
-        let got = mcp.call("get_resource", args.clone())?;
+        (
+            "get_resource",
+            get("pods", Some("demo/secrets"), "db"),
+            "pod",
+            "db",
+        ),
+        ("get_resource", get("pods", Some(".."), "db"), "pod", "db"),
+        (
+            "get_pod_logs",
+            logs("demo", "db/../../secrets", None),
+            "pod",
+            "db/../../secrets",
+        ),
+        (
+            "get_pod_logs",
+            logs("demo/secrets", "db", None),
+            "pod",
+            "db",
+        ),
+        (
+            "get_pod_logs",
+            logs("demo", "%2E%2E", None),
+            "pod",
+            "%2E%2E",
+        ),
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": "demo/secrets"}),
+            "ns",
+            "demo/secrets",
+        ),
+        (
+            "get_events",
+            json!({"cluster": EXPOSED, "namespace": "../demo"}),
+            "ns",
+            "../demo",
+        ),
+    ];
+    let mut answers = Vec::new();
+    for (tool, args, _, _) in &calls {
+        let got = mcp.call(tool, args.clone())?;
         assert!(got.is_error, "{args}: {}", got.text);
-        assert_eq!(
-            got.text,
-            expected.replace("\"nope\"", &quoted(name)),
-            "{args}"
-        );
+        answers.push(got.text);
     }
     let nodes = mcp.call(
         "get_resource",
@@ -589,57 +611,41 @@ fn up_10_names_that_are_not_single_path_segments_are_never_sent() -> Result<()> 
     )?;
     assert!(nodes.is_error, "{}", nodes.text);
     assert!(nodes.text.starts_with("NotFound: nodes "), "{}", nodes.text);
-
-    let logs = |namespace: &str, pod: &str, container: Option<&str>| json!({"cluster": EXPOSED, "namespace": namespace, "pod": pod, "container": container});
-    for args in [
-        logs("demo", "db/../../secrets", None),
-        logs("demo/secrets", "db", None),
-        logs("demo", "%2E%2E", None),
+    let container = mcp.call(
+        "get_pod_logs",
         logs("demo", "web-69c6f74b8b-qv4xv", Some("web&follow=true")),
-    ] {
-        let got = mcp.call("get_pod_logs", args.clone())?;
-        assert!(got.is_error, "{args}: {}", got.text);
-        let pod = args["pod"].as_str().unwrap();
+    )?;
+    assert!(container.is_error, "{}", container.text);
+    assert_eq!(
+        container.text,
+        "BadRequest: container \"web&follow=true\" is not valid for pod \"web-69c6f74b8b-qv4xv\""
+    );
+    // Not one request reached the server, not even discovery.
+    assert!(two.a.arrivals().is_empty(), "{:?}", two.a.arrivals());
+
+    // What a missing object looks like, from the server itself.
+    let mut missing = |args: Value| -> Result<String> {
+        let got = mcp.call("get_resource", args)?;
+        assert!(got.is_error, "{}", got.text);
+        Ok(got.text)
+    };
+    let missing_ns = missing(get("namespaces", None, "nope"))?;
+    let missing_pod = missing(get("pods", Some("demo"), "nope"))?;
+    assert_eq!(missing_ns, "NotFound: namespaces \"nope\" not found");
+    assert_eq!(missing_pod, "NotFound: pods \"nope\" not found");
+    for ((tool, args, like, name), answer) in calls.iter().zip(&answers) {
+        let expected = if *like == "ns" {
+            &missing_ns
+        } else {
+            &missing_pod
+        };
         assert_eq!(
-            got.text,
-            missing_pod.replace("\"nope\"", &quoted(pod)),
-            "{args}"
-        );
-    }
-    for (tool, args) in [
-        (
-            "list_resources",
-            json!({"cluster": EXPOSED, "kind": "pods", "namespace": "demo/secrets"}),
-        ),
-        (
-            "get_events",
-            json!({"cluster": EXPOSED, "namespace": "../demo"}),
-        ),
-    ] {
-        let got = mcp.call(tool, args.clone())?;
-        assert!(got.is_error, "{args}: {}", got.text);
-        let namespace = args["namespace"].as_str().unwrap();
-        assert_eq!(
-            got.text,
-            missing_ns.replace("\"nope\"", &quoted(namespace)),
-            "{args}"
+            answer,
+            &expected.replace("\"nope\"", &format!("{name:?}")),
+            "{tool} {args}"
         );
     }
 
-    // None of them reached the server: at most discovery, which carries no caller input.
-    let sent: Vec<String> = two.a.arrivals()[sent_before..]
-        .iter()
-        .map(|r| format!("{} {}?{}", r.method, r.path, r.query))
-        .collect();
-    for request in &sent {
-        assert!(
-            !request.contains("secrets")
-                && !request.contains("/namespaces/")
-                && !request.contains("/nodes/")
-                && !request.contains('%'),
-            "{sent:?}"
-        );
-    }
     // The Secret itself is still readable by name, redacted.
     let secret = mcp.call("get_resource", get("secret", Some("demo"), "db"))?;
     assert!(!secret.is_error, "{}", secret.text);
