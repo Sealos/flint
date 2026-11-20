@@ -90,8 +90,8 @@ claude mcp add flint -- "$HOME/.local/bin/flint-mcp"
 ### Expose a cluster without the app
 
 The Expose to AI dialog writes one `ai_exposed_clusters` entry to `settings.toml` per cluster. Without the app, add
-the entry yourself, in the settings file of the machine the server runs on (`~/.config/flint/settings.toml` on Linux,
-or `$FLINT_CONFIG_DIR/settings.toml`). An entry pins the context name to the API server URL it points to now; print
+the entry yourself, in the settings file of the machine the server runs on: `$FLINT_CONFIG_DIR/settings.toml` if
+that is set, else `$XDG_CONFIG_HOME/flint/settings.toml` on Linux (default `~/.config/flint/settings.toml`). An entry pins the context name to the API server URL it points to now; print
 that URL with:
 
 ```sh
@@ -102,9 +102,13 @@ kubectl config view --minify --context staging -o jsonpath='{.clusters[0].cluste
 [[ai_exposed_clusters]]
 context = "staging"
 server = "https://staging.example.com:6443"
-# namespaces = ["shop"]                 # optional: only these namespaces (missing: all)
-# kinds = ["pods", "deployments.apps"]  # optional: only these kinds (missing: all)
+# namespaces = ["shop"]                 # optional: only these namespaces (missing or empty: all)
+# kinds = ["pods", "deployments.apps"]  # optional: only these kinds (missing or empty: all)
 ```
+
+An empty list (`namespaces = []`) means no limit, not no access: to keep agents away from a cluster, remove its entry.
+If the file already has `ai_exposed_clusters` as an inline array (`ai_exposed_clusters = [...]`), add the entry to
+that array instead; TOML doesn't allow both forms for one key, and an invalid file turns every exposure off.
 
 - **Pinned.** Both must match: if the context is later re-pointed to another server, or another kubeconfig file has a
   context of the same name at another server, it is hidden from agents until you update `server`. A trailing slash
@@ -282,10 +286,10 @@ the kubeconfig). The archive includes musl's license (`LICENSE-MUSL`), since the
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-mcp-*-x86_64-unknown-linux-musl.tar.gz*'   # or aarch64
-sha256sum -c flint-mcp-*-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf flint-mcp-*-x86_64-unknown-linux-musl.tar.gz
-install -D -m 755 flint-mcp/flint-mcp ~/.local/bin/flint-mcp
-"$HOME/.local/bin/flint-mcp" --version
+sha256sum -c flint-mcp-*-x86_64-unknown-linux-musl.tar.gz.sha256 &&
+  tar -xzf flint-mcp-*-x86_64-unknown-linux-musl.tar.gz &&
+  install -D -m 755 flint-mcp/flint-mcp ~/.local/bin/flint-mcp &&
+  "$HOME/.local/bin/flint-mcp" --version
 claude mcp add flint -- "$HOME/.local/bin/flint-mcp"
 ```
 
