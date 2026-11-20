@@ -1,6 +1,6 @@
-//! M2 user paths: logs and shells in the dock (docs/USER-PATHS.md).
+//! M2 user paths: logs in the dock (docs/USER-PATHS.md).
 //!
-//! Not here yet: UP-41 against the fake exec (#123) and UP-42 across clusters (#124). Pause,
+//! Shells (UP-41) and sessions across navigation (UP-42, UP-24) are in `m2_shell.rs`. Pause,
 //! match navigation, wrap, copy and save are view tests (`log_tests.rs`); these prove the seams:
 //! the action, the log request, the streamed line and the status the tab shows.
 
