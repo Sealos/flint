@@ -482,6 +482,58 @@ async fn go_back_has_nowhere_to_go_from_the_place_remembered_last(cx: &mut TestA
     );
 }
 
+// covers UP-33: an object opened before its row arrives waits for it; Go Back to the bare list
+// still cancels that pick, though the list shown is that same bare list.
+#[gpui_kit::test]
+async fn go_back_cancels_an_object_still_waiting_for_its_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "pods"}))
+        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    t.feed_list(cx, pods(&[("demo", "api", 0)])).await;
+    assert_eq!(t.selected(cx), None, "the pick was cancelled");
+}
+
+// covers UP-33: the Go Back key where Go Back has nowhere to go leaves the history alone, so a
+// later selection can still go back.
+#[gpui_kit::test]
+async fn go_back_with_nowhere_to_go_keeps_the_history(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    t.dispatch(cx, "resource_list::CloseDetail", serde_json::Value::Null)
+        .unwrap();
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(t.selected(cx), None, "back to the bare list");
+}
+
 // covers UP-33, UP-55: on a protected cluster the sidebar's cursor ring leaves its lock button
 // where it was, and the lock stays reachable from the keyboard: from the sidebar, the palette
 // unlocks the cluster, asking first.

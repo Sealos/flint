@@ -289,6 +289,11 @@ impl ResourceList {
         &self.label
     }
 
+    /// Whether an object opened by name waits for its row ([`ResourceList::select_listed`]).
+    pub fn picking(&self) -> bool {
+        self.pending_select.is_some()
+    }
+
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
     }
