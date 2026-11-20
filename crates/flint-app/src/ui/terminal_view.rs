@@ -1140,6 +1140,10 @@ impl InputHandler for TerminalInput {
 #[path = "terminal_actions.rs"]
 mod actions;
 
+#[cfg(any(test, feature = "automation"))]
+#[path = "terminal_state.rs"]
+mod state;
+
 #[cfg(test)]
 #[path = "terminal_tests.rs"]
 mod tests;

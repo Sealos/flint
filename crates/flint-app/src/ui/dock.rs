@@ -964,6 +964,10 @@ impl Render for Dock {
     }
 }
 
+#[cfg(any(test, feature = "automation"))]
+#[path = "dock_state.rs"]
+mod state;
+
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_HEIGHT, MIN_HEIGHT, dock_height};

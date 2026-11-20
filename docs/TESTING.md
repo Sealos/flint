@@ -127,14 +127,46 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     At most 4 KiB.
   - `press_key {key}`: a key or chord in GPUI syntax (`escape`, `enter`, `secondary-w`, `?`; `secondary` is Cmd on
     macOS, Ctrl on Linux).
-  - `state`: the visible view tree: `focus`, `dialog` (`{title, text, buttons}` while one is open), `appearance`,
+  - `right_click {id}`: right-clicks the element drawn with that id at its center (pointer move, button down and up),
+    then draws twice, since a context menu is built a frame after the click. A row's id is in `list.rows[].id`
+    (`row-<uid>`); right-clicking it selects the row and opens its menu, which `state.menu` then lists. `rejected`
+    when no element, or more than one, is drawn with that id, or it is out of view (rows are virtualized).
+  - `state`: the visible view tree: `focus` (`workspace`, `list`, `list_filter`, `namespace_input`, `detail_yaml`,
+    `dock`, `log`, `log_search`, `shell`, `dialog`, `menu`, `other` or `none`), `dialog` (`{title, text, buttons}`
+    while one is open: Expose to AI, Save logs, a multi-line paste), `appearance`,
     `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`, `connection`, and `presence`: `live`
     only for the watched cluster, `idle` for one connected but not watched), sidebar `banners`, `active_cluster`,
     `main` (`no_contexts` when no kubeconfig file had a context), `header` (`namespace_button` and `watch_mode` are
     null while hidden, as on a failed cluster; `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the
     entries of open ones), `list` (`count` as the toolbar shows it, columns as drawn and up to 500 rows in display
-    order, each with `cells` and `cells_by_column`, Secret cells masked, with its `banners` and `placeholder`) and `detail` (which object, tab, fetch state, and its sections with
-    entry counts; never values). Errors in it are sanitized summaries.
+    order, each with its element `id`, `cells` and `cells_by_column`, Secret cells masked, with its `banners` and
+    `placeholder`), `detail` (which object, tab, fetch state, and its sections with entry counts; never values),
+    `dock` and `menu` (below). Errors in it are sanitized summaries. The JSON is stable: fields are added, never
+    renamed or removed without updating the tests that read them.
+  - `state.dock`: `{visible, height, focused, active, tabs}`. `height` is in points (what the dock gets when shown,
+    if hidden); `active` is the shown tab's id, which `dock::ActivateTab` and `dock::CloseTab` take. Each tab:
+    - `id`, `kind` (`pod_logs`, `workload_logs`, `previous_logs`, `shell`), `title` (in full), `active`, `focused`;
+    - `cluster`: `{context, server, chip, repointed, removed}`, the server without credentials;
+    - `status`, by `state`: `connecting`; `streaming`; `reconnecting {attempt, back_off, reason}`; `ended {reason,
+      pod_deleted}` (all read, the pod deleted, or a shell the tab ended); `failed {reason}`; `running {command}`;
+      `exited {code}`; `closed`. Reasons are the plain words the tab shows, not the server's text. `status_text` is
+      the status line as drawn (`Ended · no permission`, `Exited (code 3)`);
+    - `logs` (log tabs): `{lines, held_back, paused, follows, following, timestamps, sources, wrap, search: {query,
+      matches, current, searching}, selection: {first, last, lines}, streams: {pods, live, connecting, waiting,
+      failed, capped}, last_lines}`. `follows`: the session follows new lines; `following`: the view sticks to the
+      newest. `last_lines` holds at most the 50 newest lines, oldest first, each `{id, text, severity, source}`
+      (`text` without timestamp or prefix; `severity` `normal`, `warning` or `error`; `source` `pod/container` in a
+      workload tab);
+    - `shell` (shell tabs): `{cols, rows, live, exit_code, cursor: {row, col}, scrolled_back, screen}`, where `screen`
+      is the visible rows as text (trailing blanks and the blank rows at the bottom left out, at most 200), never the
+      scrollback.
+  - `state.menu`: the open context menu or drop-down, or null: `{owner, note, entries: [{label, enabled, reason,
+    submenu: [{label, enabled}]}]}`. A row's menu has `owner` `row-menu-<uid>`, `note` (why nothing can open: the
+    cluster is not connected) and each entry's `reason` when disabled; a container picker lists its containers in
+    `submenu`. Other menus (the dock's tab list, the log toolbar's "⋯") list their drawn rows, with `owner` null.
+  - Log lines and the shell's screen are test fixtures (the fake server's lines, a test's commands). They are in the
+    state so a test can wait for a line or a prompt; the channel exists only in debug builds with `--features
+    automation`, and the state carries no more than that bounded tail.
   - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` every 50 ms, on the app's clock, until the value at a
     JSON Pointer passes one test, and returns that state. Tests: `equals`, `not_equals`, `at_least`, `at_most`
     (numbers, or an array's length), `exists`, `contains` (a substring, or an array element matching), and `any` (an
@@ -180,7 +212,7 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
 
   It waits for the socket, and fails at once with the app's log if the channel refuses to start (exit code 3).
   Typed calls, one connection each: `select_cluster`, `open_view`, `select_row`, `dispatch` (an action by name),
-  `type_text`, `press_key`, `state`, `actions`, `wait_for(pointer, Test::…)` (20 s) and `wait_for_within`,
+  `type_text`, `press_key`, `right_click`, `state`, `actions`, `wait_for(pointer, Test::…)` (20 s) and `wait_for_within`,
   `screenshot(name)` and `screenshot_themes(name)` (light and dark, through the View > Appearance actions). A failed
   call's error shows the channel's message, the last state (trimmed) and the end of the app's log, so a test that
   fails through `?` explains itself.
@@ -201,7 +233,8 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   `Backend::from_env()`, so `FLINT_E2E_BACKEND=kind` runs them on kind; tests that script watches or inject faults
   use the fake server.
 - **Tests are named after user paths** (`up_03_connect_to_a_cluster`, `up_20_browse_pods_with_live_updates`, …) and
-  tagged `// covers UP-xx`. `tests/app/` holds the app paths (`m0.rs`, `m1.rs`), `tests/mcp.rs` the MCP paths. Paths
+  tagged `// covers UP-xx`. `tests/app/` holds the app paths (`m0.rs`, `m1.rs`, `m2.rs`), `tests/mcp.rs` the MCP
+  paths. Paths
   left out say why at the top of their file: UP-05 (Finder launch, real cloud auth: manual), UP-14 to UP-16 (not
   built yet), UP-26 (a load test against kind), and UP-13's live switch with macOS (a test must not change the
   system appearance; dark mode itself is tested).
@@ -477,8 +510,9 @@ runner images, so pixel diffs would be flaky.
 Which tests cover each user path today, and what is missing, is in [`E2E-COVERAGE.md`](./E2E-COVERAGE.md). In
 short: with #100, M0 and M1 have app e2e tests for every automatable path. M2 is tested only below the app. Core tests
 read real streams on kind, and view tests feed the log buffer or a `FakeExec` directly. So no test has the real app
-reading a real log or exec stream. Two things block that. The automation `state` has no dock. The fake API server
-answers exec with 404 and writes with 405. (Its logs stream since #120.)
+reading a real log or exec stream, apart from `up_40_read_pod_logs`'s smoke (a row's menu, a streamed line, the
+stream closed with its tab). The automation `state` reports the dock since #119. The fake API server answers exec
+with 404 and writes with 405. (Its logs stream since #120.)
 
 The Mac mini session owns the harness and macOS CI (#40, #100, #42, #117). Harness and fake-server work is in
 milestone T; feature tests are in their feature's milestone.

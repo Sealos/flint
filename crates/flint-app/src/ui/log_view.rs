@@ -43,13 +43,14 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
-    WindowExt as _, h_flex, v_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use jiff::tz::TimeZone;
 
+use super::confirm::{self, DialogText};
 use super::dock::{DockItem, TabKey, TabStatus};
 use super::log_model::{self, ListChange, SourceLabels, Tone};
 use super::notice::notice;
@@ -522,19 +523,16 @@ impl LogView {
             },
         );
         let view = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let (view, save) = (view.clone(), save.clone());
-            alert
-                .confirm()
-                .title("Save logs to a file?")
-                .description(description.clone())
-                .ok_text("Choose File…")
-                .cancel_text("Cancel")
-                .on_ok(move |_, _, cx| {
-                    let save = save.clone();
-                    let _ = view.update(cx, |view, cx| view.write_lines(save, cx));
-                    true
-                })
+        let dialog = DialogText {
+            title: "Save logs to a file?".into(),
+            text: description,
+            ok: "Choose File…".into(),
+            cancel: "Cancel".into(),
+            id: "save-logs-description",
+        };
+        confirm::open(window, cx, dialog, move |_, cx| {
+            let save = save.clone();
+            let _ = view.update(cx, |view, cx| view.write_lines(save, cx));
         });
     }
 
@@ -1517,6 +1515,10 @@ impl Render for LogView {
 
 #[path = "log_actions.rs"]
 mod actions;
+
+#[cfg(any(test, feature = "automation"))]
+#[path = "log_state.rs"]
+mod state;
 
 #[cfg(test)]
 #[path = "log_tests.rs"]

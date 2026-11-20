@@ -34,6 +34,10 @@ pub struct AppState {
     pub nav: Option<NavState>,
     pub list: Option<ListState>,
     pub detail: Option<DetailState>,
+    /// The bottom dock and its tabs.
+    pub dock: DockState,
+    /// The open context menu, if any.
+    pub menu: Option<MenuState>,
 }
 
 /// Where keyboard focus is.
@@ -50,7 +54,19 @@ pub enum Focus {
     NamespaceInput,
     /// The detail pane's YAML editor.
     DetailYaml,
-    /// Something else, such as a dialog or a menu.
+    /// The dock, outside its tabs (its tab bar).
+    Dock,
+    /// A log tab's lines.
+    Log,
+    /// A log tab's search field.
+    LogSearch,
+    /// A shell tab's terminal.
+    Shell,
+    /// A dialog.
+    Dialog,
+    /// A context menu or a drop-down.
+    Menu,
+    /// Something else.
     Other,
     None,
 }
@@ -223,6 +239,8 @@ impl ListState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RowState {
+    /// The element id the row is drawn with (`row-<uid>`), for `right_click`.
+    pub id: String,
     pub namespace: Option<String>,
     pub name: String,
     pub selected: bool,
@@ -278,6 +296,215 @@ pub struct ActionAvailability {
 pub struct SectionCount {
     pub name: &'static str,
     pub count: usize,
+}
+
+/// The bottom dock.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DockState {
+    pub visible: bool,
+    /// Its height in points: as drawn while visible, and what it gets when shown.
+    pub height: f32,
+    /// Keyboard focus is in the dock (its tab bar or a tab).
+    pub focused: bool,
+    /// The id of the tab shown.
+    pub active: Option<u64>,
+    /// Every tab, left to right.
+    pub tabs: Vec<TabState>,
+}
+
+/// One dock tab.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TabState {
+    /// What `dock::ActivateTab` and `dock::CloseTab` take.
+    pub id: u64,
+    /// `pod_logs`, `workload_logs`, `previous_logs` or `shell`.
+    pub kind: &'static str,
+    /// The title in full (the tab cuts it in the middle).
+    pub title: String,
+    pub active: bool,
+    pub focused: bool,
+    pub cluster: TabClusterState,
+    pub status: TabStatusState,
+    /// The status as the tab's toolbar says it (`Streaming`, `Ended · no permission`,
+    /// `Exited (code 3)`).
+    pub status_text: String,
+    /// For log tabs.
+    pub logs: Option<LogTabState>,
+    /// For shell tabs.
+    pub shell: Option<ShellTabState>,
+}
+
+/// The cluster a tab's session runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TabClusterState {
+    pub context: String,
+    /// The API server it pointed at when the tab opened, without credentials.
+    pub server: Option<String>,
+    /// What the tab's chip says.
+    pub chip: String,
+    /// The context now points at another server.
+    pub repointed: bool,
+    /// The context left kubeconfig.
+    pub removed: bool,
+}
+
+/// How a tab's session is doing, by `state`. Reasons are in plain words, as the tab says them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TabStatusState {
+    /// Opening the stream or the shell.
+    Connecting,
+    /// A log stream is reading.
+    Streaming,
+    /// A log stream waits to reopen: attempt `attempt`, after `reason` (`None` for a clean end
+    /// of a stream that may log again). `back_off`: the container crash-loops.
+    Reconnecting {
+        attempt: u32,
+        back_off: bool,
+        reason: Option<String>,
+    },
+    /// Nothing more will come, and nothing failed: all lines read, the pod deleted, or a shell
+    /// the tab ended itself (`reason` says why).
+    Ended {
+        reason: Option<String>,
+        pod_deleted: bool,
+    },
+    /// The session ended on an error, said in plain words.
+    Failed { reason: String },
+    /// A shell runs `command`.
+    Running { command: String },
+    /// A shell's command ended, with its exit code when the server sent one.
+    Exited { code: Option<i32> },
+    /// The shell's session was closed.
+    Closed,
+}
+
+/// A log tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogTabState {
+    /// Lines shown (what the buffer held when last delivered).
+    pub lines: usize,
+    /// Lines that arrived while paused.
+    pub held_back: u64,
+    pub paused: bool,
+    /// The session follows new lines (not a previous instance).
+    pub follows: bool,
+    /// The view sticks to the newest line (not scrolled up).
+    pub following: bool,
+    pub timestamps: bool,
+    /// Workload lines show their `[pod/container]` prefix.
+    pub sources: bool,
+    pub wrap: bool,
+    pub search: SearchState,
+    pub selection: Option<SelectionState>,
+    /// A workload's streams.
+    pub streams: Option<StreamCounts>,
+    /// The newest lines shown, at most [`LogTabState::LINE_LIMIT`], oldest first.
+    pub last_lines: Vec<LogLineState>,
+}
+
+impl LogTabState {
+    /// The most lines `state` reports of a tab: enough to wait for a line, never the buffer.
+    pub const LINE_LIMIT: usize = 50;
+}
+
+/// A log tab's search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchState {
+    pub query: String,
+    pub matches: usize,
+    /// The current match's position among them, from 1.
+    pub current: Option<usize>,
+    /// The first scan of the buffer is still running.
+    pub searching: bool,
+}
+
+/// Selected log lines, by line id (ids count lines from the session's start).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SelectionState {
+    pub first: u64,
+    pub last: u64,
+    pub lines: u64,
+}
+
+/// A workload's log streams, as the toolbar counts them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamCounts {
+    pub pods: usize,
+    pub live: usize,
+    pub connecting: usize,
+    /// Containers that have not started yet.
+    pub waiting: usize,
+    pub failed: usize,
+    /// Containers not read: more than the session reads at once.
+    pub capped: usize,
+}
+
+/// One log line, as the tab holds it (without its timestamp and prefix).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogLineState {
+    pub id: u64,
+    pub text: String,
+    /// `normal`, `warning` or `error`.
+    pub severity: &'static str,
+    /// `pod/container`, in a workload tab.
+    pub source: Option<String>,
+}
+
+/// A shell tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellTabState {
+    pub cols: u16,
+    pub rows: u16,
+    /// Keystrokes reach the command.
+    pub live: bool,
+    pub exit_code: Option<i32>,
+    /// Where the cursor is drawn, if it is.
+    pub cursor: Option<CursorState>,
+    /// The view is scrolled up into the history.
+    pub scrolled_back: bool,
+    /// The visible screen's rows as text, trailing blanks and blank rows at the bottom left
+    /// out, at most [`ShellTabState::SCREEN_LIMIT`] (the bottom ones).
+    pub screen: Vec<String>,
+}
+
+impl ShellTabState {
+    /// The most screen rows `state` reports.
+    pub const SCREEN_LIMIT: usize = 200;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CursorState {
+    pub row: u16,
+    pub col: u16,
+}
+
+/// An open context menu or drop-down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MenuState {
+    /// The element it opened on: `row-menu-<uid>` for a row's menu, `null` for another menu.
+    pub owner: Option<String>,
+    /// What a row's menu says above its entries (why nothing can open).
+    pub note: Option<String>,
+    pub entries: Vec<MenuEntryState>,
+}
+
+/// A menu entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MenuEntryState {
+    pub label: String,
+    pub enabled: bool,
+    /// Why it is disabled, as the menu says under it.
+    pub reason: Option<String>,
+    /// A picker's entries (containers).
+    pub submenu: Vec<SubmenuEntryState>,
+}
+
+/// An entry of a menu's submenu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmenuEntryState {
+    pub label: String,
+    pub enabled: bool,
 }
 
 /// The state chip's word for a list's sync state.

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flint_core::redact::safe_error_summary;
+use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
@@ -82,6 +83,7 @@ async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Val
             settle(target, cx).await;
             Ok(json!({"handled": handled}))
         }
+        Command::RightClick { id } => right_click(target, cx, &id).await,
         Command::State => state(target, cx),
         Command::Actions => actions(target, cx),
         Command::WaitFor {
@@ -136,6 +138,38 @@ async fn type_text(target: &Target, cx: &mut AsyncApp, text: &str) -> Result<Val
     }
     settle(target, cx).await;
     Ok(json!({"keystrokes": strokes.len(), "handled": handled}))
+}
+
+/// Right-clicks the element `id` drawn in the window, as the mouse does (pointer move, button
+/// down and up at its center), then draws twice: a context menu is built a frame after the
+/// click. Refused when no element, or more than one, is drawn with that id, or it is out of view.
+async fn right_click(target: &Target, cx: &mut AsyncApp, id: &str) -> Result<Value, Error> {
+    settle(target, cx).await;
+    let element = ElementId::Name(SharedString::from(id.to_owned()));
+    in_window(target, cx, |window, cx| {
+        let found = window.find_all(element.clone());
+        match found.as_slice() {
+            [] => Err(Error::new(
+                ErrorCode::Rejected,
+                format!("right_click: no element {id} is drawn"),
+            )),
+            [one] if !one.visible() => Err(Error::new(
+                ErrorCode::Rejected,
+                format!("right_click: {id} is drawn out of view"),
+            )),
+            [_] => {
+                window.right_click(element, cx);
+                Ok(())
+            }
+            many => Err(Error::new(
+                ErrorCode::Rejected,
+                format!("right_click: {} elements are drawn as {id}", many.len()),
+            )),
+        }
+    })??;
+    settle(target, cx).await;
+    settle(target, cx).await;
+    Ok(json!({"right_clicked": id}))
 }
 
 /// Draws the settled window and writes it as a PNG under the screenshots directory: a new file
@@ -506,6 +540,54 @@ mod tests {
         )
         .await;
         assert!(ok(&shown), "{shown}");
+        assert_eq!(shown["result"]["list"]["rows"][1]["id"], "row-uid-web");
+
+        // A right-click on the row opens its menu, which the state lists; ids not drawn once
+        // are refused.
+        let clicked = ask(
+            cx,
+            &target,
+            json!({"cmd": "right_click", "args": {"id": "row-uid-web"}}),
+        )
+        .await;
+        assert!(ok(&clicked), "{clicked}");
+        let menu = ask(
+            cx,
+            &target,
+            json!({"cmd": "wait_for", "args": {"pointer": "/menu/owner", "equals": "row-menu-uid-web"}}),
+        )
+        .await;
+        assert!(ok(&menu), "{menu}");
+        assert_eq!(menu["result"]["menu"]["entries"][0]["label"], "Logs");
+        assert_eq!(menu["result"]["focus"], "menu");
+        assert_eq!(
+            menu["result"]["detail"]["name"], "web",
+            "a right-click selects"
+        );
+        for id in ["row-uid-nope"] {
+            let refused = ask(
+                cx,
+                &target,
+                json!({"cmd": "right_click", "args": {"id": id}}),
+            )
+            .await;
+            assert_eq!(refused["error"]["code"], "rejected", "{refused}");
+        }
+        let closed = ask(
+            cx,
+            &target,
+            json!({"cmd": "press_key", "args": {"key": "escape"}}),
+        )
+        .await;
+        assert!(ok(&closed), "{closed}");
+        let gone = ask(
+            cx,
+            &target,
+            json!({"cmd": "wait_for", "args": {"pointer": "/menu", "equals": null}}),
+        )
+        .await;
+        assert!(ok(&gone), "{gone}");
+
         let row = ask(
             cx,
             &target,

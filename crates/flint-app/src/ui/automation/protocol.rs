@@ -28,6 +28,9 @@ pub enum Command {
     TypeText { text: String },
     /// Press a key or chord, in GPUI syntax: `enter`, `escape`, `secondary-w`, `down`.
     PressKey { key: String },
+    /// Right-click the drawn element named `id` (a row's `row-<uid>`), as the mouse does: for
+    /// opening a context menu.
+    RightClick { id: String },
     /// The visible view tree.
     State,
     /// Wait until `predicate` holds on `state`, or fail after `timeout_ms`.
@@ -95,6 +98,12 @@ struct TextArgs {
 #[serde(deny_unknown_fields)]
 struct KeyArgs {
     key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ElementArgs {
+    id: String,
 }
 
 /// `wait_for`'s arguments: a pointer, one test (see [`super::predicate::TESTS`]) and maybe a
@@ -237,6 +246,10 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
             let a: KeyArgs = args_of(cmd, args)?;
             Command::PressKey { key: a.key }
         }
+        "right_click" => {
+            let a: ElementArgs = args_of(cmd, args)?;
+            Command::RightClick { id: a.id }
+        }
         "state" => {
             no_args(cmd, &args)?;
             Command::State
@@ -366,6 +379,12 @@ mod tests {
                 key: "escape".into()
             }
         );
+        assert_eq!(
+            ok(r#"{"cmd":"right_click","args":{"id":"row-uid-web"}}"#),
+            Command::RightClick {
+                id: "row-uid-web".into()
+            }
+        );
         assert_eq!(ok(r#"{"id":"s","cmd":"state"}"#), Command::State);
         assert_eq!(ok(r#"{"cmd":"actions"}"#), Command::Actions);
         assert_eq!(
@@ -419,6 +438,10 @@ mod tests {
         assert_eq!(
             err(r#"{"id":1,"cmd":"state","args":{"x":1}}"#),
             (json!(1), ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            err(r#"{"id":3,"cmd":"right_click","args":{}}"#),
+            (json!(3), ErrorCode::InvalidArgs)
         );
     }
 

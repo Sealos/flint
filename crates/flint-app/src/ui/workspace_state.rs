@@ -5,32 +5,34 @@
 use flint_core::settings::AiExposureState;
 use flint_core::{Appearance, ConnectionState, WatchMode, display};
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::TestQueryExt as _;
 use gpui_kit::*;
 
 use super::super::clusters::Presence;
+use super::super::confirm;
 use super::super::row_menu;
 use super::super::view_state::{
     ActionAvailability, AppState, Banner, ClusterState, DialogState, Focus, HeaderState,
-    KubeconfigPath, KubeconfigState, Level, Main, connection_error_text, error_text,
+    KubeconfigPath, KubeconfigState, Level, Main, MenuEntryState, MenuState, connection_error_text,
+    error_text,
 };
 use super::{Workspace, header_controls, namespace_summary};
 
 impl Workspace {
     /// What the window shows now, as data.
     pub fn view_state(&self, window: &mut Window, cx: &mut Context<Self>) -> AppState {
-        let focus = self.focus_state(window, cx);
-        let dialog = window.has_active_dialog(cx).then(|| match &self.dialog {
-            Some(d) => DialogState {
-                title: d.title.to_owned(),
-                text: d.text.clone(),
-                buttons: vec![d.ok.to_owned(), d.cancel.to_owned()],
-            },
-            None => DialogState {
-                title: String::new(),
-                text: String::new(),
-                buttons: Vec::new(),
-            },
+        let menu = open_menu(self, window, cx);
+        let focus = self.focus_state(menu.is_some(), window, cx);
+        let dialog = confirm::shown(window, cx).map(|d| DialogState {
+            title: d.title,
+            text: d.text,
+            buttons: vec![d.ok, d.cancel],
         });
+        let window_height = f32::from(window.viewport_size().height);
+        let dock = self
+            .dock
+            .read(cx)
+            .view_state(self.dock_height(window_height), window, cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
 
@@ -168,6 +170,8 @@ impl Workspace {
                 state.actions = row_action_states(self, cx);
                 state
             }),
+            dock,
+            menu,
         }
     }
 
@@ -183,7 +187,7 @@ impl Workspace {
         self.list.as_ref()
     }
 
-    fn focus_state(&self, window: &Window, cx: &App) -> Focus {
+    fn focus_state(&self, menu_open: bool, window: &mut Window, cx: &mut App) -> Focus {
         if window.focused(cx).is_none() {
             return Focus::None;
         }
@@ -207,6 +211,18 @@ impl Workspace {
         if self.namespace_input.focus_handle(cx).is_focused(window) {
             return Focus::NamespaceInput;
         }
+        match self.dock.read(cx).focus_in(window, cx) {
+            // The tab list, drawn in the dock.
+            Some(Focus::Dock) if menu_open => return Focus::Menu,
+            Some(focus) => return focus,
+            None => {}
+        }
+        if window.has_active_dialog(cx) {
+            return Focus::Dialog;
+        }
+        if menu_open {
+            return Focus::Menu;
+        }
         Focus::Other
     }
 }
@@ -227,4 +243,61 @@ fn row_action_states(ws: &Workspace, cx: &App) -> Vec<ActionAvailability> {
     }
     states.push(state("Shell", &a.shell));
     states
+}
+
+/// The context menu or drop-down drawn in the last frame, if any (read from the drawn
+/// elements: GPUI keeps a menu's items to itself). A row's menu is described from the row's
+/// actions, as it is built ([`row_menu::menu_state`]); another menu by its drawn entries.
+fn open_menu(ws: &Workspace, window: &Window, cx: &App) -> Option<MenuState> {
+    let menu_id = ElementId::Name("popup-menu".into());
+    let elements = window.elements();
+    // The outermost menu: a submenu is drawn inside its menu.
+    let path = elements
+        .iter()
+        .filter(|e| e.path().last() == Some(&menu_id))
+        .map(|e| e.path().to_vec())
+        .min_by_key(Vec::len)?;
+    let owner = path.iter().rev().find_map(|id| match id {
+        ElementId::Name(name) if name.starts_with("row-menu-") => Some(name.to_string()),
+        _ => None,
+    });
+    if owner.is_some()
+        && let Some(actions) = row_menu::row_actions(ws, cx)
+    {
+        let (note, entries) = row_menu::menu_state(&actions);
+        return Some(MenuState {
+            owner,
+            note,
+            entries,
+        });
+    }
+    let mut items: Vec<(u64, MenuEntryState)> = elements
+        .iter()
+        // The menu's own rows, not a submenu's.
+        .filter(|e| {
+            e.path().len() > path.len()
+                && e.path().starts_with(&path)
+                && !e.path()[path.len()..].iter().any(
+                    |id| matches!(id, ElementId::Name(n) if n == "submenu" || n == "popup-menu"),
+                )
+        })
+        .filter_map(|e| match e.path().last() {
+            Some(ElementId::Integer(ix)) => Some((
+                *ix,
+                MenuEntryState {
+                    label: e.label().unwrap_or_default().to_owned(),
+                    enabled: e.disabled() != Some(true),
+                    reason: None,
+                    submenu: Vec::new(),
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    items.sort_by_key(|(ix, _)| *ix);
+    Some(MenuState {
+        owner: None,
+        note: None,
+        entries: items.into_iter().map(|(_, entry)| entry).collect(),
+    })
 }
