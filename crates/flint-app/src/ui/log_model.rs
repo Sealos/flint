@@ -1,13 +1,23 @@
 //! What a log tab shows, without GPUI, so it can be unit tested: how a new snapshot changes the
-//! list of lines, the text and highlights of one line, the session's state in words, and the
-//! text that copy and save write.
+//! list of lines, the text and highlights of one line (a short local timestamp, a short pod
+//! prefix in the pod's colour), the session's state and errors in words, how much of the toolbar
+//! fits, and the text that copy and save write.
+//!
+//! **Shown versus copied.** A line shows its timestamp as local `HH:MM:SS.mmm` and a workload
+//! line its pod by the part of its name that tells it from its siblings. Copies and saves follow
+//! what is shown (a part hidden is left out), but write each part in full: the server's RFC 3339
+//! timestamp in UTC and `[pod/container]`, so a file stays unambiguous across days, time zones
+//! and pods. Hovering over a shown timestamp or prefix shows the full value too.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use flint_core::{
-    LineFormat, LineId, LineSelection, LogLine, LogLines, LogSearch, LogState, LogSubject, PodSet,
-    PodSetStatus, SearchQuery, WorkloadTarget,
+    LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogSearch, LogState,
+    LogSubject, PodSet, PodSetStatus, SearchQuery, WorkloadTarget,
 };
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use super::registry::SaveScope;
 
@@ -45,13 +55,158 @@ pub fn list_change(old: Range<LineId>, new: Range<LineId>) -> ListChange {
 /// and shaping 64 KiB of text for every frame is not free.
 pub const UNWRAPPED_MAX_BYTES: usize = 4096;
 
-/// One line as drawn: its text, with the `[pod/container]` source and the timestamp in front
-/// when shown (as [`LogLine::display_as`] writes it), where those end, and the byte ranges of
-/// search matches in that text.
+/// Characters of a shown timestamp: `HH:MM:SS.mmm`.
+pub const TIME_WIDTH: usize = 12;
+
+/// `ts` as shown: local wall-clock time to the millisecond, always [`TIME_WIDTH`] wide.
+pub fn short_time(ts: Timestamp, tz: &TimeZone) -> String {
+    let local = ts.to_zoned(tz.clone());
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        local.hour(),
+        local.minute(),
+        local.second(),
+        local.millisecond()
+    )
+}
+
+/// `ts` in full, for a tooltip: as the server wrote it (UTC), then in local time.
+pub fn full_time(ts: Timestamp, tz: &TimeZone) -> String {
+    let local = ts.to_zoned(tz.clone());
+    format!("{ts}\n{} local", local.strftime("%Y-%m-%d %H:%M:%S%.f %:z"))
+}
+
+/// The short pod prefixes of a workload session: each pod by the part of its name after the
+/// prefix every pod shares (`cd27k` for `api-79db669d5-cd27k`), with the container only when the
+/// pod has several, and a colour per pod (an index into the theme's prefix palette), assigned
+/// in the order pods are first seen so the first few pods never share one. Pods are remembered
+/// for the session, so a line of a pod that went keeps its label and colour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceLabels {
+    pods: BTreeMap<Box<str>, PodLabel>,
+    /// Bytes at the start of every pod name the labels leave out.
+    cut: usize,
+    /// The widest label, in characters: shorter ones are padded so the text lines up.
+    width: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PodLabel {
+    containers: BTreeSet<Box<str>>,
+    color: usize,
+}
+
+impl SourceLabels {
+    /// Learns the pods and containers `status` reads. Whether any label changed.
+    pub fn learn(&mut self, status: &PodSetStatus) -> bool {
+        let mut changed = false;
+        for stream in &status.streams {
+            let source = &stream.source;
+            let next = self.pods.len();
+            let pod = self.pods.entry(source.pod().into()).or_insert_with(|| {
+                changed = true;
+                PodLabel {
+                    containers: BTreeSet::new(),
+                    color: next,
+                }
+            });
+            changed |= pod.containers.insert(source.container().into());
+        }
+        if changed {
+            self.cut = shared_prefix(self.pods.keys().map(|p| &**p));
+            let this = &*self;
+            let width = this
+                .pods
+                .iter()
+                .flat_map(|(pod, label)| {
+                    label
+                        .containers
+                        .iter()
+                        .map(move |c| this.label_of(pod, c, label).chars().count())
+                })
+                .max()
+                .unwrap_or(0);
+            self.width = width;
+        }
+        changed
+    }
+
+    fn label_of(&self, pod: &str, container: &str, label: &PodLabel) -> String {
+        let short = pod.get(self.cut..).filter(|s| !s.is_empty()).unwrap_or(pod);
+        if label.containers.len() > 1 {
+            format!("{short}/{container}")
+        } else {
+            short.to_owned()
+        }
+    }
+
+    /// `source` as its prefix shows it. A pod never seen in a status shows in full.
+    pub fn short(&self, source: &LineSource) -> String {
+        match self.pods.get(source.pod()) {
+            Some(label) => self.label_of(source.pod(), source.container(), label),
+            None => source.label().to_owned(),
+        }
+    }
+
+    /// `source`'s colour: an index into the palette, to take modulo its length.
+    pub fn color(&self, source: &LineSource) -> usize {
+        match self.pods.get(source.pod()) {
+            Some(label) => label.color,
+            // Not seen in a status: stable by name.
+            None => source.pod().bytes().fold(0usize, |h, b| {
+                h.wrapping_mul(31).wrapping_add(usize::from(b))
+            }),
+        }
+    }
+
+    /// The widest label, in characters.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+}
+
+/// Bytes at the start of every name in `pods` that a short label leaves out: their common
+/// prefix up to its last `-`, so a label never starts mid-word (`api-79db669d5-` of
+/// `api-79db669d5-cd27k` and `api-79db669d5-6zn94`, also of a pod alone). `0` when that would
+/// leave a name empty.
+fn shared_prefix<'a>(mut pods: impl Iterator<Item = &'a str>) -> usize {
+    let Some(first) = pods.next() else {
+        return 0;
+    };
+    let mut names = vec![first];
+    let mut common = first.len();
+    for pod in pods {
+        names.push(pod);
+        common = first
+            .bytes()
+            .zip(pod.bytes())
+            .take(common)
+            .take_while(|(a, b)| a == b)
+            .count();
+    }
+    let cut = first[..common].rfind('-').map_or(0, |at| at + 1);
+    if names.iter().any(|n| n.len() <= cut) {
+        0
+    } else {
+        cut
+    }
+}
+
+/// How lines are shown now: which parts, the pod prefixes, and the time zone of timestamps.
+#[derive(Debug, Clone, Copy)]
+pub struct LineView<'a> {
+    pub format: LineFormat,
+    pub labels: &'a SourceLabels,
+    pub tz: &'a TimeZone,
+}
+
+/// One line as drawn: its text, with the short `[pod]` prefix and the short timestamp in front
+/// when shown, where those end, and the byte ranges of search matches in that text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShownLine {
     pub text: String,
-    /// The source prefix and the space after it; `0` when not shown (or a pod session).
+    /// The source prefix, its padding and the space after it; `0` when not shown (or a pod
+    /// session).
     pub source: usize,
     /// Where the line's own text starts: after the source and the timestamp.
     pub prefix: usize,
@@ -59,35 +214,47 @@ pub struct ShownLine {
     /// The line was cut: at [`flint_core::logs::MAX_LINE_BYTES`] when it arrived, or here at
     /// `max_bytes`.
     pub cut: bool,
+    /// The prefix's colour, as [`SourceLabels::color`].
+    pub color: Option<usize>,
 }
 
-/// `line` as shown with `format`: its search matches (in the source too, when the query
-/// searches sources and the prefix is shown), and at most `max_bytes` of its text (on a
-/// character boundary).
+/// `line` as shown with `view`: its search matches (in the prefix too, when the query searches
+/// sources and the prefix is shown), and at most `max_bytes` of its text (on a character
+/// boundary). A line without a timestamp gets blanks in its place, so the text lines up.
 pub fn shown_line(
     line: &LogLine,
-    format: LineFormat,
+    view: LineView<'_>,
     query: &SearchQuery,
     max_bytes: Option<usize>,
 ) -> ShownLine {
     let mut text = String::new();
     let mut matches = Vec::new();
-    if let Some(source) = line.source.as_ref().filter(|_| format.source) {
+    let mut color = None;
+    if let Some(source) = line.source.as_ref().filter(|_| view.format.source) {
+        let short = view.labels.short(source);
         text.push('[');
         if query.sources {
-            matches.extend(
-                query
-                    .match_ranges(source.label())
-                    .into_iter()
-                    .map(|r| r.start + 1..r.end + 1),
-            );
+            let found = query.match_ranges(&short);
+            if !found.is_empty() {
+                matches.extend(found.into_iter().map(|r| r.start + 1..r.end + 1));
+            } else if !query.match_ranges(source.label()).is_empty() {
+                // The match is in the part of the name the label leaves out: mark the label.
+                matches.push(1..1 + short.len());
+            }
         }
-        text.push_str(source.label());
-        text.push_str("] ");
+        text.push_str(&short);
+        text.push(']');
+        let pad = view.labels.width().saturating_sub(short.chars().count());
+        text.extend(std::iter::repeat_n(' ', pad + 1));
+        color = Some(view.labels.color(source));
     }
     let source = text.len();
-    if let Some(ts) = line.timestamp.as_ref().filter(|_| format.timestamps) {
-        text.push_str(&format!("{ts} "));
+    if view.format.timestamps {
+        match line.timestamp {
+            Some(ts) => text.push_str(&short_time(ts, view.tz)),
+            None => text.extend(std::iter::repeat_n(' ', TIME_WIDTH)),
+        }
+        text.push(' ');
     }
     let prefix = text.len();
     let mut body: &str = &line.text;
@@ -115,6 +282,7 @@ pub fn shown_line(
         prefix,
         matches,
         cut,
+        color,
     }
 }
 
@@ -124,6 +292,19 @@ pub enum Part {
     Source,
     Timestamp,
     Match,
+}
+
+/// The styled runs of `shown` inside `segment` (the prefix, the timestamp or the text), with
+/// ranges relative to the segment: what one of the line's three drawn parts highlights.
+pub fn parts_in(shown: &ShownLine, segment: Range<usize>) -> Vec<(Range<usize>, Part)> {
+    line_parts(shown)
+        .into_iter()
+        .filter_map(|(range, part)| {
+            let start = range.start.max(segment.start);
+            let end = range.end.min(segment.end);
+            (start < end).then(|| (start - segment.start..end - segment.start, part))
+        })
+        .collect()
 }
 
 /// The styled runs of `shown`, in order and not overlapping: the source prefix and the timestamp,
@@ -160,24 +341,180 @@ pub enum Tone {
     Danger,
 }
 
-/// The session's state in a few words, and the tone to draw it in.
-pub fn state_text(state: &LogState) -> (Tone, String) {
-    match state {
-        LogState::Connecting => (Tone::Muted, "Connecting…".to_owned()),
-        LogState::Streaming => (Tone::Live, "Streaming".to_owned()),
-        LogState::Reconnecting { error, attempt, .. } => (
-            Tone::Warning,
-            match error {
-                Some(e) => format!("Reconnecting (attempt {attempt}): {e}"),
-                None => format!("Reconnecting (attempt {attempt})"),
+/// An error in plain words: a few for the status line, a sentence for the banner, and the
+/// server's own text as the detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explained {
+    /// Lower case, for "Ended · no permission".
+    pub short: &'static str,
+    pub headline: String,
+    pub detail: Option<String>,
+}
+
+/// Says what a log session's `error` means. `pod`: the session reads one pod (else a
+/// workload's pods).
+pub fn explain(error: &str, pod: bool) -> Explained {
+    let lower = error.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    let (short, headline) = if lower.starts_with("forbidden") || has(&["denied access (403"]) {
+        (
+            "no permission",
+            if pod {
+                "You don't have permission to read this pod's logs."
+            } else {
+                "You don't have permission to read these pods' logs."
             },
-        ),
-        LogState::Ended { error: Some(e), .. } => (Tone::Danger, format!("Ended: {e}")),
+        )
+    } else if lower.starts_with("unauthorized") || has(&["rejected the credentials"]) {
+        (
+            "credentials rejected",
+            "The API server rejected your credentials.",
+        )
+    } else if has(&[
+        "connection refused",
+        "could not resolve",
+        "tls handshake",
+        "connection reset",
+        "dropped",
+        "unreachable",
+        "timed out",
+        "could not reach",
+        "no route to host",
+    ]) {
+        ("can't reach the API server", "Can't reach the API server.")
+    } else if lower.starts_with("notfound") || has(&["not found"]) {
+        (
+            "not found",
+            if pod {
+                "The pod or container was not found."
+            } else {
+                "The workload was not found."
+            },
+        )
+    } else {
+        ("error", "Couldn't read the logs.")
+    };
+    Explained {
+        short,
+        headline: headline.to_owned(),
+        detail: Some(error.to_owned()),
+    }
+}
+
+/// What the status line says: a few words in a tone, and the full story for its tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusText {
+    pub tone: Tone,
+    pub text: String,
+    pub tooltip: Option<String>,
+}
+
+/// The session's state in a few words, and the tone to draw it in. Errors are said by
+/// [`explain`]: a few words here, the rest in the tooltip and the banner.
+pub fn state_text(state: &LogState, pod: bool) -> StatusText {
+    let status = |tone, text: &str| StatusText {
+        tone,
+        text: text.to_owned(),
+        tooltip: None,
+    };
+    let explained = |e: &str| {
+        let ex = explain(e, pod);
+        let tooltip = match &ex.detail {
+            Some(detail) => format!("{}\n{detail}", ex.headline),
+            None => ex.headline.clone(),
+        };
+        (ex, tooltip)
+    };
+    match state {
+        LogState::Connecting => status(Tone::Muted, "Connecting…"),
+        LogState::Streaming => status(Tone::Live, "Streaming"),
+        LogState::Reconnecting { back_off: true, error, .. } => StatusText {
+            tone: Tone::Warning,
+            text: BACK_OFF.to_owned(),
+            tooltip: Some(match error {
+                Some(e) => format!("The container is in CrashLoopBackOff: the kubelet restarts it after a delay that grows with each crash.\n{e}"),
+                None => "The container is in CrashLoopBackOff: the kubelet restarts it after a delay that grows with each crash.".to_owned(),
+            }),
+        },
+        LogState::Reconnecting { error, attempt, .. } => match error {
+            Some(e) => {
+                let (ex, tooltip) = explained(e);
+                StatusText {
+                    tone: Tone::Warning,
+                    text: match ex.short {
+                        "error" => format!("Reconnecting (attempt {attempt})"),
+                        short => format!("Reconnecting (attempt {attempt}) · {short}"),
+                    },
+                    tooltip: Some(tooltip),
+                }
+            }
+            None => status(Tone::Warning, &format!("Reconnecting (attempt {attempt})")),
+        },
+        LogState::Ended { .. } if state.previous_not_available().is_some() => {
+            let kubelet = state.previous_not_available().unwrap_or_default();
+            StatusText {
+                tone: Tone::Warning,
+                text: "Ended · not available yet".to_owned(),
+                tooltip: Some(format!("{PREVIOUS_NOT_AVAILABLE}\n{kubelet}")),
+            }
+        }
+        LogState::Ended { error: Some(e), .. } => {
+            let (ex, tooltip) = explained(e);
+            StatusText {
+                tone: Tone::Danger,
+                text: format!("Ended · {}", ex.short),
+                tooltip: Some(tooltip),
+            }
+        }
         // An ordinary end, not a failure: the pod went after everything it logged was read.
         LogState::Ended {
             pod_deleted: true, ..
-        } => (Tone::Muted, "Ended · pod deleted".to_owned()),
-        LogState::Ended { .. } => (Tone::Muted, "Ended".to_owned()),
+        } => status(Tone::Muted, "Ended · pod deleted"),
+        LogState::Ended { .. } => status(Tone::Muted, "Ended"),
+    }
+}
+
+/// What a crash-looping container's tab says while the kubelet waits to restart it.
+pub const BACK_OFF: &str = "Waiting for the container to restart (back-off)";
+
+/// What a previous-instance tab says when the kubelet could not read that log yet.
+pub const PREVIOUS_NOT_AVAILABLE: &str = "The previous instance's logs aren't available yet.";
+
+/// Whether the session is over: nothing more will come, so pausing means nothing.
+pub fn has_ended(state: &LogState) -> bool {
+    matches!(state, LogState::Ended { .. })
+}
+
+/// How much of the toolbar fits a log tab `width` wide (unknown before the first layout). The
+/// toolbar is one row at any width: controls give way rather than wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolbarFit {
+    /// The view toggles and Save are drawn as buttons; else they are in the "⋯" menu.
+    pub toggles: bool,
+    /// The Jump button says "Jump to newest" beside its arrow.
+    pub jump_label: bool,
+    /// The line count and a workload's stream counts are shown.
+    pub counts: bool,
+    /// The search's "3 of 17" is shown beside its arrows.
+    pub match_count: bool,
+}
+
+/// Widths below which the toolbar gives up a part (see [`toolbar_fit`]), chosen so the parts
+/// left fit with the status and search at their narrowest.
+pub const FIT_FULL: f32 = 980.;
+pub const FIT_COUNTS: f32 = 640.;
+pub const FIT_MATCH_COUNT: f32 = 480.;
+
+/// What of the toolbar fits `width`: everything from [`FIT_FULL`]; below, the toggles and Save
+/// go into the "⋯" menu and Jump loses its words; below [`FIT_COUNTS`], the counts go (they stay
+/// in the status's tooltip); below [`FIT_MATCH_COUNT`], the match count goes too.
+pub fn toolbar_fit(width: Option<f32>) -> ToolbarFit {
+    let width = width.unwrap_or(f32::INFINITY);
+    ToolbarFit {
+        toggles: width >= FIT_FULL,
+        jump_label: width >= FIT_FULL,
+        counts: width >= FIT_COUNTS,
+        match_count: width >= FIT_MATCH_COUNT,
     }
 }
 
@@ -360,7 +697,7 @@ mod tests {
     use std::sync::Arc;
 
     use flint_core::logs::LogBuffer;
-    use flint_core::{LineSource, LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
+    use flint_core::{LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
 
     use super::*;
 
@@ -370,6 +707,22 @@ mod tests {
             timestamps,
             source: false,
         }
+    }
+
+    /// `line` shown with `format`, no pod labels learned, timestamps in UTC.
+    fn show(
+        line: &LogLine,
+        format: LineFormat,
+        query: &SearchQuery,
+        max: Option<usize>,
+    ) -> ShownLine {
+        let labels = SourceLabels::default();
+        let view = LineView {
+            format,
+            labels: &labels,
+            tz: &TimeZone::UTC,
+        };
+        shown_line(line, view, query, max)
     }
 
     fn lines(texts: &[&str]) -> LogLines {
@@ -412,18 +765,18 @@ mod tests {
     fn a_shown_line_offsets_matches_past_the_timestamp() {
         let line = LogLine::parse("2024-05-01T12:00:00Z GET /api error 500 ERROR", false);
         let query = SearchQuery::new("error");
-        let plain = shown_line(&line, ts(false), &query, None);
+        let plain = show(&line, ts(false), &query, None);
         assert_eq!(plain.text, "GET /api error 500 ERROR");
         assert_eq!(plain.prefix, 0);
         assert_eq!(plain.matches, [9..14, 19..24]);
-        let stamped = shown_line(&line, ts(true), &query, None);
-        assert_eq!(stamped.prefix, "2024-05-01T12:00:00Z ".len());
+        let stamped = show(&line, ts(true), &query, None);
+        assert_eq!(&stamped.text[..stamped.prefix], "12:00:00.000 ");
         assert_eq!(&stamped.text[stamped.prefix..], plain.text);
         for (a, b) in stamped.matches.iter().zip(&plain.matches) {
             assert_eq!(&stamped.text[a.clone()], &plain.text[b.clone()]);
         }
         // A search never matches inside the timestamp.
-        let in_ts = shown_line(&line, ts(true), &SearchQuery::new("2024"), None);
+        let in_ts = show(&line, ts(true), &SearchQuery::new("2024"), None);
         assert!(in_ts.matches.is_empty());
         assert!(!plain.cut);
     }
@@ -442,13 +795,15 @@ mod tests {
             sources: true,
             ..SearchQuery::new("web")
         };
-        let shown = shown_line(&line, both, &query, None);
-        assert_eq!(shown.text, line.display_as(both));
-        assert_eq!(&shown.text[..shown.source], "[web-1/app] ");
+        let shown = show(&line, both, &query, None);
+        // Copies write the timestamp in full; the line shows it short.
         assert_eq!(
-            &shown.text[shown.source..shown.prefix],
-            "2024-05-01T12:00:00Z "
+            line.display_as(both),
+            "[web-1/app] 2024-05-01T12:00:00Z error in web"
         );
+        assert_eq!(shown.text, "[web-1/app] 12:00:00.000 error in web");
+        assert_eq!(&shown.text[..shown.source], "[web-1/app] ");
+        assert_eq!(&shown.text[shown.source..shown.prefix], "12:00:00.000 ");
         let found: Vec<&str> = shown
             .matches
             .iter()
@@ -468,7 +823,7 @@ mod tests {
             ]
         );
         // Hidden prefix: nothing of the source is shown or matched.
-        let hidden = shown_line(&line, ts(false), &query, None);
+        let hidden = show(&line, ts(false), &query, None);
         assert_eq!((hidden.source, hidden.text.as_str()), (0, "error in web"));
         assert_eq!(hidden.matches.len(), 1);
     }
@@ -504,59 +859,77 @@ mod tests {
     #[test]
     fn long_lines_are_cut_on_a_character_boundary() {
         let line = LogLine::parse(&"é".repeat(10), false);
-        let shown = shown_line(&line, ts(false), &SearchQuery::default(), Some(5));
+        let shown = show(&line, ts(false), &SearchQuery::default(), Some(5));
         assert_eq!(shown.text, "éé");
         assert!(shown.cut);
         assert!(shown.matches.is_empty());
         let truncated = LogLine::parse("x", true);
-        assert!(shown_line(&truncated, ts(false), &SearchQuery::default(), None).cut);
+        assert!(show(&truncated, ts(false), &SearchQuery::default(), None).cut);
     }
 
-    // covers UP-40: the session state is always shown.
+    // covers UP-40: the session state is always shown, in a few words; errors in plain words.
     #[test]
     fn states_read_as_words() {
-        assert_eq!(state_text(&LogState::Connecting).0, Tone::Muted);
+        let text = |state: LogState| {
+            let s = state_text(&state, true);
+            (s.tone, s.text)
+        };
+        assert_eq!(text(LogState::Connecting).0, Tone::Muted);
+        assert_eq!(text(LogState::Streaming), (Tone::Live, "Streaming".into()));
+        let reconnecting = |error: Option<&str>, back_off| LogState::Reconnecting {
+            error: error.map(str::to_owned),
+            attempt: 3,
+            back_off,
+        };
         assert_eq!(
-            state_text(&LogState::Streaming),
-            (Tone::Live, "Streaming".into())
+            text(reconnecting(Some("EOF"), false)),
+            (Tone::Warning, "Reconnecting (attempt 3)".into())
+        );
+        let refused = "connection refused by https://127.0.0.1:6443; is the API server running, \
+                       and is the port right?";
+        assert_eq!(
+            text(reconnecting(Some(refused), false)).1,
+            "Reconnecting (attempt 3) · can't reach the API server"
+        );
+        assert!(
+            state_text(&reconnecting(Some(refused), false), true)
+                .tooltip
+                .unwrap()
+                .contains(refused),
+            "the server's text is in the tooltip"
         );
         assert_eq!(
-            state_text(&LogState::Reconnecting {
-                error: Some("EOF".into()),
-                attempt: 3,
-                back_off: false,
-            }),
-            (Tone::Warning, "Reconnecting (attempt 3): EOF".into())
+            text(reconnecting(None, false)).1,
+            "Reconnecting (attempt 3)"
+        );
+        // A crash loop is the kubelet's back-off, not a connection being retried.
+        assert_eq!(
+            text(reconnecting(None, true)),
+            (Tone::Warning, BACK_OFF.into())
+        );
+        let ended = |error: Option<&str>, pod_deleted| LogState::Ended {
+            error: error.map(str::to_owned),
+            pod_deleted,
+        };
+        assert_eq!(text(ended(None, false)), (Tone::Muted, "Ended".into()));
+        assert_eq!(
+            text(ended(Some("container not found"), false)),
+            (Tone::Danger, "Ended · not found".into())
         );
         assert_eq!(
-            state_text(&LogState::Reconnecting {
-                error: None,
-                attempt: 1,
-                back_off: false,
-            })
-            .1,
-            "Reconnecting (attempt 1)"
-        );
-        assert_eq!(
-            state_text(&LogState::Ended {
-                error: None,
-                pod_deleted: false
-            }),
-            (Tone::Muted, "Ended".into())
-        );
-        assert_eq!(
-            state_text(&LogState::Ended {
-                error: Some("container not found".into()),
-                pod_deleted: false,
-            }),
-            (Tone::Danger, "Ended: container not found".into())
-        );
-        assert_eq!(
-            state_text(&LogState::Ended {
-                error: None,
-                pod_deleted: true,
-            }),
+            text(ended(None, true)),
             (Tone::Muted, "Ended · pod deleted".into())
+        );
+        let previous = ended(
+            Some(&format!(
+                "{}: unable to retrieve container logs for containerd://c54f",
+                flint_core::logs::PREVIOUS_NOT_AVAILABLE
+            )),
+            false,
+        );
+        assert_eq!(
+            text(previous),
+            (Tone::Warning, "Ended · not available yet".into())
         );
         assert_eq!(pause_text(0, false), "Paused");
         assert_eq!(pause_text(1, true), "Paused while selecting · 1 new line");
@@ -566,6 +939,202 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1_000), "1,000");
+    }
+
+    // covers UP-40: a 403 or an unreachable server is said in plain words, once, with the
+    // server's text as the detail; the status line stays short.
+    #[test]
+    fn common_errors_are_explained() {
+        let forbidden = "Forbidden: pods is forbidden: User \"flint-e2e\" cannot get resource \
+                         \"pods\" in API group \"\" in the namespace \"demo\"";
+        let ex = explain(forbidden, true);
+        assert_eq!(
+            ex.headline,
+            "You don't have permission to read this pod's logs."
+        );
+        assert_eq!(ex.detail.as_deref(), Some(forbidden));
+        assert_eq!(
+            explain(forbidden, false).headline,
+            "You don't have permission to read these pods' logs."
+        );
+        let status = state_text(
+            &LogState::Ended {
+                error: Some(forbidden.into()),
+                pod_deleted: false,
+            },
+            true,
+        );
+        assert_eq!(status.text, "Ended · no permission");
+        assert!(
+            !status.text.contains("forbidden"),
+            "said once, in the banner"
+        );
+        for network in [
+            "connection refused by https://127.0.0.1:6443; is the API server running?",
+            "could not resolve host example.invalid (https://example.invalid:6443)",
+            "the connection to the API server dropped",
+            "TLS handshake with https://h:6443 failed",
+        ] {
+            assert_eq!(
+                explain(network, true).headline,
+                "Can't reach the API server.",
+                "{network}"
+            );
+        }
+        assert_eq!(
+            explain(
+                "https://h rejected the credentials (401 Unauthorized)",
+                true
+            )
+            .short,
+            "credentials rejected"
+        );
+        assert_eq!(explain("boom", true).headline, "Couldn't read the logs.");
+    }
+
+    // covers UP-43: timestamps show as fixed-width local time to the millisecond.
+    #[test]
+    fn timestamps_show_short_local_and_fixed_width() {
+        let ts: Timestamp = "2026-11-20T02:20:46.939958268Z".parse().unwrap();
+        assert_eq!(short_time(ts, &TimeZone::UTC), "02:20:46.939");
+        let plus_one = TimeZone::fixed(jiff::tz::offset(1));
+        assert_eq!(short_time(ts, &plus_one), "03:20:46.939");
+        // Trailing zeros are kept: every timestamp is as wide.
+        let whole: Timestamp = "2026-11-20T02:20:46Z".parse().unwrap();
+        assert_eq!(short_time(whole, &TimeZone::UTC), "02:20:46.000");
+        assert_eq!(short_time(whole, &TimeZone::UTC).len(), TIME_WIDTH);
+        let full = full_time(ts, &plus_one);
+        assert!(
+            full.starts_with("2026-11-20T02:20:46.939958268Z\n"),
+            "{full}"
+        );
+        assert!(full.contains("03:20:46.939958268 +01:00"), "{full}");
+        // A line without a timestamp keeps the text in its column.
+        let bare = LogLine::parse("no stamp", false);
+        let shown = show(&bare, ts_on(), &SearchQuery::default(), None);
+        assert_eq!(shown.text, format!("{} no stamp", " ".repeat(TIME_WIDTH)));
+    }
+
+    fn ts_on() -> LineFormat {
+        ts(true)
+    }
+
+    fn status_of(pods: &[(&str, &str)]) -> PodSetStatus {
+        PodSetStatus {
+            pods: pods.len(),
+            streams: pods
+                .iter()
+                .map(|(pod, container)| StreamStatus {
+                    source: Arc::new(LineSource::new(pod, container)),
+                    state: LogState::Streaming,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    // covers UP-45 (#62): a workload line's prefix is the part of the pod name that tells it
+    // from its siblings, with the container only when the pod has several, in a colour of its
+    // own; the full name stays in copies and the search.
+    #[test]
+    fn pod_prefixes_are_short_and_coloured_per_pod() {
+        let mut labels = SourceLabels::default();
+        assert!(labels.learn(&status_of(&[
+            ("api-79db669d5-cd27k", "api"),
+            ("api-79db669d5-6zn94", "api"),
+        ])));
+        let src = |pod: &str, c: &str| LineSource::new(pod, c);
+        assert_eq!(labels.short(&src("api-79db669d5-cd27k", "api")), "cd27k");
+        assert_eq!(labels.short(&src("api-79db669d5-6zn94", "api")), "6zn94");
+        assert_ne!(
+            labels.color(&src("api-79db669d5-cd27k", "api")),
+            labels.color(&src("api-79db669d5-6zn94", "api"))
+        );
+        // Learning the same again changes nothing; colours stay as first given.
+        let first = labels.color(&src("api-79db669d5-cd27k", "api"));
+        assert!(!labels.learn(&status_of(&[("api-79db669d5-cd27k", "api")])));
+        // A pod of a new ReplicaSet, with two containers: the shared part shrinks to `api-`,
+        // and that pod's lines name their container.
+        assert!(labels.learn(&status_of(&[
+            ("api-5f8c-x2k", "api"),
+            ("api-5f8c-x2k", "sidecar"),
+        ])));
+        assert_eq!(
+            labels.short(&src("api-79db669d5-cd27k", "api")),
+            "79db669d5-cd27k"
+        );
+        assert_eq!(
+            labels.short(&src("api-5f8c-x2k", "sidecar")),
+            "5f8c-x2k/sidecar"
+        );
+        assert_eq!(labels.color(&src("api-79db669d5-cd27k", "api")), first);
+        assert_eq!(labels.width(), "5f8c-x2k/sidecar".len());
+        // A pod alone still drops its workload's part.
+        let mut alone = SourceLabels::default();
+        alone.learn(&status_of(&[("web-7d4b9-qv4xv", "app")]));
+        assert_eq!(alone.short(&src("web-7d4b9-qv4xv", "app")), "qv4xv");
+        // A name that is the shared part itself is shown whole.
+        let mut nested = SourceLabels::default();
+        nested.learn(&status_of(&[("web", "app"), ("web-1", "app")]));
+        assert_eq!(nested.short(&src("web", "app")), "web");
+        assert_eq!(nested.short(&src("web-1", "app")), "web-1");
+        // Never seen: shown in full.
+        assert_eq!(alone.short(&src("other", "c")), "other/c");
+
+        // Shown: padded to the widest label, so the text lines up; copied in full.
+        let mut line = LogLine::parse("2024-05-01T12:00:00Z GET /a", false);
+        line.source = Some(Arc::new(src("api-79db669d5-cd27k", "api")));
+        let view = LineView {
+            format: LineFormat {
+                timestamps: false,
+                source: true,
+            },
+            labels: &labels,
+            tz: &TimeZone::UTC,
+        };
+        let query = SearchQuery {
+            sources: true,
+            ..SearchQuery::new("cd27k")
+        };
+        let shown = shown_line(&line, view, &query, None);
+        let pad = labels.width() - "79db669d5-cd27k".len();
+        assert_eq!(
+            shown.text,
+            format!("[79db669d5-cd27k]{} GET /a", " ".repeat(pad))
+        );
+        assert_eq!(shown.color, Some(first));
+        assert_eq!(&shown.text[shown.matches[0].clone()], "cd27k");
+        assert_eq!(line.display(false), "[api-79db669d5-cd27k/api] GET /a");
+        // A search on the part the label leaves out marks the whole label.
+        let query = SearchQuery {
+            sources: true,
+            ..SearchQuery::new("api-79db")
+        };
+        let shown = shown_line(&line, view, &query, None);
+        assert_eq!(&shown.text[shown.matches[0].clone()], "79db669d5-cd27k");
+        // The three drawn parts carry their own runs.
+        assert_eq!(
+            parts_in(&shown, 0..shown.source),
+            [
+                (0..1, Part::Source),
+                (1..16, Part::Match),
+                (16..shown.source, Part::Source)
+            ]
+        );
+        assert!(parts_in(&shown, shown.prefix..shown.text.len()).is_empty());
+    }
+
+    // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.
+    #[test]
+    fn the_toolbar_gives_way_by_width() {
+        let full = toolbar_fit(None);
+        assert!(full.toggles && full.jump_label && full.counts && full.match_count);
+        assert_eq!(toolbar_fit(Some(1280.)), full);
+        let compact = toolbar_fit(Some(860.));
+        assert!(!compact.toggles && !compact.jump_label && compact.counts);
+        let narrow = toolbar_fit(Some(470.));
+        assert!(!narrow.counts && !narrow.match_count);
+        assert!(toolbar_fit(Some(560.)).match_count);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! View tests for a log tab, in a headless GPUI window (`#[gpui_kit::test]`). Snapshots are fed
 //! by hand; the first scan of a search runs through a real core's `search_logs`.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,13 +14,14 @@ use flint_core::{
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, Point, ScrollDelta,
-    TestAppContext, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, InteractiveElement as _,
+    IntoElement, Modifiers, ParentElement as _, Point, Render, ScrollDelta, Styled as _,
+    TestAppContext, Window, WindowBounds, WindowOptions, div, point, px, size,
 };
 
 use super::{LogRequest, LogView};
 use crate::ui::dock::{DockItem, TabStatus};
-use crate::ui::registry::{self, SaveLines, SaveScope};
+use crate::ui::registry::{self, Close, SaveLines, SaveScope};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -148,6 +151,8 @@ fn open_sized(
                 cx.new(|cx| {
                     let mut view = LogView::new(core, request, window, cx);
                     view.stop_streaming();
+                    // Timestamps in UTC, whatever the machine's time zone.
+                    view.tz = jiff::tz::TimeZone::UTC;
                     view
                 })
             },
@@ -374,7 +379,7 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
             [4, 9, 14, 19]
         );
         let line = v.snapshot.lines.get(9).unwrap();
-        let shown = crate::ui::log_model::shown_line(line, v.format(), &v.query, None);
+        let shown = crate::ui::log_model::shown_line(line, v.line_view(), &v.query, None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "ERROR");
         assert_eq!(line.severity, flint_core::Severity::Error);
     });
@@ -512,14 +517,14 @@ async fn timestamps_and_wrap_toggle_without_reloading(cx: &mut TestAppContext) {
     let shown = |cx: &mut TestAppContext| {
         view.read_with(cx, |v, _| {
             let line = v.snapshot.lines.get(4).unwrap();
-            crate::ui::log_model::shown_line(line, v.format(), &v.query, None).text
+            crate::ui::log_model::shown_line(line, v.line_view(), &v.query, None).text
         })
     };
     assert_eq!(shown(cx), "ERROR line 4");
     cx.update_window(window, |_, window, cx| window.click("log-timestamps", cx))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(shown(cx), "2024-05-01T12:00:00Z ERROR line 4");
+    assert_eq!(shown(cx), "12:00:00.000 ERROR line 4");
     press(cx, window, "w");
     view.read_with(cx, |v, _| {
         assert!(v.wrap && v.timestamps);
@@ -730,9 +735,9 @@ async fn a_far_match_is_scrolled_into_view(cx: &mut TestAppContext) {
     .await;
 }
 
-// covers UP-46: in a narrow dock, with a search and a pause showing, the toolbar wraps instead
-// of clipping, so Save stays on screen; Save Matching Lines and Save Selected Lines also have
-// keys and palette entries.
+// covers UP-46: in a narrow dock, with a search and a pause showing, Save moves into the "⋯"
+// menu, which stays on screen; Save Matching Lines and Save Selected Lines also have keys and
+// palette entries.
 #[gpui_kit::test]
 async fn a_narrow_toolbar_keeps_save_reachable(cx: &mut TestAppContext) {
     let (core, _dir) = core();
@@ -749,8 +754,8 @@ async fn a_narrow_toolbar_keeps_save_reachable(cx: &mut TestAppContext) {
     });
     cx.wait_for(window, WAIT, |window, cx| {
         !view.read(cx).searching
-            && window.try_find("log-matches").is_some()
-            && window.try_find("log-save").is_some_and(|save| {
+            && window.try_find("log-next-match").is_some()
+            && window.try_find("log-more").is_some_and(|save| {
                 let b = save.bounds();
                 f32::from(b.origin.x + b.size.width) <= 420. && f32::from(b.size.width) > 0.
             })
@@ -763,4 +768,376 @@ async fn a_narrow_toolbar_keeps_save_reachable(cx: &mut TestAppContext) {
     press(cx, window, "secondary-shift-s");
     cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
+}
+
+/// A log tab inside a host that, like the workspace, closes the detail pane on Esc, so a test
+/// sees whether Esc in the tab falls through to it.
+struct Host {
+    log: Entity<LogView>,
+    closed: Rc<Cell<u32>>,
+}
+
+impl Render for Host {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let closed = self.closed.clone();
+        div()
+            .key_context(registry::WORKSPACE)
+            .on_action(move |_: &Close, _, _| closed.set(closed.get() + 1))
+            .size_full()
+            .child(self.log.clone())
+    }
+}
+
+// covers UP-40, UP-43: in the search field, the first Esc clears the search and the second
+// returns focus to the lines; in the lines, Esc clears the selection and otherwise does
+// nothing, never closing the detail pane behind the tab.
+#[gpui_kit::test]
+async fn esc_clears_the_search_then_leaves_it_and_never_closes_the_detail(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        registry::init(cx);
+    });
+    let closed = Rc::new(Cell::new(0));
+    let (window, view) = cx.update(|cx| {
+        let closed = closed.clone();
+        let mut log = None;
+        let window = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(1000.), px(400.)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut view = LogView::new(core, request(), window, cx);
+                    view.stop_streaming();
+                    view
+                });
+                log = Some(view.clone());
+                cx.new(|_| Host { log: view, closed })
+            },
+        )
+        .unwrap()
+        .0;
+        (window, log.unwrap())
+    });
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(9)).is_some()
+    })
+    .await;
+    let focus = view.read_with(cx, |v, _| v.focus.clone());
+    cx.update_window(window, |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    let log_focused = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| focus.is_focused(window))
+            .unwrap()
+    };
+    cx.update_window(window, |_, window, cx| window.click(line_id(2), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.selection.is_some()));
+    press(cx, window, "escape");
+    assert!(view.read_with(cx, |v, _| v.selection.is_none()));
+    press(cx, window, "escape");
+    assert_eq!(
+        closed.get(),
+        0,
+        "Esc in the lines never closes the detail pane"
+    );
+    assert!(log_focused(cx));
+
+    // In the search field: the first Esc clears the search, the next goes back to the lines.
+    press(cx, window, "secondary-f");
+    cx.update_window(window, |_, window, cx| window.input("line", cx))
+        .unwrap();
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 10
+    })
+    .await;
+    press(cx, window, "escape");
+    view.read_with(cx, |v, cx| {
+        assert!(v.query.text.is_empty(), "the first Esc clears the search");
+        assert!(v.search_input.read(cx).value().is_empty());
+    });
+    assert!(!log_focused(cx), "the field keeps focus");
+    press(cx, window, "escape");
+    assert!(log_focused(cx), "the second Esc returns to the lines");
+    assert_eq!(closed.get(), 0);
+}
+
+// covers UP-40, UP-44: at 1280 and 760 points wide (and the dock widths of those windows),
+// with a workload's counts, a search, a selection pause and a scroll away from the newest
+// line, the toolbar stays one row with every control on screen, and only one notice strip
+// shows: a copy replaces the selection hint, and times out.
+#[gpui_kit::test]
+async fn the_toolbar_is_one_row_and_notices_replace_each_other(cx: &mut TestAppContext) {
+    for width in [1280., 860., 760., 470.] {
+        let (core, _dir) = core();
+        let (window, view) = open_sized(cx, core, workload_request(), width);
+        let mut buffer = LogBuffer::new(1000);
+        for n in 0..200 {
+            let pod = ["api-79db669d5-cd27k", "api-79db669d5-6zn94"][n % 2];
+            let mut line = LogLine::parse(&format!("2024-05-01T12:00:00Z GET /{n}"), false);
+            line.source = Some(Arc::new(LineSource::new(pod, "api")));
+            buffer.push(line);
+        }
+        let stream = |pod: &str| StreamStatus {
+            source: Arc::new(LineSource::new(pod, "api")),
+            state: LogState::Streaming,
+        };
+        let pods = PodSetStatus {
+            selector: Some("app=api".into()),
+            pods: 2,
+            streams: vec![stream("api-79db669d5-cd27k"), stream("api-79db669d5-6zn94")],
+            max_streams: 50,
+            ..Default::default()
+        };
+        feed(
+            cx,
+            &view,
+            Arc::new(LogSnapshot {
+                lines: buffer.view(),
+                state: LogState::Streaming,
+                paused: true,
+                held_back: 53,
+                version: 1,
+                pods: Some(Arc::new(pods)),
+            }),
+        );
+        view.update(cx, |v, cx| v.set_query("GET".into(), cx));
+        cx.wait_for(window, WAIT, |window, cx| {
+            !view.read(cx).searching && window.try_find(line_id(199)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| window.click(line_id(199), cx))
+            .unwrap();
+        cx.run_until_parked();
+        press(cx, window, "home");
+        press(cx, window, "secondary-c");
+        let controls = if width >= crate::ui::log_model::FIT_FULL {
+            "log-save"
+        } else {
+            "log-more"
+        };
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("log-not-following").is_some()
+                && window.try_find("log-paused").is_some()
+                && window.try_find(controls).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, _| {
+            let toolbar = window.find("log-toolbar").bounds();
+            assert_eq!(
+                f32::from(toolbar.size.height),
+                crate::ui::workspace::HEADER_HEIGHT,
+                "one row at {width}"
+            );
+            let right = window.find("log-controls").bounds();
+            assert!(
+                f32::from(right.origin.x + right.size.width) <= width,
+                "the controls fit at {width}: {right:?}"
+            );
+            let control = window.find(controls).bounds();
+            assert!(f32::from(control.origin.x + control.size.width) <= width);
+            assert!(
+                f32::from(control.origin.y) < f32::from(toolbar.origin.y + toolbar.size.height)
+            );
+            let state = window.find("log-state").bounds();
+            assert!(
+                f32::from(state.size.width) >= 40.,
+                "the status keeps a slot at {width}"
+            );
+            // One strip: the copy's note, not also the selection hint.
+            assert!(window.try_find("log-note").is_some(), "{width}");
+            assert!(window.try_find("log-selection").is_none(), "{width}");
+        })
+        .unwrap();
+        // The note times out; the selection hint comes back in its place.
+        cx.executor().advance_clock(super::NOTE_TIMEOUT);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("log-note").is_none() && window.try_find("log-selection").is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+// covers UP-40: once the stream has ended, Pause and "Paused" go and every line held back
+// shows; following state stays said beside Jump.
+#[gpui_kit::test]
+async fn an_ended_stream_has_no_pause(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(
+        cx,
+        &view,
+        lines.push(0, 10).snapshot(LogState::Streaming, true, 4),
+    );
+    press(cx, window, "space");
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-paused").is_some() && window.try_find("log-pause").is_some()
+    })
+    .await;
+    feed(
+        cx,
+        &view,
+        lines.push(10, 14).snapshot(
+            LogState::Ended {
+                error: None,
+                pod_deleted: false,
+            },
+            false,
+            0,
+        ),
+    );
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-paused").is_none() && window.try_find("log-pause").is_none()
+    })
+    .await;
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.is_paused() && !v.session.is_paused(),
+            "nothing held back"
+        );
+        assert!(!v.can_pause());
+    });
+}
+
+// covers UP-40: a 403 says so in plain words once, with the server's text under it, and the
+// status stays short; a previous instance whose log the kubelet could not read yet says that,
+// with Try Again, instead of showing the kubelet's answer as a line.
+#[gpui_kit::test]
+async fn errors_are_said_in_plain_words_with_a_retry_for_previous_logs(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open_sized(cx, core.clone(), request(), 470.);
+    let mut lines = Feed::new(100);
+    let forbidden = "Forbidden: pods is forbidden: User \"flint-e2e\" cannot get resource \"pods\" \
+                     in API group \"\" in the namespace \"demo\"";
+    feed(
+        cx,
+        &view,
+        lines.push(0, 5).snapshot(
+            LogState::Ended {
+                error: Some(forbidden.into()),
+                pod_deleted: false,
+            },
+            false,
+            0,
+        ),
+    );
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-ended").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, _| {
+        // The server's text wraps in the banner rather than being cut.
+        let detail = window.find("log-ended-detail").bounds();
+        assert!(f32::from(detail.size.width) <= 470.);
+        assert!(f32::from(detail.size.height) > 18., "wrapped: {detail:?}");
+    })
+    .unwrap();
+    let status = view.read_with(cx, |v, _| {
+        crate::ui::log_model::state_text(&v.snapshot.state, true).text
+    });
+    assert_eq!(status, "Ended · no permission");
+
+    let previous = LogRequest {
+        previous: true,
+        ..request()
+    };
+    let (window, view) = open_sized(cx, core, previous, 760.);
+    let mut empty = Feed::new(100);
+    feed(
+        cx,
+        &view,
+        empty.snapshot(
+            LogState::Ended {
+                error: Some(format!(
+                    "{}: unable to retrieve container logs for containerd://c54f",
+                    flint_core::logs::PREVIOUS_NOT_AVAILABLE
+                )),
+                pod_deleted: false,
+            },
+            false,
+            0,
+        ),
+    );
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-retry").is_some() && window.try_find("log-empty-detail").is_some()
+    })
+    .await;
+    assert!(view.read_with(cx, |v, _| v.has_ended()));
+    cx.update_window(window, |_, window, cx| window.click("log-retry", cx))
+        .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.snapshot.state.previous_not_available(),
+            None,
+            "Try Again opened the log again"
+        );
+    });
+}
+
+// covers UP-43: shown timestamps are one width, so the text lines up; the current match is
+// drawn unlike the other matches.
+#[gpui_kit::test]
+async fn timestamps_line_up_and_the_current_match_stands_out(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut buffer = LogBuffer::new(100);
+    for text in [
+        "2024-05-01T12:00:00Z a",
+        "2024-05-01T12:00:00.5Z b",
+        "2024-05-01T12:00:00.123456789Z c",
+        "no timestamp d",
+    ] {
+        buffer.push(LogLine::parse(text, false));
+    }
+    feed(
+        cx,
+        &view,
+        Arc::new(LogSnapshot {
+            lines: buffer.view(),
+            state: LogState::Streaming,
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: None,
+        }),
+    );
+    press(cx, window, "t");
+    cx.wait_for(window, WAIT, |window, _| {
+        (0..4usize).all(|id| window.try_find(("log-time", id)).is_some())
+    })
+    .await;
+    cx.update_window(window, |_, window, _| {
+        let widths: Vec<f32> = (0..4usize)
+            .map(|id| f32::from(window.find(("log-time", id)).bounds().size.width))
+            .collect();
+        assert!(
+            widths.iter().all(|w| (w - widths[0]).abs() < 0.5),
+            "{widths:?}"
+        );
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let theme = gpui_kit::component::ActiveTheme::theme(cx).clone();
+        let color = theme.info;
+        let current = LogView::highlight(crate::ui::log_model::Part::Match, true, color, &theme);
+        let other = LogView::highlight(crate::ui::log_model::Part::Match, false, color, &theme);
+        assert_ne!(current.background_color, other.background_color);
+        assert!(current.font_weight.is_some() && current.underline.is_some());
+    });
 }

@@ -22,13 +22,13 @@ use super::super::registry::{
     ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
     CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
-    Forward, ForwardCurrent, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab,
-    OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenSelectorLogs,
-    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh,
-    RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope,
-    SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
-    SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
-    SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
+    Forward, ForwardCurrent, Guards, HideFromAi, JumpToEnd, JumpToStart, LeaveSearch, NextMatch,
+    NextTab, OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs,
+    OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
+    Refresh, ReloadLogs, RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines,
+    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
+    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
+    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
     ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
     ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause,
     ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
@@ -269,7 +269,7 @@ impl Workspace {
                 },
             )
             // The active log tab's.
-            .when::<TogglePause>(|ws, cx| log(ws, cx).is_some_and(LogView::follows))
+            .when::<TogglePause>(|ws, cx| log(ws, cx).is_some_and(LogView::can_pause))
             .when::<JumpToEnd>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<JumpToStart>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<ToggleTimestamps>(|ws, cx| log(ws, cx).is_some())
@@ -284,6 +284,8 @@ impl Workspace {
             .when::<ExtendSelectionDown>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<SelectAllLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<ClearSelection>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
+            .when::<LeaveSearch>(|ws, cx| log(ws, cx).is_some())
+            .when::<ReloadLogs>(|ws, cx| log(ws, cx).is_some_and(LogView::has_ended))
             .when::<CopyLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
             .when::<SaveLogs>(|ws, cx| {
                 log(ws, cx).is_some_and(|l| l.check_save(SaveScope::All).is_ok())

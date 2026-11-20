@@ -195,7 +195,11 @@ actions!(
         /// Save the lines matching the search to a file.
         SaveMatchingLines,
         /// Save the selected lines to a file.
-        SaveSelectedLines
+        SaveSelectedLines,
+        /// Esc in the log search field: clear the search, or (when empty) go back to the lines.
+        LeaveSearch,
+        /// Open the log again from the start.
+        ReloadLogs
     ]
 );
 
@@ -1187,6 +1191,8 @@ pub const LOG_VIEW: &str = "LogView";
 pub const TERMINAL: &str = "Terminal";
 /// Plain keys in a log tab, but not while typing in its search field.
 const LOG_PLAIN: &str = "LogView && !Input";
+/// Keys meant for the log tab's search field itself (Esc), which the field passes on.
+const LOG_SEARCH: &str = "LogView > Input";
 
 fn build_unit<A: Action + Default>(args: Value) -> Result<Box<dyn Action>, String> {
     match args {
@@ -1734,6 +1740,18 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .keys(&["escape"], Some(LOG_PLAIN)),
+        Spec::unit::<LeaveSearch>(
+            "Leave Log Search",
+            "Clear the log search; when it is empty, move focus back to the lines.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["escape"], Some(LOG_SEARCH))
+        .hidden(),
+        Spec::unit::<ReloadLogs>(
+            "Reload Logs",
+            "Open the log again from the start, after it ended.",
+        )
+        .of(C::Logs, S::Logs),
         Spec::unit::<CopyLines>(
             "Copy Selected Lines",
             "Copy the selected lines as shown, without redaction.",
@@ -2124,8 +2142,11 @@ pub mod tests {
                     spec.name
                 );
             }
-            // Plain keys never fire while typing in a field.
-            if spec.keys.iter().any(|k| !k.contains('-')) {
+            // Plain keys never fire while typing in a field, unless they are meant for the
+            // field itself (Esc in the log search, which the field passes on).
+            if spec.keys.iter().any(|k| !k.contains('-'))
+                && spec.key_context != Some(super::LOG_SEARCH)
+            {
                 assert!(
                     spec.key_context.is_some_and(|c| c.contains("!Input")),
                     "{} binds a plain key outside the text-field guard",

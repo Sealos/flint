@@ -1977,6 +1977,7 @@ dependencies = [
  "flint-mcp",
  "gpui-kit",
  "image",
+ "jiff",
  "k8s-openapi",
  "kube",
  "libc",
@@ -4167,6 +4168,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-link 0.2.1",
 ]
 
 [[package]]

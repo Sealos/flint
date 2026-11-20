@@ -7,10 +7,10 @@ use gpui_kit::*;
 
 use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
-    ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, NextMatch, OnView, PrevMatch,
-    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, SelectAllLines,
-    SelectLine, SelectNextLine, SelectPrevLine, TogglePause, ToggleSources, ToggleTimestamps,
-    ToggleWrap,
+    ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, OnView,
+    PrevMatch, ReloadLogs, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, TogglePause, ToggleSources,
+    ToggleTimestamps, ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
@@ -78,15 +78,16 @@ impl LogView {
                     view.select(LineSelection::new(first, last), false, window, cx);
                 }
             })
+            // Esc in the lines clears the selection, and nothing else: it never falls through
+            // to the detail pane (whose Esc closes it) while the log tab has focus.
             .bind::<ClearSelection>(|view, _, _, cx| {
                 if view.selection.is_some() {
                     view.end_selection();
                     cx.notify();
-                } else {
-                    // Not ours: let Esc reach the detail pane.
-                    cx.propagate();
                 }
             })
+            .bind::<LeaveSearch>(Self::leave_search)
+            .bind::<ReloadLogs>(|view, _, _, cx| view.reload(cx))
             .bind::<CopyLines>(Self::copy_lines)
             .bind::<SaveLogs>(|view, _, window, cx| {
                 if view.check_save(SaveScope::All).is_ok() {
@@ -167,8 +168,22 @@ impl LogView {
         }
     }
 
+    /// Esc in the search field: the first clears the search, the next moves focus back to the
+    /// lines.
+    fn leave_search(&mut self, _: &LeaveSearch, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.search_input.read(cx).value().to_string();
+        if text.is_empty() {
+            window.focus(&self.focus, cx);
+        } else {
+            self.search_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.set_query(String::new(), cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.follows() {
+        if !self.can_pause() {
             return;
         }
         if self.is_paused() {
@@ -263,6 +278,7 @@ impl LogView {
                 "Copied {} as shown, not redacted.",
                 log_model::line_count(count)
             ),
+            cx,
         );
         cx.notify();
     }
