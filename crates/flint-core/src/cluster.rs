@@ -37,8 +37,9 @@ pub enum ClusterError {
     #[error("{0}")]
     Kube(String),
     /// A `Status` the API server sent that explains itself (`"NotFound: pods \"x\" not
-    /// found"`, RBAC's `"forbidden: User \"jane\" cannot …"`), or a known kubelet refusal sent
-    /// as plain text (`container not found ("job")`). The names it quotes are what the user
+    /// found"`, RBAC's `"forbidden: User \"jane\" cannot …"`), or, when launching an exec, a
+    /// known kubelet refusal sent as a plain-text 500 (`container not found ("job")`). The
+    /// names it quotes are what the user
     /// needs to act on, so they are shown, on one line.
     #[error("{0}")]
     Api(String),

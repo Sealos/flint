@@ -39,13 +39,11 @@ impl<'a> ApiError<'a> {
     /// starts with the reason, as RBAC's "forbidden: User …" does), or `None` when it says
     /// nothing [`status_meaning`] would not say better: no `Status` body, an empty one, or a 401
     /// (whose `Status` only repeats "Unauthorized"). A body that is not a `Status` is never
-    /// shown, except a known kubelet phrase ([`kubelet_reason`]).
+    /// shown: the bare HTTP code says more ([`status_meaning`]). Launching an exec reads one
+    /// known kubelet phrase itself ([`ApiError::kubelet_refusal`]).
     pub fn explanation(&self) -> Option<String> {
-        if self.kind() == ApiErrorKind::Unauthorized {
+        if self.kind() == ApiErrorKind::Unauthorized || self.reason == UNPARSED_STATUS {
             return None;
-        }
-        if self.reason == UNPARSED_STATUS {
-            return kubelet_reason(self.message).map(str::to_owned);
         }
         let (reason, message) = (self.reason, self.message);
         let repeats_reason = message
@@ -58,6 +56,17 @@ impl<'a> ApiError<'a> {
             (false, false) if repeats_reason => Some(message.to_owned()),
             (false, false) => Some(format!("{reason}: {message}")),
         }
+    }
+
+    /// The kubelet's refusal of an exec in a container that is not running, sent before the
+    /// upgrade as a plain-text 500 ([`kubelet_reason`]), as the server's own reason. Only for
+    /// launching an exec: anywhere else, and with any other status, that body stays a bare HTTP
+    /// code, which tells more (a 502 from a proxy, say).
+    pub(crate) fn kubelet_refusal(&self) -> Option<String> {
+        if self.code != 500 || self.reason != UNPARSED_STATUS {
+            return None;
+        }
+        kubelet_reason(self.message).map(str::to_owned)
     }
 }
 
@@ -484,12 +493,10 @@ mod tests {
         );
         assert_eq!(api(401, "Unauthorized", "Unauthorized").explanation(), None);
         assert_eq!(api(502, UNPARSED_STATUS, "<html>").explanation(), None);
-        // The kubelet's refusal of a stopped container is plain text, kept as it is.
+        // Not even the kubelet's phrase: outside an exec launch, the HTTP code says more.
         assert_eq!(
-            api(500, UNPARSED_STATUS, "container not found (\"job\")")
-                .explanation()
-                .as_deref(),
-            Some("container not found (\"job\")")
+            api(500, UNPARSED_STATUS, "container not found (\"job\")").explanation(),
+            None
         );
         assert_eq!(api(500, "", "").explanation(), None);
         assert_eq!(api(409, "", "x").explanation().as_deref(), Some("x"));
@@ -527,21 +534,31 @@ mod tests {
                     reason: UNPARSED_STATUS,
                     message: body,
                 }
-                .explanation(),
+                .kubelet_refusal(),
                 None,
                 "{body:?}"
             );
         }
-        // A 401 says nothing more, whatever its body.
+    }
+
+    #[test]
+    fn the_kubelet_refusal_is_only_a_plain_500() {
+        let phrase = "container not found (\"job\")";
+        let api = |code, reason| ApiError {
+            code,
+            reason,
+            message: phrase,
+        };
         assert_eq!(
-            ApiError {
-                code: 401,
-                reason: UNPARSED_STATUS,
-                message: "container not found (\"job\")",
-            }
-            .explanation(),
-            None
+            api(500, UNPARSED_STATUS).kubelet_refusal().as_deref(),
+            Some(phrase)
         );
+        // Another status keeps its HTTP diagnostic: a 401 (signing in), a 404, a proxy's 502.
+        for code in [401, 404, 502, 503] {
+            assert_eq!(api(code, UNPARSED_STATUS).kubelet_refusal(), None, "{code}");
+        }
+        // A parsed `Status` is the server's own words already ([`ApiError::explanation`]).
+        assert_eq!(api(500, "InternalError").kubelet_refusal(), None);
     }
 
     #[test]
