@@ -1648,7 +1648,8 @@ fn render_lock_button(
         .xsmall()
         .tab_stop(false);
     let (button, tip) = match protection {
-        Protection::Local if !stale_trust => return None,
+        // A stale trust on a local cluster can only be removed, which needs valid settings.
+        Protection::Local if !stale_trust || !settings_ok => return None,
         Protection::Local => (
             button.ghost().icon(FlintIcon::LockOpen),
             "On this machine: unlocked. Click to remove an old trust.",

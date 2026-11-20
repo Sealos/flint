@@ -287,8 +287,9 @@ watch_mode = "all"                # or "on_view"
 
 # Clusters Flint may change (and open shells in) without asking, written by Trust This Cluster in
 # the sidebar's lock menu. Pinned to the server like exposure: a re-pointed context is protected
-# again. Clusters on this machine (localhost, 127.0.0.1, ::1) are unlocked anyway, unless
-# protect_local_clusters is true (for a local tunnel to a remote cluster).
+# again. Clusters on this machine (localhost or *.localhost, 127.x.x.x, ::1, Docker Desktop's
+# kubernetes.docker.internal) are unlocked anyway, unless protect_local_clusters is true: set it
+# when a local address is a tunnel to a remote cluster (an SSH, SSM or Teleport proxy).
 # [[trusted_clusters]]
 # context = "staging"
 # server = "https://staging.example.com:6443"

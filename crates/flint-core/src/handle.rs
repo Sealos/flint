@@ -928,7 +928,7 @@ mod tests {
 
     // covers UP-41
     #[tokio::test]
-    async fn exec_on_an_unknown_cluster_is_refused_at_once() {
+    async fn exec_on_a_cluster_that_is_not_connected_fails_at_once() {
         let dir = tempfile::tempdir().unwrap();
         let core = start(dir.path());
         let mut session = core.exec(ExecRequest::shell("nowhere", "ns", "pod"));
@@ -943,15 +943,11 @@ mod tests {
         })
         .await
         .expect("fails at once");
-        // A context with no server cannot be unlocked: the gate refuses before connecting.
         assert_eq!(
             state,
             crate::exec::ExecState::Failed(crate::exec::ExecFailure::new(
-                crate::exec::ExecFailureKind::Protected,
-                crate::WriteRefusal::Protected {
-                    cluster: "nowhere".into()
-                }
-                .to_string()
+                crate::exec::ExecFailureKind::Unreachable,
+                "\"nowhere\" is not connected"
             ))
         );
     }

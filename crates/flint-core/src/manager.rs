@@ -661,14 +661,17 @@ impl ClusterManager {
         let (settings, error) = match result {
             Ok(s) => (s, None),
             Err(e) => {
-                // Expose nothing (as the MCP server does), but keep the other settings, so a
-                // typo does not make clusters from extra kubeconfig files disappear.
+                // Expose nothing (as the MCP server does) and trust nothing (as at startup), but
+                // keep the other settings, so a typo does not make clusters from extra
+                // kubeconfig files disappear. An entry removed by hand behind the typo must not
+                // stay in force.
                 tracing::warn!(
-                    "settings.toml unreadable; nothing is exposed to AI: {}",
+                    "settings.toml unreadable; nothing is exposed to AI or trusted: {}",
                     crate::redact::safe_error_summary(&e)
                 );
                 let kept = Settings {
                     ai_exposed_clusters: Vec::new(),
+                    trusted_clusters: Vec::new(),
                     ..(*self.settings).clone()
                 };
                 (kept, Some(e))
@@ -937,17 +940,18 @@ impl ClusterManager {
     /// The gate every action that changes a cluster, or runs code in it, goes through
     /// (ADR-0015): the cluster's client, unless the cluster is protected or not connected.
     fn write_client(&self, cluster: &str) -> Result<Client, WriteRefusal> {
-        let slot = self.cluster(cluster);
-        let server = slot.and_then(|c| c.info.server.as_deref());
+        let not_connected = || WriteRefusal::NotConnected {
+            cluster: cluster.to_owned(),
+        };
+        // A context Flint does not know has no client either: say that, not "protected".
+        let slot = self.cluster(cluster).ok_or_else(not_connected)?;
+        let server = slot.info.server.as_deref();
         if !protection(&self.settings, &self.unlocks, cluster, server).allows_changes() {
             return Err(WriteRefusal::Protected {
                 cluster: cluster.to_owned(),
             });
         }
-        slot.and_then(|c| c.client.clone())
-            .ok_or_else(|| WriteRefusal::NotConnected {
-                cluster: cluster.to_owned(),
-            })
+        slot.client.clone().ok_or_else(not_connected)
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1547,8 +1551,8 @@ mod tests {
 
     // covers UP-54, UP-55: the one gate for actions that change a cluster refuses while it is
     // protected, follows unlocks and trust, and is pinned to the server.
-    #[test]
-    fn the_write_gate_refuses_protected_clusters() {
+    #[tokio::test]
+    async fn the_write_gate_refuses_protected_clusters() {
         let (events, _rx) = async_channel::unbounded();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
@@ -1573,8 +1577,13 @@ mod tests {
             cluster: "dev".into(),
         };
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
-        // A context Flint does not know has no server: protected, never handed a client.
-        assert_eq!(manager.write_client("gone").err(), Some(protected("gone")));
+        // A context Flint does not know is never handed a client.
+        assert_eq!(
+            manager.write_client("gone").err(),
+            Some(WriteRefusal::NotConnected {
+                cluster: "gone".into()
+            })
+        );
 
         unlocks.unlock("dev", "https://elsewhere");
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
@@ -1592,6 +1601,12 @@ mod tests {
             .push(settings::ClusterPin::new("dev", "https://dev/"));
         manager.settings = Arc::new(trusted);
         assert_eq!(manager.write_client("dev").err(), Some(not_connected));
+
+        // A settings.toml that stops parsing trusts nothing, as at startup: an entry removed
+        // by hand behind a typo is not kept in force.
+        manager.apply_settings(Err("expected `=`".into())).await;
+        assert!(manager.settings.trusted_clusters.is_empty());
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
     }
 
     // covers UP-24

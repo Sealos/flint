@@ -105,15 +105,15 @@ impl Opening {
     }
 }
 
-/// A refusal as one sentence that names what was refused, then why: "Can't open a shell: no
-/// pod of Deployment web is ready." Every refusal the strip over the dock and the pane's
-/// captions show is worded here.
 /// Why Shell (and, later, any action that changes the cluster) cannot run on a protected
 /// cluster (ADR-0015), as the refusals, tooltips and menus say it.
 pub(in crate::ui) fn protected_reason(cluster: &str) -> String {
     format!("{cluster} is protected (read-only in Flint) until you unlock it")
 }
 
+/// A refusal as one sentence that names what was refused, then why: "Can't open a shell: no
+/// pod of Deployment web is ready." Every refusal the strip over the dock and the pane's
+/// captions show is worded here.
 pub(in crate::ui) fn refused(opening: Opening, why: &str) -> String {
     let why = why.trim_end();
     // A reason cut short ends in "…", which ends the sentence too.
