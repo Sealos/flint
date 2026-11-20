@@ -1026,6 +1026,18 @@ mod tests {
             .success()
     }
 
+    /// Whether `pid` runs: it exists and is not a zombie. The plugin's own child is reaped by
+    /// whoever adopted it, which in a container may be no one.
+    fn live(pid: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
     /// Waits for `path` to hold a line, then returns its first line.
     async fn first_line(path: &std::path::Path) -> String {
         for _ in 0..500 {
@@ -1100,14 +1112,16 @@ mod tests {
             for call in calls {
                 call.abort();
             }
-            for pid in [&leader, &child] {
+            // The plugin is Flint's child, so it is reaped too; its own child need only be dead.
+            let gone = [(&leader, exists as fn(&str) -> bool), (&child, live)];
+            for (pid, running) in gone {
                 for _ in 0..500 {
-                    if !exists(pid) {
+                    if !running(pid) {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                assert!(!exists(pid), "plugin process {pid} outlived its calls");
+                assert!(!running(pid), "plugin process {pid} outlived its calls");
             }
         }
     }

@@ -973,8 +973,13 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Exec plugin latency.** Some auth plugins take seconds to run, and some hang (a browser login that never
   completes). Flint runs the plugin itself (`flint_core::auth_plugin`) instead of letting kube run it on a blocking
   thread: the plugin is a child in its own process group, killed with what it started when its connection attempt
-  times out or is dropped. Tokens are cached until a minute before they expire, and connection progress shows in
-  the UI.
+  times out or is dropped. The group is killed only while the plugin is not reaped yet, so its id cannot name another
+  group; output is capped (1 MiB stdout, 64 KiB stderr), and a helper that keeps it open after the plugin exited gets
+  a second before what the plugin printed is used. A plugin that may prompt, with Flint in the foreground of a
+  terminal, is given the terminal and Flint takes it back after. Tokens are cached until a minute before they
+  expire; a refresh that hangs is a sign-in failure naming the plugin, and a prompting plugin is not run again for
+  five minutes after one. A proxy is refused before the plugin runs, as kube's builder did. Connection progress
+  shows in the UI.
 - **No `helm` installed.** Covered by an install hint. Bundling the binary is a possible follow-up.
 - **AI CLI flags change.** `claude` is young, and its flags can change. Keep the flags in one place, and fail
   closed when the CLI rejects them or its `system/init` check fails.

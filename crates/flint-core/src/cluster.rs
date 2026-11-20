@@ -98,7 +98,7 @@ fn exec_not_found_message(command: Option<&str>) -> String {
 }
 
 /// A duration as Go (and so kubectl) prints it: `500ms`, `10s`, `1.5s`, `1m0s`.
-fn go_duration(d: Duration) -> String {
+pub(crate) fn go_duration(d: Duration) -> String {
     let millis = d.as_millis();
     if millis < 1000 {
         return format!("{millis}ms");
@@ -346,6 +346,14 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
             message: error_chain(&e),
         })?;
     let target = Target::of(kubeconfig, context);
+    // kube's builder refuses a proxy (`proxy-url`, or `HTTPS_PROXY` and the like) before it runs
+    // an exec plugin: so does this, with kube's own error, so no login opens for nothing.
+    if config.proxy_url.is_some() {
+        return tokio::task::spawn_blocking(move || Client::try_from(config))
+            .await
+            .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+            .map_err(|e| ClusterError::kube(e).for_target(&target));
+    }
     let token = crate::auth_plugin::resolve(&mut config)
         .await
         .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
@@ -373,7 +381,8 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// timeouts, base URI, retries, auth, and extra headers. Left out: kube's debug-level HTTP
 /// tracing spans, and the client's `valid_until` (an exec plugin certificate's expiry, which
 /// kube only records and Flint never reads). A kubeconfig with a proxy goes through kube's own
-/// builder, which reports that proxies are not supported, as before. `token` is the refreshing
+/// builder in [`connect`], before any exec plugin runs, which reports that proxies are not
+/// supported, as before. `token` is the refreshing
 /// token of an exec auth plugin ([`crate::auth_plugin::resolve`]), set after kube's auth layer.
 fn build_client(
     config: kube::Config,
@@ -384,9 +393,6 @@ fn build_client(
     use tower::ServiceBuilder;
     use tower::retry::RetryLayer;
 
-    if config.proxy_url.is_some() {
-        return Client::try_from(config);
-    }
     let https = config.rustls_https_connector_with_connector(http_connector())?;
     let mut connector = hyper_timeout::TimeoutConnector::new(https);
     connector.set_connect_timeout(config.connect_timeout);
@@ -547,9 +553,9 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
         A::AuthExecParse(_) => {
             "authentication failed: the exec auth plugin's output could not be parsed".to_owned()
         }
-        A::AuthExec(_) => {
+        A::AuthExec(text) => crate::auth_plugin::describe(text).unwrap_or_else(|| {
             "authentication failed: the exec auth plugin reported an error".to_owned()
-        }
+        }),
         A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => {
             exec_not_found_message(None)
         }
