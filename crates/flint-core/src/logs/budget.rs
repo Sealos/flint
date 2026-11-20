@@ -99,9 +99,13 @@ impl LogBudget {
         wake
     }
 
-    /// Session `id` ended: its bytes no longer count.
+    /// Session `id` ended: its bytes no longer count, and the trims asked of the others are
+    /// planned again without them.
     pub(crate) fn unregister(&self, id: u64) {
-        self.lock().sessions.remove(&id);
+        let mut inner = self.lock();
+        if inner.sessions.remove(&id).is_some() {
+            inner.rebalance();
+        }
     }
 
     /// Whether session `id`'s tab is the one shown. Hiding it counts as having viewed it until
@@ -325,6 +329,19 @@ mod tests {
         budget.trimmed(2, 6 * MIB, 6 * MIB);
         budget.set_paused(1, false);
         assert_eq!(budget.take_trim(1), Some(4 * MIB));
+    }
+
+    // covers UP-42: closing a tab plans again, so a trim it made necessary is withdrawn (#296).
+    #[test]
+    fn closing_a_tab_withdraws_trims_no_longer_needed() {
+        let budget = LogBudget::new(10 * MIB);
+        for id in 1..=2 {
+            budget.register(id);
+        }
+        budget.report(1, 6 * MIB, 6 * MIB, false);
+        budget.report(2, 6 * MIB, 6 * MIB, false);
+        budget.unregister(2);
+        assert_eq!(budget.take_trim(1), None, "6 MiB fits once 2 is closed");
     }
 
     #[test]
