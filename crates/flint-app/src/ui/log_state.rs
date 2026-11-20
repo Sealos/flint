@@ -33,11 +33,7 @@ impl LogView {
                 matches: self.match_count(),
                 // Among the matches of the lines shown: evicted ones lead the list until the
                 // next scan drops them.
-                current: self.current_match.and_then(|id| {
-                    let matches = self.search.matches();
-                    let evicted = matches.partition_point(|m| *m < self.snapshot.lines.first_id());
-                    matches.binary_search(&id).ok().map(|ix| ix - evicted + 1)
-                }),
+                current: self.shown_match_count().1.map(|at| at + 1),
                 searching: self.searching,
             },
             filter: FilterState {
@@ -53,12 +49,8 @@ impl LogView {
                 first: s.start(),
                 last: s.end(),
                 // As the hint counts them: the selected lines still shown.
-                // The rows shown, in a filtered tab.
-                lines: if self.is_filtered() {
-                    self.rows_between(s.start(), s.end()).len() as u64
-                } else {
-                    s.present_len(&self.snapshot.lines)
-                },
+                // The rows shown, in a filtered tab: what copy and save would write.
+                lines: self.selected_rows(),
             }),
             streams: self.snapshot.pods.as_deref().map(stream_counts),
             // The newest lines drawn: the newest rows while filtered.
@@ -84,7 +76,7 @@ impl LogView {
         if self.searching {
             0
         } else {
-            self.search.count_in(&self.snapshot.lines)
+            self.shown_match_count().0
         }
     }
 

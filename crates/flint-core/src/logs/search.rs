@@ -303,8 +303,15 @@ pub struct LogSearch {
 
 impl LogSearch {
     pub fn new(query: SearchQuery) -> Self {
+        let matcher = query.matcher();
+        LogSearch::with_matcher(query, matcher)
+    }
+
+    /// A search with `matcher` already prepared from `query` (a front end that compiled a
+    /// regular expression once, off its UI thread, and highlights with the same matcher).
+    pub fn with_matcher(query: SearchQuery, matcher: SearchMatcher) -> Self {
         LogSearch {
-            matcher: query.matcher(),
+            matcher,
             query,
             matches: VecDeque::new(),
             scanned_to: 0,

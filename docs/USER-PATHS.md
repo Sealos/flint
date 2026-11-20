@@ -380,7 +380,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   copying and saving work on the rows shown: Save writes them, Save Matching Lines the matches among them. Turning
   the toggles off shows every line again; so does "Matching" while the search is empty. A full buffer (100,000
   lines) is filtered without the tab stalling: what was shown stays until the filter is ready, and the toolbar says
-  it is filtering.
+  it is filtering. In a narrow tab the toggles move to the More menu, and the regular expression's error shows
+  as a short "Invalid regex" with the details on hover.
 - Tests: unit, ui.
 
 ---

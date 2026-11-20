@@ -2096,7 +2096,11 @@ async fn matching_lines_only_with_a_regex_and_context(cx: &mut TestAppContext) {
     .await;
     // Plain text again: "(" is just a character, and no line has one.
     run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
-    assert!(view.read_with(cx, |v, _| v.regex_error.is_none()));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.regex_error.is_none()
+    })
+    .await;
 }
 
 // covers UP-48: a full buffer is filtered on the core's threads: the toggle returns at once, the
@@ -2197,4 +2201,89 @@ async fn a_filtered_tab_saves_and_copies_the_rows_it_shows(cx: &mut TestAppConte
     cx.run_until_parked();
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
     assert_eq!(copied, "ERROR line 4\nERROR line 9\n");
+}
+
+// covers UP-48: a refilter on its way is not lost to a long catch-up, and a context change
+// during a first scan restarts it with the new context.
+#[gpui_kit::test]
+async fn refilters_finish_whatever_arrives_meanwhile(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100_000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+    // Context set while the first scan runs: the rows come with it.
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 1}),
+    );
+    until_rows(cx, window, &view, 11).await;
+    assert_eq!(rows(cx, &view), [3, 4, 5, 8, 9, 10, 13, 14, 15, 18, 19]);
+
+    // A refilter, then thirty thousand lines in one snapshot before it lands: it still lands.
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 0}),
+    );
+    feed(cx, &view, lines.push(20, 30_020).streaming());
+    draw(cx, window);
+    until_rows(cx, window, &view, 6_004).await;
+    view.read_with(cx, |v, _| {
+        assert!(!v.filtering && !v.catching_up);
+        assert_eq!(v.list.item_count(), 6_004);
+    });
+}
+
+// covers UP-46, UP-48: with nothing shown, Save, Save Matching Lines and Copy say so rather than
+// write nothing; the match count is of the matches shown.
+#[gpui_kit::test]
+async fn a_filter_that_hides_everything_saves_and_copies_nothing(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 4).streaming());
+    draw(cx, window);
+    // Lines 0 to 3 selected, none an error.
+    view.update(cx, |v, _| v.selection = Some(LineSelection::new(0, 3)));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    view.read_with(cx, |v, _| {
+        assert!(!v.has_lines());
+        assert!(v.check_save(SaveScope::All).is_err());
+        assert!(v.check_save(SaveScope::Selection).is_err());
+        assert_eq!(v.view_state().selection.map(|s| s.lines), Some(0));
+    });
+    run(cx, window, "logs::CopyLines", serde_json::Value::Null);
+    cx.run_until_parked();
+    let note = view.read_with(cx, |v, _| v.note.clone().map(|n| n.text));
+    assert_eq!(
+        note.as_deref(),
+        Some("Nothing copied: no selected line is shown.")
+    );
+
+    // Errors arrive; a search for "line" matches every line, but counts the errors shown.
+    feed(cx, &view, lines.push(4, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("line".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.row_count() == 2
+    })
+    .await;
+    assert_eq!(view.read_with(cx, |v, _| v.shown_match_count()), (2, None));
+    assert_eq!(view.read_with(cx, |v, _| v.view_state().search.matches), 2);
 }

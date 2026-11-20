@@ -97,7 +97,9 @@ impl LogView {
     /// line again at once.
     pub(super) fn refilter(&mut self, delay: Option<std::time::Duration>, cx: &mut Context<Self>) {
         self.filter_generation += 1;
+        // A catch-up of the old filter is moot now.
         self.catching_up = false;
+        self._catch_up = Task::ready(());
         let spec = self.filter_spec();
         if !spec.is_active() {
             self.filtering = false;
@@ -109,6 +111,14 @@ impl LogView {
             return;
         }
         self.filtering = true;
+        // The search is still being prepared: it filters once it is ([`LogView::use_matcher`]).
+        if spec.query.is_some() && self.query_pending {
+            self._filter = Task::ready(());
+            cx.notify();
+            return;
+        }
+        // The search's matcher, compiled once (never here, on the UI thread).
+        let matcher = spec.query.is_some().then(|| self.matcher.clone());
         let generation = self.filter_generation;
         let core = self.core.clone();
         self._filter = cx.spawn(async move |this, cx| {
@@ -118,7 +128,9 @@ impl LogView {
             let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
                 return;
             };
-            let filter = core.filter_logs(LogFilter::new(spec), lines).await;
+            let filter = core
+                .filter_logs(LogFilter::with_matcher(spec, matcher), lines)
+                .await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
@@ -145,9 +157,16 @@ impl LogView {
             return;
         };
         if filter.pending(&self.snapshot.lines) <= super::CATCH_UP_ON_UI {
-            let mut filter = self.filter.take().expect("a filter");
-            filter.update(&self.snapshot.lines);
-            self.show_rows(filter);
+            // What the list holds now, before the update changes it.
+            let shown = self.shown_rows();
+            if let Some(filter) = &mut self.filter {
+                filter.update(&self.snapshot.lines);
+            }
+            self.splice_rows(shown);
+            return;
+        }
+        // A new filter on its way replaces this one, caught up or not.
+        if self.filtering {
             return;
         }
         self.catching_up = true;
@@ -155,29 +174,37 @@ impl LogView {
         let core = self.core.clone();
         let behind = filter.clone();
         let lines = self.snapshot.lines.clone();
-        self._filter = cx.spawn(async move |this, cx| {
+        self._catch_up = cx.spawn(async move |this, cx| {
             let caught_up = core.filter_logs(behind, lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
                 view.catching_up = false;
-                view.show_rows(caught_up);
+                let shown = view.shown_rows();
+                view.filter = Some(caught_up);
+                view.splice_rows(shown);
                 cx.notify();
             });
         });
     }
 
-    /// Shows `filter`'s rows in place of the current filter's, the same filter brought up to
-    /// date: splices the list (rows evicted at the top, new rows at the bottom) rather than
-    /// resetting it, so the scroll position stays.
-    fn show_rows(&mut self, filter: LogFilter) {
-        let (old_len, old_back) = self
-            .filter
+    /// What the list holds now: how many rows, and the last row's id.
+    fn shown_rows(&self) -> (usize, Option<LineId>) {
+        self.filter
             .as_ref()
             .map_or((self.list.item_count(), None), |f| {
                 (f.rows().len(), f.rows().back().copied())
-            });
+            })
+    }
+
+    /// Splices the list from `shown` (as [`LogView::shown_rows`] said before the filter's rows
+    /// changed) to the filter's rows now: rows evicted at the top, new rows at the bottom, so
+    /// the scroll position and the rows' measured heights stay with their lines.
+    fn splice_rows(&mut self, (old_len, old_back): (usize, Option<LineId>)) {
+        let Some(filter) = &self.filter else {
+            return;
+        };
         let rows = filter.rows();
         let appended = match old_back {
             Some(back) => rows.len() - rows.partition_point(|id| *id <= back),
@@ -195,7 +222,6 @@ impl LogView {
             let end = self.list.item_count();
             self.list.splice(end..end, appended);
         }
-        self.filter = Some(filter);
     }
 
     /// The rows shown between `from` and `to` (line ids, inclusive): what a copy or save of a

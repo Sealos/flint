@@ -53,10 +53,17 @@ pub struct LogFilter {
 }
 
 impl LogFilter {
-    pub fn new(mut spec: FilterSpec) -> Self {
+    pub fn new(spec: FilterSpec) -> Self {
+        let matcher = spec.query.as_ref().map(SearchQuery::matcher);
+        LogFilter::with_matcher(spec, matcher)
+    }
+
+    /// A filter with the search's `matcher` already prepared from `spec.query` (`None` when the
+    /// spec has no query), so a regular expression is compiled once for search and filter.
+    pub fn with_matcher(mut spec: FilterSpec, matcher: Option<SearchMatcher>) -> Self {
         spec.context = spec.context.min(MAX_CONTEXT);
         LogFilter {
-            matcher: spec.query.as_ref().map(SearchQuery::matcher),
+            matcher: matcher.filter(|_| spec.query.is_some()),
             spec,
             ..LogFilter::default()
         }

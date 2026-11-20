@@ -80,7 +80,8 @@ impl LogView {
                 let context = (action.lines as usize).min(flint_core::logs::MAX_CONTEXT);
                 if context != view.context {
                     view.context = context;
-                    if view.is_filtered() {
+                    // Also while a first scan runs: it restarts with the new context.
+                    if view.filter_spec().is_active() {
                         view.refilter(None, cx);
                     }
                     cx.notify();
@@ -149,13 +150,24 @@ impl LogView {
         self.last_row()
     }
 
-    /// Lines are shown, so there is something to select, search or save.
+    /// Lines are shown (rows, in a filtered tab), so there is something to select, search or
+    /// save.
     pub(in crate::ui) fn has_lines(&self) -> bool {
-        !self.snapshot.lines.is_empty()
+        self.row_count() > 0
     }
 
+    /// Lines are selected, and some of them shown (a filter can hide them all).
     pub(in crate::ui) fn has_selection(&self) -> bool {
-        self.selection.is_some()
+        self.selected_rows() > 0
+    }
+
+    /// How many selected lines are shown: what copy and save would write.
+    pub(in crate::ui) fn selected_rows(&self) -> u64 {
+        match self.selection {
+            None => 0,
+            Some(s) if self.is_filtered() => self.rows_between(s.start(), s.end()).len() as u64,
+            Some(s) => s.present_len(&self.snapshot.lines),
+        }
     }
 
     /// Whether a line shown matches the search, counting lines that arrived since the last
@@ -174,6 +186,37 @@ impl LogView {
                 .iter()
                 .any(|id| self.row_index(*id).is_some()),
         }
+    }
+
+    /// The matches Next and Previous Match go to: every match, or in a filtered tab those
+    /// among the rows shown. How many there are, and which of them is the current one.
+    pub(in crate::ui) fn shown_match_count(&self) -> (usize, Option<usize>) {
+        if !self.is_filtered() {
+            let lines = &self.snapshot.lines;
+            let evicted = self
+                .search
+                .matches()
+                .partition_point(|m| *m < lines.first_id());
+            let at = self.current_match.and_then(|id| {
+                self.search
+                    .matches()
+                    .binary_search(&id)
+                    .ok()
+                    .map(|ix| ix - evicted)
+            });
+            return (self.search.count_in(lines), at);
+        }
+        let mut count = 0;
+        let mut at = None;
+        for id in self.search.matches() {
+            if self.row_index(*id).is_some() {
+                if Some(*id) == self.current_match {
+                    at = Some(count);
+                }
+                count += 1;
+            }
+        }
+        (count, at)
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
@@ -197,6 +240,9 @@ impl LogView {
             SaveScope::Matches if !self.has_matches() => Some("no lines match the search"),
             SaveScope::Matches => None,
             SaveScope::Selection if self.selection.is_none() => Some("no lines are selected"),
+            SaveScope::Selection if !self.has_selection() => {
+                Some("no selected line is shown (the filter hides them)")
+            }
             SaveScope::Selection => None,
         };
         match reason {
@@ -356,6 +402,15 @@ impl LogView {
         let count = rows
             .as_ref()
             .map_or_else(|| selection.present_len(&lines), |r| r.len() as u64);
+        if count == 0 {
+            self.set_note(
+                Tone::Muted,
+                "Nothing copied: no selected line is shown.".to_owned(),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let copy = LatestCopy::start(cx);
         cx.spawn(async move |this, cx| {
             let text = cx

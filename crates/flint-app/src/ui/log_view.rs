@@ -164,6 +164,9 @@ pub struct LogView {
     /// A long catch-up of `filter` (a tab far behind, after a pause) runs on the core's
     /// threads; the rows shown stay until it lands.
     catching_up: bool,
+    _catch_up: Task<()>,
+    /// The query changed and its matcher is being prepared ([`LogView::set_query`]).
+    query_pending: bool,
     /// Bumped with every new filter, so a slow scan of an old one is dropped.
     filter_generation: u64,
     _filter: Task<()>,
@@ -261,6 +264,8 @@ impl LogView {
             filter: None,
             filtering: false,
             catching_up: false,
+            _catch_up: Task::ready(()),
+            query_pending: false,
             filter_generation: 0,
             _filter: Task::ready(()),
             search_input,
@@ -394,8 +399,10 @@ impl LogView {
         }
     }
 
-    /// Searches for `text` from now on: the first scan runs on the core's threads. The search
-    /// covers workload sources while their prefix is shown.
+    /// Searches for `text` from now on. Once the query has stayed for a moment, it is prepared
+    /// once, off the UI thread (a regular expression compiles there), and that one matcher
+    /// highlights, searches (first scan on the core's threads) and filters. The search covers
+    /// workload sources while their prefix is shown.
     fn set_query(&mut self, text: String, cx: &mut Context<Self>) {
         let query = SearchQuery {
             sources: self.format().source,
@@ -405,25 +412,44 @@ impl LogView {
         if query == self.query {
             return;
         }
-        self.matcher = query.matcher();
-        self.regex_error = self.matcher.error().map(str::to_owned);
         self.query = query.clone();
-        // The matching lines shown follow the search, once it has stayed for a moment.
-        if self.matching_only {
-            self.refilter(Some(SEARCH_DELAY), cx);
-        }
         self.current_match = None;
         self.search_generation += 1;
-        self.search = LogSearch::new(query.clone());
+        self.query_pending = !query.text.is_empty();
         if query.text.is_empty() {
+            self.use_matcher(SearchMatcher::default(), cx);
             self.searching = false;
             self._search = Task::ready(());
             cx.notify();
             return;
         }
-        // Typing replaces the scan: only a query that stays for a moment scans the buffer.
-        self.scan(self.search.clone(), Some(SEARCH_DELAY), cx);
+        // Typing replaces the wait: only a query that stays for a moment is prepared and scans.
+        self.searching = true;
+        let generation = self.search_generation;
+        self._search = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DELAY).await;
+            let prepared = query.clone();
+            let matcher = cx.background_spawn(async move { prepared.matcher() }).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.search_generation == generation {
+                    view.use_matcher(matcher, cx);
+                    view.scan(view.search.clone(), None, cx);
+                }
+            });
+        });
         cx.notify();
+    }
+
+    /// Highlights, searches and filters with `matcher`, prepared from the current query.
+    fn use_matcher(&mut self, matcher: SearchMatcher, cx: &mut Context<Self>) {
+        self.query_pending = false;
+        self.regex_error = matcher.error().map(str::to_owned);
+        self.search = LogSearch::with_matcher(self.query.clone(), matcher.clone());
+        self.matcher = matcher;
+        // The matching lines shown follow the search.
+        if self.matching_only {
+            self.refilter(None, cx);
+        }
     }
 
     /// Brings `search` up to the lines shown on the core's threads, after `delay`. Its result
@@ -514,10 +540,13 @@ impl LogView {
             workload: self.is_workload(),
             sources: self.sources,
             wrap: self.wrap,
-            has_lines: !self.snapshot.lines.is_empty(),
+            has_lines: self.has_lines(),
             has_matches: self.has_matches(),
-            has_selection: self.selection.is_some(),
+            has_selection: self.has_selection(),
             errors_only: self.errors_only,
+            regex: self.regex,
+            matching_only: self.matching_only,
+            context: self.filter_spec().is_active().then_some(self.context),
         }
     }
 
@@ -1120,52 +1149,6 @@ impl LogView {
                                     .prefix(Icon::new(IconName::Search).xsmall()),
                             ),
                     )
-                    // How the search reads, and whether it filters: never cut.
-                    .child(
-                        Button::new("log-regex")
-                            .xsmall()
-                            .ghost()
-                            .label(".*")
-                            .selected(self.regex)
-                            .tooltip("Search with a regular expression (⌥⌘X)")
-                            .on_click(registry::on_click(ToggleRegex)),
-                    )
-                    .child(
-                        Button::new("log-matching-only")
-                            .xsmall()
-                            .ghost()
-                            .label("Matching")
-                            .selected(self.matching_only)
-                            .tooltip("Show only the lines matching the search (M)")
-                            .on_click(registry::on_click(ToggleMatchingOnly)),
-                    )
-                    .when(self.is_filtered(), |el| {
-                        let context = self.context;
-                        el.child(
-                            Button::new("log-context")
-                                .xsmall()
-                                .ghost()
-                                .label(format!("±{context}"))
-                                .tooltip("Lines shown around each line that passes the filter")
-                                .dropdown_menu(move |menu, _, _| {
-                                    log_model::CONTEXT_CHOICES
-                                        .iter()
-                                        .fold(menu, |menu, &lines| {
-                                            menu.item(
-                                                PopupMenuItem::new(match lines {
-                                                    0 => "No context".to_owned(),
-                                                    1 => "1 line around".to_owned(),
-                                                    n => format!("{n} lines around"),
-                                                })
-                                                .checked(lines == context)
-                                                .on_click(registry::on_click(SetLogContext {
-                                                    lines: lines as u32,
-                                                })),
-                                            )
-                                        })
-                                }),
-                        )
-                    })
                     .when(has_query, |el| {
                         el.when(fit.match_count, |el| {
                             el.child(
@@ -1182,7 +1165,8 @@ impl LogView {
                                     } else if self.searching {
                                         "Searching…".to_owned()
                                     } else {
-                                        log_model::match_text(&self.search, self.current_match)
+                                        let (count, at) = self.shown_match_count();
+                                        log_model::match_count_text(count, at)
                                     })
                                     .test_support(),
                             )
@@ -1201,6 +1185,74 @@ impl LogView {
                     .id("log-controls")
                     .flex_none()
                     .gap_x_1()
+                    // How the search reads, and whether it filters: never cut, and in the "⋯"
+                    // menu when the tab is too narrow.
+                    .when(fit.toggles, |el| {
+                        el.child(
+                            Button::new("log-regex")
+                                .xsmall()
+                                .ghost()
+                                .label(".*")
+                                .selected(self.regex)
+                                .tooltip("Search with a regular expression (⌥⌘X)")
+                                .on_click(registry::on_click(ToggleRegex)),
+                        )
+                        .child(
+                            Button::new("log-matching-only")
+                                .xsmall()
+                                .ghost()
+                                .label("Matching")
+                                .selected(self.matching_only)
+                                .tooltip("Show only the lines matching the search (M)")
+                                .on_click(registry::on_click(ToggleMatchingOnly)),
+                        )
+                        .when(self.filter_spec().is_active(), |el| {
+                            let context = self.context;
+                            el.child(
+                                Button::new("log-context")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(format!("±{context}"))
+                                    .tooltip("Lines shown around each line that passes the filter")
+                                    .dropdown_menu(move |menu, _, _| {
+                                        log_model::CONTEXT_CHOICES.iter().fold(
+                                            menu,
+                                            |menu, &lines| {
+                                                menu.item(
+                                                    PopupMenuItem::new(match lines {
+                                                        0 => "No context".to_owned(),
+                                                        1 => "1 line around".to_owned(),
+                                                        n => format!("{n} lines around"),
+                                                    })
+                                                    .checked(lines == context)
+                                                    .on_click(registry::on_click(SetLogContext {
+                                                        lines: lines as u32,
+                                                    })),
+                                                )
+                                            },
+                                        )
+                                    }),
+                            )
+                        })
+                    })
+                    // The regex error, when the match count has no room.
+                    .when_some(
+                        self.regex_error.clone().filter(|_| !fit.match_count),
+                        |el, error| {
+                            el.child(
+                                div()
+                                    .id("log-regex-error")
+                                    .flex_none()
+                                    .text_color(theme.danger)
+                                    .child("Invalid regex")
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(format!("Invalid regex: {error}"))
+                                            .build(window, cx)
+                                    })
+                                    .test_support(),
+                            )
+                        },
+                    )
                     .when(has_query && !fit.match_count, |el| {
                         el.children(Self::match_buttons(has_matches))
                     })
@@ -1377,7 +1429,7 @@ impl LogView {
         }
         let selection = self.selection?;
         let lines = &self.snapshot.lines;
-        let count = selection.present_len(lines);
+        let count = self.selected_rows();
         let mut text = format!(
             "{} selected. {} copies and Save writes them as shown, not redacted. Esc clears.",
             log_model::line_count(count),
@@ -1634,6 +1686,11 @@ fn fill_menu(
                 Toggle::Sources => item.on_click(registry::on_click(ToggleSources)),
                 Toggle::Wrap => item.on_click(registry::on_click(ToggleWrap)),
                 Toggle::ErrorsOnly => item.on_click(registry::on_click(ToggleErrorsOnly)),
+                Toggle::Regex => item.on_click(registry::on_click(ToggleRegex)),
+                Toggle::MatchingOnly => item.on_click(registry::on_click(ToggleMatchingOnly)),
+                Toggle::Context(lines) => item.on_click(registry::on_click(SetLogContext {
+                    lines: lines as u32,
+                })),
             })
         }
         MenuRow::Save {
