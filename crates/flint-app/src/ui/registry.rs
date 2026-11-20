@@ -42,7 +42,7 @@ actions!(
     [
         /// Quit Flint.
         Quit,
-        /// Close the front window.
+        /// Close the front window, asking first while a session would end.
         CloseWindow,
         /// Follow the system light and dark mode (the `appearance` setting).
         AppearanceSystem,
@@ -1394,14 +1394,20 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
     use Category as C;
     let specs = vec![
         // Flint.
-        Spec::unit::<Quit>("Quit Flint", "Quit the app.")
+        Spec::unit::<Quit>(
+            "Quit Flint",
+            "Quit the app, asking first while a shell runs or a log tab follows.",
+        )
             .of(C::Flint, S::App)
             .keys(&["secondary-q"], None),
-        // In the workspace's context, not everywhere: a binding without a context outranks every
-        // other, so the dock's Cmd-W (close the tab) would never be reached.
-        Spec::unit::<CloseWindow>("Close Window", "Close the front window.")
-            .of(C::Flint, S::App)
-            .keys(&["secondary-w"], Some(WORKSPACE)),
+        // Shift-Cmd-W: Cmd-W closes the dock's tab first (Close Dock Tab), and the window only
+        // when the dock shows none (#177).
+        Spec::unit::<CloseWindow>(
+            "Close Window",
+            "Close the front window, asking first while a shell runs or a log tab follows.",
+        )
+        .of(C::Flint, S::App)
+        .keys(&["secondary-shift-w"], Some(WORKSPACE)),
         Spec::unit::<AppearanceSystem>(
             "Use System Appearance",
             "Follow the system light and dark mode.",
@@ -1619,10 +1625,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(&["secondary-j"], Some(WORKSPACE)),
         Spec::unit::<CloseActiveTab>(
             "Close Dock Tab",
-            "Close the dock's active tab, ending its session.",
+            "Close the dock's active tab, ending its session. Its key, Cmd-W, closes the window \
+             when the dock shows no tab.",
         )
         .of(C::View, S::Dock)
-        .keys(&["secondary-w"], Some(DOCK)),
+        // Wherever focus is in the window, not only in the dock (#177).
+        .keys(&["secondary-w"], Some(WORKSPACE)),
         Spec::unit::<NextTab>("Next Dock Tab", "Show the dock's next tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-tab"], Some(DOCK)),

@@ -10,6 +10,9 @@ mod accent;
 mod appearance_tests;
 #[cfg(feature = "automation")]
 mod automation;
+mod closing;
+#[cfg(test)]
+mod closing_tests;
 mod clusters;
 mod confirm;
 mod detail;
@@ -50,7 +53,9 @@ use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
 use clusters::ClustersModel;
-use registry::{AppearanceDark, AppearanceLight, AppearanceSystem, CloseWindow, Quit};
+use registry::{
+    AppearanceDark, AppearanceLight, AppearanceSystem, CloseActiveTab, CloseWindow, Quit,
+};
 use ui_state::UiState;
 use workspace::Workspace;
 
@@ -171,20 +176,13 @@ pub fn run(boot: Bootstrap) {
         });
 }
 
-/// The app menu with Quit and Close Window (their keys come from the registry), plus
-/// View > Appearance. GPUI shows no menu bar on Linux: there, Quit and Close Window are reached
-/// by their keys, and Appearance by the `appearance` setting until the command palette (#29).
+/// The app menu with Quit, the Window menu with Close Dock Tab and Close Window (their keys come
+/// from the registry), plus View > Appearance. Quit and Close Window ask first while a session
+/// would end ([`closing`]). GPUI shows no menu bar on Linux: there, Quit and Close Window are
+/// reached by their keys, and Appearance by the `appearance` setting until the command palette
+/// (#29).
 fn install_menus(appearance: Appearance, cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.on_action(|_: &CloseWindow, cx| {
-        // The action is dispatched through the front window, which cannot be updated until
-        // that dispatch ends: close it right after.
-        if let Some(window) = cx.active_window() {
-            cx.defer(move |cx| {
-                let _ = window.update(cx, |_, window, _| window.remove_window());
-            });
-        }
-    });
+    closing::install(cx);
     set_menus(appearance, cx);
 }
 
@@ -192,10 +190,10 @@ fn set_menus(appearance: Appearance, cx: &mut App) {
     cx.set_menus([
         Menu::new("Flint").items([MenuItem::action(registry::label::<Quit>(), Quit)]),
         appearance_menu(appearance),
-        Menu::new("Window").items([MenuItem::action(
-            registry::label::<CloseWindow>(),
-            CloseWindow,
-        )]),
+        Menu::new("Window").items([
+            MenuItem::action(registry::label::<CloseActiveTab>(), CloseActiveTab),
+            MenuItem::action(registry::label::<CloseWindow>(), CloseWindow),
+        ]),
     ]);
 }
 

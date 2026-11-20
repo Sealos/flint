@@ -577,6 +577,18 @@ impl App {
                 json!({"name": "flint::Quit"}),
                 QUIT_ANSWER,
             );
+            // Quit asks first while a shell runs or a log tab follows (#177): confirm it.
+            let ask = Instant::now() + Duration::from_millis(500);
+            while child.try_wait()?.is_none() && Instant::now() < ask {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if child.try_wait()?.is_none() {
+                let _ = self.request_within(
+                    "dispatch_action",
+                    json!({"name": "ui::Confirm"}),
+                    QUIT_ANSWER,
+                );
+            }
             let deadline = Instant::now() + Duration::from_secs(5);
             while child.try_wait()?.is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));

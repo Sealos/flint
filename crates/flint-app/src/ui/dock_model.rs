@@ -51,6 +51,56 @@ pub fn reopens(status: TabStatus, reads_to_end: bool) -> bool {
     }
 }
 
+/// Whether closing a tab in `status` ends a session still at work: a shell, or a log tab
+/// that follows its stream, while it starts, runs or reconnects. A tab that ended or failed
+/// holds only output, and previous logs (`reads_to_end`) end on their own.
+pub fn ends_a_session(status: TabStatus, reads_to_end: bool) -> bool {
+    !reads_to_end
+        && matches!(
+            status,
+            TabStatus::Starting | TabStatus::Live | TabStatus::Retrying
+        )
+}
+
+/// The sessions closing the window or quitting would end ([`ends_a_session`]), by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveSessions {
+    pub shells: usize,
+    pub logs: usize,
+}
+
+impl LiveSessions {
+    pub fn total(self) -> usize {
+        self.shells + self.logs
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+
+    /// "1 shell", "2 log streams", "1 shell and 3 log streams".
+    pub fn described(self) -> String {
+        let count = |n: usize, one: &str, many: &str| match n {
+            1 => format!("1 {one}"),
+            n => format!("{n} {many}"),
+        };
+        let shells = count(self.shells, "shell", "shells");
+        let logs = count(self.logs, "log stream", "log streams");
+        match (self.shells, self.logs) {
+            (_, 0) => shells,
+            (0, _) => logs,
+            _ => format!("{shells} and {logs}"),
+        }
+    }
+}
+
+impl std::ops::AddAssign for LiveSessions {
+    fn add_assign(&mut self, other: Self) {
+        self.shells += other.shells;
+        self.logs += other.logs;
+    }
+}
+
 /// The cluster a tab's session runs on: the kubeconfig context and the API server it pointed at
 /// when the tab opened. Like an AI exposure (ADR-0009) and a trusted cluster (ADR-0015), a tab is
 /// pinned to both, so a context re-pointed at another server is another cluster: opening the
@@ -268,6 +318,34 @@ mod tests {
         assert!(reopens(Ended, true));
         assert!(!reopens(Failed, false));
         assert!(!reopens(Failed, true));
+    }
+
+    // covers UP-42 (#177): closing the window or quitting asks while a shell or a following
+    // log tab is at work; ended tabs, failed ones and previous logs end nothing.
+    #[test]
+    fn only_working_sessions_count_as_live() {
+        use TabStatus::*;
+        for status in [Starting, Live, Retrying] {
+            assert!(ends_a_session(status, false), "{status:?}");
+            assert!(!ends_a_session(status, true), "{status:?} previous logs");
+        }
+        for status in [Ended, Failed] {
+            assert!(!ends_a_session(status, false), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn live_sessions_name_their_kinds() {
+        let live = |shells, logs| LiveSessions { shells, logs };
+        assert!(live(0, 0).is_empty());
+        assert_eq!(live(1, 0).described(), "1 shell");
+        assert_eq!(live(2, 0).described(), "2 shells");
+        assert_eq!(live(0, 1).described(), "1 log stream");
+        assert_eq!(live(1, 3).described(), "1 shell and 3 log streams");
+        let mut sum = live(1, 0);
+        sum += live(1, 2);
+        assert_eq!(sum, live(2, 2));
+        assert_eq!(sum.total(), 4);
     }
 
     // covers UP-42: tabs name their cluster in its short form, and long titles keep both ends.

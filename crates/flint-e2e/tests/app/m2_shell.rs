@@ -860,8 +860,8 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     app.dispatch("workspace::SetDockHeight", json!({"height": 333.0}))?;
     app.wait_for("/dock/height", Equals(333.into()))?;
 
-    // Closing the tabs ends their sessions: Close Dock Tab with the dock focused (Cmd-W there),
-    // and the tab's close button.
+    // Closing the tabs ends their sessions: Cmd-W with the dock focused, Cmd-W with focus in the
+    // list (it closes the active tab there too, not the window: #177), and Close Dock Tab.
     app.dispatch("dock::ActivateTab", json!({"tab": shell}))?;
     app.wait_for("/focus", Equals("shell".into()))?;
     app.press_key("secondary-w")?;
@@ -875,14 +875,22 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     assert_eq!(a.open_log_streams(), 1, "the log tab still streams");
     app.dispatch("dock::ActivateTab", json!({"tab": b_logs}))?;
     app.wait_for("/dock/active", Equals(b_logs.into()))?;
-    app.dispatch("dock::CloseActiveTab", Value::Null)?;
-    app.wait_for("/dock/tabs", Test::at_most(1))?;
+    app.dispatch("resource_list::FocusFilter", Value::Null)?;
+    app.wait_for("/focus", Equals("list_filter".into()))?;
+    app.press_key("secondary-w")?;
+    let state = app.wait_for("/dock/tabs", Test::at_most(1))?;
+    assert_eq!(
+        tab_ids(&state),
+        [logs],
+        "the window stays, with the other tab"
+    );
     until(
         "fake-b's log stream to close",
         || b.open_log_streams(),
         |n| *n == 0,
     )?;
-    app.dispatch("dock::CloseTab", json!({"tab": logs}))?;
+    app.wait_for("/dock/active", Equals(logs.into()))?;
+    app.dispatch("dock::CloseActiveTab", Value::Null)?;
     let state = app.wait_for("/dock/tabs", Equals(json!([])))?;
     assert_eq!(state["dock"]["visible"], false);
     until(

@@ -34,13 +34,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub use super::dock_model::TabStatus;
-use super::dock_model::{self, TabCluster, chip_labels, chip_tooltip};
+use super::dock_model::{self, LiveSessions, TabCluster, chip_labels, chip_tooltip};
 use super::focus::release_unfocused_input;
 use super::log_view::{LogRequest, LogView};
 use super::menu_record;
 use super::registry::{
-    self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
-    ReconnectLogs, RestartShell, ShowTabList, ToggleDock,
+    self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, CloseWindow, NextTab, OnView,
+    PrevTab, ReconnectLogs, RestartShell, ShowTabList, ToggleDock,
 };
 use super::terminal_model::ShellRequest;
 use super::terminal_view::TerminalView;
@@ -252,6 +252,23 @@ impl Dock {
             DockTab::Shell(view) => Some(view),
             DockTab::Logs(_) => None,
         }
+    }
+
+    /// The sessions closing the dock would end: its shells and following log tabs still at
+    /// work, shown or not ([`dock_model::ends_a_session`]).
+    pub fn live_sessions(&self, cx: &App) -> LiveSessions {
+        let mut live = LiveSessions::default();
+        for t in &self.tabs {
+            let item = t.tab.item(cx);
+            let (reads_to_end, count) = match item.tab_key() {
+                TabKey::Shell(_) => (false, &mut live.shells),
+                TabKey::Logs(request) => (request.previous, &mut live.logs),
+            };
+            if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
+                *count += 1;
+            }
+        }
+        live
     }
 
     /// The id of the tab whose session `key` names on `cluster` (its context and server).
@@ -678,8 +695,10 @@ impl Dock {
             .bind::<CloseActiveTab>(|dock, _, window, cx| {
                 match dock.active.filter(|_| dock.visible) {
                     Some(id) => dock.close(id, window, cx),
-                    // Not ours: let Cmd-W close the window.
-                    None => cx.propagate(),
+                    // No tab shown: Cmd-W closes the window, which asks first if a hidden tab
+                    // is still at work (the registry's guard keeps the palette and automation
+                    // from getting here).
+                    None => window.dispatch_action(Box::new(CloseWindow), cx),
                 }
             })
             .bind::<NextTab>(|dock, _, window, cx| dock.cycle(1, window, cx))
