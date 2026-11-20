@@ -199,6 +199,21 @@ impl FakeApiServer {
         self.apply_pod(&mut state, "MODIFIED", object)
     }
 
+    /// A container [`FakeApiServer::crash_container`] stopped goes into CrashLoopBackOff, as
+    /// the kubelet puts it: `waiting` with that reason, the stopped instance in
+    /// `lastState.terminated`. Until [`FakeApiServer::start_container`] starts the next
+    /// instance, a log request reads the stopped one again, with or without `previous`, and
+    /// ends. Pod watches get `MODIFIED`. Returns how many were open. Panics unless the container
+    /// stopped.
+    pub fn back_off_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        let mut object = self.held_pod(&state, namespace, pod);
+        object.back_off(container);
+        let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
+        lock(&self.inner.logs).rotate(&key);
+        self.apply_pod(&mut state, "MODIFIED", object)
+    }
+
     /// [`FakeApiServer::crash_container`], then [`FakeApiServer::start_container`] at once:
     /// two `MODIFIED` events. Returns how many pod watches were open.
     pub fn restart_container(&self, namespace: &str, pod: &str, container: &str) -> usize {

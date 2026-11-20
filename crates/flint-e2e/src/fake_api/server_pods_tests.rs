@@ -280,6 +280,50 @@ fn cell_of(table: &Value, pod: &str, column: &str) -> String {
 }
 
 #[tokio::test]
+async fn a_container_in_back_off_serves_its_last_instance() {
+    let server = FakeApiServer::start().await.unwrap();
+    let api = pods(&server).await;
+    server.set_log("demo", WEB, "first run\n");
+    server.crash_container("demo", WEB, "nginx");
+    server.back_off_container("demo", WEB, "nginx");
+    let nginx = &api
+        .get(WEB)
+        .await
+        .unwrap()
+        .status
+        .unwrap()
+        .container_statuses
+        .unwrap()[0];
+    let waiting = nginx.state.as_ref().unwrap().waiting.as_ref().unwrap();
+    assert_eq!(waiting.reason.as_deref(), Some("CrashLoopBackOff"));
+    assert_eq!(nginx.restart_count, 0);
+    assert!(nginx.last_state.as_ref().unwrap().terminated.is_some());
+    // The kubelet serves the last instance, followed or not, and the response ends.
+    assert_eq!(texts(&read_all(&api, WEB, &follow()).await), ["first run"]);
+    let previous = LogParams {
+        previous: true,
+        ..LogParams::default()
+    };
+    assert_eq!(read_all(&api, WEB, &previous).await, ["first run"]);
+    assert_eq!(server.open_log_streams(), 0);
+
+    // The next instance starts empty, the crashed one stays the previous log.
+    server.start_container("demo", WEB, "nginx");
+    let nginx = &api
+        .get(WEB)
+        .await
+        .unwrap()
+        .status
+        .unwrap()
+        .container_statuses
+        .unwrap()[0];
+    assert_eq!(nginx.restart_count, 1);
+    assert!(nginx.state.as_ref().unwrap().running.is_some());
+    assert_eq!(read_all(&api, WEB, &previous).await, ["first run"]);
+    assert!(read_all(&api, WEB, &LogParams::default()).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_crashed_container_serves_its_old_instance_until_it_starts_again() {
     let server = FakeApiServer::start().await.unwrap();
     let api = pods(&server).await;

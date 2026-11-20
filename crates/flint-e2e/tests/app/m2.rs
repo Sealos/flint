@@ -4,10 +4,10 @@
 //! match navigation, wrap, copy and save are view tests (`log_tests.rs`); these prove the seams:
 //! the action, the log request, the streamed line and the status the tab shows.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
-use flint_e2e::app::{App, AppOptions};
+use anyhow::{Context as _, Result, anyhow, bail};
+use flint_e2e::app::{App, AppError, AppOptions, WAIT};
 use flint_e2e::backend::TestCluster;
 use flint_e2e::fake_api::{ContainerLog, FakeApiServer, FakePod, Fault, Gvr, Options};
 use serde_json::{Value, json};
@@ -35,23 +35,93 @@ fn tab(state: &Value, id: u64) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
-/// Waits until tab `id` has every field of `fields` (nested objects match field by field, as
-/// `wait_for`'s `any` does), and returns the state.
+/// Where tab `id` is in the dock's list now.
+fn tab_index(app: &App, id: u64) -> Result<usize> {
+    let state = app.state()?;
+    tabs(&state)
+        .iter()
+        .position(|t| t["id"] == id)
+        .with_context(|| format!("no tab {id} in {}", state["dock"]))
+}
+
+/// A failed wait on tab `id`, with the channel's words and the whole tab as it is now: the
+/// channel's own message and state dump are cut short before they reach one tab's lines.
+fn tab_failure(app: &App, id: u64, wanted: &str, error: AppError) -> anyhow::Error {
+    let now = app
+        .state()
+        .map(|state| serde_json::to_string_pretty(tab(&state, id)).unwrap_or_default())
+        .unwrap_or_else(|e| format!("(no state: {e})"));
+    anyhow!(
+        "tab {id} never had {wanted}: {}: {}\n---- tab {id} now ----\n{now}",
+        error.code,
+        error.message
+    )
+}
+
+/// The JSON pointers (from the tab) and values of every leaf of `fields`.
+fn leaves(prefix: &str, fields: &Value, out: &mut Vec<(String, Value)>) {
+    match fields {
+        Value::Object(map) => {
+            for (key, value) in map {
+                leaves(&format!("{prefix}/{key}"), value, out);
+            }
+        }
+        leaf => out.push((prefix.to_owned(), leaf.clone())),
+    }
+}
+
+/// Equality with numbers compared by value, as `wait_for` compares them.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Waits until tab `id` has every field of `fields` at once (nested objects field by field),
+/// and returns the state. Each field is waited for at its own pointer, so a timeout names it;
+/// the failure carries the tab as it is.
 fn wait_tab_is(app: &App, id: u64, fields: Value) -> Result<Value> {
-    let mut needle = fields;
-    needle["id"] = id.into();
-    Ok(app.wait_for("/dock/tabs", Any(needle))?)
+    let mut wanted = Vec::new();
+    leaves("", &fields, &mut wanted);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let index = tab_index(app, id)?;
+        for (pointer, value) in &wanted {
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(200));
+            app.wait_for_within(
+                &format!("/dock/tabs/{index}{pointer}"),
+                Equals(value.clone()),
+                left,
+            )
+            .map_err(|e| tab_failure(app, id, &format!("{pointer} = {value}"), e))?;
+        }
+        // The fields came one at a time: check they hold together.
+        let state = app.state()?;
+        let shown = tab(&state, id);
+        if wanted
+            .iter()
+            .all(|(pointer, value)| shown.pointer(pointer).is_some_and(|got| same(got, value)))
+        {
+            return Ok(state);
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "tab {id} never had {fields} at once\n---- tab {id} now ----\n{}",
+                serde_json::to_string_pretty(shown).unwrap_or_default()
+            );
+        }
+    }
 }
 
 /// Waits until `rest` (`/logs/last_lines`) of tab `id` passes `test`, and returns the state.
-/// The pointer is taken from the tabs listed now.
+/// The pointer is taken from the tabs listed now; a failure carries the tab as it is.
 fn wait_tab(app: &App, id: u64, rest: &str, test: Test) -> Result<Value> {
-    let state = app.state()?;
-    let index = tabs(&state)
-        .iter()
-        .position(|t| t["id"] == id)
-        .with_context(|| format!("no tab {id} in {}", state["dock"]))?;
-    Ok(app.wait_for(&format!("/dock/tabs/{index}{rest}"), test)?)
+    let index = tab_index(app, id)?;
+    app.wait_for(&format!("/dock/tabs/{index}{rest}"), test.clone())
+        .map_err(|e| tab_failure(app, id, &format!("{rest} {test:?}"), e))
 }
 
 /// Waits until tab `id` shows a line with `text` among its newest lines, and returns the state.
@@ -180,14 +250,29 @@ fn up_40_read_pod_logs() -> Result<()> {
     app.press_key("escape")?;
     app.wait_for("/menu", Equals(Value::Null))?;
 
-    // Logs opens a tab that streams the pod's log: its canned lines, then a line appended now.
+    // Logs opens a tab that says it is connecting (the server holds the first request back a
+    // moment), then streams the pod's log: its canned lines, then a line appended now.
     app.wait_for("/detail/fetch", Equals("loaded".into()))?;
-    app.dispatch("detail::OpenLogs", Value::Null)?;
-    let state = app.wait_for(
-        "/dock/tabs",
-        Any(json!({"kind": "pod_logs", "status": {"state": "streaming"}})),
+    fake.inject(
+        Fault::delay(Duration::from_secs(2))
+            .on(&pods(fake))
+            .named(POD)
+            .subresource("log")
+            .times(1),
+    );
+    let id = open_tab(&app, "detail::OpenLogs", Value::Null)?;
+    let state = wait_tab_is(
+        &app,
+        id,
+        json!({"kind": "pod_logs", "status": {"state": "connecting"}, "status_text": "Connecting…"}),
     )?;
-    let id = state["dock"]["active"].as_u64().expect("the tab is shown");
+    assert!(
+        lines(tab(&state, id)).is_empty(),
+        "no line before the log answers: {}",
+        tab(&state, id)
+    );
+    app.screenshot("up40-connecting")?;
+    let state = wait_tab_is(&app, id, json!({"status": {"state": "streaming"}}))?;
     let shown = tab(&state, id);
     assert!(
         shown["title"].as_str().is_some_and(|t| t.starts_with(POD)),
@@ -215,11 +300,23 @@ fn up_40_read_pod_logs() -> Result<()> {
     assert_eq!(tab(&state, id)["logs"]["follows"], true);
     app.screenshot_themes("up40-pod-logs")?;
 
-    // Logs again for the same container shows the open tab: no second tab, no second request.
+    // Logs again for the same container shows the open tab (the dock was hidden): no second
+    // tab, no second request. A line written after it arrives on the one stream, so any
+    // request the reopen made would have been seen by then.
+    app.dispatch("dock::ToggleDock", Value::Null)?;
+    app.wait_for("/dock/visible", Equals(false.into()))?;
     app.dispatch("detail::OpenLogs", Value::Null)?;
+    app.wait_for("/dock/visible", Equals(true.into()))?;
     let state = app.wait_for("/dock/active", Equals(id.into()))?;
-    assert_eq!(tabs(&state).len(), 1, "{}", state["dock"]);
-    assert_eq!(fake.log_requests().len(), 1, "the open tab is shown again");
+    assert_eq!(tabs(&state).len(), 1, "one tab: {}", state["dock"]);
+    fake.append_log(&log, "after opening it again");
+    wait_line(&app, id, "after opening it again")?;
+    assert_eq!(
+        fake.log_requests().len(),
+        1,
+        "the open tab is shown again, with no new request"
+    );
+    assert_eq!(fake.open_log_streams(), 1, "one stream");
 
     // The connection breaks mid-stream, just after lines that share a second. The server holds
     // the reconnect back a moment, so the tab is seen saying so. Then it streams again from the
@@ -259,10 +356,15 @@ fn up_40_read_pod_logs() -> Result<()> {
     let shown = tab(&state, id);
     assert_no_repeats(shown);
     let shown = texts(shown);
-    let at = |text: &str| shown.iter().position(|t| t == text);
+    let at = |text: &str| {
+        shown
+            .iter()
+            .position(|t| t == text)
+            .unwrap_or_else(|| panic!("{text:?} shown: {shown:#?}"))
+    };
     assert!(
         at("same second three") < at("after the reconnect"),
-        "{shown:#?}"
+        "the lines in the order written: {shown:#?}"
     );
     let requests = fake.log_requests();
     assert_eq!(requests.len(), 2, "one reconnect: {requests:#?}");
@@ -353,7 +455,11 @@ fn up_43_spot_errors_in_a_log_stream() -> Result<()> {
         requests,
         "toggling timestamps sent no log request"
     );
-    assert_eq!(fake.open_log_streams(), 1);
+    assert_eq!(
+        fake.open_log_streams(),
+        1,
+        "the one stream is still open after the toggles"
+    );
 
     // A search keeps up with the stream: new matching lines are counted as they arrive.
     app.dispatch("logs::FocusSearch", Value::Null)?;
@@ -463,8 +569,16 @@ fn up_40_pick_a_container_and_read_the_previous_instance() -> Result<()> {
     )?;
     fake.append_log(&sidecar_log, "sidecar line");
     let state = wait_line(&app, second, "sidecar line")?;
-    assert!(!texts(tab(&state, second)).contains(&"app line".to_owned()));
-    assert!(!texts(tab(&state, first)).contains(&"sidecar line".to_owned()));
+    assert!(
+        !texts(tab(&state, second)).contains(&"app line".to_owned()),
+        "the sidecar's tab shows only its own lines: {}",
+        tab(&state, second)
+    );
+    assert!(
+        !texts(tab(&state, first)).contains(&"sidecar line".to_owned()),
+        "the app's tab shows only its own lines: {}",
+        tab(&state, first)
+    );
     let containers: Vec<Option<String>> = fake
         .log_requests()
         .iter()
@@ -476,11 +590,18 @@ fn up_40_pick_a_container_and_read_the_previous_instance() -> Result<()> {
     );
     app.screenshot_themes("up40-second-container")?;
 
-    // Asking for the first container again shows its tab.
+    // Asking for the first container again shows its tab (the sidecar's was shown), with no
+    // new request: a line written after it arrives on the stream already open.
     app.dispatch("detail::OpenContainerLogs", json!({"container": "app"}))?;
     let state = app.wait_for("/dock/active", Equals(first.into()))?;
-    assert_eq!(tabs(&state).len(), 2, "{}", state["dock"]);
-    assert_eq!(fake.log_requests().len(), 2);
+    assert_eq!(tabs(&state).len(), 2, "no third tab: {}", state["dock"]);
+    fake.append_log(&app_log, "app line again");
+    wait_line(&app, first, "app line again")?;
+    assert_eq!(
+        fake.log_requests().len(),
+        2,
+        "the open tab is shown again, with no new request"
+    );
 
     // Previous Logs reads the crashed instance to its end, then ends: nothing more will come.
     let old = open_tab(&app, "detail::OpenPreviousLogs", Value::Null)?;
@@ -501,7 +622,18 @@ fn up_40_pick_a_container_and_read_the_previous_instance() -> Result<()> {
             "panic: the previous instance's last words"
         ]
     );
-    assert_eq!(shown["logs"]["paused"], false, "an ended tab never pauses");
+    // Nothing more will come, so there is nothing to pause.
+    let refused = app
+        .dispatch("logs::TogglePause", Value::Null)
+        .expect_err("an ended tab can't pause");
+    assert_eq!(refused.code, "not_available", "{refused}");
+    let state = app.state()?;
+    assert_eq!(
+        tab(&state, old)["logs"]["paused"],
+        false,
+        "{}",
+        tab(&state, old)
+    );
     let request = fake
         .log_requests()
         .pop()
@@ -520,12 +652,13 @@ fn up_40_pick_a_container_and_read_the_previous_instance() -> Result<()> {
 // covers UP-40
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
-fn up_40_log_tabs_say_why_they_ended() -> Result<()> {
+fn up_40_log_tabs_say_why_they_stopped() -> Result<()> {
     let cluster = TestCluster::fake(Options::default())?;
     let fake = cluster.fake_server().expect("a fake server");
-    // `talker` gets deleted, `locked` refuses its log, and `rotated` restarted but its previous
-    // instance's log is gone: the kubelet answers with a notice instead of the log.
-    for name in ["talker", "locked"] {
+    // `talker` gets deleted, `looper` crash-loops, `locked` refuses its log, and `rotated`
+    // restarted but its previous instance's log is gone: the kubelet answers with a notice
+    // instead of the log.
+    for name in ["talker", "looper", "locked"] {
         fake.add_pod(FakePod::new("demo", name, &["app"]).label("app", name));
     }
     fake.add_pod(
@@ -545,7 +678,7 @@ fn up_40_log_tabs_say_why_they_ended() -> Result<()> {
     );
     let app = App::launch(AppOptions::new(&cluster.kubeconfig))?;
     connect(&app, &cluster.context)?;
-    open_live(&app, "pods", 20)?;
+    open_live(&app, "pods", 21)?;
 
     // The pod is deleted while its log streams: the tab reads its last line, then ends, saying
     // so as an ordinary end rather than an error.
@@ -556,6 +689,9 @@ fn up_40_log_tabs_say_why_they_ended() -> Result<()> {
     let log = ContainerLog::new("demo", "talker");
     fake.append_log(&log, "shutting down");
     wait_line(&app, talker, "shutting down")?;
+    // Paused while it streams; the end lifts the pause, since nothing more will come.
+    app.dispatch("logs::TogglePause", Value::Null)?;
+    wait_tab_is(&app, talker, json!({"logs": {"paused": true}}))?;
     fake.delete_pod("demo", "talker");
     let state = wait_tab_is(
         &app,
@@ -564,10 +700,54 @@ fn up_40_log_tabs_say_why_they_ended() -> Result<()> {
     )?;
     let ended = tab(&state, talker);
     assert_eq!(ended["status_text"], "Ended · pod deleted", "{ended}");
-    assert_eq!(ended["logs"]["paused"], false);
+    assert_eq!(
+        ended["logs"]["paused"], false,
+        "the end lifts the pause: {ended}"
+    );
     assert_no_repeats(ended);
+    let refused = app
+        .dispatch("logs::TogglePause", Value::Null)
+        .expect_err("an ended tab can't pause");
+    assert_eq!(refused.code, "not_available", "{refused}");
     app.screenshot_themes("up40-pod-deleted")?;
     fake.finish_delete("demo", "talker");
+    until("no open stream", || fake.open_log_streams(), |n| *n == 0)?;
+
+    // A crash loop: the container stops and the kubelet backs off before restarting it. The
+    // tab says it waits for the restart, then reads the next instance, never showing the
+    // stopped one's lines twice (the kubelet serves them again meanwhile).
+    show(&app, "looper")?;
+    let looper = open_tab(&app, "detail::OpenLogs", Value::Null)?;
+    wait_tab_is(&app, looper, json!({"status": {"state": "streaming"}}))?;
+    until("looper's stream", || fake.open_log_streams(), |n| *n == 1)?;
+    let log = ContainerLog::new("demo", "looper");
+    fake.append_log(&log, "run 1\nERROR run 1 crashed");
+    wait_line(&app, looper, "ERROR run 1 crashed")?;
+    fake.crash_container("demo", "looper", "app");
+    fake.back_off_container("demo", "looper", "app");
+    let state = wait_tab_is(
+        &app,
+        looper,
+        json!({"status": {"state": "reconnecting", "back_off": true},
+               "status_text": "Waiting for the container to restart (back-off)"}),
+    )?;
+    assert_eq!(fake.open_log_streams(), 0, "{}", tab(&state, looper));
+    app.screenshot_themes("up40-back-off")?;
+    fake.start_container("demo", "looper", "app");
+    wait_tab_is(&app, looper, json!({"status": {"state": "streaming"}}))?;
+    until(
+        "looper's next stream",
+        || fake.open_log_streams(),
+        |n| *n == 1,
+    )?;
+    fake.append_log(&log, "run 2");
+    let state = wait_line(&app, looper, "run 2")?;
+    assert_eq!(
+        texts(tab(&state, looper)),
+        ["run 1", "ERROR run 1 crashed", "run 2"],
+        "each line once, in order"
+    );
+    app.dispatch("dock::CloseTab", json!({"tab": looper}))?;
     until("no open stream", || fake.open_log_streams(), |n| *n == 0)?;
 
     // No permission: the tab says so in plain words.
@@ -680,7 +860,16 @@ fn up_45_follow_workload_logs() -> Result<()> {
     app.screenshot("up45-without-prefix")?;
     app.dispatch("logs::ToggleSources", Value::Null)?;
     wait_tab_is(&app, id, json!({"logs": {"sources": true}}))?;
-    assert_eq!(fake.log_requests().len(), requests, "no log request");
+    // Lines written after the toggles arrive on the streams already open.
+    fake.append_log(&ContainerLog::new("demo", POD), "a after the toggles");
+    fake.append_log(&ContainerLog::new("demo", OTHER), "b after the toggles");
+    wait_line(&app, id, "a after the toggles")?;
+    wait_line(&app, id, "b after the toggles")?;
+    assert_eq!(
+        fake.log_requests().len(),
+        requests,
+        "toggling the prefix sent no log request"
+    );
 
     // Scale up: the new pod is Pending first, and its log is read once it started, without
     // reopening the tab.
@@ -822,19 +1011,92 @@ fn up_45_follow_workload_logs() -> Result<()> {
         Any(json!({"text": "x1 revived", "source": source(refused)})),
     )?;
 
-    // A crash loop: each time the container stops, its stream waits for the next instance and
-    // reads on from it, never showing a line twice.
+    // A 500 on one pod's log is not final: that stream reconnects, again and again, while the
+    // others read on; once the server answers, it streams again.
+    fake.inject(
+        Fault::status(500)
+            .on(&pods(fake))
+            .named(replacement)
+            .subresource("log"),
+    );
+    let before = log_requests_of(fake, replacement);
+    assert_eq!(
+        fake.drop_log_streams(&ContainerLog::new("demo", replacement)),
+        1
+    );
+    until(
+        "two refused reconnects",
+        || log_requests_of(fake, replacement),
+        |n| *n >= before + 2,
+    )?;
+    let state = wait_tab(
+        &app,
+        id,
+        "/logs/streams/each",
+        Equals(each(&[
+            (replacement, "reconnecting"),
+            (refused, "streaming"),
+            (POD, "streaming"),
+        ])),
+    )?;
+    assert_eq!(
+        tab(&state, id)["logs"]["streams"]["failed"],
+        0,
+        "a 500 fails no stream: {}",
+        tab(&state, id)
+    );
+    fake.append_log(&ContainerLog::new("demo", POD), "a4 during the 500s");
+    wait_line(&app, id, "a4 during the 500s")?;
+    app.screenshot("up45-reconnecting-stream")?;
+    fake.clear_faults();
+    wait_tab(
+        &app,
+        id,
+        "/logs/streams/each",
+        Equals(each(&[
+            (replacement, "streaming"),
+            (refused, "streaming"),
+            (POD, "streaming"),
+        ])),
+    )?;
+    fake.append_log(&ContainerLog::new("demo", replacement), "r3 after the 500s");
+    wait_line(&app, id, "r3 after the 500s")?;
+
+    // A crash loop: each time the container stops, the kubelet backs off (CrashLoopBackOff) and
+    // serves the stopped instance again; the stream waits for the next instance and reads on
+    // from it, never showing a line twice.
     for round in 1..=2 {
         fake.crash_container("demo", POD, "nginx");
-        wait_tab_is(&app, id, json!({"logs": {"streams": {"live": 2}}}))?;
-        if round == 1 {
-            app.screenshot("up45-crashed-pod")?;
-        }
-        fake.start_container("demo", POD, "nginx");
+        fake.back_off_container("demo", POD, "nginx");
+        wait_tab(
+            &app,
+            id,
+            "/logs/streams/each",
+            Equals(each(&[
+                (replacement, "streaming"),
+                (refused, "streaming"),
+                (POD, "reconnecting"),
+            ])),
+        )?;
         wait_tab_is(
             &app,
             id,
-            json!({"logs": {"streams": {"live": 3, "failed": 0}}}),
+            json!({"status": {"state": "streaming"},
+                   "logs": {"streams": {"live": 2, "failed": 0}}}),
+        )?;
+        if round == 1 {
+            app.screenshot("up45-crash-loop")?;
+        }
+        fake.start_container("demo", POD, "nginx");
+        wait_tab(
+            &app,
+            id,
+            "/logs/streams/each",
+            Equals(each(&[
+                (replacement, "streaming"),
+                (refused, "streaming"),
+                (POD, "streaming"),
+            ])),
         )?;
         until(
             "the restarted container's stream",

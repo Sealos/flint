@@ -501,6 +501,12 @@ impl Logs {
         let now = self.clock.now_precise();
         let since = query.since(now);
         let entries = self.entries(key, instance.previous);
+        // The kubelet's notice is its whole answer: no options apply, and nothing follows.
+        if let Some(notice) = entries.iter().find(|e| e.notice) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let _ = tx.send(Ok(Bytes::from(format!("{}\n", notice.text))));
+            return rx;
+        }
         let from = match query.tail_lines {
             Some(n) => entries
                 .len()
@@ -532,8 +538,9 @@ impl Logs {
     }
 
     /// Replaces an instance's log with one line the kubelet writes instead of it when it cannot
-    /// read the log (`unable to retrieve container logs for containerd://…`): sent without a
-    /// timestamp, even when one is asked for, and whatever the "since" time.
+    /// read the log (`unable to retrieve container logs for containerd://…`): sent as is, with
+    /// no timestamp, whatever the "since" time, `tailLines` and `limitBytes`, and the response
+    /// ends after it, also when following.
     pub fn set_notice(&mut self, key: &Key, previous: bool, notice: &str) {
         let at = self.stamp(None);
         *self.entries(key, previous) = vec![Entry {
@@ -894,6 +901,19 @@ mod tests {
         // The current instance is untouched.
         let (text, _) = drain(&mut logs.open(&k, running(), &query("")));
         assert!(text.starts_with("fake log line 1"), "{text}");
+
+        // On the current instance it ends a followed response too, and neither `tailLines` nor
+        // `limitBytes` cut it.
+        logs.set_notice(&k, false, notice);
+        for options in ["follow=true", "follow=true&tailLines=0", "limitBytes=5"] {
+            let (text, end) = drain(&mut logs.open(&k, running(), &query(options)));
+            assert_eq!(
+                (text.as_str(), end),
+                (format!("{notice}\n").as_str(), Some(true)),
+                "{options}"
+            );
+        }
+        assert_eq!(logs.open_streams(None), 0, "nothing follows a notice");
     }
 
     #[test]

@@ -198,6 +198,32 @@ impl FakePod {
         self.sync();
     }
 
+    /// The stopped container waits to be restarted: `waiting` with reason `CrashLoopBackOff`,
+    /// its stopped instance moved to `lastState.terminated`; the restart count stays until it
+    /// starts again. Panics unless it is terminated.
+    pub(crate) fn back_off(&mut self, container: &str) {
+        let pod = self.name().to_owned();
+        let status = self.status_mut(container);
+        let terminated = status
+            .get("state")
+            .and_then(|s| s.get("terminated"))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "container {container:?} of pod {pod} has not stopped, so it cannot back off"
+                )
+            });
+        status.insert("lastState".into(), json!({"terminated": terminated}));
+        status.insert(
+            "state".into(),
+            json!({"waiting": {"reason": "CrashLoopBackOff",
+                               "message": format!("back-off restarting failed container {container}")}}),
+        );
+        status.insert("ready".into(), false.into());
+        status.insert("started".into(), false.into());
+        self.sync();
+    }
+
     /// The container runs from `now` (fixture time), always as a new instance with an empty
     /// log. One that terminated moves to `lastState.terminated` (its log becomes the previous
     /// one: returns true then); one in CrashLoopBackOff already has it there. Either way the
