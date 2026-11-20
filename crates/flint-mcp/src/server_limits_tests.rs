@@ -220,17 +220,22 @@ async fn a_call_past_its_deadline_names_the_server() {
         deadline: Duration::from_millis(300),
         ..Limits::default()
     };
-    let server = server(dir.path(), Some(&url), limits);
+    // A server path that looks like a credential is redacted in the reply, as in any other.
+    let secret = format!("{}{}", "hunter2", "-not-really");
+    let exposed = format!("{url}/password={secret}");
+    let server = server(dir.path(), Some(&exposed), limits);
     let mut client = Client::start(&server, 64 * 1024).await;
     client
         .call(1, "list_resource_kinds", json!({"cluster": "silent"}))
         .await;
     let reply = client.next().await;
     assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-    assert_eq!(
-        text(&reply),
-        format!("timed out after 300ms reaching {url}")
+    let said = text(&reply);
+    assert!(
+        said.starts_with(&format!("timed out after 300ms reaching {url}/")),
+        "{said}"
     );
+    assert!(!said.contains(&secret), "{said}");
     assert_eq!(server.inner.admission.running(), 0);
 }
 
@@ -243,6 +248,7 @@ async fn a_stalled_client_holds_the_reply_budget_at_most() {
         running: 2,
         waiting: 1000,
         reply_budget: 4 * 1024,
+        unanswered: 8,
         ..Limits::default()
     };
     let server = server(dir.path(), None, limits);
@@ -356,4 +362,67 @@ async fn refusals_to_a_stalled_client_stay_within_the_budget() {
         refused += 1;
     }
     writer.await.unwrap();
+}
+
+// covers UP-08: a request whose id is still in flight is refused at the door: rmcp never
+// starts a second handler for it.
+#[tokio::test]
+async fn a_repeated_request_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let server = server(dir.path(), Some(&url), Limits::default());
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for _ in 0..2 {
+        client
+            .call(7, "list_resource_kinds", json!({"cluster": "silent"}))
+            .await;
+    }
+    let reply = client.next().await;
+    assert_eq!(reply["id"], json!(7), "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still in flight"),
+        "{reply}"
+    );
+    wait_for("one call running", || server.inner.admission.running() == 1).await;
+    assert_eq!(server.inner.admission.admitted(), 1);
+}
+
+// covers UP-08: at the limit of unanswered requests, a cancellation still gets through: the
+// cancelled call ends, and a request waiting behind it runs.
+#[tokio::test]
+async fn a_cancellation_gets_through_at_the_request_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        unanswered: 2,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let admission = || &server.inner.admission;
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for id in 1..=3 {
+        client
+            .call(id, "list_resource_kinds", json!({"cluster": "silent"}))
+            .await;
+    }
+    wait_for("two calls running", || admission().running() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        admission().admitted(),
+        2,
+        "the third waits at the transport"
+    );
+    client.cancel(1).await;
+    // The third takes the cancelled one's place: three handlers ran, two at a time.
+    wait_for("the third runs", || {
+        admission().admitted() == 2 && admission().running() == 2
+    })
+    .await;
+    let records = || flint_core::activity::read(dir.path());
+    wait_for("the cancelled call is recorded", || records().len() == 1).await;
+    assert_eq!(records()[0].outcome, flint_core::activity::Outcome::Failed);
+    assert_eq!(admission().replies().unanswered_count(), 2);
 }

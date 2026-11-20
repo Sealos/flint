@@ -2,7 +2,7 @@
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +14,8 @@ use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
 use flint_core::read::{self, KindInfo, ResolveKindError};
 use flint_core::settings;
 use flint_core::table::{self, TablePage};
+use futures::FutureExt as _;
+use futures::future::{BoxFuture, Shared};
 use kube::Client;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -55,7 +57,13 @@ struct Inner {
     discovery: SlotMap<Kinds>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
     admission: Admission,
+    /// Connections being made, by cluster and fingerprint ([`FlintMcp::connecting`]).
+    connecting: Mutex<HashMap<(String, u64), Connecting>>,
 }
+
+/// A connection being made, shared by the calls that wait for it ([`FlintMcp::connecting`]); its
+/// error is already worded for the agent.
+type Connecting = Shared<BoxFuture<'static, Result<Client, Arc<String>>>>;
 
 /// Discovery results for one cluster.
 type Kinds = Arc<Vec<KindInfo>>;
@@ -207,8 +215,7 @@ impl FlintMcp {
             .cluster
             .as_ref()
             .and_then(|_| CALL.try_with(|c| c.borrow().server.clone()).ok().flatten());
-        let _ = CALL.try_with(|c| c.borrow_mut().recorded = true);
-        self.record(activity::ActivityRecord {
+        let record = activity::ActivityRecord {
             at_ms: activity::now_ms(),
             tool: tool.to_owned(),
             server,
@@ -223,8 +230,15 @@ impl FlintMcp {
             outcome,
             cluster_key: None,
             server_key: None,
-        })
-        .await;
+        };
+        // Within `call_tool`, the record waits for the call's outcome there: a deadline that
+        // fires after this still makes it a timeout. Called directly (tests), it is written now.
+        if let Err(record) = CALL
+            .try_with(|c| c.borrow_mut().record = Some(record.clone()))
+            .map_err(|_| record)
+        {
+            self.record(record).await;
+        }
         let content = vec![ContentBlock::text(text)];
         Ok(if ok {
             CallToolResult::success(content)
@@ -252,8 +266,9 @@ struct CallNote {
     /// The API server of the cluster the call reads, once [`FlintMcp::client`] found it exposed
     /// (without credentials).
     server: Option<String>,
-    /// Its tool recorded it ([`FlintMcp::finish`]).
-    recorded: bool,
+    /// What its tool would record ([`FlintMcp::finish`]), written once the call's outcome is
+    /// settled.
+    record: Option<activity::ActivityRecord>,
 }
 
 tokio::task_local! {
@@ -427,6 +442,7 @@ impl FlintMcp {
                 clients: Mutex::default(),
                 discovery: Mutex::default(),
                 admission: Admission::new(limits),
+                connecting: Mutex::default(),
             }),
             tool_router: Self::tool_router(),
         }
@@ -550,50 +566,57 @@ impl ServerHandler for FlintMcp {
         let named = named_in(request.arguments.as_ref());
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
+        // Until this handler ends, the call counts as unanswered, cancelled or not: it may
+        // still be writing its activity record.
+        let _ended = HandlerEnded {
+            replies: admission.replies(),
+            id: context.id.clone(),
+        };
         let deadline = admission.limits().deadline;
         let turn = tokio::select! {
             turn = admission.enter() => Some(turn),
             () = cancelled.cancelled() => None,
         };
-        let (result, recorded, server) = match turn {
+        let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
+        // The reply, and the record its tool left when it is the outcome.
+        let (result, record, server) = match turn {
             // Cancelled while it waited for a turn.
             None => (
                 Err(rmcp::ErrorData::internal_error("cancelled", None)),
-                false,
+                None,
                 None,
             ),
-            Some(Err(busy)) => (
-                Ok(CallToolResult::error(vec![ContentBlock::text(busy.to_string())]).into()),
-                false,
-                None,
-            ),
+            Some(Err(busy)) => (failed(&busy.to_string()), None, None),
             Some(Ok(turn)) => {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
                 CALL.scope(std::cell::RefCell::default(), async {
                     // Dropping the call's future ends its Kubernetes requests.
-                    let result = tokio::select! {
-                        result = self.tool_router.call(call) => result,
+                    let (result, finished) = tokio::select! {
+                        result = self.tool_router.call(call) => (result, true),
                         () = cancelled.cancelled() => {
-                            Err(rmcp::ErrorData::internal_error("cancelled", None))
+                            (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
                         }
                         () = tokio::time::sleep(deadline) => {
                             let server = CALL.with(|c| c.borrow().server.clone());
-                            let timeout = ClusterError::timeout(deadline, server.as_deref());
-                            Ok(CallToolResult::error(vec![ContentBlock::text(timeout.for_agent())]).into())
+                            let mut text =
+                                ClusterError::timeout(deadline, server.as_deref()).for_agent();
+                            // As every reply: a server URL's path can hold anything.
+                            policy::redact_text(&mut text);
+                            (failed(&text), false)
                         }
                     };
                     drop(turn);
-                    let (recorded, server) = CALL.with(|c| {
-                        let c = c.borrow();
-                        (c.recorded, c.server.clone())
+                    let (record, server) = CALL.with(|c| {
+                        let mut c = c.borrow_mut();
+                        (c.record.take().filter(|_| finished), c.server.clone())
                     });
-                    (result, recorded, server)
+                    (result, record, server)
                 })
                 .await
             }
         };
-        if !recorded {
+        let record = record.unwrap_or_else(|| {
             let bytes = match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(done)) => done
                     .content
@@ -603,7 +626,7 @@ impl ServerHandler for FlintMcp {
                 Ok(_) => 0,
                 Err(error) => error.message.len(),
             };
-            self.record(activity::ActivityRecord {
+            activity::ActivityRecord {
                 at_ms: activity::now_ms(),
                 tool,
                 server: server.filter(|_| named.cluster.is_some()),
@@ -618,10 +641,22 @@ impl ServerHandler for FlintMcp {
                 outcome: activity::Outcome::Failed,
                 cluster_key: None,
                 server_key: None,
-            })
-            .await;
-        }
+            }
+        });
+        self.record(record).await;
         result
+    }
+}
+
+/// Marks a tool call's handler as ended when dropped (`limits::ReplyBytes::handler_ended`).
+struct HandlerEnded {
+    replies: Arc<crate::limits::ReplyBytes>,
+    id: rmcp::model::RequestId,
+}
+
+impl Drop for HandlerEnded {
+    fn drop(&mut self) {
+        self.replies.handler_ended(&self.id);
     }
 }
 
@@ -677,17 +712,11 @@ impl FlintMcp {
         let slot = slot(&self.inner.clients, name, fingerprint, None);
         let client = slot
             .cell
-            .get_or_try_init(|| async {
-                tokio::time::timeout(
-                    TOOL_CONNECT_TIMEOUT,
-                    cluster::connect(&ctx.kubeconfig.merged, &info.name),
-                )
-                .await
-                .map_err(|_| ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None))?
+            .get_or_try_init(|| {
+                self.connecting(name, fingerprint, &ctx.kubeconfig, &info.name, &target)
             })
             .await
-            .map_err(|e| e.for_target(&target).for_agent())
-            .map_err(ToolError::new)?
+            .map_err(|e| ToolError::new(e.as_str()))?
             .clone();
         Ok(Conn {
             client,
@@ -695,6 +724,53 @@ impl FlintMcp {
             target,
             scope,
         })
+    }
+
+    /// The connection to `context` being made for cluster `name` at `fingerprint`, shared by
+    /// every call that waits for it. It runs in a task of its own, bounded by
+    /// [`TOOL_CONNECT_TIMEOUT`]: a call that is cancelled or past its deadline stops waiting,
+    /// and the next call waits for the same connection (and exec auth plugin) instead of
+    /// starting another.
+    fn connecting(
+        &self,
+        name: &str,
+        fingerprint: u64,
+        kubeconfig: &Arc<LoadedKubeconfig>,
+        context: &str,
+        target: &Target,
+    ) -> Connecting {
+        let mut connecting = self
+            .inner
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = (name.to_owned(), fingerprint);
+        // A connection that failed is no connection to wait for.
+        if let Some(shared) = connecting.get(&key)
+            && !matches!(shared.peek(), Some(Err(_)))
+        {
+            return shared.clone();
+        }
+        connecting.retain(|_, shared| shared.peek().is_none());
+        let (kubeconfig, context, target) =
+            (kubeconfig.clone(), context.to_owned(), target.clone());
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(
+                TOOL_CONNECT_TIMEOUT,
+                cluster::connect(&kubeconfig.merged, &context),
+            )
+            .await
+            .unwrap_or_else(|_| Err(ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None)))
+            .map_err(|e| Arc::new(e.for_target(&target).for_agent()))
+        });
+        let shared = async move {
+            task.await
+                .unwrap_or_else(|e| Err(Arc::new(format!("connection task failed: {e}"))))
+        }
+        .boxed()
+        .shared();
+        connecting.insert(key, shared.clone());
+        shared
     }
 
     async fn kinds(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
@@ -1625,8 +1701,10 @@ mod tests {
     }
 
     // covers UP-04: tool calls on a context whose exec auth plugin never answers (a login that
-    // never comes) share one plugin run, and when they give up the plugin and what it started
-    // are killed, so repeated calls never pile up plugin processes.
+    // never comes) share one plugin run. Calls that give up (cancelled, past their deadline)
+    // leave it running for the next ones, which wait for the same run instead of starting
+    // another, so repeated calls never pile up plugin processes. (The connection's own timeout
+    // ends it.)
     #[tokio::test]
     async fn tool_calls_on_a_hanging_plugin_leave_at_most_one_plugin() {
         use std::os::unix::fs::PermissionsExt;
@@ -1657,7 +1735,6 @@ mod tests {
         };
 
         for round in 1..=2 {
-            let _ = std::fs::remove_file(traces.join("child"));
             let calls: Vec<_> = (0..3)
                 .map(|_| {
                     let server = server.clone();
@@ -1672,29 +1749,27 @@ mod tests {
                 .collect();
             let child = first_line(&traces.join("child")).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert_eq!(starts(), round, "one plugin for every call in flight");
+            assert_eq!(
+                starts(),
+                1,
+                "round {round}: one plugin for every call in flight"
+            );
             let leader = std::fs::read_to_string(traces.join("starts"))
                 .unwrap()
                 .lines()
                 .last()
                 .unwrap()
                 .to_owned();
-            assert!(exists(&leader) && exists(&child));
-            // The calls give up, as at their timeout.
+            assert!(exists(&leader) && live(&child));
+            // The calls give up, as at their deadline; the plugin runs on for the next ones.
             for call in calls {
                 call.abort();
             }
-            // The plugin is Flint's child, so it is reaped too; its own child need only be dead.
-            let gone = [(&leader, exists as fn(&str) -> bool), (&child, live)];
-            for (pid, running) in gone {
-                for _ in 0..500 {
-                    if !running(pid) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                assert!(!running(pid), "plugin process {pid} outlived its calls");
-            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                exists(&leader),
+                "round {round}: the shared connection goes on"
+            );
         }
     }
 

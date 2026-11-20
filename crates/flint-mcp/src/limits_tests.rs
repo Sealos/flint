@@ -113,3 +113,21 @@ async fn reply_bytes_count_until_written() {
     sending.await.unwrap().unwrap();
     assert_eq!(replies.outstanding(), 0);
 }
+
+// covers UP-08: a cancelled tool call is counted until its handler ends (it may still write
+// its activity record); a cancelled other request is done with at once.
+#[test]
+fn cancelled_tool_calls_count_until_their_handler_ends() {
+    let replies = ReplyBytes::default();
+    let (tool, other) = (
+        rmcp::model::NumberOrString::Number(1),
+        rmcp::model::NumberOrString::Number(2),
+    );
+    replies.unanswered().insert(tool.clone(), Work::Tool);
+    replies.unanswered().insert(other.clone(), Work::Other);
+    replies.cancelled(&tool);
+    replies.cancelled(&other);
+    assert_eq!(replies.unanswered_count(), 1, "the tool call still counts");
+    replies.handler_ended(&tool);
+    assert_eq!(replies.unanswered_count(), 0);
+}
