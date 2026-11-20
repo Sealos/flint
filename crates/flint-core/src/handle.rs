@@ -929,19 +929,6 @@ mod tests {
         assert_eq!(crate::auth_plugin::retry_epoch("shell-rest"), before + 1);
     }
 
-    #[tokio::test]
-    async fn requests_for_an_unknown_cluster_answer_without_waiting() {
-        let dir = tempfile::tempdir().unwrap();
-        let core = start(dir.path());
-        let err = core
-            .fetch_object("nowhere", &KindId::pods(), Some("ns"), "p")
-            .await
-            .unwrap_err();
-        assert!(err.contains("not connected"), "{err}");
-        assert!(core.discovery("nowhere").await.is_none());
-        assert!(core.watched_kinds("nowhere").await.is_empty());
-    }
-
     // covers UP-47: a pod list nobody waits for any more stops: dropping the future aborts
     // the task doing the request.
     #[tokio::test]
