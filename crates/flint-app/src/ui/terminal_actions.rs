@@ -97,6 +97,7 @@ impl TerminalView {
             ok: "Paste".into(),
             cancel: "Cancel".into(),
             id: "paste-description",
+            default_cancel: false,
         };
         let view = cx.weak_entity();
         confirm::open(window, cx, dialog, move |_, cx| {

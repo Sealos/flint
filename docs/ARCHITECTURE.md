@@ -418,9 +418,14 @@ design is in [ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md).
 
 `flint-app/src/ui/dock.rs` (pure parts in `dock_model.rs`): a resizable panel under the main area, with one tab per
 session that outlives navigation (log tabs and shell tabs now; AI log analysis later). Tabs keep running across
-cluster switches. Cmd-J shows and hides the dock; Cmd-W closes the active tab while focus is in the dock (elsewhere it
-closes the window). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant; the module
-documentation lists the steps.
+cluster switches. Cmd-J shows and hides the dock; Cmd-W closes the active tab wherever focus is in the window, and
+closes the window only when the dock shows no tab; Shift-Cmd-W (Close Window) always closes the window. Closing the
+window or quitting while a shell runs or a log tab follows asks first, naming how many sessions end (`ui/closing.rs`,
+#177). That confirmation sets `DialogText::default_cancel`: the dialog's own keys are off, and its description (which
+takes focus) and its buttons sit in the `DefaultCancel` key context, where Enter and Escape are bound to Cancel; with
+focus on the dialog's own node (a click on the title-bar strip), a keystroke interceptor (`confirm::init`) cancels. Enter and Escape cancel; confirming
+needs the Quit or Close Window button (a click, or Space when it has focus). A new tab kind implements `DockItem` and
+adds a `DockTab` and `TabKey` variant; the module documentation lists the steps.
 
 - **Titles.** One pattern for every kind: `chatty · app`, `chatty · app (previous)`, `api (Deployment)`,
   `-l app=web`, `Shell: web-1 · app`, cut in the middle past 26 characters. Every tab shows its cluster in a chip

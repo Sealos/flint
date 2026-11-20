@@ -54,6 +54,8 @@ const ANSWER: Duration = Duration::from_secs(60);
 
 /// How long the quit request on drop may take before the app is killed.
 const QUIT_ANSWER: Duration = Duration::from_secs(2);
+/// The title of the question Quit asks while a session would end (#177).
+const QUIT_DIALOG: &str = "Quit Flint?";
 
 /// The exit code of a test build whose automation channel refused to start.
 pub const REFUSED_EXIT_CODE: i32 = 3;
@@ -577,9 +579,44 @@ impl App {
                 json!({"name": "flint::Quit"}),
                 QUIT_ANSWER,
             );
+            // Quit asks first while a shell runs or a log tab follows (#177). Confirm only that
+            // question, read off the open dialog's title: any other dialog is a bug to report,
+            // not one to click through.
+            let mut unexpected = None;
+            let mut confirmed = false;
             let deadline = Instant::now() + Duration::from_secs(5);
             while child.try_wait()?.is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
+                if confirmed {
+                    continue;
+                }
+                // The app may quit while it answers.
+                let Ok(state) = self.request_within("state", Value::Null, QUIT_ANSWER) else {
+                    continue;
+                };
+                match state["dialog"]["title"].as_str() {
+                    None => {}
+                    Some(QUIT_DIALOG) => {
+                        let _ = self.request_within(
+                            "dispatch_action",
+                            json!({"name": "ui::Confirm"}),
+                            QUIT_ANSWER,
+                        );
+                        confirmed = true;
+                    }
+                    Some(other) => {
+                        eprintln!("App::stop: Quit left an unexpected dialog open: {other:?}");
+                        unexpected = Some(other.to_owned());
+                        break;
+                    }
+                }
+            }
+            if let Some(title) = unexpected {
+                self.stdin.take();
+                kill_group(&child);
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("quitting left an unexpected dialog open: {title:?}");
             }
         }
         // Closing stdin also tells the app to go.

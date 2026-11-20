@@ -42,7 +42,7 @@ actions!(
     [
         /// Quit Flint.
         Quit,
-        /// Close the front window.
+        /// Close the front window, asking first while a session would end.
         CloseWindow,
         /// Follow the system light and dark mode (the `appearance` setting).
         AppearanceSystem,
@@ -650,8 +650,10 @@ impl ActionSpec {
         handled && self.is_enabled(cx)
     }
 
-    /// The live key binding to show next to the action ("⌘F", [`keystroke_hint`]), if any: the one added last to
-    /// the keymap (the highest precedence), so later or user bindings win over the defaults.
+    /// The live key binding to show next to the action ("⌘F", [`keystroke_hint`]), if any: of
+    /// those for its own keys, the one added last to the keymap (the highest precedence), so
+    /// later or user bindings win over the defaults. Fallback and per-context extras (Close
+    /// Window's Cmd-W, a shell tab's Ctrl+Shift+W) are not shown.
     #[cfg_attr(
         not(any(test, feature = "automation")),
         expect(dead_code, reason = "used by the command palette (#29) and automation")
@@ -660,16 +662,19 @@ impl ActionSpec {
         let action = (self.probe)();
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
-        let binding = keymap.bindings_for_action(&*action).next_back()?;
         let os = cx.platform_info().os;
-        Some(
-            binding
-                .keystrokes()
-                .iter()
-                .map(|k| keystroke_hint(k.modifiers(), k.key(), os))
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
+        let own: Vec<String> = self.keys.iter().map(|k| key_hint_for(k, os)).collect();
+        keymap
+            .bindings_for_action(&*action)
+            .map(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(|k| keystroke_hint(k.modifiers(), k.key(), os))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .rfind(|hint| own.contains(hint))
     }
 }
 
@@ -877,6 +882,19 @@ pub fn on_click<E: ?Sized, A: Action>(action: A) -> impl Fn(&E, &mut Window, &mu
     }
 }
 
+/// [`on_click`] for a control that answers something other than the workspace (a dialog's
+/// button): `action` is dispatched from `focus`, a node inside that thing.
+pub fn on_click_in<E: ?Sized, A: Action>(
+    focus: FocusHandle,
+    action: A,
+) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if let Err(e) = dispatch_in(&focus, &action, window, cx) {
+            tracing::warn!("{e}");
+        }
+    }
+}
+
 /// [`on_click`] that also hands a refusal to `refused`, for a control drawn from state that may
 /// be older than the click (a menu left open), so the user learns why nothing happened.
 pub fn on_click_or<E: ?Sized>(
@@ -929,6 +947,18 @@ pub fn init(cx: &mut App) {
                 Err(e) => tracing::error!(action = spec.name, keys, "invalid key binding: {e}"),
             }
         }
+        // Cmd-W closes the window when no dock tab is shown: Close Dock Tab, bound to it later
+        // (so first in precedence), is bound only while a tab is shown, and the key falls
+        // through to this. Not in the spec's keys, so menus and the palette show Shift-Cmd-W.
+        if spec.type_id == TypeId::of::<CloseWindow>() {
+            push(
+                &mut bindings,
+                CLOSE_WINDOW_FALLBACK,
+                (spec.probe)(),
+                &context,
+                cx,
+            );
+        }
         // The list's arrows also work in a window holding only a list (as in view tests).
         if spec.scope == Scope::List && spec.key_context == Some(PLAIN) {
             for keys in spec.keys {
@@ -947,13 +977,42 @@ pub fn init(cx: &mut App) {
     }
     // Keys the shell in a shell tab gets instead of the app.
     let terminal = Some(parse(TERMINAL));
+    // Linux terminals close their tab on Ctrl+Shift+W: so does a shell tab, over Close Window.
+    for keys in TERMINAL_CLOSE_TAB {
+        push(&mut bindings, keys, Box::new(CloseActiveTab), &terminal, cx);
+    }
     for keys in TERMINAL_PASSTHROUGH {
         match KeyBinding::load(keys, Box::new(NoAction), terminal.clone(), false, None, cx) {
             Ok(binding) => bindings.push(binding),
             Err(e) => tracing::error!(keys, "invalid terminal key: {e}"),
         }
     }
+    // In a confirmation whose OK ends sessions, Enter cancels, as Escape does: that dialog's own
+    // keys are off, and these answer for it.
+    for keys in ["enter", "escape"] {
+        bindings.push(KeyBinding::new(
+            keys,
+            Cancel,
+            Some(super::confirm::DEFAULT_CANCEL),
+        ));
+    }
+    super::confirm::init(cx);
     cx.bind_keys(bindings);
+}
+
+/// Loads `keys` for `action` in `context` into `bindings`, logging a key that does not parse.
+fn push(
+    bindings: &mut Vec<KeyBinding>,
+    keys: &str,
+    action: Box<dyn Action>,
+    context: &Option<Rc<KeyBindingContextPredicate>>,
+    cx: &App,
+) {
+    let name = action.name();
+    match KeyBinding::load(keys, action, context.clone(), false, None, cx) {
+        Ok(binding) => bindings.push(binding),
+        Err(e) => tracing::error!(action = name, keys, "invalid key binding: {e}"),
+    }
 }
 
 /// A type-erased `enabled` check.
@@ -1181,7 +1240,7 @@ pub const WORKSPACE: &str = "Workspace";
 const PLAIN: &str = "Workspace && !Input";
 /// The same, for the list: deeper than the workspace, so it wins there.
 const LIST_ALONE: &str = "ResourceList && !Input";
-/// The bottom dock's key context: Cmd-W closes a tab there instead of the window.
+/// The bottom dock's key context.
 pub const DOCK: &str = "Dock";
 /// A log tab's key context.
 pub const LOG_VIEW: &str = "LogView";
@@ -1394,14 +1453,20 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
     use Category as C;
     let specs = vec![
         // Flint.
-        Spec::unit::<Quit>("Quit Flint", "Quit the app.")
+        Spec::unit::<Quit>(
+            "Quit Flint",
+            "Quit the app, asking first while a shell runs or a log tab follows.",
+        )
             .of(C::Flint, S::App)
             .keys(&["secondary-q"], None),
-        // In the workspace's context, not everywhere: a binding without a context outranks every
-        // other, so the dock's Cmd-W (close the tab) would never be reached.
-        Spec::unit::<CloseWindow>("Close Window", "Close the front window.")
-            .of(C::Flint, S::App)
-            .keys(&["secondary-w"], Some(WORKSPACE)),
+        // Shift-Cmd-W: Cmd-W closes the dock's tab first (Close Dock Tab), and the window only
+        // when the dock shows none (#177).
+        Spec::unit::<CloseWindow>(
+            "Close Window",
+            "Close the front window, asking first while a shell runs or a log tab follows.",
+        )
+        .of(C::Flint, S::App)
+        .keys(&["secondary-shift-w"], Some(WORKSPACE)),
         Spec::unit::<AppearanceSystem>(
             "Use System Appearance",
             "Follow the system light and dark mode.",
@@ -1619,10 +1684,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .keys(&["secondary-j"], Some(WORKSPACE)),
         Spec::unit::<CloseActiveTab>(
             "Close Dock Tab",
-            "Close the dock's active tab, ending its session.",
+            "Close the dock's active tab, ending its session. Its key, Cmd-W, closes the window \
+             when the dock shows no tab.",
         )
         .of(C::View, S::Dock)
-        .keys(&["secondary-w"], Some(DOCK)),
+        // Wherever focus is in the window, not only in the dock (#177).
+        .keys(&["secondary-w"], Some(WORKSPACE)),
         Spec::unit::<NextTab>("Next Dock Tab", "Show the dock's next tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-tab"], Some(DOCK)),
@@ -1864,6 +1931,17 @@ pub(in crate::ui) const TERMINAL_PASTE: &[&str] = if cfg!(target_os = "macos") {
 } else {
     &["secondary-shift-v"]
 };
+
+/// Close Window's Cmd-W, under Close Dock Tab's: see [`init`].
+const CLOSE_WINDOW_FALLBACK: &str = "secondary-w";
+
+/// Close Dock Tab in a shell tab: Ctrl+Shift+W on Linux, as its terminals close a tab (over
+/// Close Window's binding there); nothing extra on macOS, where Cmd-W already does.
+const fn terminal_close_tab_keys(mac: bool) -> &'static [&'static str] {
+    if mac { &[] } else { &["secondary-shift-w"] }
+}
+pub(in crate::ui) const TERMINAL_CLOSE_TAB: &[&str] =
+    terminal_close_tab_keys(cfg!(target_os = "macos"));
 
 /// Keys a shell tab sends to its program even where the app or gpui-component bind them: Tab
 /// (focus traversal), Esc, Return and the arrows (lists, dialogs), and Ctrl with a letter or
@@ -2266,6 +2344,45 @@ pub mod tests {
             } else {
                 &["secondary-shift-v"]
             }
+        );
+    }
+
+    // covers UP-42 (#177): Cmd-W closes the dock's tab before the window. Close Window's
+    // fallback Cmd-W is loaded before Close Dock Tab's, so it is lower in precedence, and it is
+    // not one of Close Window's own keys, which the menus and the palette show.
+    #[test]
+    fn cmd_w_reaches_the_dock_tab_before_the_window() {
+        let position = |name: &str| actions().iter().position(|s| s.name == name).unwrap();
+        assert!(position("flint::CloseWindow") < position("dock::CloseActiveTab"));
+        let close_window = find("flint::CloseWindow").unwrap();
+        assert_eq!(close_window.keys, ["secondary-shift-w"]);
+        assert!(!close_window.keys.contains(&super::CLOSE_WINDOW_FALLBACK));
+        assert_eq!(find("dock::CloseActiveTab").unwrap().keys, ["secondary-w"]);
+    }
+
+    // covers UP-42 (#177): on Linux, Ctrl+Shift+W in a shell tab closes the tab, as Linux
+    // terminals do, instead of the window (Close Window's key elsewhere); the shell never gets
+    // it. On macOS nothing extra is bound: Cmd-W already closes the tab. Checked for both systems
+    // on every host, like the other per-OS keys.
+    #[test]
+    fn linux_ctrl_shift_w_in_a_shell_closes_the_tab() {
+        use gpui_kit::{Keystroke, OperatingSystem};
+        assert!(super::terminal_close_tab_keys(true).is_empty());
+        let linux = super::terminal_close_tab_keys(false);
+        assert_eq!(linux, ["secondary-shift-w"]);
+        assert_eq!(linux, find("flint::CloseWindow").unwrap().keys);
+        let parse = |k: &str| Keystroke::parse_with_os(k, OperatingSystem::Linux).unwrap();
+        let ctrl_shift_w = parse(linux[0]);
+        assert!(ctrl_shift_w.modifiers.control && ctrl_shift_w.modifiers.shift);
+        assert!(
+            !super::TERMINAL_PASSTHROUGH
+                .iter()
+                .any(|p| parse(p) == ctrl_shift_w),
+            "the shell would get it"
+        );
+        assert_eq!(
+            super::TERMINAL_CLOSE_TAB,
+            super::terminal_close_tab_keys(cfg!(target_os = "macos"))
         );
     }
 

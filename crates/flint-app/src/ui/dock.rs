@@ -34,7 +34,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub use super::dock_model::TabStatus;
-use super::dock_model::{self, TabCluster, chip_labels, chip_tooltip};
+use super::dock_model::{self, LiveSessions, TabCluster, chip_labels, chip_tooltip};
 use super::focus::release_unfocused_input;
 use super::log_view::{LogRequest, LogView};
 use super::menu_record;
@@ -252,6 +252,23 @@ impl Dock {
             DockTab::Shell(view) => Some(view),
             DockTab::Logs(_) => None,
         }
+    }
+
+    /// The sessions closing the dock would end: its shells and following log tabs still at
+    /// work, shown or not ([`dock_model::ends_a_session`]).
+    pub fn live_sessions(&self, cx: &App) -> LiveSessions {
+        let mut live = LiveSessions::default();
+        for t in &self.tabs {
+            let item = t.tab.item(cx);
+            let (reads_to_end, count) = match item.tab_key() {
+                TabKey::Shell(_) => (false, &mut live.shells),
+                TabKey::Logs(request) => (request.previous, &mut live.logs),
+            };
+            if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
+                *count += 1;
+            }
+        }
+        live
     }
 
     /// The id of the tab whose session `key` names on `cluster` (its context and server).
@@ -671,17 +688,25 @@ impl Dock {
         cx.notify();
     }
 
-    /// Every dock action and its handler, for [`Bind`].
+    /// The tab shown, if the dock is visible and has one: what Close Dock Tab closes.
+    pub fn shown_tab(&self) -> Option<u64> {
+        self.active.filter(|_| self.visible)
+    }
+
+    /// The dock's actions on the tab shown, for [`Bind`]: bound only while a tab is shown
+    /// ([`Dock::shown_tab`]), so the Window menu's Close Dock Tab is disabled otherwise. Cmd-W
+    /// then falls through to its lower-precedence binding, Close Window (#177).
+    pub fn bind_shown_tab_actions<B: Bind<Self>>(bind: B) -> B {
+        bind.bind::<CloseActiveTab>(|dock, _, window, cx| match dock.shown_tab() {
+            Some(id) => dock.close(id, window, cx),
+            None => cx.propagate(),
+        })
+    }
+
+    /// Every other dock action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<ToggleDock>(|dock, _, window, cx| dock.toggle(window, cx))
             .bind::<ShowTabList>(|dock, _, window, cx| dock.show_tab_list(window, cx))
-            .bind::<CloseActiveTab>(|dock, _, window, cx| {
-                match dock.active.filter(|_| dock.visible) {
-                    Some(id) => dock.close(id, window, cx),
-                    // Not ours: let Cmd-W close the window.
-                    None => cx.propagate(),
-                }
-            })
             .bind::<NextTab>(|dock, _, window, cx| dock.cycle(1, window, cx))
             .bind::<PrevTab>(|dock, _, window, cx| dock.cycle(-1, window, cx))
             .bind::<ActivateTab>(|dock, action, window, cx| {
@@ -885,7 +910,13 @@ impl Render for Dock {
             .id("dock")
             .key_context(registry::DOCK)
             .track_focus(&self.focus)
-            .map(|el| Self::bind_actions(OnView::new(el, cx)).into_element())
+            .map(|el| {
+                let bind = Self::bind_actions(OnView::new(el, cx));
+                match self.shown_tab() {
+                    Some(_) => Self::bind_shown_tab_actions(bind).into_element(),
+                    None => bind.into_element(),
+                }
+            })
             .size_full()
             .bg(theme.background);
         let Some(active) = self.active_tab() else {
@@ -991,7 +1022,9 @@ mod tests {
 
     #[test]
     fn every_dock_action_is_bound() {
-        assert_binds_scope(Scope::Dock, super::Dock::bind_actions);
+        assert_binds_scope(Scope::Dock, |names| {
+            super::Dock::bind_shown_tab_actions(super::Dock::bind_actions(names))
+        });
     }
 
     // covers UP-42: the dock keeps a usable height and leaves the main area room.

@@ -14,7 +14,7 @@ use crate::ui::dock::{DockItem as _, DockTab, TabStatus};
 use crate::ui::list::ResourceList;
 use crate::ui::nav::NavPanel;
 use crate::ui::registry::{self, ActionError};
-use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace};
+use crate::ui::support_tests::{TestWorkspace, WAIT, open_fake_shell, open_workspace};
 use crate::ui::view_state::Focus;
 
 /// Test hooks into the workspace's private state, for the view tests of every module
@@ -35,6 +35,10 @@ impl Workspace {
 
     pub(in crate::ui) fn focus_handle_for_tests(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    pub(in crate::ui) fn dock_view(&self) -> Entity<crate::ui::dock::Dock> {
+        self.dock.clone()
     }
 
     /// The namespace filter remembered for `cluster`.
@@ -796,48 +800,6 @@ async fn the_tab_list_opens_from_the_keyboard(cx: &mut TestAppContext) {
         assert!(window.try_find("popup-menu").is_none(), "the list closed");
     })
     .unwrap();
-}
-
-/// Opens a running shell on `alpha` in the dock, over a session the test drives.
-fn open_fake_shell(
-    cx: &mut TestAppContext,
-    t: &TestWorkspace,
-) -> (u64, flint_core::exec::fake::FakeExec) {
-    use crate::ui::dock_model::TabCluster;
-    use crate::ui::terminal_model::ShellRequest;
-    use crate::ui::terminal_view::TerminalView;
-    let request = ShellRequest {
-        cluster: "alpha".into(),
-        namespace: "demo".into(),
-        pod: "web".into(),
-        container: Some("app".into()),
-    };
-    let (session, mut fake) = flint_core::exec::fake::FakeExec::open(
-        request.exec_request(flint_core::TerminalSize::default()),
-    );
-    let server = t.server.clone();
-    let id = cx
-        .update_window(t.window, |_, window, cx| {
-            let dock = t.workspace.read(cx).dock.clone();
-            dock.update(cx, |dock, cx| {
-                dock.open(
-                    crate::ui::dock::TabKey::Shell(request.clone()),
-                    TabCluster::new("alpha", Some(&server)),
-                    |window, cx| {
-                        DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
-                    },
-                    window,
-                    cx,
-                )
-            })
-        })
-        .unwrap();
-    fake.set_state(flint_core::ExecState::Running {
-        command: vec!["bash".into()],
-    });
-    fake.pump();
-    cx.run_until_parked();
-    (id, fake)
 }
 
 fn tab_status(cx: &mut TestAppContext, t: &TestWorkspace, id: u64) -> TabStatus {

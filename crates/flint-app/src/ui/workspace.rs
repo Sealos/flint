@@ -27,11 +27,12 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::closing;
 use super::clusters::{ClustersModel, Presence, state_label};
 use super::confirm::{self, DialogText};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, refused};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
-use super::dock_model::TabCluster;
+use super::dock_model::{LiveSessions, TabCluster};
 use super::focus::release_unfocused_input;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
@@ -291,6 +292,8 @@ impl Workspace {
         let on_focus_lost =
             cx.on_focus_lost(window, |this, window, cx| this.reclaim_focus(window, cx));
         registry::install(focus.clone(), Self::guards(cx.entity().downgrade()), cx);
+        // The window's close button asks first while a session would end, as Close Window does.
+        closing::guard_close_button(window, cx);
         let mut this = Self {
             model,
             focus,
@@ -328,6 +331,11 @@ impl Workspace {
         };
         this.show_appearance(window, cx);
         this
+    }
+
+    /// The sessions closing this window would end: the dock's shells and following log tabs.
+    pub fn live_sessions(&self, cx: &App) -> LiveSessions {
+        self.dock.read(cx).live_sessions(cx)
     }
 
     /// Shows the theme the `appearance` setting, macOS and `FLINT_APPEARANCE` call for, and
@@ -1608,6 +1616,7 @@ fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogT
         ok: "Expose".into(),
         cancel: "Cancel".into(),
         id: "expose-description",
+        default_cancel: false,
     }
 }
 

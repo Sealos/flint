@@ -104,6 +104,11 @@ impl Workspace {
         let detail = ForwardCurrent::new(element, self, cx, |ws| ws.detail.as_ref());
         let element = DetailView::bind_actions(detail).into_element();
         let element = Dock::bind_actions(Forward::new(element, Some(&self.dock))).into_element();
+        // Close Dock Tab only while a tab is shown, so the Window menu's item is disabled
+        // otherwise and Cmd-W falls through to Close Window.
+        let shown = self.dock.read(cx).shown_tab().map(|_| self.dock.clone());
+        let element =
+            Dock::bind_shown_tab_actions(Forward::new(element, shown.as_ref())).into_element();
         let log = self.dock.read(cx).active_log().cloned();
         let element = LogView::bind_actions(Forward::new(element, log.as_ref())).into_element();
         let shell = self.dock.read(cx).active_terminal().cloned();

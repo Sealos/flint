@@ -67,6 +67,7 @@ The tests sit next to the view they test, as child modules, so they can read its
 | Resource list and its banners | `ui/list_tests.rs` | UP-20, UP-21, UP-27 |
 | Detail pane and its banners | `ui/detail_tests.rs` | UP-04, UP-20, UP-23 |
 | Workspace actions, focus, typing, Close Window | `ui/workspace_tests.rs` | (the registry across views) |
+| Cmd-W, Close Window and Quit with dock sessions | `ui/closing_tests.rs` | UP-42 |
 | Appearance | `ui/appearance_tests.rs` | UP-32 |
 
 Together they cover the UI parts of UP-01, 02, 07, 08, 20, 21, 23, 24, 25 and 27, and part of UP-22: a CRD appears

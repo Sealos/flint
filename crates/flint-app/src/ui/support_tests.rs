@@ -223,6 +223,59 @@ pub async fn open_empty_workspace(
     (window, workspace, model)
 }
 
+/// Opens a running shell on `alpha` in the dock, over a session the test drives.
+pub fn open_fake_shell(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+) -> (u64, flint_core::exec::fake::FakeExec) {
+    open_fake_shell_in(cx, t, "web")
+}
+
+/// [`open_fake_shell`] into pod `pod`.
+pub fn open_fake_shell_in(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    pod: &str,
+) -> (u64, flint_core::exec::fake::FakeExec) {
+    use crate::ui::dock_model::TabCluster;
+    use crate::ui::terminal_model::ShellRequest;
+    use crate::ui::terminal_view::TerminalView;
+    let request = ShellRequest {
+        cluster: "alpha".into(),
+        namespace: "demo".into(),
+        pod: pod.into(),
+        container: Some("app".into()),
+    };
+    let (session, mut fake) = flint_core::exec::fake::FakeExec::open(
+        request.exec_request(flint_core::TerminalSize::default()),
+    );
+    let server = t.server.clone();
+    let id = cx
+        .update_window(t.window, |_, window, cx| {
+            let dock = t.workspace.read(cx).dock_view();
+            dock.update(cx, |dock, cx| {
+                dock.open(
+                    crate::ui::dock::TabKey::Shell(request.clone()),
+                    TabCluster::new("alpha", Some(&server)),
+                    |window, cx| {
+                        crate::ui::dock::DockTab::Shell(
+                            cx.new(|cx| TerminalView::new(session, request, window, cx)),
+                        )
+                    },
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    fake.set_state(flint_core::ExecState::Running {
+        command: vec!["bash".into()],
+    });
+    fake.pump();
+    cx.run_until_parked();
+    (id, fake)
+}
+
 impl TestWorkspace {
     /// Dispatches the registered action `name` from the focused element, as automation and the
     /// palette do, and lets the UI settle.

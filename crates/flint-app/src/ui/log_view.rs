@@ -580,6 +580,7 @@ impl LogView {
             ok: "Choose File…".into(),
             cancel: "Cancel".into(),
             id: "save-logs-description",
+            default_cancel: false,
         };
         confirm::open(window, cx, dialog, move |_, cx| {
             let save = save.clone();

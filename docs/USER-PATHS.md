@@ -269,8 +269,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-42 Sessions outlive navigation
 - **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them (the tab's
-  close button, or Cmd-W while the dock has focus; elsewhere Cmd-W still closes the window). A closed tab frees
-  everything it held. Cmd-J shows and hides the
+  close button, or Cmd-W wherever focus is while the dock shows a tab; with no tab shown, Cmd-W closes the window,
+  and Shift-Cmd-W always does). A closed tab frees everything it held. Closing the window (Shift-Cmd-W, its close
+  button, or Cmd-W with no tab shown) or quitting (Cmd-Q) while a shell runs or a log tab follows asks first, naming
+  how many sessions end. Enter and Escape cancel; confirming needs the Quit or Close Window button (a click, or Space
+  when it has focus). With none running, nothing is asked. Cmd-J shows and hides the
   dock, and its height is remembered. Every tab names its cluster beside its title, and two clusters never read the
   same. With many tabs, the tab I open or show stays in view, also when the window is resized, and the tab list
   (Shift-Cmd-J, or the button at the strip's end) shows every tab with its cluster and status. Opening the same logs
