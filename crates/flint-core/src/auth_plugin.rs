@@ -145,20 +145,30 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     }
     // A group of its own, so a kill also ends what the plugin started (`gcloud` runs Python, a
     // shell wrapper runs the real binary). Not when it may prompt on the terminal Flint was
-    // started from: only the foreground group may read it.
-    let own_group = !(interactive && std::io::stdin().is_terminal());
+    // started from (through stdin or `/dev/tty`): a background group stops when it does.
+    let own_group = !(interactive && has_terminal());
     if own_group {
         cmd.process_group(0);
     }
     cmd.kill_on_drop(true);
-    let child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
-    let mut group = KillGroup(child.id().filter(|_| own_group));
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(AuthError::AuthExecStart)?;
-    // Finished and reaped: nothing is left to kill, and the group id may be reused.
-    group.0 = None;
+    let mut child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
+    // Closed at once, as `Command::output()` does.
+    drop(child.stdin.take());
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let mut running = Running {
+        group: child.id().filter(|_| own_group),
+        child,
+    };
+    let (status, stdout, stderr) =
+        tokio::try_join!(running.child.wait(), read_all(stdout), read_all(stderr))
+            .map_err(AuthError::AuthExecStart)?;
+    // Finished: nothing is left to kill, and the group id may be reused.
+    running.group = None;
+    let out = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     if !out.status.success() {
         // kube puts the command's `Debug` form here, environment included; only the name is kept.
         return Err(AuthError::AuthExecRun {
@@ -169,14 +179,35 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     parse(&out.stdout)
 }
 
-/// Kills a process group when dropped, unless disarmed (`None`).
-struct KillGroup(Option<u32>);
+/// Whether Flint has a controlling terminal a plugin could prompt on.
+fn has_terminal() -> bool {
+    std::io::stdin().is_terminal() || std::fs::File::open("/dev/tty").is_ok()
+}
 
-impl Drop for KillGroup {
+/// All of a pipe, or nothing for none.
+async fn read_all(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
+}
+
+/// A running plugin. Dropped before it finished (`group` still set), it kills the plugin's
+/// process group, then the plugin itself (`kill_on_drop`), which tokio reaps.
+struct Running {
+    child: tokio::process::Child,
+    group: Option<u32>,
+}
+
+impl Drop for Running {
     fn drop(&mut self) {
-        if let Some(pgid) = self.0.and_then(|id| libc::pid_t::try_from(id).ok()) {
-            // SAFETY: killpg takes plain integers. The leader is not reaped yet (the future
-            // that waits for it is being dropped), so the group id still names its group.
+        if let Some(pgid) = self.group.and_then(|id| libc::pid_t::try_from(id).ok()) {
+            // SAFETY: killpg takes plain integers. This runs before `child` is dropped, so tokio
+            // has not reaped the leader through it. Should `wait` have reaped it already, the
+            // pipe reads were still pending, so a process in the group still holds them open and
+            // the group id still names this group.
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
         }
     }

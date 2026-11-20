@@ -461,14 +461,14 @@ pub fn context_fingerprint(kubeconfig: &Kubeconfig, context: &str) -> Option<u64
     let user = ctx
         .and_then(|c| c.user.as_ref())
         .and_then(|u| kubeconfig.auth_infos.iter().find(|n| &n.name == u));
-    // The kube types are not `Hash`; their serialized form is a stable stand-in. It goes through
-    // `serde_json::Value`, whose objects keep their keys sorted: exec `env` items are `HashMap`s,
-    // serialized in a different order at each load, which would make every load look like a
-    // change (and the MCP server connect again, and run the plugin again, at every call). The
-    // string holds credentials, so it is hashed right away and never stored.
-    let text = serde_json::to_value((named, cluster, user))
-        .ok()?
-        .to_string();
+    // The kube types are not `Hash`; their serialized form is a stable stand-in, with object keys
+    // sorted: exec `env` items are `HashMap`s, serialized in a different order at each load, which
+    // would make every load look like a change (and the MCP server connect again, and run the
+    // plugin again, at every call). The sort is explicit because the app builds serde_json with
+    // `preserve_order`. The string holds credentials, so it is hashed right away and never stored.
+    let mut value = serde_json::to_value((named, cluster, user)).ok()?;
+    value.sort_all_objects();
+    let text = value.to_string();
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     Some(hasher.finish())
