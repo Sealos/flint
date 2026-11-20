@@ -14,6 +14,16 @@ use crate::redact;
 /// are slow, so this is generous.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// TCP keepalive for API server connections, as client-go sets it (Go's dialer `KeepAlive`):
+/// the first probe after this much idle time, then one every interval, [`KEEPALIVE_PROBES`]
+/// times. Without it a connection that died silently (the laptop slept, the network or VPN
+/// changed) is never noticed, and followed logs, watches and shells wait on it forever. A read
+/// timeout would end healthy long-lived streams that are just quiet, so there is none.
+pub const KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Unanswered keepalive probes before the connection is given up: Go's default count.
+pub const KEEPALIVE_PROBES: u32 = 9;
+
 /// A cluster's identity in Flint: its kubeconfig context name.
 pub type ClusterId = String;
 
@@ -330,10 +340,61 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
             message: error_chain(&e),
         })?;
     let target = Target::of(kubeconfig, context);
-    tokio::task::spawn_blocking(move || Client::try_from(config))
+    tokio::task::spawn_blocking(move || build_client(config))
         .await
         .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
         .map_err(|e| ClusterError::kube(e).for_target(&target))
+}
+
+/// The TCP connector under every client: kube's (`enforce_http(false)`, so HTTPS is allowed),
+/// with [`KEEPALIVE`].
+fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.enforce_http(false);
+    connector.set_keepalive(Some(KEEPALIVE));
+    connector.set_keepalive_interval(Some(KEEPALIVE));
+    connector.set_keepalive_retries(Some(KEEPALIVE_PROBES));
+    connector
+}
+
+/// `Client::try_from(config)` with TCP keepalive. kube 5.1 creates its `HttpConnector` inside
+/// `ClientBuilder::try_from` and has no hook to configure it, so this builds the same stack
+/// from kube's public parts (`ConfigExt`), as kube 5.1's `make_generic_builder` does for
+/// Flint's features (rustls, no proxy support, no gzip): TLS, kube's connect, read and write
+/// timeouts, base URI, retries, auth, and extra headers. Left out: kube's debug-level HTTP
+/// tracing spans, and the client's `valid_until` (an exec plugin certificate's expiry, which
+/// kube only records and Flint never reads). A kubeconfig with a proxy goes through kube's own
+/// builder, which reports that proxies are not supported, as before.
+fn build_client(config: kube::Config) -> Result<Client, kube::Error> {
+    use kube::client::ConfigExt;
+    use kube::client::retry::RetryPolicy;
+    use tower::ServiceBuilder;
+    use tower::retry::RetryLayer;
+
+    if config.proxy_url.is_some() {
+        return Client::try_from(config);
+    }
+    let https = config.rustls_https_connector_with_connector(http_connector())?;
+    let mut connector = hyper_timeout::TimeoutConnector::new(https);
+    connector.set_connect_timeout(config.connect_timeout);
+    connector.set_read_timeout(config.read_timeout);
+    connector.set_write_timeout(config.write_timeout);
+    connector.set_reset_reader_on_write(config.reset_reader_on_write);
+    let http: hyper_util::client::legacy::Client<_, kube::client::Body> =
+        hyper_util::client::legacy::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .build(connector);
+    let service = ServiceBuilder::new()
+        .layer(config.base_uri_layer())
+        .option_layer(
+            config
+                .default_retry
+                .then(|| RetryLayer::new(RetryPolicy::server_retry())),
+        )
+        .option_layer(config.auth_layer()?)
+        .layer(config.extra_headers_layer()?)
+        .map_err(tower::BoxError::from)
+        .service(http);
+    Ok(kube::client::ClientBuilder::new(service, config.default_namespace).build())
 }
 
 /// Stops exec auth plugins from prompting: they get no stdin and cannot ask for input. Used when
@@ -785,6 +846,84 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!("timed out after 2s reaching http://{addr}")
+        );
+    }
+
+    /// Reads an integer socket option.
+    fn sockopt(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut value: libc::c_int = 0;
+        let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+        // SAFETY: `value` and `len` are valid for writes of the sizes passed.
+        let rc =
+            unsafe { libc::getsockopt(fd, level, name, (&raw mut value).cast(), &raw mut len) };
+        assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+        value
+    }
+
+    // covers UP-40, UP-41
+    #[tokio::test]
+    async fn api_server_connections_use_tcp_keepalive() {
+        use std::os::fd::AsRawFd;
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accept = tokio::spawn(async move { listener.accept().await });
+        let uri: http::Uri = format!("http://{addr}").parse().unwrap();
+        let stream = http_connector().oneshot(uri).await.unwrap();
+        let fd = stream.inner().as_raw_fd();
+        let secs = libc::c_int::try_from(KEEPALIVE.as_secs()).unwrap();
+        assert_ne!(sockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
+        #[cfg(target_os = "macos")]
+        let idle = libc::TCP_KEEPALIVE;
+        #[cfg(not(target_os = "macos"))]
+        let idle = libc::TCP_KEEPIDLE;
+        assert_eq!(sockopt(fd, libc::IPPROTO_TCP, idle), secs);
+        assert_eq!(sockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), secs);
+        assert_eq!(
+            sockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+            libc::c_int::try_from(KEEPALIVE_PROBES).unwrap()
+        );
+    }
+
+    // covers UP-03
+    #[tokio::test]
+    async fn clients_reach_the_api_server_through_the_keepalive_stack() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A minimal HTTP/1.1 server that answers `/version` once.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "the request ended early");
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"major":"1","minor":"34","gitVersion":"v1.34.0","gitCommit":"","gitTreeState":"","buildDate":"","goVersion":"","compiler":"","platform":"linux/arm64"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        let client = connect(&kubeconfig(&format!("http://{addr}")), "ctx")
+            .await
+            .unwrap();
+        let version = server_version(&client).await.unwrap();
+        assert_eq!(version.git_version, "v1.34.0");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /version"), "{request}");
+        // The auth layer is in the stack.
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer t\r\n"),
+            "{request}"
         );
     }
 }

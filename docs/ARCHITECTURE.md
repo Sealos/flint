@@ -128,6 +128,11 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   plus `/opt/homebrew/bin:/usr/local/bin`. A `path` value in `settings.toml` overrides all of this. Flint sets the
   result as its own process `PATH` before starting the tokio runtime or any threads, because `kube` starts exec
   plugins with Flint's own environment. VS Code does the same.
+- **Dead connections:** API server connections use TCP keepalive as client-go does (first probe after 30 s idle,
+  then every 30 s, 9 probes), so a connection that died silently (the Mac slept, the network or VPN changed) fails
+  and its log stream, watch or shell reconnects or ends instead of waiting forever. There is no read timeout: it would
+  end healthy streams that are only quiet. kube has no hook for this, so `cluster::build_client` builds kube's client
+  stack itself with a keepalive connector.
 - One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view.
 - The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
   with their watches running in the background, so switching to them is instant. The least recently used is made
