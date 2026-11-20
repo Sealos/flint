@@ -955,7 +955,7 @@ impl DetailView {
                                 h_flex()
                                     .gap_2()
                                     .text_sm()
-                                    .child(div().size_1p5().flex_none().rounded_full().bg(color))
+                                    .child(super::theme::status_dot(color, true).flex_none())
                                     .child(div().font_semibold().child(c.type_.clone()))
                                     .child(div().text_color(color).child(c.status.clone()))
                                     .when(!c.reason.is_empty(), |el| {

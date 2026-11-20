@@ -199,7 +199,8 @@ pub(super) mod tests {
     use std::rc::Rc;
 
     // Each status dot draws exactly as the hand-built circle it replaced: the nav's dot and
-    // ring, the list's and the log and shell tabs' state dots, and the cluster row's dot.
+    // ring, the list's, the log and shell tabs' and the dock tab's state dots, the detail
+    // pane's condition rows, and the cluster row's dot.
     #[test]
     fn status_dots_draw_as_the_circles_they_replaced() {
         let color = hsla(0.4, 0.6, 0.5, 1.);
@@ -230,7 +231,7 @@ pub(super) mod tests {
             status_dot(color, true).style(),
             div().size_1p5().rounded_full().bg(color).style()
         );
-        // The log and shell tabs' state.
+        // The log and shell tabs' state, the dock tab's dot and the detail pane's conditions.
         assert_eq!(
             status_dot(color, true).flex_none().style(),
             div()

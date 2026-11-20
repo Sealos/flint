@@ -764,7 +764,7 @@ impl Dock {
                 }
             })
             .on_click(registry::on_click(ActivateTab { tab: id }))
-            .child(div().size_1p5().flex_none().rounded_full().bg(dot))
+            .child(super::theme::status_dot(dot, true).flex_none())
             // The cluster first: a shell on production must not pass for one on a dev cluster.
             // The tab's own tooltip names the context and server.
             .child(cluster_chip(
