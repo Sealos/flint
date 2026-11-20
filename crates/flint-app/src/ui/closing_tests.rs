@@ -177,6 +177,69 @@ async fn closing_the_window_with_a_live_shell_asks_first(cx: &mut TestAppContext
     }
 }
 
+// covers UP-42 (#177): Window > Close Dock Tab never closes the window. With no tab shown it is
+// unavailable (the menu disables it), and dispatching it as the menu does changes nothing;
+// Cmd-W still falls through to Close Window.
+#[gpui_kit::test]
+async fn the_close_dock_tab_menu_item_never_closes_the_window(cx: &mut TestAppContext) {
+    use super::registry::CloseActiveTab;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let available =
+        |cx: &mut TestAppContext| cx.update(|cx| cx.is_action_available(&CloseActiveTab));
+    let from_menu = |cx: &mut TestAppContext| {
+        cx.update(|cx| cx.dispatch_action(&CloseActiveTab));
+        cx.run_until_parked();
+    };
+
+    // No tab at all.
+    focus_list(cx, &t);
+    assert!(!available(cx), "disabled with no tab");
+    from_menu(cx);
+    assert!(window_is_open(cx, &t));
+
+    // A tab, shown: the item closes it.
+    let (_, mut web) = open_fake_shell_in(cx, &t, "web");
+    let (_, mut api) = open_fake_shell_in(cx, &t, "api");
+    focus_list(cx, &t);
+    assert!(available(cx), "enabled while a tab is shown");
+    from_menu(cx);
+    assert_eq!(tab_count(cx, &t), 1);
+    assert!(api.is_closed());
+
+    // The dock hidden, its tab still running: disabled, and the item does nothing.
+    t.dispatch(cx, "dock::ToggleDock", Value::Null).unwrap();
+    focus_list(cx, &t);
+    assert!(!available(cx), "disabled with the dock hidden");
+    from_menu(cx);
+    assert!(window_is_open(cx, &t));
+    assert!(!t.has_dialog(cx), "nothing is asked");
+    assert_eq!(tab_count(cx, &t), 1);
+    assert!(!web.is_closed());
+}
+
+// covers UP-42 (#177): asking again while the question is open opens no second dialog: one
+// Cancel answers Cmd-Q pressed twice, and the close button pressed after it.
+#[gpui_kit::test]
+async fn asking_twice_opens_one_dialog(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let (_, _web) = open_fake_shell_in(cx, &t, "web");
+    focus_list(cx, &t);
+
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    t.press_key_of(cx, "flint::Quit");
+    assert!(!VisualTestContext::from_window(t.window, cx).simulate_close());
+    cx.run_until_parked();
+    assert_eq!(shown_dialog(cx, &t).await.title, "Quit Flint?");
+    cancel(cx, &t).await;
+    assert!(!t.has_dialog(cx), "one Cancel closes the only dialog");
+    assert_eq!(quits(cx), 0);
+    assert!(window_is_open(cx, &t));
+}
+
 // covers UP-42 (#177): with no session at work, the close button closes at once.
 #[gpui_kit::test]
 async fn the_close_button_closes_an_idle_window_at_once(cx: &mut TestAppContext) {

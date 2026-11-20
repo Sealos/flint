@@ -216,11 +216,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// The sessions closing this window would end: the dock's shells and following log tabs.
-    pub fn live_sessions(&self, cx: &App) -> LiveSessions {
-        self.dock.read(cx).live_sessions(cx)
-    }
-
     pub fn new(
         model: Entity<ClustersModel>,
         ui_state: UiState,
@@ -336,6 +331,11 @@ impl Workspace {
         };
         this.show_appearance(window, cx);
         this
+    }
+
+    /// The sessions closing this window would end: the dock's shells and following log tabs.
+    pub fn live_sessions(&self, cx: &App) -> LiveSessions {
+        self.dock.read(cx).live_sessions(cx)
     }
 
     /// Shows the theme the `appearance` setting, macOS and `FLINT_APPEARANCE` call for, and

@@ -9,6 +9,7 @@
 // module-tests: closing_tests.rs
 
 use gpui_kit::base::Root;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
@@ -81,8 +82,12 @@ fn quit(cx: &mut App) {
     }
 }
 
-/// Opens the confirmation over `window`; confirming closes the window, or quits.
+/// Opens the confirmation over `window`; confirming closes the window, or quits. Not while a
+/// dialog is open there: pressing Cmd-Q or the close button again opens no second one.
 fn ask(window: &mut Window, cx: &mut App, ending: Ending, live: LiveSessions) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
     confirm::open(
         window,
         cx,

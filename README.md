@@ -110,8 +110,9 @@ TMPDIR=$(mktemp -d) APPIMAGE_EXTRACT_AND_RUN=1 flint
 ```
 
 The AppImage is unsigned; the `.sha256` file is the check.
-On Linux there is no menu bar: Quit is Ctrl-Q, Close Window is Ctrl+Shift+W (Ctrl-W closes the active dock tab, or the
-window when the dock shows none), and every Cmd shortcut is Ctrl. Settings and
+On Linux there is no menu bar: Quit is Ctrl-Q, Close Window is Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the
+window when the dock shows none; inside a shell tab Ctrl-W goes to the shell and Ctrl-Shift-W closes the tab, as in
+Linux terminals), and every Cmd shortcut is Ctrl. Settings and
 state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
 
 ## Build and run
