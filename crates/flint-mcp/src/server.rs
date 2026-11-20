@@ -693,6 +693,25 @@ impl FlintMcp {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
         check_namespace(p.namespace.as_deref())?;
+        // The object's name and Kind go into a field selector: names only, so neither can add
+        // a selector of its own (`a,involvedObject.namespace=…`).
+        if let Some(kind) = p
+            .object_kind
+            .as_deref()
+            .filter(|k| !k.chars().all(|c| c.is_ascii_alphanumeric()) || k.is_empty())
+        {
+            return Err(not_found("kinds", kind));
+        }
+        if let Some(name) = p
+            .object_name
+            .as_deref()
+            .filter(|n| !policy::is_object_name(n))
+        {
+            return Err(not_found(
+                p.object_kind.as_deref().unwrap_or("objects"),
+                name,
+            ));
+        }
         let limit = policy::EVENTS.clamp(p.limit) as usize;
         let scoped = !conn.scope.is_everything();
         // Events about a kind outside the scope: refused before anything is fetched.

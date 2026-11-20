@@ -727,6 +727,22 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
         json!({"namespaces": ["demo"], "kinds": []}),
         "{clusters}"
     );
+    // Names go first, scoped or not: an object name or Kind that could add a field selector of
+    // its own is not found, and nothing is sent.
+    let before = two.a.requests().len();
+    for args in [
+        json!({"cluster": EXPOSED, "object_name": "a,involvedObject.namespace=kube-system"}),
+        json!({"cluster": EXPOSED, "object_kind": "Pod,involvedObject.namespace=kube-system"}),
+        json!({"cluster": EXPOSED, "namespace": "demo/../kube-system"}),
+    ] {
+        let got = mcp.call("get_events", args.clone())?;
+        assert!(
+            got.is_error && got.text.starts_with("NotFound:"),
+            "{args}: {}",
+            got.text
+        );
+    }
+    assert_eq!(two.a.requests().len(), before, "nothing was sent");
     // The context's default namespace is out of scope: not named.
     assert_eq!(
         clusters["clusters"][0]["default_namespace"],
