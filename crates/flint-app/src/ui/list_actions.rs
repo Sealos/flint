@@ -45,27 +45,29 @@ impl ResourceList {
         }
     }
 
-    /// [`SortBy`] takes a column drawn now, by key ([`flint_core::Column::key`]) or header.
+    /// [`SortBy`] takes a column drawn now: by its `key` ([`flint_core::Column::key`]) when
+    /// given, else by its header.
     pub(in crate::ui) fn check_sort(&self, action: &SortBy) -> Result<(), ActionError> {
-        if self.drawn_column_key(&action.column).is_some() {
+        if self.sort_key(action).is_some() {
             Ok(())
         } else {
             Err(ActionError::rejected::<SortBy>(format!(
                 "no column {} is drawn",
-                action.column
+                action.key.as_deref().unwrap_or(&action.column)
             )))
         }
     }
 
-    /// The key of the drawn column whose key is `column`, or else of the first one headed
-    /// `column`.
-    pub(in crate::ui) fn drawn_column_key(&self, column: &str) -> Option<String> {
+    /// The key of the drawn column `action` names: the one with its `key` when given, else the
+    /// first one headed `column`.
+    pub(in crate::ui) fn sort_key(&self, action: &SortBy) -> Option<String> {
         let columns = &self.shown.columns;
-        let drawn = || self.drawn.iter().map(|&(col, _)| &columns[col]);
-        drawn()
-            .find(|c| c.key() == column)
-            .or_else(|| drawn().find(|c| *c.name == *column))
-            .map(|c| c.key())
+        let mut drawn = self.drawn.iter().map(|&(col, _)| &columns[col]);
+        let found = match &action.key {
+            Some(key) => drawn.find(|c| c.key() == *key),
+            None => drawn.find(|c| *c.name == *action.column),
+        };
+        found.map(|c| c.key())
     }
 
     /// The names of the columns drawn, left to right: what [`SortBy`] takes.
@@ -96,7 +98,7 @@ impl ResourceList {
 
     fn sort_by(&mut self, action: &SortBy, _: &mut Window, cx: &mut Context<Self>) {
         match self.check_sort(action) {
-            Ok(()) => self.toggle_sort(&action.column, cx),
+            Ok(()) => self.toggle_sort(action, cx),
             Err(e) => tracing::warn!("{e}"),
         }
     }

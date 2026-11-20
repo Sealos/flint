@@ -494,10 +494,10 @@ impl ResourceList {
         self.clear_selection(cx);
     }
 
-    /// Sorts by the drawn column with key `column` (or, failing that, with that header), as a
-    /// header click does, and reports the new sort to remember.
-    fn toggle_sort(&mut self, column: &str, cx: &mut Context<Self>) {
-        let Some(key) = self.drawn_column_key(column) else {
+    /// Sorts by the drawn column `action` names, as a header click does, and reports the new
+    /// sort to remember.
+    fn toggle_sort(&mut self, action: &SortBy, cx: &mut Context<Self>) {
+        let Some(key) = self.sort_key(action) else {
             return;
         };
         self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
@@ -718,7 +718,8 @@ impl ResourceList {
             };
             // By key: a header shared by two columns sorts the one clicked.
             let click = SortBy {
-                column: column.key(),
+                column: name.clone(),
+                key: Some(column.key()),
             };
             header = header.child(
                 h_flex()

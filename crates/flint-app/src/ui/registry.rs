@@ -329,9 +329,13 @@ pub struct SelectRow {
 #[action(namespace = resource_list, no_json)]
 #[serde(deny_unknown_fields)]
 pub struct SortBy {
-    /// A drawn column's header (`Restarts`), or its key (`server:Restarts`, `flint:age`) when
-    /// two columns share a header: by header, the first drawn column with it is sorted.
+    /// A drawn column's header (`Restarts`): the first drawn column with it is sorted.
     pub column: String,
+    /// The column's key instead (`server:Restarts`, `flint:age`), as a header click sends it,
+    /// so a header shared by two columns sorts the one clicked. Never matched against headers,
+    /// nor `column` against keys.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// Reveal or hide one value of a Secret, by key.
@@ -1511,11 +1515,16 @@ const ROW: &[Arg] = &[
     },
     arg("name", "object name", ArgKind::Text),
 ];
-const COLUMN: &[Arg] = &[arg(
-    "column",
-    "column name, as drawn: Restarts",
-    ArgKind::Column,
-)];
+const COLUMN: &[Arg] = &[
+    arg("column", "column name, as drawn: Restarts", ArgKind::Column),
+    Arg {
+        name: "key",
+        description: "the column's key instead of its name (server:Restarts, flint:age), as a \
+                      header click sends it",
+        required: false,
+        kind: ArgKind::Text,
+    },
+];
 const KEY: &[Arg] = &[arg("key", "the data key", ArgKind::Text)];
 const PALETTE_ROW: &[Arg] = &[arg("row", "row, from the top, 0 and up", ArgKind::Number)];
 const CONTAINER: &[Arg] = &[

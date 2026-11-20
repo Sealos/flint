@@ -345,3 +345,65 @@ async fn a_saved_sort_waits_while_a_narrow_pane_leaves_its_column_out(cx: &mut T
     cx.run_until_parked();
     expect_rows(cx, &t, applied).await;
 }
+
+// covers UP-21: a header that looks like a key is still a header.
+#[gpui_kit::test]
+async fn sorting_by_header_never_matches_a_key(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, super::support_tests::standard_sections())
+        .await;
+    // A CRD printer column headed "flint:name": web z, db y, api x.
+    let snapshot = pods_with("flint:name", 0, |name| match name {
+        "web" => "z",
+        "db" => "y",
+        _ => "x",
+    });
+    t.open_kind(cx, "pods", snapshot).await;
+    // As the palette sends it: by header.
+    t.dispatch(cx, "resource_list::SortBy", json!({"column": "flint:name"}))
+        .unwrap();
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("flint:name", false),
+            vec!["api".into(), "db".into(), "web".into()],
+        ),
+    )
+    .await;
+    wait_for_saved(cx, &t, "server:flint:name").await;
+    // By key, as a header click sends it: the built-in Name column.
+    t.dispatch(
+        cx,
+        "resource_list::SortBy",
+        json!({"column": "Name", "key": "flint:name"}),
+    )
+    .unwrap();
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("Name", false),
+            vec!["api".into(), "db".into(), "web".into()],
+        ),
+    )
+    .await;
+    // A key never matches a header, nor a header a key.
+    assert!(
+        t.dispatch(
+            cx,
+            "resource_list::SortBy",
+            json!({"column": "server:Restarts"})
+        )
+        .is_err()
+    );
+    assert!(
+        t.dispatch(
+            cx,
+            "resource_list::SortBy",
+            json!({"column": "Restarts", "key": "Restarts"})
+        )
+        .is_err()
+    );
+}
