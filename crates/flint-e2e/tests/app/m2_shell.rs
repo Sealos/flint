@@ -5,7 +5,7 @@
 //! The log paths are in `m2.rs`. Not here, and why:
 //!
 //! - **Resizing the window** (UP-41): the automation channel cannot resize the window. The dock's
-//!   height (`workspace::SetDockHeight`) and the sidebar's width (`workspace::SetPaneWidth`)
+//!   height (`workspace::SetDockHeight`) and the side panes' widths (`workspace::SetPaneWidth`)
 //!   resize the terminal through the same layout, and are tested.
 //! - **Colours, wide characters, full-screen programs, the wheel and Cmd-C** (UP-41): the terminal
 //!   model's and the view's tests (`flint-core`'s `terminal.rs`, `ui/terminal_tests.rs`). The
@@ -341,19 +341,57 @@ fn up_41_shell_into_a_container() -> Result<()> {
     wait_for_row(&app, i, &format!("{} {}", taller.height, taller.width))?;
     assert_eq!(exec.resizes(), [first, taller]);
 
-    // A wider pane is more columns (the sidebar narrower). The window can't be resized over the
-    // automation channel; this is the same layout path.
+    // Narrower side panes are more columns. The window can't be resized over the automation
+    // channel; this is the same layout path. The dock spans the list and the detail pane. When
+    // the window is too narrow for every pane, the detail pane gives way first, then the
+    // navigation, then the sidebar; so in a 1024-point window a narrower sidebar alone only
+    // gives its room back to the squeezed navigation, and the dock keeps its width. Both side
+    // panes at their narrowest widen the dock in any window over 950 points (sidebar 140,
+    // navigation 150, detail 300, list 360).
+    for (pane, width) in [("navigation", 150.0), ("clusters", 140.0)] {
+        app.dispatch(
+            "workspace::SetPaneWidth",
+            json!({"pane": pane, "width": width}),
+        )?;
+    }
+    // Then a taller dock, last: the grid it lays out has the new columns too, so once the
+    // state shows the new rows it shows the final columns (the tab tells the pod a size once
+    // it holds still, so the two widths may or may not reach it as separate resizes).
     app.dispatch(
-        "workspace::SetPaneWidth",
-        json!({"pane": "clusters", "width": 120.0}),
+        "workspace::SetDockHeight",
+        json!({"height": height + 180.0}),
     )?;
-    let state = app.wait_for(&at(i, "shell/cols"), Test::at_least(taller.width + 1))?;
-    let wider = size(&state, i);
-    assert_eq!(wider.height, taller.height, "only the columns change");
-    wait_for_resize(&exec, wider)?;
+    let state = app.wait_for(&at(i, "shell/rows"), Test::at_least(taller.height + 1))?;
+    let resized = size(&state, i);
+    if resized.width <= taller.width {
+        let shot = app.request("screenshot", json!({"name": "up41-shell-narrow-window"}))?;
+        let pixels = shot["width"].as_f64().unwrap_or(0.0);
+        // A point is at least a pixel: a window this many pixels wide is at most as many
+        // points.
+        if pixels > 950.0 {
+            bail!(
+                "narrower side panes left the shell at {} columns (was {}) in a window \
+                 {pixels} pixels wide",
+                resized.width,
+                taller.width
+            );
+        }
+        eprintln!(
+            "the window is {pixels} pixels wide, too narrow for the side panes to widen the \
+             dock: only the rows are checked"
+        );
+    }
+    wait_for_resize(&exec, resized)?;
     run(&app, "stty size")?;
-    wait_for_row(&app, i, &format!("{} {}", wider.height, wider.width))?;
-    assert_eq!(exec.resizes(), [first, taller, wider]);
+    wait_for_row(&app, i, &format!("{} {}", resized.height, resized.width))?;
+    let resizes = exec.resizes();
+    assert_eq!(resizes[..2], [first, taller]);
+    assert_eq!(resizes.last(), Some(&resized));
+    assert_eq!(
+        resizes.iter().filter(|r| **r == resized).count(),
+        1,
+        "the final size once: {resizes:?}"
+    );
 
     // bash turned bracketed paste on: two lines copied from the screen go in bracketed, with no
     // question, and run only on Return.
