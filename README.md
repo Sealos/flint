@@ -6,10 +6,12 @@ with [GPUI](https://www.gpui.rs/) so it starts fast, stays light on memory, and 
 It also ships a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, so AI agents can inspect the
 clusters you choose to expose.
 
-Status: early development (milestone M1.5). The app lists your kubeconfig contexts, connects to the one you select,
+Status: early development (milestone M2). The app lists your kubeconfig contexts, connects to the one you select,
 and browses every kind it serves, CRDs included: live lists with the `kubectl get` columns, a namespace and text
-filter, and a detail view with metadata, conditions, events and read-only YAML. It has a light and a dark theme
-that follow the system (View > Appearance, or the `appearance` setting, overrides it). Logs and exec arrive in M2.
+filter, and a detail view with metadata, conditions, events and read-only YAML. A bottom dock holds pod and workload
+logs (follow, search, timestamps, previous logs, save to a file) and shells into containers; open them from a row's
+context menu, the detail pane or the keyboard. It has a light and a dark theme that follow the system (View >
+Appearance, or the `appearance` setting, overrides it). Shells open on any cluster without asking, production included; protected clusters arrive in M3.
 
 ## Install from a release
 
@@ -210,7 +212,9 @@ objects, events, and pod logs, and nothing else. It only sees clusters you mark 
 next to a cluster in the sidebar, which asks you to confirm the context and its server; exposed clusters show an "AI"
 badge). Nothing is exposed by default. An exposure is tied to the context's API server URL, so a context that is
 re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
-Secret values are always redacted, and large outputs are cut short.
+Large outputs are cut short. Only Secret values are redacted: everything else an agent reads, including ConfigMaps,
+`env` values in pod specs, and (until M5.5) pod logs and event messages, is sent as the cluster returns it. Only
+expose clusters whose contents, logs and events you are willing to send to your AI provider.
 
 Register it with Claude Code, using the installed binary (or `"$PWD/target/release/flint"` after
 `cargo build --release`):

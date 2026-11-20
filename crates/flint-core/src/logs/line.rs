@@ -246,7 +246,7 @@ mod tests {
         );
     }
 
-    // covers UP-40
+    // covers UP-43
     #[test]
     fn severity_follows_the_whole_word_rules() {
         use Severity::*;

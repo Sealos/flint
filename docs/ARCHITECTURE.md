@@ -149,9 +149,10 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   is connected and watched like the active cluster. Rows keep their cluster: details and actions act on the row's
   own cluster. Each cluster may have an optional colour tag, shown in the sidebar, the Cluster column and the detail
   header.
-- **Protection:** every cluster is protected (read-only in Flint) by default, except clusters on the user's machine
-  and clusters marked trusted. A session unlock (one confirmation naming the cluster and server) lasts until Flint
-  quits ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)).
+- **Protection (planned, M3, #81):** every cluster will be protected (read-only in Flint) by default, except clusters on the user's machine
+  and clusters marked trusted. A session unlock (one confirmation naming the cluster and server) will last until Flint
+  quits ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)). Not built yet: today shells open on any
+  cluster without a confirmation.
 - Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
   another cluster, warm or cold. They end only when the user closes them or quits Flint.
 
@@ -489,16 +490,20 @@ Rules:
   user toggles exposure from the cluster sidebar. The list is read again on every call, and calls naming any other
   cluster fail as if it did not exist.
 - **Read-only:** there are no tools that create, change, or delete anything, and no exec or port-forward.
-- **Scope:** an exposed cluster may also list the namespaces and kinds an agent may read
-  ([ADR-0013](./adr/0013-agent-trust-model.md)). Empty means everything. Requests outside the scope fail like an
-  unexposed cluster. With a namespace scope, cluster-scoped kinds are hidden unless the kinds scope names them.
+- **Scope (planned, M5.5, #67):** an exposed cluster will also be able to list the namespaces and kinds an agent may
+  read ([ADR-0013](./adr/0013-agent-trust-model.md)). Empty will mean everything. Requests outside the scope will fail
+  like an unexposed cluster. With a namespace scope, cluster-scoped kinds will be hidden unless the kinds scope names
+  them. Not built yet: today an exposed cluster is readable in full.
 - **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept.
-  `metadata.managedFields` is removed from all output. Pod logs and event messages go through a shared redactor that
-  replaces values that look like credentials (auth headers, JWTs, private keys, cloud access keys, `password=`-style
-  pairs), and the result says how many were replaced.
-- **Activity log:** every call is recorded (time, cluster, tool, what it named, result size, cut short or denied),
-  never the returned content. The app shows it per cluster.
-- **Bounded output:** lists and logs have default and maximum sizes (for example 200 objects and 500 log lines). When
+  `metadata.managedFields` is removed from all output. Nothing else is redacted: ConfigMap data, literal `env` values
+  in pod specs, annotations and custom resources reach the agent as the cluster returns them. **Pod logs and event
+  messages are not redacted yet either:** they are cut only by the size limits below. A shared redactor that replaces
+  values that look like credentials (auth headers, JWTs, private keys, cloud access keys, `password=`-style pairs)
+  and says how many were replaced is planned for M5.5 (#68).
+- **Activity log (planned, M5.5, #69):** every call will be recorded (time, cluster, tool, what it named, result
+  size, cut short or denied), never the returned content, and the app will show it per cluster. Not built yet.
+- **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
+  and 500 log lines), and lists, objects and logs are also capped at 256 KiB. When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
 - **stdout is the protocol channel:** all logging goes to stderr.
 
