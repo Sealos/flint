@@ -172,8 +172,12 @@ jobs:
       - name: Clippy (automation channel)
         run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
       # One test run: the automation build compiles every test, the channel's too. The plain
-      # build is still checked by clippy above.
+      # build is still checked by clippy above. With GPUI's leak detector, as on Linux: the
+      # channel's task lives as long as the app and must not keep the workspace alive. (The
+      # channel is macOS-only, so the Linux job cannot run this.)
       - name: Tests (with the automation channel)
+        env:
+          GPUI_LEAK_DETECTION: "1"
         run: cargo test -p flint-app --features automation --locked
       # The step above built target/debug/flint with the automation channel (the `flint mcp`
       # integration test needs the binary). Reuse it rather than building again, but check it.

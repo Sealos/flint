@@ -98,7 +98,7 @@ pub fn start(places: Places, window: AnyWindowHandle, workspace: Entity<Workspac
 
     let target = Target {
         window,
-        workspace,
+        workspace: workspace.downgrade(),
         screenshots: places.screenshots.clone(),
     };
     cx.spawn(async move |cx| {
