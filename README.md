@@ -27,9 +27,10 @@ See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP client
 - **Read-only.** The tools list clusters, resource kinds, objects, events, and pod logs, and nothing else: no tool
   creates, changes, or deletes anything, and there is no exec or port-forward.
 - **Credentials redacted.** Secret values are always redacted. In pod logs, event messages, other message fields
-  (status, conditions, container termination messages, and list columns) and container `args` and `command`, values
-  that look like credentials are replaced with a marker such as `[REDACTED:password]`, and each result says how many
-  were replaced: `Authorization` and bearer tokens, passwords in URLs, AWS, GCP, GitHub, GitLab, Slack, Stripe, OpenAI
+  (status, conditions, container termination messages, and list columns), annotations and container `args` and
+  `command`, values that look like credentials are replaced with a marker such as `[REDACTED:password]`, and each
+  result says how many were replaced: `Authorization` and bearer tokens, `Cookie` and `Set-Cookie` headers, passwords
+  in URLs and MySQL DSNs, registry `auth` values in docker config JSON, AWS, GCP, GitHub, GitLab, Slack, Stripe, OpenAI
   and Anthropic keys and tokens, Slack webhooks, Azure SAS signatures, JWTs, private key blocks, and the values of
   `password=`, `secret:`, `token=` and `api_key=` style pairs and flags. Flint's own log viewer and events are
   unchanged: they show text as written.

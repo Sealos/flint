@@ -124,9 +124,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (policy), mcp + cluster, ui.
 
 ### UP-15 Credentials in logs don't reach the agent
-- **When** an agent reads pod logs or events that contain a token, a password pair, a private key or a cloud access
-  key, through `get_pod_logs`, `get_events`, `list_resources` or `get_resource` (messages, and container `args`
-  and `command`).
+- **When** an agent reads pod logs or events that contain a token, a password pair (also a passphrase of several words
+  after `password: `), a cookie, a private key, a registry `auth` value, a database DSN or a cloud access key,
+  through `get_pod_logs`, `get_events`, `list_resources` or `get_resource` (messages and message lists,
+  annotations, and container `args` and `command`).
 - **Then** each value is replaced with a marker such as `[REDACTED:password]`, and the result says how many were
   replaced. The rest of the line is unchanged: keys, URL users and hosts, header schemes. The server's instructions
   tell the agent about the markers and the count.

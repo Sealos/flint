@@ -48,10 +48,12 @@ impl Redacted<'_> {
 const MARKER_PREFIX: &str = "[REDACTED:";
 
 /// Replaces every value in `text` that looks like a credential with `[REDACTED:<kind>]`:
-/// `Authorization` header values, bearer tokens, passwords in URLs, AWS, GCP, GitHub, GitLab
-/// and Slack keys and tokens, Slack webhook paths, Azure SAS signatures, JWTs, private key
-/// blocks, and the values of `password`, `secret`, `token` and `api_key` style keys (`=`, `:`,
-/// JSON and YAML). Keys, user names, hosts and the rest of each line are kept.
+/// `Authorization` header values, bearer tokens, `Cookie` and `Set-Cookie` header values,
+/// passwords in URLs and in MySQL DSNs (`user:pass@tcp(host)/db`), registry `auth` values in
+/// docker config JSON, AWS, GCP, GitHub, GitLab and Slack keys and tokens, Slack webhook paths,
+/// Azure SAS signatures, JWTs, private key blocks, and the values of `password`, `secret`,
+/// `token` and `api_key` style keys (`=`, `:`, JSON and YAML; an unquoted value after `: ` runs
+/// to the end of the line). Keys, user names, hosts and the rest of each line are kept.
 pub fn redact_credentials(text: &str) -> Redacted<'_> {
     let mut out = Builder::new(text);
     let mut from = 0;
@@ -241,9 +243,11 @@ fn cut_off_body_start(text: &str, floor: usize, end: usize) -> Option<usize> {
 /// match, or `None` to leave that match alone. The value group is `v` (replaced as matched),
 /// `vt` (a bare value: closing punctuation after it is kept), `vq` (empty, right after an
 /// opening double quote: the value runs to its closing quote, with `q` holding the backslashes
-/// before the opening quote) or `vd` (empty: the value runs to the closing quote when `q`
-/// matched, else to the end of the line). The regex never scans an open-ended value itself;
-/// [`quoted_len`] finds its end in one forward pass, so each line costs linear time.
+/// before the opening quote), `vd` (empty: the value runs to the closing quote when `q`
+/// matched, else to the end of the line) or `vl` (the value's first character: the value runs
+/// to the end of the line, or to a double quote or escaped `\n` before it, see
+/// [`line_value_len`]). The regex never scans an open-ended value itself; [`quoted_len`] and
+/// [`line_value_len`] find its end in one forward pass, so each line costs linear time.
 struct Rule {
     regex: Regex,
     kind: fn(&Captures, &str) -> Option<&'static str>,
@@ -268,11 +272,22 @@ const VENDOR: u32 = 1 << 13;
 const JWT: u32 = 1 << 14;
 const FLAG: u32 = 1 << 15;
 const PAIR: u32 = 1 << 16;
+const COOKIE: u32 = 1 << 17;
+const REGISTRY_AUTH: u32 = 1 << 18;
+const MYSQL_DSN: u32 = 1 << 19;
 
 /// Trigger words (matched ignoring ASCII case) and the rules each one can start.
 const TRIGGERS: &[(&str, u32)] = &[
     ("authorization", AUTH),
     ("bearer", BEARER),
+    ("cookie", COOKIE),
+    ("\"auth", REGISTRY_AUTH),
+    ("'auth", REGISTRY_AUTH),
+    ("auth:", REGISTRY_AUTH),
+    ("auth=", REGISTRY_AUTH),
+    ("@tcp", MYSQL_DSN),
+    ("@udp(", MYSQL_DSN),
+    ("@unix(", MYSQL_DSN),
     ("://", URL_PASSWORD | URL_PASSWORD_LOOSE),
     ("hooks.slack.com", SLACK_WEBHOOK),
     ("sig=", AZURE_SAS),
@@ -325,6 +340,9 @@ fn rule(pattern: &str, kind: fn(&Captures, &str) -> Option<&'static str>) -> Rul
 /// optional `[` (Go's header maps). Each rule adds the opening quote it accepts.
 const SEP: &str = r#"\\*["']?[ \t]*(?:=>|:=|[:=]|%3[DdAa])[ \t]*\[?"#;
 
+/// [`SEP`] without the optional `[`, for a rule that handles a list itself.
+const SEP_NO_LIST: &str = r#"\\*["']?[ \t]*(?:=>|:=|[:=]|%3[DdAa])[ \t]*"#;
+
 /// A value after a key: double-quoted (at any JSON escape level, to its closing quote),
 /// single-quoted, or bare.
 const VALUE: &str =
@@ -350,7 +368,7 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
             // their last parameter, so a `Signature` never shows.
             rule(
                 &format!(
-                    r#"(?i)\b(?:proxy-)?authorization{SEP}(?:(?P<q>\\*)"|\\*'?)(?:(?P<dg>digest)[ \t]+(?P<vd>)|(?P<sp>aws4-hmac-sha256)[ \t]+(?P<v>{AUTH_PARAM}(?:[ \t]*,[ \t]*{AUTH_PARAM})*)|(?:(?P<s>basic|bearer|token|negotiate|ntlm|apikey)[ \t]+)?(?P<vt>[^\s"'\\\],;]+))"#
+                    r#"(?i)(?:\b|\\n)(?:proxy-)?authorization{SEP}(?:(?P<q>\\*)"|\\*'?)(?:(?P<dg>digest)[ \t]+(?P<vd>)|(?P<sp>aws4-hmac-sha256)[ \t]+(?P<v>{AUTH_PARAM}(?:[ \t]*,[ \t]*{AUTH_PARAM})*)|(?:(?P<s>basic|bearer|token|negotiate|ntlm|apikey)[ \t]+)?(?P<vt>[^\s"'\\\],;]+))"#
                 ),
                 |c, v| {
                     (c.name("dg").is_some()
@@ -362,11 +380,26 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
             ),
         ),
         (
+            COOKIE,
+            // Every cookie in the header is hidden, with its name: the value runs to the closing
+            // quote when the header is quoted, to the closing bracket of a list (a JSON array, a
+            // Go header map, `[]string{...}`), else to the end of the line. Also right after an
+            // escaped `\n`, as in a request dumped into a JSON string.
+            rule(
+                &format!(
+                    r#"(?i)(?:\b|\\n)(?:set-)?cookie{SEP_NO_LIST}(?:(?P<b>\[\]string\{{|\[)(?P<vb>)|(?P<q>\\*)"(?P<vq>)|\\*'?(?P<vl>[^\s"'\\]))"#
+                ),
+                |_, _| Some("cookie"),
+            ),
+        ),
+        (
             BEARER,
             rule(r"(?i)\bbearer[ \t]+(?P<v>[A-Za-z0-9\-._~+/]+=*)", |_, v| {
-                // "bearer authentication", "Bearer token": words, not tokens.
+                // "bearer authentication", "Bearer token": words, not tokens. A short token is
+                // taken as one when it holds a digit.
                 let word = v.bytes().all(|b| b.is_ascii_alphabetic()) && v.len() < 20;
-                (v.len() >= 8 && !word).then_some("bearer")
+                let digit = v.bytes().any(|b| b.is_ascii_digit());
+                ((v.len() >= 8 || digit) && !word).then_some("bearer")
             }),
         ),
         (
@@ -391,6 +424,16 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
                         digits > 0 && matches!(v.as_bytes().get(digits), Some(b'/' | b'?' | b'#'));
                     (split && !port).then_some("password")
                 },
+            ),
+        ),
+        (
+            MYSQL_DSN,
+            // Go's MySQL DSN, which has no `://`: `user:pass@tcp(host:3306)/db`. The password
+            // runs from the first `:` to the `@` before the protocol, so one holding `:` or `@`
+            // is hidden whole. Brackets are left out so a marker is never matched again.
+            rule(
+                r#"(?:^|[^A-Za-z0-9_.\-])[A-Za-z0-9_.\-]*:(?P<v>[^\s"'\[\]]+)@(?:tcp6?|udp|unix)\("#,
+                |_, _| Some("password"),
             ),
         ),
         (
@@ -487,6 +530,15 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
             ),
         ),
         (
+            REGISTRY_AUTH,
+            // A docker config's `"auth": "<base64 user:pass>"`, as JSON at any escape level, and
+            // the same key in YAML or a Python dict; only a value that decodes to `user:pass`.
+            rule(
+                &format!(r#"(?i)(?:^|[^A-Za-z0-9_.\-])auth{SEP}{VALUE}"#),
+                |_, v| is_basic_auth(v).then_some("registry-auth"),
+            ),
+        ),
+        (
             FLAG,
             // `--password hunter2`: a command-line flag with its value after a space.
             rule(
@@ -499,7 +551,12 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
         (
             PAIR,
             rule(
-                &format!(r#"(?i)(?:^|[^A-Za-z0-9_.\-])(?P<k>{KEYS}){SEP}{VALUE}"#),
+                // `key: value` with a space after the colon and no quote (YAML, headers,
+                // prose) takes the rest of the line, so a value of several words is hidden
+                // whole; `key=value`, `key:value` and quoted keys take one word.
+                &format!(
+                    r#"(?i)(?:^|[^A-Za-z0-9_.\-])(?P<k>{KEYS})(?:[ \t]*:[ \t]+(?P<vl>[^\s"'\\=:>\[])|{SEP}{VALUE})"#
+                ),
                 |c, v| {
                     let key = c.name("k").map_or("", |k| k.as_str()).to_ascii_lowercase();
                     // A working directory (`PWD=/app`), or a credentials file path
@@ -519,7 +576,10 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
                         || v.bytes().all(|b| b == b'*')
                         || NOT_VALUES.iter().any(|w| v.eq_ignore_ascii_case(w))
                         || path_key && v.starts_with(['/', '~'])
-                        || short_key && v.bytes().all(|b| b.is_ascii_digit())
+                        || short_key
+                            && v.split_ascii_whitespace()
+                                .next()
+                                .is_some_and(|w| w.bytes().all(|b| b.is_ascii_digit()))
                     {
                         return None;
                     }
@@ -566,6 +626,44 @@ const NOT_VALUES: &[&str] = &[
     ">-",
     ">+",
 ];
+
+/// Whether `value` is base64 of `user:password`, as a docker config's `auth` holds.
+fn is_basic_auth(value: &str) -> bool {
+    use base64::Engine as _;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    const BASE64: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    value.len() >= 4
+        && BASE64
+            .decode(value)
+            .is_ok_and(|raw| raw.len() >= 2 && raw.contains(&b':'))
+}
+
+/// Authentication schemes that can open a value; the credential is the word after.
+const SCHEMES: &[&str] = &["bearer", "basic"];
+
+/// The length of the scheme and the spaces after it when `value` opens with one followed by
+/// more text (`Bearer abc`), else 0.
+fn scheme_len(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    SCHEMES
+        .iter()
+        .find_map(|scheme| {
+            let n = scheme.len();
+            let rest = bytes.get(n..)?;
+            let spaces = rest
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
+            (bytes[..n].eq_ignore_ascii_case(scheme.as_bytes())
+                && spaces > 0
+                && spaces < rest.len())
+            .then_some(n + spaces)
+        })
+        .unwrap_or(0)
+}
 
 static FLAG_ONLY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"(?i)^(?P<k>--?(?:{FLAG_KEYS}))$")).expect("flag rule builds")
@@ -632,9 +730,27 @@ fn value_range(caps: &Captures, line: &str) -> Option<Range<usize>> {
         return Some(v.range());
     }
     if let Some(v) = caps.name("vt") {
-        // Bare values run to whitespace or a quote; closing punctuation after them stays.
-        let kept = v.as_str().trim_end_matches([',', ';', ')', '}', ']']);
-        return Some(v.start()..v.start() + kept.len());
+        return Some(word_value(line, v.range()));
+    }
+    if let Some(v) = caps.name("vl") {
+        // Only a password runs to the end of the line (a passphrase); after `token: ` or
+        // `secret: ` the rest is more often an error message than part of the value.
+        if caps.name("k").is_some() && key_kind(caps) != "password" {
+            return Some(word_value(line, v.start()..word_end(line, v.start())));
+        }
+        let len = line_value_len(&line[v.start()..]);
+        let skip = scheme_len(&line[v.start()..v.start() + len]);
+        return Some(v.start() + skip..v.start() + len);
+    }
+    if let Some(v) = caps.name("vb") {
+        let close = if caps.name("b").is_some_and(|b| b.len() > 1) {
+            b'}'
+        } else {
+            b']'
+        };
+        let len =
+            memchr::memchr(close, &line.as_bytes()[v.start()..]).unwrap_or(line.len() - v.start());
+        return Some(v.start()..v.start() + len);
     }
     if let Some(v) = caps.name("vd") {
         let end = match caps.name("q") {
@@ -675,6 +791,62 @@ fn quoted_len(rest: &str, level: usize) -> usize {
     rest.len()
 }
 
+/// Where a bare word that starts at `from` ends: at whitespace or a quote.
+fn word_end(line: &str, from: usize) -> usize {
+    from + line.as_bytes()[from..]
+        .iter()
+        .take_while(|&&b| !b.is_ascii_whitespace() && !matches!(b, b'"' | b'\'' | b'\\'))
+        .count()
+}
+
+/// A bare value matched at `word`, without the closing punctuation after it. After a scheme
+/// (`token=Bearer abc`), the credential is the word after it.
+fn word_value(line: &str, word: Range<usize>) -> Range<usize> {
+    let trimmed = |range: Range<usize>| {
+        range.start
+            ..range.start
+                + line[range]
+                    .trim_end_matches([',', ';', ')', '}', ']'])
+                    .len()
+    };
+    let value = trimmed(word.clone());
+    if value.end == word.end
+        && SCHEMES
+            .iter()
+            .any(|s| line[value.clone()].eq_ignore_ascii_case(s))
+    {
+        let from = value.end
+            + line.as_bytes()[value.end..]
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
+        let token = trimmed(from..word_end(line, from));
+        if from > value.end && !token.is_empty() {
+            return token;
+        }
+    }
+    value
+}
+
+/// The length of an unquoted value that starts `rest` and runs to the end of the line: up to
+/// the first unescaped double quote (the end of the string the line is quoted in) or escaped
+/// `\n` (the end of a line inside a JSON string), without trailing spaces. An escaped quote
+/// (`\"`) is part of the value. One forward scan.
+fn line_value_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let end = loop {
+        match memchr::memchr2(b'"', b'\\', &bytes[i..]) {
+            None => break bytes.len(),
+            Some(at) if bytes[i + at] == b'"' => break i + at,
+            Some(at) if bytes.get(i + at + 1) == Some(&b'n') => break i + at,
+            // Any other escape pair, `\"` and `\\` among them, is part of the value.
+            Some(at) => i = (i + at + 2).min(bytes.len()),
+        }
+    };
+    rest[..end].trim_end().len()
+}
+
 /// Applies one rule to a line. Returns the new line, or `None` when nothing was replaced.
 fn apply(rule: &Rule, line: &str, count: &mut usize) -> Option<String> {
     let mut out = String::new();
@@ -687,10 +859,9 @@ fn apply(rule: &Rule, line: &str, count: &mut usize) -> Option<String> {
         let whole = caps.get(0).expect("group 0");
         let mut next = whole.end().max(whole.start() + 1);
         if let Some(value) = value_range(&caps, line) {
-            if caps.name("vq").is_some() || caps.name("vd").is_some() {
-                // The match stopped at the opening quote; the next one starts after the value.
-                next = value.end.max(whole.start() + 1);
-            }
+            // A value can run past the match (to its closing quote, the end of the line, or
+            // the word after a scheme); the next match starts after it.
+            next = next.max(value.end);
             let text = &line[value.clone()];
             // A marker from an earlier rule (a separator may have taken its `[`).
             let before = value.start.saturating_sub(1);

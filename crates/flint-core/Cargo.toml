@@ -24,6 +24,8 @@ libc.workspace = true
 memchr.workspace = true
 regex.workspace = true
 aho-corasick.workspace = true
+# `redact::text`: docker config `auth` values; already in the tree through kube.
+base64.workspace = true
 http.workspace = true
 # The client stack with TCP keepalive (`cluster::build_client`); all already in the tree through kube.
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }

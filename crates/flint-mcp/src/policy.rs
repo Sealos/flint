@@ -151,13 +151,14 @@ fn strip(value: &mut Value) {
 
 /// Whether an object field holds free text that a workload or controller wrote: an Event's
 /// `message` (`note` in `events.k8s.io`), status and condition messages, container termination
-/// messages (which can be the container's last log lines), and operators' `failureMessage`,
-/// `errorMessage` or `statusMessage`.
+/// messages (which can be the container's last log lines), operators' `failureMessage`,
+/// `errorMessage` or `statusMessage`, and lists of them under a key ending in `messages`.
 fn is_message_field(key: &str) -> bool {
-    key == "note"
-        || key
-            .get(key.len().saturating_sub("message".len())..)
-            .is_some_and(|end| end.eq_ignore_ascii_case("message"))
+    let ends_with = |suffix: &str| {
+        key.get(key.len().saturating_sub(suffix.len())..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
+    };
+    key == "note" || ends_with("message") || ends_with("messages")
 }
 
 /// Whether `object` is a core v1 ConfigMap, whose data is shown as the cluster returns it.
@@ -167,9 +168,10 @@ fn is_config_map(object: &serde_json::Map<String, Value>) -> bool {
 }
 
 /// Replaces credential-shaped values ([`flint_core::redact::redact_credentials`]), at any
-/// depth, in every string under a `note` key or a key ending in `message`, and in container
-/// `args` and `command` lists, where the element after a flag such as `--password` is hidden
-/// whole. ConfigMaps are left as they are. Returns how many values were replaced.
+/// depth, in every string under a `note` key or a key ending in `message` or `messages` (also
+/// the strings of a list there), in every annotation value, and in container `args` and
+/// `command` lists, where the element after a flag such as `--password` is hidden whole.
+/// ConfigMaps are left as they are. Returns how many values were replaced.
 pub fn redact_object_text(value: &mut Value) -> usize {
     match value {
         Value::Object(map) if is_config_map(map) => 0,
@@ -177,7 +179,22 @@ pub fn redact_object_text(value: &mut Value) -> usize {
             .iter_mut()
             .map(|(key, value)| match value {
                 Value::String(text) if is_message_field(key) => redact_text(text),
+                Value::Array(items) if is_message_field(key) => items
+                    .iter_mut()
+                    .map(|item| match item {
+                        Value::String(text) => redact_text(text),
+                        other => redact_object_text(other),
+                    })
+                    .sum(),
                 Value::Array(args) if key == "args" || key == "command" => redact_args(args),
+                // Tools keep whole objects and free text in annotations.
+                Value::Object(annotations) if key == "annotations" => annotations
+                    .values_mut()
+                    .map(|value| match value {
+                        Value::String(text) => redact_text(text),
+                        other => redact_object_text(other),
+                    })
+                    .sum(),
                 _ => redact_object_text(value),
             })
             .sum(),
@@ -656,6 +673,44 @@ mod tests {
             ])
         );
         assert_eq!(container["env"][0]["value"], "kept");
+    }
+
+    // covers UP-15
+    #[test]
+    fn annotations_and_message_lists_are_redacted() {
+        let mut object = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Backup",
+            "metadata": {"name": "b", "annotations": {
+                "kubectl.kubernetes.io/last-applied-configuration":
+                    r#"{"spec":{"target":"postgres://app:hunter2@db/app"}}"#,
+                "example.com/notes": "rotate soon, password: correct horse battery",
+                "example.com/owner": "team-data",
+                "example.com/replicas": 3,
+                "example.com/values": {"job": {"message": "seed failed: token=t6"}}
+            }},
+            "status": {
+                "messages": ["upload failed: token=t5", "retrying in 30s"],
+                "warningMessages": [{"text": "kept as is"}]
+            }
+        });
+        assert_eq!(sanitize(&mut object), 4);
+        let text = object.to_string();
+        for leaked in ["hunter2", "horse", "t5", "t6"] {
+            assert!(!text.contains(leaked), "{leaked}: {text}");
+        }
+        let annotations = &object["metadata"]["annotations"];
+        assert_eq!(annotations["example.com/owner"], "team-data");
+        assert_eq!(annotations["example.com/replicas"], 3);
+        assert_eq!(
+            annotations["example.com/notes"],
+            "rotate soon, password: [REDACTED:password]"
+        );
+        assert_eq!(
+            object["status"]["messages"],
+            json!(["upload failed: token=[REDACTED:token]", "retrying in 30s"])
+        );
+        assert_eq!(object["status"]["warningMessages"][0]["text"], "kept as is");
     }
 
     // covers UP-15

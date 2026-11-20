@@ -259,7 +259,7 @@ impl FlintMcp {
     }
 
     #[tool(
-        description = "Get one object as YAML. managedFields are removed and Secret values redacted. Credentials in messages and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
+        description = "Get one object as YAML. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_resource(&self, Parameters(p): Parameters<GetResourceParams>) -> ToolResult {
@@ -286,7 +286,7 @@ impl FlintMcp {
 #[tool_handler(
     router = self.tool_router,
     name = "flint",
-    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
+    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
 impl ServerHandler for FlintMcp {}
 
