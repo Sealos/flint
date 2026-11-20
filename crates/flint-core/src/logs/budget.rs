@@ -391,9 +391,17 @@ mod tests {
             "shown only once the trim is done"
         );
         trimming.join().unwrap();
-        // Shown first: the trim is withdrawn, and applying it does nothing.
-        budget.set_shown(2, false);
+
+        // Shown first: a trim planned while it was hidden is withdrawn, and applying it does
+        // nothing.
+        budget.set_shown(1, false);
+        budget.set_shown(2, true);
+        budget.report(1, 6 * MIB, 6 * MIB, false);
         budget.report(2, 6 * MIB, 6 * MIB, false);
+        assert!(
+            budget.lock().sessions[&1].trim_to.is_some(),
+            "a trim is planned"
+        );
         budget.set_shown(1, true);
         let mut ran = false;
         budget.apply_trim(1, |t| {
