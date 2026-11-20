@@ -1198,3 +1198,29 @@ async fn a_stopped_container_fails_with_the_kubelets_reason_before_or_after_the_
         );
     }
 }
+
+// covers UP-41, UP-42
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_or_dropping_a_shell_closes_its_connection() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+
+    // Dropped, as closing a dock tab does. The shell keeps running; only Flint can end it.
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
+    server.wait_for_exec_sessions(1, WAIT).await.unwrap();
+    let fake = server.last_exec().unwrap();
+    drop(shell);
+    assert_eq!(fake.wait_for_end(WAIT).await.unwrap(), ExecEnd::ClientGone);
+    server.wait_for_exec_sessions(0, WAIT).await.unwrap();
+
+    // Closed explicitly.
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
+    server.wait_for_exec_sessions(1, WAIT).await.unwrap();
+    let fake = server.last_exec().unwrap();
+    shell.close();
+    assert_eq!(fake.wait_for_end(WAIT).await.unwrap(), ExecEnd::ClientGone);
+    server.wait_for_exec_sessions(0, WAIT).await.unwrap();
+    assert_eq!(server.exec_sessions().len(), 2);
+}
