@@ -2195,6 +2195,44 @@ async fn a_filtered_tab_saves_and_copies_the_rows_it_shows(cx: &mut TestAppConte
     assert_eq!(copied, "ERROR line 4\nERROR line 9");
 }
 
+// covers UP-48: turning a filter on or off keeps the reader's place: the list goes back to the
+// line at its top, or the first row after it.
+#[gpui_kit::test]
+async fn a_filter_change_keeps_the_place(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 1000).streaming());
+    draw(cx, window);
+    view.update(cx, |v, _| {
+        v.list.scroll_to(gpui_kit::ListOffset {
+            item_ix: 500,
+            offset_in_item: px(0.),
+        })
+    });
+    draw(cx, window);
+    let top = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.row_id(v.list.logical_scroll_top().item_ix))
+    };
+    assert_eq!(top(cx), Some(500));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 200).await;
+    assert_eq!(top(cx), Some(504), "the first error after line 500");
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 1000).await;
+    assert_eq!(top(cx), Some(504));
+}
+
 // covers UP-48: as lines come and go, the matches among the rows shown are kept up to date
 // from what was found before, the same as finding them again over every match.
 #[gpui_kit::test]
@@ -2243,8 +2281,8 @@ async fn shown_matches_follow_new_and_evicted_lines(cx: &mut TestAppContext) {
     assert_eq!(now, generations, "lines only came and went");
     // Lines 162 to 201 are in the buffer: the errors 164 to 199 and a line either side, of
     // which those up to 199 say "line 1".
-    assert_eq!(shown.first(), Some(&163));
-    assert_eq!(shown.last(), Some(&199));
+    assert_eq!(shown.front(), Some(&163));
+    assert_eq!(shown.back(), Some(&199));
 }
 
 // covers UP-48: a refilter on its way is not lost to a long catch-up, and a context change

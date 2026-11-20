@@ -138,7 +138,12 @@ pub struct LogView {
     search: LogSearch,
     /// The matches among the rows shown in a filtered tab, kept until the search or the rows
     /// change ([`LogView::shown_matches`]).
-    shown_matches: std::cell::RefCell<Option<(actions::ShownMatchesKey, Arc<[LineId]>)>>,
+    shown_matches: std::cell::RefCell<
+        Option<(
+            actions::ShownMatchesKey,
+            Arc<std::collections::VecDeque<LineId>>,
+        )>,
+    >,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
@@ -987,7 +992,8 @@ impl LogView {
         let workload = self.is_workload();
         let sources = self.sources;
         let wrap = self.wrap;
-        let count = if self.filtering || self.catching_up {
+        let filtering = self.filtering || self.catching_up;
+        let count = if filtering {
             "Filtering…".to_owned()
         } else {
             log_model::shown_count(self.is_filtered().then(|| self.row_count()), lines.len())
@@ -1086,6 +1092,18 @@ impl LogView {
                             })
                             .test_support(),
                     )
+                    // Too narrow for the count: a filter on its way still says so, since the
+                    // rows shown until it lands are not yet the filter's.
+                    .when(!fit.counts && filtering, |el| {
+                        el.child(
+                            div()
+                                .id("log-filtering")
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child("Filtering…")
+                                .test_support(),
+                        )
+                    })
                     .when(fit.counts, |el| {
                         el.child(
                             div()

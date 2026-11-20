@@ -2,6 +2,7 @@
 //! workspace's guards share with them. The toolbar's buttons, the save menu and clicks on lines
 //! dispatch these actions.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use flint_core::{LineId, LineSelection};
@@ -194,7 +195,7 @@ impl LogView {
     /// the search's matches or the rows changed, in one walk over both (they are sorted), so a
     /// redraw does not go over every match. While lines only come and go (same search, filter
     /// and rows), only the end is walked again: see [`LogView::shown_matches_from`].
-    pub(in crate::ui) fn shown_matches(&self) -> Arc<[LineId]> {
+    pub(in crate::ui) fn shown_matches(&self) -> Arc<VecDeque<LineId>> {
         let rows = self.filter_rows();
         let matches = self.search.matches();
         let key = ShownMatchesKey {
@@ -217,49 +218,48 @@ impl LogView {
         {
             return shown.clone();
         }
-        let shown: Arc<[LineId]> = match rows {
-            None => Arc::from([]),
-            Some(rows) => {
-                let (kept, from) = match &*cache {
-                    Some((old, shown))
-                        if old.search == key.search
-                            && old.filter == key.filter
-                            && old.rows_generation == key.rows_generation =>
-                    {
-                        let from = self.shown_matches_from(old);
-                        let first = key.first;
-                        let start = shown.partition_point(|id| *id < first);
-                        let end = shown.partition_point(|id| *id < from);
-                        (&shown[start..end.max(start)], from)
-                    }
-                    _ => (&[][..], 0),
-                };
-                let (all_rows, all_matches) = (rows, matches);
-                let rows = rows.range(rows.partition_point(|id| *id < from)..);
-                let matches = matches.range(matches.partition_point(|id| *id < from)..);
-                // Walks the shorter of the two (both sorted), looking each id up in the other:
-                // a tab showing few rows, or few matches, does little work however many the
-                // other has.
-                let found: Vec<LineId> = if rows.len() <= matches.len() {
-                    rows.copied()
-                        .filter(|id| all_matches.binary_search(id).is_ok())
-                        .collect()
-                } else {
-                    matches
-                        .copied()
-                        .filter(|id| all_rows.binary_search(id).is_ok())
-                        .collect()
-                };
-                kept.iter()
-                    .copied()
-                    .chain(
-                        found
-                            .into_iter()
-                            .filter(|id| self.snapshot.lines.contains(*id)),
-                    )
-                    .collect()
-            }
+        let Some(rows) = rows else {
+            let shown = Arc::new(VecDeque::new());
+            *cache = Some((key, shown.clone()));
+            return shown;
         };
+        // Same search, filter and rows: the matches found are kept in place, less the evicted
+        // ones and the end that may change, and only that end is found again.
+        let (mut shown, from) = match cache.take() {
+            Some((old, mut shown))
+                if old.search == key.search
+                    && old.filter == key.filter
+                    && old.rows_generation == key.rows_generation =>
+            {
+                let from = self.shown_matches_from(&old);
+                let kept = Arc::make_mut(&mut shown);
+                let evicted = kept.partition_point(|id| *id < key.first);
+                kept.drain(..evicted);
+                let end = kept.partition_point(|id| *id < from);
+                kept.truncate(end);
+                (shown, from)
+            }
+            _ => (Arc::new(VecDeque::new()), 0),
+        };
+        let (all_rows, all_matches) = (rows, matches);
+        let rows = rows.range(rows.partition_point(|id| *id < from)..);
+        let matches = matches.range(matches.partition_point(|id| *id < from)..);
+        let lines = &self.snapshot.lines;
+        let kept = Arc::make_mut(&mut shown);
+        // Walks the shorter of the two (both sorted), looking each id up in the other: a tab
+        // showing few rows, or few matches, does little work however many the other has.
+        if rows.len() <= matches.len() {
+            kept.extend(
+                rows.copied()
+                    .filter(|id| all_matches.binary_search(id).is_ok() && lines.contains(*id)),
+            );
+        } else {
+            kept.extend(
+                matches
+                    .copied()
+                    .filter(|id| all_rows.binary_search(id).is_ok() && lines.contains(*id)),
+            );
+        }
         *cache = Some((key, shown.clone()));
         shown
     }
@@ -426,7 +426,7 @@ impl LogView {
                 .and_then(|ix| shown.get(ix)),
             (None, _) => None,
         };
-        next.or(if forward { shown.first() } else { shown.last() })
+        next.or(if forward { shown.front() } else { shown.back() })
             .copied()
     }
 

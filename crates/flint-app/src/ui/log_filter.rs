@@ -104,9 +104,12 @@ impl LogView {
         if !spec.is_active() {
             self.filtering = false;
             self._filter = Task::ready(());
-            if self.filter.take().is_some() {
+            if self.filter.is_some() {
+                let anchor = self.scroll_anchor();
+                self.filter = None;
                 self.rows_generation += 1;
                 self.list.reset(self.snapshot.lines.len());
+                self.scroll_back_to(anchor);
             }
             cx.notify();
             return;
@@ -126,8 +129,10 @@ impl LogView {
                 if view.filter_generation != generation {
                     return;
                 }
+                let anchor = view.scroll_anchor();
                 let rows = view.install_filter(filter);
                 view.list.reset(rows);
+                view.scroll_back_to(anchor);
                 view.filtering = false;
                 // Lines that came while it scanned are caught up with when the tab is drawn.
                 cx.notify();
@@ -225,6 +230,35 @@ impl LogView {
             let end = self.list.item_count();
             self.list.splice(end..end, appended);
         }
+    }
+
+    /// The line at the top of the list, unless it follows the tail: where the list goes back
+    /// to when its rows are replaced ([`LogView::scroll_back_to`]).
+    fn scroll_anchor(&self) -> Option<LineId> {
+        if self.list.is_following_tail() {
+            return None;
+        }
+        self.row_id(self.list.logical_scroll_top().item_ix)
+    }
+
+    /// Scrolls the list, its rows just replaced, back to `anchor`, or the first row after it
+    /// (the last row when none is), so changing a filter keeps the reader's place.
+    fn scroll_back_to(&mut self, anchor: Option<LineId>) {
+        let Some(id) = anchor else {
+            return;
+        };
+        let count = self.row_count();
+        if count == 0 {
+            return;
+        }
+        let ix = match self.filter_rows() {
+            Some(rows) => rows.partition_point(|row| *row < id),
+            None => id.saturating_sub(self.snapshot.lines.first_id()) as usize,
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix: ix.min(count - 1),
+            offset_in_item: px(0.),
+        });
     }
 
     /// How many rows are shown between `from` and `to` (line ids, inclusive), without listing
