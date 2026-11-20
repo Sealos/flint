@@ -353,9 +353,11 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 
-**Required checks.** As of now, merging into master requires `fmt`, `clippy`, `test (flint-core)`, `test (flint-mcp)`,
-`docs`, `cargo-deny (bans licenses sources)`, `unused-deps`, `module-tests`, `typos` and `actionlint`. The other jobs,
-`linux (flint-app)` and `macos (flint-app)` included, run on every PR but do not block a merge.
+**Required checks.** Merging into master requires `fmt`, `clippy`, `test (flint-core)`, `test (flint-mcp)`, `docs`,
+`cargo-deny (bans licenses sources)`, `unused-deps`, `module-tests`, `typos`, `actionlint`, `conventional`,
+`linux (flint-app)` and `macos (flint-app)`. `linux (flint-app)` is the app check that always gates: it runs the app's
+tests, the automation channel's included, on every PR. Merges may go ahead while `macos (flint-app)` is still queued
+on GitHub's macOS runners, as long as it has not failed.
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
 App e2e runs on PRs, inside `macos (flint-app)`. `cluster-e2e` runs on PRs that touch `flint-core` or `flint-mcp`, on master, and nightly.
