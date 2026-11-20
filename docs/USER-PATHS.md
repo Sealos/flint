@@ -237,8 +237,14 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** a tab opens in the bottom dock (or the open one for that container is shown). I can pick a container, follow
   new lines, see the previous container's logs, search with highlighted matches and move between them, and pause
   following, with the number of lines held back shown. Scrolling up stops following; scrolling back to the bottom (or
-  Jump to Newest Line) follows again. The tab says whether it is connecting, streaming, reconnecting (and which
-  attempt) or ended (and why). Memory stays bounded on chatty pods.
+  Jump to Newest Line) follows again; while it does not follow, the toolbar says "Not following" beside Jump. The tab
+  says whether it is connecting, streaming, reconnecting (and which attempt), waiting for a crash-looping container
+  to restart (back-off) or ended, and why in plain words (no permission, can't reach the API server) with the
+  server's text under them. Once a stream has ended there is nothing to pause. A previous instance whose log the
+  kubelet cannot read yet says so, with Try Again, instead of showing the kubelet's answer as a line. The toolbar
+  stays one row in a narrow dock (the toggles and Save move into a "⋯" menu), and one notice line at a time shows
+  under it. Esc in the search field clears the search, then returns to the lines; Esc in the lines clears the
+  selection and never closes the detail pane. Memory stays bounded on chatty pods.
 - Tests: cluster, ui.
 
 ### UP-41 Shell into a container
@@ -273,7 +279,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** error lines are marked in the error color and warning lines in the warning color, in both themes.
   Matching ignores case and works on whole words: `ERROR`, `FATAL`, `panic`, and words ending in `Exception` or
   `Error` are errors, `WARN` and `WARNING` are warnings. Timestamps appear and disappear without reloading the
-  stream. Searching keeps the highlighting.
+  stream; they show muted, in local time to the millisecond, all one width, with the full timestamp on hover and in
+  copies and saves. Wrapped lines hang past the timestamp. Searching keeps the highlighting, and the current match
+  stands out from the others.
 - Tests: unit (pattern matching), cluster, ui.
 
 ### UP-44 Select and copy log lines
@@ -285,18 +293,19 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-45 Follow a workload's logs
 - **When** I open logs for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job (Logs on its row or in its detail
   pane, or Cmd-L), or for a label selector (Open Logs by Label Selector in the palette).
-- **Then** one tab, titled with the kind and name, shows the lines of every pod and container merged in arrival order, each prefixed with its pod and
-  container (the prefix can be hidden). Pods that start, restart or replace deleted ones are followed without
+- **Then** one tab, titled with the kind and name, shows the lines of every pod and container merged in arrival order, each prefixed with its pod (the
+  part of its name that tells it from the others, and its container when it has several) in a colour of its own; the
+  full pod and container are on hover and in copies, and the prefix can be hidden. Pods that start, restart or replace deleted ones are followed without
   reopening the tab. A pod whose stream fails does not stop the others, and the tab shows how many streams are
   live, failed or over the limit. Search, severity, timestamps and selection work as for one pod.
 - Tests: unit, cluster, ui.
 
 ### UP-46 Save logs to a file
 - **When** I save a log tab's lines: all of them (Cmd-S), the search matches (Shift-Cmd-S), or the selection
-  (Option-Cmd-S), also from the Save menu (which stays on screen in a narrow dock) or the palette.
+  (Option-Cmd-S), also from the Save menu (inside the "⋯" menu in a narrow dock) or the palette.
 - **Then** a confirmation says how many lines will be written and that the file is not redacted; after it, the native
-  save dialog writes them as shown, with timestamps only if they are shown, and the tab says how many lines went
-  where.
+  save dialog writes them as shown, with timestamps only if they are shown (in full), and the tab says how many lines
+  went where.
 - Tests: unit, ui.
 
 ### UP-47 Logs and a shell from any pod or workload row

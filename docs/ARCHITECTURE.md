@@ -234,7 +234,12 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   Sessions belong to no cluster slot, so they keep running across cluster switches. `timestamps=true` is always
   requested, so showing timestamps is a view toggle, and a dropped stream resumes from the last timestamp (with
   backoff, skipping lines already shown). A followed stream that ends is reopened only while the container can log
-  again (it restarts, or the pod still runs).
+  again (it restarts, or the pod still runs). When the pod's status says the container waits in `CrashLoopBackOff`,
+  `LogState::Reconnecting` carries `back_off`, and the tab says it waits for the restart rather than counting
+  reconnect attempts. The kubelet answers a log it cannot read (the previous instance's, early in a restart) with one
+  line without a timestamp, `unable to retrieve container logs for …`: as the first line of a read it ends a
+  previous-instance session with `PREVIOUS_NOT_AVAILABLE` (`LogState::previous_not_available`) and makes a
+  current-instance stream retry, so it never shows as a log line.
 - **Delivery** follows [ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md): at most one `Arc<LogSnapshot>` per
   ~100 ms. The buffer is stored in shared blocks (at most 1024 lines, or 1/32 of the memory budget), so a snapshot
   of 100k lines costs a few hundred pointer copies. Every line has a `LineId` that never changes, so a view diffs
@@ -245,10 +250,28 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   alive and counts against the same budget. The cost: after a long pause, the oldest frozen lines disappear just as
   they would while following.
 - **Log tab** (`flint-app/src/ui/log_view.rs`): a virtualized list (GPUI `list` in tail-follow mode) spliced by line
-  id from each snapshot, so following costs only the new lines. Timestamps, wrapping and a workload's
-  `[pod/container]` prefix are view toggles, and a workload tab counts its streams in the toolbar. Copy and Save
-  (after a confirmation, then the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot
-  diff, line text and highlights, state wording, save text) are in `log_model.rs`.
+  id from each snapshot, so following costs only the new lines. Timestamps, wrapping and a workload's pod prefix
+  are view toggles, and a workload tab counts its streams in the toolbar. Copy and Save (after a confirmation, then
+  the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot diff, line text and
+  highlights, state and error wording, toolbar fit, save text) are in `log_model.rs`.
+  - **Toolbar:** one row at any width (`toolbar_fit`, from the tab's measured width): the status (state, pause and
+    held-back count) has a slot that truncates, with everything in its tooltip; the toggles, Pause, Jump and Save are
+    one group that never wraps, and below about 980 points the toggles and Save fold into a "⋯" menu, then the
+    counts and the match count go. Away from the newest line it says "Not following" beside Jump. Pause and
+    "Paused" go once the stream has ended (held-back lines then show).
+  - **Notices:** one strip under the toolbar, the latest transient thing: a copy or save note (a muted one times
+    out after 4 s; any goes when the selection changes), else the selection hint. An ended session's error has its
+    own banner: plain words (`explain`: a 403 is "You don't have permission to read this pod's logs.", a transport
+    failure "Can't reach the API server.") over the server's text, which wraps; the status says only a few words.
+    A previous-instance tab the kubelet could not serve says so, with Try Again (`ReloadLogs`).
+  - **Lines:** a shown timestamp is local `HH:MM:SS.mmm`, muted and fixed-width; a workload line's prefix is the
+    pod name after the prefix all its pods share (the container only when the pod has several), padded to the
+    widest, in a colour per pod (`theme::log_source_colors`, by first sight). Prefix, timestamp and text are
+    separate elements, so wrapped text hangs past both; hovering over the timestamp or prefix shows the full value.
+    The current search match is drawn over a stronger tint, bold and underlined, on a tinted line.
+  - **Keys:** Esc in the search field clears the search, then (empty) returns focus to the lines (`LeaveSearch`,
+    bound in `LogView > Input`, which the field passes Esc to). Esc in the lines clears the selection and otherwise
+    does nothing: it never falls through to the detail pane's Close.
 - **Colors and control characters** are stripped from each line once, on arrival in the core
   (`logs::strip_controls`), before it is classified, searched or stored: ANSI escape sequences (SGR colors, cursor
   codes, OSC titles and links, cut-off sequences at the end of a line) and control characters other than tab.
@@ -264,7 +287,9 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   error wins over a warning.
 - **Copy** puts the selected lines on the clipboard as shown (with timestamps only when they are shown) and without
   redaction. AI log analysis redacts what it sends (see below). In a workload session copy keeps the
-  `[pod/container]` prefix unless the view hides it (`LineSelection::text_as`).
+  `[pod/container]` prefix unless the view hides it (`LineSelection::text_as`). "As shown" means the same parts:
+  copies and saves write each in full, the server's RFC 3339 UTC timestamp and the whole `[pod/container]`, so a
+  file stays unambiguous across days, time zones and pods, though the tab shows them short.
 - **Workload logs** (UP-45): `open_logs` also takes a `WorkloadTarget`: a Deployment, StatefulSet, DaemonSet,
   ReplicaSet or Job (its `spec.selector`, read once), or a label selector. One session watches the matching pods
   (a pod watch, not polling) and runs one stream per pod container: every regular container and native sidecar, or
