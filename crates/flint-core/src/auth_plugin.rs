@@ -14,7 +14,8 @@
 //! [`DRAIN_GRACE`] after the plugin exits; then what the plugin printed is used as it is.
 //!
 //! A plugin that may prompt, while Flint runs in the foreground of a terminal, is given that
-//! terminal (its group becomes the terminal's foreground group) and Flint takes it back after:
+//! terminal once it started (its group becomes the terminal's foreground group; one such plugin at
+//! a time) and Flint takes it back after:
 //! the plugin can still ask for a password, and still dies with its group.
 //!
 //! Otherwise this follows kube's `auth_exec` (kube-client 5.1): the same arguments, environment,
@@ -25,10 +26,12 @@
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use futures::future::BoxFuture;
+use futures::FutureExt as _;
+use futures::future::{BoxFuture, Shared};
 use http::header::AUTHORIZATION;
 use http::{HeaderValue, Request};
 use jiff::{SignedDuration, Timestamp};
@@ -61,6 +64,7 @@ const PROMPT_BACK_OFF: Duration = Duration::from_secs(5 * 60);
 /// texts there may quote the plugin's output, Flint's name only the plugin's program.
 const TIMED_OUT: &str = "flint:timed-out:";
 const TOO_LARGE: &str = "flint:too-large:";
+const RESTING: &str = "flint:resting:";
 
 /// What a plugin run returned.
 #[derive(Debug)]
@@ -120,7 +124,9 @@ pub(crate) async fn resolve(config: &mut kube::Config) -> Result<Option<TokenLay
                 exec,
                 token,
                 expires,
-                quiet_until: None,
+                refreshing: None,
+                failed: None,
+                resting: None,
             }),
         )))),
         Credential::None => None,
@@ -177,22 +183,13 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     // A group of its own, so a kill also ends what the plugin started (`gcloud` runs Python, a
     // shell wrapper runs the real binary).
     cmd.process_group(0);
+    // Taken before the plugin starts, so a second prompting plugin waits for the first to give
+    // the terminal back instead of starting in the background, where reading it stops it.
     let terminal = if interactive {
-        Terminal::foreground()
+        Terminal::acquire().await
     } else {
         None
     };
-    if let Some(terminal) = &terminal {
-        let fd = terminal.fd.as_raw_fd();
-        // SAFETY: the closure runs in the child between fork and exec and only makes
-        // async-signal-safe calls (sigprocmask, tcsetpgrp, getpid).
-        unsafe {
-            cmd.pre_exec(move || {
-                take_terminal(fd);
-                Ok(())
-            });
-        }
-    }
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
     // Closed at once, as `Command::output()` does.
@@ -205,13 +202,15 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
         group: pid,
         terminal,
     };
+    // Only once it started: a plugin that cannot be started never had the terminal.
+    running.hand_over_terminal();
 
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let drained = {
         let pipes = async {
             tokio::try_join!(
-                read_capped(stdout, &mut out, STDOUT_CAP),
-                read_capped(stderr, &mut err, STDERR_CAP),
+                read_capped(stdout, &mut out, STDOUT_CAP, true),
+                read_capped(stderr, &mut err, STDERR_CAP, false),
             )
         };
         tokio::pin!(pipes);
@@ -261,11 +260,14 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     parse(&out.stdout)
 }
 
-/// Reads `pipe` to its end into `buf`; past `cap` bytes, fails with `FileTooLarge`.
+/// Reads `pipe` to its end into `buf`, keeping at most `cap` bytes. Past them, with `fail` it
+/// fails with `FileTooLarge` (stdout: no credential is that long); without, it reads on and drops
+/// the rest (stderr: chatter does not cost the credential).
 async fn read_capped(
     pipe: Option<impl AsyncRead + Unpin>,
     buf: &mut Vec<u8>,
     cap: usize,
+    fail: bool,
 ) -> std::io::Result<()> {
     let Some(mut pipe) = pipe else {
         return Ok(());
@@ -277,7 +279,12 @@ async fn read_capped(
             return Ok(());
         }
         if buf.len() + n > cap {
-            return Err(std::io::ErrorKind::FileTooLarge.into());
+            if fail {
+                return Err(std::io::ErrorKind::FileTooLarge.into());
+            }
+            let room = cap - buf.len();
+            buf.extend_from_slice(&chunk[..room]);
+            continue;
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -319,39 +326,46 @@ fn has_exited(pid: libc::pid_t) -> bool {
     rc != 0 || found == pid
 }
 
-/// The terminal Flint runs in the foreground of: a prompting plugin is given it while it runs.
+/// Who has Flint's terminal: one prompting plugin at a time.
+static TERMINAL: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(Arc::default);
+
+/// The terminal Flint runs in the foreground of, held for one prompting plugin: it is given the
+/// terminal while it runs. Released when dropped.
 struct Terminal {
     fd: OwnedFd,
+    _owner: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Terminal {
-    /// Flint's controlling terminal, if Flint's group is its foreground group (otherwise no one
-    /// Flint starts may read it anyway).
-    fn foreground() -> Option<Self> {
+    /// Flint's controlling terminal, once no other plugin has it, if Flint's group is its
+    /// foreground group (otherwise no one Flint starts may read it anyway).
+    async fn acquire() -> Option<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/tty")
             .ok()?;
         let fd = OwnedFd::from(file);
+        let owner = TERMINAL.clone().lock_owned().await;
         // SAFETY: plain calls on a descriptor this function owns.
         let ours = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() };
-        ours.then_some(Terminal { fd })
+        ours.then_some(Terminal { fd, _owner: owner })
     }
 }
 
-/// In the plugin, between fork and exec: makes its group (already its own) the terminal's
-/// foreground group. SIGTTOU is blocked meanwhile, as a background group may not otherwise do it.
-fn take_terminal(fd: RawFd) {
-    // SAFETY: async-signal-safe calls on valid arguments.
+/// Makes `group` the foreground group of the terminal `fd`, with SIGTTOU blocked in this thread
+/// meanwhile (a background group may not otherwise do it).
+fn set_foreground(fd: RawFd, group: libc::pid_t) {
+    // SAFETY: plain calls on a valid descriptor and on signal sets this function owns.
     unsafe {
         let mut block: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut block);
         libc::sigaddset(&raw mut block, libc::SIGTTOU);
-        libc::sigprocmask(libc::SIG_BLOCK, &raw const block, &raw mut old);
-        libc::tcsetpgrp(fd, libc::getpid());
-        libc::sigprocmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block, &raw mut old);
+        libc::tcsetpgrp(fd, group);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
     }
 }
 
@@ -369,6 +383,16 @@ struct Running {
 }
 
 impl Running {
+    /// Gives the plugin's group the terminal, and continues it in case it read the terminal
+    /// before and was stopped for it.
+    fn hand_over_terminal(&self) {
+        if let (Some(terminal), Some(pgid)) = (&self.terminal, self.group) {
+            set_foreground(terminal.fd.as_raw_fd(), pgid);
+            // SAFETY: killpg takes plain integers; the plugin is not reaped.
+            unsafe { libc::killpg(pgid, libc::SIGCONT) };
+        }
+    }
+
     fn kill_group(&self) {
         if let Some(pgid) = self.group {
             // SAFETY: killpg takes plain integers. `group` is cleared when the plugin is reaped,
@@ -385,22 +409,13 @@ impl Running {
     }
 }
 
-/// Takes `terminal` back for Flint's group if `plugin`'s group is its foreground group. SIGTTOU
-/// is blocked in this thread meanwhile: Flint's group is in the background until then.
+/// Takes `terminal` back for Flint's group if `plugin`'s group is its foreground group.
 fn give_back(terminal: &Terminal, plugin: libc::pid_t) {
     let fd = terminal.fd.as_raw_fd();
-    // SAFETY: plain calls on a descriptor `terminal` owns, and on signal sets this function owns.
-    unsafe {
-        if libc::tcgetpgrp(fd) != plugin {
-            return;
-        }
-        let mut block: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&raw mut block);
-        libc::sigaddset(&raw mut block, libc::SIGTTOU);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block, &raw mut old);
-        libc::tcsetpgrp(fd, libc::getpgrp());
-        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+    // SAFETY: a plain call on a descriptor `terminal` owns.
+    if unsafe { libc::tcgetpgrp(fd) } == plugin {
+        // SAFETY: as above.
+        set_foreground(fd, unsafe { libc::getpgrp() });
     }
 }
 
@@ -466,6 +481,15 @@ pub(crate) fn describe(text: &str) -> Option<String> {
             crate::cluster::go_duration(CONNECT_TIMEOUT)
         ));
     }
+    if let Some((until, name)) = text
+        .strip_prefix(RESTING)
+        .and_then(|rest| rest.split_once('|'))
+    {
+        return Some(format!(
+            "authentication failed: the exec auth plugin `{name}` timed out, so it is not run \
+             again until {until}; retry to try now"
+        ));
+    }
     let name = text.strip_prefix(TOO_LARGE)?;
     Some(format!(
         "authentication failed: the exec auth plugin `{name}` printed more output than a \
@@ -473,13 +497,25 @@ pub(crate) fn describe(text: &str) -> Option<String> {
     ))
 }
 
+/// Bumped by [`retry_now`]: a rest taken before the latest bump is over.
+static RETRY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Someone asked to connect now (selected or retried a cluster): plugins resting after a
+/// timed-out refresh ([`PROMPT_BACK_OFF`]) may run again. Requests Flint makes by itself keep
+/// waiting it out.
+pub fn retry_now() {
+    RETRY_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The client stack's layer that sets the plugin's token on each request.
 pub(crate) type TokenLayer = AsyncFilterLayer<RefreshingToken>;
 
 /// A plugin token that expires, shared by every request of one client. The first request that
-/// finds it within [`REFRESH_MARGIN`] of its expiry runs the plugin again, bounded by
-/// [`CONNECT_TIMEOUT`]; the others wait for that run, so one client runs at most one plugin at a
-/// time.
+/// finds it within [`REFRESH_MARGIN`] of its expiry starts a refresh: the plugin runs again in a
+/// task of its own, bounded by [`CONNECT_TIMEOUT`], and stores what it got. Requests wait for that
+/// one refresh; one that gives up (its own deadline) stops waiting, and the refresh goes on for
+/// the next. So one client runs at most one plugin at a time, and a slow login is not restarted
+/// by every short request.
 #[derive(Clone)]
 pub(crate) struct RefreshingToken(Arc<tokio::sync::Mutex<TokenState>>);
 
@@ -487,43 +523,135 @@ struct TokenState {
     exec: ExecConfig,
     token: SecretString,
     expires: Timestamp,
-    /// Until when a prompting plugin is not run again, after its refresh timed out.
-    quiet_until: Option<Instant>,
+    /// The refresh running, which requests wait for.
+    refreshing: Option<Shared<BoxFuture<'static, ()>>>,
+    /// Why the last refresh failed, for the requests that waited for it.
+    failed: Option<Arc<AuthError>>,
+    /// A prompting plugin whose refresh timed out rests until then (as an instant and as wall
+    /// time, to say), unless [`retry_now`] was called since (the epoch it was taken at).
+    resting: Option<(Instant, Timestamp, u64)>,
+}
+
+impl TokenState {
+    fn fresh(&self) -> bool {
+        Timestamp::now() + REFRESH_MARGIN < self.expires
+    }
+
+    fn name(&self) -> String {
+        redact::command_name(self.exec.command.as_deref().unwrap_or_default())
+    }
+
+    /// Until when a timed-out prompting plugin rests, if it still does.
+    fn rests_until(&self) -> Option<Timestamp> {
+        let (until, wall, epoch) = self.resting?;
+        (Instant::now() < until && epoch == RETRY_EPOCH.load(Ordering::Relaxed)).then_some(wall)
+    }
+}
+
+/// An auth error shared by the requests that waited for one refresh. It reads as the error and
+/// has it as its source, so it is found and worded like kube's own.
+#[derive(Debug)]
+struct SharedAuthError(Arc<AuthError>);
+
+impl std::fmt::Display for SharedAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SharedAuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
 }
 
 impl RefreshingToken {
     async fn header(&self) -> Result<HeaderValue, BoxError> {
-        let mut state = self.0.lock().await;
-        if Timestamp::now() + REFRESH_MARGIN >= state.expires {
-            let name = redact::command_name(state.exec.command.as_deref().unwrap_or_default());
-            let timed_out = || AuthError::AuthExec(format!("{TIMED_OUT}{name}"));
-            if state.quiet_until.is_some_and(|t| Instant::now() < t) {
-                return Err(timed_out().into());
+        let refresh = {
+            let mut state = self.0.lock().await;
+            if state.fresh() {
+                return bearer(&state.token);
             }
-            let Ok(fresh) = tokio::time::timeout(CONNECT_TIMEOUT, run(&state.exec)).await else {
-                if state.exec.interactive_mode != Some(ExecInteractiveMode::Never) {
-                    state.quiet_until = Some(Instant::now() + PROMPT_BACK_OFF);
+            if let Some(until) = state.rests_until() {
+                return Err(resting(&state.name(), until).into());
+            }
+            match &state.refreshing {
+                Some(refresh) => refresh.clone(),
+                None => {
+                    let refresh = self.start_refresh(state.exec.clone());
+                    state.failed = None;
+                    state.refreshing = Some(refresh.clone());
+                    refresh
                 }
-                return Err(timed_out().into());
-            };
-            match fresh? {
-                Credential::Token {
+            }
+        };
+        refresh.await;
+        let state = self.0.lock().await;
+        if state.fresh() {
+            return bearer(&state.token);
+        }
+        match &state.failed {
+            Some(error) => Err(SharedAuthError(error.clone()).into()),
+            None => Err(AuthError::UnrefreshableTokenResponse.into()),
+        }
+    }
+
+    /// Runs the plugin again in a task of its own, which stores the token (or why it failed)
+    /// when it ends. The returned future resolves then.
+    fn start_refresh(&self, exec: ExecConfig) -> Shared<BoxFuture<'static, ()>> {
+        let state = self.0.clone();
+        let task = tokio::spawn(async move {
+            let result = tokio::time::timeout(CONNECT_TIMEOUT, run(&exec)).await;
+            let mut state = state.lock().await;
+            state.refreshing = None;
+            let failed = match result {
+                Ok(Ok(Credential::Token {
                     token,
                     expires: Some(expires),
-                } => {
+                })) => {
                     state.token = token;
                     state.expires = expires;
-                    state.quiet_until = None;
+                    state.resting = None;
+                    None
                 }
                 // kube's answer when a refresh no longer returns an expiring token.
-                _ => return Err(AuthError::UnrefreshableTokenResponse.into()),
-            }
+                Ok(Ok(_)) => Some(AuthError::UnrefreshableTokenResponse),
+                Ok(Err(e)) => Some(e),
+                Err(_) => {
+                    if exec.interactive_mode != Some(ExecInteractiveMode::Never) {
+                        state.resting = Some((
+                            Instant::now() + PROMPT_BACK_OFF,
+                            Timestamp::now() + PROMPT_BACK_OFF,
+                            RETRY_EPOCH.load(Ordering::Relaxed),
+                        ));
+                    }
+                    Some(AuthError::AuthExec(format!("{TIMED_OUT}{}", state.name())))
+                }
+            };
+            state.failed = failed.map(Arc::new);
+        });
+        async move {
+            let _ = task.await;
         }
-        let mut value = HeaderValue::try_from(format!("Bearer {}", state.token.expose_secret()))
-            .map_err(AuthError::InvalidBearerToken)?;
-        value.set_sensitive(true);
-        Ok(value)
+        .boxed()
+        .shared()
     }
+}
+
+/// The error for a request while the plugin rests until `until`: it was not run.
+fn resting(name: &str, until: Timestamp) -> AuthError {
+    let until = until
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%H:%M")
+        .to_string();
+    AuthError::AuthExec(format!("{RESTING}{until}|{name}"))
+}
+
+fn bearer(token: &SecretString) -> Result<HeaderValue, BoxError> {
+    let mut value = HeaderValue::try_from(format!("Bearer {}", token.expose_secret()))
+        .map_err(AuthError::InvalidBearerToken)?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 impl<B: Send + 'static> AsyncPredicate<Request<B>> for RefreshingToken {

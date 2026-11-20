@@ -469,29 +469,61 @@ async fn a_helper_holding_the_output_does_not_cost_the_credential() {
     wait_dead(helper).await;
 }
 
-// covers UP-04: a refresh that hangs is a sign-in failure naming the plugin, not a server
-// that cannot be reached. A plugin that may prompt is not run again for a while after that.
-#[tokio::test(start_paused = true)]
-async fn a_hanging_refresh_is_a_sign_in_failure() {
-    let plugin = FakePlugin::new(
+/// A plugin whose first run prints an expired token (so the first request refreshes), and
+/// whose later runs wait for `$PLUGIN_DIR/release` (a login being completed), then print a
+/// fresh token `t-<run>`.
+fn slow_login() -> FakePlugin {
+    FakePlugin::new(
         "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
-         if [ \"$(wc -l < \"$PLUGIN_DIR/starts\" | tr -d ' ')\" = 1 ]; then\n\
+         n=$(wc -l < \"$PLUGIN_DIR/starts\" | tr -d ' ')\n\
+         if [ \"$n\" = 1 ]; then\n\
          printf '{\"status\":{\"token\":\"t-1\",\"expirationTimestamp\":\"2000-01-01T00:00:00Z\"}}'\n\
          exit 0\n\
          fi\n\
-         exec sleep 600\n",
-    );
-    let mut kubeconfig = plugin.kubeconfig("http://127.0.0.1:1");
-    let exec = kubeconfig.auth_infos[0]
+         while [ ! -e \"$PLUGIN_DIR/release\" ]; do sleep 0.05; done\n\
+         printf '{\"status\":{\"token\":\"t-%s\",\"expirationTimestamp\":\"2999-01-01T00:00:00Z\"}}' \"$n\"\n",
+    )
+}
+
+/// Waits (in real time) until the plugin has started `count` times.
+async fn wait_starts(plugin: &FakePlugin, count: usize) {
+    for _ in 0..500 {
+        if plugin.starts().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the plugin did not start {count} times");
+}
+
+fn prompting(kubeconfig: &mut Kubeconfig) {
+    kubeconfig.auth_infos[0]
         .auth_info
         .as_mut()
         .unwrap()
         .exec
         .as_mut()
-        .unwrap();
-    exec.interactive_mode = Some(ExecInteractiveMode::IfAvailable);
+        .unwrap()
+        .interactive_mode = Some(ExecInteractiveMode::IfAvailable);
+}
+
+// covers UP-04: a refresh that hangs is a sign-in failure naming the plugin, not a server that
+// cannot be reached. A plugin that may prompt then rests: requests say until when, without
+// running it, until someone retries.
+#[tokio::test]
+async fn a_hanging_refresh_is_a_sign_in_failure() {
+    let plugin = slow_login();
+    let mut kubeconfig = plugin.kubeconfig("http://127.0.0.1:1");
+    prompting(&mut kubeconfig);
     let client = cluster::connect(&kubeconfig, "ctx").await.unwrap();
-    let Err(err) = cluster::server_version(&client).await else {
+    let request = tokio::spawn({
+        let client = client.clone();
+        async move { cluster::server_version(&client).await }
+    });
+    // The refresh's plugin is running; from now on time runs ahead, to its timeout.
+    wait_starts(&plugin, 2).await;
+    tokio::time::pause();
+    let Err(err) = request.await.unwrap() else {
         panic!("the refresh hangs");
     };
     assert!(!err.is_timeout(), "{err}");
@@ -500,11 +532,59 @@ async fn a_hanging_refresh_is_a_sign_in_failure() {
         "authentication failed: the exec auth plugin `plugin` did not finish within 1m0s; it may \
          be waiting for a login. Run it in a terminal (for example, log in again) and retry."
     );
-    let hung = plugin.starts()[1];
-    wait_reaped(hung).await;
-    // Within the back-off, no new plugin starts (no browser login opens again).
-    assert!(cluster::server_version(&client).await.is_err());
+    wait_reaped(plugin.starts()[1]).await;
+
+    // Resting: no new plugin starts (no browser login opens again), and the error says so.
+    let Err(err) = cluster::server_version(&client).await else {
+        panic!("the plugin rests");
+    };
+    let message = err.to_string();
+    assert!(
+        message.starts_with("authentication failed: the exec auth plugin `plugin` timed out, so it is not run again until ")
+            && message.ends_with("; retry to try now"),
+        "{message}"
+    );
     assert_eq!(plugin.starts().len(), 2);
+
+    // A retry runs it again.
+    retry_now();
+    tokio::time::resume();
+    let request = tokio::spawn(async move { cluster::server_version(&client).await });
+    wait_starts(&plugin, 3).await;
+    request.abort();
+}
+
+// covers UP-04: a request that gives up (its own short deadline) does not end a refresh that
+// waits for a slow login: the next request waits for the same plugin run, which then succeeds.
+#[tokio::test]
+async fn a_short_request_does_not_restart_a_slow_login() {
+    let plugin = slow_login();
+    let (server, seen) = version_server(1).await;
+    let client = cluster::connect(&plugin.kubeconfig(&server), "ctx")
+        .await
+        .unwrap();
+    let short = tokio::time::timeout(Duration::from_millis(300), cluster::server_version(&client));
+    assert!(short.await.is_err(), "the login is not done yet");
+    wait_starts(&plugin, 2).await;
+    let login = plugin.starts()[1];
+    assert!(exists(login), "the refresh goes on");
+    std::fs::write(plugin.dir.path().join("release"), "").unwrap();
+    cluster::server_version(&client).await.unwrap();
+    assert_eq!(seen.await.unwrap(), ["bearer t-2"]);
+    assert_eq!(plugin.starts().len(), 2, "one plugin run for both requests");
+}
+
+// covers UP-03: a plugin that is chatty on stderr still signs in: stderr past its cap is
+// dropped, not an error.
+#[tokio::test]
+async fn a_chatty_plugin_still_signs_in() {
+    let plugin = FakePlugin::new(
+        "head -c 200000 /dev/zero >&2\n\
+         printf '{\"status\":{\"token\":\"t-chatty\"}}'\n",
+    );
+    let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
+    resolve(&mut config).await.unwrap();
+    assert_eq!(config.auth_info.token.unwrap().expose_secret(), "t-chatty");
 }
 
 /// Set for the copy of this test binary that `script` runs on a terminal.
@@ -559,6 +639,27 @@ async fn on_a_terminal() {
     // SAFETY: plain calls on the standard input descriptor.
     let foreground = || unsafe { libc::tcgetpgrp(0) == libc::getpgrp() };
     assert!(foreground(), "not in the terminal's foreground");
+
+    // A prompting plugin that cannot be started never takes the terminal.
+    let mut missing = FakePlugin::new("").kubeconfig("http://127.0.0.1:1");
+    prompting(&mut missing);
+    missing.auth_infos[0]
+        .auth_info
+        .as_mut()
+        .unwrap()
+        .exec
+        .as_mut()
+        .unwrap()
+        .command = Some("/nonexistent/flint-test-plugin".into());
+    let Err(err) = cluster::connect(&missing, "ctx").await else {
+        panic!("a missing plugin cannot connect");
+    };
+    assert!(
+        matches!(err, ClusterError::ExecPluginNotFound { .. }),
+        "{err}"
+    );
+    assert!(foreground(), "a missing plugin took the terminal");
+
     let plugin = FakePlugin::new(
         "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
          tpgid=$(ps -o tpgid= -p $$ | tr -d ' ')\n\
@@ -569,24 +670,33 @@ async fn on_a_terminal() {
          wait\n",
     );
     let mut kubeconfig = plugin.kubeconfig("http://127.0.0.1:1");
-    kubeconfig.auth_infos[0]
-        .auth_info
-        .as_mut()
-        .unwrap()
-        .exec
-        .as_mut()
-        .unwrap()
-        .interactive_mode = Some(ExecInteractiveMode::IfAvailable);
-    let attempt = tokio::spawn(async move { cluster::connect(&kubeconfig, "ctx").await });
+    prompting(&mut kubeconfig);
+    let attempt = tokio::spawn({
+        let kubeconfig = kubeconfig.clone();
+        async move { cluster::connect(&kubeconfig, "ctx").await }
+    });
     let (leader, child) = plugin.wait_started().await;
     assert!(
         std::fs::read_to_string(plugin.dir.path().join("foreground")).is_ok(),
         "the plugin did not get the terminal"
     );
+    // A second prompting plugin (another cluster) waits for the terminal instead of starting in
+    // the background.
+    let second = FakePlugin::hanging();
+    let mut other = second.kubeconfig("http://127.0.0.1:1");
+    prompting(&mut other);
+    let waiting = tokio::spawn(async move { cluster::connect(&other, "ctx").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(second.starts().is_empty(), "the second plugin did not wait");
     attempt.abort();
     assert!(attempt.await.is_err_and(|e| e.is_cancelled()));
     wait_reaped(leader).await;
     wait_dead(child).await;
+    // Then the second gets it.
+    let (second_leader, second_child) = second.wait_started().await;
+    waiting.abort();
+    wait_reaped(second_leader).await;
+    wait_dead(second_child).await;
     assert!(foreground(), "the terminal was not given back");
     std::fs::write(done, "ok").unwrap();
 }
