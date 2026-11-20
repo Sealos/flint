@@ -147,7 +147,9 @@ actions!(
         /// Show or hide the extra `-o wide` columns.
         ToggleWide,
         /// Move focus to the list's text filter.
-        FocusFilter
+        FocusFilter,
+        /// Move focus from the list's text filter back to its rows (Esc, Enter or Down there).
+        FocusRows
     ]
 );
 actions!(
@@ -1518,6 +1520,8 @@ pub const WORKSPACE: &str = "Workspace";
 const PLAIN: &str = "Workspace && !Input";
 /// The same, for the list: deeper than the workspace, so it wins there.
 const LIST_ALONE: &str = "ResourceList && !Input";
+/// The list's text filter.
+const LIST_FILTER: &str = "ResourceList > Input";
 /// The bottom dock's key context.
 pub const DOCK: &str = "Dock";
 /// A log tab's key context.
@@ -2108,6 +2112,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<FocusFilter>("Focus Filter", "Move focus to the list's text filter.")
             .of(C::List, S::List)
             .keys(&["secondary-f"], Some(WORKSPACE)),
+        Spec::unit::<FocusRows>(
+            "Focus Rows",
+            "Move focus from the filter back to the rows, keeping the filter text.",
+        )
+        .of(C::List, S::List)
+        .keys(&["escape", "enter", "down"], Some(LIST_FILTER))
+        .hidden(),
         Spec::unit::<SelectPrev>("Select Previous Row", "Move the selection up.")
             .of(C::List, S::List)
             .keys(&["up"], Some(PLAIN)),
@@ -2854,12 +2865,15 @@ pub mod tests {
     }
 
     /// Plain keys never fire while typing in a field, except Esc meant for the log search field
-    /// itself (which the field passes on). Keys with a modifier are not plain.
+    /// itself (which the field passes on), and the keys the palette's field and the list's
+    /// filter hand on (no field there takes Enter, Esc or Down for itself). Keys with a modifier
+    /// are not plain.
     fn plain_key_allowed(key: &str, context: Option<&str>) -> bool {
         key.contains('-')
             || context.is_some_and(|c| c.contains("!Input"))
             || (key == "escape" && context == Some(super::LOG_SEARCH))
             || context == Some(super::PALETTE_INPUT)
+            || (matches!(key, "escape" | "enter" | "down") && context == Some(super::LIST_FILTER))
     }
 
     #[test]
@@ -2874,6 +2888,9 @@ pub mod tests {
         // The palette's search field gives its arrows, Enter and Esc to the palette.
         assert!(plain_key_allowed("enter", Some(super::PALETTE_INPUT)));
         assert!(!plain_key_allowed("enter", Some(super::PALETTE)));
+        // The list's filter hands Esc, Enter and Down back to the rows, and keeps the rest.
+        assert!(plain_key_allowed("down", Some(super::LIST_FILTER)));
+        assert!(!plain_key_allowed("t", Some(super::LIST_FILTER)));
     }
 
     // covers UP-41: on Linux, `secondary-` app shortcuts become Ctrl ones. Every one that is

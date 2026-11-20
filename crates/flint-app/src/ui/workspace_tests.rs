@@ -1083,7 +1083,8 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
 }
 
 // Keys meant for the list and the detail pane (Home, End, the arrows, Esc) do nothing while the
-// user types in a field: the list's filter or the namespace filter's.
+// user types in a field: the list's filter or the namespace filter's. In the list's filter,
+// Down and Esc only move focus back to the rows (`keys_in_the_filter_return_to_the_rows`).
 #[gpui_kit::test]
 async fn keys_typed_into_a_field_leave_the_list_and_pane_alone(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -1122,7 +1123,12 @@ async fn keys_typed_into_a_field_leave_the_list_and_pane_alone(cx: &mut TestAppC
             })
             .unwrap();
         assert!(typing, "{field} has focus");
-        for key in ["home", "end", "up", "down", "escape"] {
+        let keys: &[&str] = if field == "list-filter" {
+            &["home", "end", "up", "down"]
+        } else {
+            &["home", "end", "up", "down", "escape"]
+        };
+        for key in keys {
             t.press(cx, key);
             unchanged(cx, field);
         }

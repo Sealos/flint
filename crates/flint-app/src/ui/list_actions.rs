@@ -5,8 +5,8 @@
 use gpui_kit::*;
 
 use super::super::registry::{
-    ActionError, Bind, CloseDetail, FocusFilter, OnView, SelectFirst, SelectLast, SelectNext,
-    SelectPrev, SelectRow, SortBy, ToggleWide,
+    ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, SelectFirst, SelectLast,
+    SelectNext, SelectPrev, SelectRow, SortBy, ToggleWide,
 };
 use super::{ResourceList, find_row, list_model};
 
@@ -22,6 +22,7 @@ impl ResourceList {
             .bind::<SortBy>(Self::sort_by)
             .bind::<ToggleWide>(Self::toggle_wide)
             .bind::<FocusFilter>(Self::focus_filter)
+            .bind::<FocusRows>(Self::focus_rows)
     }
 
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {
@@ -113,6 +114,12 @@ impl ResourceList {
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
         let focus = self.filter.focus_handle(cx);
         window.focus(&focus, cx);
+    }
+
+    /// Back to the rows from the filter; the filter keeps its text.
+    fn focus_rows(&mut self, _: &FocusRows, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 }
 
