@@ -125,10 +125,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-15 Credentials in logs don't reach the agent
 - **When** an agent reads pod logs or events that contain a token, a password pair, a private key or a cloud access
-  key.
-- **Then** each value is replaced with a marker, and the result says how many were replaced. The rest of the line is
-  unchanged.
-- Tests: unit (redactor patterns), mcp + cluster.
+  key, through `get_pod_logs`, `get_events`, `list_resources` or `get_resource`.
+- **Then** each value is replaced with a marker such as `[REDACTED:password]`, and the result says how many were
+  replaced. The rest of the line is unchanged: keys, URL users and hosts, header schemes.
+- **And** Flint's own log viewer and events still show the text as written.
+- Tests: unit (redactor patterns, ordinary lines untouched, throughput), mcp, core.
 
 ### UP-16 See what an agent read
 - **When** an agent has called Flint's MCP tools, and I open a cluster's agent activity.

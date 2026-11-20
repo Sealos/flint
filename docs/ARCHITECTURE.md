@@ -681,11 +681,33 @@ Rules:
   like an unexposed cluster. With a namespace scope, cluster-scoped kinds will be hidden unless the kinds scope names
   them. Not built yet: today an exposed cluster is readable in full.
 - **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept.
-  `metadata.managedFields` is removed from all output. Nothing else is redacted: ConfigMap data, literal `env` values
-  in pod specs, annotations and custom resources reach the agent as the cluster returns them. **Pod logs and event
-  messages are not redacted yet either:** they are cut only by the size limits below. A shared redactor that replaces
-  values that look like credentials (auth headers, JWTs, private keys, cloud access keys, `password=`-style pairs)
-  and says how many were replaced is planned for M5.5 (#68).
+  `metadata.managedFields` is removed from all output.
+  - **Credentials in text** ([ADR-0013](./adr/0013-agent-trust-model.md)): `flint_core::redact::redact_credentials`
+    replaces each value that looks like a credential with `[REDACTED:<kind>]`, keeping the key, the scheme, the user
+    and host of a URL, and the rest of the line. It covers `Authorization`/`Proxy-Authorization` header values
+    (Basic, Bearer and other schemes, also in JSON and Go header maps), bearer tokens, passwords in URLs
+    (`scheme://user:pass@host`), AWS access key ids (`AKIA`/`ASIA`) and secret access keys (by key name, or a
+    40-character mixed-case value on the same line as a key id), GCP API keys, GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`,
+    `ghr_`, `github_pat_`), GitLab (`glpat-`) and Slack (`xox?-`, `xapp-`) tokens, Slack webhook paths, Azure SAS
+    `sig=` values, JWTs, private key blocks (PEM and PGP; the BEGIN and END lines are kept, and a block cut off by the
+    log tail is hidden up to the cut), and the values of keys ending in `password`, `passwd`, `secret`, `token`,
+    `api_key`/`apikey`/`api-key`, `access_key`, `secret_key`, `private_key` or `account_key`, with `=`, `:`, `=>`,
+    `:=` or a URL-encoded `=`, bare or quoted, as in logfmt, JSON (escaped JSON too), YAML, Ruby and Go, plus
+    command-line flags such as `--password hunter2`. A bare value runs to the next space or quote. Masks a workload
+    already wrote (`****`, `[REDACTED]`) are left alone. The patterns err toward redacting.
+  - **Where it applies:** every line `get_pod_logs` returns; every event message `get_events` returns; every
+    `list_resources` cell (printer columns show event, status and condition messages); every string, at any depth,
+    under a `note` key or a key ending in `message` in `get_resource` (event messages and notes, status and
+    condition messages, container termination messages, which can be the last log lines, and operators'
+    `failureMessage` or `errorMessage`); and tool error text. Each result says how many values were replaced
+    (`"redacted"` in JSON, a `# redacted=N` first line on YAML).
+  - **Speed:** one Aho-Corasick pass over the whole text finds trigger words; only lines holding one are matched,
+    and only against the rules those triggers start. Private key blocks are found first, over the whole text. The
+    `regex` crate runs in linear time, so no input backtracks catastrophically. About 340 MB/s on a release build.
+  - **Not redacted:** ConfigMap data, literal `env` values in pod specs, annotations (other than on Secrets) and
+    custom resource fields other than messages reach the agent as the cluster returns them.
+  - **The app is unchanged:** its log viewer, events and object views show the cluster's text as written, since
+    people look at their own cluster there.
 - **Activity log (planned, M5.5, #69):** every call will be recorded (time, cluster, tool, what it named, result
   size, cut short or denied), never the returned content, and the app will show it per cluster. Not built yet.
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
@@ -695,7 +717,8 @@ Rules:
 
 The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
 tool layer and the policy (opt-in, limits) live in `flint-mcp`. The redaction rules live in `flint_core::redact`, so
-the app and the MCP server hide the same things.
+the app and the MCP server hide the same Secret values; the credential redactor for text is applied by the MCP server
+only.
 
 ## Look and keyboard
 

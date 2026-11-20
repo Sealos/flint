@@ -100,7 +100,11 @@ type ToolResult = Result<CallToolResult, rmcp::ErrorData>;
 fn finish(result: Result<String, ToolError>) -> ToolResult {
     Ok(match result {
         Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Err(ToolError(msg)) => CallToolResult::error(vec![ContentBlock::text(msg)]),
+        // A server's error text can quote what a workload wrote (webhooks, aggregated APIs).
+        Err(ToolError(mut msg)) => {
+            policy::redact_text(&mut msg);
+            CallToolResult::error(vec![ContentBlock::text(msg)])
+        }
     })
 }
 
@@ -505,7 +509,7 @@ impl FlintMcp {
         .await
         .map_err(|e| conn.fail(e))?;
         let is_secret = kind.group().is_empty() && kind.kind() == "Secret";
-        let (columns, rows, cut) =
+        let (columns, rows, cut, redacted) =
             table_rows(&page, is_secret, table::unix_now(), policy::LIST_BYTES);
         let mut out = json!({
             "cluster": p.cluster,
@@ -515,6 +519,7 @@ impl FlintMcp {
             "count": rows.len(),
             "truncated": page.more,
             "continue": page.continue_token,
+            "redacted": redacted,
             "columns": columns,
             "rows": rows,
         });
@@ -543,17 +548,23 @@ impl FlintMcp {
             value["apiVersion"] = json!(kind.api_version());
             value["kind"] = json!(kind.kind());
         }
-        policy::sanitize(&mut value);
+        let redacted = policy::sanitize(&mut value);
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
-        Ok(if truncated {
-            format!(
-                "# truncated=true: output cut at {} bytes\n{text}",
+        let mut out = String::new();
+        if redacted > 0 {
+            out.push_str(&format!(
+                "# redacted={redacted}: credentials in messages were replaced\n"
+            ));
+        }
+        if truncated {
+            out.push_str(&format!(
+                "# truncated=true: output cut at {} bytes\n",
                 policy::OBJECT_BYTES
-            )
-        } else {
-            text.to_owned()
-        })
+            ));
+        }
+        out.push_str(text);
+        Ok(out)
     }
 
     async fn do_get_events(&self, p: GetEventsParams) -> Result<String, ToolError> {
@@ -576,6 +587,7 @@ impl FlintMcp {
         .await
         .map_err(|e| conn.fail(e))?;
         let truncated = more || events.len() > limit;
+        let mut redacted = 0;
         let rows: Vec<Value> = events
             .iter()
             .take(limit)
@@ -591,7 +603,10 @@ impl FlintMcp {
                     ),
                     "namespace": e.metadata.namespace,
                     "count": e.count,
-                    "message": e.message,
+                    "message": e.message.clone().map(|mut m| {
+                        redacted += policy::redact_text(&mut m);
+                        m
+                    }),
                 })
             })
             .collect();
@@ -599,6 +614,7 @@ impl FlintMcp {
             "cluster": p.cluster,
             "count": rows.len(),
             "truncated": truncated,
+            "redacted": redacted,
             "events": rows,
         }))
     }
@@ -638,14 +654,16 @@ impl FlintMcp {
         }
         let (text, cut_lines) = policy::tail_lines(&text, lines as usize);
         let (text, cut_bytes) = policy::tail_bytes(text, policy::LOG_BYTES);
+        let text = flint_core::redact::redact_credentials(text);
         to_json(&json!({
             "cluster": p.cluster,
             "namespace": p.namespace,
             "pod": p.pod,
             "container": p.container,
-            "lines": text.lines().count(),
+            "lines": text.text.lines().count(),
             "truncated": cut_lines || cut_bytes || cut_fetch,
-            "log": text,
+            "redacted": text.count,
+            "log": text.text,
         }))
     }
 }
@@ -671,13 +689,15 @@ impl Inner {
 /// Column names and rows for list_resources. Each row is `{name, namespace, created, cells}`,
 /// with `cells` in column order as `kubectl get` prints them (ages computed from `now`).
 /// Wide (priority > 0) columns are marked with `"wide": true`. Rows stop once they add up to
-/// `max_bytes` of JSON; the flag says whether any were dropped.
+/// `max_bytes` of JSON; the flag says whether any were dropped. Cells pass through the
+/// credential redactor (printer columns can show event and status messages); the last value
+/// is how many credentials it replaced.
 fn table_rows(
     page: &TablePage,
     is_secret: bool,
     now: i64,
     max_bytes: usize,
-) -> (Vec<Value>, Vec<Value>, bool) {
+) -> (Vec<Value>, Vec<Value>, bool, usize) {
     let columns: Vec<Value> = page
         .columns
         .iter()
@@ -691,6 +711,7 @@ fn table_rows(
         .collect();
     let mut bytes = 0;
     let mut cut = false;
+    let mut redacted = 0;
     let mut rows = Vec::new();
     for row in &page.rows {
         let value = {
@@ -700,7 +721,9 @@ fn table_rows(
                     if is_secret && !policy::is_safe_secret_column(&page.columns[i].name) {
                         policy::REDACTED.to_owned()
                     } else {
-                        text.into_owned()
+                        let mut text = text.into_owned();
+                        redacted += policy::redact_text(&mut text);
+                        text
                     }
                 })
                 .collect();
@@ -718,7 +741,7 @@ fn table_rows(
         }
         rows.push(value);
     }
-    (columns, rows, cut)
+    (columns, rows, cut, redacted)
 }
 
 #[cfg(test)]
@@ -795,9 +818,9 @@ mod tests {
                 Cell::Text("n1".into()),
             ],
         );
-        let (columns, rows, cut) = table_rows(&page, false, 1_090, policy::LIST_BYTES);
+        let (columns, rows, cut, _) = table_rows(&page, false, 1_090, policy::LIST_BYTES);
         assert!(!cut);
-        let (_, few, cut) = table_rows(&page, false, 1_090, 10);
+        let (_, few, cut, _) = table_rows(&page, false, 1_090, 10);
         assert!(cut && few.is_empty(), "the byte cap applies");
         assert_eq!(columns[4], json!({"name": "Node", "wide": true}));
         assert_eq!(rows[0]["cells"], json!(["web", "demo", "1/1", "90s", "n1"]));
@@ -824,12 +847,40 @@ mod tests {
                 Cell::Age,
             ],
         );
-        let (_, rows, _) = table_rows(&page, true, 1_000, policy::LIST_BYTES);
+        let (_, rows, _, _) = table_rows(&page, true, 1_000, policy::LIST_BYTES);
         let text = rows[0].to_string();
         assert!(!text.contains("hunter2"), "{text}");
         assert_eq!(
             rows[0]["cells"],
             json!(["web", "Opaque", "2", policy::REDACTED, "0s"])
+        );
+    }
+
+    // covers UP-15
+    #[test]
+    fn row_cells_are_redacted_and_counted() {
+        // An Event row: the Message column shows the event message.
+        let page = page(
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Reason", ColumnRole::Value, 0),
+                col("Message", ColumnRole::Value, 0),
+            ],
+            vec![
+                Cell::Name,
+                Cell::Text("Failed".into()),
+                Cell::Text("pull from https://bot:hunter2@registry.example.com failed".into()),
+            ],
+        );
+        let (_, rows, _, redacted) = table_rows(&page, false, 1_000, policy::LIST_BYTES);
+        assert_eq!(redacted, 1);
+        assert_eq!(
+            rows[0]["cells"],
+            json!([
+                "web",
+                "Failed",
+                "pull from https://bot:[REDACTED:password]@registry.example.com failed"
+            ])
         );
     }
 

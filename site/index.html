@@ -152,7 +152,7 @@ claude mcp add flint -- /usr/local/bin/flint mcp</code></pre>
         <ul class="ticks">
           <li>Nothing is exposed by default. You opt in per cluster with <b>Expose to AI</b>.</li>
           <li>An exposure is tied to the API server URL, so a re-pointed context is hidden again.</li>
-          <li>Secret values are always redacted, and large outputs are cut short.</li>
+          <li>Secret values are always redacted, credentials in pod logs and event messages are replaced with markers, and large outputs are cut short.</li>
         </ul>
       </div>
       <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># link the app's binary once (DMG install)</span>

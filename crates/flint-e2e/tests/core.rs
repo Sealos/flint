@@ -1224,3 +1224,63 @@ async fn closing_or_dropping_a_shell_closes_its_connection() {
     server.wait_for_exec_sessions(0, WAIT).await.unwrap();
     assert_eq!(server.exec_sessions().len(), 2);
 }
+
+// covers UP-15
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_app_reads_logs_and_events_as_written() {
+    // Redaction is for agents (`flint mcp`); people see their own cluster's text unchanged.
+    let server = FakeApiServer::start().await.unwrap();
+    let token = "Authorization: Bearer s3cr3t-t0ken-value-0123";
+    let url = "https://bot:hunter2@registry.example.com";
+    server.set_log("demo", "web-69c6f74b8b-qv4xv", &format!("{token}\n"));
+    server.set_object(
+        &server.gvr("events"),
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {"name": "web.pull", "namespace": "demo"},
+            "involvedObject": {"kind": "Pod", "name": "web-69c6f74b8b-qv4xv", "namespace": "demo"},
+            "reason": "Failed",
+            "message": format!("Failed to pull from {url}"),
+            "type": "Warning",
+        }),
+    );
+
+    let core = Core::start(&server, Some("demo")).await;
+    let target = LogTarget {
+        namespace: "demo".into(),
+        pod: "web-69c6f74b8b-qv4xv".into(),
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    let snap = until_log(&mut session, "the line", |s| !s.lines.is_empty()).await;
+    assert_eq!(log_texts(&snap), [token]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let loaded = kubeconfig_of(&server, dir.path());
+    let (client, _) = cluster::connect_and_check(&loaded.merged, CONTEXT, WAIT)
+        .await
+        .unwrap();
+    let (events, _) = read::events(
+        &client,
+        &read::EventQuery {
+            namespace: Some("demo".into()),
+            involved: Some(read::InvolvedObject {
+                kind: None,
+                name: Some("web-69c6f74b8b-qv4xv".into()),
+            }),
+            field_selector: None,
+            fetch_limit: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.as_deref().is_some_and(|m| m.contains(url))),
+        "{events:?}"
+    );
+}

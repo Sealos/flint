@@ -3,9 +3,10 @@
 //! Not here:
 //! - UP-05 (exec-plugin auth when launched from Finder): needs a real cloud cluster and a Finder
 //!   launch; manual at release. PATH resolution is unit-tested in flint-core.
-//! - UP-09, UP-10, UP-11: MCP only, no app; in tests/mcp.rs (they run on Linux too).
-//! - UP-14, UP-15, UP-16 (scoped exposure, log redaction for agents, agent activity): not built
-//!   yet (planned in #70); they get tests when they land.
+//! - UP-09, UP-10, UP-11, UP-15: MCP only, no app; in tests/mcp.rs (they run on Linux too).
+//!   UP-15's "the app shows logs and events as written" is in tests/core.rs.
+//! - UP-14, UP-16 (scoped exposure, agent activity): not built yet (planned in #70); they get
+//!   tests when they land.
 //! - UP-13's "follows macOS live" needs the system appearance to change, which a test must not
 //!   do to the user's Mac. Dark mode working (M0's bar) is checked here through the View >
 //!   Appearance actions.

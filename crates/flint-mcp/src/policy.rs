@@ -128,18 +128,59 @@ pub fn exposed_cluster<'a>(
         .ok_or_else(|| PolicyError::ClusterNotFound(name.to_owned()))
 }
 
-/// Makes an object safe to show: removes `metadata.managedFields` and redacts Secret values.
-/// Works on single objects and on lists (`items`).
-pub fn sanitize(value: &mut Value) {
+/// Makes an object safe to show: removes `metadata.managedFields`, redacts Secret values, and
+/// redacts credentials in message fields ([`redact_messages`]). Works on single objects and on
+/// lists (`items`). Returns how many credentials were replaced in messages.
+pub fn sanitize(value: &mut Value) -> usize {
+    let mut count = 0;
     if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
         for item in items {
-            sanitize(item);
+            count += sanitize(item);
         }
     }
     flint_core::read::strip_managed_fields(value);
     if flint_core::redact::is_secret_object(value) {
         flint_core::redact::mask_secret(value, REDACTED);
     }
+    count + redact_messages(value)
+}
+
+/// Whether an object field holds free text that a workload or controller wrote: an Event's
+/// `message` (`note` in `events.k8s.io`), status and condition messages, container termination
+/// messages (which can be the container's last log lines), and operators' `failureMessage`,
+/// `errorMessage` or `statusMessage`.
+fn is_message_field(key: &str) -> bool {
+    key == "note"
+        || key
+            .get(key.len().saturating_sub("message".len())..)
+            .is_some_and(|end| end.eq_ignore_ascii_case("message"))
+}
+
+/// Replaces credential-shaped values ([`flint_core::redact::redact_credentials`]) in every
+/// string under a `note` key or a key ending in `message`, at any depth. Returns how many were
+/// replaced.
+pub fn redact_messages(value: &mut Value) -> usize {
+    match value {
+        Value::Object(map) => map
+            .iter_mut()
+            .map(|(key, value)| match value {
+                Value::String(text) if is_message_field(key) => redact_text(text),
+                _ => redact_messages(value),
+            })
+            .sum(),
+        Value::Array(items) => items.iter_mut().map(redact_messages).sum(),
+        _ => 0,
+    }
+}
+
+/// Redacts credentials in `text` in place. Returns how many were replaced.
+pub fn redact_text(text: &mut String) -> usize {
+    let redacted = flint_core::redact::redact_credentials(text);
+    let count = redacted.count;
+    if let std::borrow::Cow::Owned(new) = redacted.text {
+        *text = new;
+    }
+    count
 }
 
 /// Cuts `text` to at most `max_bytes`, at a line boundary when possible. Returns whether it cut.
@@ -342,6 +383,53 @@ mod tests {
         sanitize(&mut cm);
         assert_eq!(cm["data"]["k"], "v");
         assert!(cm["metadata"].get("managedFields").is_none());
+    }
+
+    // covers UP-15
+    #[test]
+    fn messages_are_redacted_at_any_depth() {
+        let mut list = json!({
+            "kind": "List",
+            "items": [
+                {
+                    "apiVersion": "v1",
+                    "kind": "Event",
+                    "metadata": {"name": "e", "annotations": {"message": "password=kept-in-metadata"}},
+                    "reason": "Failed",
+                    "message": "Failed to pull: Authorization: Basic dXNlcjpwYXNz"
+                },
+                {"apiVersion": "events.k8s.io/v1", "kind": "Event", "note": "token=abc123"},
+                {"kind": "Machine", "status": {"failureMessage": "bootstrap failed: password=pw1"}},
+                {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "status": {"containerStatuses": [{"lastState": {"terminated": {
+                        "message": "panic: connect postgres://app:hunter2@db:5432/app"
+                    }}}]}
+                }
+            ]
+        });
+        assert_eq!(sanitize(&mut list), 5);
+        let text = list.to_string();
+        for leaked in [
+            "dXNlcjpwYXNz",
+            "abc123",
+            "hunter2",
+            "kept-in-metadata",
+            "pw1",
+        ] {
+            assert!(!text.contains(leaked), "{leaked}: {text}");
+        }
+        assert_eq!(
+            list["items"][0]["message"],
+            "Failed to pull: Authorization: Basic [REDACTED:authorization]"
+        );
+        assert_eq!(list["items"][0]["reason"], "Failed");
+        assert_eq!(list["items"][1]["note"], "token=[REDACTED:token]");
+
+        let mut plain = json!({"kind": "ConfigMap", "data": {"message": "hello"}});
+        assert_eq!(sanitize(&mut plain), 0);
+        assert_eq!(plain["data"]["message"], "hello");
     }
 
     // covers UP-10
