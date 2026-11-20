@@ -32,6 +32,7 @@ use std::rc::Rc;
 use std::sync::LazyLock;
 
 use gpui_kit::base::actions::{Cancel, Confirm};
+use gpui_kit::component::input;
 use gpui_kit::*;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -49,7 +50,34 @@ actions!(
         /// Always use Flint Light.
         AppearanceLight,
         /// Always use Flint Dark.
-        AppearanceDark
+        AppearanceDark,
+        /// Say which Flint this is: its version, in a dialog.
+        About,
+        /// Hide Flint's windows (macOS).
+        Hide,
+        /// Hide every other app's windows (macOS).
+        HideOthers,
+        /// Show every app's windows again (macOS).
+        ShowAll
+    ]
+);
+actions!(
+    palette,
+    [
+        /// Open the command palette, or close it when it is open.
+        ToggleCommandPalette,
+        /// Move the palette's selection up.
+        PaletteUp,
+        /// Move the palette's selection down.
+        PaletteDown,
+        /// Run the palette's selected entry (or go on to the argument it needs).
+        PaletteConfirm,
+        /// Close the palette, giving focus back to where it was; while it asks for an argument, go
+        /// back a step instead.
+        PaletteDismiss,
+        /// Go back a step (Backspace in the empty search field while the palette asks for an
+        /// argument); otherwise the field deletes as usual.
+        PaletteBack
     ]
 );
 actions!(
@@ -416,6 +444,14 @@ pub struct SaveLines {
     pub timestamps: Option<bool>,
 }
 
+/// Run the palette entry shown in row `row` (a click on it).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = palette, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct PalettePick {
+    pub row: usize,
+}
+
 /// Which part of the app handles an action, and so where it is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -437,6 +473,10 @@ pub enum Scope {
     Logs,
     /// The shell tab shown in the dock.
     Terminal,
+    /// The open command palette.
+    Palette,
+    /// The focused text field (gpui-component's own actions: Cut, Copy, Paste, Select All).
+    TextField,
 }
 
 /// What a palette groups an action under.
@@ -450,6 +490,22 @@ pub enum Category {
     Detail,
     Logs,
     Terminal,
+}
+
+impl Category {
+    /// As the palette shows it beside an action's label.
+    pub fn name(self) -> &'static str {
+        match self {
+            Category::Flint => "Flint",
+            Category::Cluster => "Cluster",
+            Category::Namespace => "Namespace",
+            Category::View => "View",
+            Category::List => "List",
+            Category::Detail => "Detail",
+            Category::Logs => "Logs",
+            Category::Terminal => "Terminal",
+        }
+    }
 }
 
 /// Whether a palette offers an action. Hidden ones exist for automation, or for controls that
@@ -478,6 +534,8 @@ pub enum ArgKind {
     Kind,
     /// A column of the open list.
     Column,
+    /// A container of the pod the detail pane shows.
+    Container,
 }
 
 /// One argument of an action.
@@ -499,10 +557,6 @@ pub enum ActionError {
     )]
     Unknown(String),
     /// The arguments do not fit the action.
-    #[cfg_attr(
-        not(any(test, feature = "automation")),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     InvalidArgs { action: String, message: String },
     /// Nothing in the window handles the action now, or it is disabled (no list is open, no
     /// cluster is active).
@@ -550,10 +604,6 @@ pub struct ActionSpec {
     pub name: &'static str,
     /// A Title Case name for menus and the palette; it ends in "…" when it takes arguments.
     pub label: &'static str,
-    #[cfg_attr(
-        not(any(test, feature = "automation")),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     pub description: &'static str,
     pub category: Category,
     pub scope: Scope,
@@ -579,19 +629,11 @@ impl fmt::Debug for ActionSpec {
 
 impl ActionSpec {
     /// Whether the action needs arguments (a palette asks for them first).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     pub fn takes_args(&self) -> bool {
         !self.args.is_empty()
     }
 
     /// Builds the action from its arguments: a JSON object, or `null` for none.
-    #[cfg_attr(
-        not(any(test, feature = "automation")),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     pub fn build(&self, args: Value) -> Result<Box<dyn Action>, ActionError> {
         (self.build)(args).map_err(|message| ActionError::InvalidArgs {
             action: self.name.to_owned(),
@@ -606,10 +648,6 @@ impl ActionSpec {
 
     /// Whether the action is enabled now, whatever its arguments: its guard, if the workspace
     /// installed one (a list action with no list open is not).
-    #[cfg_attr(
-        not(any(test, feature = "automation")),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     pub fn is_enabled(&self, cx: &App) -> bool {
         guard(self.type_id, cx).is_none_or(|g| (g.enabled)(cx))
     }
@@ -638,10 +676,6 @@ impl ActionSpec {
 
     /// Like [`ActionSpec::is_available`], from `focus` instead of the focused element. A
     /// palette that holds focus itself asks from the element focused before it opened.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     pub fn is_available_in(&self, focus: &FocusHandle, window: &Window, cx: &App) -> bool {
         let handled = match self.scope {
             Scope::App => true,
@@ -656,16 +690,74 @@ impl ActionSpec {
     /// Window's Cmd-W, a shell tab's Ctrl+Shift+W) are not shown.
     #[cfg_attr(
         not(any(test, feature = "automation")),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
+        expect(dead_code, reason = "automation lists every action's shortcut")
     )]
     pub fn shortcut(&self, cx: &App) -> Option<String> {
         let action = (self.probe)();
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
+        self.own_hint(keymap.bindings_for_action(&*action), cx)
+    }
+
+    /// [`ActionSpec::shortcut`] as it works from `focus`, whose key contexts are `contexts`
+    /// (outermost first, as [`Window::context_stack`] gives them while it has focus): the
+    /// action's own binding that fires there. A key bound to something else in a deeper context
+    /// takes it only while that other action would run: Cmd-R in a log tab is Refresh Object
+    /// while the tab has nothing to reconnect. In a log tab, Copy's Cmd-C (a text field's) is not
+    /// shown, since its context does not apply.
+    pub fn shortcut_in(
+        &self,
+        contexts: &[KeyContext],
+        focus: &FocusHandle,
+        window: &Window,
+        cx: &App,
+    ) -> Option<String> {
+        let action = (self.probe)();
+        let own_context = self
+            .key_context
+            .map(|c| KeyBindingContextPredicate::parse(c).expect("static key context parses"));
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let own: Vec<KeyBinding> = keymap
+            .bindings_for_action(&*action)
+            .filter(|b| b.predicate().as_deref() == own_context.as_ref())
+            .cloned()
+            .collect();
+        let is_own = |b: &KeyBinding| {
+            b.action().partial_eq(&*action) && b.predicate().as_deref() == own_context.as_ref()
+        };
+        // The latest added first: it wins over the defaults. Of the bindings for its keys
+        // there, in precedence order, the first that would take the key decides.
+        let fires = own.iter().rev().find(|binding| {
+            let (candidates, _) = keymap.bindings_for_input(binding.keystrokes(), contexts);
+            candidates
+                .iter()
+                .find(|c| is_own(c) || would_run(c.action(), focus, window, cx))
+                .is_some_and(&is_own)
+        })?;
+        self.own_hint(std::iter::once(fires), cx)
+    }
+
+    /// Whether one of the action's own keys fires it from `focus` ([`ActionSpec::shortcut_in`]).
+    pub fn bound_in(
+        &self,
+        contexts: &[KeyContext],
+        focus: &FocusHandle,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.shortcut_in(contexts, focus, window, cx).is_some()
+    }
+
+    /// The last of `bindings` that is one of the action's own keys, as the OS writes it.
+    fn own_hint<'a>(
+        &self,
+        bindings: impl DoubleEndedIterator<Item = &'a KeyBinding>,
+        cx: &App,
+    ) -> Option<String> {
         let os = cx.platform_info().os;
         let own: Vec<String> = self.keys.iter().map(|k| key_hint_for(k, os)).collect();
-        keymap
-            .bindings_for_action(&*action)
+        bindings
             .map(|binding| {
                 binding
                     .keystrokes()
@@ -675,6 +767,19 @@ impl ActionSpec {
                     .join(" ")
             })
             .rfind(|hint| own.contains(hint))
+    }
+}
+
+/// Whether `action`, bound to a key, would take it from `focus`: a key bound to nothing (a shell
+/// tab's own keys) always does; a registered action while it is available; another while
+/// something there handles it.
+fn would_run(action: &dyn Action, focus: &FocusHandle, window: &Window, cx: &App) -> bool {
+    if action.as_any().is::<NoAction>() {
+        return true;
+    }
+    match spec_of(action) {
+        Some(spec) => spec.is_available_in(focus, window, cx),
+        None => window.is_action_available_in(action, focus),
     }
 }
 
@@ -789,10 +894,6 @@ pub fn available<'a>(
 }
 
 /// The actions available from `focus` (the element focused before a palette opened).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the command palette (#29) and automation")
-)]
 pub fn available_in<'a>(
     focus: &'a FocusHandle,
     window: &'a Window,
@@ -847,6 +948,20 @@ pub fn dispatch_in(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<(), ActionError> {
+    check_in(focus, action, window, cx)?;
+    focus.dispatch_action(action, window, cx);
+    Ok(())
+}
+
+/// The checks [`dispatch_in`] makes, without dispatching: whether `action` would be handled
+/// from `focus`, and whether its guard lets it through. The palette asks before it closes, so a
+/// refusal stays on screen beside what was typed.
+pub fn check_in(
+    focus: &FocusHandle,
+    action: &dyn Action,
+    window: &Window,
+    cx: &App,
+) -> Result<(), ActionError> {
     let spec = spec_of(action);
     let handled = match spec {
         Some(spec) if spec.scope == Scope::App => true,
@@ -855,11 +970,10 @@ pub fn dispatch_in(
     if !handled {
         return Err(ActionError::NotAvailable(action.name().to_owned()));
     }
-    if let Some(spec) = spec {
-        spec.validate(action, cx)?;
+    match spec {
+        Some(spec) => spec.validate(action, cx),
+        None => Ok(()),
     }
-    focus.dispatch_action(action, window, cx);
-    Ok(())
 }
 
 /// Checks and dispatches `action` from the workspace's focus target (see [`install`]), or from
@@ -1250,6 +1364,12 @@ pub const TERMINAL: &str = "Terminal";
 const LOG_PLAIN: &str = "LogView && !Input";
 /// Keys meant for the log tab's search field itself (Esc), which the field passes on.
 const LOG_SEARCH: &str = "LogView > Input";
+/// The command palette's key context.
+pub const PALETTE: &str = "CommandPalette";
+/// Keys the palette takes from its own search field (the arrows, Enter, Esc), over the field's.
+const PALETTE_INPUT: &str = "CommandPalette > Input";
+/// A focused text field, where gpui-component handles Cut, Copy, Paste and Select All.
+const TEXT_FIELD: &str = "Input";
 
 fn build_unit<A: Action + Default>(args: Value) -> Result<Box<dyn Action>, String> {
     match args {
@@ -1394,8 +1514,9 @@ const COLUMN: &[Arg] = &[arg(
     ArgKind::Column,
 )];
 const KEY: &[Arg] = &[arg("key", "the data key", ArgKind::Text)];
+const PALETTE_ROW: &[Arg] = &[arg("row", "row, from the top, 0 and up", ArgKind::Number)];
 const CONTAINER: &[Arg] = &[
-    arg("container", "container name", ArgKind::Text),
+    arg("container", "container name", ArgKind::Container),
     Arg {
         name: "previous",
         description: "the previous (terminated) instance",
@@ -1411,7 +1532,7 @@ const SELECTOR: &[Arg] = &[
         ArgKind::Text,
     ),
 ];
-const SHELL_CONTAINER: &[Arg] = &[arg("container", "container name", ArgKind::Text)];
+const SHELL_CONTAINER: &[Arg] = &[arg("container", "container name", ArgKind::Container)];
 const CELLS: &[Arg] = &[
     arg(
         "start_row",
@@ -1476,6 +1597,69 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             .of(C::Flint, S::App),
         Spec::unit::<AppearanceDark>("Use Dark Appearance", "Always use Flint Dark.")
             .of(C::Flint, S::App),
+        Spec::unit::<About>("About Flint", "Show Flint's version.").of(C::Flint, S::Workspace),
+        Spec::unit::<ToggleCommandPalette>(
+            "Show Command Palette",
+            "Search every action available now, and run one.",
+        )
+        .of(C::Flint, S::Workspace)
+        .keys(&["secondary-shift-p"], Some(WORKSPACE)),
+        Spec::unit::<Hide>("Hide Flint", "Hide Flint's windows.")
+            .of(C::Flint, S::App)
+            .keys(HIDE, None),
+        Spec::unit::<HideOthers>("Hide Others", "Hide the windows of every other app.")
+            .of(C::Flint, S::App)
+            .keys(HIDE_OTHERS, None),
+        Spec::unit::<ShowAll>("Show All", "Show the windows of every app again.")
+            .of(C::Flint, S::App),
+        // The Edit menu, for the text fields (the list filter, the namespace field, dialogs):
+        // gpui-component's own actions, which a focused field handles.
+        Spec::unit::<input::Cut>("Cut", "Cut the selected text of the focused field.")
+            .of(C::Flint, S::TextField)
+            .keys(&["secondary-x"], Some(TEXT_FIELD)),
+        Spec::unit::<input::Copy>("Copy", "Copy the selected text of the focused field.")
+            .of(C::Flint, S::TextField)
+            .keys(&["secondary-c"], Some(TEXT_FIELD)),
+        Spec::unit::<input::Paste>("Paste", "Paste into the focused field.")
+            .of(C::Flint, S::TextField)
+            .keys(&["secondary-v"], Some(TEXT_FIELD)),
+        Spec::unit::<input::SelectAll>("Select All", "Select all the text of the focused field.")
+            .of(C::Flint, S::TextField)
+            .keys(&["secondary-a"], Some(TEXT_FIELD)),
+        // The palette's own keys, while it is open; it does not list them.
+        Spec::unit::<PaletteUp>("Select Previous Command", "Move the palette's selection up.")
+            .of(C::Flint, S::Palette)
+            .keys(&["up", "ctrl-p"], Some(PALETTE_INPUT))
+            .hidden(),
+        Spec::unit::<PaletteDown>("Select Next Command", "Move the palette's selection down.")
+            .of(C::Flint, S::Palette)
+            .keys(&["down", "ctrl-n"], Some(PALETTE_INPUT))
+            .hidden(),
+        Spec::unit::<PaletteConfirm>(
+            "Run Selected Command",
+            "Run the palette's selected entry, or ask for the argument it needs.",
+        )
+        .of(C::Flint, S::Palette)
+        .keys(&["enter"], Some(PALETTE_INPUT))
+        .hidden(),
+        Spec::unit::<PaletteDismiss>(
+            "Close Command Palette",
+            "Close the palette and give focus back to where it was, or go back a step while it \
+             asks for an argument.",
+        )
+        .of(C::Flint, S::Palette)
+        .keys(&["escape"], Some(PALETTE_INPUT))
+        .hidden(),
+        Spec::unit::<PaletteBack>(
+            "Go Back a Step",
+            "In the palette's empty field, go back to the previous argument or the actions.",
+        )
+        .of(C::Flint, S::Palette)
+        .keys(&["backspace"], Some(PALETTE_INPUT))
+        .hidden(),
+        Spec::with_args::<PalettePick>("Run Command in Row…", "Run the palette entry in a row.", PALETTE_ROW)
+            .of(C::Flint, S::Palette)
+            .hidden(),
         Spec::confirm(),
         Spec::unit::<Cancel>("Cancel", "Dismiss the open dialog.").of(C::Flint, S::Dialog),
         // Clusters.
@@ -1608,8 +1792,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Sort by a column: ascending, descending, then unsorted.",
             COLUMN,
         )
-        .of(C::List, S::List)
-        .hidden(),
+        .of(C::List, S::List),
         // Detail pane.
         Spec::unit::<Close>("Close Detail", "Close the detail pane.")
             .of(C::Detail, S::Detail)
@@ -1917,6 +2100,19 @@ const fn restart_shell_keys(mac: bool) -> &'static [&'static str] {
     }
 }
 
+/// Hide Flint: Cmd-H on macOS. Linux desktops have no such command, and Ctrl-H is a shell's.
+const HIDE: &[&str] = if cfg!(target_os = "macos") {
+    &["secondary-h"]
+} else {
+    &[]
+};
+/// Hide Others: Option-Cmd-H on macOS; nothing elsewhere.
+const HIDE_OTHERS: &[&str] = if cfg!(target_os = "macos") {
+    &["secondary-alt-h"]
+} else {
+    &[]
+};
+
 /// Copy in a shell tab: Cmd-C on macOS; Ctrl-Shift-C elsewhere, where Ctrl-C interrupts the
 /// program.
 pub(in crate::ui) const TERMINAL_COPY: &[&str] = if cfg!(target_os = "macos") {
@@ -2154,7 +2350,6 @@ pub mod tests {
         for name in [
             "workspace::SetPaneWidth",
             "resource_list::SelectRow",
-            "resource_list::SortBy",
             "workspace::ToggleNavSection",
             "workspace::SetNamespaces",
             "detail::ToggleSecretValue",
@@ -2163,6 +2358,57 @@ pub mod tests {
             assert!(hidden.contains(&name), "{name} is in the palette");
         }
         assert!(!hidden.contains(&"detail::Close"));
+        // Reachable only from the palette (#29): no key, no menu item, no control.
+        for name in [
+            "resource_list::SortBy",
+            "workspace::SelectCluster",
+            "workspace::OpenView",
+            "logs::OpenSelectorLogs",
+        ] {
+            assert!(!hidden.contains(&name), "{name} is hidden from the palette");
+        }
+        // The palette's own keys are not entries in it.
+        for spec in actions().iter().filter(|s| s.scope == Scope::Palette) {
+            assert_eq!(spec.visibility, Visibility::Hidden, "{}", spec.name);
+        }
+    }
+
+    // The standard macOS menu items are actions in category Flint (#29), the Edit menu's for
+    // text fields only, so they never take a key from a shell tab.
+    #[test]
+    fn standard_menu_items_are_registered() {
+        for (name, label) in [
+            ("flint::About", "About Flint"),
+            ("flint::Hide", "Hide Flint"),
+            ("flint::HideOthers", "Hide Others"),
+            ("flint::ShowAll", "Show All"),
+            ("input::Cut", "Cut"),
+            ("input::Copy", "Copy"),
+            ("input::Paste", "Paste"),
+            ("input::SelectAll", "Select All"),
+        ] {
+            let spec = find(name).unwrap_or_else(|| panic!("{name} is not registered"));
+            assert_eq!(spec.label, label);
+            assert_eq!(spec.category, Category::Flint, "{name}");
+            assert_eq!(spec.visibility, Visibility::Palette, "{name}");
+        }
+        let mac = cfg!(target_os = "macos");
+        let hide: &[&str] = if mac { &["secondary-h"] } else { &[] };
+        let hide_others: &[&str] = if mac { &["secondary-alt-h"] } else { &[] };
+        assert_eq!(find("flint::Hide").unwrap().keys, hide);
+        assert_eq!(find("flint::HideOthers").unwrap().keys, hide_others);
+        for (name, key) in [
+            ("input::Cut", "secondary-x"),
+            ("input::Copy", "secondary-c"),
+            ("input::Paste", "secondary-v"),
+            ("input::SelectAll", "secondary-a"),
+        ] {
+            let spec = find(name).unwrap();
+            assert_eq!(spec.keys, [key]);
+            assert_eq!(spec.scope, Scope::TextField);
+            assert_eq!(spec.key_context, Some(super::TEXT_FIELD));
+            assert_ne!(spec.key_context, Some(super::TERMINAL));
+        }
     }
 
     #[test]
@@ -2242,6 +2488,7 @@ pub mod tests {
         key.contains('-')
             || context.is_some_and(|c| c.contains("!Input"))
             || (key == "escape" && context == Some(super::LOG_SEARCH))
+            || context == Some(super::PALETTE_INPUT)
     }
 
     #[test]
@@ -2253,6 +2500,9 @@ pub mod tests {
         assert!(plain_key_allowed("secondary-f", search));
         assert!(plain_key_allowed("t", Some("LogView && !Input")));
         assert!(!plain_key_allowed("escape", Some("Workspace")));
+        // The palette's search field gives its arrows, Enter and Esc to the palette.
+        assert!(plain_key_allowed("enter", Some(super::PALETTE_INPUT)));
+        assert!(!plain_key_allowed("enter", Some(super::PALETTE)));
     }
 
     // covers UP-41: on Linux, `secondary-` app shortcuts become Ctrl ones. Every one that is

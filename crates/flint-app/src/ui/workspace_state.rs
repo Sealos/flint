@@ -27,7 +27,11 @@ impl Workspace {
         let dialog = confirm::shown(window, cx).map(|d| DialogState {
             title: d.title,
             text: d.text,
-            buttons: vec![d.ok, d.cancel],
+            // A notice (About Flint) has no Cancel.
+            buttons: [d.ok, d.cancel]
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .collect(),
         });
         let window_height = f32::from(window.viewport_size().height);
         let dock = self
@@ -167,6 +171,7 @@ impl Workspace {
             }),
             dock,
             menu,
+            palette: self.palette.as_ref().map(|(p, _)| p.read(cx).view_state()),
         }
     }
 
@@ -188,6 +193,13 @@ impl Workspace {
         }
         if self.focus.is_focused(window) {
             return Focus::Workspace;
+        }
+        if self
+            .palette
+            .as_ref()
+            .is_some_and(|(p, _)| p.read(cx).has_focus(window, cx))
+        {
+            return Focus::Palette;
         }
         if let Some(focus) = self
             .list

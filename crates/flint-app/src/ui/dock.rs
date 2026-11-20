@@ -688,6 +688,12 @@ impl Dock {
         cx.notify();
     }
 
+    /// The open tab list, for tests.
+    #[cfg(test)]
+    pub(in crate::ui) fn tab_menu_for_tests(&self) -> Option<Entity<PopupMenu>> {
+        self.tab_menu.as_ref().map(|(menu, _)| menu.clone())
+    }
+
     /// The tab shown, if the dock is visible and has one: what Close Dock Tab closes.
     pub fn shown_tab(&self) -> Option<u64> {
         self.active.filter(|_| self.visible)

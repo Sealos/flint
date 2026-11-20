@@ -2,6 +2,7 @@
 //! the workspace's guards share with them. The toolbar's buttons dispatch these actions; mouse
 //! selection and keystrokes for the shell are not actions (they are the program's input).
 
+use gpui_kit::component::input;
 use gpui_kit::*;
 
 use super::super::registry::{
@@ -17,15 +18,7 @@ impl TerminalView {
     /// Every shell tab action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<CopyText>(Self::copy_text)
-            .bind::<PasteText>(|view, _, window, cx| {
-                let text = cx.read_from_clipboard().and_then(|item| item.text());
-                match text {
-                    Some(text) if view.is_live() && !text.is_empty() => {
-                        view.paste(text, window, cx)
-                    }
-                    _ => {}
-                }
-            })
+            .bind::<PasteText>(|view, _, window, cx| view.paste_clipboard(window, cx))
             .bind::<ScrollPageUp>(|view, _, _, _| {
                 let page = i32::from(view.snapshot.terminal.size.rows);
                 view.session.scroll(page);
@@ -112,8 +105,27 @@ impl TerminalView {
         });
     }
 
+    /// Pastes the clipboard's text, if any, while the shell runs ([`TerminalView::paste`]).
+    fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        match text {
+            Some(text) if self.is_live() && !text.is_empty() => self.paste(text, window, cx),
+            _ => {}
+        }
+    }
+
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {
-        Self::bind_actions(OnView::new(element, cx)).into_element()
+        let element = Self::bind_actions(OnView::new(element, cx)).into_element();
+        // Edit > Copy and Edit > Paste (a text field's actions) do the tab's own copy and paste
+        // while it has focus. Only here, not forwarded: their keys are bound in text fields only,
+        // so the shell keeps its own.
+        element
+            .on_action(cx.listener(|view, _: &input::Copy, window, cx| {
+                view.copy_text(&CopyText, window, cx)
+            }))
+            .on_action(
+                cx.listener(|view, _: &input::Paste, window, cx| view.paste_clipboard(window, cx)),
+            )
     }
 
     /// [`SelectText`] takes cells on the screen, the first not after the last.

@@ -37,6 +37,7 @@ use super::focus::release_unfocused_input;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
+use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
     RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
@@ -183,6 +184,8 @@ pub struct Workspace {
     detail: Option<Entity<DetailView>>,
     /// The bottom dock. It does not change with the active cluster.
     dock: Entity<Dock>,
+    /// The command palette, while it is open.
+    palette: Option<(Entity<CommandPalette>, Subscription)>,
     /// Namespace names of the active cluster, for the namespace filter.
     namespaces: Vec<String>,
     /// Whether the user may list namespaces (`Failed` when not), for the namespace filter.
@@ -306,6 +309,7 @@ impl Workspace {
             list: None,
             detail: None,
             dock,
+            palette: None,
             namespaces: Vec::new(),
             namespaces_state: SyncState::Idle,
             namespace_input,
@@ -1912,6 +1916,23 @@ impl Render for Workspace {
                         )
                     }),
             )
+            .when_some(self.palette.as_ref(), |el, (palette, _)| {
+                // Over everything, near the top, as in Zed. The overlay itself takes no clicks.
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .justify_center()
+                        // As tall as its content: a click below it is outside it.
+                        .items_start()
+                        .pt(px(56.))
+                        .px_4()
+                        .child(palette.clone()),
+                )
+            })
     }
 }
 
