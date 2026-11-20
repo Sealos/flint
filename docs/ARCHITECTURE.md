@@ -736,7 +736,9 @@ Rules:
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
   and 500 log lines), and lists, objects and logs are also capped at 256 KiB. When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
-- **stdout is the protocol channel:** all logging goes to stderr.
+- **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
+  `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
+  app).
 
 The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
 tool layer and the policy (opt-in, limits) live in `flint-mcp`. The redaction rules live in `flint_core::redact`, so

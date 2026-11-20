@@ -151,10 +151,12 @@ and use your own. Only `PATH` is read: a `KUBECONFIG` exported in your shell is 
 unless you add files with `kubeconfig_paths`.
 
 **Logs.** Flint logs to stderr only, so an app opened from Finder or the Dock keeps no log. To see one, start it from
-a terminal: `/Applications/Flint.app/Contents/MacOS/flint`.
+a terminal: `/Applications/Flint.app/Contents/MacOS/flint`. It prints warnings and errors only; add `--verbose` for
+info, or set `FLINT_LOG` (see [Build and run](#build-and-run)).
 
 **The command-line binary.** The app's executable is also the `flint` command, for `flint mcp` (see
-[MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`. Until the Homebrew cask puts it on your
+[MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`. `flint --help` lists its commands,
+options and the environment variables it reads. Until the Homebrew cask puts it on your
 `PATH`, link it to `/usr/local/bin/flint`, one stable path for your shell and your MCP client configs. `-f` replaces a
 `flint` installed earlier from the command-line archive below:
 
@@ -284,7 +286,10 @@ watch_mode = "all"                # or "on_view"
 
 The app watches `settings.toml` and your kubeconfig files and picks up changes without a restart.
 
-Set `FLINT_LOG=debug` for more logging (to stderr).
+Flint logs to stderr, warnings and errors only by default. `flint --verbose` (or `flint mcp --verbose`) adds info;
+`FLINT_LOG` sets the filter exactly, for example `FLINT_LOG=debug` or `FLINT_LOG=flint_core=debug`, and wins over
+`--verbose`. `RUST_LOG` is read when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists the commands, options
+and environment variables, with the development aids below under their own heading.
 
 `FLINT_CLUSTER=<context>` is a development and testing aid, for example for agents that take screenshots: at startup
 Flint activates that context exactly as a click would. It must name a context in the loaded kubeconfig; otherwise Flint
@@ -299,7 +304,8 @@ Two more development aids work together with `FLINT_CLUSTER`, so screenshots can
 
 - `FLINT_VIEW` opens a view once the cluster's discovery arrives: a kind (`pods`, `deployments.apps`,
   `widgets.example.com`; the group may be left out), `kind/name` for a cluster-scoped object, or
-  `namespace/kind/name`. Add `#yaml` to an object to open its YAML tab. Without `FLINT_CLUSTER` it is ignored.
+  `namespace/kind/name`. Add `#yaml` to an object to open its YAML tab, or `#logs` to a pod to open its logs.
+  Without `FLINT_CLUSTER` it is ignored.
 - `FLINT_APPEARANCE=light` or `dark` forces a theme over the `appearance` setting and macOS.
 
 ```sh

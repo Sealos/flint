@@ -214,6 +214,40 @@ fn logs_stay_off_stdout_and_eof_ends_the_server() {
     assert!(stderr.contains("mcp server failed"), "{stderr}");
 }
 
+/// Without `FLINT_LOG` or `RUST_LOG`, the server logs warnings and errors but no INFO lines;
+/// `--verbose` adds them. No cluster, no network.
+#[test]
+fn plain_runs_log_warnings_only_and_verbose_adds_info() {
+    let scratch = tempfile::tempdir().unwrap();
+    let config_dir = scratch.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    // Invalid settings: a warning to see, and no `path`, so with no usable shell no login
+    // shell runs.
+    std::fs::write(config_dir.join("settings.toml"), "path = [\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
+            .args(args)
+            .env("KUBECONFIG", scratch.path().join("none"))
+            .env("FLINT_CONFIG_DIR", &config_dir)
+            .env_remove("FLINT_LOG")
+            .env_remove("RUST_LOG")
+            .env("SHELL", "/nonexistent")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let plain = run(&[]);
+    assert!(plain.contains("using default settings"), "{plain}");
+    assert!(plain.contains("mcp server failed"), "{plain}");
+    assert!(!plain.contains(" INFO "), "{plain}");
+
+    let verbose = run(&["--verbose"]);
+    assert!(verbose.contains(" INFO "), "{verbose}");
+    assert!(verbose.contains("config directory"), "{verbose}");
+}
+
 /// A local port nothing listens on: one the OS just handed out, released again.
 fn closed_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
