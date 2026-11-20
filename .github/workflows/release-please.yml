@@ -19,6 +19,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# bash -eo pipefail, so a failing command before a pipe (`package-macos-app.sh | tee`) fails its
+# step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   release-please:
     runs-on: ubuntu-latest
@@ -64,6 +70,9 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: macos-latest
+    # Two release builds (about 15 minutes each on a cold cache) plus packaging; a hung step must
+    # not hold the runner for the default six hours.
+    timeout-minutes: 90
     env:
       TAG: ${{ needs.release-please.outputs.tag_name }}
       VERSION: ${{ needs.release-please.outputs.version }}
@@ -105,7 +114,7 @@ jobs:
       - name: Package Flint.app and the DMG
         run: |
           scripts/package-macos-app.sh dist/flint/flint "$VERSION" dist/app | tee package.log
-          DMG="Flint-${TAG}-macos-universal.dmg"
+          DMG="flint-${TAG}-macos-universal.dmg"
           # The script prints the DMG's path last; it must be the name `publish` checks for.
           test "$(basename "$(tail -n 1 package.log)")" = "$DMG"
           mv "dist/app/$DMG" "$DMG"
@@ -197,7 +206,7 @@ jobs:
           names=$(gh release view "$TAG" --json isDraft,assets --jq 'select(.isDraft == false) | .assets[].name')
           for file in \
             "flint-${TAG}-macos-universal.tar.gz" \
-            "Flint-${TAG}-macos-universal.dmg" \
+            "flint-${TAG}-macos-universal.dmg" \
             "flint-${TAG}-linux-x86_64.AppImage" \
             "flint-${TAG}-linux-aarch64.AppImage"; do
             for want in "$file" "$file.sha256"; do

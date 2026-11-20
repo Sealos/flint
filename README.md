@@ -16,12 +16,12 @@ Appearance, or the `appearance` setting, overrides it). Shells open on any clust
 ## Install from a release
 
 Each [release](https://github.com/Sealos/flint/releases) has `Flint.app` in a disk image,
-`Flint-vX.Y.Z-macos-universal.dmg`, for Apple Silicon and Intel Macs on macOS 13 or later. Releases after v0.2.0 have
+`flint-vX.Y.Z-macos-universal.dmg`, for Apple Silicon and Intel Macs on macOS 13 or later. Releases after v0.2.0 have
 it; replace `vX.Y.Z` with the newest tag on the releases page.
 
 1. Download the DMG from the releases page (or with
-   `gh release download vX.Y.Z -R Sealos/flint -p 'Flint-*-macos-universal.dmg*'`). To check it, run
-   `shasum -a 256 -c Flint-vX.Y.Z-macos-universal.dmg.sha256` next to it.
+   `gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-macos-universal.dmg*'`). To check it, run
+   `shasum -a 256 -c flint-vX.Y.Z-macos-universal.dmg.sha256` next to it.
 2. Open the DMG and drag **Flint** onto **Applications**, then eject the DMG.
 3. Open Flint from Applications, Launchpad or Spotlight.
 
@@ -39,18 +39,23 @@ quarantined and opens directly.
 
 **Environment.** Opened from Finder, the Dock or Spotlight, Flint gets no terminal environment. It runs your login
 shell once at startup to read its `PATH`, so exec credential plugins (`aws`, `gke-gcloud-auth-plugin`, `kubelogin`)
-and `helm` are found as in a terminal; set `path` in `settings.toml` (below) to override it. Only `PATH` is read: a
-`KUBECONFIG` exported in your shell is not, so Flint reads `~/.kube/config` unless you add files with
-`kubeconfig_paths`.
+and `helm` are found as in a terminal. If the shell takes longer than 3 seconds or fails, Flint uses the `PATH` it was
+started with plus `/opt/homebrew/bin` and `/usr/local/bin`. Set `path` in `settings.toml` (below) to skip the shell
+and use your own. Only `PATH` is read: a `KUBECONFIG` exported in your shell is not, so Flint reads `~/.kube/config`
+unless you add files with `kubeconfig_paths`.
+
+**Logs.** Flint logs to stderr only, so an app opened from Finder or the Dock keeps no log. To see one, start it from
+a terminal: `/Applications/Flint.app/Contents/MacOS/flint`.
 
 **The command-line binary.** The app's executable is also the `flint` command, for `flint mcp` (see
-[MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`:
-`/Applications/Flint.app/Contents/MacOS/flint`. Until the Homebrew cask puts it on your `PATH`, call it by that path
-or link it:
+[MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`. Until the Homebrew cask puts it on your
+`PATH`, link it to `/usr/local/bin/flint`, one stable path for your shell and your MCP client configs. `-f` replaces a
+`flint` installed earlier from the command-line archive below:
 
 ```sh
 sudo mkdir -p /usr/local/bin
-sudo ln -s /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint
+sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint
+flint --version
 ```
 
 ### macOS command-line archive
@@ -223,6 +228,8 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
   `scripts/package-appimage.sh` and smoke-tests it with `scripts/smoke-appimage.sh`.
 - **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. macOS
   runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
+- **macOS packaging, `macos-app (dmg)`:** on PRs that touch the DMG packaging, packages `Flint.app` and its DMG and
+  runs `scripts/smoke-macos-app.sh` and its self-test (`scripts/smoke-macos-app-test.sh`). Not required.
 - **Cluster e2e (Linux):** a kind cluster set up by `scripts/cluster-fixtures.sh`, then the `flint-core` and
   `flint-mcp` tests with `--include-ignored`, the MCP ones through the GPUI-free `flint-mcp` binary. Runs on PRs that
   touch core or MCP, on master, and nightly (which adds the API-server restart test).
@@ -231,6 +238,7 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
   - `cargo machete` (unused dependencies);
   - `typos`;
   - `actionlint`;
+  - `shellcheck` on `scripts/*.sh`;
   - `scripts/check-module-tests.sh`;
   - `scripts/check-theme-colors.sh` (no hard-coded colors in UI code; see below).
 - **PR title:** must be a Conventional Commit, because PRs are squash-merged and release-please reads the subject.
@@ -255,11 +263,12 @@ Large outputs are cut short. Only Secret values are redacted: everything else an
 `env` values in pod specs, and (until M5.5) pod logs and event messages, is sent as the cluster returns it. Only
 expose clusters whose contents, logs and events you are willing to send to your AI provider.
 
-Register it with Claude Code, using the executable inside the app (or `/usr/local/bin/flint` from the command-line
-archive, or `"$PWD/target/release/flint"` after `cargo build --release`):
+Register it with Claude Code by `/usr/local/bin/flint`: the link into `Flint.app` (see
+[Install from a release](#install-from-a-release)) or the binary from the command-line archive. The path stays the same
+when you update Flint or switch between the two. After `cargo build --release`, use `"$PWD/target/release/flint"`.
 
 ```sh
-claude mcp add flint -- /Applications/Flint.app/Contents/MacOS/flint mcp
+claude mcp add flint -- /usr/local/bin/flint mcp
 ```
 
 On Linux, register the AppImage the same way; it passes `mcp` through to `flint`:
@@ -289,7 +298,7 @@ format, for example `feat(mcp): …` or `fix(core): …`.
    published, so the draft stage is when files can still be attached.
 3. The same workflow then builds `flint` for Apple Silicon and Intel, combines them into a universal binary, and
    attaches `flint-vX.Y.Z-macos-universal.tar.gz`. It also packages that binary as an ad-hoc signed `Flint.app` in
-   `Flint-vX.Y.Z-macos-universal.dmg` (`scripts/package-macos-app.sh`), mounts the DMG to check it
+   `flint-vX.Y.Z-macos-universal.dmg` (`scripts/package-macos-app.sh`), mounts the DMG to check it
    (`scripts/smoke-macos-app.sh`), and attaches it. In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
    runners (`scripts/package-appimage.sh`) and attaches `flint-vX.Y.Z-linux-x86_64.AppImage` and
    `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum.

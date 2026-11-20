@@ -2,8 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Flint.app's Info.plist. scripts/package-macos-app.sh replaces @VERSION@ with the release
-  version (X.Y.Z). CFBundleIdentifier is permanent once shipped: Keychain items, settings and
-  notarization hang off it (#175, #25).
+  version (X.Y.Z). CFBundleIdentifier is permanent once shipped: Keychain items, notarization,
+  privacy permissions and notification settings hang off it (#175, #25). Flint's own settings do
+  not: they live in the fixed ~/Library/Application Support/Flint.
   LSMinimumSystemVersion: GPUI documents no floor; 13.0 is the oldest release Flint supports.
 -->
 <plist version="1.0">

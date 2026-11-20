@@ -9,6 +9,8 @@ on:
     paths:
       - scripts/package-macos-app.sh
       - scripts/smoke-macos-app.sh
+      - scripts/smoke-macos-app-test.sh
+      - LICENSE
       - scripts/check-no-automation.sh
       - packaging/macos/**
       - assets/brand/Flint.icns
@@ -50,10 +52,17 @@ jobs:
         run: cargo build --release --locked -p flint-app
       - name: Package Flint.app and the DMG
         run: |
-          VERSION=$(./target/release/flint --version | cut -d' ' -f2)
+          # The workspace version, as release-please writes it, so the smoke test's --version check
+          # compares the binary with Cargo.toml rather than with itself.
+          VERSION=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -er '.packages[] | select(.name == "flint-app") | .version')
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           scripts/package-macos-app.sh target/release/flint "$VERSION" dist | tee package.log
           DMG=$(tail -n 1 package.log)
           echo "DMG=$DMG" >> "$GITHUB_ENV"
       - name: Smoke test the DMG
         run: scripts/smoke-macos-app.sh "$DMG" "$VERSION"
+      # The smoke test must fail closed: on a wrong bundle ID, version, signature or a missing
+      # LICENSE.
+      - name: Smoke test fails on broken DMGs
+        run: scripts/smoke-macos-app-test.sh "$DMG" "$VERSION"

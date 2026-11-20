@@ -3,15 +3,15 @@
 #
 #   scripts/package-macos-app.sh <binary> <version> <out-dir>
 #
-# writes <out-dir>/Flint.app and <out-dir>/Flint-v<version>-macos-<arch>.dmg, where <arch> is
+# writes <out-dir>/Flint.app and <out-dir>/flint-v<version>-macos-<arch>.dmg, where <arch> is
 # "universal" for a binary with both arm64 and x86_64 slices (what releases ship) and the single
 # architecture otherwise. <version> is X.Y.Z (a leading "v" is accepted). Prints the DMG's path
 # on the last line of its output.
 #
 # The bundle is ad-hoc signed (`codesign -s -`), not Developer ID signed or notarized: that waits
 # on the Apple Developer account (#25). Signing later replaces the ad-hoc signature at the same
-# bundle identifier. The Info.plist comes from packaging/macos/Info.plist and the icon from
-# assets/brand/Flint.icns. scripts/smoke-macos-app.sh checks the DMG.
+# bundle identifier. The Info.plist comes from packaging/macos/Info.plist, the icon from
+# assets/brand/Flint.icns, and LICENSE goes into Contents/Resources. scripts/smoke-macos-app.sh checks the DMG.
 set -euo pipefail
 
 if [ $# -ne 3 ]; then
@@ -47,13 +47,14 @@ else
   arch=${archs// /-}
 fi
 app=$out_dir/Flint.app
-dmg=$out_dir/Flint-v$version-macos-$arch.dmg
+dmg=$out_dir/flint-v$version-macos-$arch.dmg
 
 # The bundle.
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 install -m 755 "$binary" "$app/Contents/MacOS/flint"
 install -m 644 "$repo/assets/brand/Flint.icns" "$app/Contents/Resources/Flint.icns"
+install -m 644 "$repo/LICENSE" "$app/Contents/Resources/LICENSE"
 sed "s/@VERSION@/$version/g" "$repo/packaging/macos/Info.plist" >"$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 plutil -lint "$app/Contents/Info.plist"
