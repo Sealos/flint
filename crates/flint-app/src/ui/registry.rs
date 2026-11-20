@@ -323,11 +323,14 @@ pub struct SelectRow {
     pub name: String,
 }
 
-/// Sort by a column, as clicking its header does: ascending, descending, then unsorted.
+/// Sort by a column, as clicking its header does: ascending, descending, then unsorted. The
+/// choice is remembered for the cluster and kind.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = resource_list, no_json)]
 #[serde(deny_unknown_fields)]
 pub struct SortBy {
+    /// A drawn column's header (`Restarts`), or its key (`server:Restarts`, `flint:age`) when
+    /// two columns share a header: by header, the first drawn column with it is sorted.
     pub column: String,
 }
 

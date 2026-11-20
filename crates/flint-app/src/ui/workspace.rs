@@ -791,8 +791,13 @@ impl Workspace {
         self.close_list(cx);
         let core = self.model.read(cx).core().clone();
         let namespaces = self.ui_state.namespace_filter(&cluster).to_vec();
-        let list =
-            cx.new(|cx| ResourceList::new(core, cluster.clone(), entry, namespaces, window, cx));
+        let sort = self
+            .ui_state
+            .list_sort(&cluster, entry.id.as_str())
+            .cloned();
+        let list = cx.new(|cx| {
+            ResourceList::new(core, cluster.clone(), entry, namespaces, sort, window, cx)
+        });
         if row_menu::has_row_actions(&entry.id) {
             let menu = row_menu::row_menu(cx.weak_entity());
             list.update(cx, |list, _| list.set_row_menu(menu));
@@ -890,6 +895,13 @@ impl Workspace {
                 // The replaced pane's YAML, if it had focus and focus has moved on.
                 release_unfocused_input(window, cx);
                 self.tell_detail_sessions_blocked(cx);
+            }
+            ListEvent::SortChanged(sort) => {
+                let list = list.read(cx);
+                let save =
+                    self.ui_state
+                        .set_list_sort(list.cluster(), list.kind().as_str(), sort.clone());
+                self.persist(save, cx);
             }
             ListEvent::SelectedChanged => {
                 if let Some(detail) = &self.detail {

@@ -80,6 +80,20 @@ pub struct Column {
 }
 
 impl Column {
+    /// The column's identity, apart from its header text: what a remembered sort is saved by.
+    /// The columns Flint draws from the object's metadata are `flint:name`, `flint:namespace`
+    /// and `flint:age`; the server's other columns are `server:<header>`. A column Flint computes
+    /// itself gets a role, and so a `flint:` key, of its own, so it is never taken for a server
+    /// column with the same header. Keys are saved in `state.toml`: a shipped key never changes.
+    pub fn key(&self) -> String {
+        match self.role {
+            ColumnRole::Name => "flint:name".to_owned(),
+            ColumnRole::Namespace => "flint:namespace".to_owned(),
+            ColumnRole::Age => "flint:age".to_owned(),
+            ColumnRole::Value => format!("server:{}", self.name),
+        }
+    }
+
     fn synthetic(name: &str, ty: ColumnType, role: ColumnRole) -> Self {
         Column {
             name: name.into(),
@@ -895,6 +909,23 @@ pub async fn list_table(
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn column_keys_follow_the_role_not_the_header() {
+        let value = |name: &str| Column {
+            role: ColumnRole::Value,
+            ..Column::synthetic(name, ColumnType::String, ColumnRole::Value)
+        };
+        assert_eq!(value("Restarts").key(), "server:Restarts");
+        // A server column named like one of Flint's keeps its own key.
+        assert_eq!(value("Namespace").key(), "server:Namespace");
+        let age = Column::synthetic("Age", ColumnType::Date, ColumnRole::Age);
+        assert_eq!(age.key(), "flint:age");
+        let name = Column::synthetic("NAME", ColumnType::String, ColumnRole::Name);
+        assert_eq!(name.key(), "flint:name");
+        let ns = Column::synthetic("Namespace", ColumnType::String, ColumnRole::Namespace);
+        assert_eq!(ns.key(), "flint:namespace");
+    }
 
     /// A Table watch event or list, as the server sends it (see the spike).
     pub(crate) fn pod_table(

@@ -66,6 +66,9 @@ pub enum ListEvent {
     SelectedChanged,
     /// The selected object is gone from a synced list (deleted).
     SelectedGone,
+    /// The user changed the sort (`None`: back to the default order), to remember for the
+    /// cluster and kind.
+    SortChanged(Option<SortSpec>),
 }
 
 impl EventEmitter<ListEvent> for ResourceList {}
@@ -134,11 +137,14 @@ pub struct ResourceList {
 }
 
 impl ResourceList {
+    /// A list of `entry`'s kind on `cluster`, filtered to `namespaces` and sorted by `sort` (the
+    /// one remembered for the cluster and kind, if any).
     pub fn new(
         core: CoreHandle,
         cluster: ClusterId,
         entry: &NavEntry,
         namespaces: Vec<String>,
+        sort: Option<SortSpec>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -193,6 +199,7 @@ impl ResourceList {
             rows: Arc::from(Vec::new()),
             query: Query {
                 namespaces,
+                sort,
                 ..Default::default()
             },
             show_wide: false,
@@ -335,7 +342,11 @@ impl ResourceList {
         let query = ViewQuery {
             namespaces: self.query.namespaces.clone(),
             text: self.query.text.clone(),
-            sort: list_model::resolve_sort(&snapshot.columns, self.query.sort.as_ref()),
+            sort: list_model::resolve_sort(
+                &snapshot.columns,
+                self.query.sort.as_ref(),
+                self.show_wide,
+            ),
         };
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
@@ -477,8 +488,14 @@ impl ResourceList {
         self.clear_selection(cx);
     }
 
+    /// Sorts by the drawn column with key `column` (or, failing that, with that header), as a
+    /// header click does, and reports the new sort to remember.
     fn toggle_sort(&mut self, column: &str, cx: &mut Context<Self>) {
-        self.query.sort = list_model::next_sort(self.query.sort.as_ref(), column);
+        let Some(key) = self.drawn_column_key(column) else {
+            return;
+        };
+        self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
+        cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
         cx.notify();
     }
@@ -647,25 +664,28 @@ impl ResourceList {
             .border_color(theme.border)
             .text_xs()
             .font_semibold();
+        let sorted_col = list_model::sort_column(
+            &self.shown.columns,
+            self.query.sort.as_ref(),
+            self.show_wide,
+        );
         for &(col, width) in &self.drawn {
             let column = &self.shown.columns[col];
             let name = column.name.to_string();
-            let sorted = self
-                .query
-                .sort
-                .as_ref()
-                .filter(|s| s.column == name)
-                .map(|s| s.descending);
+            let sorted = (sorted_col == Some(col))
+                .then(|| self.query.sort.as_ref().map(|s| s.descending))
+                .flatten();
             let numeric = list_model::is_numeric(column);
             let tip = if column.description.is_empty() {
                 name.clone()
             } else {
                 format!("{name}\n{}", column.description)
             };
-            let click_name = name.clone();
+            // By key: a header shared by two columns sorts the one clicked.
+            let click_key = column.key();
             header = header.child(
                 h_flex()
-                    .id(SharedString::from(format!("sort-{name}")))
+                    .id(SharedString::from(header_id(&self.shown.columns, col)))
                     .h_full()
                     .px_2()
                     .gap_1()
@@ -688,7 +708,7 @@ impl ResourceList {
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .on_click(registry::on_click(SortBy { column: click_name }))
+                    .on_click(registry::on_click(SortBy { column: click_key }))
                     .test_support(),
             );
         }
@@ -931,6 +951,17 @@ fn cell_text(row: &Row, col: usize, now: i64) -> SharedString {
     match row.cells.get(col) {
         Some(Cell::Text(text)) => SharedString::from(text.clone()),
         _ => SharedString::from(row.cell_text(col, now).into_owned()),
+    }
+}
+
+/// The element id of column `col`'s header: `sort-<header>`, with the column's index appended
+/// when another column has the same header.
+fn header_id(columns: &[flint_core::Column], col: usize) -> String {
+    let name = &columns[col].name;
+    if columns.iter().filter(|c| c.name == *name).count() > 1 {
+        format!("sort-{name}-{col}")
+    } else {
+        format!("sort-{name}")
     }
 }
 

@@ -1,12 +1,13 @@
 //! UI state kept in `state.toml`: the namespace filter and the last open kind of each cluster,
-//! and the pane sizes (side pane widths and the dock's height).
+//! the sort of each cluster's lists per kind, and the pane sizes (side pane widths and the
+//! dock's height).
 //!
 //! The file is read once at startup and written whole after each change, off the UI thread.
 //! The app is its only writer.
 
 use std::path::PathBuf;
 
-use flint_core::settings::{self, PaneWidths, State};
+use flint_core::settings::{self, ListSort, PaneWidths, State};
 
 pub struct UiState {
     dir: PathBuf,
@@ -69,6 +70,42 @@ impl UiState {
         self.state
             .last_views
             .insert(cluster.to_owned(), kind.to_owned());
+        Some(self.to_save())
+    }
+
+    /// The sort remembered for `kind`'s list on `cluster`, if any.
+    pub fn list_sort(&self, cluster: &str, kind: &str) -> Option<&ListSort> {
+        self.state.list_sorts.get(cluster)?.get(kind)
+    }
+
+    /// Remembers the sort of `kind`'s list on `cluster` (`None`: the default order). Returns
+    /// what to save, or `None` if nothing changed.
+    pub fn set_list_sort(
+        &mut self,
+        cluster: &str,
+        kind: &str,
+        sort: Option<ListSort>,
+    ) -> Option<(PathBuf, State)> {
+        if self.list_sort(cluster, kind) == sort.as_ref() {
+            return None;
+        }
+        match sort {
+            Some(sort) => {
+                self.state
+                    .list_sorts
+                    .entry(cluster.to_owned())
+                    .or_default()
+                    .insert(kind.to_owned(), sort);
+            }
+            None => {
+                if let Some(kinds) = self.state.list_sorts.get_mut(cluster) {
+                    kinds.remove(kind);
+                    if kinds.is_empty() {
+                        self.state.list_sorts.remove(cluster);
+                    }
+                }
+            }
+        }
         Some(self.to_save())
     }
 
@@ -197,6 +234,66 @@ mod tests {
         );
         assert_eq!(reloaded.last_view("other"), None);
         assert_eq!(reloaded.panes(), panes);
+    }
+
+    // covers UP-21
+    #[test]
+    fn list_sorts_are_remembered_per_cluster_and_kind_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = UiState::load(dir.path().to_owned());
+        let restarts = ListSort {
+            column: "server:Restarts".into(),
+            descending: true,
+        };
+        save(
+            ui.set_list_sort("kind-flint-dev", "pods", Some(restarts.clone()))
+                .unwrap(),
+        );
+        assert!(
+            ui.set_list_sort("kind-flint-dev", "pods", Some(restarts.clone()))
+                .is_none()
+        );
+        let age = ListSort {
+            column: "flint:age".into(),
+            descending: false,
+        };
+        save(
+            ui.set_list_sort("kind-flint-dev", "deployments.apps", Some(age.clone()))
+                .unwrap(),
+        );
+
+        let mut reloaded = UiState::load(dir.path().to_owned());
+        assert_eq!(
+            reloaded.list_sort("kind-flint-dev", "pods"),
+            Some(&restarts)
+        );
+        assert_eq!(
+            reloaded.list_sort("kind-flint-dev", "deployments.apps"),
+            Some(&age)
+        );
+        assert_eq!(reloaded.list_sort("other", "pods"), None);
+        assert_eq!(reloaded.list_sort("kind-flint-dev", "namespaces"), None);
+
+        // Back to the default order forgets it; the last one gone drops the cluster's entry.
+        save(
+            reloaded
+                .set_list_sort("kind-flint-dev", "pods", None)
+                .unwrap(),
+        );
+        assert!(
+            reloaded
+                .set_list_sort("kind-flint-dev", "pods", None)
+                .is_none()
+        );
+        save(
+            reloaded
+                .set_list_sort("kind-flint-dev", "deployments.apps", None)
+                .unwrap(),
+        );
+        let reloaded = UiState::load(dir.path().to_owned());
+        assert_eq!(reloaded.list_sort("kind-flint-dev", "pods"), None);
+        let text = std::fs::read_to_string(dir.path().join(settings::STATE_FILE)).unwrap();
+        assert!(!text.contains("kind-flint-dev"), "{text}");
     }
 
     #[test]

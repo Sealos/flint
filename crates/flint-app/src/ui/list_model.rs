@@ -6,13 +6,10 @@ use std::sync::Arc;
 
 use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, SortBy};
 
-/// The user's sort choice, by column name. Columns can change between snapshots (an edited
-/// CRD's printer columns), so the index is looked up again for every snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SortSpec {
-    pub column: String,
-    pub descending: bool,
-}
+/// The user's sort choice, by column key ([`Column::key`]), as `state.toml` keeps it per cluster
+/// and kind. Columns can change between snapshots (an edited CRD's printer columns), so the
+/// index is looked up again for every snapshot.
+pub type SortSpec = flint_core::settings::ListSort;
 
 /// Indexes of the columns to show: every default column, plus the `-o wide` ones (priority 1
 /// and up) when `show_wide` is set.
@@ -30,20 +27,35 @@ pub fn has_wide_columns(columns: &[Column]) -> bool {
     columns.iter().any(|c| c.priority > 0)
 }
 
-/// The sort for `compute_view`: `spec`'s column looked up by name in `columns`. `None` when
-/// nothing is sorted or the column no longer exists, which keeps the snapshot order (namespace,
-/// then name).
-pub fn resolve_sort(columns: &[Column], spec: Option<&SortSpec>) -> Option<SortBy> {
+/// The index in `columns` of the column `spec` sorts by, looked up by key among the columns
+/// shown (`-o wide` ones only with `show_wide`): a remembered sort on a wide column waits until
+/// Wide is on again, rather than sorting by a column nobody sees.
+pub fn sort_column(columns: &[Column], spec: Option<&SortSpec>, show_wide: bool) -> Option<usize> {
     let spec = spec?;
-    let column = columns.iter().position(|c| *c.name == *spec.column)?;
+    visible_columns(columns, show_wide)
+        .into_iter()
+        .find(|&i| columns[i].key() == spec.column)
+}
+
+/// The sort for `compute_view`: `spec`'s column looked up by key in `columns`. `None` when
+/// nothing is sorted, or the column no longer exists (a remembered sort on a CRD column since
+/// removed) or is a wide column while Wide is off, which keeps the snapshot order: namespace,
+/// then name.
+pub fn resolve_sort(
+    columns: &[Column],
+    spec: Option<&SortSpec>,
+    show_wide: bool,
+) -> Option<SortBy> {
+    let column = sort_column(columns, spec, show_wide)?;
+    let spec = spec?;
     Some(SortBy {
         column,
         descending: spec.descending,
     })
 }
 
-/// The sort after clicking a column header: a new column sorts ascending, then descending, then
-/// back to the default order.
+/// The sort after clicking the header of the column with key `clicked`: a new column sorts
+/// ascending, then descending, then back to the default order.
 pub fn next_sort(current: Option<&SortSpec>, clicked: &str) -> Option<SortSpec> {
     match current {
         Some(s) if s.column == clicked && !s.descending => Some(SortSpec {
@@ -486,32 +498,35 @@ mod tests {
     // covers UP-21
     #[test]
     fn header_clicks_cycle_ascending_descending_default() {
-        let asc = next_sort(None, "Age");
+        let asc = next_sort(None, "flint:age");
         assert_eq!(
             asc,
             Some(SortSpec {
-                column: "Age".into(),
+                column: "flint:age".into(),
                 descending: false
             })
         );
-        let desc = next_sort(asc.as_ref(), "Age");
+        let desc = next_sort(asc.as_ref(), "flint:age");
         assert_eq!(desc.as_ref().map(|s| s.descending), Some(true));
-        assert_eq!(next_sort(desc.as_ref(), "Age"), None);
+        assert_eq!(next_sort(desc.as_ref(), "flint:age"), None);
         // Another column starts ascending again.
-        let other = next_sort(desc.as_ref(), "Name").unwrap();
-        assert_eq!((other.column.as_str(), other.descending), ("Name", false));
+        let other = next_sort(desc.as_ref(), "flint:name").unwrap();
+        assert_eq!(
+            (other.column.as_str(), other.descending),
+            ("flint:name", false)
+        );
     }
 
     // covers UP-21, UP-22
     #[test]
-    fn sort_follows_its_column_by_name_when_columns_change() {
+    fn sort_follows_its_column_by_key_when_columns_change() {
         let spec = SortSpec {
-            column: "Restarts".into(),
+            column: "server:Restarts".into(),
             descending: true,
         };
         let columns = pod_columns();
         assert_eq!(
-            resolve_sort(&columns, Some(&spec)),
+            resolve_sort(&columns, Some(&spec), false),
             Some(SortBy {
                 column: 3,
                 descending: true
@@ -521,7 +536,7 @@ mod tests {
         let mut changed = columns.clone();
         changed.insert(2, col("Phase", 0, ColumnRole::Value, ColumnType::String));
         assert_eq!(
-            resolve_sort(&changed, Some(&spec)),
+            resolve_sort(&changed, Some(&spec), false),
             Some(SortBy {
                 column: 4,
                 descending: true
@@ -529,8 +544,38 @@ mod tests {
         );
         // The column is gone: back to the default order rather than sorting by a stranger.
         changed.retain(|c| &*c.name != "Restarts");
-        assert_eq!(resolve_sort(&changed, Some(&spec)), None);
-        assert_eq!(resolve_sort(&columns, None), None);
+        assert_eq!(resolve_sort(&changed, Some(&spec), false), None);
+        assert_eq!(resolve_sort(&columns, None, false), None);
+    }
+
+    // covers UP-20, UP-21
+    #[test]
+    fn a_sort_on_a_wide_column_applies_only_while_wide_is_on() {
+        let columns = pod_columns();
+        let node = SortSpec {
+            column: "server:Node".into(),
+            descending: false,
+        };
+        assert_eq!(sort_column(&columns, Some(&node), false), None);
+        assert_eq!(sort_column(&columns, Some(&node), true), Some(6));
+    }
+
+    // covers UP-21
+    #[test]
+    fn a_sort_keeps_to_its_column_when_another_has_the_same_header() {
+        // A CRD's printer column named "Namespace", beside Flint's own Namespace column.
+        let mut columns = pod_columns();
+        columns.push(col("Namespace", 0, ColumnRole::Value, ColumnType::String));
+        let flint = SortSpec {
+            column: "flint:namespace".into(),
+            descending: false,
+        };
+        let server = SortSpec {
+            column: "server:Namespace".into(),
+            descending: false,
+        };
+        assert_eq!(sort_column(&columns, Some(&flint), false), Some(1));
+        assert_eq!(sort_column(&columns, Some(&server), false), Some(7));
     }
 
     #[test]

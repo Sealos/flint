@@ -166,8 +166,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-21 Find what I'm looking for
 - **When** I filter by namespace (one or several), type a text filter, and sort by a column.
-- **Then** the list narrows and sorts instantly. The namespace choice is remembered per cluster.
-- Tests: unit (filter and sort), ui.
+- **Then** the list narrows and sorts instantly. The namespace choice is remembered per cluster, and the sort per
+  cluster and kind, also across restarts. A remembered sort whose column is gone (a CRD's printer columns changed)
+  falls back to the kind's default order.
+- Tests: unit (filter, sort, remembered sort), ui.
 
 ### UP-22 Browse a CRD
 - **Given** a CRD with `additionalPrinterColumns`.

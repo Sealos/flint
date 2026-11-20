@@ -45,14 +45,9 @@ impl ResourceList {
         }
     }
 
-    /// [`SortBy`] takes a column drawn now.
+    /// [`SortBy`] takes a column drawn now, by key ([`flint_core::Column::key`]) or header.
     pub(in crate::ui) fn check_sort(&self, action: &SortBy) -> Result<(), ActionError> {
-        let columns = &self.shown.columns;
-        if self
-            .drawn
-            .iter()
-            .any(|&(col, _)| *columns[col].name == action.column)
-        {
+        if self.drawn_column_key(&action.column).is_some() {
             Ok(())
         } else {
             Err(ActionError::rejected::<SortBy>(format!(
@@ -60,6 +55,17 @@ impl ResourceList {
                 action.column
             )))
         }
+    }
+
+    /// The key of the drawn column whose key is `column`, or else of the first one headed
+    /// `column`.
+    pub(in crate::ui) fn drawn_column_key(&self, column: &str) -> Option<String> {
+        let columns = &self.shown.columns;
+        let drawn = || self.drawn.iter().map(|&(col, _)| &columns[col]);
+        drawn()
+            .find(|c| c.key() == column)
+            .or_else(|| drawn().find(|c| *c.name == *column))
+            .map(|c| c.key())
     }
 
     /// The names of the columns drawn, left to right: what [`SortBy`] takes.
@@ -97,6 +103,8 @@ impl ResourceList {
 
     fn toggle_wide(&mut self, _: &ToggleWide, _: &mut Window, cx: &mut Context<Self>) {
         self.show_wide = !self.show_wide;
+        // A remembered sort on a wide column applies only while Wide is on.
+        self.recompute(cx);
         cx.notify();
     }
 
