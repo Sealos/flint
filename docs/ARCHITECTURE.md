@@ -353,7 +353,7 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
 All sessions also share one budget (`log_total_mib`, default 512 MiB, never below `log_buffer_mib`;
 `flint_core::logs::LogBudget`), since nothing limits how many log tabs are open. Sessions report the bytes their buffers hold when they publish; when the total is
 over the budget, the tabs viewed least recently drop their oldest blocks first (each only what its sealed blocks can
-give; the open tail block stays), then paused tabs, and never the tab shown (beyond its own `log_buffer_mib`). The dock tells the core which log tab is shown (`LogSession::set_shown`).
+give; the open tail block stays while the stream runs, and is sealed when it ends), then paused tabs, and never the tab shown (beyond its own `log_buffer_mib`). The dock tells the core which log tab is shown (`LogSession::set_shown`).
 Streams keep running; only history goes, and a trimmed tab says "Older lines dropped to save memory" so a short
 history is not taken for a quiet pod (#254).
 

@@ -328,6 +328,10 @@ impl Output {
         if self.state != *state {
             self.state = state.clone();
             self.dirty = true;
+            // No line follows: the last block can be given back to the budget too.
+            if matches!(state, LogState::Ended { .. }) {
+                self.buffer.seal_tail();
+            }
         }
     }
 
@@ -425,11 +429,11 @@ pub(crate) async fn run(
                 }
             }
             () = trim_asked() => {
-                if let Some(b) = &budget
-                    && let Some(bytes) = b.budget.take_trim(b.id)
-                {
-                    out.trim_to(bytes);
-                    b.budget.trimmed(b.id, out.buffer.bytes(), out.buffer.trimmable_bytes());
+                if let Some(b) = &budget {
+                    b.budget.apply_trim(b.id, |bytes| {
+                        out.trim_to(bytes);
+                        (out.buffer.bytes(), out.buffer.trimmable_bytes())
+                    });
                 }
             }
             _ = tick.tick(), if out.dirty => {
@@ -597,6 +601,27 @@ mod tests {
 
     fn owned<const N: usize>(lines: [&str; N]) -> Vec<String> {
         lines.map(str::to_owned).into()
+    }
+
+    // covers UP-42: an ended stream's last block counts as something the budget can take back
+    // (#296).
+    #[test]
+    fn an_ended_stream_can_give_all_its_lines_back() {
+        let mut out = Output::new(&config(1_000));
+        for n in 0..10 {
+            out.append(LogLine::parse(&format!("line {n}"), false));
+        }
+        assert_eq!(
+            out.buffer.trimmable_bytes(),
+            0,
+            "a running stream keeps its tail"
+        );
+        out.set_state(&LogState::Ended {
+            error: None,
+            pod_deleted: false,
+        });
+        assert!(out.buffer.bytes() > 0);
+        assert_eq!(out.buffer.trimmable_bytes(), out.buffer.bytes());
     }
 
     fn ended(s: &LogSnapshot) -> bool {
