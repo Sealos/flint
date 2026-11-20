@@ -29,6 +29,8 @@ Flint is in early development: every release is a pre-release until 1.0.
 - Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain; protected clusters.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
+- Cluster sets and warm clusters for instant switching, AI log analysis, and a tighter MCP server (scope by
+  namespace and kind, redacted credentials, an activity log).
 - A signed and notarized app with a Homebrew cask.
 
 ## Install from a release
@@ -51,8 +53,11 @@ AppImages only.
 
    ```sh
    gh release download "$tag" -R Sealos/flint -p 'flint-*-macos-universal.dmg*'
-   shasum -a 256 -c flint-*-macos-universal.dmg.sha256
+   shasum -a 256 -c "flint-$tag-macos-universal.dmg.sha256"
    ```
+
+   If `gh` finds no matching asset, the newest release predates the DMG: use the
+   [command-line archive](#macos-command-line-archive) instead.
 
 2. Open the DMG and drag **Flint** onto **Applications**, then eject the DMG.
 3. Open Flint from Applications, Launchpad or Spotlight.
@@ -97,8 +102,8 @@ from a terminal and it opens the Flint window:
 
 ```sh
 gh release download "$tag" -R Sealos/flint -p 'flint-*-macos-universal.tar.gz*'   # tag as above
-shasum -a 256 -c flint-*-macos-universal.tar.gz.sha256
-tar -xzf flint-*-macos-universal.tar.gz
+shasum -a 256 -c "flint-$tag-macos-universal.tar.gz.sha256"
+tar -xzf "flint-$tag-macos-universal.tar.gz"
 sudo install -m 755 flint/flint /usr/local/bin/flint
 flint --version
 flint                                   # opens the window
@@ -116,8 +121,8 @@ needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
 
 ```sh
 gh release download "$tag" -R Sealos/flint -p 'flint-*-linux-x86_64.AppImage*'   # tag as above; or linux-aarch64
-sha256sum -c flint-*-linux-x86_64.AppImage.sha256
-install -D -m 755 flint-*-linux-x86_64.AppImage ~/.local/bin/flint
+sha256sum -c "flint-$tag-linux-x86_64.AppImage.sha256"
+install -D -m 755 "flint-$tag-linux-x86_64.AppImage" ~/.local/bin/flint
 flint --version
 flint                                   # opens the window
 ```
