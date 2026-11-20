@@ -907,6 +907,13 @@ Rules:
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
   and 500 log lines), and lists, objects and logs are also capped at 256 KiB. When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
+- **Bounded work (`flint_mcp::Limits`, #252):** rmcp starts a task per request and per reply and limits neither, so
+  Flint does. At most 16 tool calls run at once and 48 more wait for a turn; past those a call is refused at once with
+  a tool error ("too many tool calls in flight"; retry). A running call holds its turn until it ends: when the client
+  cancels it (`notifications/cancelled`, which drops its Kubernetes requests) or after 60 s, with a timeout naming the
+  cluster's server. Replies handed to the transport and not written yet are counted by a wrapping transport; while
+  they pass 8 MiB no call starts its work, so a client that stops reading stdout holds at most that plus what the
+  running calls produce. Refused, cancelled and timed-out calls are recorded in the activity log as failed.
 - **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
   `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
   app).

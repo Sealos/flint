@@ -41,7 +41,8 @@ See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP client
   `password=`, `secret:`, `token=` and `api_key=` style pairs and flags. Flint's own log viewer and events are
   unchanged: they show text as written.
 - **Bounded.** Lists, events and logs have default and maximum sizes, and when output is cut short the result says
-  so.
+  so. At most 16 calls run at once (more wait, and past 64 they are refused), each for at most 60 seconds, and an
+  agent that stops reading replies stops getting new calls run.
 - **Recorded.** Every call is written to an activity log in Flint's config directory: when, which cluster and tool,
   what it named (kind, namespace, object, container), how much came back, and whether it was cut short or denied.
   What came back is never stored. Click a cluster's "AI" badge (or run Show Agent Activity… from the palette) to see its calls; the view

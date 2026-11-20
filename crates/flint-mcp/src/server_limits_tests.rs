@@ -1,0 +1,280 @@
+//! The [`Limits`] end to end: the server served over an in-memory pipe, the test as its client.
+
+use std::time::Duration;
+
+use rmcp::ServiceExt as _;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
+use super::FlintMcp;
+use crate::limits::Limits;
+
+/// A server that accepts connections and never answers; each accepted socket is handed over,
+/// so a test can see it closed.
+async fn silent_server() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let _ = tx.send(socket);
+        }
+    });
+    (url, rx)
+}
+
+/// A server whose settings expose `silent` at `server` (none when `None`).
+fn server(dir: &std::path::Path, silent: Option<&str>, limits: Limits) -> FlintMcp {
+    let url = silent.unwrap_or("http://127.0.0.1:1");
+    std::fs::write(
+        dir.join("kubeconfig"),
+        format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: silent\n  cluster:\n    server: {url}\n\
+             users:\n- name: u\n  user:\n    token: not-a-real-token\ncontexts:\n- name: silent\n  \
+             context:\n    cluster: silent\n    user: u\n"
+        ),
+    )
+    .unwrap();
+    let settings = silent.map_or(String::new(), |url| {
+        format!("[[ai_exposed_clusters]]\ncontext = \"silent\"\nserver = \"{url}\"\n")
+    });
+    std::fs::write(dir.join("settings.toml"), settings).unwrap();
+    FlintMcp::with_limits(dir.to_owned(), vec![dir.join("kubeconfig")], None, limits)
+}
+
+/// The test's end of the pipe: JSON-RPC lines.
+struct Client {
+    write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    read: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+}
+
+impl Client {
+    /// Serves `server` over a pipe holding `buffer` bytes each way, and initializes it.
+    async fn start(server: &FlintMcp, buffer: usize) -> Self {
+        let (ours, theirs) = tokio::io::duplex(buffer);
+        let transport =
+            rmcp::transport::IntoTransport::<rmcp::RoleServer, std::io::Error, _>::into_transport(
+                tokio::io::split(theirs),
+            );
+        let counted = server.counted(transport);
+        let served = server.clone();
+        tokio::spawn(async move {
+            if let Ok(service) = served.serve(counted).await {
+                let _ = service.waiting().await;
+            }
+        });
+        let (read, write) = tokio::io::split(ours);
+        let mut client = Client {
+            write,
+            read: BufReader::new(read),
+        };
+        client
+            .send(
+                json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                }}),
+            )
+            .await;
+        let init = client.next().await;
+        assert_eq!(init["id"], json!(0), "{init}");
+        client
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        client
+    }
+
+    async fn send(&mut self, message: Value) {
+        let mut line = message.to_string();
+        line.push('\n');
+        self.write.write_all(line.as_bytes()).await.unwrap();
+        self.write.flush().await.unwrap();
+    }
+
+    async fn call(&mut self, id: u64, tool: &str, arguments: Value) {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}}))
+            .await;
+    }
+
+    async fn cancel(&mut self, id: u64) {
+        self.send(
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": id, "reason": "test"}}),
+        )
+        .await;
+    }
+
+    /// The next message, within 10 seconds.
+    async fn next(&mut self) -> Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), self.read.read_line(&mut line))
+            .await
+            .expect("a message within 10 s")
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The next message, if one comes within `wait`.
+    async fn next_within(&mut self, wait: Duration) -> Option<Value> {
+        let mut line = String::new();
+        match tokio::time::timeout(wait, self.read.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(&line).unwrap()),
+            _ => None,
+        }
+    }
+}
+
+/// The text of a tool result.
+fn text(reply: &Value) -> &str {
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+}
+
+/// Waits up to 10 seconds for `ready`.
+async fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{what}");
+}
+
+// covers UP-08: calls against a cluster that never answers run up to the limit; the next ones
+// wait, and past those the rest are refused at once, saying why. Cancelling the calls stops
+// them, Kubernetes requests included: the server sees its connections closed.
+#[tokio::test]
+async fn calls_past_the_limit_wait_or_are_refused_and_cancelling_stops_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, mut sockets) = silent_server().await;
+    let limits = Limits {
+        running: 2,
+        waiting: 2,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let admission = || &server.inner.admission;
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for id in 1..=6 {
+        client
+            .call(id, "list_resource_kinds", json!({"cluster": "silent"}))
+            .await;
+    }
+    let mut refused = Vec::new();
+    for _ in 0..2 {
+        let reply = client.next().await;
+        assert!(
+            text(&reply).starts_with("too many tool calls in flight"),
+            "{reply}"
+        );
+        refused.push(reply["id"].as_u64().unwrap());
+    }
+    wait_for("two calls running", || admission().running() == 2).await;
+    assert!(
+        client
+            .next_within(Duration::from_millis(500))
+            .await
+            .is_none(),
+        "the others wait"
+    );
+    assert_eq!(admission().running(), 2);
+    assert_eq!(admission().admitted(), 4);
+
+    let mut open = Vec::new();
+    while let Ok(socket) = sockets.try_recv() {
+        open.push(socket);
+    }
+    assert!(!open.is_empty(), "the running calls reached the server");
+    for id in (1..=6).filter(|id| !refused.contains(id)) {
+        client.cancel(id).await;
+    }
+    wait_for("the cancelled calls left", || admission().admitted() == 0).await;
+    for mut socket in open {
+        let mut buf = [0; 4096];
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "a cancelled call's request is closed");
+    }
+}
+
+// covers UP-08: a call past its deadline ends with a timeout naming the server.
+#[tokio::test]
+async fn a_call_past_its_deadline_names_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        deadline: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let mut client = Client::start(&server, 64 * 1024).await;
+    client
+        .call(1, "list_resource_kinds", json!({"cluster": "silent"}))
+        .await;
+    let reply = client.next().await;
+    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+    assert_eq!(
+        text(&reply),
+        format!("timed out after 300ms reaching {url}")
+    );
+    assert_eq!(server.inner.admission.running(), 0);
+}
+
+// covers UP-08: a client that stops reading while it keeps calling holds at most the reply
+// budget (plus what the running calls produce) in replies not written yet; no reply is lost.
+#[tokio::test]
+async fn a_stalled_client_holds_the_reply_budget_at_most() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        running: 2,
+        waiting: 1000,
+        reply_budget: 4 * 1024,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), None, limits);
+    let mut client = Client::start(&server, 1024).await;
+    let calls = 200;
+    for id in 1..=calls {
+        client.call(id, "list_clusters", json!({})).await;
+    }
+    // Nothing is read meanwhile.
+    let replies = server.inner.admission.replies();
+    let mut most = 0;
+    for _ in 0..50 {
+        most = most.max(replies.outstanding());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let one_reply = 2 * 1024;
+    assert!(
+        most <= limits.reply_budget + limits.running * one_reply,
+        "{most} bytes held"
+    );
+    assert!(most > 0, "replies were held");
+    assert!(
+        server.inner.admission.admitted() > limits.running,
+        "calls wait while the client does not read"
+    );
+    // Reading again, every reply comes.
+    let mut ids = Vec::new();
+    for _ in 0..calls {
+        let reply = client.next().await;
+        assert!(reply["result"]["isError"] != json!(true), "{reply}");
+        ids.push(reply["id"].as_u64().unwrap());
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=calls).collect::<Vec<_>>());
+}

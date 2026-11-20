@@ -22,6 +22,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::limits::{Admission, Counted, Limits};
 use crate::policy;
 
 /// How long `list_clusters` waits for each cluster's `/version`.
@@ -52,6 +53,8 @@ struct Inner {
     kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
     clients: SlotMap<Client>,
     discovery: SlotMap<Kinds>,
+    /// How many tool calls run and wait, and the reply bytes not yet written (#252).
+    admission: Admission,
 }
 
 /// Discovery results for one cluster.
@@ -405,6 +408,16 @@ impl FlintMcp {
     /// `kubeconfig_base` is the `KUBECONFIG` list (or `~/.kube/config`); the settings'
     /// `kubeconfig_paths`, expanded with `home`, are appended on every call.
     pub fn new(config_dir: PathBuf, kubeconfig_base: Vec<PathBuf>, home: Option<PathBuf>) -> Self {
+        Self::with_limits(config_dir, kubeconfig_base, home, Limits::default())
+    }
+
+    /// [`FlintMcp::new`] with other [`Limits`].
+    pub fn with_limits(
+        config_dir: PathBuf,
+        kubeconfig_base: Vec<PathBuf>,
+        home: Option<PathBuf>,
+        limits: Limits,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config_dir,
@@ -413,9 +426,22 @@ impl FlintMcp {
                 kubeconfig: Mutex::default(),
                 clients: Mutex::default(),
                 discovery: Mutex::default(),
+                admission: Admission::new(limits),
             }),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// `transport` with the bytes of replies not yet written counted, which [`Limits`] bounds.
+    /// Serve the server over this.
+    pub fn counted<T>(
+        &self,
+        transport: T,
+    ) -> impl rmcp::transport::Transport<rmcp::RoleServer> + use<T>
+    where
+        T: rmcp::transport::Transport<rmcp::RoleServer> + 'static,
+    {
+        Counted::new(transport, self.inner.admission.replies())
     }
 
     #[tool(
@@ -508,10 +534,12 @@ impl FlintMcp {
     instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
 impl ServerHandler for FlintMcp {
-    /// Every call, with its own `CALL` note. A call the router answers without running its
-    /// tool (an unknown tool, arguments that do not fit the tool's schema) is recorded here, as
-    /// failed, with what its arguments name; the others are recorded by their tool
-    /// (`FlintMcp::finish`).
+    /// Every call, with its own `CALL` note, within the [`Limits`]: admitted (or refused at
+    /// once when too many are in flight), stopped when the client cancels it, and ended at the
+    /// deadline. A call the router answers without running its tool (an unknown tool, arguments
+    /// that do not fit the tool's schema) is recorded here, as failed, with what its arguments
+    /// name; so is one refused, cancelled or past its deadline. The others are recorded by their
+    /// tool (`FlintMcp::finish`).
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -519,13 +547,47 @@ impl ServerHandler for FlintMcp {
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
         let named = named_in(request.arguments.as_ref());
-        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let (result, recorded) = CALL
-            .scope(std::cell::RefCell::default(), async {
-                let result = self.tool_router.call(call).await;
-                (result, CALL.with(|c| c.borrow().recorded))
-            })
-            .await;
+        let cancelled = context.ct.clone();
+        let admission = &self.inner.admission;
+        let deadline = admission.limits().deadline;
+        let turn = tokio::select! {
+            turn = admission.enter() => turn,
+            () = cancelled.cancelled() => {
+                return Err(rmcp::ErrorData::internal_error("cancelled", None));
+            }
+        };
+        let (result, recorded, server) = match turn {
+            Err(busy) => (
+                Ok(CallToolResult::error(vec![ContentBlock::text(busy.to_string())]).into()),
+                false,
+                None,
+            ),
+            Ok(turn) => {
+                let call =
+                    rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                CALL.scope(std::cell::RefCell::default(), async {
+                    // Dropping the call's future ends its Kubernetes requests.
+                    let result = tokio::select! {
+                        result = self.tool_router.call(call) => result,
+                        () = cancelled.cancelled() => {
+                            Err(rmcp::ErrorData::internal_error("cancelled", None))
+                        }
+                        () = tokio::time::sleep(deadline) => {
+                            let server = CALL.with(|c| c.borrow().server.clone());
+                            let timeout = ClusterError::timeout(deadline, server.as_deref());
+                            Ok(CallToolResult::error(vec![ContentBlock::text(timeout.for_agent())]).into())
+                        }
+                    };
+                    drop(turn);
+                    let (recorded, server) = CALL.with(|c| {
+                        let c = c.borrow();
+                        (c.recorded, c.server.clone())
+                    });
+                    (result, recorded, server)
+                })
+                .await
+            }
+        };
         if !recorded {
             let bytes = match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(done)) => done
@@ -539,7 +601,7 @@ impl ServerHandler for FlintMcp {
             self.record(activity::ActivityRecord {
                 at_ms: activity::now_ms(),
                 tool,
-                server: None,
+                server: server.filter(|_| named.cluster.is_some()),
                 cluster: named.cluster,
                 kind: named.kind,
                 namespace: named.namespace,
@@ -1694,3 +1756,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "server_limits_tests.rs"]
+mod limits_tests;

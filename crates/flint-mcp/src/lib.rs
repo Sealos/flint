@@ -3,9 +3,11 @@
 //! The read functions live in `flint-core`; this crate holds only the tool layer and the policy:
 //! opt-in clusters, redaction, and output bounds. It must never depend on GPUI.
 
+mod limits;
 pub mod policy;
 mod server;
 
+pub use limits::Limits;
 pub use server::FlintMcp;
 
 use std::process::ExitCode;
@@ -58,7 +60,12 @@ pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
         bootstrap.home.clone(),
     );
     let result = runtime.block_on(async move {
-        let service = server.serve(rmcp::transport::stdio()).await?;
+        let stdio =
+            rmcp::transport::IntoTransport::<rmcp::RoleServer, std::io::Error, _>::into_transport(
+                rmcp::transport::stdio(),
+            );
+        let transport = server.counted(stdio);
+        let service = server.serve(transport).await?;
         service.waiting().await?;
         anyhow::Ok(())
     });
