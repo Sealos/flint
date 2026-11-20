@@ -17,7 +17,7 @@ use k8s_openapi::jiff::Timestamp;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
-use super::budget::LogBudget;
+use super::budget::{Kept, LogBudget};
 use super::buffer::{LogBuffer, LogLines};
 use super::line::LogLine;
 use super::pods::{PodSource, WorkloadTarget};
@@ -306,21 +306,28 @@ impl Output {
         drop(self.trim_frozen());
     }
 
-    /// Gives memory back to the shared budget: takes the oldest blocks out down to `bytes`.
-    /// What it took out (the blocks, and a paused view's old copy) is returned unfreed, for the
-    /// caller to drop once it lets go of the budget's lock.
-    #[must_use = "dropping it frees the lines: do so outside the budget's lock"]
-    fn trim_to(&mut self, bytes: usize) -> Released {
+    /// Gives memory back to the shared budget, under its lock: takes the oldest blocks out
+    /// down to `bytes`, moving their handles and nothing more, and says what the buffer kept.
+    /// The blocks are returned unfreed, for [`Output::finish_trim`] after the lock.
+    fn detach(&mut self, bytes: usize) -> (Kept, Vec<Arc<[LogLine]>>) {
         let blocks = self.buffer.detach_to(bytes);
-        if blocks.is_empty() {
-            return Released::default();
+        if !blocks.is_empty() {
+            self.trimmed = true;
+            self.dirty = true;
         }
-        self.trimmed = true;
-        self.dirty = true;
-        Released {
-            _blocks: blocks,
-            _frozen: self.trim_frozen(),
-        }
+        let kept = Kept {
+            bytes: self.buffer.bytes(),
+            trimmable: self.buffer.trimmable_bytes(),
+            first: self.buffer.first_id(),
+        };
+        (kept, blocks)
+    }
+
+    /// The rest of a trim, after the budget's lock: a paused view lets go of the blocks taken
+    /// out, and they are freed.
+    fn finish_trim(&mut self, blocks: Vec<Arc<[LogLine]>>) {
+        drop(self.trim_frozen());
+        drop(blocks);
     }
 
     /// Keeps a paused view from holding blocks the buffer dropped; returns its old copy.
@@ -376,13 +383,6 @@ impl Output {
         }));
         self.dirty = false;
     }
-}
-
-/// Lines a trim took out of a session, freed when this is dropped.
-#[derive(Default)]
-struct Released {
-    _blocks: Vec<Arc<[LogLine]>>,
-    _frozen: Option<LogLines>,
 }
 
 /// A session's place in the shared budget: registered while it runs.
@@ -447,14 +447,17 @@ pub(crate) async fn run(
                 }
             }
             () = trim_asked() => {
-                if let Some(b) = &budget {
-                    let released = b.budget.apply_trim(b.id, |bytes| {
-                        let released = out.trim_to(bytes);
-                        ((out.buffer.bytes(), out.buffer.trimmable_bytes()), released)
-                    });
-                    // Freed here, with the budget's lock let go: a big paused tab can hold
-                    // many lines, and showing a tab waits on that lock.
-                    drop(released);
+                if let Some(b) = &budget
+                    && let Some(blocks) = b.budget.apply_trim(b.id, |bytes| out.detach(bytes))
+                {
+                    // With the budget's lock let go: a big paused tab can hold many lines, and
+                    // showing a tab waits on that lock.
+                    out.finish_trim(blocks);
+                    // Published at once, so the trim reaches the tab soon; a tab shown before
+                    // this drops the lines itself ([`LogBudget::set_shown`]).
+                    if out.dirty {
+                        out.publish(&tx);
+                    }
                 }
             }
             _ = tick.tick(), if out.dirty => {
@@ -624,23 +627,51 @@ mod tests {
         lines.map(str::to_owned).into()
     }
 
-    // covers UP-42: a trim hands back what it took out (blocks, and a paused view's old copy)
-    // instead of freeing it, so the run loop frees it after the budget's lock (#296).
+    // covers UP-42: only taking the blocks out runs under the budget's lock; a paused view's
+    // rebuild and the freeing come after, so showing a tab does not wait on them, and learns
+    // which lines the trim kept (#296).
     #[test]
-    fn a_trim_hands_back_what_it_took_out() {
-        let mut out = Output::new(&config(100_000));
-        for n in 0..3 * crate::logs::CHUNK_LINES {
-            out.append(LogLine::parse(&format!("line {n}"), false));
-        }
-        out.publish(&watch::channel(Arc::new(LogSnapshot::connecting())).0);
-        out.set_paused(true);
-        let released = out.trim_to(0);
-        assert_eq!(released._blocks.len(), 3, "every sealed block");
-        assert!(released._frozen.is_some(), "the paused view's old copy");
-        assert_eq!(out.buffer.trimmable_bytes(), 0);
-        assert!(out.trimmed);
-        let nothing = out.trim_to(0);
-        assert!(nothing._blocks.is_empty() && nothing._frozen.is_none());
+    fn showing_a_tab_does_not_wait_on_the_rest_of_a_trim() {
+        let budget = LogBudget::new(1);
+        budget.register(1);
+        let (in_finish, finishing) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn({
+            let budget = budget.clone();
+            move || {
+                let mut out = Output::new(&config(100_000));
+                for n in 0..3 * crate::logs::CHUNK_LINES {
+                    out.append(LogLine::parse(&format!("line {n}"), false));
+                }
+                out.publish(&watch::channel(Arc::new(LogSnapshot::connecting())).0);
+                out.set_paused(true);
+                budget.report(1, out.buffer.bytes(), out.buffer.trimmable_bytes(), true);
+                let blocks = budget.apply_trim(1, |bytes| out.detach(bytes)).unwrap();
+                assert_eq!(blocks.len(), 3, "every sealed block, unfreed");
+                in_finish.send(out.buffer.first_id()).unwrap();
+                // The rest of the trim waits here, as a slow rebuild would.
+                wait.recv().unwrap();
+                out.finish_trim(blocks);
+                let frozen = out.frozen.as_ref().unwrap();
+                assert_eq!(
+                    frozen.first_id(),
+                    out.buffer.first_id(),
+                    "the paused view follows"
+                );
+            }
+        });
+        let first = finishing.recv().unwrap();
+        let (shown_tx, shown) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let budget = budget.clone();
+            move || shown_tx.send(budget.set_shown(1, true)).unwrap()
+        });
+        let kept = shown
+            .recv_timeout(Duration::from_secs(5))
+            .expect("showing the tab does not wait on the rebuild");
+        assert_eq!(kept, Some(first));
+        go.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     // covers UP-42: an ended stream's last block counts as something the budget can take back

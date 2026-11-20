@@ -11,10 +11,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use flint_core::{
-    LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogSearch, LogState,
-    LogSubject, PodSet, PodSetStatus, SearchQuery, WorkloadTarget,
+    LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogSearch, LogSnapshot,
+    LogState, LogSubject, PodSet, PodSetStatus, SearchQuery, WorkloadTarget,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -608,6 +609,29 @@ pub const PREVIOUS_NOT_AVAILABLE: &str =
     "The previous instance's logs aren't available (the container may have been removed).";
 
 /// Whether the session is over: nothing more will come, so pausing means nothing.
+/// The snapshot a log tab shows as it is shown: the newer of the one it has and the session's
+/// newest, without lines before `kept_from` (the oldest line its session kept at its last trim),
+/// which a trim made while it was hidden may not have published yet.
+pub fn shown_snapshot(
+    current: &Arc<LogSnapshot>,
+    latest: Arc<LogSnapshot>,
+    kept_from: Option<LineId>,
+) -> Arc<LogSnapshot> {
+    let snapshot = if latest.version > current.version {
+        latest
+    } else {
+        current.clone()
+    };
+    match kept_from {
+        Some(first) if snapshot.lines.first_id() < first => Arc::new(LogSnapshot {
+            lines: snapshot.lines.trimmed(first),
+            trimmed: true,
+            ..(*snapshot).clone()
+        }),
+        _ => snapshot,
+    }
+}
+
 pub fn has_ended(state: &LogState) -> bool {
     matches!(state, LogState::Ended { .. })
 }
@@ -916,12 +940,52 @@ pub fn save_text(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use flint_core::logs::LogBuffer;
     use flint_core::{LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
 
     use super::*;
+
+    // covers UP-42: a tab being shown takes the newest snapshot, without the lines a trim made
+    // while it was hidden dropped, though that trim was not published yet (#296).
+    #[test]
+    fn a_tab_shown_after_a_trim_shows_only_what_was_kept() {
+        let mut buffer = LogBuffer::new(100);
+        for n in 0..10 {
+            buffer.push(LogLine::parse(&format!("line {n}"), false));
+        }
+        let snapshot = |version, lines: LogLines| {
+            Arc::new(LogSnapshot {
+                lines,
+                state: LogState::Streaming,
+                paused: false,
+                held_back: 0,
+                version,
+                pods: None,
+                trimmed: false,
+            })
+        };
+        let current = snapshot(3, buffer.view());
+        // Nothing newer, never trimmed: the same snapshot.
+        let same = shown_snapshot(&current, snapshot(2, LogLines::default()), None);
+        assert!(Arc::ptr_eq(&same, &current));
+        // Newer: taken.
+        let newer = snapshot(4, buffer.view());
+        assert!(Arc::ptr_eq(
+            &shown_snapshot(&current, newer.clone(), None),
+            &newer
+        ));
+        // Trimmed to line 6 and not yet published: lines 0 to 5 are not shown.
+        let shown = shown_snapshot(&current, snapshot(3, buffer.view()), Some(6));
+        assert_eq!(shown.lines.first_id(), 6);
+        assert_eq!(shown.lines.len(), 4);
+        assert!(shown.trimmed);
+        // Already published: nothing to drop.
+        let published = snapshot(5, buffer.view().trimmed(6));
+        assert!(Arc::ptr_eq(
+            &shown_snapshot(&current, published.clone(), Some(6)),
+            &published
+        ));
+    }
 
     /// Timestamps on or off, no source prefix.
     fn ts(timestamps: bool) -> LineFormat {

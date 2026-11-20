@@ -329,8 +329,19 @@ impl LogView {
     }
 
     /// Whether this tab is the one shown, for the shared log memory budget (see the dock).
-    pub fn set_shown(&self, shown: bool) {
-        self.session.set_shown(shown);
+    ///
+    /// Shown, it takes in the newest snapshot now rather than with the next frame, without
+    /// the lines a trim made while it was hidden: that trim may not have reached a snapshot
+    /// yet, and lines dropped from a tab on screen would read as lines that never came (UP-42).
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        let kept_from = self.session.set_shown(shown);
+        if !shown {
+            return;
+        }
+        let snapshot = log_model::shown_snapshot(&self.snapshot, self.session.peek(), kept_from);
+        if !Arc::ptr_eq(&snapshot, &self.snapshot) {
+            self.set_snapshot(snapshot, cx);
+        }
     }
 
     #[cfg(test)]

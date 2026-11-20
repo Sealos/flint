@@ -566,7 +566,7 @@ impl Dock {
     /// the tabs viewed least recently first, and never the one shown. Run where the shown tab
     /// or the dock's visibility changes, and on every render for anything else (a hidden dock
     /// is not drawn, so hiding it cannot rely on the render).
-    fn sync_shown_log(&mut self, cx: &App) {
+    fn sync_shown_log(&mut self, cx: &mut App) {
         let now = self
             .active
             .filter(|_| self.visible)
@@ -576,7 +576,7 @@ impl Dock {
         }
         for (id, shown) in [(self.shown_log, false), (now, true)] {
             if let Some(DockTab::Logs(view)) = id.and_then(|id| self.tab(id)) {
-                view.read(cx).set_shown(shown);
+                view.update(cx, |view, cx| view.set_shown(shown, cx));
             }
         }
         self.shown_log = now;
