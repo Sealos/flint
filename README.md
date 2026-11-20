@@ -428,6 +428,11 @@ Releases are cut by [release-please](https://github.com/googleapis/release-pleas
 [Conventional Commits](https://www.conventionalcommits.org/) on `master`. Commit subjects and PR titles follow that
 format, for example `feat(mcp): …` or `fix(core): …`.
 
+The type decides what the release notes show. `feat`, `fix` and `perf` are listed; `refactor`, `docs`, `test`, `ci`,
+`build`, `chore` and `style` are hidden (`release-please-config.json`). Use `feat` only for something a person using
+Flint can see or do. Internal work, such as an action registry, a test-only automation channel or a fake exec
+server, is `refactor`, `test` or `chore` (or `fix` when it repairs a bug a user could hit), even when it adds code.
+
 1. Every push to `master` updates an open **release PR** with the next version and the `CHANGELOG.md` entries.
    Below 1.0, `feat` bumps the minor version and `fix` bumps the patch.
 2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release as a draft. Releases are immutable once
