@@ -25,9 +25,12 @@ pub struct SocketFile {
 }
 
 impl SocketFile {
-    /// Removes the socket, unless something else has replaced it since.
+    /// Removes the socket, unless something else has replaced it since. The file type is
+    /// checked too: once the socket is gone, a new file at the path can be given the same
+    /// inode number (Linux reuses freed inodes at once).
     pub fn remove(&self) {
         if let Ok(meta) = fs::symlink_metadata(&self.path)
+            && meta.file_type().is_socket()
             && meta.dev() == self.dev
             && meta.ino() == self.ino
         {
