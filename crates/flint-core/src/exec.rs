@@ -455,8 +455,8 @@ pub(crate) struct Process {
     resize: Option<futures::channel::mpsc::Sender<kube::api::TerminalSize>>,
     /// Resolves with the status the API server sends when the command ends, if it sends one.
     status: BoxFuture<'static, Option<Status>>,
-    /// Resolves when the connection is gone, with why it broke, if it did. Dropping it closes
-    /// the connection.
+    /// Resolves when the connection is gone, with why it broke, if it did. Dropping it, at any
+    /// point, closes the connection.
     finish: BoxFuture<'static, Result<(), String>>,
 }
 
@@ -532,9 +532,16 @@ impl Launcher for KubeLauncher {
             let missing = || LaunchError::new("the exec connection has no terminal".to_owned());
             let stdin = attached.stdin().ok_or_else(missing)?;
             let stdout = attached.stdout().ok_or_else(missing)?;
-            let status = attached.take_status().ok_or_else(missing)?;
+            // Resolves once kube's task has the status or has ended without one (its sender
+            // lives in that task), so it says the connection ended without joining the task.
+            let status = attached.take_status().ok_or_else(missing)?.shared();
+            let ended = status.clone();
             let resize = attached.terminal_size();
+            // `join` detaches kube's task from `attached`, whose drop is what aborts it (and
+            // closes the WebSocket): join only once the task is ending, so dropping `finish`
+            // before then (the session was closed) still closes the connection.
             let finish = async move {
+                ended.await;
                 attached
                     .join()
                     .await
