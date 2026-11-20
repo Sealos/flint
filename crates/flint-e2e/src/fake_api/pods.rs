@@ -472,7 +472,7 @@ pub(crate) struct PodCells {
     /// Ready, Status and Restarts (the count), Node, IP and the `<none>` columns.
     pub cells: Vec<(&'static str, String)>,
     /// When a container last terminated (fixture time), if it restarted: the Restarts cell
-    /// reads "<n> (<age> ago)" from it, rendered when served, as Age is.
+    /// reads `"<n> (<age> ago)"` from it, rendered when served, as Age is.
     pub last_restart: Option<String>,
 }
 

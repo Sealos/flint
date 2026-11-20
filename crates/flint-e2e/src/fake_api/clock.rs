@@ -140,7 +140,7 @@ impl Clock {
         self.render_restarts(value);
     }
 
-    /// Renders "<n> (<age> ago)" in the Restarts cells of rows that carry their last restart
+    /// Renders `"<n> (<age> ago)"` in the Restarts cells of rows that carry their last restart
     /// ([`super::FakeRow::with_last_restart`]), and drops that marker.
     fn render_restarts(&self, value: &mut Value) {
         let Some(rows) = value.get_mut("rows").and_then(Value::as_array_mut) else {

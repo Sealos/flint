@@ -99,7 +99,7 @@ impl FakeRow {
         self
     }
 
-    /// Has the server render cell `cell` (a restart count) as "<n> (<age> ago)" from `at`
+    /// Has the server render cell `cell` (a restart count) as `"<n> (<age> ago)"` from `at`
     /// (fixture time) whenever it serves the row, as the API server prints Restarts.
     pub(crate) fn with_last_restart(mut self, cell: usize, at: &str) -> Self {
         if let Some(row) = self.0.as_object_mut() {
