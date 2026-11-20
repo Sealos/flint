@@ -10,7 +10,6 @@ use serde_json::Value;
 pub const REDACTED: &str = "<redacted>";
 
 /// Annotation `kubectl apply` writes with the whole object, Secret values included.
-#[cfg(test)]
 const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
 pub use flint_core::redact::{is_safe_secret_annotation, is_safe_secret_column, redact_quoted};
@@ -189,8 +188,9 @@ pub fn redact_object_text(value: &mut Value) -> usize {
                 Value::Array(args) if key == "args" || key == "command" => redact_args(args),
                 // Tools keep whole objects and free text in annotations.
                 Value::Object(annotations) if key == "annotations" => annotations
-                    .values_mut()
-                    .map(|value| match value {
+                    .iter_mut()
+                    .map(|(name, value)| match value {
+                        Value::String(text) if name == LAST_APPLIED => redact_last_applied(text),
                         Value::String(text) => redact_text(text),
                         other => redact_object_text(other),
                     })
@@ -201,6 +201,24 @@ pub fn redact_object_text(value: &mut Value) -> usize {
         Value::Array(items) => items.iter_mut().map(redact_object_text).sum(),
         _ => 0,
     }
+}
+
+/// Redacts the object `kubectl apply` kept in an annotation as the live object is redacted,
+/// so a container argument after `--password` is hidden in the copy too, then the JSON text
+/// as free text. Text that is not JSON is only redacted as free text.
+fn redact_last_applied(text: &mut String) -> usize {
+    let mut count = 0;
+    if let Ok(mut applied) = serde_json::from_str::<Value>(text) {
+        count = redact_object_text(&mut applied);
+        if count > 0 {
+            let newline = text.ends_with('\n');
+            *text = applied.to_string();
+            if newline {
+                text.push('\n');
+            }
+        }
+    }
+    count + redact_text(text)
 }
 
 /// Redacts an argument list: each string through the text redactor, and the whole argument
@@ -711,6 +729,60 @@ mod tests {
             json!(["upload failed: token=[REDACTED:token]", "retrying in 30s"])
         );
         assert_eq!(object["status"]["warningMessages"][0]["text"], "kept as is");
+    }
+
+    // covers UP-15
+    #[test]
+    fn last_applied_configurations_are_redacted_like_the_live_object() {
+        let applied = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "app",
+                "args": ["--password", "pw7", "--verbose"],
+                "env": [{"name": "DSN", "value": "postgres://app:hunter2@db/app"}]
+            }]}}}
+        });
+        let mut object = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"annotations": {LAST_APPLIED: format!("{applied}\n")}}
+        });
+        assert_eq!(sanitize(&mut object), 2);
+        let text = object["metadata"]["annotations"][LAST_APPLIED]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(text.ends_with('\n'), "{text}");
+        let kept: Value = serde_json::from_str(&text).unwrap();
+        let container = &kept["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(
+            container["args"],
+            json!(["--password", "[REDACTED:password]", "--verbose"])
+        );
+        assert_eq!(
+            container["env"][0]["value"],
+            "postgres://app:[REDACTED:password]@db/app"
+        );
+
+        // Nothing to hide: the annotation is kept byte for byte, and text that is not JSON is
+        // still redacted as free text.
+        let plain = r#"{"kind":"Service",  "spec":{"ports":[{"port":80}]}}"#;
+        let mut object = json!({"kind": "Service", "metadata": {"annotations": {
+            LAST_APPLIED: plain,
+            "other": "{not json password=pw8"
+        }}});
+        assert_eq!(sanitize(&mut object), 1);
+        assert_eq!(object["metadata"]["annotations"][LAST_APPLIED], plain);
+        assert_eq!(
+            object["metadata"]["annotations"]["other"],
+            "{not json password=[REDACTED:password]"
+        );
+        let mut broken = json!({"kind": "Pod", "metadata": {"annotations": {
+            LAST_APPLIED: "{\"args\":[\"--token\" token=t9"
+        }}});
+        assert_eq!(sanitize(&mut broken), 1);
+        assert!(!broken.to_string().contains("t9"));
     }
 
     // covers UP-15
