@@ -242,6 +242,12 @@ pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
         })
     };
     let apps: Vec<String> = specs("containers").iter().map(name_of).collect();
+    // Native sidecars run beside the app: the annotation may name one, as kubectl allows.
+    let sidecars: Vec<String> = specs("initContainers")
+        .iter()
+        .filter(|c| c["restartPolicy"].as_str() == Some("Always"))
+        .map(name_of)
+        .collect();
     let annotated = str_at(
         pod,
         &[
@@ -250,7 +256,7 @@ pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
             "kubectl.kubernetes.io/default-container",
         ],
     )
-    .filter(|name| apps.iter().any(|a| a == name));
+    .filter(|name| apps.iter().chain(&sidecars).any(|a| a == name));
     let default = annotated
         .or(apps.first().map(String::as_str))
         .map(str::to_owned);
@@ -262,7 +268,7 @@ pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
                 has_previous: ran_before("initContainerStatuses", &name),
                 not_running: not_running("initContainerStatuses", &name),
                 init: c["restartPolicy"].as_str() != Some("Always"),
-                default: false,
+                default: default.as_deref() == Some(name.as_str()),
                 name,
             }
         })
@@ -467,6 +473,23 @@ mod tests {
                 row("app", false, false, true),
                 row("worker", false, true, false),
             ]
+        );
+        // The annotation may name a native sidecar, but not a plain init container.
+        let mut annotated = pod.clone();
+        annotated["metadata"]["annotations"] =
+            json!({"kubectl.kubernetes.io/default-container": "mesh"});
+        let defaults: Vec<String> = pod_containers(&annotated)
+            .into_iter()
+            .filter(|c| c.default)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(defaults, ["mesh"]);
+        annotated["metadata"]["annotations"] =
+            json!({"kubectl.kubernetes.io/default-container": "migrate"});
+        assert!(
+            pod_containers(&annotated)
+                .iter()
+                .any(|c| c.name == "app" && c.default)
         );
     }
 

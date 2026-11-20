@@ -1749,6 +1749,45 @@ async fn pickers_show_the_keys_and_which_containers_run(cx: &mut TestAppContext)
     assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
 }
 
+// covers UP-41, UP-47: when the default container is not running, Shift-Cmd-E refuses with the
+// reason its "(default, not running)" entry shows, while the picker still offers the others.
+#[gpui_kit::test]
+async fn the_key_refuses_a_default_container_that_is_not_running(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "state": {"waiting": {"reason": "CrashLoopBackOff"}}},
+                {"name": "sidecar", "state": {"running": {}}}
+            ]}
+        })),
+    );
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-e");
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new(), "no doomed shell");
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some("Can't open a shell: container app is not running.")
+    );
+    // The pane's Shell is still a picker, and says nothing against it.
+    assert_eq!(shell_button_disabled(cx, &t), Some(false));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 3); // After Logs, Previous Logs and its reason.
+    assert_eq!(submenu(cx, &t), ["app (default, not running)", "sidecar"]);
+    click_submenu(cx, &t, 2);
+    assert_eq!(dock_tabs(cx, &t).0, ["$ web · sidecar"]);
+}
+
 // covers UP-47: the strip that says why takes a row of its own under the list and the pane,
 // above the dock, so it covers none of them, and stays one line high however long the reason
 // is (the whole sentence is in its tooltip).

@@ -407,12 +407,15 @@ Previous Logs (the containers that ran before) and Shell, and the pane's Logs an
 (`detail::OpenContainerLogs`, `detail::OpenContainerShell`) that mark the default container, whose entry also carries
 the plain action so the menu shows its key beside it; a container whose status says it is waiting or terminated
 (crash-looping, say) is listed disabled in the Shell picker as "not running", and a native sidecar (an init container
-with `restartPolicy: Always`) counts as an app container; the keys always open the default container at once, never a
-picker. The default is the one `kubectl` picks (the `kubectl.kubernetes.io/default-container` annotation, else the
-first app container), so ⌘L and ⇧⌘E do in one step what `kubectl logs` and `kubectl exec` do without `-c`, the same
-way every time and from the palette too, where no menu is open; the picker is one right-click or button away, and the
-buttons' tooltips say which container the key opens. For a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs
-opens the workload session (all pods, prefixed) and Shell opens in its first ready pod by name.
+with `restartPolicy: Always`) counts as an app container, for a pod's pickers and a workload's pods alike
+(`WorkloadPod::from_pod`), and the default-container annotation may name one; when the default container is not
+running, its key refuses with the same "not running" reason while the picker offers the others; the keys always open
+the default container at once, never a picker. The default is the one `kubectl` picks (the
+`kubectl.kubernetes.io/default-container` annotation, else the first app container), so ⌘L and ⇧⌘E do in one step what
+`kubectl logs` and `kubectl exec` do without `-c`, the same way every time and from the palette too, where no menu is
+open; the picker is one right-click or button away, and the buttons' tooltips say which container the key opens. For a
+Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs opens the workload session (all pods, prefixed) and Shell
+opens in its first ready pod by name.
 
 - **Workload pods** (`ui/detail_pods.rs`, `CoreHandle::workload_pods`): never listed on each update of the workload.
   A cached list (`resourceVersion=0`) shows which pod a shell would open in: a moment after the row is selected (so
@@ -476,10 +479,13 @@ opens in a tab in the bottom dock.
   further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed;
   why it failed is said once, in the banner under it: plain words, then "Details:" and what was said, in full and
   wrapping, so a long RBAC message stays readable in a narrow dock. Core types where a failure came from
-  (`ExecFailureKind`: the server, signing in, reaching the cluster, the connection, a missing shell), and
-  `terminal_model::failure_words` words it from that: a local error (a missing auth plugin, an unreadable client
-  certificate) reads "Flint couldn't sign in to the cluster.", never as the pod's; only the server's own refusals are
-  told apart by their words (no permission, pod or exec not found, container not running). After the end the screen stays scrollable and copyable. Closing the tab drops the session.
+  (`ExecFailureKind`), from its real cause, in `LaunchError::kube` before kube's error is collapsed: an auth error
+  anywhere in kube's chain, a missing exec plugin, a bad kubeconfig or a 401 is signing in ("Flint couldn't sign in
+  to the cluster."); a failed WebSocket upgrade (a proxy answering 200, missing upgrade headers) has words of its own;
+  a refused or timed-out connection is reaching the cluster; only the API server's own `Status` is the server's, and
+  only those are told apart by their words (no permission, pod or exec not found, container not running). A bare HTTP
+  code (a proxy's page, a wrong server path) and anything else read "The shell could not start." with the full text.
+  After the end the screen stays scrollable and copyable. Closing the tab drops the session.
 - **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,
   Space, the arrows, Home/End, Page Up/Down and Ctrl with a letter or symbol to nothing
   (`registry::TERMINAL_PASSTHROUGH`); it is the deepest context, so those keys skip the app's bindings (focus

@@ -62,6 +62,9 @@ pub struct RowActions {
     pub shell: Availability,
     /// The pod a shell opens in, its app containers, and the default one, as far as known.
     pub shell_pod: Option<ShellPod>,
+    /// The Shell entry is a container picker: the pod has several containers and one of them
+    /// takes a shell now, even if the default one does not.
+    pub shell_picker: bool,
     /// A pod's containers (init ones too), once fetched: what Logs and Previous Logs pick
     /// from.
     pub log_containers: Vec<PodContainer>,
@@ -88,6 +91,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
             .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
         shell: gate(detail.shell_check::<OpenShell>(None)),
         shell_pod: detail.shell_pod(),
+        shell_picker: detail.shell_picker().is_some(),
         log_containers: match subject {
             Subject::Pod => detail.log_containers().to_vec(),
             _ => Vec::new(),
@@ -212,7 +216,7 @@ fn fill(
     };
     match a.shell_pod {
         // The container picker.
-        Some(shell) if a.shell.is_ok() && shell.containers.len() > 1 => {
+        Some(shell) if a.shell_picker && a.blocked.is_none() => {
             menu.submenu(label, window, cx, move |sub, _, _| {
                 shell
                     .containers

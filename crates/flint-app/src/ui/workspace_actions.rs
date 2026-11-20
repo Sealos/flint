@@ -212,9 +212,12 @@ impl Workspace {
             })
             .add::<OpenContainerShell>(
                 |ws, cx| {
+                    // Another container may take a shell while the default one is not running.
                     ws.sessions_open_here(cx)
-                        && detail(ws, cx)
-                            .is_some_and(|d| d.shell_check::<OpenContainerShell>(None).is_ok())
+                        && detail(ws, cx).is_some_and(|d| {
+                            d.shell_check::<OpenContainerShell>(None).is_ok()
+                                || d.shell_picker().is_some()
+                        })
                 },
                 |ws, a, cx| match detail(ws, cx) {
                     Some(d) => d.shell_check::<OpenContainerShell>(Some(&a.container)),

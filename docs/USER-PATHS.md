@@ -251,8 +251,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-41 Shell into a container
 - **When** I open a shell on a pod (Shell in its detail pane or its row's context menu, or Shift-Cmd-E), or on a
   workload (in its first ready pod; UP-47). When the pod has several containers, the button and the menu let me pick
-  one, the default marked with Shift-Cmd-E beside it; a container that is not running is listed but disabled, and a
-  native sidecar is offered like any app container. Shift-Cmd-E opens the default container at once.
+  one, the default marked with Shift-Cmd-E beside it; a container that is not running is listed but disabled (and
+  Shift-Cmd-E says so when it is the default), and a native sidecar is offered like any app container. Shift-Cmd-E
+  opens the default container at once.
 - **Then** a tab opens in the bottom dock with an interactive terminal that resizes with the dock and the window.
   Colors, bold, italic, underline, inverse and wide characters show as in other terminals, in both themes, and
   full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and

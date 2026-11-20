@@ -432,6 +432,17 @@ impl DetailView {
         check_container::<A>(&target, container).map(|_| ())
     }
 
+    /// The pod a Shell picker offers, when it has several containers and a shell can open in
+    /// one of them now (the default one may not be running while another is).
+    pub(in crate::ui) fn shell_picker(&self) -> Option<ShellPod> {
+        let pod = self.shell_pod()?;
+        let open = pod
+            .containers
+            .iter()
+            .any(|c| self.shell_check::<OpenContainerShell>(Some(c)).is_ok());
+        (pod.containers.len() > 1 && open).then_some(pod)
+    }
+
     fn list_failed(&self, kind: flint_core::WorkloadKind, error: &str) -> String {
         format!(
             "the pods of {} {} could not be listed: {error}",
@@ -670,13 +681,21 @@ fn check_container<A: Action>(
     container: Option<&str>,
 ) -> Result<String, ActionError> {
     match container {
-        Some(name) if target.containers.iter().any(|c| c == name) => Ok(name.to_owned()),
-        Some(name) => Err(ActionError::rejected::<A>(format!(
-            "pod {} has no app container {name}",
-            target.pod
-        ))),
+        Some(name) if !target.containers.iter().any(|c| c == name) => Err(
+            ActionError::rejected::<A>(format!("pod {} has no app container {name}", target.pod)),
+        ),
+        // The picker lists it disabled; the key (or the palette) says why, the same way.
+        Some(name) if target.not_running.iter().any(|c| c == name) => Err(not_running::<A>(name)),
+        Some(name) => Ok(name.to_owned()),
+        None if target.not_running.contains(&target.default) => {
+            Err(not_running::<A>(&target.default))
+        }
         None => Ok(target.default.clone()),
     }
+}
+
+fn not_running<A: Action>(container: &str) -> ActionError {
+    ActionError::rejected::<A>(format!("container {container} is not running"))
 }
 
 /// An action's name, as the menu and the palette say it.

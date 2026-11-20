@@ -262,6 +262,11 @@ pub fn failure_words(failure: &ExecFailure) -> (&'static str, String) {
         ExecFailureKind::Unreachable => "Flint couldn't reach the cluster.",
         ExecFailureKind::Connection => "The connection to the shell broke.",
         ExecFailureKind::MissingShell => "Neither bash nor sh is in this container.",
+        ExecFailureKind::Upgrade => {
+            "The connection to the cluster can't carry a shell (a proxy may be blocking \
+             WebSocket upgrades)."
+        }
+        ExecFailureKind::Other => "The shell could not start.",
         ExecFailureKind::Server => server_words(&failure.message),
     };
     (headline, failure.message.trim().to_owned())
@@ -602,6 +607,22 @@ mod tests {
                 "exec: \"/bin/sh\": stat /bin/sh: no such file or directory"
             ),
             "Neither bash nor sh is in this container."
+        );
+        assert_eq!(
+            words(
+                ExecFailureKind::Upgrade,
+                "failed to switch protocol: 200 OK"
+            ),
+            "The connection to the cluster can't carry a shell (a proxy may be blocking \
+             WebSocket upgrades)."
+        );
+        // A bare 404 (a proxy's page) names no cause: it is never worded as the pod's.
+        assert_eq!(
+            words(
+                ExecFailureKind::Other,
+                "the server answered 404 Not Found: is the server URL (and its path) right?"
+            ),
+            "The shell could not start."
         );
         assert_eq!(
             words(

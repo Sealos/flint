@@ -335,20 +335,31 @@ pub struct WorkloadPod {
     pub name: String,
     /// Its `Ready` condition is true and it is not being deleted.
     pub ready: bool,
-    /// Its app containers (not init containers or sidecars), in spec order.
+    /// The containers a shell can open in, in spec order: its native sidecars (init containers
+    /// with `restartPolicy: Always`, which run beside the app), then its app containers. Plain
+    /// init containers, which run to completion first, are left out.
     pub containers: Vec<String>,
     /// The container `kubectl exec` picks: the one the `kubectl.kubernetes.io/default-container`
-    /// annotation names, if it is an app container, else the first.
+    /// annotation names, if the pod has it (a native sidecar too), else the first app
+    /// container.
     pub default_container: Option<String>,
 }
 
 impl WorkloadPod {
     pub fn from_pod(pod: &Pod) -> Self {
-        let containers: Vec<String> = pod
+        let sidecars = pod.spec.iter().flat_map(|s| {
+            s.init_containers
+                .iter()
+                .flatten()
+                .filter(|c| c.restart_policy.as_deref() == Some("Always"))
+                .map(|c| c.name.clone())
+        });
+        let apps: Vec<String> = pod
             .spec
             .iter()
             .flat_map(|s| s.containers.iter().map(|c| c.name.clone()))
             .collect();
+        let containers: Vec<String> = sidecars.chain(apps.iter().cloned()).collect();
         let annotated = pod
             .metadata
             .annotations
@@ -365,7 +376,7 @@ impl WorkloadPod {
         WorkloadPod {
             name: pod.metadata.name.clone().unwrap_or_default(),
             ready,
-            default_container: annotated.or_else(|| containers.first().cloned()),
+            default_container: annotated.or_else(|| apps.first().cloned()),
             containers,
         }
     }
@@ -588,6 +599,29 @@ mod tests {
         let annotated = WorkloadPod::from_pod(&annotated);
         assert_eq!(annotated.default_container.as_deref(), Some("proxy"));
         assert!(!annotated.ready, "no Ready condition yet");
+    }
+
+    // covers UP-41, UP-47: a native sidecar (an init container that keeps running) takes a
+    // shell like an app container, and the annotation may name it; without the annotation the
+    // first app container is the default, as kubectl picks.
+    #[test]
+    fn a_workload_pods_native_sidecars_take_a_shell() {
+        let spec = json!({
+            "initContainers": [
+                {"name": "migrate"},
+                {"name": "mesh", "restartPolicy": "Always"}
+            ],
+            "containers": [{"name": "app"}]
+        });
+        let plain = WorkloadPod::from_pod(&pod(json!({"metadata": {"name": "a"}, "spec": spec})));
+        assert_eq!(plain.containers, ["mesh", "app"]);
+        assert_eq!(plain.default_container.as_deref(), Some("app"));
+        let annotated = WorkloadPod::from_pod(&pod(json!({
+            "metadata": {"name": "a", "annotations": {
+                "kubectl.kubernetes.io/default-container": "mesh"}},
+            "spec": spec
+        })));
+        assert_eq!(annotated.default_container.as_deref(), Some("mesh"));
     }
 
     // covers UP-47: an empty selector would list every pod in the namespace, so it is refused

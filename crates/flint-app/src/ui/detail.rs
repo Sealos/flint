@@ -604,7 +604,11 @@ impl DetailView {
                     .into_any_element(),
             );
         }
-        if let Err(e) = self.shell_check::<OpenShell>(None) {
+        // A pod whose default container is not running still offers the others.
+        let picker = self.shell_picker();
+        if let Err(e) = self.shell_check::<OpenShell>(None)
+            && picker.is_none()
+        {
             return Some(
                 button
                     .disabled(true)
@@ -652,11 +656,16 @@ impl DetailView {
         }
         Some(
             button
-                .tooltip(match self.subject {
-                    Subject::Workload(_) => {
-                        format!("In {pod}: {}", picker_hint(Some(&default), &keys))
+                .tooltip({
+                    let hint = if not_running.contains(&default) {
+                        format!("Choose a container (the default, {default}, is not running)")
+                    } else {
+                        picker_hint(Some(&default), &keys)
+                    };
+                    match self.subject {
+                        Subject::Workload(_) => format!("In {pod}: {hint}"),
+                        _ => hint,
                     }
-                    _ => picker_hint(Some(&default), &keys),
                 })
                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                     let mut menu = menu.label("Container");
@@ -692,9 +701,11 @@ impl DetailView {
             .log_plan::<OpenLogs>(None, false)
             .err()
             .map(|e| actions::reason(&e));
+        // A picker that still offers a running container says nothing against Shell.
         let shell = self
             .shell_check::<OpenShell>(None)
             .err()
+            .filter(|_| self.shell_picker().is_none())
             .map(|e| actions::reason(&e));
         match (logs, shell) {
             (Some(logs), Some(shell)) if logs == shell => {

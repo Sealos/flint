@@ -161,8 +161,13 @@ pub enum ExecFailureKind {
     Unreachable,
     /// The exec connection broke after the command started.
     Connection,
+    /// The connection to the cluster could not be upgraded to the WebSocket an exec needs: a
+    /// proxy answered the upgrade with a plain response, or dropped its headers.
+    Upgrade,
     /// Neither shell Flint tries is in the container.
     MissingShell,
+    /// Anything else: no cause Flint can name (the full text says what happened).
+    Other,
 }
 
 impl ExecFailure {
@@ -188,19 +193,32 @@ impl std::fmt::Display for ExecFailure {
 }
 
 impl ExecFailureKind {
-    /// Where an error starting the exec came from, by what core made of it.
-    fn of(error: &ClusterError) -> Self {
+    /// Where an error starting the exec came from: from kube's error itself (an auth error
+    /// anywhere in its chain, a failed upgrade), then from what core made of it. Only the API
+    /// server's own `Status` is `Server`; a bare HTTP code is not the pod's.
+    fn of(err: &kube::Error, error: &ClusterError) -> Self {
+        use kube::client::UpgradeConnectionError as U;
+        match err {
+            kube::Error::UpgradeConnection(U::ProtocolSwitch(code)) if code.as_u16() == 401 => {
+                return ExecFailureKind::SignIn;
+            }
+            kube::Error::UpgradeConnection(_) => return ExecFailureKind::Upgrade,
+            _ => {}
+        }
+        if crate::cluster::find_auth_error(err).is_some() {
+            return ExecFailureKind::SignIn;
+        }
         match error {
             ClusterError::Api(_) => ExecFailureKind::Server,
             ClusterError::Http { code: 401, .. } => ExecFailureKind::SignIn,
-            ClusterError::Http { .. } => ExecFailureKind::Server,
+            ClusterError::Http { .. } => ExecFailureKind::Other,
             ClusterError::Timeout { .. } | ClusterError::Transport { .. } => {
                 ExecFailureKind::Unreachable
             }
             ClusterError::UnknownContext(_)
             | ClusterError::Config { .. }
-            | ClusterError::ExecPluginNotFound { .. }
-            | ClusterError::Kube(_) => ExecFailureKind::SignIn,
+            | ClusterError::ExecPluginNotFound { .. } => ExecFailureKind::SignIn,
+            ClusterError::Kube(_) => ExecFailureKind::Other,
         }
     }
 }
@@ -455,8 +473,9 @@ impl LaunchError {
     /// ("No such file or directory") must not make the next shell be tried.
     fn kube(err: kube::Error, executable: &str) -> Self {
         let from_server = matches!(err, kube::Error::Api(_));
-        let error = ClusterError::kube(err);
-        let kind = ExecFailureKind::of(&error);
+        // Classified from kube's error as well as core's, which keeps less of it.
+        let error = ClusterError::kube_ref(&err);
+        let kind = ExecFailureKind::of(&err, &error);
         let message = error.to_string();
         let missing_command = from_server && is_missing_command(&message, executable);
         Self {
@@ -1762,8 +1781,8 @@ mod tests {
         )));
         let local = LaunchError::kube(local, "bash");
         assert!(!local.missing_command);
-        // Not the container's: a client file Flint could not read.
-        assert_eq!(local.kind, ExecFailureKind::SignIn);
+        // Not the container's, nor known to be signing in: no cause to name.
+        assert_eq!(local.kind, ExecFailureKind::Other);
         // The exec auth plugin is not on PATH ("… not found on PATH").
         let plugin = kube::Error::Auth(kube::client::AuthError::AuthExecStart(
             std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1782,6 +1801,57 @@ mod tests {
         );
         assert!(LaunchError::kube(api_error(NOT_FOUND), "bash").missing_command);
         assert!(!LaunchError::kube(api_error(NOT_FOUND), "/bin/sh").missing_command);
+    }
+
+    // covers UP-41: where an exec failure came from is decided by its real cause: an auth error
+    // anywhere in kube's chain signs in, a failed WebSocket upgrade (a proxy answering 200) is
+    // its own, a bare HTTP code is not the pod's, and the catch-all names nothing.
+    #[test]
+    fn exec_failures_are_classified_by_their_cause() {
+        use kube::client::UpgradeConnectionError as U;
+        let kind = |err: kube::Error| LaunchError::kube(err, "bash").kind;
+        assert_eq!(
+            kind(kube::Error::UpgradeConnection(U::ProtocolSwitch(
+                http::StatusCode::OK
+            ))),
+            ExecFailureKind::Upgrade
+        );
+        assert_eq!(
+            kind(kube::Error::UpgradeConnection(
+                U::MissingUpgradeWebSocketHeader
+            )),
+            ExecFailureKind::Upgrade
+        );
+        assert_eq!(
+            kind(kube::Error::UpgradeConnection(U::ProtocolSwitch(
+                http::StatusCode::UNAUTHORIZED
+            ))),
+            ExecFailureKind::SignIn
+        );
+        // A token file Flint could not read is an auth error: signing in.
+        assert_eq!(
+            kind(kube::Error::Auth(kube::client::AuthError::ReadTokenFile(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+                "/var/run/token".into()
+            ))),
+            ExecFailureKind::SignIn
+        );
+        // A bare 404 (a proxy's page, a wrong server path) is not a pod problem; a bare 401
+        // is signing in.
+        let any = kube::Error::LinesCodecMaxLineLengthExceeded;
+        let http = |code| ClusterError::Http { code, server: None };
+        assert_eq!(
+            ExecFailureKind::of(&any, &http(404)),
+            ExecFailureKind::Other
+        );
+        assert_eq!(
+            ExecFailureKind::of(&any, &http(401)),
+            ExecFailureKind::SignIn
+        );
+        assert_eq!(
+            ExecFailureKind::of(&any, &ClusterError::Kube("something odd".into())),
+            ExecFailureKind::Other
+        );
     }
 
     #[test]
