@@ -570,7 +570,7 @@ impl Launcher for KubeLauncher {
     }
 }
 
-/// Says why a session must end because its context changed ([`crate::recheck::moved`]), or
+/// Says why a session must end because its context changed ([`crate::recheck::reason`]), or
 /// `None` while the context still points at the API server the session opened on.
 pub(crate) type ContextCheck = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
@@ -1384,25 +1384,32 @@ mod tests {
         session
     }
 
-    /// A context the test re-points or removes: its server now (`None`: removed), and how
-    /// many checks a session pinned to `https://staging` made, as [`ContextCheck`] does
-    /// through the cluster manager.
+    /// A context the test re-points or removes, as kubeconfig reloads record it in the cluster
+    /// manager, and how many checks a session pinned to it (at `https://staging`) made, as
+    /// [`ContextCheck`] does through the manager.
     #[derive(Clone)]
     struct FakeContext {
-        server: Arc<Mutex<Option<&'static str>>>,
+        history: Arc<Mutex<crate::recheck::ContextHistory>>,
+        pin: crate::recheck::ContextPin,
         checks: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeContext {
         fn new() -> Self {
+            let mut history = crate::recheck::ContextHistory::default();
+            history.record([("main", Some("https://staging"))], true);
+            let pin = history.pin("main");
             Self {
-                server: Arc::new(Mutex::new(Some("https://staging"))),
+                history: Arc::new(Mutex::new(history)),
+                pin,
                 checks: Arc::default(),
             }
         }
 
+        /// A kubeconfig reload where `main` points to `server`, or is gone (`None`).
         fn point_to(&self, server: Option<&'static str>) {
-            *self.server.lock().unwrap() = server;
+            let found = server.map(|server| ("main", Some(server)));
+            self.history.lock().unwrap().record(found, true);
         }
 
         fn check(&self) -> ContextCheck {
@@ -1411,12 +1418,10 @@ mod tests {
                 context
                     .checks
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let current = *context.server.lock().unwrap();
-                let reason = crate::recheck::moved(
+                let reason = context.history.lock().unwrap().check(
                     crate::recheck::Pinned::Shell,
                     "main",
-                    Some("https://staging"),
-                    current.map(Some),
+                    context.pin,
                 );
                 async move { reason }.boxed()
             })
