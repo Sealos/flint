@@ -12,9 +12,11 @@ becomes an issue before anything else.
 
 Once the release PR is merged, the tag already holds `CHANGELOG.md`, so this check comes first.
 
-- [ ] Every entry under Features and Bug Fixes in the release PR is something a user can see. If internal work
-  slipped in, edit both `CHANGELOG.md` on the release branch and the release notes in the PR description, and
-  note the commit so its type is right next time (see [Releases](../README.md#releases)).
+- [ ] Every entry in every public section of the release PR (Features, Bug Fixes, Performance) is something a user
+  can see. If internal work slipped in, edit both `CHANGELOG.md` on the release branch and the release notes in the
+  PR description, and note the commit so its type is right next time (see [Releases](../README.md#releases)).
+- [ ] Repeat the check after any new commit lands on `master`: release-please regenerates `CHANGELOG.md` and the PR
+  description and overwrites manual edits. Check the version of the release PR that you actually merge.
 
 ## 1. The release page
 
