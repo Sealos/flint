@@ -58,15 +58,33 @@ impl Bootstrap {
     }
 }
 
-/// Sends logs to stderr, filtered by `FLINT_LOG` (default `info`). Never stdout: in `flint mcp`,
-/// stdout carries the protocol. Call it once, after [`bootstrap`].
-pub fn init_logging() {
-    let filter = EnvFilter::try_from_env("FLINT_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+/// Sends logs to stderr, filtered by [`log_filter`] from `FLINT_LOG` and `RUST_LOG`. Never
+/// stdout: in `flint mcp`, stdout carries the protocol. Call it once, after [`bootstrap`].
+/// `verbose` (`--verbose`) raises the default from warnings to info.
+pub fn init_logging(verbose: bool) {
+    let flint_log = std::env::var("FLINT_LOG").ok();
+    let rust_log = std::env::var("RUST_LOG").ok();
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(
+            flint_log.as_deref(),
+            rust_log.as_deref(),
+            verbose,
+        ))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
+}
+
+/// The log filter: `FLINT_LOG` if set, else `RUST_LOG`, else `info` when `verbose` and `warn`
+/// otherwise, so a plain run prints only warnings and errors. An empty or unparsable variable
+/// counts as unset. A variable wins over `verbose`: it says exactly what to log.
+pub fn log_filter(flint_log: Option<&str>, rust_log: Option<&str>, verbose: bool) -> EnvFilter {
+    [flint_log, rust_log]
+        .into_iter()
+        .flatten()
+        .filter(|directives| !directives.trim().is_empty())
+        .find_map(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| EnvFilter::new(if verbose { "info" } else { "warn" }))
 }
 
 /// Loads settings, resolves and installs `PATH`, and computes the kubeconfig files.
@@ -95,6 +113,8 @@ pub unsafe fn bootstrap() -> Result<Bootstrap, SettingsError> {
 
 #[cfg(test)]
 mod tests {
+    use tracing_subscriber::filter::LevelFilter;
+
     use super::*;
 
     fn boot(extra: Vec<PathBuf>) -> Bootstrap {
@@ -123,6 +143,47 @@ mod tests {
         assert_eq!(
             config.kubeconfig_base,
             [PathBuf::from("/home/u/.kube/config")]
+        );
+    }
+
+    fn max_level(flint_log: Option<&str>, rust_log: Option<&str>, verbose: bool) -> LevelFilter {
+        log_filter(flint_log, rust_log, verbose)
+            .max_level_hint()
+            .unwrap()
+    }
+
+    #[test]
+    fn plain_runs_log_warnings_and_verbose_runs_info() {
+        assert_eq!(max_level(None, None, false), LevelFilter::WARN);
+        assert_eq!(max_level(None, None, true), LevelFilter::INFO);
+    }
+
+    #[test]
+    fn flint_log_then_rust_log_override_the_default_and_verbose() {
+        assert_eq!(max_level(Some("debug"), None, false), LevelFilter::DEBUG);
+        assert_eq!(max_level(Some("error"), None, true), LevelFilter::ERROR);
+        assert_eq!(max_level(None, Some("trace"), false), LevelFilter::TRACE);
+        assert_eq!(
+            max_level(Some("debug"), Some("trace"), false),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(
+            log_filter(Some("flint_core=debug"), None, false).to_string(),
+            "flint_core=debug"
+        );
+    }
+
+    #[test]
+    fn empty_or_unparsable_filters_count_as_unset() {
+        assert_eq!(max_level(Some(""), None, false), LevelFilter::WARN);
+        assert_eq!(
+            max_level(Some("  "), Some("debug"), false),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(max_level(Some("=bogus=["), None, true), LevelFilter::INFO);
+        assert_eq!(
+            max_level(Some("=bogus=["), Some("error"), true),
+            LevelFilter::ERROR
         );
     }
 

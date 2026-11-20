@@ -7,15 +7,21 @@
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage: flint-mcp            serve the read-only MCP server on stdio
-       flint-mcp --version  print the version
+usage: flint-mcp [--verbose]  serve the read-only MCP server on stdio
+       flint-mcp --version    print the version
+
+-v, --verbose logs info to stderr as well as warnings. FLINT_LOG (or RUST_LOG) sets the filter
+exactly, for example FLINT_LOG=debug.
 
 Same server as `flint mcp`, without the desktop app. Not shipped; register `flint mcp` in AI clients.";
 
-/// `Ok` to serve; `Err` holds what to print and the exit code. Program name excluded.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(), (String, u8)> {
-    match args.into_iter().next().as_deref() {
-        None => Ok(()),
+/// `Ok(verbose)` to serve; `Err` holds what to print and the exit code. Program name excluded.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<bool, (String, u8)> {
+    let (verbose, rest): (Vec<String>, Vec<String>) = args
+        .into_iter()
+        .partition(|a| matches!(a.as_str(), "-v" | "--verbose"));
+    match rest.first().map(String::as_str) {
+        None => Ok(!verbose.is_empty()),
         Some("-h" | "--help" | "help") => Err((USAGE.to_owned(), 0)),
         Some("-V" | "--version" | "version") => {
             Err((format!("flint-mcp {}", env!("CARGO_PKG_VERSION")), 0))
@@ -29,8 +35,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(), (String, u8)
 
 fn main() -> ExitCode {
     // Only argument parsing may run before the server's bootstrap: it must not start threads.
-    match parse_args(std::env::args().skip(1)) {
-        Ok(()) => {}
+    let verbose = match parse_args(std::env::args().skip(1)) {
+        Ok(verbose) => verbose,
         Err((text, 0)) => {
             println!("{text}");
             return ExitCode::SUCCESS;
@@ -39,22 +45,30 @@ fn main() -> ExitCode {
             eprintln!("{text}");
             return ExitCode::from(code);
         }
-    }
+    };
     // SAFETY: nothing has started a thread yet.
-    unsafe { flint_mcp::serve_stdio_main("flint-mcp") }
+    unsafe { flint_mcp::serve_stdio_main("flint-mcp", verbose) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_args;
 
-    fn parse(args: &[&str]) -> Result<(), (String, u8)> {
+    fn parse(args: &[&str]) -> Result<bool, (String, u8)> {
         parse_args(args.iter().map(|a| (*a).to_owned()))
     }
 
     #[test]
     fn no_arguments_serves() {
-        assert_eq!(parse(&[]), Ok(()));
+        assert_eq!(parse(&[]), Ok(false));
+    }
+
+    #[test]
+    fn verbose_serves_with_more_logging() {
+        assert_eq!(parse(&["--verbose"]), Ok(true));
+        assert_eq!(parse(&["-v"]), Ok(true));
+        assert!(parse(&["--help"]).unwrap_err().0.contains("--verbose"));
+        assert_eq!(parse(&["--verbose", "bogus"]).unwrap_err().1, 2);
     }
 
     #[test]

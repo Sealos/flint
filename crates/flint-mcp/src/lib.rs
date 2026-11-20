@@ -15,13 +15,14 @@ use rmcp::ServiceExt;
 
 /// The whole MCP server process, after argument parsing: bootstrap, logging to stderr, then
 /// [`run_stdio`] until the client disconnects. `flint mcp` and the `flint-mcp` binary both run
-/// this, so they behave the same. `program` prefixes a startup error.
+/// this, so they behave the same. `program` prefixes a startup error; `verbose` (`--verbose`)
+/// logs info as well as warnings, unless `FLINT_LOG` or `RUST_LOG` says otherwise.
 ///
 /// # Safety
 ///
 /// Like [`bootstrap::bootstrap`]: call it while the process is single-threaded, before anything
 /// starts a thread.
-pub unsafe fn serve_stdio_main(program: &str) -> ExitCode {
+pub unsafe fn serve_stdio_main(program: &str, verbose: bool) -> ExitCode {
     // SAFETY: forwarded to the caller.
     let boot = match unsafe { bootstrap::bootstrap() } {
         Ok(boot) => boot,
@@ -30,7 +31,7 @@ pub unsafe fn serve_stdio_main(program: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    bootstrap::init_logging();
+    bootstrap::init_logging(verbose);
     boot.log_summary();
     match run_stdio(&boot) {
         Ok(()) => ExitCode::SUCCESS,
