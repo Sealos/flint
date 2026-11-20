@@ -364,18 +364,28 @@ namespaces left by other tests are not.
   the container runs and ends cleanly when it stops; a stopped container or a previous instance is read to its end.
   A log nobody wrote holds three canned lines from just before the server started; pods added by tests start empty.
 - **Driving logs:** a `ContainerLog::new(ns, pod)` (`.container(c)`, `.previous()`) names a log. `append_log`
-  writes lines stamped now (in order) and pushes them to open streams; `append_log_at` stamps them at a given time,
-  to script lines sharing a second for resume tests. `set_log` / `set_container_log` replace a log. `end_log_streams`
-  ends open streams cleanly (EOF, the pod stays, so Flint reconnects from its last timestamp); `drop_log_streams`
-  breaks them. `open_log_streams()` counts open followed streams (a stream closes when its client goes away) and
-  `wait_for_log_streams(n, within)` waits until exactly `n` are open, for "closing the tab closes the stream". To
-  refuse one pod's log, narrow a fault: `Fault::forbidden().on(&pods).named(pod).subresource("log")`.
+  writes lines stamped now, each strictly after the last line written now, and pushes them to open streams;
+  `append_log_at` stamps them at a given time (to script lines sharing a second for resume tests) and leaves "now"
+  alone. `set_log` / `set_container_log` replace a log. `end_log_streams` ends open streams cleanly (EOF, the pod
+  stays, so Flint reconnects from its last timestamp); `drop_log_streams` breaks them. `limitBytes` cuts at exactly
+  that many bytes (even inside a character) and ends the stream. `open_log_streams()` counts open followed streams (a
+  stream closes when its client goes away) and `wait_for_log_streams(n, within)` waits until exactly `n` are open,
+  for "closing the tab closes the stream". To refuse one pod's log, narrow a fault:
+  `Fault::forbidden().on(&pods).named(pod).subresource("log")`.
 - **Pod churn:** `pod(ns, name)` returns a pod's object as a `FakePod`; `.sibling(name)` makes another pod of the same
   workload (labels, owner, spec; new uid, fresh running status), and `FakePod::new(ns, name, &containers)` builds one
-  (`.label`, `.owner`, `.waiting`, `.terminated`, `.restarted`). `add_pod` sends `ADDED`; `delete_pod` ends the pod's
-  log streams then sends `DELETED`; `replace_pod` does both (the same name gives a recreated pod with another uid);
-  `restart_container` ends the container's streams, keeps its log as the previous one and sends `MODIFIED` with one
-  more restart. Table rows and plain watches both see these.
+  (`.label`, `.owner`, `.waiting`, `.terminated`, `.restarted`). Phases follow the kubelet's `getPhase` and Table
+  cells its `printPod` (the Restarts age is rendered when served, as Age is). Every change below is a watch event
+  carrying the object as it was at that change.
+  - `add_pod` sends `ADDED`; a pod built `.waiting(c, "ContainerCreating")` is Pending until `start_container`, which
+    keeps its uid (`MODIFIED`).
+  - `crash_container` stops a container (exit 1): its streams end and, until `start_container` starts the next
+    instance, a log request reads the stopped one, as the kubelet serves it. `start_container` then keeps that log
+    as the previous one, with one more restart. `restart_container` does both at once.
+  - `delete_pod` deletes gracefully: `MODIFIED` with a `deletionTimestamp` (Terminating), then the containers stop
+    (exit 0, a terminal phase), their streams end and the pod and its logs stay readable until `finish_delete`
+    sends `DELETED`. `force_delete_pod` skips Terminating. `replace_pod` deletes and finishes the old pod, then adds
+    the new one (the same name gives a recreated pod with another uid).
 - **Wiring:** `write_kubeconfig(path, namespace)` writes a kubeconfig that trusts the server's CA.
   `write_kubeconfigs` puts several servers in one file under their own context names (UP-01, UP-06, UP-24).
 - **Timing:** `CoreConfig::watch_timing` shortens the core's retry waits; e2e tests use 10–50 ms.

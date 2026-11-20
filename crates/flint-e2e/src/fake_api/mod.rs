@@ -10,8 +10,9 @@
 //! Pod logs behave like a real cluster's for what Flint asks (`logs`): per container and
 //! previous instance, `follow`, `tailLines`, `sinceSeconds`/`sinceTime`, `timestamps` and
 //! `limitBytes`. Tests write them ([`FakeApiServer::append_log`]), end or break the open streams,
-//! and churn pods ([`FakeApiServer::add_pod`], [`FakeApiServer::replace_pod`],
-//! [`FakeApiServer::restart_container`]) with the watch events a cluster sends.
+//! and churn pods ([`FakeApiServer::add_pod`], [`FakeApiServer::start_container`],
+//! [`FakeApiServer::crash_container`], [`FakeApiServer::delete_pod`],
+//! [`FakeApiServer::replace_pod`]) with the watch events a cluster sends.
 //!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {

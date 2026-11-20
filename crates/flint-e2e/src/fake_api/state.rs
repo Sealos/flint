@@ -59,6 +59,10 @@ pub struct Change {
     pub row: FakeRow,
     /// The row before a `MODIFIED`, so a watch with a selector can tell an object left it.
     pub previous: Option<FakeRow>,
+    /// The full object as of this change (plain watches send it): taken when the change is
+    /// made, so later changes do not leak into it. A `DELETED` carries the object's last state
+    /// at the deletion's resource version.
+    pub object: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -363,7 +367,10 @@ impl State {
     /// A change watches see: `ADDED` and `MODIFIED` add or replace the row (and update the
     /// object), `DELETED` removes both (an unknown row is still reported, at a new version).
     pub fn change(&mut self, gvr: &Gvr, ty: &'static str, row: FakeRow) -> Change {
-        let (row, previous) = if ty == "DELETED" {
+        let (row, previous, object) = if ty == "DELETED" {
+            let last = self
+                .row(gvr, row.namespace(), row.name())
+                .map(|held| self.object_of(gvr, &held));
             let gone = match self.remove(gvr, row.namespace(), row.name()) {
                 Some(gone) => gone,
                 None => {
@@ -372,9 +379,15 @@ impl State {
                     gone
                 }
             };
-            (gone, None)
+            let mut object = last.unwrap_or_else(|| self.object_of(gvr, &gone));
+            if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+                meta.insert("resourceVersion".into(), gone.resource_version().into());
+            }
+            (gone, None, object)
         } else {
-            self.upsert(gvr, row)
+            let (row, previous) = self.upsert(gvr, row);
+            let object = self.object_of(gvr, &row);
+            (row, previous, object)
         };
         let resource_version = self.resource_version;
         self.remember(Change {
@@ -383,6 +396,7 @@ impl State {
             ty,
             row,
             previous,
+            object,
         })
     }
 
@@ -416,7 +430,7 @@ impl State {
     /// The row of a full object: its current row (or one made with `cells`, the rest at their
     /// defaults), with the object's metadata. Adds `kind` and `apiVersion` to the object if
     /// missing.
-    fn row_for_object(
+    pub(crate) fn row_for_object(
         &self,
         gvr: &Gvr,
         object: &mut Value,
@@ -463,21 +477,20 @@ impl State {
         Ok(())
     }
 
-    /// Adds or replaces a full object as a change watches see (`ADDED` or `MODIFIED`), with a
-    /// row made from `cells` (by column name).
+    /// Adds or replaces a full object as a change watches see (`ADDED` or `MODIFIED`), with
+    /// its row (see [`State::row_for_object`]).
     pub fn apply_object(
         &mut self,
         gvr: &Gvr,
         ty: &'static str,
-        mut object: Value,
-        cells: &[(&str, &str)],
-    ) -> Result<Change, String> {
-        let row = self.row_for_object(gvr, &mut object, cells)?;
+        object: Value,
+        row: FakeRow,
+    ) -> Change {
         self.objects
             .entry(gvr.clone())
             .or_default()
             .insert(key_of(&object), object);
-        Ok(self.change(gvr, ty, row))
+        self.change(gvr, ty, row)
     }
 
     /// The full object held for `namespace`/`name`, if one was recorded or set (not one made
@@ -849,14 +862,11 @@ mod tests {
         let pods = Gvr::core("pods");
         let pod = json!({"metadata": {"name": "fresh", "namespace": "demo", "uid": "u-1",
                          "labels": {"app": "web"}}, "spec": {"containers": [{"name": "app"}]}});
-        let added = state
-            .apply_object(
-                &pods,
-                "ADDED",
-                pod,
-                &[("Ready", "1/1"), ("Status", "Running")],
-            )
+        let mut pod = pod;
+        let row = state
+            .row_for_object(&pods, &mut pod, &[("Ready", "1/1"), ("Status", "Running")])
             .unwrap();
+        let added = state.apply_object(&pods, "ADDED", pod, row);
         assert_eq!(added.ty, "ADDED");
         assert_eq!(added.row.uid(), "u-1");
         assert_eq!(added.row.metadata()["labels"]["app"], "web");
@@ -878,7 +888,15 @@ mod tests {
         let gone = state.change(&pods, "DELETED", added.row);
         assert!(state.held_object(&pods, Some("demo"), "fresh").is_none());
         assert_eq!(gone.ty, "DELETED");
-        assert!(state.apply_object(&pods, "ADDED", json!({}), &[]).is_err());
+        // The deletion carries the object's last state at the deletion's version.
+        assert_eq!(gone.object["metadata"]["uid"], "u-1");
+        assert!(gone.object["spec"]["containers"].is_array());
+        assert_eq!(
+            gone.object["metadata"]["resourceVersion"],
+            gone.resource_version.to_string()
+        );
+        assert_eq!(added.object["metadata"]["uid"], "u-1");
+        assert!(state.row_for_object(&pods, &mut json!({}), &[]).is_err());
         // Rows made from the row only hold no object.
         let system = state.rows(&pods, Some("kube-system"), &Query::default());
         assert!(

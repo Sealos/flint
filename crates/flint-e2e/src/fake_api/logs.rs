@@ -20,7 +20,8 @@
 //!   exactly that instant is kept). `sinceSeconds` counts back from now; `sinceTime` is passed
 //!   to the kubelet at second precision (`LogLocation` formats it as RFC 3339). With
 //!   `timestamps`, each line starts with its time in UTC, nine fractional digits, and a space.
-//!   `limitBytes` cuts the output after that many bytes.
+//!   `limitBytes` cuts the output at exactly that many bytes (inside a line or a character) and
+//!   ends it, followed or not.
 //! - **Following** (`follow=true`) keeps the response open while the container runs: new lines
 //!   arrive as they are written, and the response ends cleanly (EOF) when the container stops,
 //!   whether it crashed, restarted, or its pod was deleted. A container that is not running, or
@@ -379,15 +380,16 @@ pub(crate) fn format_timestamp(at: Timestamp) -> String {
     )
 }
 
-/// The text of `entries` from `since` on, with timestamps if asked, cut at `remaining` bytes
-/// (which it counts down).
+/// The bytes of `entries` from `since` on, with timestamps if asked, cut at exactly
+/// `remaining` bytes (which it counts down), as the kubelet's `logWriter` cuts: the limit may
+/// fall inside a line, or inside a character.
 fn render(
     entries: &[Entry],
     timestamps: bool,
     since: Option<Timestamp>,
     remaining: &mut Option<u64>,
-) -> String {
-    let mut out = String::new();
+) -> Vec<u8> {
+    let mut out = Vec::new();
     for entry in entries {
         if since.is_some_and(|since| entry.at < since) {
             continue;
@@ -399,19 +401,13 @@ fn render(
             format!("{} {}\n", format_timestamp(entry.at), entry.text)
         } else {
             format!("{}\n", entry.text)
-        };
+        }
+        .into_bytes();
         if let Some(left) = remaining {
-            let cut = usize::try_from(*left).unwrap_or(usize::MAX);
-            if line.len() > cut {
-                let mut end = cut;
-                while !line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                line.truncate(end);
-            }
+            line.truncate(usize::try_from(*left).unwrap_or(usize::MAX));
             *left -= line.len() as u64;
         }
-        out.push_str(&line);
+        out.extend_from_slice(&line);
     }
     out
 }
@@ -422,8 +418,9 @@ pub(crate) struct Logs {
     clock: Clock,
     instances: HashMap<Key, Instances>,
     followers: Vec<Follower>,
-    /// The newest timestamp given to a line, so lines written in a row are ordered.
-    last: Option<Timestamp>,
+    /// The newest timestamp given to a line written "now", so such lines are ordered even
+    /// within one clock tick. Lines written at a given time do not move it.
+    last_now: Option<Timestamp>,
 }
 
 impl Logs {
@@ -432,7 +429,7 @@ impl Logs {
             clock,
             instances: HashMap::new(),
             followers: Vec::new(),
-            last: None,
+            last_now: None,
         }
     }
 
@@ -464,18 +461,18 @@ impl Logs {
         slot.get_or_insert(canned)
     }
 
-    /// A time for a new line: `at`, or now, never before the last line written without one.
+    /// A time for a new line: `at` as given, or now, strictly after the last line written
+    /// now. Lines written at a given time (in the past or the future) leave "now" alone.
     fn stamp(&mut self, at: Option<Timestamp>) -> Timestamp {
-        let at = at.unwrap_or_else(|| {
-            let now = self.clock.now_precise();
-            match self.last {
-                Some(last) if now <= last => {
-                    last.checked_add(Duration::from_nanos(1)).unwrap_or(last)
-                }
-                _ => now,
-            }
-        });
-        self.last = Some(self.last.map_or(at, |last| last.max(at)));
+        if let Some(at) = at {
+            return at;
+        }
+        let now = self.clock.now_precise();
+        let at = match self.last_now {
+            Some(last) if now <= last => last.checked_add(Duration::from_nanos(1)).unwrap_or(last),
+            _ => now,
+        };
+        self.last_now = Some(at);
         at
     }
 
@@ -585,13 +582,17 @@ impl Logs {
             .count()
     }
 
-    /// The container restarted: its current log becomes the previous one, a new empty log
-    /// starts, and its open streams end.
-    pub fn restart(&mut self, key: &Key) {
-        self.end(key);
+    /// A new instance of the container starts: its current log becomes the previous one, and
+    /// a new empty log starts. (Its streams ended when the old instance stopped.)
+    pub fn rotate(&mut self, key: &Key) {
         let current = std::mem::take(self.entries(key, false));
         let instances = self.instances.entry(key.clone()).or_default();
         instances.previous = Some(current);
+    }
+
+    /// The pod's containers stopped: their open streams end; their logs stay readable.
+    pub fn end_pod(&mut self, namespace: &str, pod: &str) -> usize {
+        self.close(|k| k.0 == namespace && k.1 == pod, None)
     }
 
     /// The pod is gone: its streams end and its logs are forgotten, so a pod created under its
@@ -649,10 +650,15 @@ mod tests {
 
     /// Everything a response has sent so far, and whether it ended (`Some(true)`: cleanly).
     fn drain(rx: &mut mpsc::UnboundedReceiver<Chunk>) -> (String, Option<bool>) {
-        let mut out = String::new();
+        let (bytes, end) = drain_bytes(rx);
+        (String::from_utf8(bytes).unwrap(), end)
+    }
+
+    fn drain_bytes(rx: &mut mpsc::UnboundedReceiver<Chunk>) -> (Vec<u8>, Option<bool>) {
+        let mut out = Vec::new();
         loop {
             match rx.try_recv() {
-                Ok(Ok(bytes)) => out.push_str(std::str::from_utf8(&bytes).unwrap()),
+                Ok(Ok(bytes)) => out.extend_from_slice(&bytes),
                 Ok(Err(_)) => return (out, Some(false)),
                 Err(mpsc::error::TryRecvError::Empty) => return (out, None),
                 Err(mpsc::error::TryRecvError::Disconnected) => return (out, Some(true)),
@@ -939,6 +945,50 @@ mod tests {
     }
 
     #[test]
+    fn byte_limits_cut_inside_characters_and_end_followers() {
+        let mut logs = logs();
+        let k = key("app");
+        logs.set(&k, false, "");
+        // "é" is two bytes; a limit of 2 falls between them.
+        let mut rx = logs.open(&k, running(), &query("follow=true&limitBytes=2"));
+        assert_eq!(logs.append(&k, None, "aé\n"), 1);
+        assert_eq!(drain_bytes(&mut rx), (b"a\xc3".to_vec(), Some(true)));
+        assert_eq!(logs.open_streams(None), 0);
+        let finished = Instance {
+            previous: false,
+            running: false,
+        };
+        let (bytes, end) = drain_bytes(&mut logs.open(&k, finished, &query("limitBytes=3")));
+        assert_eq!((bytes, end), (b"a\xc3\xa9".to_vec(), Some(true)));
+    }
+
+    #[test]
+    fn lines_written_at_a_time_leave_now_alone() {
+        let mut logs = logs();
+        let k = key("app");
+        logs.set(&k, false, "");
+        let future = logs
+            .clock
+            .now_precise()
+            .checked_add(Duration::from_secs(3600))
+            .unwrap();
+        logs.append(&k, Some(future), "scripted");
+        logs.append(&k, None, "one\ntwo");
+        let finished = Instance {
+            previous: false,
+            running: false,
+        };
+        let text = drain(&mut logs.open(&k, finished, &query("timestamps=true"))).0;
+        let stamps: Vec<Timestamp> = text
+            .lines()
+            .map(|l| l.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(stamps[0], future);
+        assert!(stamps[1] < future && stamps[2] < future, "{text}");
+        assert!(stamps[1] < stamps[2]);
+    }
+
+    #[test]
     fn followers_skip_lines_written_before_their_since() {
         let mut logs = logs();
         let k = key("app");
@@ -951,13 +1001,14 @@ mod tests {
     }
 
     #[test]
-    fn restarts_keep_the_last_instance_and_end_streams() {
+    fn a_new_instance_keeps_the_last_one_as_previous() {
         let mut logs = logs();
         let k = key("app");
         logs.set(&k, false, "first run\n");
         let mut rx = logs.open(&k, running(), &query("follow=true"));
         drain(&mut rx);
-        logs.restart(&k);
+        assert_eq!(logs.end(&k), 1);
+        logs.rotate(&k);
         assert_eq!(drain(&mut rx).1, Some(true));
         let previous = Instance {
             previous: true,
@@ -987,6 +1038,16 @@ mod tests {
             running(),
             &query("follow=true"),
         );
+        let mut again = logs.open(&k, running(), &query("follow=true&tailLines=0"));
+        assert_eq!(logs.end_pod("demo", "web"), 2);
+        assert_eq!(drain(&mut rx), ("old pod\n".into(), Some(true)));
+        assert_eq!(drain(&mut again).1, Some(true));
+        // Stopped containers' logs stay readable until the pod is gone.
+        assert_eq!(
+            drain(&mut logs.open(&k, running(), &query(""))).0,
+            "old pod\n"
+        );
+        let mut rx = logs.open(&k, running(), &query("follow=true&tailLines=0"));
         assert_eq!(logs.remove_pod("demo", "web"), 1);
         assert_eq!(drain(&mut rx).1, Some(true));
         assert_eq!(drain(&mut elsewhere).1, None);

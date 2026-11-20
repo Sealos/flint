@@ -388,7 +388,7 @@ impl FakeApiServer {
             Some(("DELETED", row)) if state.row(gvr, row.namespace(), row.name()).is_none() => {
                 return 0;
             }
-            Some((ty, row)) => Outgoing::Event(state.change(gvr, ty, row.clone())),
+            Some((ty, row)) => Outgoing::Event(Box::new(state.change(gvr, ty, row.clone()))),
             None => Outgoing::Step(step),
         };
         self.broadcast(gvr, &outgoing)
@@ -769,13 +769,14 @@ fn opening_events(
             .rows(gvr, namespace, query)
             .into_iter()
             .map(|row| {
-                Outgoing::Event(Change {
+                Outgoing::Event(Box::new(Change {
                     gvr: gvr.clone(),
                     resource_version: state.resource_version(),
                     ty: "ADDED",
+                    object: state.object_of(gvr, &row),
                     row,
                     previous: None,
-                })
+                }))
             })
             .collect::<Vec<_>>()
     };
@@ -796,7 +797,10 @@ fn opening_events(
                 )
             })?;
             Ok(match state.changes_since(gvr, rv) {
-                Some(changes) => changes.into_iter().map(Outgoing::Event).collect(),
+                Some(changes) => changes
+                    .into_iter()
+                    .map(|c| Outgoing::Event(Box::new(c)))
+                    .collect(),
                 None => vec![Outgoing::Step(WatchStep::Expired)],
             })
         }

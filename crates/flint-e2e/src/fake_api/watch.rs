@@ -68,7 +68,7 @@ pub(crate) enum Outgoing {
     /// A scripted step; row steps change the server's rows when they run.
     Step(WatchStep),
     /// A change already applied to the server's rows.
-    Event(Change),
+    Event(Box<Change>),
     /// The end of a streaming list's initial events.
     InitialEventsEnd,
 }
@@ -139,9 +139,20 @@ impl Encoder {
         Bytes::from(text)
     }
 
-    pub fn event(&mut self, state: &State, clock: &Clock, ty: &str, row: &FakeRow) -> Bytes {
+    /// One event about `row`. Plain events send `object` (the object as of the change), or
+    /// the current object when there is none.
+    pub fn event(
+        &mut self,
+        state: &State,
+        clock: &Clock,
+        ty: &str,
+        row: &FakeRow,
+        object: Option<&Value>,
+    ) -> Bytes {
         let mut object = if self.plain {
-            state.object_of(&self.gvr, row)
+            object
+                .cloned()
+                .unwrap_or_else(|| state.object_of(&self.gvr, row))
         } else {
             let meta = json!({"resourceVersion": row.resource_version()});
             let table = state.table(
@@ -266,7 +277,7 @@ fn encode(stream: &Stream, encoder: &mut Encoder, outgoing: Outgoing) -> (Option
     let send = |encoder: &mut Encoder, state: &State, change: &Change| {
         filter
             .event_type(change)
-            .map(|ty| encoder.event(state, &stream.clock, ty, &change.row))
+            .map(|ty| encoder.event(state, &stream.clock, ty, &change.row, Some(&change.object)))
     };
     match outgoing {
         Outgoing::Event(change) => (send(encoder, &state, &change), Next::Continue),
@@ -343,6 +354,7 @@ mod tests {
             gvr: Gvr::core("configmaps"),
             resource_version: 1,
             ty,
+            object: json!({"metadata": row.metadata()}),
             row,
             previous,
         }
@@ -353,7 +365,7 @@ mod tests {
         let state = state();
         let clock = Clock::new(SystemTime::now());
         let mut encoder = Encoder::new(Gvr::core("configmaps"), false);
-        let first = parse(&encoder.event(&state, &clock, "ADDED", &row("a")));
+        let first = parse(&encoder.event(&state, &clock, "ADDED", &row("a"), None));
         let second = parse(&encoder.bookmark(&state, false));
         assert_eq!(first["type"], "ADDED");
         assert!(first["object"]["columnDefinitions"].is_array());
@@ -379,7 +391,7 @@ mod tests {
             (Some("ERROR"), Some(410))
         );
         let mut plain = Encoder::new(Gvr::core("configmaps"), true);
-        let event = parse(&plain.event(&state, &clock, "ADDED", &row("a")));
+        let event = parse(&plain.event(&state, &clock, "ADDED", &row("a"), None));
         assert_eq!(event["object"]["kind"], "ConfigMap");
         let bookmark = parse(&plain.bookmark(&state, false));
         assert_eq!(bookmark["object"]["metadata"]["resourceVersion"], "1000");

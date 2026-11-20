@@ -1,6 +1,6 @@
 //! The server's pod log and pod churn helpers: write and stream logs ([`ContainerLog`]), end or
-//! break open log streams, and create, delete, replace and restart pods with the watch events a
-//! real cluster sends.
+//! break open log streams, and create, start, crash, delete and replace pods with the watch
+//! events a real cluster sends.
 
 use std::time::{Duration, SystemTime};
 
@@ -133,9 +133,11 @@ impl FakeApiServer {
             .map(FakePod::from_json)
     }
 
-    /// Creates a pod, created and started now, and sends `ADDED` to the pod watches that select
-    /// it (Table and plain). Its containers start with empty logs. Returns how many pod watches
-    /// were open. Panics if a pod of that name exists (use [`FakeApiServer::replace_pod`]).
+    /// Creates a pod, created now, and sends `ADDED` to the pod watches that select it (Table
+    /// and plain). Its containers start with empty logs; build it with [`FakePod::waiting`] to
+    /// add it Pending and start it with [`FakeApiServer::start_container`]. Returns how many
+    /// pod watches were open. Panics if a pod of that name exists (see
+    /// [`FakeApiServer::replace_pod`]).
     pub fn add_pod(&self, pod: FakePod) -> usize {
         let mut state = lock(&self.inner.state);
         let gvr = pods_gvr();
@@ -151,13 +153,79 @@ impl FakeApiServer {
         self.apply_pod(&mut state, "ADDED", pod)
     }
 
-    /// Deletes a pod: its log streams end cleanly (its containers stop), then pod watches get
-    /// `DELETED`. Its logs are forgotten. Returns how many pod watches were open. Panics if the
-    /// pod does not exist.
-    ///
-    /// A real deletion first marks the pod (`MODIFIED` with a `deletionTimestamp`) during its
-    /// grace period; the fake skips that step.
+    /// Starts a container that waits (a Pending pod's, or one in CrashLoopBackOff) or that
+    /// stopped. The pod keeps its uid; pod watches get `MODIFIED`. A container that stopped
+    /// starts a new instance: one more restart, its log becomes the previous one, and a new
+    /// empty log begins. Returns how many pod watches were open. Panics if it already runs.
+    pub fn start_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        let mut object = self.held_pod(&state, namespace, pod);
+        if object.start(container, &self.inner.clock.fixture_now()) {
+            let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
+            lock(&self.inner.logs).rotate(&key);
+        }
+        self.apply_pod(&mut state, "MODIFIED", object)
+    }
+
+    /// The container crashes (exit code 1): its open log streams end cleanly, and pod watches
+    /// get `MODIFIED` with it terminated. Until it starts again
+    /// ([`FakeApiServer::start_container`]), a log request without `previous` reads this
+    /// stopped instance, as the kubelet serves it. Returns how many pod watches were open.
+    pub fn crash_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        let mut object = self.held_pod(&state, namespace, pod);
+        object.stop(container, 1, &self.inner.clock.fixture_now());
+        let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
+        lock(&self.inner.logs).end(&key);
+        self.apply_pod(&mut state, "MODIFIED", object)
+    }
+
+    /// [`FakeApiServer::crash_container`], then [`FakeApiServer::start_container`] at once:
+    /// two `MODIFIED` events. Returns how many pod watches were open.
+    pub fn restart_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
+        self.crash_container(namespace, pod, container);
+        self.start_container(namespace, pod, container)
+    }
+
+    /// Deletes a pod gracefully, as `kubectl delete` does: pod watches get `MODIFIED` with a
+    /// `deletionTimestamp` (Terminating); then its containers stop (exit 0), their open log
+    /// streams end cleanly, and watches get `MODIFIED` with a terminal phase. The pod can still
+    /// be read, and its logs too, until [`FakeApiServer::finish_delete`]. Returns how many pod
+    /// watches were open. Panics if the pod does not exist or is not held in full.
     pub fn delete_pod(&self, namespace: &str, name: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        self.terminate_pod(&mut state, namespace, name)
+    }
+
+    fn terminate_pod(&self, state: &mut State, namespace: &str, name: &str) -> usize {
+        let now = self.inner.clock.fixture_now();
+        let mut object = self.held_pod(state, namespace, name);
+        object.mark_deleted(&now, 30);
+        self.apply_pod(state, "MODIFIED", object.clone());
+        object.stop_all(&now);
+        lock(&self.inner.logs).end_pod(namespace, name);
+        self.apply_pod(state, "MODIFIED", object)
+    }
+
+    /// Ends the deletion of a pod [`FakeApiServer::delete_pod`] started: pod watches get
+    /// `DELETED`, and the pod and its logs are gone (404). Returns how many pod watches were
+    /// open. Panics unless the pod is being deleted.
+    pub fn finish_delete(&self, namespace: &str, name: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        let pod = self.held_pod(&state, namespace, name);
+        assert!(
+            pod.as_json()
+                .pointer("/metadata/deletionTimestamp")
+                .is_some(),
+            "pod {namespace}/{name} is not being deleted; call delete_pod first"
+        );
+        self.remove_pod(&mut state, namespace, name)
+    }
+
+    /// Deletes a pod at once, as `kubectl delete --grace-period=0 --force` does: its log
+    /// streams end and pod watches get `DELETED`, with no Terminating step. Returns how many
+    /// pod watches were open. Panics if the pod does not exist.
+    pub fn force_delete_pod(&self, namespace: &str, name: &str) -> usize {
         let mut state = lock(&self.inner.state);
         self.remove_pod(&mut state, namespace, name)
     }
@@ -169,46 +237,53 @@ impl FakeApiServer {
             .unwrap_or_else(|| panic!("pods \"{name}\" not found in {namespace}"));
         lock(&self.inner.logs).remove_pod(namespace, name);
         let change = state.change(&gvr, "DELETED", row);
-        self.broadcast(&gvr, &Outgoing::Event(change))
+        self.broadcast(&gvr, &Outgoing::Event(Box::new(change)))
     }
 
-    /// Replaces a pod, as a rollout or a StatefulSet does: `old` is deleted
-    /// ([`FakeApiServer::delete_pod`]), then `new` is added ([`FakeApiServer::add_pod`]), which
-    /// may have the same name (another uid). Returns how many pod watches were open.
+    /// Replaces a pod, as a rollout or a StatefulSet does: `old` is deleted gracefully and
+    /// gone ([`FakeApiServer::delete_pod`], [`FakeApiServer::finish_delete`]), then `new` is
+    /// added ([`FakeApiServer::add_pod`]); it may have the same name (another uid). Pod watches
+    /// get `MODIFIED`, `MODIFIED`, `DELETED`, `ADDED`. Returns how many were open.
     pub fn replace_pod(&self, namespace: &str, old: &str, new: FakePod) -> usize {
         let mut state = lock(&self.inner.state);
+        self.terminate_pod(&mut state, namespace, old);
         self.remove_pod(&mut state, namespace, old);
         drop(state);
         self.add_pod(new)
     }
 
-    /// Restarts a container after a crash (exit code 1), as the kubelet does under
-    /// `restartPolicy: Always`: its open log streams end cleanly, its log becomes the previous
-    /// one and a new empty log starts, and pod watches get `MODIFIED` with one more restart and
-    /// the last instance in `lastState.terminated`. Returns how many pod watches were open.
-    pub fn restart_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
-        let mut state = lock(&self.inner.state);
-        let mut object = state
+    /// The full object of a pod; panics if there is none.
+    fn held_pod(&self, state: &State, namespace: &str, pod: &str) -> FakePod {
+        state
             .held_object(&pods_gvr(), Some(namespace), pod)
             .cloned()
             .map(FakePod::from_json)
-            .unwrap_or_else(|| panic!("pods \"{pod}\" not found in {namespace}, or not in full"));
-        object.restart(container, &self.inner.clock.fixture_now());
-        let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
-        lock(&self.inner.logs).restart(&key);
-        self.apply_pod(&mut state, "MODIFIED", object)
+            .unwrap_or_else(|| panic!("pods \"{pod}\" not found in {namespace}, or not in full"))
     }
 
-    /// Stores a pod object with a row printed from it, and tells the pod watches.
+    /// Stores a pod object with a row printed from it (its Restarts age rendered when served),
+    /// and tells the pod watches. `ty` is `ADDED` or `MODIFIED`.
     fn apply_pod(&self, state: &mut State, ty: &'static str, pod: FakePod) -> usize {
         let gvr = pods_gvr();
-        let object = pod.into_json();
-        let cells = pods::table_cells(&object);
-        let cells: Vec<(&str, &str)> = cells.iter().map(|(c, v)| (*c, v.as_str())).collect();
-        let change = state
-            .apply_object(&gvr, ty, object, &cells)
+        let mut object = pod.into_json();
+        let printed = pods::table_cells(&object);
+        let cells: Vec<(&str, &str)> = printed
+            .cells
+            .iter()
+            .map(|(c, v)| (*c, v.as_str()))
+            .collect();
+        let mut row = state
+            .row_for_object(&gvr, &mut object, &cells)
             .unwrap_or_else(|e| panic!("{e}"));
-        self.broadcast(&gvr, &Outgoing::Event(change))
+        let restarts = state
+            .columns(&gvr)
+            .as_array()
+            .and_then(|c| c.iter().position(|c| c["name"] == "Restarts"));
+        if let (Some(at), Some(index)) = (&printed.last_restart, restarts) {
+            row = row.with_last_restart(index, at);
+        }
+        let change = state.apply_object(&gvr, ty, object, row);
+        self.broadcast(&gvr, &Outgoing::Event(Box::new(change)))
     }
 }
 

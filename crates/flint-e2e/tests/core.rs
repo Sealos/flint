@@ -586,21 +586,46 @@ async fn a_pod_log_streams_resumes_without_repeats_and_ends_with_its_pod() {
     assert!(resume.since_time.is_some() && resume.tail_lines.is_none() && resume.follow);
     assert!(resume.timestamps);
 
-    // The pod is deleted: its stream ends, and so does the session, saying why.
+    // The pod is deleted as kubectl deletes it: it turns Terminating, its container stops and
+    // the stream ends while the pod still exists (Succeeded), then it goes.
     server.delete_pod("demo", "talker");
     let ended = until_log(&mut session, "ended", |s| {
         matches!(s.state, LogState::Ended { .. })
     })
     .await;
-    assert_eq!(
-        ended.state,
-        LogState::Ended {
-            error: Some("the pod was deleted".into())
-        }
-    );
+    eprintln!("UP-40 deletion: Flint shows {:?}", ended.state);
+    assert_eq!(ended.state, LogState::Ended { error: None });
     assert_eq!(log_texts(&ended), ["one", "two", "three"]);
+    // Flint read the stopped container to its end once more (no follow), without repeats.
+    let last = server.log_requests().pop().unwrap();
+    assert!(!last.parsed_query().follow && last.parsed_query().since_time.is_some());
+    server.finish_delete("demo", "talker");
+    let after = session.latest();
+    assert_eq!(after.state, LogState::Ended { error: None });
+}
+
+// covers UP-42
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_live_pod_session_closes_its_stream() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let target = LogTarget {
+        namespace: "demo".into(),
+        pod: "web-69c6f74b8b-qv4xv".into(),
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    until_log(&mut session, "streaming", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+    // The pod keeps running; only closing the session can close the stream.
     drop(session);
     server.wait_for_log_streams(0, WAIT).await.unwrap();
+    assert!(server.pod("demo", "web-69c6f74b8b-qv4xv").is_some());
 }
 
 // covers UP-45
@@ -630,9 +655,27 @@ async fn a_workload_log_follows_its_pods_through_churn() {
     texts.sort();
     assert_eq!(texts, [format!("{a}/nginx a1"), format!("{b}/nginx b1")]);
 
-    // Scale up: the new pod is followed without reopening.
+    // Scale up: the new pod is Pending first; Flint opens its log only once it started, and
+    // follows it without reopening the session.
     let new = "web-69c6f74b8b-new01";
-    server.add_pod(server.pod("demo", a).unwrap().sibling(new));
+    let pending = server
+        .pod("demo", a)
+        .unwrap()
+        .sibling(new)
+        .waiting("nginx", "ContainerCreating");
+    server.add_pod(pending);
+    until_log(&mut session, "a waiting pod", |s| {
+        s.pods
+            .as_ref()
+            .is_some_and(|p| p.pods == 3 && p.waiting == 1 && p.live() == 2)
+    })
+    .await;
+    let new_log_path = format!("/api/v1/namespaces/demo/pods/{new}/log");
+    assert!(
+        server.log_requests().iter().all(|r| r.path != new_log_path),
+        "no log request before the container started"
+    );
+    server.start_container("demo", new, "nginx");
     until_log(&mut session, "three pods", live(3)).await;
     server.wait_for_log_streams(3, WAIT).await.unwrap();
     server.append_log(&ContainerLog::new("demo", new), "n1\n");
@@ -660,8 +703,19 @@ async fn a_workload_log_follows_its_pods_through_churn() {
     let pods = snap.pods.as_ref().unwrap();
     assert!(pods.streams.iter().all(|s| s.source.pod() != b), "{pods:?}");
 
-    // A restarted container is read on from its new instance, without repeats.
-    server.restart_container("demo", a, "nginx");
+    // A crash: until the container starts again, Flint's reconnects (from a1's second) read
+    // the stopped instance, a1 included; it must not show a1 twice.
+    let a_log_path = format!("/api/v1/namespaces/demo/pods/{a}/log");
+    let before = server.log_requests().len();
+    server.crash_container("demo", a, "nginx");
+    let replay = server
+        .wait_for_request(WAIT, |r| {
+            r.path == a_log_path && r.status == Some(200) && r.parsed_query().since_time.is_some()
+        })
+        .await
+        .unwrap();
+    assert!(server.log_requests().len() > before, "{replay}");
+    server.start_container("demo", a, "nginx");
     server.wait_for_log_streams(2, WAIT).await.unwrap();
     server.append_log(&ContainerLog::new("demo", a), "a2\n");
     let line = format!("{a}/nginx a2");

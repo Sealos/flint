@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 
 use crate::record::normalize::stable_uid;
 
+/// The key of a row's last restart, which the server renders into the Restarts cell when it
+/// serves the row ([`FakeRow::with_last_restart`]) and never sends.
+pub(crate) const LAST_RESTART: &str = "fakeLastRestart";
+
 /// A Table row (`{"cells": [...], "object": {"kind": "PartialObjectMetadata", ...}}`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FakeRow(Value);
@@ -91,6 +95,15 @@ impl FakeRow {
         match self.cells_mut().and_then(|c| c.get_mut(index)) {
             Some(cell) => *cell = value.into(),
             None => panic!("row {name} has {width} cells; there is no cell {index}"),
+        }
+        self
+    }
+
+    /// Has the server render cell `cell` (a restart count) as "<n> (<age> ago)" from `at`
+    /// (fixture time) whenever it serves the row, as the API server prints Restarts.
+    pub(crate) fn with_last_restart(mut self, cell: usize, at: &str) -> Self {
+        if let Some(row) = self.0.as_object_mut() {
+            row.insert(LAST_RESTART.into(), json!({"cell": cell, "at": at}));
         }
         self
     }
