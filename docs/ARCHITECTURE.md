@@ -249,6 +249,11 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   `[pod/container]` prefix are view toggles, and a workload tab counts its streams in the toolbar. Copy and Save
   (after a confirmation, then the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot
   diff, line text and highlights, state wording, save text) are in `log_model.rs`.
+- **Colors and control characters** are stripped from each line once, on arrival in the core
+  (`logs::strip_controls`), before it is classified, searched or stored: ANSI escape sequences (SGR colors, cursor
+  codes, OSC titles and links, cut-off sequences at the end of a line) and control characters other than tab. Colors
+  are not interpreted, so lines show, copy and save as plain text, and `\x1b[33mWARN` still reads as a warning.
+  Only a line with something to strip costs an extra allocation.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
   following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.

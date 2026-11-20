@@ -1,7 +1,8 @@
-//! One log line: the timestamp the API server put in front of it, its text, its severity
-//! (classified once when the line arrives), and, in a workload session, the pod and container it
-//! came from.
+//! One log line: the timestamp the API server put in front of it, its text (without terminal
+//! escape sequences and control characters, see [`strip_controls`]), its severity (classified
+//! once when the line arrives), and, in a workload session, the pod and container it came from.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use k8s_openapi::jiff::Timestamp;
@@ -82,7 +83,8 @@ pub struct LogLine {
     /// The timestamp the API server prefixed (Flint always asks for `timestamps=true`), or `None`
     /// if the line did not start with one.
     pub timestamp: Option<Timestamp>,
-    /// The line without its timestamp, trailing newline, or carriage return.
+    /// The line without its timestamp, trailing newline, or carriage return, and without
+    /// terminal escape sequences and control characters other than tab ([`strip_controls`]).
     pub text: Arc<str>,
     pub severity: Severity,
     /// The line was longer than [`MAX_LINE_BYTES`] and was cut.
@@ -93,7 +95,8 @@ pub struct LogLine {
 }
 
 impl LogLine {
-    /// Splits off the leading RFC 3339 timestamp, if any, and classifies the rest.
+    /// Splits off the leading RFC 3339 timestamp, if any, strips terminal escape sequences and
+    /// control characters from the rest ([`strip_controls`]), and classifies it.
     pub fn parse(raw: &str, truncated: bool) -> Self {
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
@@ -108,10 +111,11 @@ impl LogLine {
                 Err(_) => (None, raw),
             },
         };
+        let text = strip_controls(text);
         LogLine {
             timestamp,
-            severity: classify(text),
-            text: Arc::from(text),
+            severity: classify(&text),
+            text: Arc::from(text.as_ref()),
             truncated,
             source: None,
         }
@@ -155,6 +159,132 @@ impl LogLine {
         out.push_str(&self.text);
         out
     }
+}
+
+/// `text` without terminal escape sequences and control characters, which many programs write
+/// to their logs (colors such as `\x1b[32mINFO\x1b[0m`, cursor movement, window titles). They
+/// are removed, not interpreted: log lines are shown, searched, copied and saved as plain text,
+/// and a color code glued to a word (`\x1b[33mWARN`) would hide it from [`classify`].
+///
+/// - **Escape sequences** (ECMA-48): CSI (`ESC [` … final byte, which covers SGR colors and
+///   cursor codes), OSC (`ESC ]` … BEL or ST, such as titles and hyperlinks), the other control
+///   strings (DCS, SOS, PM, APC, up to ST), and two- and three-byte escapes (`ESC 7`,
+///   `ESC ( B`). Their 8-bit C1 forms (U+009B for CSI, …) are removed the same way. A sequence
+///   the line ends in the middle of (a cut line, say) is removed to the end of the line.
+/// - **Control characters:** the other C0 characters except tab, DEL, and the other C1
+///   characters are removed rather than replaced with a visible mark. They are not text: a
+///   terminal acts on them (a bell, a backspace, a carriage return redrawing a progress bar)
+///   instead of printing them, so a mark would show something the program never meant to show
+///   and split the words around it for search. Tab is kept: it is text spacing.
+///
+/// Borrows `text` when there is nothing to remove, which is the common case.
+pub fn strip_controls(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    // The end of the text already copied to `out` (or skipped).
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(end) = control_end(bytes, i) else {
+            i += 1;
+            continue;
+        };
+        out.get_or_insert_with(|| String::with_capacity(text.len()))
+            .push_str(&text[copied..i]);
+        i = end;
+        copied = end;
+    }
+    match out {
+        None => Cow::Borrowed(text),
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            Cow::Owned(out)
+        }
+    }
+}
+
+/// When a control character or escape sequence starts at `i`, the index just past it. Every
+/// index it returns is on a character boundary: sequences end at ASCII bytes or after a
+/// two-byte C1 character, and stop before any other byte.
+fn control_end(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes[i] {
+        0x1b => Some(escape_end(bytes, i + 1)),
+        b'\t' => None,
+        0x00..=0x1f | 0x7f => Some(i + 1),
+        // C1 controls, U+0080 to U+009F, are 0xC2 0x80 to 0xC2 0x9F in UTF-8.
+        0xc2 => match bytes.get(i + 1) {
+            Some(&c1 @ 0x80..=0x9f) => Some(c1_end(c1, bytes, i + 2)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The end of an escape sequence whose ESC ends at `i`.
+fn escape_end(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i) {
+        // A lone ESC at the end of the line.
+        None => i,
+        Some(b'[') => csi_end(bytes, i + 1),
+        Some(b']') => string_end(bytes, i + 1, true),
+        Some(b'P' | b'X' | b'^' | b'_') => string_end(bytes, i + 1, false),
+        // Intermediate bytes, then a final byte: `ESC ( B` selects a character set.
+        Some(0x20..=0x2f) => {
+            let mut end = i;
+            while matches!(bytes.get(end), Some(0x20..=0x2f)) {
+                end += 1;
+            }
+            if matches!(bytes.get(end), Some(0x30..=0x7e)) {
+                end + 1
+            } else {
+                end
+            }
+        }
+        // A two-byte escape: `ESC 7`, `ESC M`, `ESC =`.
+        Some(0x30..=0x7e) => i + 1,
+        // Not an escape sequence: only the ESC goes.
+        Some(_) => i,
+    }
+}
+
+/// The end of a C1 control character (its second UTF-8 byte is `c1`) that ends at `i`, with
+/// the sequence it introduces.
+fn c1_end(c1: u8, bytes: &[u8], i: usize) -> usize {
+    match c1 {
+        0x9b => csi_end(bytes, i),
+        0x9d => string_end(bytes, i, true),
+        0x90 | 0x98 | 0x9e | 0x9f => string_end(bytes, i, false),
+        _ => i,
+    }
+}
+
+/// The end of a CSI sequence whose parameters start at `i`: parameter and intermediate bytes,
+/// then a final byte. A byte that cannot be part of it ends it early and stays.
+fn csi_end(bytes: &[u8], mut i: usize) -> usize {
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            0x40..=0x7e => return i + 1,
+            0x20..=0x3f => i += 1,
+            _ => return i,
+        }
+    }
+    i
+}
+
+/// The end of a control string (OSC, DCS, …) whose payload starts at `i`: after its string
+/// terminator (`ESC \` or U+009C), or BEL for OSC (`bel`), as xterm accepts. Another ESC ends it
+/// early and stays, so the escape it starts is read on its own.
+fn string_end(bytes: &[u8], mut i: usize, bel: bool) -> usize {
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            0x07 if bel => return i + 1,
+            0x1b if bytes.get(i + 1) == Some(&b'\\') => return i + 2,
+            0x1b => return i,
+            0xc2 if bytes.get(i + 1) == Some(&0x9c) => return i + 2,
+            _ => i += 1,
+        }
+    }
+    i
 }
 
 /// The severity of a line's text. Case-insensitive and on whole words (runs of letters, digits
@@ -244,6 +374,93 @@ mod tests {
             (source.pod(), source.container(), source.label()),
             ("web-1", "app", "web-1/app")
         );
+    }
+
+    fn stripped(text: &str) -> String {
+        strip_controls(text).into_owned()
+    }
+
+    // covers UP-40
+    #[test]
+    fn plain_text_is_borrowed() {
+        for text in ["", "hello", "tab\tseparated", "naïve café °C ©", "日本語"] {
+            assert!(
+                matches!(strip_controls(text), Cow::Borrowed(t) if t == text),
+                "{text:?}"
+            );
+        }
+    }
+
+    // covers UP-40
+    #[test]
+    fn sgr_colors_are_stripped() {
+        assert_eq!(stripped("\x1b[32mINFO\x1b[0m started"), "INFO started");
+        assert_eq!(
+            stripped("\x1b[1;38;5;196mbold red\x1b[m \x1b[38:2::255:0:0mtrue\x1b[39m"),
+            "bold red true"
+        );
+    }
+
+    // covers UP-40
+    #[test]
+    fn cursor_and_other_escapes_are_stripped() {
+        // Cursor movement, erase line, private modes, a charset switch, save and restore.
+        assert_eq!(
+            stripped("\x1b[2K\x1b[1G\x1b[?25lprogress\x1b[?25h \x1b(Bdone\x1b7\x1b8"),
+            "progress done"
+        );
+        // The 8-bit CSI.
+        assert_eq!(stripped("\u{9b}31mred\u{9b}0m"), "red");
+    }
+
+    // covers UP-40
+    #[test]
+    fn osc_and_control_strings_are_stripped() {
+        // A window title ended by BEL, a hyperlink ended by ST.
+        assert_eq!(stripped("\x1b]0;my title\x07ready"), "ready");
+        assert_eq!(
+            stripped("see \x1b]8;;https://example.com/ü\x1b\\docs\x1b]8;;\x1b\\ now"),
+            "see docs now"
+        );
+        assert_eq!(stripped("\x1bPq#0;2;0;0;0\x1b\\after"), "after");
+        assert_eq!(stripped("\u{9d}2;title\u{9c}after"), "after");
+    }
+
+    // covers UP-40
+    #[test]
+    fn sequences_cut_at_the_end_of_the_line_are_stripped() {
+        assert_eq!(stripped("text\x1b"), "text");
+        assert_eq!(stripped("text\x1b["), "text");
+        assert_eq!(stripped("text\x1b[38;5;1"), "text");
+        assert_eq!(stripped("text\x1b]0;title with no end"), "text");
+        assert_eq!(stripped("text\x1b("), "text");
+        // A malformed CSI ends at the byte that cannot belong to it, which stays.
+        assert_eq!(stripped("a\x1b[31\u{e9}b"), "a\u{e9}b");
+        // An OSC interrupted by another escape: both go.
+        assert_eq!(stripped("\x1b]0;t\x1b[31mred"), "red");
+    }
+
+    // covers UP-40
+    #[test]
+    fn control_characters_other_than_tab_are_stripped() {
+        assert_eq!(
+            stripped("a\x00b\x07c\x08d\re\x0bf\x0cg\x7fh\u{85}i\tj"),
+            "abcdefghi\tj"
+        );
+    }
+
+    // covers UP-43
+    #[test]
+    fn lines_are_stripped_before_they_are_classified() {
+        let line = LogLine::parse("2024-05-01T12:00:00Z \x1b[33mWARN\x1b[0m disk", false);
+        assert_eq!(&*line.text, "WARN disk");
+        assert_eq!(line.severity, Severity::Warning);
+        let line = LogLine::parse("\x1b[31mERROR\x1b[0m: boom\r\n", false);
+        assert_eq!(&*line.text, "ERROR: boom");
+        assert_eq!(line.severity, Severity::Error);
+        assert_eq!(line.display(false), "ERROR: boom");
+        // Classified as raw text, the code would have hidden the word.
+        assert_eq!(classify("\x1b[33mWARN\x1b[0m"), Severity::Normal);
     }
 
     // covers UP-43

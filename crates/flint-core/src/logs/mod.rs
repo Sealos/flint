@@ -18,7 +18,9 @@ mod stream;
 mod workload;
 
 pub use buffer::{BLOCKS_PER_BUDGET, CHUNK_LINES, LogBuffer, LogLines};
-pub use line::{LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify};
+pub use line::{
+    LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify, strip_controls,
+};
 pub use pods::{Freshness, PodSet, WorkloadKind, WorkloadPod, WorkloadTarget};
 pub use search::{LogSearch, SearchQuery};
 pub use selection::LineSelection;
