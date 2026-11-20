@@ -25,6 +25,8 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
 
   v0.2.0 and earlier have no DMG.
 - [ ] The notes list the changes from `CHANGELOG.md`.
+- [ ] Every entry under Features and Bug Fixes is something a user can see. If internal work slipped in, edit the
+  release notes, and note the commit so its type is right next time (see [Releases](../README.md#releases)).
 - [ ] The checksums match. In an empty directory:
 
   ```sh
