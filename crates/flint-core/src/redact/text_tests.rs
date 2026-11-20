@@ -493,6 +493,19 @@ fn values_already_redacted_are_not_counted_again() {
     let twice = redact_credentials(&once.text);
     assert_eq!(twice.count, 0, "{}", twice.text);
     assert_eq!(twice.text, once.text);
+
+    for line in [
+        "password: correct horse battery",
+        "Cookie: session=abc123",
+        "root:hunter2@tcp(db:3306)/app",
+        r#"{"auth":"dXNlcjpwYXNz"}"#,
+        "token: Bearer abc",
+    ] {
+        let once = redact_credentials(line);
+        assert_eq!(once.count, 1, "{line} -> {}", once.text);
+        let twice = redact_credentials(&once.text);
+        assert_eq!((twice.count, &twice.text), (0, &once.text), "{line}");
+    }
 }
 
 #[test]
@@ -718,6 +731,418 @@ fn credential_flags_name_the_next_argument() {
     }
 }
 
+#[test]
+fn unquoted_passwords_after_a_colon_run_to_the_end_of_the_line() {
+    for (line, want) in [
+        (
+            "password: correct horse battery",
+            "password: [REDACTED:password]",
+        ),
+        (
+            "  db_password:   correct horse battery  ",
+            "  db_password:   [REDACTED:password]  ",
+        ),
+        (
+            r#"{"msg":"config password: two words","level":"info"}"#,
+            r#"{"msg":"config password: [REDACTED:password]","level":"info"}"#,
+        ),
+        (
+            r#"{"msg":"passwd: two words\nnext line"}"#,
+            r#"{"msg":"passwd: [REDACTED:password]\nnext line"}"#,
+        ),
+        // An escaped quote is part of the value; in escaped JSON the value runs on.
+        (
+            r#"{"msg":"password: correct \"horse\" battery"}"#,
+            r#"{"msg":"password: [REDACTED:password]"}"#,
+        ),
+        (
+            r#"{\"msg\":\"password: two words\"}"#,
+            r#"{\"msg\":\"password: [REDACTED:password]"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    // One word after `=`, `:` with no space, a quoted key, or a key other than a password
+    // (after `token: ` the rest is more often an error message).
+    for (line, want) in [
+        (
+            "failed to fetch oauth token: unexpected status: 401 Unauthorized",
+            "failed to fetch oauth token: [REDACTED:token] status: 401 Unauthorized",
+        ),
+        ("secret: two words", "secret: [REDACTED:secret] words"),
+        (
+            "password=hunter2 user=app",
+            "password=[REDACTED:password] user=app",
+        ),
+        (
+            "{Password:p(a)ss User:x}",
+            "{Password:[REDACTED:password] User:x}",
+        ),
+        (
+            r#"{"password": 123, "user": "a"}"#,
+            r#"{"password": [REDACTED:password], "user": "a"}"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        "password: ********",
+        "password: |",
+        "password: null",
+        "pass: 3 fail: 0",
+        "password reset: email sent to user 42",
+        "secretName: web-tls",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn cookie_headers() {
+    for (line, want) in [
+        (
+            "Cookie: session=abc123; theme=dark",
+            "Cookie: [REDACTED:cookie]",
+        ),
+        (
+            "set-cookie: sid=31d4d96e407aad42; Path=/; Secure; HttpOnly",
+            "set-cookie: [REDACTED:cookie]",
+        ),
+        (
+            r#"{"headers":{"Cookie":"session=abc123; theme=dark","Accept":"*/*"}}"#,
+            r#"{"headers":{"Cookie":"[REDACTED:cookie]","Accept":"*/*"}}"#,
+        ),
+        (
+            r#"msg="request" cookie="session=abc123; theme=dark" status=200"#,
+            r#"msg="request" cookie="[REDACTED:cookie]" status=200"#,
+        ),
+        (
+            "map[Accept:[*/*] Cookie:[sid=abc123; theme=dark] User-Agent:[curl]]",
+            "map[Accept:[*/*] Cookie:[[REDACTED:cookie]] User-Agent:[curl]]",
+        ),
+        (
+            r#"{"Set-Cookie":["a=s3cr3tA; Path=/","b=s3cr3tB; Path=/"],"Vary":"Accept"}"#,
+            r#"{"Set-Cookie":[[REDACTED:cookie]],"Vary":"Accept"}"#,
+        ),
+        (
+            r#"http.Header{"Cookie":[]string{"sid=abc123"}}"#,
+            r#"http.Header{"Cookie":[]string{[REDACTED:cookie]}}"#,
+        ),
+        // A request dumped into a JSON string, and the same for `Authorization`.
+        (
+            r#"{"msg":"GET / HTTP/1.1\nHost: x\nCookie: sid=abc123\n"}"#,
+            r#"{"msg":"GET / HTTP/1.1\nHost: x\nCookie: [REDACTED:cookie]\n"}"#,
+        ),
+        (
+            r#"{"msg":"GET /\nAuthorization: Bearer abcdefghijkl\n"}"#,
+            r#"{"msg":"GET /\nAuthorization: Bearer [REDACTED:authorization]\n"}"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        "cookie consent banner shown",
+        "no session cookie in request",
+        "cookies: 3",
+        "cookie_name=sid",
+        "Cookie:",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn docker_config_auth_values() {
+    for (line, want) in [
+        (
+            r#"{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz"}}}"#,
+            r#"{"auths":{"registry.example.com":{"auth":"[REDACTED:registry-auth]"}}}"#,
+        ),
+        (
+            r#"config: {\"auths\":{\"r.io\":{\"username\":\"u\",\"auth\": \"dXNlcjpwYXNzd29yZA==\"}}}"#,
+            r#"config: {\"auths\":{\"r.io\":{\"username\":\"u\",\"auth\": \"[REDACTED:registry-auth]\"}}}"#,
+        ),
+        (
+            "{'auth': 'dXNlcjpwYXNz'}",
+            "{'auth': '[REDACTED:registry-auth]'}",
+        ),
+        ("auth: dXNlcjpwYXNz", "auth: [REDACTED:registry-auth]"),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        r#"{"auth":"none"}"#,
+        r#"{"auth": "oidc", "authority": "https://login.example.com"}"#,
+        r#"{"auth":{"type":"basic"}}"#,
+        r#"{"auth":true}"#,
+        r#"{"author":"dXNlcjpwYXNz"}"#,
+        "auth: enabled",
+        "oauth=dXNlcjpwYXNz",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn mysql_dsns_without_a_scheme() {
+    for (line, want) in [
+        (
+            "dsn=root:hunter2@tcp(db:3306)/app?parseTime=true",
+            "dsn=root:[REDACTED:password]@tcp(db:3306)/app?parseTime=true",
+        ),
+        (
+            r#"connecting to "app:p@ss:w0rd@tcp(10.0.0.5:3306)/app""#,
+            r#"connecting to "app:[REDACTED:password]@tcp(10.0.0.5:3306)/app""#,
+        ),
+        (
+            "app:pw@unix(/var/run/mysqld.sock)/app",
+            "app:[REDACTED:password]@unix(/var/run/mysqld.sock)/app",
+        ),
+        (
+            "mysql://root:hunter2@tcp(db:3306)/app",
+            "mysql://root:[REDACTED:password]@tcp(db:3306)/app",
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        "dial tcp(10.0.0.5:3306): connection refused",
+        "dsn=root@tcp(db:3306)/app",
+        "10:15:30 user@tcp(db:3306) connected",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn short_bearer_tokens() {
+    // After a credential key the scheme is hidden with its token, so neither shows.
+    for (line, want) in [
+        ("token: Bearer abc", "token: [REDACTED:token]"),
+        ("token=Bearer abc", "token=[REDACTED:token]"),
+        ("X-Auth-Token: bearer xy", "X-Auth-Token: [REDACTED:token]"),
+        ("api_key=Basic Zm9v", "api_key=[REDACTED:key]"),
+        (
+            "using Bearer ab12 upstream",
+            "using Bearer [REDACTED:bearer] upstream",
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        "missing bearer token in request",
+        "Bearer authentication is enabled",
+        "auth scheme Bearer",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn a_scheme_is_not_continued_by_the_next_field() {
+    for (line, want) in [
+        ("token=Bearer user=app", "token=[REDACTED:token] user=app"),
+        // A credential key after the scheme, with any separator the pair rule accepts.
+        (
+            r#"token=Basic password= "example""#,
+            r#"token=[REDACTED:token] password= "[REDACTED:password]""#,
+        ),
+        (
+            "token: Bearer secret : s3cr3t",
+            "token: [REDACTED:token] secret : [REDACTED:secret]",
+        ),
+        (
+            r#"token=Basic api_key:="k-1""#,
+            r#"token=[REDACTED:token] api_key:="[REDACTED:key]""#,
+        ),
+        (
+            "auth_token=Basic --verbose",
+            "auth_token=[REDACTED:token] --verbose",
+        ),
+        // What follows `Bearer` looks like a token: it is hidden with its quoted value.
+        (
+            r#"token=Bearer password="hunter2""#,
+            r#"token=[REDACTED:token] [REDACTED:bearer]""#,
+        ),
+        (
+            r#"Bearer password="hunter2""#,
+            r#"Bearer [REDACTED:bearer]""#,
+        ),
+        // A padded token before a closing quote is still the credential.
+        (
+            r#"["Bearer abcdef12=="]"#,
+            r#"["Bearer [REDACTED:bearer]"]"#,
+        ),
+        (
+            r#"msg="token=Basic Zm9vYmFy==" next=1"#,
+            r#"msg="token=[REDACTED:token]" next=1"#,
+        ),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+}
+
+#[test]
+fn cookie_lists_end_at_their_closing_bracket_outside_quotes() {
+    for (line, want) in [
+        (
+            r#"{"Set-Cookie":["a=1; Path=/x]y","b=s3cr3tB; Path=/"],"Vary":"Accept"}"#,
+            r#"{"Set-Cookie":[[REDACTED:cookie]],"Vary":"Accept"}"#,
+        ),
+        (
+            r#"{\"Set-Cookie\":[\"a=1; Path=/]\",\"b=s3cr3tB\"],\"Vary\":\"Accept\"}"#,
+            r#"{\"Set-Cookie\":[[REDACTED:cookie]],\"Vary\":\"Accept\"}"#,
+        ),
+        (
+            r#"http.Header{"Cookie":[]string{"a=}b", "sid=s3cr3t"}, "Accept":[]string{"*/*"}}"#,
+            r#"http.Header{"Cookie":[]string{[REDACTED:cookie]}, "Accept":[]string{"*/*"}}"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+}
+
+#[test]
+fn mysql_dsn_passwords_with_spaces_and_brackets() {
+    for (line, want) in [
+        (
+            r#"{"dsn":"app:p w[1]@tcp(db:3306)/app"}"#,
+            r#"{"dsn":"app:[REDACTED:password]@tcp(db:3306)/app"}"#,
+        ),
+        (
+            "dsn: 'root:a b@tcp(db)/x' ok",
+            "dsn: 'root:[REDACTED:password]@tcp(db)/x' ok",
+        ),
+        (
+            r#""dsn": root:pw@tcp(db)/x"#,
+            r#""dsn": root:[REDACTED:password]@tcp(db)/x"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        r#"{"ts":"10:15:30","addr":"user@tcp(db:3306)"}"#,
+        "connected at 10:15 to user@tcp(db)",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn a_passphrase_with_a_hidden_first_word_is_hidden_whole() {
+    assert_eq!(
+        redacted("password: <<aws>>IOSFODNN7EXAMPLE and more words", 2),
+        "password: [REDACTED:aws-access-key-id] [REDACTED:password]"
+    );
+    same("password: [REDACTED:password]");
+}
+
+#[test]
+fn digest_after_an_escaped_newline_ends_with_its_header() {
+    assert_eq!(
+        redacted(
+            r#"{"msg":"GET /\nAuthorization: Digest username=\"a\", response=\"6629fae4\"\nHost: x","level":"info"}"#,
+            1
+        ),
+        r#"{"msg":"GET /\nAuthorization: Digest [REDACTED:authorization]\nHost: x","level":"info"}"#
+    );
+    same(r#"{"msg":"GET /\nHost: x\nAccept: */*"}"#);
+}
+
+#[test]
+fn single_quoted_headers_end_at_the_closing_quote() {
+    for (line, want) in [
+        (
+            "curl -H 'Cookie: sid=abc123; theme=dark' https://example.com/api",
+            "curl -H 'Cookie: [REDACTED:cookie]' https://example.com/api",
+        ),
+        (
+            "curl -H 'X-Password: two words' -d x",
+            "curl -H 'X-Password: [REDACTED:password]' -d x",
+        ),
+        // Not a quoted header: an apostrophe inside the passphrase is part of it.
+        ("password: it's a secret", "password: [REDACTED:password]"),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    same("curl -H 'Accept: */*' https://example.com/api");
+}
+
+#[test]
+fn yaml_auth_with_a_space_before_the_colon() {
+    assert_eq!(
+        redacted("auth : dXNlcjpwYXNz", 1),
+        "auth : [REDACTED:registry-auth]"
+    );
+    same("auth : enabled");
+}
+
+#[test]
+fn quoted_cookie_values_inside_a_raw_header() {
+    for (line, want) in [
+        (
+            r#"Cookie: session="example-value"; theme=dark"#,
+            "Cookie: [REDACTED:cookie]",
+        ),
+        (
+            r#"{"msg":"Cookie: session=\"v\"; theme=dark","level":"info"}"#,
+            r#"{"msg":"Cookie: [REDACTED:cookie]","level":"info"}"#,
+        ),
+        (
+            r#"curl -H 'Cookie: session="v"; theme=dark' https://example.com"#,
+            "curl -H 'Cookie: [REDACTED:cookie]' https://example.com",
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    same(r#"{"msg":"cookie consent \"ok\""}"#);
+}
+
+#[test]
+fn a_pass_count_is_only_a_bare_number() {
+    for (line, want) in [
+        (
+            r#"pass="123 example phrase""#,
+            r#"pass="[REDACTED:password]""#,
+        ),
+        ("pass: 123 abc", "pass: 123 abc"),
+        (
+            "pass: 3 fail: 0 token=example",
+            "pass: 3 fail: 0 token=[REDACTED:token]",
+        ),
+        (
+            "PWD: /app password: two words",
+            "PWD: /app password: [REDACTED:password]",
+        ),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+    for line in ["pass: 3 fail: 0", "pass=1 failed=0", "PWD: /app"] {
+        same(line);
+    }
+}
+
+#[test]
+fn a_double_quoted_dsn_with_an_apostrophe_in_its_password() {
+    assert_eq!(
+        redacted(r#"dsn="app:it's private@tcp(db)/app""#, 1),
+        r#"dsn="app:[REDACTED:password]@tcp(db)/app""#
+    );
+}
+
+#[test]
+fn cookie_list_quote_level_skips_leading_spaces() {
+    assert_eq!(
+        redacted(
+            r#"{\"Set-Cookie\":[ \"a=1; Path=/]\",\"b=s3cr3tB\"],\"Vary\":\"Accept\"}"#,
+            1
+        ),
+        r#"{\"Set-Cookie\":[[REDACTED:cookie]],\"Vary\":\"Accept\"}"#
+    );
+}
+
 /// About 10 MB of realistic log lines, with a few secrets.
 fn synthetic_log() -> String {
     let lines = [
@@ -775,13 +1200,42 @@ fn ten_megabytes_of_logs_are_fast() {
 #[test]
 fn long_lines_of_quoted_values_are_linear() {
     const MIB: usize = 1024 * 1024;
-    for unit in [r#"token="a" "#, r#""password":"x","#] {
+    for unit in [
+        r#"token="a" "#,
+        r#""password":"x","#,
+        r#"password: a" "#,
+        r#"password: a\n"#,
+        r#"token: Bearer a\n"#,
+        r#"Cookie: a" "#,
+        "a:b@tcp( ",
+        r#""auth":"YTpi","#,
+        r#"Cookie:["a]","b"] "#,
+        r#""a:b c@tcp(" "#,
+        r#"\nAuthorization: Digest a"#,
+        r#"token=Bearer x="y" "#,
+        "-H 'Cookie: a' ",
+        r#"-H 'Cookie: a="b"' "#,
+    ] {
         let line = unit.repeat(MIB / unit.len());
         let start = std::time::Instant::now();
         let out = redact_credentials(&line);
         let secs = start.elapsed().as_secs_f64();
         println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
         assert_eq!(out.count, MIB / unit.len(), "{unit}");
+        assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
+    }
+    // Values the pair rule leaves alone are not scanned to the end of the line again and again.
+    for unit in [
+        "pass: 3 ",
+        "PWD: /a ",
+        "password: ***** ",
+        "password: null ",
+    ] {
+        let line = unit.repeat(MIB / unit.len());
+        let start = std::time::Instant::now();
+        redact_credentials(&line);
+        let secs = start.elapsed().as_secs_f64();
+        println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
         assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
     }
 }

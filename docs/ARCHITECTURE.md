@@ -688,9 +688,22 @@ Rules:
     - `Authorization`/`Proxy-Authorization` header values (Basic, Bearer and other schemes, also in JSON and Go
       header maps; a Digest value is hidden to the end of the header, its closing quote when quoted or else the end
       of the line, so its `response` never shows however the parameters are separated or quoted; an AWS SigV4
-      value is hidden through its last parameter, so its `Signature` never shows) and bearer tokens;
+      value is hidden through its last parameter, so its `Signature` never shows) and bearer tokens (8 characters
+      or more, or shorter with a digit; a token that looks like a key with a quoted value, `Bearer password="x"`,
+      is hidden with that value; after a credential key, `token: Bearer abc`, the scheme and the word after it
+      are hidden together whatever its length, unless that word is the next field, a flag or `key=`);
+    - `Cookie` and `Set-Cookie` header values, every cookie with its name: to the closing quote when quoted, to the
+      closing bracket of a list (a JSON array, a Go header map, `[]string{...}`; a bracket inside a quoted cookie
+      does not end it), to the closing apostrophe of a single-quoted header (`curl -H 'Cookie: ...'`), or else to
+      the end of the line; a quoted cookie value (`session="v"`) does not end it. This header rule and the `Authorization` one also match right after an escaped `\n`, as
+      in a request dumped into a JSON string, where the value (a Digest one too) ends at the next escaped `\n`;
     - passwords in URLs (`scheme://user:pass@host`), up to the authority's last `@`; a password with an unencoded
-      `/`, `?` or `#` is caught too, unless the part after the colon is a port (`:8443/`);
+      `/`, `?` or `#` is caught too, unless the part after the colon is a port (`:8443/`); and in Go MySQL DSNs,
+      which have no `://` (`user:pass@tcp(host:3306)/db`, also `unix(` and `udp(`), from the DSN's first `:` to
+      the `@` before the protocol; a DSN in double quotes starts after the last one, so its password can hold
+      spaces, brackets and apostrophes;
+    - registry `auth` values in docker config JSON (`"auth": "<base64 user:pass>"`, at any escape level, and the
+      same key in YAML, also `auth :`, or a Python dict), when the value decodes to `user:password`;
     - AWS access key ids (`AKIA`/`ASIA`) and secret access keys (by key name, or a 40-character mixed-case value on
       the same line as a key id), GCP API keys, GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`),
       GitLab (`glpat-`, `glrt-`, `gldt-`) and Slack (`xox?-`, `xapp-`) tokens, Slack webhook paths, Stripe live keys
@@ -703,18 +716,29 @@ Rules:
       `master_key`, `ssh_key` or `credentials`, and of keys that are or end in `_pass`/`_pwd` (`DB_PASS`; not
       `bypass`), with `=`, `:`, `=>`, `:=` or a URL-encoded `=`, bare or quoted, as in logfmt,
       JSON (escaped JSON at any level, with escaped quotes inside the value), YAML, Ruby and Go, plus command-line
-      flags such as `--password hunter2`. A quoted value runs to its closing quote; a bare one to the next space or
-      quote. Masks a workload already wrote (`****`, `[REDACTED]`) are left alone, and so are a few values that
+      flags such as `--password hunter2`. A quoted value runs to its closing quote. A bare password after `: ` (an
+      unquoted password key, a colon and a space, as in YAML, headers and prose) runs to the end of the line, or to
+      an unescaped double quote (other than one opening a value after `=`) or escaped `\n` before it, so
+      `password: correct horse battery` is hidden whole, also when an earlier rule already hid its first word; a
+      single-quoted header ends at its closing apostrophe. Any other bare value runs to the next space or quote,
+      so `oauth token: unexpected status: 401` keeps the error. When a value is left alone, the search goes on
+      right after its key, so `pass: 3 fail: 0 token=x` still hides the token. Masks a workload already wrote (`****`, `[REDACTED]`) are left alone, and so are a few values that
       are not credentials: a path after `PWD`/`OLDPWD` or a `credentials` key (`PWD=/app`,
-      `GOOGLE_APPLICATION_CREDENTIALS=/var/run/key.json`), and a number after a bare `pass` key
-      (`pass=1 failed=0`; `DB_PASS=123456` is still hidden).
+      `GOOGLE_APPLICATION_CREDENTIALS=/var/run/key.json`), and a bare number after a bare `pass` key
+      (`pass=1 failed=0`, `pass: 3 fail: 0`; `DB_PASS=123456` and `pass="123 example phrase"` are still hidden).
 
-    The patterns err toward redacting.
+    The patterns err toward redacting. A test keeps the redactor as it was before #224 and checks, over every
+    unit-test input and each credential shape in each wrapper a log puts it in, that every byte it hid is still
+    hidden.
   - **Where it applies:** every line `get_pod_logs` returns; every event message `get_events` returns; every
     `list_resources` cell (printer columns show event, status and condition messages); every string, at any depth,
-    under a `note` key or a key ending in `message` in `get_resource` (event messages and notes, status and
-    condition messages, container termination messages, which can be the last log lines, and operators'
-    `failureMessage` or `errorMessage`), and in container `args` and `command` lists, where the element after a
+    under a `note` key or a key ending in `message` or `messages` (also each string of a list there) in
+    `get_resource` (event messages and notes, status and condition messages, container termination messages, which
+    can be the last log lines, operators' `failureMessage` or `errorMessage`, and lists such as `messages`), every
+    annotation value, at any depth (tools keep whole objects there; kubectl's last-applied configuration is
+    parsed and redacted like the live object, so an argument after `--password` is hidden there too), and
+    container
+    `args` and `command` lists, where the element after a
     flag such as `--password` is hidden whole; and tool error text. ConfigMaps are left as they are. Logs are
     redacted before the 256 KiB cap, so each value is seen next to its label, and the cap drops a line it would cut
     in the middle; when that leaves nothing, because the last line alone is longer than the cap, `get_pod_logs`
@@ -724,11 +748,11 @@ Rules:
   - **Speed:** one Aho-Corasick pass over the whole text finds trigger words; only lines holding one are matched,
     and only against the rules those triggers start. Private key blocks are found first, over the whole text. The
     `regex` crate runs in linear time, so no input backtracks catastrophically. No pattern captures a value of
-    open-ended length: a quoted value's end is found by one forward scan and the next match starts after it, so a
-    line costs time linear in its length. A test redacts 1 MiB lines packed with quoted pairs in well under the
+    open-ended length: a quoted value's or a rest-of-line value's end is found by one forward scan and the next
+    match starts after it, so a line costs time linear in its length. A test redacts 1 MiB lines packed with quoted pairs in well under the
     2 s it allows.
-  - **Not redacted:** ConfigMap data, literal `env` values in pod specs, annotations (other than on Secrets) and
-    custom resource fields other than messages and argument lists reach the agent as the cluster returns them.
+  - **Not redacted:** ConfigMap data, literal `env` values in pod specs, and custom resource fields other than
+    messages, annotations and argument lists reach the agent as the cluster returns them.
   - **The app is unchanged:** its log viewer, events and object views show the cluster's text as written, since
     people look at their own cluster there.
 - **Activity log (planned, M5.5, #69):** every call will be recorded (time, cluster, tool, what it named, result
