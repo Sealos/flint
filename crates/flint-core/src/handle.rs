@@ -900,7 +900,10 @@ mod tests {
         .expect("fails at once");
         assert_eq!(
             state,
-            crate::exec::ExecState::Failed("\"nowhere\" is not connected".to_owned())
+            crate::exec::ExecState::Failed(crate::exec::ExecFailure::new(
+                crate::exec::ExecFailureKind::Unreachable,
+                "\"nowhere\" is not connected"
+            ))
         );
     }
 

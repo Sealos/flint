@@ -30,7 +30,9 @@ pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{
     ClusterDiscovery, NavEntry, NavEntryError, NavSection, Navigation, SectionKind,
 };
-pub use exec::{ExecRequest, ExecSession, ExecSnapshot, ExecState, ExecUpdates};
+pub use exec::{
+    ExecFailure, ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, ExecUpdates,
+};
 pub use handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, CoreHandle, Event,
     LogSession, LogUpdates, Subscription, WatchTiming,

@@ -456,12 +456,61 @@ async fn an_exited_shell_shows_its_code_and_keeps_its_screen(cx: &mut TestAppCon
 
     shell
         .fake
-        .set_state(ExecState::Failed("pods \"web-1\" not found".into()));
+        .set_state(ExecState::Failed(flint_core::ExecFailure::new(
+            flint_core::ExecFailureKind::Server,
+            "pods \"web-1\" not found",
+        )));
     shell.settle(cx);
     assert_eq!(
         shell.view.read_with(cx, |v, _| v.tab_status()),
         TabStatus::Failed
     );
+}
+
+// covers UP-41: a shell that could not run says why once, in its banner: plain words, then
+// "Details:" and what the server said, in full, wrapping (a long RBAC message keeps its user,
+// verb and namespace); the toolbar says only "Failed".
+#[gpui_kit::test]
+async fn a_failed_shell_says_why_once_in_plain_words(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    let said = format!(
+        "Forbidden: pods \"web-1\" is forbidden: User \"system:serviceaccount:{}:viewer\" \
+         cannot create resource \"pods/exec\" in API group \"\" in the namespace \"demo\"",
+        "a-rather-long-namespace-name-".repeat(6)
+    );
+    shell
+        .fake
+        .set_state(ExecState::Failed(flint_core::ExecFailure::new(
+            flint_core::ExecFailureKind::Server,
+            said.clone(),
+        )));
+    shell.settle(cx);
+    let (texts, banner) = cx
+        .update_window(shell.window, |_, window, _| {
+            let texts: Vec<String> = gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .map(|t| t.text().to_owned())
+                .collect();
+            (texts, window.find("terminal-ended").bounds())
+        })
+        .unwrap();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "You don't have permission to open a shell in this pod."),
+        "{texts:?}"
+    );
+    let details = format!("Details: {said}");
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.contains(&said))
+            .collect::<Vec<_>>(),
+        [&details],
+        "the server's words once, in full"
+    );
+    // Wrapped over more than two lines, not clamped.
+    assert!(f32::from(banner.size.height) > 60., "{banner:?}");
 }
 
 // covers UP-41: the bell flashes the screen for a moment.
