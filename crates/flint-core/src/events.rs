@@ -6,7 +6,9 @@
 //! queue keeps one per key (a connection keeps two: its latest attempt starting, and where it
 //! settled): a newer one replaces the queued one, and moves to the back, so the
 //! order of what is left is the order of the last changes, and applying them leaves the reader
-//! where applying every event would have. [`Event::Error`]s are kept in order, at most
+//! where applying every event would have. (Readers that compare successive cluster lists see
+//! fewer of them; the manager sends a discovery reset for a context that starts over, so they do
+//! not need to.) [`Event::Error`]s are kept in order, at most
 //! [`MAX_ERRORS`]; past that the oldest goes, counted and logged. The queue therefore holds at
 //! most a few events per cluster, whatever bursts the manager sends.
 //!

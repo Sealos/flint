@@ -1181,3 +1181,36 @@ async fn a_burst_of_changes_ends_on_the_latest_state(cx: &mut TestAppContext) {
     });
     assert_eq!(names, ["alpha", "beta"]);
 }
+
+// covers UP-06: a cluster that started over in the core (re-pointed, or back after being
+// removed) forgets what was discovered of it, however many cluster lists the app skipped.
+#[gpui_kit::test]
+async fn a_cluster_that_starts_over_forgets_its_discovery(cx: &mut TestAppContext) {
+    use flint_core::Event;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: None,
+            error: Some("discovery failed".into()),
+        },
+    );
+    assert!(
+        t.model
+            .read_with(cx, |m, _| m.discovery.contains_key("alpha"))
+    );
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: None,
+            error: None,
+        },
+    );
+    assert!(
+        t.model
+            .read_with(cx, |m, _| !m.discovery.contains_key("alpha"))
+    );
+}

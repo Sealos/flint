@@ -114,7 +114,9 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   bounded however slowly it is read: state events (the cluster list, the active cluster, settings, a cluster's
   discovery, the activity log) keep only their latest form per kind and cluster, a connection its latest attempt
   starting and where it settled, and errors the last 64 (older ones are dropped, counted and logged). The order of
-  what is left is the order of the last changes, so reading it ends where reading every event would. The reader owns
+  what is left is the order of the last changes, so reading it ends where reading every event would. (A context
+  that starts over in the core, re-pointed or back after being removed, gets a discovery reset after the list, so a
+  reader that skipped the lists in between still forgets its old kinds.) The reader owns
   the queue: `CoreHandle::events` hands out readers, and once every reader is dropped the core stops queueing.
 - Watches can change faster than the UI should redraw. The core marks the store as changed and sends at most one
   change event per view per frame budget (about 100 ms). The view then reads the latest snapshot. Individual watch

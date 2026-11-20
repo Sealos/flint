@@ -1198,6 +1198,10 @@ impl ClusterManager {
             .map(|c| (c.info.name.clone(), c))
             .collect();
         let mut changed_active = false;
+        // Contexts that start over with a fresh slot (re-pointed, or back after being removed):
+        // their discovery is reset after the list goes out (#255).
+        let first_load = old.is_empty();
+        let mut reset = Vec::new();
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
             let slot = match old.remove(&info.name) {
@@ -1218,9 +1222,15 @@ impl ClusterManager {
                         Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
+                    reset.push(info.name.clone());
                     fresh
                 }
-                None => Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config),
+                None => {
+                    if !first_load {
+                        reset.push(info.name.clone());
+                    }
+                    Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config)
+                }
             };
             self.clusters.push(slot);
         }
@@ -1239,6 +1249,15 @@ impl ClusterManager {
             paths: path_exist,
         };
         self.emit(Event::ClustersChanged(Arc::new(snapshot)));
+        // After the list, so it replaces any discovery of the old slot still queued, and the
+        // reader forgets it however many lists it skipped.
+        for cluster in reset {
+            self.emit(Event::DiscoveryChanged {
+                cluster,
+                discovery: None,
+                error: None,
+            });
+        }
 
         if let Some(active) = self.active.clone() {
             if old.contains_key(&active) {

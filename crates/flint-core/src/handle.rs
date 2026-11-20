@@ -247,7 +247,9 @@ pub enum Event {
         error: Option<String>,
     },
     /// Discovery ran for a cluster: at connect, and again when its CRDs change. On failure,
-    /// `error` is set and `discovery` holds the previous result, if any.
+    /// `error` is set and `discovery` holds the previous result, if any. With neither, the
+    /// cluster started over (re-pointed, or back after being removed) and has not been
+    /// discovered: forget what was discovered of it.
     DiscoveryChanged {
         cluster: ClusterId,
         discovery: Option<Arc<ClusterDiscovery>>,

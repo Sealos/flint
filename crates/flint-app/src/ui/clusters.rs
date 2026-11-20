@@ -104,6 +104,14 @@ impl ClustersModel {
                 self.settings = settings;
                 self.settings_error = error;
             }
+            // Neither: the cluster started over in the core; what was discovered is stale.
+            Event::DiscoveryChanged {
+                cluster,
+                discovery: None,
+                error: None,
+            } => {
+                self.discovery.remove(&cluster);
+            }
             Event::DiscoveryChanged {
                 cluster,
                 discovery,

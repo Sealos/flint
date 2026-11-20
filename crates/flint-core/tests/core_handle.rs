@@ -325,8 +325,9 @@ async fn events_nobody_reads_stay_bounded() {
     let events = core.events();
     tokio::time::sleep(Duration::from_millis(500)).await;
     rewrite_kubeconfig(dir.path(), 50, &["one", "two"]).await;
-    // Clusters, settings, activity: one each, however many times they changed.
-    assert!(events.len() <= 4, "{} events queued", events.len());
+    // Clusters, settings, activity: one each, however many times they changed; and at most one
+    // discovery reset per context seen (one, two, burst-0..2).
+    assert!(events.len() <= 3 + 5, "{} events queued", events.len());
     let mut latest = None;
     while !events.is_empty() {
         if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
@@ -343,6 +344,41 @@ async fn events_nobody_reads_stay_bounded() {
         names.starts_with(&["one".to_owned(), "two".to_owned()]),
         "{names:?}"
     );
+}
+
+// covers UP-06: a context re-pointed and pointed back (or removed and added back) before the
+// front end reads starts over in the core; whatever lists the reader skipped, a reset of its
+// discovery is queued, so no old server's kinds are kept.
+#[tokio::test]
+async fn a_context_that_starts_over_resets_its_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one", "two"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    next_clusters(&events).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let elsewhere = kubeconfig(&["one", "two"]).replace("127.0.0.1:1", "127.0.0.1:2");
+    for text in [elsewhere, kubeconfig(&["one"]), kubeconfig(&["one", "two"])] {
+        std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let mut read = Vec::new();
+    while !events.is_empty() {
+        read.push(match events.recv().await.unwrap() {
+            Event::ClustersChanged(_) => "clusters".to_owned(),
+            Event::DiscoveryChanged {
+                cluster,
+                discovery: None,
+                error: None,
+            } => format!("reset {cluster}"),
+            other => format!("{other:?}").chars().take(20).collect(),
+        });
+    }
+    // Each reset is the last word on its cluster's discovery (nothing of the old slot follows).
+    for reset in ["reset one", "reset two"] {
+        assert!(read.iter().any(|e| e == reset), "{read:?}");
+    }
+    assert!(read.iter().any(|e| e == "clusters"), "{read:?}");
 }
 
 // covers UP-06: once the front end drops its stream, the core stops queueing events for it;
