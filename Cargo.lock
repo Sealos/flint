@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "flint-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "flint-core",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "flint-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "flint-e2e"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "flint-mcp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flint-core",
