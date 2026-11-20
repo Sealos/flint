@@ -600,6 +600,15 @@ opens in a tab in the bottom dock.
   log sessions, which are pinned the same way) whether the context changed since, never the server. A change ends it
   with `ExecFailureKind::ContextChanged` and the reason, worded as a log session's (`recheck::reason`). Ending drops
   the exec connection, as closing the session does, so no stream stays open on the old server.
+- **Input budget (#256).** A session holds at most 1 MiB of input (`exec::INPUT_BUDGET`) that the pod has not read:
+  what waits for the session task, what is kept for the next shell while the first may turn out not to exist, and
+  what waits for the pod's stdin. `ExecSession::write` and `paste` reserve their bytes with an atomic update (never
+  blocking the UI) and are refused whole, with `InputRefused`, when they do not fit; the reservation travels with
+  the bytes and is given back once kube's stdin pipe has them, or when they are dropped on any path. The shell tab
+  then says the shell is not reading its input. The terminal's replies to the program may go 16 KiB past the
+  budget. A copy kept for the next shell counts too; when it does not fit, nothing is kept, and if the next shell
+  starts, its snapshot says so (`input_not_replayed`). Resizes and closing never wait behind input: a resize
+  replaces the size not yet taken in and has its own task to the pod's TTY, and closing is a signal of its own.
 - **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.

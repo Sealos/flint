@@ -31,6 +31,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::exec::InputRefused;
 use flint_core::terminal::{Cell, CursorShape, SelectionKind, Side, TermMode, TerminalSize};
 use flint_core::{ExecSession, ExecSnapshot};
 use gpui_kit::base::TestSupportExt as _;
@@ -233,6 +234,9 @@ impl TerminalView {
         if snapshot.state.is_finished() {
             self.marked = None;
         }
+        if snapshot.input_not_replayed && !self.snapshot.input_not_replayed {
+            self.set_note(Tone::Warning, terminal_model::INPUT_NOT_REPLAYED.to_owned());
+        }
         // The terminal drops a selection on its own (the program cleared the screen, switched
         // screens or wrote over it); one scrolled out of view is still there to copy.
         if self.press.is_none() {
@@ -348,8 +352,15 @@ impl TerminalView {
             return;
         }
         self.wheel.reset();
-        self.session.write(bytes);
+        if let Err(refused) = self.session.write(bytes) {
+            self.input_refused(refused, false);
+        }
         cx.notify();
+    }
+
+    /// Says that the shell is not reading its input, so what was typed or pasted was not sent.
+    pub(super) fn input_refused(&mut self, refused: InputRefused, paste: bool) {
+        self.set_note(Tone::Warning, terminal_model::input_refused(refused, paste));
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -479,7 +490,10 @@ impl TerminalView {
                 (false, false) => b"\x1b[B",
             };
             let bytes = key.repeat(lines.unsigned_abs() as usize);
-            self.session.write(bytes);
+            if let Err(refused) = self.session.write(bytes) {
+                self.input_refused(refused, false);
+                cx.notify();
+            }
         } else {
             self.session.scroll(lines);
         }

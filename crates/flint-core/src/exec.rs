@@ -15,6 +15,11 @@
 //! command produces any output, which tells it apart from a shell that ran and failed. (Docker
 //! prints it on the TTY and exits with 126 or 127 instead; that is recognised too.)
 //!
+//! Input is held to a byte budget ([`INPUT_BUDGET`], see `budget`): keystrokes and pastes
+//! that do not fit while the command is not reading are refused ([`InputRefused`]), never
+//! queued without end. Resizes and closing do not queue behind input: a resize replaces the
+//! size not yet taken in, and closing is a signal of its own.
+//!
 //! Errors are shown through [`ClusterError::kube`] and [`crate::cluster::error_chain`], which
 //! never quote exec auth plugin commands, environments, or output.
 
@@ -39,9 +44,16 @@ use crate::cluster::{ClusterError, ClusterId};
 use crate::protection::WriteRefusal;
 use crate::recheck::Recheck;
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
+use budget::{Charge, InputBudget};
 
+mod budget;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+
+pub use budget::{INPUT_BUDGET, InputRefused};
+
+/// The bytes bracketed paste adds around a paste (see [`TerminalModel::paste_bytes`]).
+const PASTE_MARKERS: usize = b"\x1b[200~\x1b[201~".len();
 
 /// What the API server answers an exec that arrives without its upgrade headers.
 const UPGRADE_REQUIRED: &str = "Upgrade request required";
@@ -262,14 +274,20 @@ impl ExecState {
 pub struct ExecSnapshot {
     pub state: ExecState,
     pub terminal: TerminalSnapshot,
+    /// Input typed while a shell that turned out not to exist was tried was more than the
+    /// session keeps for the next one ([`INPUT_BUDGET`]), so the shell that started did not
+    /// get it. Stays set once set.
+    pub input_not_replayed: bool,
 }
 
-/// What a front end asks of a running session.
+/// What a front end asks of a running session. Keystrokes and pastes carry the [`Charge`]
+/// reserved for them. [`Input::Resize`] and [`Input::Close`] never wait in the queue:
+/// `Session::recv` makes them from the size slot and the close signal.
 pub(crate) enum Input {
-    Write(Vec<u8>),
-    Paste(String),
+    Write(Vec<u8>, Charge),
+    Paste(String, Charge),
     /// Paste only if the program has bracketed paste on; the reply says whether it did.
-    PasteIfBracketed(String, oneshot::Sender<bool>),
+    PasteIfBracketed(String, Charge, oneshot::Sender<bool>),
     Resize(TerminalSize),
     Scroll(i32),
     ScrollToBottom,
@@ -295,12 +313,20 @@ pub(crate) enum Input {
 pub struct ExecSession {
     request: ExecRequest,
     inputs: async_channel::Sender<Input>,
+    /// The size the terminal should have: a newer one replaces one not taken in yet.
+    size: watch::Sender<TerminalSize>,
+    /// Set by [`ExecSession::close`]; dropping it closes the session too.
+    close: watch::Sender<bool>,
+    budget: Arc<InputBudget>,
     rx: watch::Receiver<Arc<ExecSnapshot>>,
 }
 
 /// The core's side of a session: what [`run`] reads from and publishes to.
 pub(crate) struct SessionChannels {
     inputs: async_channel::Receiver<Input>,
+    size: watch::Receiver<TerminalSize>,
+    close: watch::Receiver<bool>,
+    budget: Arc<InputBudget>,
     out: watch::Sender<Arc<ExecSnapshot>>,
     model: TerminalModel,
 }
@@ -311,18 +337,33 @@ impl ExecSession {
         let first = Arc::new(ExecSnapshot {
             state: ExecState::Connecting,
             terminal: model.snapshot(),
+            input_not_replayed: false,
         });
         let (out, mut rx) = watch::channel(first);
         rx.mark_changed();
-        // Unbounded: input comes at human speed, and sending must never block the UI.
+        // Unbounded, so sending never blocks the UI; the input budget bounds what it holds,
+        // and other messages are small and come at human speed.
         let (inputs_tx, inputs) = async_channel::unbounded();
+        let (size_tx, size) = watch::channel(request.size);
+        let (close_tx, close) = watch::channel(false);
+        let budget = InputBudget::new(INPUT_BUDGET);
         (
             Self {
                 request,
                 inputs: inputs_tx,
+                size: size_tx,
+                close: close_tx,
+                budget: budget.clone(),
                 rx,
             },
-            SessionChannels { inputs, out, model },
+            SessionChannels {
+                inputs,
+                size,
+                close,
+                budget,
+                out,
+                model,
+            },
         )
     }
 
@@ -332,38 +373,64 @@ impl ExecSession {
     }
 
     fn send(&self, input: Input) {
-        // Fails only once the session task has ended; there is nothing left to tell.
+        // Fails only once the session task has ended; there is nothing left to tell. The
+        // input's charge is given back as it is dropped.
         let _ = self.inputs.try_send(input);
     }
 
     /// Sends keystrokes (already encoded for the terminal) to the command, and scrolls the view
-    /// back to the bottom. Ignored once the command has finished.
-    pub fn write(&self, bytes: impl Into<Vec<u8>>) {
-        self.send(Input::Write(bytes.into()));
+    /// back to the bottom. Ignored once the command has finished. Refused, and nothing sent,
+    /// when they do not fit in what the session holds for a command that is not reading its
+    /// input ([`INPUT_BUDGET`]).
+    pub fn write(&self, bytes: impl Into<Vec<u8>>) -> Result<(), InputRefused> {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let charge = budget::reserve(&self.budget, bytes.len())?;
+        self.send(Input::Write(bytes, charge));
+        Ok(())
     }
 
     /// Pastes `text`, bracketed when the program asked for it (see
-    /// [`TerminalModel::paste_bytes`]).
-    pub fn paste(&self, text: impl Into<String>) {
-        self.send(Input::Paste(text.into()));
+    /// [`TerminalModel::paste_bytes`]). Refused whole, as [`ExecSession::write`] is.
+    pub fn paste(&self, text: impl Into<String>) -> Result<(), InputRefused> {
+        let text = text.into();
+        let charge = budget::reserve(&self.budget, text.len() + PASTE_MARKERS)?;
+        self.send(Input::Paste(text, charge));
+        Ok(())
     }
 
     /// Pastes `text` only if the program has bracketed paste on when the paste reaches it, and
     /// resolves to whether it did. A front end asks before pasting several lines that would
     /// each run; deciding from its last snapshot could miss the program turning the mode off
-    /// (bash does while it runs a command). `false` once the session ended too.
+    /// (bash does while it runs a command). `false` once the session ended too. Refused at
+    /// once, as [`ExecSession::paste`] is.
     pub fn paste_if_bracketed(
         &self,
         text: impl Into<String>,
-    ) -> impl Future<Output = bool> + Send + 'static {
+    ) -> Result<impl Future<Output = bool> + Send + 'static, InputRefused> {
+        let text = text.into();
+        let charge = budget::reserve(&self.budget, text.len() + PASTE_MARKERS)?;
         let (reply, rx) = oneshot::channel();
-        self.send(Input::PasteIfBracketed(text.into(), reply));
-        async move { rx.await.unwrap_or(false) }
+        self.send(Input::PasteIfBracketed(text, charge, reply));
+        Ok(async move { rx.await.unwrap_or(false) })
     }
 
-    /// Resizes the terminal and tells the pod's TTY.
+    /// How many bytes of input wait for the command to read them (or for the session to take
+    /// them in): at most [`INPUT_BUDGET`], plus a little for the terminal's own replies.
+    pub fn queued_input(&self) -> usize {
+        self.budget.used()
+    }
+
+    /// Resizes the terminal and tells the pod's TTY. Never waits behind input: a size not
+    /// taken in yet is replaced.
     pub fn resize(&self, size: TerminalSize) {
-        self.send(Input::Resize(size));
+        self.size.send_if_modified(|current| {
+            let changed = *current != size;
+            *current = size;
+            changed
+        });
     }
 
     /// Scrolls the view by `lines`: positive goes up into the history.
@@ -401,9 +468,10 @@ impl ExecSession {
         async move { rx.await.ok().flatten() }
     }
 
-    /// Ends the command and the session. Dropping the session does the same.
+    /// Ends the command and the session, before any input still waiting. Dropping the
+    /// session does the same.
     pub fn close(&self) {
-        self.send(Input::Close);
+        self.close.send_replace(true);
     }
 
     /// Waits until a snapshot newer than the last one read with [`ExecSession::latest`] is
@@ -654,7 +722,7 @@ pub(crate) async fn run(
     let mut session = Session::new(channels);
     let candidates = request.candidates();
     // Typed before the command started; sent once it has.
-    let mut pending = Vec::new();
+    let mut pending = Replay::default();
     for (i, command) in candidates.iter().enumerate() {
         let last = i + 1 == candidates.len();
         session.set_state(ExecState::Connecting);
@@ -697,6 +765,9 @@ pub(crate) async fn run(
         {
             Outcome::MissingCommand(_) if !last => {
                 tracing::debug!(?command, "command not in the container; trying the next");
+                if std::mem::take(&mut pending.dropped) {
+                    session.input_not_replayed = true;
+                }
                 // Some runtimes print the error on the TTY: start the next shell on a clean
                 // screen.
                 session.reset_screen();
@@ -713,6 +784,8 @@ pub(crate) async fn run(
         }
         break;
     }
+    // No command will take it any more: give its bytes back.
+    drop(pending);
     session.linger().await;
 }
 
@@ -729,21 +802,100 @@ enum Outcome {
     Done(ExecState),
 }
 
-/// Bytes and resizes for the remote TTY, written by their own task so a slow upload never
-/// stops output from being read (kube's message loop does both on one task).
-enum ToRemote {
-    Bytes(Vec<u8>),
-    Resize(TerminalSize),
+/// Where a running command's input goes: bytes to the task that writes the pod's stdin, and
+/// sizes to the task that resizes its TTY. Each has its own task, so a slow upload never stops
+/// output from being read (kube's message loop does both on one task), and a resize never
+/// waits behind bytes the pod does not read.
+struct ToPod {
+    stdin: mpsc::UnboundedSender<Chunk>,
+    size: watch::Sender<TerminalSize>,
+}
+
+/// Bytes for the pod's stdin, with their share of the input budget.
+struct Chunk {
+    bytes: Vec<u8>,
+    charge: Charge,
+}
+
+impl ToPod {
+    fn write(&self, bytes: Vec<u8>, charge: Charge) {
+        // Fails once the writer is gone; dropping the chunk gives its bytes back.
+        let _ = self.stdin.send(Chunk { bytes, charge });
+    }
+}
+
+/// Input kept for the next command to try, while the one starting may turn out not to exist,
+/// and before any started, everything typed. All of it is charged to the session's budget, so
+/// a copy of input already sent counts twice.
+#[derive(Default)]
+struct Replay {
+    bytes: Vec<u8>,
+    charge: Option<Charge>,
+    /// Some input did not fit in the budget, so none is kept: a replay with a gap could run
+    /// something never typed.
+    dropped: bool,
+}
+
+impl Replay {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Keeps `bytes`, with what was reserved for them.
+    fn take_in(&mut self, bytes: Vec<u8>, charge: Charge) {
+        if self.dropped {
+            return;
+        }
+        self.bytes.extend(bytes);
+        match &mut self.charge {
+            Some(held) => held.absorb(charge),
+            None => self.charge = Some(charge),
+        }
+    }
+
+    /// Keeps a copy of `bytes`, sent to the command, if the budget has room for it; otherwise
+    /// drops everything kept.
+    fn keep(&mut self, bytes: &[u8], budget: &Arc<InputBudget>) {
+        if self.dropped || bytes.is_empty() {
+            return;
+        }
+        match budget::reserve(budget, bytes.len()) {
+            Ok(charge) => self.take_in(bytes.to_vec(), charge),
+            Err(_) => self.drop_all(),
+        }
+    }
+
+    /// Hands over what is kept, keeping nothing.
+    fn take(&mut self) -> Option<(Vec<u8>, Charge)> {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.charge.take().map(|charge| (bytes, charge))
+    }
+
+    fn clear(&mut self) {
+        drop(self.take());
+    }
+
+    fn drop_all(&mut self) {
+        self.clear();
+        self.dropped = true;
+    }
 }
 
 struct Session {
     model: TerminalModel,
     state: ExecState,
     inputs: async_channel::Receiver<Input>,
+    size: watch::Receiver<TerminalSize>,
+    /// The handle can still send sizes.
+    sizing: bool,
+    close: watch::Receiver<bool>,
+    budget: Arc<InputBudget>,
     out: watch::Sender<Arc<ExecSnapshot>>,
     last_publish: Option<Instant>,
     /// Output arrived since the last snapshot.
     dirty: bool,
+    /// See [`ExecSnapshot::input_not_replayed`].
+    input_not_replayed: bool,
 }
 
 impl Session {
@@ -752,9 +904,14 @@ impl Session {
             model: channels.model,
             state: ExecState::Connecting,
             inputs: channels.inputs,
+            size: channels.size,
+            sizing: true,
+            close: channels.close,
+            budget: channels.budget,
             out: channels.out,
             last_publish: None,
             dirty: false,
+            input_not_replayed: false,
         }
     }
 
@@ -764,6 +921,7 @@ impl Session {
         self.out.send_replace(Arc::new(ExecSnapshot {
             state: self.state.clone(),
             terminal: self.model.snapshot(),
+            input_not_replayed: self.input_not_replayed,
         }));
     }
 
@@ -789,43 +947,63 @@ impl Session {
             .then(|| self.last_publish.map_or_else(Instant::now, |at| at + FRAME))
     }
 
+    /// What the front end asks next: closing first, then a new size, then queued input, so
+    /// neither of the first two waits behind input. Cancel-safe.
+    async fn recv(&mut self) -> Result<Input, async_channel::RecvError> {
+        loop {
+            tokio::select! {
+                biased;
+                // Dropping the handle drops the sender, which closes too.
+                _ = self.close.wait_for(|closed| *closed) => return Ok(Input::Close),
+                changed = self.size.changed(), if self.sizing => match changed {
+                    Ok(()) => return Ok(Input::Resize(*self.size.borrow_and_update())),
+                    Err(_) => self.sizing = false,
+                },
+                input = self.inputs.recv() => return input,
+            }
+        }
+    }
+
     /// The next input, publishing held-back screen changes when their frame is due meanwhile.
     async fn next_input(&mut self) -> Result<Input, async_channel::RecvError> {
         loop {
             let Some(deadline) = self.deadline() else {
-                return self.inputs.recv().await;
+                return self.recv().await;
             };
             tokio::select! {
-                input = self.inputs.recv() => return input,
+                input = self.recv() => return input,
                 () = tokio::time::sleep_until(deadline) => self.publish(),
             }
         }
     }
 
     /// Handles input that does not need the remote command. `pending` collects keystrokes while
-    /// the command starts; `None` drops them (the command has finished).
+    /// the command starts; `None` drops them (the command has finished), giving their bytes
+    /// back.
     fn handle_offline(
         &mut self,
         input: Result<Input, async_channel::RecvError>,
-        pending: Option<&mut Vec<u8>>,
+        pending: Option<&mut Replay>,
     ) -> Flow {
         let Ok(input) = input else {
             // The session handle is gone.
             return Flow::Close;
         };
         match input {
-            Input::Write(bytes) => {
+            Input::Write(bytes, charge) => {
                 if let Some(pending) = pending {
-                    pending.extend(bytes);
+                    pending.take_in(bytes, charge);
                 }
             }
-            Input::Paste(text) => {
+            Input::Paste(text, mut charge) => {
                 if let Some(pending) = pending {
-                    pending.extend(self.model.paste_bytes(&text));
+                    let bytes = self.model.paste_bytes(&text);
+                    charge.set(bytes.len());
+                    pending.take_in(bytes, charge);
                 }
             }
             // No program runs yet (or any more), so none asked for bracketed paste.
-            Input::PasteIfBracketed(_, reply) => {
+            Input::PasteIfBracketed(_, _, reply) => {
                 let _ = reply.send(false);
             }
             Input::Resize(size) => {
@@ -870,45 +1048,59 @@ impl Session {
     fn handle_live(
         &mut self,
         input: Result<Input, async_channel::RecvError>,
-        remote: &mpsc::UnboundedSender<ToRemote>,
-        unconfirmed: Option<&mut Vec<u8>>,
+        to_pod: &ToPod,
+        unconfirmed: Option<&mut Replay>,
     ) -> Flow {
-        let bytes = match input {
-            Ok(Input::Write(bytes)) => bytes,
-            Ok(Input::Paste(text)) => self.model.paste_bytes(&text),
-            Ok(Input::PasteIfBracketed(text, reply)) => {
+        let (bytes, mut charge) = match input {
+            Ok(Input::Write(bytes, charge)) => (bytes, charge),
+            Ok(Input::Paste(text, charge)) => (self.model.paste_bytes(&text), charge),
+            Ok(Input::PasteIfBracketed(text, charge, reply)) => {
                 let bracketed = self.model.bracketed_paste();
                 let _ = reply.send(bracketed);
                 if !bracketed {
                     return Flow::Continue;
                 }
-                self.model.paste_bytes(&text)
+                (self.model.paste_bytes(&text), charge)
             }
-            other => return self.handle_live_control(other, remote),
+            other => return self.handle_live_control(other, to_pod),
         };
+        charge.set(bytes.len());
         self.follow_output();
         if let Some(unconfirmed) = unconfirmed {
-            unconfirmed.extend_from_slice(&bytes);
+            unconfirmed.keep(&bytes, &self.budget);
         }
-        let _ = remote.send(ToRemote::Bytes(bytes));
+        to_pod.write(bytes, charge);
         Flow::Continue
     }
 
     fn handle_live_control(
         &mut self,
         input: Result<Input, async_channel::RecvError>,
-        remote: &mpsc::UnboundedSender<ToRemote>,
+        to_pod: &ToPod,
     ) -> Flow {
         match input {
             Ok(Input::Resize(size)) => {
                 // The TTY gets the size the screen really has.
                 let size = size.normalized();
                 if size != self.model.size() {
-                    let _ = remote.send(ToRemote::Resize(size));
+                    to_pod.size.send_replace(size);
                 }
                 self.handle_offline(Ok(Input::Resize(size)), None)
             }
             other => self.handle_offline(other, None),
+        }
+    }
+
+    /// Sends the terminal's `reply` to a query (a cursor position report) to the program. A
+    /// reply may go a little past the input budget; past that, the program is not reading its
+    /// input and the reply is dropped.
+    fn reply(&self, reply: Vec<u8>, to_pod: &ToPod) {
+        if reply.is_empty() {
+            return;
+        }
+        match budget::reserve_reply(&self.budget, reply.len()) {
+            Some(charge) => to_pod.write(reply, charge),
+            None => tracing::debug!("terminal reply dropped: the command is not reading input"),
         }
     }
 
@@ -930,14 +1122,14 @@ impl Session {
     /// closed. `pending` holds keystrokes typed before it started, which are sent first. When
     /// another shell would be tried if this one turns out not to exist (`fallback`), `pending`
     /// keeps them (with what is typed next) until the output shows the command started (it
-    /// cannot be a runtime's launch error any more); otherwise it is emptied at once. When
-    /// `watch` finds the context changed, the command ends at once: returning drops the
-    /// connection, as closing the session does.
+    /// cannot be a runtime's launch error any more), as long as the input budget has room for
+    /// the copy; otherwise it is emptied at once. When `watch` finds the context changed, the
+    /// command ends at once: returning drops the connection, as closing the session does.
     async fn drive(
         &mut self,
         process: Process,
         executable: &str,
-        pending: &mut Vec<u8>,
+        pending: &mut Replay,
         fallback: bool,
         watch: &mut ContextWatch,
     ) -> Outcome {
@@ -948,19 +1140,33 @@ impl Session {
             status,
             mut finish,
         } = process;
-        let (remote, rx) = mpsc::unbounded_channel();
-        let writer = AbortOnDrop(tokio::spawn(write_remote(stdin, resize, rx)));
-        // The API server starts the TTY at a default size; set ours right away.
-        let _ = remote.send(ToRemote::Resize(self.model.size()));
-        if !pending.is_empty() {
-            let _ = remote.send(ToRemote::Bytes(pending.clone()));
-        }
-        let mut pending = if fallback {
-            Some(pending)
-        } else {
-            pending.clear();
-            None
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
+        // The API server starts the TTY at a default size; the resizer sets ours right away.
+        let (size_tx, mut size_rx) = watch::channel(self.model.size());
+        size_rx.mark_changed();
+        let to_pod = ToPod {
+            stdin: stdin_tx,
+            size: size_tx,
         };
+        let writer = AbortOnDrop(tokio::spawn(write_remote(stdin, stdin_rx)));
+        let resizer = resize.map(|tx| AbortOnDrop(tokio::spawn(resize_remote(tx, size_rx))));
+        if fallback {
+            if !pending.is_empty() {
+                match budget::reserve(&self.budget, pending.bytes.len()) {
+                    Ok(charge) => to_pod.write(pending.bytes.clone(), charge),
+                    // No room for a copy: send what was typed, and keep nothing for the next.
+                    Err(_) => {
+                        if let Some((bytes, charge)) = pending.take() {
+                            to_pod.write(bytes, charge);
+                        }
+                        pending.drop_all();
+                    }
+                }
+            }
+        } else if let Some((bytes, charge)) = pending.take() {
+            to_pod.write(bytes, charge);
+        }
+        let mut pending = fallback.then_some(pending);
         let mut buf = vec![0; IO_BUFFER];
         let mut saw_output = false;
         // The command has shown it started: its output cannot be a launch error any more.
@@ -986,20 +1192,18 @@ impl Session {
                         }
                         if !started && !could_be_launch_error(&early) {
                             started = true;
-                            if let Some(pending) = pending.as_deref_mut() {
+                            // No next shell: what was kept for it is given back.
+                            if let Some(pending) = pending.take() {
                                 pending.clear();
                             }
                         }
                         let reply = self.model.advance(&buf[..n]);
-                        if !reply.is_empty() {
-                            let _ = remote.send(ToRemote::Bytes(reply));
-                        }
+                        self.reply(reply, &to_pod);
                         self.screen_changed();
                     }
                 },
-                input = self.inputs.recv() => {
-                    let unconfirmed = pending.as_deref_mut().filter(|_| !started);
-                    if self.handle_live(input, &remote, unconfirmed) == Flow::Close {
+                input = self.recv() => {
+                    if self.handle_live(input, &to_pod, pending.as_deref_mut()) == Flow::Close {
                         return Outcome::Done(ExecState::Closed);
                     }
                 }
@@ -1020,15 +1224,14 @@ impl Session {
                 () = tokio::time::sleep_until(sync.unwrap_or_else(Instant::now)),
                     if sync.is_some() => {
                     let reply = self.model.end_sync();
-                    if !reply.is_empty() {
-                        let _ = remote.send(ToRemote::Bytes(reply));
-                    }
+                    self.reply(reply, &to_pod);
                     self.screen_changed();
                 }
             }
         }
-        drop(remote);
+        drop(to_pod);
         drop(writer);
+        drop(resizer);
         // Output held back for a synchronized update belongs on the final screen.
         self.model.end_sync();
         self.publish();
@@ -1090,32 +1293,38 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// Writes input to the pod's stdin, giving each chunk's bytes back to the budget once kube's
+/// pipe has taken them. Aborting it, or its ending, drops the chunks still queued, which gives
+/// theirs back too.
 async fn write_remote(
     mut stdin: Pin<Box<dyn AsyncWrite + Send>>,
-    mut resize: Option<futures::channel::mpsc::Sender<kube::api::TerminalSize>>,
-    mut rx: mpsc::UnboundedReceiver<ToRemote>,
+    mut rx: mpsc::UnboundedReceiver<Chunk>,
 ) {
-    while let Some(message) = rx.recv().await {
-        match message {
-            ToRemote::Bytes(bytes) => {
-                if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
-                    return;
-                }
-            }
-            ToRemote::Resize(size) => {
-                if let Some(tx) = resize.as_mut() {
-                    let size = kube::api::TerminalSize {
-                        width: size.cols,
-                        height: size.rows,
-                    };
-                    if tx.send(size).await.is_err() {
-                        resize = None;
-                    }
-                }
-            }
+    while let Some(Chunk { bytes, charge }) = rx.recv().await {
+        if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+            return;
         }
+        drop(charge);
     }
     let _ = stdin.shutdown().await;
+}
+
+/// Tells the pod's TTY the newest size, first the one it starts with. Sizes set while one is
+/// being sent replace each other, so only the newest follows.
+async fn resize_remote(
+    mut tx: futures::channel::mpsc::Sender<kube::api::TerminalSize>,
+    mut sizes: watch::Receiver<TerminalSize>,
+) {
+    while sizes.changed().await.is_ok() {
+        let size = *sizes.borrow_and_update();
+        let size = kube::api::TerminalSize {
+            width: size.cols,
+            height: size.rows,
+        };
+        if tx.send(size).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// How a command that started `executable` ended, from the exec status (if the server sent
@@ -1537,13 +1746,13 @@ mod tests {
         })
         .await;
         assert_eq!(snap.terminal.cursor.unwrap().col, 12);
-        session.write(b"ls\r".to_vec());
+        session.write(b"ls\r".to_vec()).unwrap();
         assert_eq!(remote.read_stdin(3).await, b"ls\r");
-        session.paste("a\nb");
+        session.paste("a\nb").unwrap();
         assert_eq!(remote.read_stdin(3).await, b"a\rb");
         // A paste that waits for bracketed paste mode is refused while it is off, and sent
         // bracketed once the program turns it on.
-        assert!(!session.paste_if_bracketed("c\nd").await);
+        assert!(!session.paste_if_bracketed("c\nd").unwrap().await);
         remote.print(b"\x1b[?2004h").await;
         wait_for(&mut session, "bracketed paste", |s| {
             s.terminal
@@ -1551,7 +1760,7 @@ mod tests {
                 .contains(crate::terminal::TermMode::BRACKETED_PASTE)
         })
         .await;
-        assert!(session.paste_if_bracketed("c\nd").await);
+        assert!(session.paste_if_bracketed("c\nd").unwrap().await);
         assert_eq!(remote.read_stdin(9).await, b"\x1b[200~c\nd");
         assert_eq!(launcher.launched(), vec![vec!["bash".to_owned()]]);
     }
@@ -1620,7 +1829,7 @@ mod tests {
         launcher.push(Ok(sh));
         let mut session = open(&launcher, request());
         // Typed while bash was being tried: it goes to the shell that starts.
-        session.write(b"x".to_vec());
+        session.write(b"x".to_vec()).unwrap();
         bash_remote.next_resize().await;
         bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
         wait_for(&mut session, "sh", |s| {
@@ -1750,7 +1959,7 @@ mod tests {
             .unwrap();
         // The screen stays readable, and keystrokes go nowhere.
         assert_eq!(snap.terminal.row_text(0), "staging$");
-        session.write(b"rm -rf /tmp/x\r".to_vec());
+        session.write(b"rm -rf /tmp/x\r".to_vec()).unwrap();
         session.close();
         wait_for(&mut session, "closed", |s| s.state.is_finished()).await;
         assert!(!session.changed().await, "the session task ended");
@@ -1891,7 +2100,7 @@ mod tests {
         wait_for(&mut session, "output", |s| s.terminal.history_lines > 0).await;
         session.scroll(2);
         wait_for(&mut session, "scrolled", |s| s.terminal.display_offset == 2).await;
-        session.write(b"q".to_vec());
+        session.write(b"q".to_vec()).unwrap();
         wait_for(&mut session, "bottom", |s| s.terminal.display_offset == 0).await;
     }
 
@@ -1976,7 +2185,7 @@ mod tests {
         })
         .await;
         // Typed after the diagnostic appeared: still replayed to the shell that starts.
-        session.write(b"y".to_vec());
+        session.write(b"y".to_vec()).unwrap();
         assert_eq!(bash_remote.read_stdin(1).await, b"y");
         bash_remote.exit(exit_status("126"));
         let snap = wait_for(
@@ -2069,6 +2278,196 @@ mod tests {
         remote.exit(status("Success", "", ""));
         let snap = wait_for(&mut session, "exit", |s| s.state.is_finished()).await;
         assert_eq!(snap.terminal.row_text(0), "bye");
+    }
+
+    /// Waits until the session holds `bytes` of input.
+    async fn queued(session: &ExecSession, bytes: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.queued_input() != bytes {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} bytes queued, not {bytes}", session.queued_input()));
+    }
+
+    /// The largest paste a shell tab sends.
+    const PASTE: usize = 256 * 1024;
+
+    // covers UP-41 (#256): a pod that stops reading its stdin holds at most the input budget,
+    // the rest is refused and said so, and a resize and closing still reach it at once.
+    #[tokio::test]
+    async fn a_pod_that_stops_reading_holds_at_most_the_budget() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        assert_eq!(remote.next_resize().await, (40, 5));
+        wait_for(&mut session, "running", |s| {
+            matches!(s.state, ExecState::Running { .. })
+        })
+        .await;
+        // From here on the pod reads nothing: its stdin pipe fills, and the writer waits.
+        let paste = "x".repeat(PASTE);
+        let mut accepted = 0;
+        for _ in 0..8 {
+            match session.paste(paste.clone()) {
+                Ok(()) => accepted += 1,
+                Err(refused) => {
+                    assert_eq!(refused.bytes, PASTE + PASTE_MARKERS);
+                    assert!(refused.queued + refused.bytes > INPUT_BUDGET, "{refused:?}");
+                }
+            }
+            assert!(session.queued_input() <= INPUT_BUDGET);
+        }
+        assert_eq!(accepted, 3);
+        // Once the session has taken them in, they hold what they are (no paste markers).
+        queued(&session, 3 * PASTE).await;
+        // A keystroke that fits is taken; one more is refused.
+        let room = INPUT_BUDGET - session.queued_input();
+        session.write(vec![b'y'; room]).unwrap();
+        assert_eq!(
+            session.write(b"z".to_vec()),
+            Err(InputRefused {
+                bytes: 1,
+                queued: INPUT_BUDGET
+            })
+        );
+
+        // A resize does not wait behind the input.
+        session.resize(TerminalSize::new(100, 30));
+        let resized = tokio::time::timeout(Duration::from_secs(1), remote.next_resize()).await;
+        assert_eq!(resized.expect("the resize reached the TTY"), (100, 30));
+        // Nor does closing; and every byte held is given back.
+        session.close();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for(&mut session, "closed", |s| s.state == ExecState::Closed),
+        )
+        .await
+        .expect("closed at once");
+        queued(&session, 0).await;
+    }
+
+    // covers UP-41 (#256): input a pod never read is given back when the command exits, and
+    // input sent afterwards is dropped without being held.
+    #[tokio::test]
+    async fn input_a_pod_never_read_is_given_back_when_it_exits() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        // More than the stdin pipe takes: the writer waits with a chunk in hand, more queued.
+        for _ in 0..3 {
+            session.paste("x".repeat(PASTE)).unwrap();
+        }
+        queued(&session, 3 * PASTE).await;
+        remote.exit(exit_status("1"));
+        wait_for(&mut session, "exit", |s| s.state.is_finished()).await;
+        queued(&session, 0).await;
+        session.paste("x".repeat(PASTE)).unwrap();
+        queued(&session, 0).await;
+    }
+
+    /// Launches that wait until the test hands over each process.
+    #[derive(Clone, Default)]
+    struct GatedLauncher(Arc<Mutex<VecDeque<oneshot::Receiver<Process>>>>);
+
+    impl GatedLauncher {
+        fn gate(&self) -> oneshot::Sender<Process> {
+            let (tx, rx) = oneshot::channel();
+            self.0.lock().unwrap().push_back(rx);
+            tx
+        }
+    }
+
+    impl Launcher for GatedLauncher {
+        fn launch(&self, _: Vec<String>) -> BoxFuture<'static, Result<Process, LaunchError>> {
+            let rx = self.0.lock().unwrap().pop_front().expect("a gated launch");
+            async move {
+                rx.await
+                    .map_err(|_| LaunchError::new("no process".to_owned()))
+            }
+            .boxed()
+        }
+    }
+
+    // covers UP-41 (#256): pastes before the shell starts, while another shell could still
+    // be tried, stay within the budget. With no room left for a copy for the next shell, the
+    // first one gets them and the next one nothing, which the snapshot says.
+    #[tokio::test]
+    async fn pastes_before_launch_stay_within_the_budget() {
+        let launcher = GatedLauncher::default();
+        let bash = launcher.gate();
+        let sh = launcher.gate();
+        let mut session = open_watched(&launcher, request(), Arc::new(|| async { None }.boxed()));
+        let paste = "x".repeat(600 * 1024);
+        session.paste(paste.clone()).unwrap();
+        assert!(session.paste(paste.clone()).is_err(), "over the budget");
+        assert!(session.queued_input() <= INPUT_BUDGET);
+
+        let (bash_proc, mut bash_remote) = process();
+        bash.send(bash_proc).ok().unwrap();
+        bash_remote.next_resize().await;
+        // bash gets what was typed, though it is not kept for /bin/sh.
+        assert_eq!(bash_remote.read_stdin(paste.len()).await, paste.as_bytes());
+        queued(&session, 0).await;
+        bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
+
+        let (sh_proc, mut sh_remote) = process();
+        sh.send(sh_proc).ok().unwrap();
+        let snap = wait_for(
+            &mut session,
+            "sh",
+            |s| matches!(&s.state, ExecState::Running { command } if command == &["/bin/sh"]),
+        )
+        .await;
+        assert!(snap.input_not_replayed, "the snapshot says so");
+        sh_remote.next_resize().await;
+        session.write(b"q".to_vec()).unwrap();
+        assert_eq!(
+            sh_remote.read_stdin(1).await,
+            b"q",
+            "nothing replayed before it"
+        );
+    }
+
+    // covers UP-41 (#256): input sent while a shell may still turn out missing is kept for
+    // the next one only while the budget has room for the copy.
+    #[tokio::test]
+    async fn a_copy_kept_for_the_next_shell_stays_within_the_budget() {
+        let launcher = FakeLauncher::default();
+        let (bash, mut bash_remote) = process();
+        let (sh, mut sh_remote) = process();
+        launcher.push(Ok(bash));
+        launcher.push(Ok(sh));
+        let mut session = open(&launcher, request());
+        bash_remote.next_resize().await;
+        wait_for(&mut session, "bash", |s| {
+            matches!(s.state, ExecState::Running { .. })
+        })
+        .await;
+        // bash has printed nothing: it may not exist. A small paste is kept for /bin/sh...
+        session.paste("ab").unwrap();
+        assert_eq!(bash_remote.read_stdin(2).await, b"ab");
+        queued(&session, 2).await;
+        // ...but not one whose copy does not fit beside it: then nothing is kept.
+        let paste = "x".repeat(600 * 1024);
+        session.paste(paste.clone()).unwrap();
+        assert_eq!(bash_remote.read_stdin(paste.len()).await, paste.as_bytes());
+        queued(&session, 0).await;
+        bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
+        let snap = wait_for(
+            &mut session,
+            "sh",
+            |s| matches!(&s.state, ExecState::Running { command } if command == &["/bin/sh"]),
+        )
+        .await;
+        assert!(snap.input_not_replayed);
+        sh_remote.next_resize().await;
+        session.write(b"q".to_vec()).unwrap();
+        assert_eq!(sh_remote.read_stdin(1).await, b"q");
     }
 
     #[test]
