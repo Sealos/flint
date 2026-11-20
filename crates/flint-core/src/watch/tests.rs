@@ -669,6 +669,65 @@ async fn a_namespace_limited_user_gets_the_namespaces_they_may_list_merged() {
     task.abort();
 }
 
+// covers UP-31: a one-off read of a namespace-limited list nobody subscribes to gets every
+// lane's current rows, and leaves the list's state (what status displays show) as it was.
+#[tokio::test(start_paused = true)]
+async fn a_peek_of_a_namespace_limited_list_reads_every_lane() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", forbidden());
+    }
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "x", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods/b",
+        pod_table(&[("u2", "b", "y", "Running")], true, "20"),
+    );
+    let (_scope_tx, scope) = tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(vec![
+        "a".to_owned(),
+        "b".to_owned(),
+    ]));
+    let hub = Arc::new(Hub::new("c".into(), pods().id()));
+    let epoch = hub.take_over(KindSnapshot::default());
+    let engine = engine::Engine::new(
+        "c".into(),
+        pods(),
+        fake.clone(),
+        hub.clone(),
+        epoch,
+        config(),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    )
+    .with_scope(Some(scope));
+    let task = tokio::spawn(engine.run(Feed::Watch));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while hub.state() != SyncState::Synced {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both namespaces list");
+    assert_eq!(hub.listeners(), 0);
+
+    let answer = tokio::time::timeout(Duration::from_secs(1), hub.peek())
+        .await
+        .expect("answered")
+        .expect("answered");
+    assert_eq!(names(&answer), ["x", "y"], "both namespaces' rows");
+    assert_eq!(answer.state, SyncState::Synced);
+    assert_eq!(hub.state(), SyncState::Synced);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        hub.state(),
+        SyncState::Synced,
+        "the read left the state alone"
+    );
+    assert!(hub.latest().rows.is_empty(), "nothing published");
+    task.abort();
+}
+
 // covers UP-27
 #[tokio::test(start_paused = true)]
 async fn a_namespace_limited_list_goes_back_to_all_namespaces_when_allowed_again() {

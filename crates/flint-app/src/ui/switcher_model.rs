@@ -71,6 +71,22 @@ impl Item {
     }
 }
 
+/// The extra points of `item`, whose text matched: [`IN_NAME`] when the query is found in the
+/// name alone (always, when the text is the name: a kind, a cluster-scoped object), plus
+/// [`name_bonus`]. `start` is where the quick match began: at or past the name, it is in the
+/// name, so ranking very many objects needs no second scan; only the final order (`exact`)
+/// checks the name itself when the match began in the namespace.
+fn name_points(matcher: &mut Matcher, item: &Item, query: &str, start: usize, exact: bool) -> i32 {
+    let in_name = item.name_at == 0
+        || start >= item.name_at as usize
+        || (exact
+            // A name has no "/" (it splits namespace and name): a query with one is never in it.
+            && !query.contains('/')
+            && matcher.matches_rest(0, item.name()));
+    let in_name = if in_name { IN_NAME } else { 0 };
+    in_name + name_bonus(item.name(), query)
+}
+
 /// [`EXACT_NAME`] or [`NAME_PREFIX`] for `name` and the lowercase `query`, else 0.
 fn name_bonus(name: &str, query: &str) -> i32 {
     let (exact, prefix) = if name.is_ascii() && query.is_ascii() {
@@ -235,8 +251,11 @@ impl Search {
         // Ranked by the quick score; only the best RESULTS get the full scoring below.
         let mut consider = |ix: u32, matcher: &mut Matcher| {
             let item = &index.items[ix as usize];
-            let found = match matcher.quick_points_of(&item.text, item.ascii) {
-                Some(points) => Some((points + name_bonus(item.name(), &lowered), true)),
+            let found = match matcher.quick_match(&item.text, item.ascii) {
+                Some((points, start)) => Some((
+                    points + name_points(matcher, item, &lowered, start, false),
+                    true,
+                )),
                 None => {
                     let alt_possible = item.object.is_none() || {
                         let taken = label_takes[item.kind as usize];
@@ -272,11 +291,7 @@ impl Search {
             .map(|(quick, ix, own)| {
                 let item = &index.items[ix as usize];
                 let (points, ranges) = if own {
-                    let in_name = match matcher.points(item.name()) {
-                        Some(_) if item.name_at > 0 => IN_NAME,
-                        _ => 0,
-                    };
-                    let bonus = name_bonus(item.name(), &lowered) + in_name;
+                    let bonus = name_points(&mut matcher, item, &lowered, 0, true);
                     matcher
                         .score(&item.text)
                         .map_or((quick, Vec::new()), |s| (s.points + bonus, s.ranges))
@@ -472,6 +487,25 @@ mod tests {
         assert_eq!(index.items[0].name(), "ConfigMaps");
     }
 
+    // covers UP-31: a cluster-scoped object and a kind earn the name's points as a namespaced
+    // object does: with the same match, the shorter text first.
+    #[test]
+    fn the_name_counts_the_same_with_or_without_a_namespace() {
+        let index = Index::new(
+            &[
+                entry("", "nodes", "Node", "Nodes"),
+                entry("", "pods", "Pod", "Pods"),
+            ],
+            &[
+                snapshot(KindId::pods(), &[(Some("x"), "work-1")]),
+                snapshot(KindId::new("", "nodes"), &[(None, "work-1")]),
+            ],
+        );
+        let mut search = Search::default();
+        assert_eq!(texts(&index, &mut search, "work"), ["work-1", "x/work-1"]);
+        assert_eq!(texts(&index, &mut search, "wk1"), ["work-1", "x/work-1"]);
+    }
+
     // covers UP-31: typing more searches only the earlier matches, with the same results as
     // starting over; deleting starts over.
     #[test]
@@ -548,7 +582,7 @@ mod tests {
     }
 
     // covers UP-31: typing a name letter by letter over 50,000 objects stays within a frame.
-    // About 16 ms per keystroke at worst in this unoptimized test build here; the limit is 50 ms
+    // About 16-23 ms per keystroke at worst in this unoptimized test build here; the limit is 50 ms
     // so a shared CI runner does not fail it, while a quadratic slowdown or a lost pre-check
     // still would.
     #[test]

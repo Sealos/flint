@@ -118,7 +118,9 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 - A watch nobody subscribes to builds no snapshots. `CoreHandle::stored_snapshots` reads the rows every watch of a
   cluster holds without subscribing: a kind someone subscribes to gives what it last published, and any other is
   asked for one snapshot (`Hub::peek`, a one-shot reply, answered within 300 ms or left out), which its watch task
-  builds from its store and keeps nowhere. A read is not a subscriber: the hub still holds no rows afterwards, the
+  builds from its store and keeps nowhere; a namespace-limited list asks each of its namespaces' watches the same
+  way and merges their answers, without touching its own state. A kind whose watch does not answer in time (busy
+  relisting) shows its kind row as "not loaded" rather than older rows. A read is not a subscriber: the hub still holds no rows afterwards, the
   task publishes nothing, the kind keeps its place behind the per-cluster list limit, and the hub can be released
   meanwhile. It never tells the manager, creates no hub and makes no request, so no watch starts in either mode.
   The resource switcher uses it.
@@ -933,7 +935,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     50 ms a keystroke in an unoptimized build.
   - "pods web" finds the pod `web`: an object also matches its kind's label followed by its text, with less weight.
   - The name counts most: the query being the whole name (the object's without its namespace, or the kind's label)
-    earns the most extra points, the name starting with it fewer, and the query found in the name alone a few, so
+    earns the most extra points, the name starting with it fewer, and the query found in the name alone a few (always
+    for a kind or a cluster-scoped object, whose text is the name; while ranking every object it is judged from
+    where the quick match starts, and the best 200 check the name itself), so
     Deployment `demo/web` comes before ConfigMap `demo/web-cfg` for "web". Equal scores list the shorter text
     first. While the objects arrive, the selection stays on the item the user moved to.
   - Enter on a kind runs Open Kind… (`workspace::OpenView`); on an object, Open Object… (`workspace::OpenObject`,
@@ -941,7 +945,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     namespace filter is never changed for it: when the filter hides the object, its row is not listed, its details
     still show, and the list says so (`list-filtered-out`). The selection shown before is cleared at once; when the
     first current list lacks the object, the list says it no longer exists (`list-missing`) and stops waiting, so
-    one made later with the name is not selected. Clearing the selection drops a pick still waited for. Both go through the registry from where focus
+    one made later with the name is not selected. Only a list published after the list subscribed counts: the
+    first snapshot a subscription gets may be a watch's last publish from long before (a kind viewed earlier). Clearing the selection drops a pick still waited for. Both go through the registry from where focus
     was, as the palette runs any action, and are not recorded as recent actions.
   - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
     in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.

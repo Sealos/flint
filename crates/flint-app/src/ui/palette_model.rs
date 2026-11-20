@@ -124,10 +124,19 @@ impl Matcher {
 
     /// [`Matcher::quick_points`] for a text already known to be ASCII (`ascii`) or not.
     pub fn quick_points_of(&mut self, text: &str, ascii: bool) -> Option<i32> {
+        self.quick_match(text, ascii).map(|(points, _)| points)
+    }
+
+    /// [`Matcher::quick_points_of`], with the byte where the match it scored starts.
+    pub fn quick_match(&mut self, text: &str, ascii: bool) -> Option<(i32, usize)> {
         let query = match &self.ascii {
-            _ if self.query.is_empty() => return Some(0),
+            _ if self.query.is_empty() => return Some((0, 0)),
             Some(query) if ascii => query,
-            _ => return self.points(text),
+            _ => {
+                return self
+                    .score(text)
+                    .map(|s| (s.points, s.ranges.first().map_or(0, |r| r.start)));
+            }
         };
         let bytes = text.as_bytes();
         let last = query.len() - 1;
@@ -164,7 +173,7 @@ impl Matcher {
                 }
                 next = j;
                 if q == 0 {
-                    return Some(points - GAP * j as i32);
+                    return Some((points - GAP * j as i32, j));
                 }
                 q -= 1;
             }

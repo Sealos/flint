@@ -308,10 +308,12 @@ impl NavPanel {
             .border_color(super::theme::cursor_ring(theme, cursor))
             .child(
                 div()
+                    .id(SharedString::from(format!("nav-label-{}", entry.id)))
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(entry.label.clone()),
+                    .child(entry.label.clone())
+                    .test_support(),
             )
             .children(mark.map(|m| match m {
                 // Static, not a spinner: dozens of kinds load at once after activation, and

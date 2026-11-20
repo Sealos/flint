@@ -576,3 +576,65 @@ async fn a_click_on_replaced_switcher_rows_is_dropped(cx: &mut TestAppContext) {
     .await;
     assert_eq!(t.selected(cx).as_deref(), Some("web-7d9f"));
 }
+
+// covers UP-31: a kind viewed before keeps its last list; an object made since is not taken
+// for gone on that old list, and opens once the list is current. Clearing the selection
+// meanwhile drops the pick.
+#[gpui_kit::test]
+async fn an_object_missing_only_from_an_old_list_opens(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    // The old list, as a watch published it before: no `web`.
+    let _old = store(cx, &t, KindId::pods(), &[("demo", "api", 0)]);
+    let current = || {
+        objects(
+            KindId::pods(),
+            &[("demo", "api", 0), ("demo", "web", 0)],
+            SyncState::Synced,
+            u64::MAX / 2,
+        )
+    };
+    let missing = |cx: &mut TestAppContext| {
+        let workspace = t.workspace.clone();
+        cx.update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| {
+                ws.view_state(window, cx)
+                    .list
+                    .is_some_and(|l| l.banners.iter().any(|b| b.id == "list-missing"))
+            })
+        })
+        .unwrap()
+    };
+    let open_web = |cx: &mut TestAppContext| {
+        t.dispatch(
+            cx,
+            "workspace::OpenObject",
+            serde_json::json!({"kind": "pods", "namespace": "demo", "name": "web"}),
+        )
+        .unwrap();
+    };
+    open_web(cx);
+    assert!(!missing(cx), "the old list does not prove it gone");
+    assert_eq!(t.selected(cx), None);
+    let fresh = current();
+    t.feed_list(cx, fresh).await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert!(!missing(cx));
+
+    // Again on an old list, then Esc: the pick is dropped, and the current list selects
+    // nothing.
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "services"}),
+    )
+    .unwrap();
+    open_web(cx);
+    t.dispatch(cx, "resource_list::CloseDetail", serde_json::Value::Null)
+        .unwrap();
+    let fresh = current();
+    t.feed_list(cx, fresh).await;
+    assert_eq!(t.selected(cx), None, "the cleared pick stayed armed");
+}

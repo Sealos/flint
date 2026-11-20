@@ -302,3 +302,54 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.activate(cx, "beta").await;
     assert!(!t.available(cx).contains(&"workspace::GoBack"));
 }
+
+// covers UP-33: the cursor's ring moves without moving anything: every row keeps its border,
+// so a row's contents sit where they were with the ring on or off.
+#[gpui_kit::test]
+async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let origin = |cx: &mut TestAppContext, id: &str| {
+        t.find(cx, id.to_owned())
+            .unwrap_or_else(|| panic!("{id} is drawn"))
+            .bounds()
+            .origin
+    };
+    t.focus_workspace(cx);
+    let (dot, label) = (
+        origin(cx, "cluster-dot-alpha"),
+        origin(cx, "nav-label-pods"),
+    );
+    // The sidebar's cursor on alpha, then the navigation's on Pods.
+    t.press(cx, "tab");
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
+    t.press(cx, "tab");
+    t.press(cx, "down");
+    assert_eq!(nav_cursor(&nav(cx, &t)).as_deref(), Some("kind:pods"));
+    assert_eq!(origin(cx, "nav-label-pods"), label);
+    assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
+}
+
+// covers UP-33: Go Back to the kind already open, with nothing to select, still puts focus in
+// the list.
+#[gpui_kit::test]
+async fn go_back_to_the_open_kind_focuses_the_list(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    t.dispatch(cx, "resource_list::CloseDetail", serde_json::Value::Null)
+        .unwrap();
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(t.selected(cx), None);
+    assert_eq!(focus(cx, &t), Focus::List);
+}

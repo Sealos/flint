@@ -112,6 +112,10 @@ pub struct ResourceList {
     /// An object asked for ([`ResourceList::select_listed`]) that the list did not have: what
     /// the list says about it, until another selection.
     missing: Option<(Option<String>, String)>,
+    /// The version of the snapshot the subscription started with. That one may be a watch's
+    /// last publish from long ago (a kind viewed earlier keeps it), so an object is judged gone
+    /// only on a snapshot published since.
+    subscribed_version: u64,
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
@@ -167,6 +171,7 @@ impl ResourceList {
         let kind = entry.id.clone();
         let mut subscription = core.subscribe(&cluster, &kind);
         let latest = subscription.peek();
+        let subscribed_version = latest.version;
         let watch = cx.spawn(async move |this, cx| {
             while subscription.changed().await {
                 let snapshot = subscription.latest();
@@ -227,6 +232,7 @@ impl ResourceList {
             pending_select: None,
             pending_once: false,
             missing: None,
+            subscribed_version,
             computing: false,
             dirty: false,
             remeasure: false,
@@ -320,9 +326,13 @@ impl ResourceList {
         if let Some((namespace, name)) = self.pending_select.take() {
             if find_row(&self.latest, namespace.as_deref(), &name).is_some() {
                 self.select_named(namespace.as_deref(), &name, cx);
-            } else if self.pending_once && self.latest.state.is_current() {
-                // Listed in full and not there: it is gone. Stop waiting, so an object made
-                // later with the name is not selected out of the blue.
+            } else if self.pending_once
+                && self.latest.state.is_current()
+                && self.latest.version > self.subscribed_version
+            {
+                // Listed in full since the list opened, and not there: it is gone. Stop
+                // waiting, so an object made later with the name is not selected out of the
+                // blue.
                 self.missing = Some((namespace, name));
                 cx.notify();
             } else {
