@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::clock::Clock;
+use super::exec::{self as remote, Execs};
 use super::faults::{self, Effect, Fault, Faults};
 use super::fixtures::{FIXTURES_DIR, Fixtures, Gvr, Layout};
 use super::kubeconfig;
@@ -51,6 +52,11 @@ pub struct Options {
     /// Resources answered without Tables (plain lists and plain watch events), as aggregated
     /// API servers that ignore `as=Table` do.
     pub plain_only: Vec<Gvr>,
+    /// Whether the kubelet's exec refusals (no streams, a container not running) come before
+    /// the upgrade, as plain-text HTTP errors (the default, recorded on kind v1.37), or after
+    /// it, as an `InternalError` status on the error channel. See `exec`'s module docs for
+    /// which clusters do which.
+    pub kubelet_websockets: bool,
 }
 
 impl Default for Options {
@@ -60,6 +66,7 @@ impl Default for Options {
             streaming_lists: true,
             now: SystemTime::now(),
             plain_only: Vec::new(),
+            kubelet_websockets: true,
         }
     }
 }
@@ -114,6 +121,8 @@ struct Inner {
     state: Arc<Mutex<State>>,
     /// Pod logs and their open streams. Locked after `state` when both are needed.
     logs: Mutex<Logs>,
+    /// Exec sessions and the images tests set. Locked after `state` when both are needed.
+    execs: Mutex<Execs>,
     faults: Mutex<Faults>,
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
@@ -176,6 +185,7 @@ impl FakeApiServer {
         let inner = Arc::new(Inner {
             state: Arc::new(Mutex::new(State::new(&fixtures))),
             logs: Mutex::new(Logs::new(clock.clone())),
+            execs: Mutex::default(),
             clock,
             fixtures,
             options,
@@ -509,7 +519,8 @@ async fn accept_loop(
             };
             let service = service_fn(move |req| handle(inner.clone(), req));
             let conn = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(tls), service);
+                .serve_connection(TokioIo::new(tls), service)
+                .with_upgrades();
             tokio::select! {
                 _ = conn => {}
                 _ = shutdown.changed() => {}
@@ -574,16 +585,23 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
         verb,
         status: None,
     };
-    let effect = lock(&inner.faults).take(verb, &route);
+    let upgrade = remote::is_websocket_upgrade(req.headers());
+    let effect = lock(&inner.faults).take(verb, &route, upgrade);
     let response = match effect {
         Some(Effect::DropConnection) => {
             lock(&inner.requests).push(record);
             return Err(io::Error::other("fault: connection dropped"));
         }
+        Some(Effect::RefuseUpgrade) => execs::refused_upgrade(),
         Some(Effect::Forbidden) => error(&ApiError::new(
             403,
             "Forbidden",
             faults::forbidden_message(verb, &route),
+        )),
+        Some(Effect::ForbiddenAs(rbac_verb)) => error(&ApiError::new(
+            403,
+            "Forbidden",
+            faults::forbidden_message_as(&rbac_verb, &route),
         )),
         Some(Effect::Status(code)) => error(&ApiError::new(
             code,
@@ -592,13 +610,37 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
         )),
         Some(Effect::Delay(delay)) => {
             tokio::time::sleep(delay).await;
-            respond(&inner, req.method(), &route, verb, &query, &accept)
+            serve(&inner, req, upgrade, &route, verb, &query, &accept)
         }
-        None => respond(&inner, req.method(), &route, verb, &query, &accept),
+        Some(Effect::StripUpgrade) => serve(&inner, req, false, &route, verb, &query, &accept),
+        None => serve(&inner, req, upgrade, &route, verb, &query, &accept),
     };
     record.status = Some(response.status().as_u16());
     lock(&inner.requests).push(record);
     Ok(response)
+}
+
+/// Answers a request: an exec is upgraded (or refused), anything else answered at once.
+fn serve(
+    inner: &Arc<Inner>,
+    req: Request<Incoming>,
+    upgrade: bool,
+    route: &Route,
+    verb: Verb,
+    query: &Query,
+    accept: &str,
+) -> Response<Body> {
+    match route {
+        Route::Subresource {
+            gvr,
+            namespace: Some(ns),
+            name,
+            subresource,
+        } if *gvr == Gvr::core("pods") && subresource == "exec" => {
+            execs::open_exec(inner, req, upgrade, ns, name, query)
+        }
+        _ => respond(inner, req.method(), route, verb, query, accept),
+    }
 }
 
 /// A JSON response in the server's time.
@@ -888,6 +930,9 @@ fn start_watch(
 
 #[path = "server_pods.rs"]
 mod pods;
+
+#[path = "server_exec.rs"]
+mod execs;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

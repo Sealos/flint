@@ -1,6 +1,6 @@
 //! flint-core against the fake API server: discovery, Table lists and watches, the relist after
-//! a 410, 403s, and log sessions on streaming logs through pod churn. No cluster needed; these
-//! run in plain `cargo test`.
+//! a 410, 403s, log sessions on streaming logs through pod churn, and exec sessions over the
+//! fake's WebSocket. No cluster needed; these run in plain `cargo test`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -9,12 +9,13 @@ use std::time::Duration;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::read::{self, ListQuery};
 use flint_core::{
-    KindId, KindSnapshot, LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet,
-    Settings, Subscription, SyncState, WatchMode, WatchTiming, WorkloadKind, WorkloadTarget,
-    cluster, table,
+    ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, KindId, KindSnapshot,
+    LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet, Settings, Subscription,
+    SyncState, TerminalSize, WatchMode, WatchTiming, WorkloadKind, WorkloadTarget, cluster, table,
 };
 use flint_e2e::fake_api::{
-    CONTEXT, ContainerLog, FakeApiServer, FakePod, Fault, Gvr, Options, Verb, WatchStep,
+    CONTEXT, ContainerLog, ExecEnd, FakeApiServer, FakePod, Fault, Gvr, Options, TtySize, Verb,
+    WatchStep,
 };
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -890,4 +891,310 @@ async fn a_workload_log_follows_its_pods_through_churn() {
         1,
         "{texts:?}"
     );
+}
+
+async fn until_exec(
+    session: &mut ExecSession,
+    what: &str,
+    pred: impl Fn(&ExecSnapshot) -> bool,
+) -> Arc<ExecSnapshot> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let snap = session.latest();
+            if pred(&snap) {
+                return snap;
+            }
+            assert!(session.changed().await, "exec session stopped");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let snap = session.peek();
+        panic!(
+            "{what}: never reached, last state {:?}\n{}",
+            snap.state,
+            snap.terminal.text()
+        )
+    })
+}
+
+fn has_line(snap: &ExecSnapshot, line: &str) -> bool {
+    (0..snap.terminal.size.rows).any(|r| snap.terminal.row_text(r).trim_end() == line)
+}
+
+fn running(command: &str) -> ExecState {
+    ExecState::Running {
+        command: vec![command.to_owned()],
+    }
+}
+
+/// The pod of the fixtures' web deployment: nginx, which has bash.
+const WEB: &str = "web-69c6f74b8b-qv4xv";
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_gets_a_bash_prompt_echoes_typing_and_resizes() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let request = ExecRequest::shell(CONTEXT, "demo", WEB).size(TerminalSize::new(90, 20));
+    let mut shell = core.handle.exec(request);
+    let prompt = format!("root@{WEB}:/#");
+    until_exec(&mut shell, "the bash prompt", |s| {
+        s.state == running("bash") && has_line(s, &prompt)
+    })
+    .await;
+    let fake = server.last_exec().unwrap();
+    assert_eq!(fake.command(), ["bash"]);
+    assert!(fake.tty());
+    // The terminal's size goes to the TTY before anything the test does.
+    fake.wait_for_resizes(1, WAIT).await.unwrap();
+    assert_eq!(
+        fake.resizes()[0],
+        TtySize {
+            width: 90,
+            height: 20
+        }
+    );
+
+    // Enter is a carriage return; the echo and the output reach the screen.
+    shell.write(b"echo hi\r".to_vec());
+    fake.wait_for_stdin(b"echo hi\r", WAIT).await.unwrap();
+    until_exec(&mut shell, "the echo", |s| {
+        has_line(s, &format!("{prompt} echo hi")) && has_line(s, "hi")
+    })
+    .await;
+
+    shell.resize(TerminalSize::new(100, 30));
+    fake.wait_for_resizes(2, WAIT).await.unwrap();
+    assert_eq!(
+        fake.resizes()[1],
+        TtySize {
+            width: 100,
+            height: 30
+        }
+    );
+    shell.write(b"stty size\r".to_vec());
+    until_exec(&mut shell, "the new size", |s| has_line(s, "30 100")).await;
+
+    // bash turned bracketed paste on, so a paste arrives bracketed; Ctrl-C drops the line.
+    shell.paste("echo a\necho b");
+    fake.wait_for_stdin(b"\x1b[200~echo a\necho b\x1b[201~", WAIT)
+        .await
+        .unwrap();
+    shell.write(vec![0x03]);
+    fake.wait_for_stdin(b"\x1b[201~\x03", WAIT).await.unwrap();
+    // Output the test pushes shows too.
+    assert!(fake.print("\r\npushed by the test\r\n"));
+    until_exec(&mut shell, "pushed output", |s| {
+        has_line(s, "pushed by the test")
+    })
+    .await;
+    assert_eq!(server.exec_requests().len(), 1);
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_without_bash_falls_back_to_sh() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let mut shell = core.handle.exec(ExecRequest::shell(
+        CONTEXT,
+        "demo",
+        "podinfo-c6497595d-b8chj",
+    ));
+    until_exec(&mut shell, "sh to start", |s| {
+        s.state == running("/bin/sh") && has_line(s, "~ $")
+    })
+    .await;
+    let commands: Vec<Vec<String>> = server
+        .exec_requests()
+        .iter()
+        .map(|r| r.parsed_query().command)
+        .collect();
+    assert_eq!(commands, [["bash"], ["/bin/sh"]]);
+    let sessions = server.exec_sessions();
+    assert!(matches!(
+        sessions[0].wait_for_end(WAIT).await.unwrap(),
+        ExecEnd::Failed(_)
+    ));
+    // busybox asked where the cursor is, and the terminal answered.
+    sessions[1]
+        .wait_for_stdin(b"\x1b[1;5R", WAIT)
+        .await
+        .unwrap();
+    shell.write(b"echo from-sh\r".to_vec());
+    until_exec(&mut shell, "the echo", |s| has_line(s, "from-sh")).await;
+    assert_eq!(server.open_exec_sessions(), 1);
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_codes_end_the_session_and_keep_the_screen() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
+    server.wait_for_exec_sessions(1, WAIT).await.unwrap();
+    shell.write(b"echo bye\r".to_vec());
+    until_exec(&mut shell, "the echo", |s| has_line(s, "bye")).await;
+    shell.write(b"exit 3\r".to_vec());
+    let snap = until_exec(&mut shell, "the exit", |s| s.state.is_finished()).await;
+    assert_eq!(snap.state, ExecState::Exited { code: Some(3) });
+    assert!(has_line(&snap, "bye") && has_line(&snap, "exit"));
+    let fake = server.last_exec().unwrap();
+    assert_eq!(fake.wait_for_end(WAIT).await.unwrap(), ExecEnd::Exited(3));
+    server.wait_for_exec_sessions(0, WAIT).await.unwrap();
+    // Typing after the exit goes nowhere. The paste is answered after the write was handled
+    // (inputs are handled in order), and says no program takes input any more: that is the
+    // check that can fail. The screen and stdin checks below only document the outcome (Flint
+    // doesn't echo locally, and the fake has closed the session).
+    shell.write(b"echo late\r".to_vec());
+    assert!(!shell.paste_if_bracketed("x").await);
+    let snap = shell.latest();
+    assert!(
+        !snap.terminal.text().contains("late"),
+        "{}",
+        snap.terminal.text()
+    );
+    assert!(!String::from_utf8_lossy(&fake.stdin()).contains("late"));
+
+    // Ctrl-D on an empty line ends bash with the last status.
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
+    shell.write(vec![0x04]);
+    let snap = until_exec(&mut shell, "the exit", |s| s.state.is_finished()).await;
+    assert_eq!(snap.state, ExecState::Exited { code: Some(0) });
+    assert!(server.last_exec_stdin().ends_with(&[0x04]));
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_connection_fails_the_session() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
+    server.wait_for_exec_sessions(1, WAIT).await.unwrap();
+    // Flint shows Running before it sends the first resize; break the connection after it, so
+    // the resize does not fail on a connection already gone.
+    let fake = server.last_exec().unwrap();
+    fake.wait_for_resizes(1, WAIT).await.unwrap();
+    assert_eq!(server.drop_exec_sessions(), 1);
+    let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+    match &snap.state {
+        ExecState::Failed(failure) => {
+            assert_eq!(failure.kind, ExecFailureKind::Connection, "{failure}");
+            assert!(failure.contains("the exec connection broke"), "{failure}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A clean close without a status is an exit with no code.
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
+    server.wait_for_exec_sessions(1, WAIT).await.unwrap();
+    // As above: closed before the first resize, the resize's failure would win.
+    let fake = server.last_exec().unwrap();
+    fake.wait_for_resizes(1, WAIT).await.unwrap();
+    assert!(fake.close());
+    let snap = until_exec(&mut shell, "the end", |s| s.state.is_finished()).await;
+    assert_eq!(snap.state, ExecState::Exited { code: None });
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_upgrades_and_rbac_fail_with_their_cause() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.inject(Fault::refuse_upgrade().times(1));
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+    match &snap.state {
+        ExecState::Failed(failure) => {
+            assert_eq!(failure.kind, ExecFailureKind::Upgrade, "{failure}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Only one request: a refused upgrade is not a missing shell.
+    assert_eq!(server.exec_requests().len(), 1);
+    assert!(server.exec_sessions().is_empty());
+
+    server.inject(
+        Fault::forbidden()
+            .on(&Gvr::core("pods"))
+            .subresource("exec")
+            .times(1),
+    );
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+    match &snap.state {
+        ExecState::Failed(failure) => {
+            assert_eq!(failure.kind, ExecFailureKind::Server, "{failure}");
+            assert!(
+                failure.contains("cannot get resource \"pods/exec\""),
+                "{failure}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_that_strips_the_upgrade_is_an_upgrade_failure() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.inject(Fault::strip_upgrade().times(1));
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+    match &snap.state {
+        ExecState::Failed(failure) => {
+            assert_eq!(failure.kind, ExecFailureKind::Upgrade, "{failure}");
+            assert!(failure.contains("Upgrade request required"), "{failure}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(server.exec_requests().len(), 1);
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_container_fails_with_the_kubelets_reason_before_or_after_the_upgrade() {
+    for kubelet_websockets in [true, false] {
+        let server = FakeApiServer::start_with(Options {
+            kubelet_websockets,
+            ..Options::default()
+        })
+        .await
+        .unwrap();
+        let core = Core::start(&server, Some("demo")).await;
+        let mut shell = core
+            .handle
+            .exec(ExecRequest::shell(CONTEXT, "demo", "fixture-job-qd9jf"));
+        let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+        match &snap.state {
+            // After the upgrade, the status says why.
+            ExecState::Failed(failure) if !kubelet_websockets => {
+                assert_eq!(failure.kind, ExecFailureKind::Server, "{failure}");
+                assert!(
+                    failure.contains("container not found (\"job\")"),
+                    "{failure}"
+                );
+            }
+            // Before it, the kubelet's reason is plain text, which kube wraps as an unparsed
+            // body and Flint shows as a bare 500 (`ClusterError::Http`), dropping the reason.
+            // This pins today's behaviour; reported on #168.
+            ExecState::Failed(failure) => {
+                assert_eq!(failure.kind, ExecFailureKind::Other, "{failure}");
+                assert!(failure.contains("500"), "{failure}");
+            }
+            other => panic!("{kubelet_websockets}: {other:?}"),
+        }
+        // Not a missing shell: `/bin/sh` is not tried.
+        assert_eq!(server.exec_requests().len(), 1, "{kubelet_websockets}");
+        assert_eq!(
+            server.exec_sessions().len(),
+            usize::from(!kubelet_websockets)
+        );
+    }
 }

@@ -182,6 +182,16 @@ pub struct Query {
     pub since_time: Option<String>,
     /// `limitBytes` of a log request.
     pub limit_bytes: Option<i64>,
+    /// The `command` parameters of an exec request, in order: the executable and its arguments.
+    pub command: Vec<String>,
+    /// `stdin` of an exec request.
+    pub stdin: bool,
+    /// `stdout` of an exec request.
+    pub stdout: bool,
+    /// `stderr` of an exec request.
+    pub stderr: bool,
+    /// `tty` of an exec request.
+    pub tty: bool,
 }
 
 impl Query {
@@ -210,6 +220,11 @@ impl Query {
                 "sinceSeconds" => q.since_seconds = value.parse().ok(),
                 "sinceTime" => q.since_time = Some(value).filter(|v| !v.is_empty()),
                 "limitBytes" => q.limit_bytes = value.parse().ok(),
+                "command" => q.command.push(value),
+                "stdin" => q.stdin = truthy,
+                "stdout" => q.stdout = truthy,
+                "stderr" => q.stderr = truthy,
+                "tty" => q.tty = truthy,
                 _ => {}
             }
         }
@@ -351,6 +366,11 @@ mod tests {
         assert_eq!(log.since_seconds, Some(30));
         assert_eq!(log.since_time.as_deref(), Some("2026-01-01T00:00:00Z"));
         assert_eq!(log.limit_bytes, Some(10));
+        let exec = Query::parse(Some(
+            "command=sh&command=-c&command=echo+%22a+b%22&stdin=true&stdout=true&tty=true",
+        ));
+        assert_eq!(exec.command, ["sh", "-c", "echo \"a b\""]);
+        assert!(exec.stdin && exec.stdout && exec.tty && !exec.stderr);
         assert_eq!(Query::parse(None), Query::default());
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
