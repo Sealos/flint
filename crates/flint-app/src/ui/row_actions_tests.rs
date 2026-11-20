@@ -383,6 +383,28 @@ fn click_entry(cx: &mut TestAppContext, t: &TestWorkspace, ix: usize) {
     draw(cx, t);
 }
 
+/// The open submenu's entries, after its "Container" label.
+fn submenu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        let sub = window.within("submenu");
+        (1usize..)
+            .map_while(|ix| sub.try_find(ix))
+            .map(|item| item.label().unwrap_or_default().to_owned())
+            .collect()
+    })
+    .unwrap()
+}
+
+/// Clicks the open submenu's entry `ix` (1 is the first container).
+fn click_submenu(cx: &mut TestAppContext, t: &TestWorkspace, ix: usize) {
+    cx.update_window(t.window, |_, window, cx| {
+        window.within("submenu").click(ix, cx)
+    })
+    .unwrap();
+    draw(cx, t);
+}
+
 /// The dock: its tabs' titles, left to right, and the active one's position.
 fn dock_tabs(cx: &mut TestAppContext, t: &TestWorkspace) -> (Vec<String>, Option<usize>) {
     t.workspace.read_with(cx, |ws, cx| {
@@ -447,10 +469,13 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     show_fetched(cx, &t, pod_detail("web"));
     assert_eq!(dock_tabs(cx, &t), (vec!["web · app".to_owned()], Some(0)));
 
-    // Loaded: Previous Logs applies (app restarted), Shell picks a container.
+    // Loaded, with two containers: each entry picks one, the default marked. Previous Logs
+    // lists the one that restarted.
     right_click(cx, &t, "web").await;
     assert_eq!(menu(cx, &t), ["Logs", "Previous Logs", "Shell"]);
     click_entry(cx, &t, 1);
+    assert_eq!(submenu(cx, &t), ["app (default)"]);
+    click_submenu(cx, &t, 1);
     assert_eq!(
         dock_tabs(cx, &t),
         (
@@ -460,33 +485,84 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     );
     right_click(cx, &t, "web").await;
     click_entry(cx, &t, 2);
-    let containers: Vec<String> = cx
-        .update_window(t.window, |_, window, _| {
-            let sub = window.within("submenu");
-            (1usize..)
-                .map_while(|ix| sub.try_find(ix))
-                .map(|item| item.label().unwrap_or_default().to_owned())
-                .collect()
-        })
-        .unwrap();
-    assert_eq!(containers, ["app", "sidecar"]);
-    cx.update_window(t.window, |_, window, cx| {
-        window.within("submenu").click(2usize, cx)
-    })
-    .unwrap();
-    draw(cx, &t);
+    assert_eq!(submenu(cx, &t), ["app (default)", "sidecar"]);
+    click_submenu(cx, &t, 2);
     assert_eq!(dock_tabs(cx, &t).0[2], "Shell: web · sidecar");
 
     // Logs again from the menu shows the open tab, not a second one; so does Previous Logs
     // (Shift-Cmd-L) from the list.
     right_click(cx, &t, "web").await;
     click_entry(cx, &t, 0);
+    assert_eq!(submenu(cx, &t), ["app (default)", "sidecar"]);
+    click_submenu(cx, &t, 1);
     assert_eq!(dock_tabs(cx, &t).1, Some(0));
     assert_eq!(dock_tabs(cx, &t).0.len(), 3);
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-l");
     let (titles, active) = dock_tabs(cx, &t);
     assert_eq!((titles.len(), active), (3, Some(1)));
+}
+
+// covers UP-47, UP-40, UP-41: on a pod with several containers the menu picks one, the default
+// marked, while the keys open the default container at once: the one the
+// `kubectl.kubernetes.io/default-container` annotation names, here the second.
+#[gpui_kit::test]
+async fn keys_open_the_default_container_and_the_menu_picks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {
+                "name": "web", "namespace": "demo", "uid": "uid-web",
+                "annotations": {"kubectl.kubernetes.io/default-container": "sidecar"}
+            },
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 2, "lastState": {"terminated": {"exitCode": 1}}},
+                {"name": "sidecar", "restartCount": 0}
+            ]}
+        })),
+    );
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-l");
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-e");
+    assert_eq!(
+        dock_tabs(cx, &t).0,
+        ["web · sidecar", "Shell: web · sidecar"]
+    );
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 0);
+    assert_eq!(submenu(cx, &t), ["app", "sidecar (default)"]);
+    click_submenu(cx, &t, 1);
+    assert_eq!(dock_tabs(cx, &t).0[2], "web · app");
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 2);
+    assert_eq!(submenu(cx, &t), ["app", "sidecar (default)"]);
+    click_submenu(cx, &t, 1);
+    assert_eq!(dock_tabs(cx, &t).0[3], "Shell: web · app");
+    // The default container never restarted: the key says so, while the menu offers the one
+    // that did.
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-l");
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some(
+            "Can't open the previous logs: container sidecar has not restarted, so it has no \
+             previous logs."
+        )
+    );
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 1);
+    assert_eq!(submenu(cx, &t), ["app"]);
+    click_submenu(cx, &t, 1);
+    assert_eq!(dock_tabs(cx, &t).0[4], "web · app (previous)");
 }
 
 // covers UP-47, UP-40: keys and the registry act on the selected row too; an entry that does
@@ -559,7 +635,11 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     assert_eq!(refusal(cx, &t), None);
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-l");
-    assert_eq!(refusal(cx, &t).as_deref(), Some(why));
+    // The strip names what was refused, then why, as a sentence.
+    assert_eq!(
+        refusal(cx, &t),
+        Some(format!("Can't open the previous logs: {why}."))
+    );
     assert_eq!(dock_tabs(cx, &t).0.len(), 2);
 }
 
@@ -784,7 +864,7 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
     assert_eq!(dock_tabs(cx, &t).0.len(), 2);
     assert_eq!(
         refusal(cx, &t).as_deref(),
-        Some("pod web-c has no app container proxy")
+        Some("Can't open a shell: pod web-c has no app container proxy.")
     );
 }
 
@@ -865,7 +945,7 @@ async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
     pods.answer(cx, &t, Err("pods is forbidden".into()));
     assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new(), "not into web-a");
     let why = "the pods of Deployment web could not be listed: pods is forbidden";
-    assert_eq!(refusal(cx, &t).as_deref(), Some(why));
+    assert_eq!(refusal(cx, &t), Some(format!("Can't open a shell: {why}.")));
     assert_eq!(actions(cx, &t), [available("Logs"), available("Shell")]);
     assert_eq!(shell_button_disabled(cx, &t), Some(false));
 }
@@ -1006,6 +1086,7 @@ async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
     assert_eq!(selected.as_deref(), Some("web"));
     show_fetched(cx, &t, pod_detail("web"));
     click_entry(cx, &t, 0);
+    click_submenu(cx, &t, 1);
     assert_eq!(dock_tabs(cx, &t).0, ["web · app"]);
 }
 
@@ -1054,7 +1135,7 @@ async fn a_late_action_keeps_focus_and_gives_up_in_time(cx: &mut TestAppContext)
     draw(cx, &t);
     assert_eq!(
         refusal(cx, &t).as_deref(),
-        Some("Shell: gave up waiting for web to load (30 s)")
+        Some("Can't open a shell: gave up waiting for web to load (30 s).")
     );
     let state = app_state(cx, &t).detail.unwrap();
     assert!(state.banners.iter().all(|b| b.id != "detail-pending"));
@@ -1081,7 +1162,7 @@ async fn a_pending_action_on_a_failed_fetch_says_why(cx: &mut TestAppContext) {
     draw(cx, &t);
     assert_eq!(
         refusal(cx, &t).as_deref(),
-        Some("the pod could not be fetched: the server is unavailable")
+        Some("Can't open a shell: the pod could not be fetched: the server is unavailable.")
     );
 }
 
@@ -1142,13 +1223,35 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     draw(cx, &t);
     show_fetched(cx, &t, pod_detail("web"));
     assert_eq!(dispatch(cx, &t, "detail::OpenShell", Value::Null), Ok(()));
-    t.model.update(cx, |model, cx| {
-        for cluster in &mut model.clusters {
-            cluster.state = ConnectionState::Failed(SafeErrorText::reduced("connection refused"));
-        }
-        cx.notify();
-    });
-    draw(cx, &t);
+    // Disconnected, the list and the pane stay: the pane's buttons are disabled, saying why
+    // without hovering.
+    let set_state = |cx: &mut TestAppContext, state: ConnectionState| {
+        t.model.update(cx, |model, cx| {
+            for cluster in &mut model.clusters {
+                cluster.state = state.clone();
+            }
+            cx.notify();
+        });
+        draw(cx, &t);
+    };
+    set_state(cx, ConnectionState::Disconnected);
+    assert_eq!(logs_button_disabled(cx, &t), Some(true));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(
+        captions(cx, &t),
+        ["Can't open the logs or a shell: alpha is not connected."]
+    );
+    set_state(
+        cx,
+        ConnectionState::Failed(SafeErrorText::reduced("connection refused")),
+    );
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    assert_eq!(
+        detail_view.read_with(cx, |d, _| d.action_captions()),
+        ["Can't open the logs or a shell: alpha is not connected: connection refused."]
+    );
     for action in [
         "detail::OpenLogs",
         "detail::OpenPreviousLogs",
@@ -1210,7 +1313,10 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     })
     .unwrap();
     let why = refusal(cx, &t).unwrap();
-    assert!(why.starts_with("Shell: alpha is not connected"), "{why}");
+    assert!(
+        why.starts_with("Can't open a shell: alpha is not connected"),
+        "{why}"
+    );
 }
 
 // covers UP-42, UP-47: a log tab opened from a row's menu frees everything once the tab closes
@@ -1475,6 +1581,254 @@ async fn a_refusal_goes_when_it_no_longer_applies(cx: &mut TestAppContext) {
     assert_eq!(refusal(cx, &t), None, "another list");
 }
 
+/// Whether the detail pane's Logs button is drawn disabled (`None`: not drawn).
+fn logs_button_disabled(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<bool> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .try_find("detail-logs")
+            .map(|b| b.disabled() == Some(true))
+    })
+    .unwrap()
+}
+
+/// The captions under the detail pane's buttons, as drawn.
+fn captions(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .map(|t| t.text().to_owned())
+            .filter(|t| t.starts_with("Can't"))
+            .collect()
+    })
+    .unwrap()
+}
+
+// covers UP-47: the pane says why Logs or Shell cannot open in a caption under its buttons, not
+// only in their tooltips; Logs stays, disabled, when the pod could not be fetched.
+#[gpui_kit::test]
+async fn the_pane_says_why_under_its_buttons(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let lister = FakePods::install(cx);
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    // Loading: both wait, so both are enabled and nothing is said.
+    show_loading(cx, &t);
+    assert_eq!(logs_button_disabled(cx, &t), Some(false));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+    // The fetch failed: both are disabled, the reason said once.
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    detail_view.update(cx, |d, cx| d.show_failed("Forbidden: no".into(), cx));
+    assert_eq!(logs_button_disabled(cx, &t), Some(true));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    // The body says what the server said; the caption does not repeat it.
+    assert_eq!(
+        captions(cx, &t),
+        ["Can't open the logs or a shell until the pod is fetched."]
+    );
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(logs_button_disabled(cx, &t), Some(false));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+
+    // A Deployment with no ready pod: Shell alone.
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let_pods_list(cx, &t);
+    lister.answer(cx, &t, Ok(vec![workload_pod("web-a", false, &["app"])]));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(
+        captions(cx, &t),
+        ["Can't open a shell: no pod of Deployment web is ready."]
+    );
+}
+
+// covers UP-47: a deleted pod's Shell is disabled, but the caption leaves the "deleted" to the
+// pane's notice instead of saying it again.
+#[gpui_kit::test]
+async fn a_deleted_pod_gets_no_caption(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(cx, &t, pod_detail("web"));
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    detail_view.update(cx, |d, cx| d.mark_gone(cx));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+}
+
+// covers UP-47, UP-40, UP-41: on a multi-container pod each picker shows the key of the action
+// on its default container's entry, so the keys stay visible; the pane's picker marks the
+// default and its tooltip names what the key opens. A container that is not running is listed
+// disabled in the Shell picker, and a native sidecar is an app container.
+#[gpui_kit::test]
+async fn pickers_show_the_keys_and_which_containers_run(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {
+                "initContainers": [{"name": "mesh", "restartPolicy": "Always"}],
+                "containers": [{"name": "app"}, {"name": "worker"}]
+            },
+            "status": {
+                "initContainerStatuses": [{"name": "mesh", "state": {"running": {}}}],
+                "containerStatuses": [
+                    {"name": "app", "state": {"running": {}}},
+                    {"name": "worker", "restartCount": 4,
+                     "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+                ]
+            }
+        })),
+    );
+    // The pane's Logs picker: the default marked, the tooltip naming what Cmd-L opens.
+    let tooltip = t.description(cx, "detail-logs");
+    let keys = registry::key_hint("secondary-l");
+    assert_eq!(
+        tooltip.as_deref(),
+        Some(format!("Choose a container ({keys} opens app, the default)").as_str())
+    );
+    cx.update_window(t.window, |_, window, cx| window.click("detail-logs", cx))
+        .unwrap();
+    let entries: Vec<String> = menu(cx, &t).into_iter().filter(|e| !e.is_empty()).collect();
+    assert_eq!(
+        entries,
+        [
+            "Container",
+            "mesh",
+            "app (default)",
+            "worker",
+            "Previous instance",
+            "worker"
+        ]
+    );
+    press(cx, &t, "escape");
+
+    // The row's Shell picker: the sidecar is offered, the crash-looping one disabled; the
+    // default's entry shows Shift-Cmd-E.
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 2);
+    assert_eq!(
+        submenu(cx, &t),
+        ["mesh", "app (default)", "worker (not running)"]
+    );
+    let shown_keys = cx
+        .update_window(t.window, |_, window, _| {
+            gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .map(|t| t.text().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    let shell_keys = gpui_kit::component::kbd::Kbd::format(
+        &gpui_kit::Keystroke::parse(if cfg!(target_os = "macos") {
+            "cmd-shift-e"
+        } else {
+            "ctrl-shift-e"
+        })
+        .unwrap(),
+    );
+    assert!(
+        shown_keys.contains(&shell_keys),
+        "{shell_keys} in {shown_keys:?}"
+    );
+    // The disabled one does nothing.
+    click_submenu(cx, &t, 3);
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
+}
+
+// covers UP-41, UP-47: when the default container is not running, Shift-Cmd-E refuses with the
+// reason its "(default, not running)" entry shows, while the picker still offers the others.
+#[gpui_kit::test]
+async fn the_key_refuses_a_default_container_that_is_not_running(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "state": {"waiting": {"reason": "CrashLoopBackOff"}}},
+                {"name": "sidecar", "state": {"running": {}}}
+            ]}
+        })),
+    );
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-e");
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new(), "no doomed shell");
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some("Can't open a shell: container app is not running.")
+    );
+    // The pane's Shell is still a picker, and says nothing against it.
+    assert_eq!(shell_button_disabled(cx, &t), Some(false));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 3); // After Logs, Previous Logs and its reason.
+    assert_eq!(submenu(cx, &t), ["app (default, not running)", "sidecar"]);
+    click_submenu(cx, &t, 2);
+    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web · sidecar"]);
+}
+
+// covers UP-47: the strip that says why takes a row of its own under the list and the pane,
+// above the dock, so it covers none of them, and stays one line high however long the reason
+// is (the whole sentence is in its tooltip).
+#[gpui_kit::test]
+async fn the_refusal_strip_covers_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(cx, &t, pod_detail("web"));
+    // A dock tab, so the dock shows below the strip.
+    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
+    draw(cx, &t);
+    let strip = |cx: &mut TestAppContext, why: String| {
+        let workspace = t.workspace.clone();
+        workspace.update(cx, |ws, cx| ws.refuse(why, cx));
+        draw(cx, &t);
+        cx.update_window(t.window, |_, window, _| {
+            let bounds = |id: &'static str| window.find(id).bounds();
+            (
+                bounds("action-error"),
+                bounds("detail"),
+                bounds("row-uid-web"),
+                bounds("dock-pane"),
+            )
+        })
+        .unwrap()
+    };
+    let (short, detail, row, dock) = strip(cx, "Can't open a shell: no.".into());
+    assert!(short.top() >= detail.bottom(), "{short:?} under {detail:?}");
+    assert!(short.top() >= row.bottom(), "{short:?} under {row:?}");
+    assert!(short.bottom() <= dock.top(), "{short:?} over {dock:?}");
+    let long = format!("Can't open a shell: {}.", "a long reason ".repeat(60));
+    let (long, ..) = strip(cx, long);
+    assert_eq!(long.size.height, short.size.height, "one line");
+}
+
 // covers UP-47, UP-41: a tab that opens late while the user types in a dock tab opens behind
 // it: the tab in use stays shown and keeps focus, so keys are not lost to a hidden tab.
 #[gpui_kit::test]
@@ -1592,6 +1946,6 @@ async fn a_refused_entry_says_why_in_words(cx: &mut TestAppContext) {
     });
     assert_eq!(
         why,
-        "Open Shell: alpha is not connected: connection refused"
+        "Can't open a shell: alpha is not connected: connection refused."
     );
 }

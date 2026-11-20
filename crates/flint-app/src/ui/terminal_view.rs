@@ -45,7 +45,7 @@ use super::dock::{DockItem, TabKey, TabStatus, cluster_chip};
 use super::dock_model;
 use super::log_model::Tone;
 use super::log_view::Note;
-use super::notice::{notice, notice_with};
+use super::notice::{notice, notice_detail, notice_with};
 use super::registry::{self, CopyText, PasteText, RestartShell, ScrollToBottom};
 use super::terminal_keys::{self, ALT_IS_META};
 use super::terminal_model::{
@@ -566,6 +566,17 @@ impl TerminalView {
     /// The strips under the toolbar: why the command ended, and the last copy.
     fn render_notes(&self, theme: &Theme) -> Vec<AnyElement> {
         let mut notes = Vec::new();
+        let restart = || {
+            Button::new("terminal-restart")
+                .xsmall()
+                .label("Restart shell")
+                .tab_stop(false)
+                .tooltip(format!(
+                    "Start a new shell in a tab beside this one ({})",
+                    registry::key_hint(registry::RESTART_SHELL[0])
+                ))
+                .on_click(registry::on_click(RestartShell))
+        };
         let ended = match &self.snapshot.state {
             _ if self.ended.is_some() => self.ended.clone().map(|why| (theme.warning, why)),
             flint_core::ExecState::Exited { code } => Some((
@@ -579,23 +590,28 @@ impl TerminalView {
                         .to_owned(),
                 },
             )),
-            flint_core::ExecState::Failed(reason) => {
-                Some((theme.danger, format!("The shell could not run: {reason}")))
+            flint_core::ExecState::Failed(failure) => {
+                // The plain words, then what was said, in full: said once, here.
+                let (headline, detail) = terminal_model::failure_words(failure);
+                notes.push(
+                    notice_detail(
+                        "terminal-ended",
+                        headline,
+                        format!("Details: {detail}"),
+                        theme.danger,
+                        theme.muted_foreground,
+                        restart(),
+                    )
+                    .test_support()
+                    .into_any_element(),
+                );
+                None
             }
             _ => None,
         };
         if let Some((color, text)) = ended {
-            let restart = Button::new("terminal-restart")
-                .xsmall()
-                .label("Restart shell")
-                .tab_stop(false)
-                .tooltip(format!(
-                    "Start a new shell in a tab beside this one ({})",
-                    registry::key_hint(registry::RESTART_SHELL[0])
-                ))
-                .on_click(registry::on_click(RestartShell));
             notes.push(
-                notice_with("terminal-ended", text, color, restart)
+                notice_with("terminal-ended", text, color, restart())
                     .test_support()
                     .into_any_element(),
             );

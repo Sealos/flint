@@ -28,13 +28,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::clusters::{ClustersModel, Presence, state_label};
-use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, TakeFocus};
+use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, refused};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
 use super::dock_model::TabCluster;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
-use super::notice::notice;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
     RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
@@ -448,7 +447,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(reason) = self.sessions_blocked(&request.cluster, cx) {
-            self.refuse(format!("Logs: {reason}"), cx);
+            let opening = if request.previous {
+                Opening::PreviousLogs
+            } else {
+                Opening::Logs
+            };
+            self.refuse(refused(opening, &reason), cx);
             return;
         }
         let core = self.model.read(cx).core().clone();
@@ -498,12 +502,12 @@ impl Workspace {
         let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
             return;
         };
-        let what = match &key {
-            TabKey::Logs(_) => "Logs",
-            TabKey::Shell(_) => "Shell",
+        let opening = match &key {
+            TabKey::Logs(_) => Opening::ReconnectLogs,
+            TabKey::Shell(_) => Opening::RestartShell,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
-            self.refuse(format!("{what}: {reason}"), cx);
+            self.refuse(refused(opening, &reason), cx);
             return;
         }
         self.clear_action_error(cx);
@@ -565,7 +569,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(reason) = self.sessions_blocked(&request.cluster, cx) {
-            self.refuse(format!("Shell: {reason}"), cx);
+            self.refuse(refused(Opening::Shell, &reason), cx);
             return;
         }
         let core = self.model.read(cx).core().clone();
@@ -618,10 +622,22 @@ impl Workspace {
         });
     }
 
+    /// Tells the detail pane whether sessions can open on its object's cluster, so its Logs and
+    /// Shell are disabled, saying why, while the cluster is not connected.
+    fn tell_detail_sessions_blocked(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        let cluster = detail.read(cx).object().cluster.clone();
+        let why = self.sessions_blocked(&cluster, cx);
+        detail.update(cx, |d, cx| d.set_sessions_blocked(why, cx));
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.check_dock_servers(cx);
+        self.tell_detail_sessions_blocked(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();
@@ -852,6 +868,7 @@ impl Workspace {
                         }),
                     ];
                 self.detail = Some(detail);
+                self.tell_detail_sessions_blocked(cx);
             }
             ListEvent::SelectedChanged => {
                 if let Some(detail) = &self.detail {
@@ -1870,7 +1887,7 @@ impl Render for Workspace {
                         cx,
                     )))
                     .when_some(self.action_error.clone(), |el, why| {
-                        el.child(notice("action-error", why, theme.danger))
+                        el.child(refusal_strip(why, theme))
                     })
                     .when(self.dock.read(cx).is_visible(), |el| {
                         el.child(
@@ -1902,6 +1919,40 @@ impl Render for Workspace {
                     }),
             )
     }
+}
+
+/// Why a Logs or Shell did not open: a row of its own between the main area and the dock, so
+/// it covers neither the list nor the pane (they give up its height while it shows), one line
+/// high whatever it says (the full sentence is in its tooltip), with a warning icon.
+fn refusal_strip(why: String, theme: &Theme) -> impl IntoElement {
+    let full: SharedString = why.clone().into();
+    h_flex()
+        .id("action-error")
+        .flex_none()
+        .w_full()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .text_xs()
+        .bg(theme.warning.opacity(0.1))
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            Icon::new(IconName::TriangleAlert)
+                .xsmall()
+                .flex_none()
+                .text_color(theme.warning),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme.foreground)
+                .child(why),
+        )
+        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        .test_support()
 }
 
 /// How long the reason a Logs or Shell did not open stays shown.

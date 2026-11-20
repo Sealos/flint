@@ -125,7 +125,12 @@ impl ClusterError {
     /// failures become [`ClusterError::Timeout`] or [`ClusterError::Transport`]. Other errors
     /// keep their full source chain, except auth plugin errors (see [`error_chain`]).
     pub fn kube(err: kube::Error) -> Self {
-        match ApiError::from_kube(&err) {
+        Self::kube_ref(&err)
+    }
+
+    /// [`ClusterError::kube`] without taking the error, for a caller that still reads it.
+    pub(crate) fn kube_ref(err: &kube::Error) -> Self {
+        match ApiError::from_kube(err) {
             Some(api) => match api.explanation() {
                 Some(message) => ClusterError::Api(message),
                 None => ClusterError::Http {
@@ -133,22 +138,22 @@ impl ClusterError {
                     server: None,
                 },
             },
-            None if is_exec_not_found(&err) => ClusterError::ExecPluginNotFound { command: None },
+            None if is_exec_not_found(err) => ClusterError::ExecPluginNotFound { command: None },
             // kube's own connection timeout: the server did not answer at all.
-            None if is_transport_timeout(&err) => ClusterError::Timeout {
+            None if is_transport_timeout(err) => ClusterError::Timeout {
                 after: None,
                 server: None,
                 exec_command: None,
             },
             // An auth provider's failure can hold a refused or reset connection of its own (a
             // token endpoint): it is not the API server's.
-            None if find_auth_error(&err).is_some() => ClusterError::Kube(error_chain(&err)),
-            None => match api_error::classify_transport(&err) {
+            None if find_auth_error(err).is_some() => ClusterError::Kube(error_chain(err)),
+            None => match api_error::classify_transport(err) {
                 Some(problem) => ClusterError::Transport {
                     problem,
                     server: None,
                 },
-                None => ClusterError::Kube(error_chain(&err)),
+                None => ClusterError::Kube(error_chain(err)),
             },
         }
     }
@@ -500,7 +505,9 @@ fn is_exec_not_found(err: &(dyn StdError + 'static)) -> bool {
 }
 
 /// The first auth error in `err`'s chain, if any.
-fn find_auth_error<'a>(err: &'a (dyn StdError + 'static)) -> Option<&'a kube::client::AuthError> {
+pub(crate) fn find_auth_error<'a>(
+    err: &'a (dyn StdError + 'static),
+) -> Option<&'a kube::client::AuthError> {
     let mut current = Some(err);
     while let Some(e) = current {
         if let Some(kube::Error::Auth(auth)) = e.downcast_ref::<kube::Error>() {

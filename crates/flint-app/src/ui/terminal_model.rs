@@ -4,7 +4,7 @@
 //! testable without a window; the view (`terminal_view.rs`) draws with them.
 
 use flint_core::terminal::{Cell, CellFlags, CursorShape, SelectionKind, Side, TerminalSize};
-use flint_core::{ClusterId, ExecRequest, ExecState};
+use flint_core::{ClusterId, ExecFailure, ExecFailureKind, ExecRequest, ExecState};
 
 use super::log_model::Tone;
 
@@ -245,8 +245,52 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
         ExecState::Exited { code: Some(0) } => (Tone::Muted, "Exited (code 0)".to_owned()),
         ExecState::Exited { code: Some(code) } => (Tone::Warning, format!("Exited (code {code})")),
         ExecState::Exited { code: None } => (Tone::Muted, "Exited".to_owned()),
-        ExecState::Failed(reason) => (Tone::Danger, format!("Failed: {reason}")),
+        // Why is said once, in the tab's banner ([`failure_words`]).
+        ExecState::Failed(_) => (Tone::Danger, "Failed".to_owned()),
         ExecState::Closed => (Tone::Muted, "Closed".to_owned()),
+    }
+}
+
+/// Why a shell could not run, in plain words, and what was said (by the server, the
+/// connection or Flint's client), as the detail: the tab's banner says both, once. Where the
+/// failure came from is typed ([`ExecFailureKind`]), so a local error (a missing auth plugin,
+/// an unreadable client certificate) is never worded as the pod's; only the server's own
+/// refusals are told apart by their words.
+pub fn failure_words(failure: &ExecFailure) -> (&'static str, String) {
+    let headline = match failure.kind {
+        ExecFailureKind::SignIn => "Flint couldn't sign in to the cluster.",
+        ExecFailureKind::Unreachable => "Flint couldn't reach the cluster.",
+        ExecFailureKind::Connection => "The connection to the shell broke.",
+        ExecFailureKind::MissingShell => "Neither bash nor sh is in this container.",
+        ExecFailureKind::Upgrade => {
+            "The connection to the cluster can't carry a shell (a proxy may be blocking \
+             WebSocket upgrades)."
+        }
+        ExecFailureKind::Other => "The shell could not start.",
+        ExecFailureKind::Server => server_words(&failure.message),
+    };
+    (headline, failure.message.trim().to_owned())
+}
+
+/// The plain words for an exec the API server refused or failed, from what it said.
+fn server_words(said: &str) -> &'static str {
+    let lower = said.to_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    if lower.starts_with("forbidden") || has("is forbidden") {
+        "You don't have permission to open a shell in this pod."
+    } else if has("container not found")
+        || has("not running")
+        || has("completed pod")
+        || has("is waiting to start")
+        || has("containercreating")
+    {
+        "The container is not running, so a shell can't start in it."
+    } else if has("executable file not found") || has("no such file or directory") {
+        "The command is not in this container."
+    } else if lower.starts_with("notfound") || has("not found") {
+        "The pod was not found, or the server can't open a shell in it."
+    } else {
+        "The shell could not start."
     }
 }
 
@@ -501,11 +545,96 @@ mod tests {
             state_text(&ExecState::Exited { code: Some(130) }),
             (Tone::Warning, "Exited (code 130)".into())
         );
+        // Why it failed is said once, in the banner, not again beside the state.
         assert_eq!(
-            state_text(&ExecState::Failed("pods \"x\" not found".into())),
-            (Tone::Danger, "Failed: pods \"x\" not found".into())
+            state_text(&ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::Server,
+                "pods \"x\" not found"
+            ))),
+            (Tone::Danger, "Failed".into())
         );
         assert_eq!(state_text(&ExecState::Closed).1, "Closed");
+    }
+
+    // covers UP-41: common exec failures read in plain words, the server's text kept as the
+    // detail.
+    #[test]
+    fn exec_failures_read_in_plain_words() {
+        let words = |kind, said: &str| failure_words(&ExecFailure::new(kind, said)).0;
+        let server = |said: &str| words(ExecFailureKind::Server, said);
+        assert_eq!(
+            server("Forbidden: pods \"web\" is forbidden: User \"jane\" cannot create pods/exec"),
+            "You don't have permission to open a shell in this pod."
+        );
+        assert_eq!(
+            server("NotFound: subresource exec is not recorded"),
+            "The pod was not found, or the server can't open a shell in it."
+        );
+        assert_eq!(
+            server("unable to upgrade connection: container not found (\"app\")"),
+            "The container is not running, so a shell can't start in it."
+        );
+        assert_eq!(
+            server(
+                "BadRequest: cannot exec into a container in a completed pod; current phase is Succeeded"
+            ),
+            "The container is not running, so a shell can't start in it."
+        );
+        assert_eq!(server("InternalError: boom"), "The shell could not start.");
+        // Local errors read as Flint's, whatever their words say: a missing auth plugin is
+        // "not found on PATH", a missing client certificate "No such file or directory".
+        assert_eq!(
+            words(
+                ExecFailureKind::SignIn,
+                "the exec plugin gke-gcloud-auth-plugin was not found on PATH"
+            ),
+            "Flint couldn't sign in to the cluster."
+        );
+        assert_eq!(
+            words(
+                ExecFailureKind::SignIn,
+                "No such file or directory (os error 2)"
+            ),
+            "Flint couldn't sign in to the cluster."
+        );
+        assert_eq!(
+            words(ExecFailureKind::Unreachable, "not connected"),
+            "Flint couldn't reach the cluster."
+        );
+        assert_eq!(
+            words(
+                ExecFailureKind::MissingShell,
+                "exec: \"/bin/sh\": stat /bin/sh: no such file or directory"
+            ),
+            "Neither bash nor sh is in this container."
+        );
+        assert_eq!(
+            words(
+                ExecFailureKind::Upgrade,
+                "failed to switch protocol: 200 OK"
+            ),
+            "The connection to the cluster can't carry a shell (a proxy may be blocking \
+             WebSocket upgrades)."
+        );
+        // A bare 404 (a proxy's page) names no cause: it is never worded as the pod's.
+        assert_eq!(
+            words(
+                ExecFailureKind::Other,
+                "the server answered 404 Not Found: is the server URL (and its path) right?"
+            ),
+            "The shell could not start."
+        );
+        assert_eq!(
+            words(
+                ExecFailureKind::Connection,
+                "the exec connection broke: reset"
+            ),
+            "The connection to the shell broke."
+        );
+        assert_eq!(
+            failure_words(&ExecFailure::new(ExecFailureKind::Server, " boom ")).1,
+            "boom"
+        );
     }
 
     fn blank(cell: &Cell, _: &u8) -> bool {

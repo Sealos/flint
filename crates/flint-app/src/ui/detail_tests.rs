@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use super::{DetailTab, DetailView, Fetch};
 use crate::ui::object::MASK;
 use crate::ui::registry::ActionError;
-use crate::ui::support_tests::{TestWorkspace, WAIT, objects, open_workspace, standard_sections};
+use crate::ui::support_tests::{
+    TestWorkspace, WAIT, entry, objects, open_workspace, standard_sections,
+};
 
 /// Shows `detail` as a fetch that succeeds does ([`DetailView::show_fetched`]).
 fn show_fetched(cx: &mut TestAppContext, t: &TestWorkspace, detail: ObjectDetail) {
@@ -112,6 +114,39 @@ async fn wait_for_failed_fetch(cx: &mut TestAppContext, t: &TestWorkspace) {
         matches!(&view.read(cx).fetch, Fetch::Failed(e) if e.contains("not connected"))
     })
     .await;
+}
+
+// covers UP-23, UP-47: a pane of a kind with neither logs nor a shell (a ConfigMap) draws no
+// Logs or Shell button and no caption, loading or failed.
+#[gpui_kit::test]
+async fn a_configmap_pane_has_no_logs_or_shell(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let mut sections = standard_sections();
+    sections[2]
+        .entries
+        .push(entry("", "configmaps", "ConfigMap", "Config Maps", true));
+    t.connect_alpha(cx, sections).await;
+    let kind = KindId::new("", "configmaps");
+    t.open_kind(
+        cx,
+        "configmaps",
+        objects(kind, &[("demo", "settings", 0)], SyncState::Synced, 1),
+    )
+    .await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "settings"}),
+    )
+    .unwrap();
+    t.wait_for_element(cx, "detail").await;
+    let none = |cx: &mut TestAppContext| {
+        ["detail-logs", "detail-shell", "detail-captions"].map(|id| t.find(cx, id).is_some())
+    };
+    assert_eq!(none(cx), [false; 3], "loading");
+    wait_for_failed_fetch(cx, &t).await;
+    assert_eq!(none(cx), [false; 3], "failed");
 }
 
 // covers UP-23: the pane shows the object's metadata, labels, owners, conditions and events,

@@ -131,10 +131,96 @@ pub enum ExecState {
     Running { command: Vec<String> },
     /// The command ended. `code` is its exit code when the API server reported one.
     Exited { code: Option<i32> },
-    /// The session could not start or broke off. A sentence safe to show.
-    Failed(String),
+    /// The session could not start or broke off: why, and where the failure came from.
+    Failed(ExecFailure),
     /// The front end closed the session.
     Closed,
+}
+
+/// Why a session failed: a sentence safe to show, and its [`ExecFailureKind`], so a front end
+/// can word it without guessing from the text. It reads as its message (`Deref<Target = str>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecFailure {
+    pub kind: ExecFailureKind,
+    pub message: String,
+}
+
+/// Where a session's failure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecFailureKind {
+    /// The API server, or the kubelet and container runtime behind it, refused or failed the
+    /// exec, and said why (RBAC, a pod or container not found or not running, a command that
+    /// failed to start).
+    Server,
+    /// Flint could not sign in to the cluster: the exec auth plugin is missing or failed, a
+    /// client certificate or key could not be read, the kubeconfig is invalid, or the server
+    /// answered 401. A local problem: the error never came from the pod.
+    SignIn,
+    /// Flint could not reach the API server: the cluster is not connected, or the connection
+    /// was refused, reset or timed out before the exec started.
+    Unreachable,
+    /// The exec connection broke after the command started.
+    Connection,
+    /// The connection to the cluster could not be upgraded to the WebSocket an exec needs: a
+    /// proxy answered the upgrade with a plain response, or dropped its headers.
+    Upgrade,
+    /// Neither shell Flint tries is in the container.
+    MissingShell,
+    /// Anything else: no cause Flint can name (the full text says what happened).
+    Other,
+}
+
+impl ExecFailure {
+    pub fn new(kind: ExecFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::ops::Deref for ExecFailure {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for ExecFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl ExecFailureKind {
+    /// Where an error starting the exec came from: from kube's error itself (an auth error
+    /// anywhere in its chain, a failed upgrade), then from what core made of it. Only the API
+    /// server's own `Status` is `Server`; a bare HTTP code is not the pod's.
+    fn of(err: &kube::Error, error: &ClusterError) -> Self {
+        use kube::client::UpgradeConnectionError as U;
+        match err {
+            kube::Error::UpgradeConnection(U::ProtocolSwitch(code)) if code.as_u16() == 401 => {
+                return ExecFailureKind::SignIn;
+            }
+            kube::Error::UpgradeConnection(_) => return ExecFailureKind::Upgrade,
+            _ => {}
+        }
+        if crate::cluster::find_auth_error(err).is_some() {
+            return ExecFailureKind::SignIn;
+        }
+        match error {
+            ClusterError::Api(_) => ExecFailureKind::Server,
+            ClusterError::Http { code: 401, .. } => ExecFailureKind::SignIn,
+            ClusterError::Http { .. } => ExecFailureKind::Other,
+            ClusterError::Timeout { .. } | ClusterError::Transport { .. } => {
+                ExecFailureKind::Unreachable
+            }
+            ClusterError::UnknownContext(_)
+            | ClusterError::Config { .. }
+            | ClusterError::ExecPluginNotFound { .. } => ExecFailureKind::SignIn,
+            ClusterError::Kube(_) => ExecFailureKind::Other,
+        }
+    }
 }
 
 impl ExecState {
@@ -367,6 +453,7 @@ pub(crate) struct Process {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaunchError {
     message: String,
+    kind: ExecFailureKind,
     /// The container has no such executable: try the next shell.
     missing_command: bool,
 }
@@ -375,6 +462,7 @@ impl LaunchError {
     fn new(message: String) -> Self {
         Self {
             message,
+            kind: ExecFailureKind::Connection,
             missing_command: false,
         }
     }
@@ -385,9 +473,18 @@ impl LaunchError {
     /// ("No such file or directory") must not make the next shell be tried.
     fn kube(err: kube::Error, executable: &str) -> Self {
         let from_server = matches!(err, kube::Error::Api(_));
-        let message = ClusterError::kube(err).to_string();
+        // Classified from kube's error as well as core's, which keeps less of it.
+        let error = ClusterError::kube_ref(&err);
+        let kind = ExecFailureKind::of(&err, &error);
+        let message = error.to_string();
+        let missing_command = from_server && is_missing_command(&message, executable);
         Self {
-            missing_command: from_server && is_missing_command(&message, executable),
+            kind: if missing_command {
+                ExecFailureKind::MissingShell
+            } else {
+                kind
+            },
+            missing_command,
             message,
         }
     }
@@ -462,7 +559,10 @@ pub(crate) async fn start(
         }
         Err(message) => {
             let mut session = Session::new(channels);
-            session.set_state(ExecState::Failed(message));
+            session.set_state(ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::Unreachable,
+                message,
+            )));
             session.linger().await;
         }
     }
@@ -497,7 +597,7 @@ pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels:
                 continue;
             }
             Err(e) => {
-                session.set_state(ExecState::Failed(e.message));
+                session.set_state(ExecState::Failed(ExecFailure::new(e.kind, e.message)));
                 break;
             }
         };
@@ -516,7 +616,9 @@ pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels:
                 session.reset_screen();
                 continue;
             }
-            Outcome::MissingCommand(message) => session.set_state(ExecState::Failed(message)),
+            Outcome::MissingCommand(message) => session.set_state(ExecState::Failed(
+                ExecFailure::new(ExecFailureKind::MissingShell, message),
+            )),
             Outcome::Done(ExecState::Closed) => {
                 session.set_state(ExecState::Closed);
                 return;
@@ -931,7 +1033,10 @@ fn outcome(
     let Some(status) = status else {
         return Outcome::Done(match connection {
             Ok(()) => ExecState::Exited { code: None },
-            Err(e) => ExecState::Failed(format!("the exec connection broke: {e}")),
+            Err(e) => ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::Connection,
+                format!("the exec connection broke: {e}"),
+            )),
         });
     };
     if status.status.as_deref() == Some("Success") {
@@ -957,7 +1062,10 @@ fn outcome(
     if !saw_output && is_missing_command(&message, executable) {
         Outcome::MissingCommand(message)
     } else {
-        Outcome::Done(ExecState::Failed(message))
+        Outcome::Done(ExecState::Failed(ExecFailure::new(
+            ExecFailureKind::Server,
+            message,
+        )))
     }
 }
 
@@ -1470,6 +1578,7 @@ mod tests {
             message.starts_with("the exec connection broke: ") && message.contains("reset"),
             "{message}"
         );
+        assert_eq!(message.kind, ExecFailureKind::Connection);
         // Output already in the pipe still reaches the screen.
         assert_eq!(snap.terminal.row_text(0), "partial line");
     }
@@ -1530,6 +1639,8 @@ mod tests {
             panic!("{:?}", snap.state);
         };
         assert!(message.starts_with("authentication failed"), "{message}");
+        // A local error: Flint could not sign in, the pod never answered.
+        assert_eq!(message.kind, ExecFailureKind::SignIn);
         assert!(!message.contains("s3cr3t") && !message.contains("token-abc"));
         assert_eq!(launcher.launched().len(), 1, "auth errors are not retried");
     }
@@ -1540,7 +1651,13 @@ mod tests {
         let (mut session, channels) = ExecSession::new(request());
         tokio::spawn(start(Err("not connected".to_owned()), request(), channels));
         let snap = wait_for(&mut session, "failure", |s| s.state.is_finished()).await;
-        assert_eq!(snap.state, ExecState::Failed("not connected".to_owned()));
+        assert_eq!(
+            snap.state,
+            ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::Unreachable,
+                "not connected"
+            ))
+        );
     }
 
     // covers UP-41
@@ -1662,9 +1779,79 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "No such file or directory (os error 2)",
         )));
-        assert!(!LaunchError::kube(local, "bash").missing_command);
+        let local = LaunchError::kube(local, "bash");
+        assert!(!local.missing_command);
+        // Not the container's, nor known to be signing in: no cause to name.
+        assert_eq!(local.kind, ExecFailureKind::Other);
+        // The exec auth plugin is not on PATH ("… not found on PATH").
+        let plugin = kube::Error::Auth(kube::client::AuthError::AuthExecStart(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+        assert_eq!(
+            LaunchError::kube(plugin, "bash").kind,
+            ExecFailureKind::SignIn
+        );
+        assert_eq!(
+            LaunchError::kube(api_error(NOT_FOUND), "bash").kind,
+            ExecFailureKind::MissingShell
+        );
+        assert_eq!(
+            LaunchError::kube(api_error("pods \"web\" is forbidden"), "bash").kind,
+            ExecFailureKind::Server
+        );
         assert!(LaunchError::kube(api_error(NOT_FOUND), "bash").missing_command);
         assert!(!LaunchError::kube(api_error(NOT_FOUND), "/bin/sh").missing_command);
+    }
+
+    // covers UP-41: where an exec failure came from is decided by its real cause: an auth error
+    // anywhere in kube's chain signs in, a failed WebSocket upgrade (a proxy answering 200) is
+    // its own, a bare HTTP code is not the pod's, and the catch-all names nothing.
+    #[test]
+    fn exec_failures_are_classified_by_their_cause() {
+        use kube::client::UpgradeConnectionError as U;
+        let kind = |err: kube::Error| LaunchError::kube(err, "bash").kind;
+        assert_eq!(
+            kind(kube::Error::UpgradeConnection(U::ProtocolSwitch(
+                http::StatusCode::OK
+            ))),
+            ExecFailureKind::Upgrade
+        );
+        assert_eq!(
+            kind(kube::Error::UpgradeConnection(
+                U::MissingUpgradeWebSocketHeader
+            )),
+            ExecFailureKind::Upgrade
+        );
+        assert_eq!(
+            kind(kube::Error::UpgradeConnection(U::ProtocolSwitch(
+                http::StatusCode::UNAUTHORIZED
+            ))),
+            ExecFailureKind::SignIn
+        );
+        // A token file Flint could not read is an auth error: signing in.
+        assert_eq!(
+            kind(kube::Error::Auth(kube::client::AuthError::ReadTokenFile(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+                "/var/run/token".into()
+            ))),
+            ExecFailureKind::SignIn
+        );
+        // A bare 404 (a proxy's page, a wrong server path) is not a pod problem; a bare 401
+        // is signing in.
+        let any = kube::Error::LinesCodecMaxLineLengthExceeded;
+        let http = |code| ClusterError::Http { code, server: None };
+        assert_eq!(
+            ExecFailureKind::of(&any, &http(404)),
+            ExecFailureKind::Other
+        );
+        assert_eq!(
+            ExecFailureKind::of(&any, &http(401)),
+            ExecFailureKind::SignIn
+        );
+        assert_eq!(
+            ExecFailureKind::of(&any, &ClusterError::Kube("something odd".into())),
+            ExecFailureKind::Other
+        );
     }
 
     #[test]
@@ -1728,9 +1915,10 @@ mod tests {
         );
         assert_eq!(
             outcome(None, Err("reset".into()), "bash", true, None),
-            Outcome::Done(ExecState::Failed(
-                "the exec connection broke: reset".to_owned()
-            ))
+            Outcome::Done(ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::Connection,
+                "the exec connection broke: reset"
+            )))
         );
     }
 

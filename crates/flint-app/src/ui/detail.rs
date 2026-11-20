@@ -10,7 +10,7 @@ use std::sync::Arc;
 use flint_core::read::event_time;
 use flint_core::table::{human_duration, unix_now};
 use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, WorkloadKind};
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -29,8 +29,9 @@ use super::log_view::LogRequest;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
-    self, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenShell, Refresh, ShowOverview,
-    ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleSecretValue,
+    self, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell,
+    Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
+    ToggleSecretValue,
 };
 use super::terminal_model::ShellRequest;
 
@@ -90,8 +91,8 @@ pub enum DetailEvent {
     OpenLogs(LogRequest, TakeFocus),
     /// Open (or show) a shell tab in a container of the pod, or of a workload's ready pod.
     OpenShell(ShellRequest, TakeFocus),
-    /// Logs or Shell was refused, or could not be done once what it waited for loaded: why,
-    /// for the window to say.
+    /// Logs or Shell was refused, or could not be done once what it waited for loaded: one
+    /// sentence saying what and why ([`refused`]), for the window to say.
     Refused(String),
 }
 
@@ -187,6 +188,9 @@ pub struct DetailView {
     current_wanted: bool,
     /// Logs or Shell asked for while loading (`FLINT_VIEW=…#logs`, a row just selected).
     pending: Option<Waiting>,
+    /// Why no session can open on the object's cluster (it is not connected), as the workspace
+    /// says it (`Workspace::sessions_blocked`): Logs and Shell are disabled, saying so.
+    sessions_blocked: Option<String>,
     _fetch: Task<()>,
     _show_pods: Task<()>,
     _yaml: Task<()>,
@@ -232,6 +236,7 @@ impl DetailView {
             listing: None,
             current_wanted: false,
             pending: None,
+            sessions_blocked: None,
             _fetch: Task::ready(()),
             _show_pods: Task::ready(()),
             _yaml: Task::ready(()),
@@ -239,6 +244,18 @@ impl DetailView {
         view.refresh(window, cx);
         view.list_pods_soon(cx);
         view
+    }
+
+    /// Says why no session can open on the object's cluster now, or `None` once it can.
+    pub(in crate::ui) fn set_sessions_blocked(
+        &mut self,
+        why: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sessions_blocked != why {
+            self.sessions_blocked = why;
+            cx.notify();
+        }
     }
 
     pub fn object(&self) -> &ObjectRef {
@@ -466,6 +483,7 @@ impl DetailView {
                             .on_click(registry::on_click(Close)),
                     ),
             )
+            .children(self.render_captions(theme))
             .child(
                 TabBar::new("detail-tabs")
                     .underline()
@@ -490,6 +508,20 @@ impl DetailView {
     /// For pods: Logs, with a container picker when the pod has several containers or a
     /// previous instance to read. For workloads: Logs of every pod (UP-45).
     fn render_logs_button(&self) -> Option<AnyElement> {
+        if self.subject == Subject::Other {
+            return None;
+        }
+        if let Some(why) = &self.sessions_blocked {
+            return Some(
+                Button::new("detail-logs")
+                    .xsmall()
+                    .ghost()
+                    .label("Logs")
+                    .disabled(true)
+                    .tooltip(why.clone())
+                    .into_any_element(),
+            );
+        }
         if let Subject::Workload(_) = self.subject {
             return Some(
                 Button::new("detail-logs")
@@ -505,47 +537,48 @@ impl DetailView {
             );
         }
         let containers: Vec<PodContainer> = self.log_containers().to_vec();
-        let button = Button::new("detail-logs")
-            .xsmall()
-            .ghost()
-            .label("Logs")
-            .tooltip(format!(
-                "Open the logs in the dock ({})",
-                registry::key_hint("secondary-l")
-            ));
+        let keys = registry::key_hint("secondary-l");
+        let button = Button::new("detail-logs").xsmall().ghost().label("Logs");
+        // Logs that cannot open (the pod could not be fetched, say) stay, disabled, saying why.
+        if let Err(e) = self.log_plan::<OpenLogs>(None, false) {
+            return Some(
+                button
+                    .disabled(true)
+                    .tooltip(actions::reason(&e))
+                    .into_any_element(),
+            );
+        }
         match containers.as_slice() {
-            [] => None,
+            // Still loading: Logs waits for the pod.
+            [] => Some(
+                button
+                    .tooltip(format!("Open the logs in the dock ({keys})"))
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            ),
             [only] if !only.has_previous => Some(
                 button
+                    .tooltip(format!("Open the logs in the dock ({keys})"))
                     .on_click(registry::on_click(OpenLogs))
                     .into_any_element(),
             ),
             _ => Some(
                 button
+                    .tooltip(picker_hint(
+                        containers.iter().find(|c| c.default).map(|c| &c.name[..]),
+                        &keys,
+                    ))
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let mut menu = menu.label("Container");
                         for c in &containers {
-                            let label = if c.init {
-                                format!("{} (init)", c.name)
-                            } else {
-                                c.name.clone()
-                            };
-                            menu = menu.item(PopupMenuItem::new(label).on_click(
-                                registry::on_click(OpenContainerLogs {
-                                    container: c.name.clone(),
-                                    previous: false,
-                                }),
-                            ));
+                            let (item, action) = log_item(c, false);
+                            menu = menu.item(item.on_click(registry::on_click(action)));
                         }
                         if containers.iter().any(|c| c.has_previous) {
                             menu = menu.separator().label("Previous instance");
                             for c in containers.iter().filter(|c| c.has_previous) {
-                                menu = menu.item(PopupMenuItem::new(c.name.clone()).on_click(
-                                    registry::on_click(OpenContainerLogs {
-                                        container: c.name.clone(),
-                                        previous: true,
-                                    }),
-                                ));
+                                let (item, action) = log_item(c, true);
+                                menu = menu.item(item.on_click(registry::on_click(action)));
                             }
                         }
                         menu
@@ -563,7 +596,19 @@ impl DetailView {
             return None;
         }
         let button = Button::new("detail-shell").xsmall().ghost().label("Shell");
-        if let Err(e) = self.shell_check::<OpenShell>(None) {
+        if let Some(why) = &self.sessions_blocked {
+            return Some(
+                button
+                    .disabled(true)
+                    .tooltip(why.clone())
+                    .into_any_element(),
+            );
+        }
+        // A pod whose default container is not running still offers the others.
+        let picker = self.shell_picker();
+        if let Err(e) = self.shell_check::<OpenShell>(None)
+            && picker.is_none()
+        {
             return Some(
                 button
                     .disabled(true)
@@ -589,7 +634,19 @@ impl DetailView {
             // A pod still loading: Shell waits for it.
             _ => button.tooltip(format!("Open a shell in the dock ({keys})")),
         };
-        let containers = shell.map(|s| s.containers).unwrap_or_default();
+        let Some(ShellPod {
+            pod,
+            containers,
+            default,
+            not_running,
+        }) = shell
+        else {
+            return Some(
+                button
+                    .on_click(registry::on_click(OpenShell))
+                    .into_any_element(),
+            );
+        };
         if containers.len() < 2 {
             return Some(
                 button
@@ -599,17 +656,94 @@ impl DetailView {
         }
         Some(
             button
+                .tooltip({
+                    let hint = if not_running.contains(&default) {
+                        format!("Choose a container (the default, {default}, is not running)")
+                    } else {
+                        picker_hint(Some(&default), &keys)
+                    };
+                    match self.subject {
+                        Subject::Workload(_) => format!("In {pod}: {hint}"),
+                        _ => hint,
+                    }
+                })
                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                     let mut menu = menu.label("Container");
                     for name in &containers {
-                        menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                            registry::on_click(OpenContainerShell {
-                                container: name.clone(),
-                            }),
-                        ));
+                        let running = !not_running.contains(name);
+                        let (item, action) = shell_item(name, *name == default, running);
+                        menu = menu.item(item.on_click(registry::on_click(action)));
                     }
                     menu
                 })
+                .into_any_element(),
+        )
+    }
+
+    /// Why Logs or Shell cannot open, as the captions under the pane's buttons say it: one
+    /// sentence ([`refused`]) for each, or one for both when the reason is the same.
+    pub(in crate::ui) fn action_captions(&self) -> Vec<String> {
+        if self.subject == Subject::Other {
+            return Vec::new();
+        }
+        if let Some(why) = &self.sessions_blocked {
+            return vec![refused(Opening::LogsAndShell, why)];
+        }
+        // The body (or the deleted notice) already says what went wrong: the caption does not
+        // repeat the server's words.
+        if self.subject == Subject::Pod && matches!(self.fetch, Fetch::Failed(_)) {
+            return vec!["Can't open the logs or a shell until the pod is fetched.".to_owned()];
+        }
+        if self.gone {
+            return Vec::new();
+        }
+        let logs = self
+            .log_plan::<OpenLogs>(None, false)
+            .err()
+            .map(|e| actions::reason(&e));
+        // A picker that still offers a running container says nothing against Shell.
+        let shell = self
+            .shell_check::<OpenShell>(None)
+            .err()
+            .filter(|_| self.shell_picker().is_none())
+            .map(|e| actions::reason(&e));
+        match (logs, shell) {
+            (Some(logs), Some(shell)) if logs == shell => {
+                vec![refused(Opening::LogsAndShell, &logs)]
+            }
+            (logs, shell) => logs
+                .map(|why| refused(Opening::Logs, &why))
+                .into_iter()
+                .chain(shell.map(|why| refused(Opening::Shell, &why)))
+                .collect(),
+        }
+    }
+
+    /// The captions under the header: why Logs or Shell is disabled, in muted text, so the
+    /// reason shows without hovering the button (its tooltip says it too).
+    fn render_captions(&self, theme: &Theme) -> Option<AnyElement> {
+        let captions = self.action_captions();
+        if captions.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .id("detail-captions")
+                .px_3()
+                .pb_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .children(captions.into_iter().enumerate().map(|(ix, text)| {
+                    let full: SharedString = text.clone().into();
+                    div()
+                        .id(("detail-caption", ix))
+                        .min_w_0()
+                        .truncate()
+                        .child(text.clone())
+                        .test_text(text)
+                        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                }))
+                .test_support()
                 .into_any_element(),
         )
     }
@@ -1129,6 +1263,75 @@ fn key_value(
 }
 
 /// "5m" for an RFC 3339 timestamp five minutes ago.
+/// A container as a picker lists it: `app (default)`, `migrate (init)`. The default one is
+/// what the keys open (⌘L, ⇧⌘L, ⇧⌘E), so the picker says which it is.
+pub(in crate::ui) fn container_label(name: &str, init: bool, default: bool) -> String {
+    match (init, default) {
+        (true, _) => format!("{name} (init)"),
+        (false, true) => format!("{name} (default)"),
+        (false, false) => name.to_owned(),
+    }
+}
+
+/// A Shell picker's entry: a container that is not running (waiting, crash-looping,
+/// terminated) is listed disabled, saying so.
+pub(in crate::ui) fn shell_label(name: &str, default: bool, running: bool) -> String {
+    match (default, running) {
+        (true, true) => format!("{name} (default)"),
+        (false, true) => name.to_owned(),
+        (true, false) => format!("{name} (default, not running)"),
+        (false, false) => format!("{name} (not running)"),
+    }
+}
+
+/// A Logs picker's entry for `c` (its previous instance with `previous`) and the action it
+/// runs. The default container's entry carries Logs (or Previous Logs) too, so the menu shows
+/// its key beside it: the key opens that container. The caller adds the click.
+pub(in crate::ui) fn log_item(
+    c: &PodContainer,
+    previous: bool,
+) -> (PopupMenuItem, OpenContainerLogs) {
+    let item = PopupMenuItem::new(container_label(&c.name, c.init, c.default));
+    let item = match (c.default, previous) {
+        (true, false) => item.action(Box::new(OpenLogs)),
+        (true, true) => item.action(Box::new(OpenPreviousLogs)),
+        (false, _) => item,
+    };
+    let action = OpenContainerLogs {
+        container: c.name.clone(),
+        previous,
+    };
+    (item, action)
+}
+
+/// A Shell picker's entry and the action it runs; the default container's carries Shell, so
+/// its key shows. The caller adds the click.
+pub(in crate::ui) fn shell_item(
+    name: &str,
+    default: bool,
+    running: bool,
+) -> (PopupMenuItem, OpenContainerShell) {
+    let item = PopupMenuItem::new(shell_label(name, default, running)).disabled(!running);
+    let item = if default {
+        item.action(Box::new(OpenShell))
+    } else {
+        item
+    };
+    let action = OpenContainerShell {
+        container: name.to_owned(),
+    };
+    (item, action)
+}
+
+/// The tooltip of a button that picks a container: the key skips the picker and opens the
+/// default container.
+fn picker_hint(default: Option<&str>, keys: &str) -> String {
+    match default {
+        Some(name) => format!("Choose a container ({keys} opens {name}, the default)"),
+        None => "Choose a container".to_owned(),
+    }
+}
+
 fn timestamp_age(text: &str, now: i64) -> Option<String> {
     let seconds = text
         .parse::<k8s_openapi::jiff::Timestamp>()
@@ -1209,7 +1412,7 @@ mod actions;
 #[path = "detail_pods.rs"]
 mod pods;
 
-pub(in crate::ui) use actions::reason;
+pub(in crate::ui) use actions::{Opening, ShellPod, reason, refused};
 pub(in crate::ui) use pods::Pods;
 #[cfg(test)]
 pub(in crate::ui) use pods::RELIST_DELAY;
@@ -1224,7 +1427,20 @@ mod state;
 
 #[cfg(test)]
 mod tests {
-    use super::timestamp_age;
+    use super::{container_label, picker_hint, shell_label, timestamp_age};
+
+    #[test]
+    fn pickers_mark_the_container_the_keys_open() {
+        assert_eq!(container_label("app", false, true), "app (default)");
+        assert_eq!(container_label("sidecar", false, false), "sidecar");
+        assert_eq!(container_label("migrate", true, false), "migrate (init)");
+        assert_eq!(shell_label("app", true, true), "app (default)");
+        assert_eq!(shell_label("worker", false, false), "worker (not running)");
+        assert_eq!(
+            picker_hint(Some("app"), "⌘L"),
+            "Choose a container (⌘L opens app, the default)"
+        );
+    }
 
     #[test]
     fn ages_of_rfc3339_timestamps() {

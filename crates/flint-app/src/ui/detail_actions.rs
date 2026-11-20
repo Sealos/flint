@@ -64,6 +64,9 @@ pub(in crate::ui) struct ShellPod {
     /// The app containers, in spec order.
     pub containers: Vec<String>,
     pub default: String,
+    /// Those of them whose status says they are not running (waiting, crash-looping,
+    /// terminated): a picker lists them disabled. Not known for a workload's pods.
+    pub not_running: Vec<String>,
 }
 
 /// Why an action was refused, in words for the user.
@@ -71,6 +74,58 @@ pub(in crate::ui) fn reason(error: &ActionError) -> String {
     match error {
         ActionError::Rejected { reason, .. } => reason.clone(),
         other => other.to_string(),
+    }
+}
+
+/// What a refused Logs, Previous Logs or Shell was to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) enum Opening {
+    Logs,
+    PreviousLogs,
+    Shell,
+    /// Both Logs and Shell, refused for the same reason (the pane's caption says it once).
+    LogsAndShell,
+    /// An ended log tab's Reconnect.
+    ReconnectLogs,
+    /// An ended shell tab's Restart shell.
+    RestartShell,
+}
+
+impl Opening {
+    /// What could not be done, as the refusal's sentence starts.
+    fn cant(self) -> &'static str {
+        match self {
+            Opening::Logs => "Can't open the logs",
+            Opening::PreviousLogs => "Can't open the previous logs",
+            Opening::Shell => "Can't open a shell",
+            Opening::LogsAndShell => "Can't open the logs or a shell",
+            Opening::ReconnectLogs => "Can't reconnect the logs",
+            Opening::RestartShell => "Can't restart the shell",
+        }
+    }
+}
+
+/// A refusal as one sentence that names what was refused, then why: "Can't open a shell: no
+/// pod of Deployment web is ready." Every refusal the strip over the dock and the pane's
+/// captions show is worded here.
+pub(in crate::ui) fn refused(opening: Opening, why: &str) -> String {
+    let why = why.trim_end();
+    // A reason cut short ends in "…", which ends the sentence too.
+    let end = if why.ends_with(['.', '!', '?', '…']) {
+        ""
+    } else {
+        "."
+    };
+    format!("{}: {why}{end}", opening.cant())
+}
+
+impl From<&Pending> for Opening {
+    fn from(action: &Pending) -> Self {
+        match action {
+            Pending::Logs { previous: false } => Opening::Logs,
+            Pending::Logs { previous: true } => Opening::PreviousLogs,
+            Pending::Shell { .. } => Opening::Shell,
+        }
     }
 }
 
@@ -107,7 +162,10 @@ impl DetailView {
                         cx.emit(DetailEvent::OpenLogs(request, TakeFocus::Yes))
                     }
                     Ok(Plan::Wait) => {}
-                    Err(e) => view.refuse(&e, cx),
+                    Err(e) => {
+                        let previous = action.previous;
+                        view.refuse(&Pending::Logs { previous }, &e, cx)
+                    }
                 }
             })
             .bind::<OpenShell>(|view, _, window, cx| {
@@ -150,7 +208,7 @@ impl DetailView {
             }
             Err(e) => {
                 self.pending = None;
-                self.refuse(&e, cx);
+                self.refuse(&action, &e, cx);
             }
         }
         cx.notify();
@@ -182,9 +240,9 @@ impl DetailView {
         }
         let what = self.waiting_for(&waiting.action);
         let seconds = PENDING_TIMEOUT.as_secs();
-        cx.emit(DetailEvent::Refused(format!(
-            "{}: gave up waiting for {what} ({seconds} s)",
-            action_name(&waiting.action)
+        cx.emit(DetailEvent::Refused(refused(
+            Opening::from(&waiting.action),
+            &format!("gave up waiting for {what} ({seconds} s)"),
         )));
         cx.notify();
     }
@@ -215,8 +273,8 @@ impl DetailView {
         ))
     }
 
-    fn refuse(&mut self, error: &ActionError, cx: &mut Context<Self>) {
-        cx.emit(DetailEvent::Refused(reason(error)));
+    fn refuse(&mut self, action: &Pending, error: &ActionError, cx: &mut Context<Self>) {
+        cx.emit(DetailEvent::Refused(refused(action.into(), &reason(error))));
     }
 
     /// Runs the action waiting, now that the object has loaded (or failed to). A workload's
@@ -241,8 +299,8 @@ impl DetailView {
                 cx.emit(opened.event(waiting.focus));
             }
             Err(e) => {
-                self.pending = None;
-                self.refuse(&e, cx);
+                let waiting = self.pending.take().expect("checked above");
+                self.refuse(&waiting.action, &e, cx);
             }
         }
         cx.notify();
@@ -311,10 +369,16 @@ impl DetailView {
                     .or_else(|| self.pod_shell_containers().next())?
                     .name
                     .clone();
+                let not_running = self
+                    .pod_shell_containers()
+                    .filter(|c| c.not_running)
+                    .map(|c| c.name.clone())
+                    .collect();
                 Some(ShellPod {
                     pod: self.object.name.clone(),
                     containers,
                     default,
+                    not_running,
                 })
             }
             // Listed before the workload changed, a pod named could be gone: none is named
@@ -372,6 +436,17 @@ impl DetailView {
             return Err(ActionError::rejected::<A>(self.no_shell_pod()));
         };
         check_container::<A>(&target, container).map(|_| ())
+    }
+
+    /// The pod a Shell picker offers, when it has several containers and a shell can open in
+    /// one of them now (the default one may not be running while another is).
+    pub(in crate::ui) fn shell_picker(&self) -> Option<ShellPod> {
+        let pod = self.shell_pod()?;
+        let open = pod
+            .containers
+            .iter()
+            .any(|c| self.shell_check::<OpenContainerShell>(Some(c)).is_ok());
+        (pod.containers.len() > 1 && open).then_some(pod)
     }
 
     fn list_failed(&self, kind: flint_core::WorkloadKind, error: &str) -> String {
@@ -602,6 +677,7 @@ fn shell_pod_of(pods: &[WorkloadPod]) -> Option<ShellPod> {
         pod: pod.name.clone(),
         containers: pod.containers.clone(),
         default: pod.default_container.clone()?,
+        not_running: Vec::new(),
     })
 }
 
@@ -611,13 +687,21 @@ fn check_container<A: Action>(
     container: Option<&str>,
 ) -> Result<String, ActionError> {
     match container {
-        Some(name) if target.containers.iter().any(|c| c == name) => Ok(name.to_owned()),
-        Some(name) => Err(ActionError::rejected::<A>(format!(
-            "pod {} has no app container {name}",
-            target.pod
-        ))),
+        Some(name) if !target.containers.iter().any(|c| c == name) => Err(
+            ActionError::rejected::<A>(format!("pod {} has no app container {name}", target.pod)),
+        ),
+        // The picker lists it disabled; the key (or the palette) says why, the same way.
+        Some(name) if target.not_running.iter().any(|c| c == name) => Err(not_running::<A>(name)),
+        Some(name) => Ok(name.to_owned()),
+        None if target.not_running.contains(&target.default) => {
+            Err(not_running::<A>(&target.default))
+        }
         None => Ok(target.default.clone()),
     }
+}
+
+fn not_running<A: Action>(container: &str) -> ActionError {
+    ActionError::rejected::<A>(format!("container {container} is not running"))
 }
 
 /// An action's name, as the menu and the palette say it.
@@ -636,6 +720,27 @@ mod tests {
     #[test]
     fn every_detail_action_is_bound() {
         assert_binds_scope(Scope::Detail, super::DetailView::bind_actions);
+    }
+
+    #[test]
+    fn a_refusal_is_a_sentence_naming_what_was_refused() {
+        use super::{Opening, refused};
+        assert_eq!(
+            refused(Opening::Shell, "no pod of Deployment notready is ready"),
+            "Can't open a shell: no pod of Deployment notready is ready."
+        );
+        assert_eq!(
+            refused(Opening::Logs, "the server said no."),
+            "Can't open the logs: the server said no."
+        );
+        assert_eq!(
+            refused(Opening::Shell, "the pods could not be listed: a very long…"),
+            "Can't open a shell: the pods could not be listed: a very long…"
+        );
+        assert_eq!(
+            refused(Opening::PreviousLogs, "container app has not restarted "),
+            "Can't open the previous logs: container app has not restarted."
+        );
     }
 }
 

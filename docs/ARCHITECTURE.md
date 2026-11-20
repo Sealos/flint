@@ -383,9 +383,10 @@ documentation lists the steps.
   active tab's ended or failed session again, on the server its context points at now, in a new tab right after it
   (`Dock::open_beside`), which is shown. The ended tab keeps its lines or scrollback until it is closed, so starting
   again never discards output. A deleted pod's log tab cannot be reconnected (`DockItem::can_restart`). The dock
-  emits `DockEvent::Restart` and the workspace builds the session, refusing, saying why, while the cluster is not
-  connected. On a tab whose session runs, Cmd-R falls through to Refresh. The ended banners of log and shell tabs
-  carry Reconnect and Restart shell buttons.
+  emits `DockEvent::Restart` and the workspace builds the session, refusing while the cluster is not connected with a
+  refusal's sentence ("Can't restart the shell: alpha is not connected.", "Can't reconnect the logs: …";
+  `detail::refused`). On a tab whose session runs, Cmd-R falls through to Refresh. The ended and failed banners of
+  log and shell tabs carry Reconnect and Restart shell buttons.
 - **Many tabs.** The strip scrolls the active tab into view whenever a tab opens, is shown or closes, and on the
   frame after the tab bar changes width (the window or a pane was resized) or a kubeconfig reload changes chips. Show Dock Tabs (`dock::ShowTabList`,
   Shift-Cmd-J, or the button at the strip's end) lists every tab with its cluster and status and shows the one
@@ -395,9 +396,27 @@ documentation lists the steps.
 (`detail::OpenShell`, ⇧⌘E) act on the selected row, which the detail pane shows, so the keys, the palette, the pane's
 buttons and a row's context menu (`ui/row_menu.rs`) are one set of actions. `row_menu::row_actions` says what each can
 do now and why not, with the same checks as the guards; the menu, the pane's buttons and the automation `state` show
-it (a disabled entry carries its reason). A right-click selects the row first. For a pod they open its default
-container (a picker when it has several app containers); for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job,
-Logs opens the workload session (all pods, prefixed) and Shell opens in its first ready pod by name.
+it (a disabled entry carries its reason). The pane says it without hovering too: a muted caption under its header
+(`DetailView::action_captions`) gives the refusal's sentence for Logs and for Shell, once when they share it; Logs and
+Shell stay, disabled, when the pod could not be fetched. The caption never repeats what the pane already says: a pod
+that could not be fetched reads "Can't open the logs or a shell until the pod is fetched." (the body shows the
+server's error), and a deleted object gets no caption (its notice says so). While the object's cluster is not
+connected the workspace tells the pane (`DetailView::set_sessions_blocked`, from `Workspace::sessions_blocked`), and
+both buttons are disabled with that reason in their tooltips and the caption. Kinds other than pods and workloads have
+no Logs or Shell button. A right-click selects the row first. On a pod with several containers the menu's Logs,
+Previous Logs (the containers that ran before) and Shell, and the pane's Logs and Shell buttons, are container pickers
+(`detail::OpenContainerLogs`, `detail::OpenContainerShell`) that mark the default container, whose entry also carries
+the plain action so the menu shows its key beside it; a container whose status says it is waiting or terminated
+(crash-looping, say) is listed disabled in the Shell picker as "not running", and a native sidecar (an init container
+with `restartPolicy: Always`) counts as an app container, for a pod's pickers and a workload's pods alike
+(`WorkloadPod::from_pod`), and the default-container annotation may name one; when the default container is not
+running, its key refuses with the same "not running" reason while the picker offers the others; the keys always open
+the default container at once, never a picker. The default is the one `kubectl` picks (the
+`kubectl.kubernetes.io/default-container` annotation, else the first app container), so ⌘L and ⇧⌘E do in one step what
+`kubectl logs` and `kubectl exec` do without `-c`, the same way every time and from the palette too, where no menu is
+open; the picker is one right-click or button away, and the buttons' tooltips say which container the key opens. For a
+Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs opens the workload session (all pods, prefixed) and Shell
+opens in its first ready pod by name.
 
 - **Workload pods** (`ui/detail_pods.rs`, `CoreHandle::workload_pods`): never listed on each update of the workload.
   A cached list (`resourceVersion=0`) shows which pod a shell would open in: a moment after the row is selected (so
@@ -414,9 +433,12 @@ Logs opens the workload session (all pods, prefixed) and Shell opens in its firs
   opened late takes focus only if focus has not moved since the ask (one asked for at startup, `FLINT_VIEW=…#logs`,
   always does); if focus is in another dock tab, the new tab opens behind it (`Dock::add`). The open menu is rebuilt
   whenever what it shows changes, until it is dismissed.
-- **Refusals.** An action refused, at once or after waiting, says why in a strip over the dock (`action-error`),
-  cleared by the next tab opened, a change of selection, list or cluster, or after 10 seconds. A menu entry refused as
-  not available says why from the row's actions, never by the action's internal name. Shell is refused for a deleted pod or workload and for a pod
+- **Refusals.** An action refused, at once or after waiting, says why in a strip between the main area and the dock
+  (`action-error`): a row of its own, so it covers neither the list nor the pane, one line high with a warning icon
+  (the whole sentence in its tooltip). It is cleared by the next tab opened, a change of selection, list or cluster,
+  or after 10 seconds. Every refusal is one sentence worded by `detail::refused`, naming what was refused, then why
+  ("Can't open a shell: no pod of Deployment web is ready."). A menu entry refused as not available says why from
+  the row's actions, never by the action's internal name. Shell is refused for a deleted pod or workload and for a pod
   that finished (`Succeeded`, `Failed`) or is being deleted. While the row's cluster is not connected every entry is
   disabled and the menu says why with core's summary of the error (`ClusterError::summary`); an action's
   own reason (a refused pod list, say) is cut to one short line.
@@ -455,8 +477,16 @@ opens in a tab in the bottom dock.
   hidden and inverse are drawn; the cursor is a block, beam or underline (a hollow block, or a faded beam or underline,
   without focus; none once the session ended); the bell flashes the
   screen. The grid size comes from the element's size and the font's advance; a change is sent after 80 ms without
-  further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed
-  (reason); after the end the screen stays scrollable and copyable. Closing the tab drops the session.
+  further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed;
+  why it failed is said once, in the banner under it: plain words, then "Details:" and what was said, in full and
+  wrapping, so a long RBAC message stays readable in a narrow dock. Core types where a failure came from
+  (`ExecFailureKind`), from its real cause, in `LaunchError::kube` before kube's error is collapsed: an auth error
+  anywhere in kube's chain, a missing exec plugin, a bad kubeconfig or a 401 is signing in ("Flint couldn't sign in
+  to the cluster."); a failed WebSocket upgrade (a proxy answering 200, missing upgrade headers) has words of its own;
+  a refused or timed-out connection is reaching the cluster; only the API server's own `Status` is the server's, and
+  only those are told apart by their words (no permission, pod or exec not found, container not running). A bare HTTP
+  code (a proxy's page, a wrong server path) and anything else read "The shell could not start." with the full text.
+  After the end the screen stays scrollable and copyable. Closing the tab drops the session.
 - **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,
   Space, the arrows, Home/End, Page Up/Down and Ctrl with a letter or symbol to nothing
   (`registry::TERMINAL_PASSTHROUGH`); it is the deepest context, so those keys skip the app's bindings (focus

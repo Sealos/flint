@@ -3,8 +3,56 @@
 
 // module-tests: list_tests.rs (the Reconnecting and Failed view tests render these banners)
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
+
+/// A tinted strip in `color` with a plain `headline` and, under it, `detail` (what a server
+/// said) in full, wrapping as long as it needs: a long RBAC message keeps its user, verb and
+/// namespace readable in a narrow pane. `control` (a button) sits at its end.
+pub fn notice_detail(
+    id: impl Into<ElementId>,
+    headline: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    color: Hsla,
+    muted: Hsla,
+    control: impl IntoElement,
+) -> Stateful<Div> {
+    let (headline, detail): (SharedString, SharedString) = (headline.into(), detail.into());
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .bg(color.opacity(0.08))
+        .border_b_1()
+        .border_color(color.opacity(0.3))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_color(color)
+                        .child(headline.clone())
+                        .test_text(headline),
+                )
+                .child(
+                    div()
+                        .text_color(muted)
+                        .child(detail.clone())
+                        .test_text(detail),
+                ),
+        )
+        .child(div().flex_none().child(control))
+}
 
 /// A tinted strip in `color` with `text` wrapped to at most two lines; the full text is in a
 /// tooltip, so a long server message is readable without widening the pane.
