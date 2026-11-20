@@ -532,6 +532,8 @@ async fn a_hanging_refresh_is_a_sign_in_failure() {
         "authentication failed: the exec auth plugin `plugin` did not finish within 1m0s; it may \
          be waiting for a login. Run it in a terminal (for example, log in again) and retry."
     );
+    // Real time again: the killed plugin is reaped when the system says so, not by the clock.
+    tokio::time::resume();
     wait_reaped(plugin.starts()[1]).await;
 
     // Resting: no new plugin starts (no browser login opens again), and the error says so.
@@ -548,7 +550,6 @@ async fn a_hanging_refresh_is_a_sign_in_failure() {
 
     // A retry runs it again.
     retry_now("ctx");
-    tokio::time::resume();
     let request = tokio::spawn(async move { cluster::server_version(&client).await });
     wait_starts(&plugin, 3).await;
     request.abort();
@@ -615,15 +616,31 @@ fn a_prompting_plugin_on_a_terminal_is_killed_and_the_terminal_returned() {
             "--test-threads=1",
         ]);
     }
-    let Ok(out) = cmd
+    let output = dir.path().join("output");
+    let Ok(mut run) = cmd
         .env(TTY_CHILD, &done)
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::fs::File::create(&output).unwrap())
+        .spawn()
     else {
         eprintln!("skipped: no `script` to run a terminal with");
         return;
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+    // A run that hangs fails here instead of never ending. (A write to the terminal that SIGTTOU
+    // would stop fails with EIO here instead: under `script` the test's process group is
+    // orphaned. Either way the test sees it.)
+    let started = std::time::Instant::now();
+    while run.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(90) {
+            let _ = run.kill();
+            panic!(
+                "the terminal run did not finish:\n{}",
+                std::fs::read_to_string(&output).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = std::fs::read_to_string(&output).unwrap_or_default();
     assert!(
         std::fs::read_to_string(&done).is_ok_and(|t| t == "ok"),
         "the terminal run failed:\n{text}"
@@ -673,6 +690,14 @@ async fn on_a_terminal() {
     // SAFETY: plain calls on the standard input descriptor.
     let foreground = || unsafe { libc::tcgetpgrp(0) == libc::getpgrp() };
     assert!(foreground(), "not in the terminal's foreground");
+    // `stty tostop`: a background write to the terminal stops its writer.
+    // SAFETY: an all-zero termios is valid; plain calls on standard input.
+    unsafe {
+        let mut settings: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(0, &raw mut settings), 0);
+        settings.c_lflag |= libc::TOSTOP;
+        assert_eq!(libc::tcsetattr(0, libc::TCSANOW, &raw const settings), 0);
+    }
 
     // A prompting plugin that cannot be started never takes the terminal.
     let mut missing = FakePlugin::new("").kubeconfig("http://127.0.0.1:1");
@@ -715,6 +740,13 @@ async fn on_a_terminal() {
         std::fs::read_to_string(plugin.dir.path().join("foreground")).is_ok(),
         "the plugin did not get the terminal"
     );
+    // Flint logs while the plugin has the terminal: with `tostop`, it must not be stopped for it.
+    // Straight to the terminal (the test harness captures `eprintln!`).
+    std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"flint logs while a plugin has the terminal\n",
+    )
+    .unwrap();
     // A second prompting plugin (another cluster) waits for the terminal briefly instead of
     // starting in the background; then it runs without prompting, and one that has what it
     // needs answers at once, not after the first one's login.
@@ -806,7 +838,79 @@ async fn on_a_terminal() {
     // SAFETY: a plain call on standard input, writing into `now`.
     assert_eq!(unsafe { libc::tcgetattr(0, &raw mut now) }, 0);
     assert_ne!(now.c_lflag & libc::ECHO, 0, "echo was left off");
+
+    in_the_background().await;
     std::fs::write(done, "ok").unwrap();
+}
+
+/// With Flint a background job of its terminal (another group in the foreground), a plugin that
+/// may prompt runs without prompting, and one that must prompt waits until Flint is brought to
+/// the foreground (`fg`).
+async fn in_the_background() {
+    // SAFETY: plain calls on standard input.
+    let foreground = || unsafe { libc::tcgetpgrp(0) == libc::getpgrp() };
+    let mut other = std::process::Command::new("sleep");
+    other.arg("60");
+    std::os::unix::process::CommandExt::process_group(&mut other, 0);
+    let mut other = other.spawn().unwrap();
+    let other_group = libc::pid_t::try_from(other.id()).unwrap();
+    set_foreground(0, other_group);
+    assert!(!foreground());
+
+    let cached = FakePlugin::new(
+        "printf '%s' \"$KUBERNETES_EXEC_INFO\" > \"$PLUGIN_DIR/info\"\n\
+         printf '{\"status\":{\"token\":\"t-cached\"}}'\n",
+    );
+    let mut kubeconfig = cached.kubeconfig("http://127.0.0.1:1");
+    prompting(&mut kubeconfig);
+    let mut config = super::tests::config(&kubeconfig).await;
+    resolve(&mut config, "background").await.unwrap();
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cached.dir.path().join("info")).unwrap())
+            .unwrap();
+    assert_eq!(
+        info["spec"]["interactive"], false,
+        "a background Flint may not prompt"
+    );
+
+    let always = FakePlugin::new(
+        "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
+         printf '{\"status\":{\"token\":\"t-always\"}}'\n",
+    );
+    let mut must = always.kubeconfig("http://127.0.0.1:1");
+    must.auth_infos[0]
+        .auth_info
+        .as_mut()
+        .unwrap()
+        .exec
+        .as_mut()
+        .unwrap()
+        .interactive_mode = Some(ExecInteractiveMode::Always);
+    let mut must_config = super::tests::config(&must).await;
+    let waiting = tokio::spawn(async move {
+        resolve(&mut must_config, "background").await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        always.starts().is_empty(),
+        "`Always` waits for the foreground"
+    );
+    // It waits without holding the terminal: a plugin that may prompt is not kept waiting for
+    // it, and runs without prompting at once (Flint is in the background).
+    let mut again = super::tests::config(&kubeconfig).await;
+    let started = std::time::Instant::now();
+    resolve(&mut again, "background").await.unwrap();
+    assert!(started.elapsed() < TERMINAL_WAIT, "{:?}", started.elapsed());
+    // `fg`.
+    // SAFETY: a plain call.
+    set_foreground(0, unsafe { libc::getpgrp() });
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("`Always` runs once Flint is in the foreground")
+        .unwrap();
+    assert_eq!(always.starts().len(), 1);
+    let _ = other.kill();
+    let _ = other.wait();
 }
 
 // covers UP-04: a client that is dropped while its token refreshes kills the refresh's plugin
@@ -911,7 +1015,7 @@ fn plugin_problems_name_the_plugin_in_the_summary() {
     assert!(matches!(
         &error,
         ClusterError::ExecPlugin { command, problem: crate::cluster::PluginProblem::TimedOut }
-            if command == "kubelogin"
+            if command.as_deref() == Some("kubelogin")
     ));
     assert!(
         error
@@ -920,6 +1024,16 @@ fn plugin_problems_name_the_plugin_in_the_summary() {
             .contains("`kubelogin` did not finish within 1m0s"),
         "{}",
         error.summary().as_str()
+    );
+    // A command with whitespace is not named, so no argument shows: the generic words.
+    let unnamed = ClusterError::kube(kube::Error::Auth(AuthError::AuthExec(TIMED_OUT.to_owned())));
+    assert!(
+        unnamed
+            .summary()
+            .as_str()
+            .starts_with("authentication failed: the exec auth plugin did not finish within"),
+        "{}",
+        unnamed.summary().as_str()
     );
     let resting = ClusterError::kube(kube::Error::Auth(resting("kubelogin", Timestamp::now())));
     assert!(
