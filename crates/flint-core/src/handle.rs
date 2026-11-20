@@ -167,6 +167,9 @@ pub(crate) enum Request {
     OpenLogs {
         id: u64,
         cluster: ClusterId,
+        /// The server the session is for, as the context showed it when the tab opened (its
+        /// label); `None` for whatever the context shows when the core takes the request.
+        server: Option<Option<String>>,
         subject: LogSubject,
         options: LogOptions,
         snapshots: watch::Sender<Arc<LogSnapshot>>,
@@ -189,6 +192,9 @@ pub(crate) enum Request {
     /// started with it is pinned to.
     WriteClient {
         cluster: ClusterId,
+        /// The server the session is for (its tab's), if it names one: refused if the context
+        /// shows another.
+        server: Option<Option<String>>,
         reply: oneshot::Sender<Result<(kube::Client, ContextPin), WriteRefusal>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
@@ -478,7 +484,35 @@ impl CoreHandle {
         subject: impl Into<LogSubject>,
         options: LogOptions,
     ) -> LogSession {
-        let subject = subject.into();
+        self.open_logs_with(cluster, None, subject.into(), options)
+    }
+
+    /// As [`CoreHandle::open_logs`], for the context's definition at `server`: the server the
+    /// tab showing it is labelled with, as the cluster list gave it. A session for a server that
+    /// is not the context's confirmed one (a fallback, or one the context has since left) ends
+    /// at its first client lookup, so it never reads from another server (UP-06).
+    pub fn open_logs_at(
+        &self,
+        cluster: &str,
+        server: Option<&str>,
+        subject: impl Into<LogSubject>,
+        options: LogOptions,
+    ) -> LogSession {
+        self.open_logs_with(
+            cluster,
+            Some(server.map(str::to_owned)),
+            subject.into(),
+            options,
+        )
+    }
+
+    fn open_logs_with(
+        &self,
+        cluster: &str,
+        server: Option<Option<String>>,
+        subject: LogSubject,
+        options: LogOptions,
+    ) -> LogSession {
         let (snapshots, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
         rx.mark_changed();
         let (paused, paused_rx) = watch::channel(false);
@@ -486,6 +520,7 @@ impl CoreHandle {
         let _ = self.requests.try_send(Request::OpenLogs {
             id,
             cluster: cluster.to_owned(),
+            server,
             subject: subject.clone(),
             options: options.clone(),
             snapshots,
@@ -552,7 +587,7 @@ impl CoreHandle {
         // auth plugin again (the cached client may hold it back after a timed-out refresh).
         crate::auth_plugin::retry_now(&request.cluster);
         let (session, channels) = ExecSession::new(request.clone());
-        let client = self.write_client(&request.cluster);
+        let client = self.write_client(&request.cluster, request.server.clone());
         let requests = self.requests.clone();
         let cluster = request.cluster.clone();
         self.runtime.spawn(async move {
@@ -571,11 +606,13 @@ impl CoreHandle {
     fn write_client(
         &self,
         cluster: &str,
+        server: Option<Option<String>>,
     ) -> impl Future<Output = Result<(kube::Client, ContextPin), WriteRefusal>> + Send + 'static
     {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::WriteClient {
             cluster: cluster.to_owned(),
+            server,
             reply,
         });
         async move {
@@ -897,7 +934,7 @@ fn context_check(
         let (reply, rx) = oneshot::channel();
         let sent = requests.try_send(Request::CheckContext {
             cluster: cluster.clone(),
-            pin,
+            pin: pin.clone(),
             reply,
         });
         Box::pin(async move {
