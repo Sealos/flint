@@ -1255,6 +1255,8 @@ impl Render for ResourceList {
                 })
                 .into_any_element(),
         };
+        // The rows have focus (not the filter): ringed, as Tab between panes shows (UP-33).
+        let focused = self.focus.is_focused(window);
         v_flex()
             .id("resource-list")
             .key_context(CONTEXT)
@@ -1262,9 +1264,17 @@ impl Render for ResourceList {
             .map(|el| Self::register_actions(el, cx))
             .size_full()
             .min_w_0()
+            .relative()
             .child(self.render_toolbar(theme, cx))
             .children(self.banners(theme))
             .child(body)
+            .when(focused, |el| {
+                el.child(
+                    super::theme::pane_focus_ring(theme)
+                        .id("list-focus-ring")
+                        .test_support(),
+                )
+            })
     }
 }
 

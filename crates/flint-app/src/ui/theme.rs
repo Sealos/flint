@@ -83,6 +83,17 @@ pub fn cursor_ring(theme: &Theme, on: bool) -> Hsla {
     }
 }
 
+/// The focus ring around a whole pane that has keyboard focus (the list, the detail pane):
+/// the cursor ring's colour on an overlay drawn over the pane's edge, so the pane's layout does
+/// not change with focus and clicks go to what is under it. Put it last in a `relative()` pane.
+pub fn pane_focus_ring(theme: &Theme) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .border_1()
+        .border_color(cursor_ring(theme, true))
+}
+
 /// The accent edge that marks a selected row or item, drawn beside its tint: the tint alone is too
 /// faint to tell selected apart. Put it in a `relative()` element; `inset` keeps it off the
 /// element's top and bottom, so it sits clear of rounded corners.

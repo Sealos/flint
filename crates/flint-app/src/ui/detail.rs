@@ -1409,8 +1409,10 @@ fn timestamp_age(text: &str, now: i64) -> Option<String> {
 }
 
 impl Render for DetailView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // The pane itself has focus (Tab between panes, UP-33): ringed.
+        let focused = self.focus.is_focused(window);
         let cx: &mut Context<Self> = cx;
         let content: AnyElement = match (&self.fetch, self.tab) {
             (Fetch::Loading, _) => h_flex()
@@ -1469,9 +1471,17 @@ impl Render for DetailView {
             .size_full()
             .min_w_0()
             .bg(theme.background)
+            .relative()
             .child(self.render_header(&theme, cx))
             .children(self.render_notices(&theme))
             .child(content)
+            .when(focused, |el| {
+                el.child(
+                    super::theme::pane_focus_ring(&theme)
+                        .id("detail-focus-ring")
+                        .test_support(),
+                )
+            })
     }
 }
 

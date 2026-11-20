@@ -466,3 +466,36 @@ async fn the_sidebar_cursor_scrolls_into_view(cx: &mut TestAppContext) {
         "the cursor's row was not brought into view"
     );
 }
+
+// covers UP-33: Tab to the list or the detail pane rings the pane with the focus ring, and the
+// ring goes with focus; a click on a row still reaches the row under it.
+#[gpui_kit::test]
+async fn the_list_and_the_detail_pane_show_focus(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    pods_with_detail(cx, &t).await;
+    let rings = |cx: &mut TestAppContext| {
+        (
+            t.find(cx, "list-focus-ring").is_some(),
+            t.find(cx, "detail-focus-ring").is_some(),
+        )
+    };
+    t.focus_workspace(cx);
+    assert_eq!(rings(cx), (false, false));
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    assert_eq!(focus(cx, &t), Focus::List);
+    assert_eq!(rings(cx), (true, false));
+    t.press(cx, "tab");
+    assert_eq!(focus(cx, &t), Focus::Detail);
+    assert_eq!(rings(cx), (false, true));
+    t.press(cx, "tab");
+    assert_eq!(rings(cx), (false, false));
+    // The ring is drawn over the list's edge, not over its rows' clicks.
+    t.press(cx, "shift-tab");
+    t.press(cx, "shift-tab");
+    assert_eq!(rings(cx), (true, false));
+    t.click(cx, "row-uid-api");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+}
