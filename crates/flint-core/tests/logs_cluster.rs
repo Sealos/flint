@@ -141,7 +141,7 @@ i=0; while true; do
   i=$((i+1)); sleep 0.05
 done"#;
 
-// covers UP-40, UP-42
+// covers UP-40, UP-42, UP-43
 #[tokio::test]
 #[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
 async fn follows_a_chatty_pod_within_the_buffer_and_across_cluster_switches() {
