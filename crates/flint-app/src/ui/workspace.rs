@@ -607,10 +607,8 @@ impl Workspace {
         self.close_list();
         let core = self.model.read(cx).core().clone();
         let namespaces = self.ui_state.namespace_filter(&cluster).to_vec();
-        let (kind, label) = (entry.id.clone(), entry.label.clone());
-        let list = cx.new(|cx| {
-            ResourceList::new(core, cluster.clone(), kind, label, namespaces, window, cx)
-        });
+        let list =
+            cx.new(|cx| ResourceList::new(core, cluster.clone(), entry, namespaces, window, cx));
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
         let focus = list.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
@@ -771,16 +769,20 @@ impl Workspace {
             // lines of the file, credentials included (as the MCP server does).
             let summary = safe_error_summary(error);
             let detail = format!("{}\n{summary}", path.display());
-            list = list.child(
+            list = list.child({
+                let text = format!("{}: {summary}", display::file_name(path));
                 div()
                     .id(SharedString::from(format!("kubeconfig-error-{i}")))
+                    .aria_label(text.clone())
+                    .aria_description(detail.clone())
                     .px_2()
                     .pt_2()
                     .text_xs()
                     .text_color(theme.danger)
-                    .child(format!("{}: {summary}", display::file_name(path)))
-                    .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx)),
-            );
+                    .child(text)
+                    .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
+                    .test_support()
+            });
         }
         if let Some(error) = &model.last_error {
             list = list.child(
@@ -881,8 +883,13 @@ impl Workspace {
             })
             .test_support();
 
+        let tooltip = hover_text.clone();
         h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
+            // Named for assistive technology (and view tests): the short title, then the
+            // tooltip's full context, server and state.
+            .aria_label(title.clone())
+            .aria_description(tooltip)
             .gap_2()
             .px_1p5()
             .py_1()
@@ -941,6 +948,7 @@ impl Workspace {
                 row.child(Tag::secondary().outline().xsmall().flex_none().child("AI"))
             })
             .child(self.render_exposure_toggle(&name, server, exposure, settings_ok))
+            .test_support()
             .into_any_element()
     }
 
@@ -1134,7 +1142,7 @@ impl Workspace {
     }
 
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
-        let this = cx.entity();
+        let this = cx.weak_entity();
         let input = self.namespace_input.clone();
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
@@ -1147,6 +1155,9 @@ impl Workspace {
             )
             .content(move |_, _, cx| {
                 let theme = cx.theme().clone();
+                let Some(this) = this.upgrade() else {
+                    return v_flex();
+                };
                 let ws = this.read(cx);
                 let filter = ws
                     .cluster
@@ -1396,7 +1407,13 @@ fn confirm_expose(
         alert
             .confirm()
             .title(dialog.title)
-            .description(dialog.text.clone())
+            .description(
+                div()
+                    .id("expose-description")
+                    .aria_label(dialog.text.clone())
+                    .child(dialog.text.clone())
+                    .test_support(),
+            )
             .ok_text(dialog.ok)
             .cancel_text(dialog.cancel)
             .on_ok(move |_, _, cx| {
@@ -1447,6 +1464,8 @@ fn sidebar_error(
     let tip = summary.clone();
     div()
         .id(id)
+        .aria_label(message)
+        .aria_description(summary.clone())
         .mx_1()
         .mb_2()
         .px_2()
@@ -1465,6 +1484,7 @@ fn sidebar_error(
                 .child(summary),
         )
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .test_support()
         .into_any_element()
 }
 
@@ -1490,12 +1510,19 @@ fn empty_state(model: &ClustersModel, theme: &Theme) -> AnyElement {
         .gap_1()
         .text_sm()
         .text_color(theme.muted_foreground)
-        .child("No contexts found in your kubeconfig files.")
+        .child(
+            div()
+                .id("kubeconfig-empty")
+                .aria_label("No contexts found in your kubeconfig files.")
+                .child("No contexts found in your kubeconfig files.")
+                .test_support(),
+        )
         .child({
             let line = format!("KUBECONFIG: {kubeconfig_env}");
             let tip = line.clone();
             div()
                 .id("kubeconfig-env")
+                .aria_label(line.clone())
                 .text_xs()
                 .pt_1()
                 .truncate()
@@ -1520,6 +1547,7 @@ fn empty_state(model: &ClustersModel, theme: &Theme) -> AnyElement {
                     // of wrapping mid-name.
                     div()
                         .id(("searched-path", i))
+                        .aria_label(line.clone())
                         .text_xs()
                         .pl_2()
                         .truncate()
@@ -1593,7 +1621,7 @@ fn header_controls(
 ) -> HeaderControls {
     let failed = matches!(cluster.state, ConnectionState::Failed(_));
     HeaderControls {
-        namespaces: !failed && list.is_none_or(|l| l.shown().0.namespaced),
+        namespaces: !failed && list.is_none_or(|l| l.namespaced()),
         watch_mode: !failed,
     }
 }
@@ -1770,6 +1798,34 @@ mod tests {
         // No active cluster: navigation is hidden and takes no room from the sidebar.
         let welcome = layout(&saved, 650., false, false);
         assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
+    }
+
+    // covers UP-07, UP-08
+    #[test]
+    fn the_expose_confirmation_names_the_context_and_servers() {
+        let dialog = super::expose_dialog("kind-dev", "https://127.0.0.1:6443", None);
+        assert_eq!(
+            (dialog.title, dialog.ok, dialog.cancel),
+            ("Expose to AI agents?", "Expose", "Cancel")
+        );
+        assert!(
+            dialog
+                .text
+                .contains("Context: kind-dev\nServer: https://127.0.0.1:6443")
+        );
+        assert!(dialog.text.contains("cannot change anything"));
+        assert!(!dialog.text.contains("different server"));
+        let moved = super::expose_dialog(
+            "kind-dev",
+            "https://127.0.0.1:6443",
+            Some("https://10.0.0.1:6443"),
+        );
+        assert!(moved.text.contains("Server: https://127.0.0.1:6443"));
+        assert!(
+            moved
+                .text
+                .contains("exposed at https://10.0.0.1:6443, which is a different server")
+        );
     }
 
     // covers UP-21

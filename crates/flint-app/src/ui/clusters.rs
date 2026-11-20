@@ -391,3 +391,7 @@ mod tests {
         assert_eq!(Presence::Idle.name(), "idle");
     }
 }
+
+#[cfg(test)]
+#[path = "clusters_tests.rs"]
+mod view_tests;

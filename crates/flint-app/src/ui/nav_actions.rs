@@ -319,3 +319,7 @@ mod tests {
         assert!(retry_shown(cx));
     }
 }
+
+#[cfg(test)]
+#[path = "nav_tests.rs"]
+mod view_tests;

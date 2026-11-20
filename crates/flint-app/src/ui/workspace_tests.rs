@@ -1,89 +1,50 @@
 //! View tests for the workspace's actions: through the registry, through clicks and keys, and
 //! with focus on the workspace itself (the actions forwarded to the list and detail pane).
 
+use flint_core::ClusterId;
 use flint_core::settings::AiExposureState;
-use flint_core::{KindId, NavEntry};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, TestAppContext};
+use gpui_kit::{AppContext as _, Entity, FocusHandle, TestAppContext};
 use serde_json::{Value, json};
 
-use crate::ui::detail::DetailTab;
+use super::Workspace;
+use crate::ui::detail::{DetailTab, DetailView};
 use crate::ui::dock::{DockItem as _, DockTab, TabStatus};
+use crate::ui::list::ResourceList;
+use crate::ui::nav::NavPanel;
 use crate::ui::registry::{self, ActionError};
-use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
+use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace};
 use crate::ui::view_state::Focus;
 
-/// Selects `cluster` and waits until the workspace follows.
-async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
-    dispatch(
-        cx,
-        t,
-        "workspace::SelectCluster",
-        json!({ "cluster": cluster }),
-    )
-    .unwrap();
-    let workspace = t.workspace.clone();
-    cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).cluster.as_deref() == Some(cluster)
-    })
-    .await;
-}
+/// Test hooks into the workspace's private state, for the view tests of every module
+/// (`support_tests.rs`).
+impl Workspace {
+    /// The cluster the main area shows.
+    pub(in crate::ui) fn shown_cluster(&self) -> Option<&str> {
+        self.cluster.as_deref()
+    }
 
-/// Opens Pods on the active cluster with `rows`, fed by hand.
-async fn open_pods(cx: &mut TestAppContext, t: &TestWorkspace, rows: &[(&str, &str, i64)]) {
-    let entry = NavEntry {
-        id: KindId::pods(),
-        label: "Pods".into(),
-        kind: "Pod".into(),
-        api_version: "v1".into(),
-        namespaced: true,
-        listable: true,
-        watchable: true,
-    };
-    let workspace = t.workspace.clone();
-    let snapshot = pods(rows);
-    cx.update_window(t.window, |_, window, cx| {
-        workspace.update(cx, |ws, cx| {
-            ws.open_kind(&entry, window, cx);
-            let list = ws.list.clone().unwrap();
-            list.update(cx, |list, cx| {
-                list.stop_watching();
-                list.set_snapshot(snapshot, cx);
-            });
-        })
-    })
-    .unwrap();
-    let first = gpui_kit::SharedString::from(format!("row-uid-{}", rows[0].1));
-    cx.wait_for(t.window, WAIT, move |window, _| {
-        window.try_find(first.clone()).is_some()
-    })
-    .await;
-}
+    pub(in crate::ui) fn list_view(&self) -> Option<Entity<ResourceList>> {
+        self.list.clone()
+    }
 
-fn dispatch(
-    cx: &mut TestAppContext,
-    t: &TestWorkspace,
-    name: &str,
-    args: Value,
-) -> Result<(), ActionError> {
-    cx.update_window(t.window, |_, window, cx| {
-        registry::dispatch(name, args, window, cx)
-    })
-    .unwrap()
-}
+    pub(in crate::ui) fn detail_view(&self) -> Option<Entity<DetailView>> {
+        self.detail.clone()
+    }
 
-fn selected(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
-    t.workspace.read_with(cx, |ws, cx| {
-        ws.list.as_ref().and_then(|l| l.read(cx).selected_name())
-    })
-}
+    pub(in crate::ui) fn nav_view(&self) -> Entity<NavPanel> {
+        self.nav.clone()
+    }
 
-fn focus_workspace(cx: &mut TestAppContext, t: &TestWorkspace) {
-    let focus = t.workspace.read_with(cx, |ws, _| ws.focus.clone());
-    cx.update_window(t.window, |_, window, cx| window.focus(&focus, cx))
-        .unwrap();
-    cx.run_until_parked();
+    pub(in crate::ui) fn focus_handle_for_tests(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    /// The namespace filter remembered for `cluster`.
+    pub(in crate::ui) fn namespace_filter_of(&self, cluster: &ClusterId) -> Vec<String> {
+        self.ui_state.namespace_filter(cluster).to_vec()
+    }
 }
 
 // A registered action reaches the workspace with nothing else focused, does what the cluster
@@ -108,15 +69,10 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
     assert!(!offered.contains(&"workspace::RetryConnection"));
 
     assert!(matches!(
-        dispatch(
-            cx,
-            &t,
-            "workspace::SelectCluster",
-            json!({"cluster": "gamma"})
-        ),
+        t.dispatch(cx, "workspace::SelectCluster", json!({"cluster": "gamma"})),
         Err(ActionError::Rejected { .. })
     ));
-    activate(cx, &t, "beta").await;
+    t.activate(cx, "beta").await;
     // Nothing listens on beta's port: the sidebar and the main pane say so, naming the server.
     let refused = format!(
         "connection refused by {}; is the API server running, and is the port right?",
@@ -151,18 +107,17 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
     assert!(!offered.contains(&"resource_list::SelectNext"));
     assert!(!offered.contains(&"detail::Close"));
     assert_eq!(
-        dispatch(cx, &t, "detail::Refresh", Value::Null),
+        t.dispatch(cx, "detail::Refresh", Value::Null),
         Err(ActionError::NotAvailable("detail::Refresh".into()))
     );
     // Hiding a hidden cluster would do nothing.
     assert!(matches!(
-        dispatch(cx, &t, "workspace::HideFromAi", json!({"cluster": "beta"})),
+        t.dispatch(cx, "workspace::HideFromAi", json!({"cluster": "beta"})),
         Err(ActionError::Rejected { .. })
     ));
     // Namespace names are trimmed; blank ones are refused.
-    dispatch(
+    t.dispatch(
         cx,
-        &t,
         "workspace::SetNamespaces",
         json!({"namespaces": [" demo "]}),
     )
@@ -172,12 +127,7 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
         .read_with(cx, |ws, _| ws.ui_state.namespace_filter("beta").to_vec());
     assert_eq!(filter, ["demo"]);
     assert!(matches!(
-        dispatch(
-            cx,
-            &t,
-            "workspace::AddNamespace",
-            json!({"namespace": "  "})
-        ),
+        t.dispatch(cx, "workspace::AddNamespace", json!({"namespace": "  "})),
         Err(ActionError::Rejected { .. })
     ));
 }
@@ -187,25 +137,24 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
 async fn list_and_detail_actions_work_from_the_workspace(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(cx, &t, &[("demo", "api", 0), ("demo", "web", 1)]).await;
-    focus_workspace(cx, &t);
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 1)])
+        .await;
+    t.focus_workspace(cx);
 
-    dispatch(
+    t.dispatch(
         cx,
-        &t,
         "resource_list::SelectRow",
         json!({"namespace": "demo", "name": "api"}),
     )
     .unwrap();
-    assert_eq!(selected(cx, &t).as_deref(), Some("api"));
-    focus_workspace(cx, &t);
-    dispatch(cx, &t, "resource_list::SelectNext", Value::Null).unwrap();
-    assert_eq!(selected(cx, &t).as_deref(), Some("web"));
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    t.focus_workspace(cx);
+    t.dispatch(cx, "resource_list::SelectNext", Value::Null)
+        .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
     assert!(matches!(
-        dispatch(
+        t.dispatch(
             cx,
-            &t,
             "resource_list::SelectRow",
             json!({"namespace": "demo", "name": "nope"})
         ),
@@ -213,14 +162,14 @@ async fn list_and_detail_actions_work_from_the_workspace(cx: &mut TestAppContext
     ));
     // The kind has no -o wide columns, so the toggle is not offered.
     assert_eq!(
-        dispatch(cx, &t, "resource_list::ToggleWide", Value::Null),
+        t.dispatch(cx, "resource_list::ToggleWide", Value::Null),
         Err(ActionError::NotAvailable(
             "resource_list::ToggleWide".into()
         ))
     );
 
-    focus_workspace(cx, &t);
-    dispatch(cx, &t, "detail::ShowYaml", Value::Null).unwrap();
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::ShowYaml", Value::Null).unwrap();
     let workspace = t.workspace.clone();
     let state = cx
         .update_window(t.window, |_, window, cx| {
@@ -233,10 +182,10 @@ async fn list_and_detail_actions_work_from_the_workspace(cx: &mut TestAppContext
         .workspace
         .read_with(cx, |ws, cx| ws.detail.as_ref().map(|d| d.read(cx).tab()));
     assert_eq!(tab, Some(DetailTab::Yaml));
-    dispatch(cx, &t, "detail::Close", Value::Null).unwrap();
+    t.dispatch(cx, "detail::Close", Value::Null).unwrap();
     cx.run_until_parked();
     assert!(t.workspace.read_with(cx, |ws, _| ws.detail.is_none()));
-    assert_eq!(selected(cx, &t), None);
+    assert_eq!(t.selected(cx), None);
 }
 
 // Clicks keep focus where it is (a click in the detail pane leaves it on the list), and the
@@ -245,10 +194,8 @@ async fn list_and_detail_actions_work_from_the_workspace(cx: &mut TestAppContext
 async fn clicks_keep_focus_and_keys_follow(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(
+    t.open_pods(
         cx,
-        &t,
         &[("demo", "api", 0), ("demo", "db", 2), ("demo", "web", 1)],
     )
     .await;
@@ -259,14 +206,14 @@ async fn clicks_keep_focus_and_keys_follow(cx: &mut TestAppContext) {
         window.try_find("detail").is_some()
     })
     .await;
-    assert_eq!(selected(cx, &t).as_deref(), Some("api"));
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
     cx.update_window(t.window, |_, window, cx| {
         window.click("detail", cx);
         window.press("down", cx);
     })
     .unwrap();
     cx.run_until_parked();
-    assert_eq!(selected(cx, &t).as_deref(), Some("db"));
+    assert_eq!(t.selected(cx).as_deref(), Some("db"));
     let list_focused = cx
         .update_window(t.window, |_, window, cx| {
             let list = t.workspace.read(cx).list.clone().unwrap();
@@ -276,12 +223,12 @@ async fn clicks_keep_focus_and_keys_follow(cx: &mut TestAppContext) {
     assert!(list_focused);
 
     // With focus on the workspace, the arrows still move the selection and Esc closes the pane.
-    focus_workspace(cx, &t);
+    t.focus_workspace(cx);
     cx.update_window(t.window, |_, window, cx| window.press("down", cx))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(selected(cx, &t).as_deref(), Some("web"));
-    focus_workspace(cx, &t);
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    t.focus_workspace(cx);
     cx.update_window(t.window, |_, window, cx| window.press("escape", cx))
         .unwrap();
     cx.run_until_parked();
@@ -294,9 +241,8 @@ async fn clicks_keep_focus_and_keys_follow(cx: &mut TestAppContext) {
 async fn focus_comes_back_after_a_cluster_switch(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(cx, &t, &[("demo", "api", 0)]).await;
-    activate(cx, &t, "beta").await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.activate(cx, "beta").await;
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |window, cx| {
         workspace.read(cx).focus.is_focused(window)
@@ -310,7 +256,8 @@ async fn focus_comes_back_after_a_cluster_switch(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert!(available);
-    dispatch(cx, &t, "workspace::ShowAllNamespaces", Value::Null).unwrap();
+    t.dispatch(cx, "workspace::ShowAllNamespaces", Value::Null)
+        .unwrap();
 }
 
 // What a palette shows: the actions available from the element focused before it opened, with
@@ -319,8 +266,7 @@ async fn focus_comes_back_after_a_cluster_switch(cx: &mut TestAppContext) {
 async fn a_palette_can_list_actions_with_shortcuts(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(cx, &t, &[("demo", "api", 0)]).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
     let list = t.workspace.read_with(cx, |ws, _| ws.list.clone().unwrap());
     let (names, shortcut) = cx
         .update_window(t.window, |_, window, cx| {
@@ -351,7 +297,8 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
             .unwrap()
     };
 
-    dispatch(cx, &t, "workspace::ExposeToAi", json!({"cluster": "alpha"})).unwrap();
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
     // The automation state says what the dialog asks.
@@ -365,15 +312,16 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
     assert_eq!(dialog.title, "Expose to AI agents?");
     assert!(dialog.text.contains("Context: alpha"), "{}", dialog.text);
     assert_eq!(dialog.buttons, ["Expose", "Cancel"]);
-    dispatch(cx, &t, "ui::Cancel", Value::Null).unwrap();
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
         .await;
     assert!(!has_dialog(cx));
 
-    dispatch(cx, &t, "workspace::ExposeToAi", json!({"cluster": "alpha"})).unwrap();
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
         .await;
-    dispatch(cx, &t, "ui::Confirm", Value::Null).unwrap();
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         let model = model.read(cx);
@@ -393,11 +341,9 @@ async fn the_expose_dialog_answers_confirm_and_cancel(cx: &mut TestAppContext) {
 async fn set_pane_width_keeps_the_width_a_narrow_window_cannot_show(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(cx, &t, &[("demo", "api", 0)]).await;
-    dispatch(
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(
         cx,
-        &t,
         "resource_list::SelectRow",
         json!({"namespace": "demo", "name": "api"}),
     )
@@ -408,9 +354,8 @@ async fn set_pane_width_keeps_the_width_a_narrow_window_cannot_show(cx: &mut Tes
     let before = panes(cx);
 
     // 1100 px leaves the detail pane no more than it shows already: nothing moves, nothing saved.
-    dispatch(
+    t.dispatch(
         cx,
-        &t,
         "workspace::SetPaneWidth",
         json!({"pane": "detail", "width": 600}),
     )
@@ -419,9 +364,8 @@ async fn set_pane_width_keeps_the_width_a_narrow_window_cannot_show(cx: &mut Tes
     assert_eq!(panes(cx), before);
 
     // A change the window can show is kept.
-    dispatch(
+    t.dispatch(
         cx,
-        &t,
         "workspace::SetPaneWidth",
         json!({"pane": "clusters", "width": 240}),
     )
@@ -429,9 +373,8 @@ async fn set_pane_width_keeps_the_width_a_narrow_window_cannot_show(cx: &mut Tes
     cx.run_until_parked();
     assert_eq!(panes(cx).clusters, Some(240));
     assert!(matches!(
-        dispatch(
+        t.dispatch(
             cx,
-            &t,
             "workspace::SetPaneWidth",
             json!({"pane": "clusters", "width": -1})
         ),
@@ -442,9 +385,8 @@ async fn set_pane_width_keeps_the_width_a_narrow_window_cannot_show(cx: &mut Tes
 /// Selects pod `name` and shows it in the detail pane as fetched, with containers `app`
 /// (restarted once, so it has previous logs) and `sidecar`.
 async fn show_pod(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
-    dispatch(
+    t.dispatch(
         cx,
-        t,
         "resource_list::SelectRow",
         json!({"namespace": "demo", "name": name}),
     )
@@ -470,7 +412,10 @@ async fn show_pod(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
         events_truncated: false,
         events_error: None,
     };
-    detail.update(cx, |d, cx| d.show_fetched(pod, cx));
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| d.show_fetched(pod, window, cx))
+    })
+    .unwrap();
     cx.run_until_parked();
 }
 
@@ -500,10 +445,9 @@ fn press(cx: &mut TestAppContext, t: &TestWorkspace, key: &str) {
 async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(cx, &t, &[("demo", "web", 1)]).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
     assert_eq!(
-        dispatch(cx, &t, "detail::OpenLogs", Value::Null),
+        t.dispatch(cx, "detail::OpenLogs", Value::Null),
         Err(ActionError::NotAvailable("detail::OpenLogs".into())),
         "no pod is shown yet"
     );
@@ -511,24 +455,23 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
 
     // The sidecar never restarted, so it has no previous logs.
     assert!(matches!(
-        dispatch(
+        t.dispatch(
             cx,
-            &t,
             "detail::OpenContainerLogs",
             json!({"container": "sidecar", "previous": true})
         ),
         Err(ActionError::Rejected { .. })
     ));
-    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t), (true, vec!["web · app".to_owned()]));
     // Opening it again shows the same tab.
-    focus_workspace(cx, &t);
-    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
-    dispatch(cx, &t, "detail::OpenPreviousLogs", Value::Null).unwrap();
-    dispatch(
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    t.dispatch(cx, "detail::OpenPreviousLogs", Value::Null)
+        .unwrap();
+    t.dispatch(
         cx,
-        &t,
         "detail::OpenContainerLogs",
         json!({"container": "sidecar"}),
     )
@@ -559,7 +502,7 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
     assert_eq!(active(cx), Some(0));
 
     // A cluster switch closes the list, not the dock: the sessions keep running.
-    activate(cx, &t, "beta").await;
+    t.activate(cx, "beta").await;
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t).1.len(), 3);
     let alive = first.upgrade().expect("the log tab survives the switch");
@@ -570,8 +513,9 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
     drop(alive);
 
     // The log tab's actions work from the workspace, forwarded to the tab shown.
-    focus_workspace(cx, &t);
-    dispatch(cx, &t, "logs::ToggleTimestamps", Value::Null).unwrap();
+    t.focus_workspace(cx);
+    t.dispatch(cx, "logs::ToggleTimestamps", Value::Null)
+        .unwrap();
     let names: Vec<&str> = cx
         .update_window(t.window, |_, window, cx| {
             registry::available(window, cx).map(|s| s.name).collect()
@@ -608,10 +552,9 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
 async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_pods(cx, &t, &[("demo", "web", 1)]).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
     assert_eq!(
-        dispatch(cx, &t, "detail::OpenShell", Value::Null),
+        t.dispatch(cx, "detail::OpenShell", Value::Null),
         Err(ActionError::NotAvailable("detail::OpenShell".into())),
         "no pod is shown yet"
     );
@@ -621,15 +564,14 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     })
     .unwrap();
     assert!(matches!(
-        dispatch(
+        t.dispatch(
             cx,
-            &t,
             "detail::OpenContainerShell",
             json!({"container": "nope"})
         ),
         Err(ActionError::Rejected { .. })
     ));
-    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t), (true, vec!["$ web · app".to_owned()]));
     let first = t.workspace.read_with(cx, |ws, cx| {
@@ -643,11 +585,10 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     .await;
     // An ended shell does not answer for its container: Shell opens a new one beside it. (A
     // running one is shown instead; see `terminal_tests.rs`.)
-    focus_workspace(cx, &t);
-    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
-    dispatch(
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
+    t.dispatch(
         cx,
-        &t,
         "detail::OpenContainerShell",
         json!({"container": "sidecar"}),
     )
@@ -662,7 +603,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     });
 
     // A cluster switch keeps the shells.
-    activate(cx, &t, "beta").await;
+    t.activate(cx, "beta").await;
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t).1.len(), 3);
     let alive = shell.upgrade().expect("the shell tab survives the switch");
@@ -673,7 +614,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     drop(alive);
 
     // Its actions are forwarded from the workspace, and guarded.
-    focus_workspace(cx, &t);
+    t.focus_workspace(cx);
     let names: Vec<&str> = cx
         .update_window(t.window, |_, window, cx| {
             registry::available(window, cx).map(|s| s.name).collect()
@@ -693,7 +634,8 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     let id = t
         .workspace
         .read_with(cx, |ws, cx| ws.dock.read(cx).active_id().unwrap());
-    dispatch(cx, &t, "dock::CloseTab", json!({ "tab": id })).unwrap();
+    t.dispatch(cx, "dock::CloseTab", json!({ "tab": id }))
+        .unwrap();
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t).1, ["$ web · app", "$ web · app"]);
     assert!(shell.upgrade().is_none(), "closing a tab ends its session");
@@ -704,7 +646,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
 async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    focus_workspace(cx, &t);
+    t.focus_workspace(cx);
     press(cx, &t, "secondary-j");
     assert_eq!(dock_tabs(cx, &t), (true, Vec::new()));
     cx.wait_for(t.window, WAIT, |window, _| {
@@ -712,15 +654,17 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
     })
     .await;
 
-    dispatch(cx, &t, "workspace::SetDockHeight", json!({"height": 333})).unwrap();
+    t.dispatch(cx, "workspace::SetDockHeight", json!({"height": 333}))
+        .unwrap();
     assert!(matches!(
-        dispatch(cx, &t, "workspace::SetDockHeight", json!({"height": -5})),
+        t.dispatch(cx, "workspace::SetDockHeight", json!({"height": -5})),
         Err(ActionError::Rejected { .. })
     ));
     let saved = |cx: &mut TestAppContext| t.workspace.read_with(cx, |ws, _| ws.panes.dock);
     assert_eq!(saved(cx), Some(333));
     // Taller than the 700 px window allows: the main area keeps its room.
-    dispatch(cx, &t, "workspace::SetDockHeight", json!({"height": 5000})).unwrap();
+    t.dispatch(cx, "workspace::SetDockHeight", json!({"height": 5000}))
+        .unwrap();
     assert_eq!(saved(cx), Some(540));
     cx.wait_for(t.window, WAIT, |window, _| {
         window
@@ -744,7 +688,78 @@ async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
         Some(540)
     );
 
-    focus_workspace(cx, &t);
+    t.focus_workspace(cx);
     press(cx, &t, "secondary-j");
     assert_eq!(dock_tabs(cx, &t), (false, Vec::new()));
+}
+
+// Keys meant for the list and the detail pane (Home, End, the arrows, Esc) do nothing while the
+// user types in a field: the list's filter or the namespace filter's.
+#[gpui_kit::test]
+async fn keys_typed_into_a_field_leave_the_list_and_pane_alone(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[("demo", "api", 0), ("demo", "db", 1), ("demo", "web", 2)],
+    )
+    .await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "db"}),
+    )
+    .unwrap();
+    let pane = t.detail(cx).unwrap().entity_id();
+    let unchanged = |cx: &mut TestAppContext, field: &str| {
+        assert_eq!(t.selected(cx).as_deref(), Some("db"), "{field}");
+        assert_eq!(t.detail(cx).map(|d| d.entity_id()), Some(pane), "{field}");
+    };
+
+    for field in ["list-filter", "ns-add"] {
+        if field == "ns-add" {
+            t.click(cx, "namespace-filter-button");
+            t.wait_for_element(cx, "ns-add").await;
+        }
+        t.click(cx, field);
+        let typing = cx
+            .update_window(t.window, |_, window, cx| {
+                use gpui_kit::test::TestQueryExt as _;
+                window.render_frame(cx);
+                window
+                    .find_all_by_role(gpui_kit::Role::TextInput)
+                    .iter()
+                    .any(|e| e.focused() == Some(true))
+            })
+            .unwrap();
+        assert!(typing, "{field} has focus");
+        for key in ["home", "end", "up", "down", "escape"] {
+            t.press(cx, key);
+            unchanged(cx, field);
+        }
+    }
+}
+
+// Close Window closes the front window, from the registry (the palette, automation), its key,
+// and the Window menu (an app-level dispatch).
+#[gpui_kit::test]
+async fn close_window_closes_the_window(cx: &mut TestAppContext) {
+    use crate::ui::registry::CloseWindow;
+
+    for how in ["registry", "key", "menu"] {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_workspace(cx, dir.path()).await;
+        assert!(t.available(cx).contains(&"flint::CloseWindow"));
+        // The front window, as the one the user works in is.
+        cx.update_window(t.window, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        match how {
+            "registry" => t.dispatch(cx, "flint::CloseWindow", Value::Null).unwrap(),
+            "key" => t.press_key_of(cx, "flint::CloseWindow"),
+            _ => cx.update(|cx| cx.dispatch_action(&CloseWindow)),
+        }
+        cx.run_until_parked();
+        assert!(cx.update_window(t.window, |_, _, _| ()).is_err(), "{how}");
+    }
 }

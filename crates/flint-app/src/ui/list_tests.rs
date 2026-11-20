@@ -115,15 +115,9 @@ fn open_sized(
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    let mut list = ResourceList::new(
-                        core,
-                        "test".into(),
-                        KindId::pods(),
-                        label.into(),
-                        Vec::new(),
-                        window,
-                        cx,
-                    );
+                    let entry = crate::ui::support_tests::entry("", "pods", "Pod", label, true);
+                    let mut list =
+                        ResourceList::new(core, "test".into(), &entry, Vec::new(), window, cx);
                     list.stop_watching();
                     list
                 })
@@ -497,7 +491,7 @@ async fn wide_columns_appear_only_when_toggled(cx: &mut TestAppContext) {
     .await;
 }
 
-// covers UP-33 (basic arrows), UP-23 (selection opens the detail)
+// covers UP-23 (selection opens the detail); also the list's part of UP-33 (arrows)
 #[gpui_kit::test]
 async fn clicking_and_arrows_select_rows(cx: &mut TestAppContext) {
     let (core, _dir) = core();
@@ -702,6 +696,93 @@ async fn new_columns_are_reported_before_the_next_frame(cx: &mut TestAppContext)
     assert_eq!(state.rows[0].cells, ["api", "demo", "3"]);
 }
 
+// covers UP-21, UP-27: banners over the rows. A list the user may not read in every namespace
+// says which namespaces it shows; a failed list that still has rows keeps them under a banner
+// saying they may be out of date, until it syncs again.
+#[gpui_kit::test]
+async fn banners_say_what_the_rows_cover(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    let rows = [("demo", "web", 0), ("team-a", "api", 0)];
+    let mut limited = (*pods(&rows, SyncState::Synced, 1)).clone();
+    limited.limited_to = Some(Arc::new(flint_core::NamespaceLimit {
+        listed: vec!["demo".into(), "team-a".into()],
+        denied: Vec::new(),
+        reason: "pods is forbidden".into(),
+    }));
+    list.update(cx, |list, cx| list.set_snapshot(Arc::new(limited), cx));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("list-limited").is_some()
+            && window.try_find("row-uid-api").is_some()
+            && window.try_find("list-banner").is_none()
+    })
+    .await;
+
+    list.update(cx, |list, cx| {
+        list.set_snapshot(
+            pods(
+                &rows,
+                SyncState::Failed {
+                    error: "connection refused".into(),
+                },
+                2,
+            ),
+            cx,
+        )
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("list-banner").is_some()
+            && window.try_find("row-uid-web").is_some()
+            && window.try_find("list-limited").is_none()
+    })
+    .await;
+
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&rows, SyncState::Synced, 3), cx)
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("list-banner").is_none() && window.try_find("row-uid-web").is_some()
+    })
+    .await;
+}
+
+// covers UP-21: in the main window, Home and End jump to the ends of the list, the arrows move
+// the selection, Focus Filter's key moves focus to the text filter (where typing narrows the
+// list), and the arrows leave the selection alone while typing there.
+#[gpui_kit::test]
+async fn keys_drive_the_list_in_the_main_window(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::open_workspace;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[("demo", "api", 0), ("demo", "db", 0), ("demo", "web", 0)],
+    )
+    .await;
+    t.press(cx, "end");
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    t.press(cx, "up");
+    assert_eq!(t.selected(cx).as_deref(), Some("db"));
+    t.press(cx, "home");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    let filter_focused = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("input-state").focused()
+        })
+        .unwrap();
+    assert_eq!(filter_focused, Some(true));
+    t.type_text(cx, "we");
+    let list = t.list(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| list.read(cx).shown().1 == 1)
+        .await;
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+}
+
 /// A quick measure of what one frame of a 10,000-row list costs on the UI thread (layout and
 /// paint of the visible rows, in the headless test window). Ignored: run it in release mode
 /// with `--ignored --nocapture` to compare changes to the row rendering.
@@ -732,4 +813,45 @@ async fn measure_frame_cost_with_10k_rows(cx: &mut TestAppContext) {
     }
     let per_frame = started.elapsed() / frames;
     eprintln!("10k rows: {per_frame:?} per frame (headless, {frames} frames)");
+}
+
+// A closed list is freed, with its filter's input: when another kind replaces it, and when a
+// cluster switch closes it. Nothing it registered (for the next frame, its tasks) keeps it
+// alive. With GPUI_LEAK_DETECTION=1 a failure lists the live handles.
+//
+// Not `assert_no_new_leaks`: each cluster switch also rebuilds the other cluster's screen (its
+// Retry buttons' focus handles are new and alive), which is not the list's.
+#[gpui_kit::test]
+async fn a_closed_list_is_released(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{open_workspace, pods, standard_sections};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let parts = |cx: &mut TestAppContext| {
+        let list = t.list(cx).unwrap();
+        let filter = list.read_with(cx, |l, _| l.filter.downgrade());
+        (list.downgrade(), filter)
+    };
+
+    // Replaced by another kind.
+    t.open_kind(cx, "pods", pods(&[("demo", "api", 0)])).await;
+    let (pods_list, pods_filter) = parts(cx);
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "services"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    pods_list.assert_released();
+    pods_filter.assert_released();
+
+    // Closed by a cluster switch.
+    let (services_list, services_filter) = parts(cx);
+    t.activate(cx, "beta").await;
+    cx.run_until_parked();
+    assert!(t.list(cx).is_none());
+    services_list.assert_released();
+    services_filter.assert_released();
 }

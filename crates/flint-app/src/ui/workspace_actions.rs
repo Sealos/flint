@@ -647,3 +647,11 @@ mod tests {
 #[cfg(test)]
 #[path = "workspace_tests.rs"]
 mod view_tests;
+
+#[cfg(test)]
+#[path = "header_tests.rs"]
+mod header_tests;
+
+#[cfg(test)]
+#[path = "expose_tests.rs"]
+mod expose_tests;

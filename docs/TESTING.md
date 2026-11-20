@@ -19,19 +19,64 @@ must keep working. This document covers *how* it is tested. The choices behind i
 
 Every source module has unit tests, either a `#[cfg(test)] mod tests` or a `// module-tests: <file>` line that points to
 its test file. `lib.rs`, `main.rs` and `mod.rs` are wiring and are exempt. `scripts/check-module-tests.sh` enforces
-this in CI. `scripts/module-tests-allowlist.txt` lists the modules that predate the rule. The list may only shrink.
+this in CI. `scripts/module-tests-allowlist.txt` listed the modules that predated the rule. It is empty now, and it
+stays empty.
 
 ### View tests
 
-Headless GPUI tests (`#[gpui_kit::test]`, `TestAppContext`/`VisualTestContext`) build a view on top of a real
-`CoreHandle` or a fake one. They dispatch actions and keystrokes, then assert on the view's state: rows, selection,
-banners, enabled controls. They don't render pixels and don't need a screen, so they run in normal CI. Every view
-module gets at least one.
+Headless GPUI tests (`#[gpui_kit::test]`, `TestAppContext`) build a view on top of a real `CoreHandle`. They
+dispatch registered actions, keystrokes and clicks, then assert on the view's state: rows, selection, banners, which
+controls are enabled, which dialog is open, focus. They don't render pixels and don't need a screen, so they run in
+normal CI. Every view module gets at least one.
 
-Whole-window tests (`ui/workspace_tests.rs`, helpers in `ui/support_tests.rs`) open the workspace over two kubeconfig
-contexts on 127.0.0.1: one whose server never answers (so its views stay up) and one that refuses connections. They
-drive the app through registered actions, clicks and keys, and check that the three agree. Every click handler must
-perform a registered action; `scripts/check-click-actions.sh` enforces this in CI.
+Whole-window tests open the workspace over kubeconfig contexts on 127.0.0.1 (helpers in `ui/support_tests.rs`). By
+default there are two: `alpha`, whose server accepts connections and never answers (so its views stay up), and `beta`,
+whose server refuses them. Nothing outside the test process is reached. The tests drive the app through registered
+actions, clicks and keys, and check that the three agree. Every click handler must perform a registered action;
+`scripts/check-click-actions.sh` enforces this in CI.
+
+What the silent server cannot send, a test feeds in by hand:
+
+- **Core events** (a connect, a discovery, a settings change) go through the model's own event handler, as the core's
+  event stream delivers them (`TestWorkspace::feed`, `connect_alpha`). `connect_alpha` first waits for the core's own
+  "connecting" for that activation, so a fed "connected" is never overwritten, also after a switch back.
+- **List rows** go to the open list with its watch stopped (`TestWorkspace::open_kind`, `feed_list`).
+- **A fetched object** goes into the detail pane after the real fetch has failed with "not connected". From there it
+  takes the same code a successful fetch does (`DetailView::loaded`).
+
+Settings come from a `settings.toml` the test writes, read as the app reads it at launch, so a malformed file is a
+real one.
+
+Tests wait with `cx.wait_for` and `run_until_parked`, which advance the executor's clock, never the wall clock. Only
+observed elements can be found: gpui-component controls (buttons, inputs, checkboxes, menu items, tabs, dialogs), which
+expose their label, their tooltip as the description, and whether they are disabled or focused, plus elements a view
+marks with `.test_support()`. Painted text cannot be read. Where a test needs text (a cluster row's short name and
+tooltip, the empty state, the settings banner, the Expose to AI confirmation), the view names the element for
+assistive technology with `aria_label` and `aria_description`, and marks it with `.test_support()`. Shortcuts are
+pressed as the registry binds them (`TestWorkspace::press_key_of`), so the tests follow the bindings on every
+platform.
+
+The tests sit next to the view they test, as child modules, so they can read its private state:
+
+| View | Tests | User paths |
+|---|---|---|
+| Cluster sidebar | `ui/clusters_tests.rs` | UP-01, UP-02, UP-04, UP-12 |
+| Expose to AI toggle and dialog | `ui/expose_tests.rs`, `ui/workspace_tests.rs` | UP-07, UP-08 |
+| Navigation | `ui/nav_tests.rs`, `ui/nav_actions.rs` | UP-03, UP-04, UP-20, UP-22, UP-24 |
+| Header: namespace filter, watch mode | `ui/header_tests.rs` | UP-21, UP-25 |
+| Resource list and its banners | `ui/list_tests.rs` | UP-20, UP-21, UP-27 |
+| Detail pane and its banners | `ui/detail_tests.rs` | UP-04, UP-20, UP-23 |
+| Workspace actions, focus, typing, Close Window | `ui/workspace_tests.rs` | (the registry across views) |
+| Appearance | `ui/appearance_tests.rs` | UP-32 |
+
+Together they cover the UI parts of UP-01, 02, 07, 08, 20, 21, 23, 24, 25 and 27, and part of UP-22: a CRD appears
+under its API group and opens. The rest needs a real API server, so it stays in the cluster tests: UP-22's printer
+columns, UP-24's "the old cluster's watches stop", and UP-27's recovery itself (the view tests check what the list
+shows while reconnecting). UP-33 is covered only in part: the list's arrows, Home and End are tested, but there are no
+arrow keys for the cluster sidebar yet.
+
+The list and the detail pane each have a test that closes them and checks nothing they made is left alive
+(`a_closed_list_is_released`, `a_closed_detail_pane_is_released`).
 
 ### Automation channel
 

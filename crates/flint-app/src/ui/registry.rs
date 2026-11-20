@@ -1228,9 +1228,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<Quit>("Quit Flint", "Quit the app.")
             .of(C::Flint, S::App)
             .keys(&["secondary-q"], None),
+        // In the workspace's context, not everywhere: a binding without a context outranks every
+        // other, so the dock's Cmd-W (close the tab) would never be reached.
         Spec::unit::<CloseWindow>("Close Window", "Close the front window.")
             .of(C::Flint, S::App)
-            .keys(&["secondary-w"], None),
+            .keys(&["secondary-w"], Some(WORKSPACE)),
         Spec::unit::<AppearanceSystem>(
             "Use System Appearance",
             "Follow the system light and dark mode.",
