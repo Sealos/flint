@@ -336,7 +336,7 @@ namespaces left by other tests are not.
 **Replay:** `FakeApiServer::start()` (or `start_blocking` without a runtime) serves the fixtures over HTTPS on
 `127.0.0.1` with a CA generated per server.
 
-- Aggregated discovery, Table or plain lists (by `Accept`), single objects, pod logs (`set_log`), field and label
+- Aggregated discovery, Table or plain lists (by `Accept`), single objects, pod logs (below), field and label
   selectors, `limit`/`continue`. Writes get 405: the server is read-only. Table lists refuse field selectors other
   than `metadata.name` and `metadata.namespace` with 400.
 - Watches, like a real server: without a resource version they start with the current state as `ADDED`; from a
@@ -354,7 +354,38 @@ namespaces left by other tests are not.
   matching requests (by resource, verb, namespace scope, and count).
 - Methods that take a `Gvr` panic on one the fixtures don't serve, with a suggestion. `server.gvr("deployments")`
   looks one up by plural.
-- `requests()` records every request, for asserting relists and retries.
+- `requests()` records every request, for asserting relists and retries; `log_requests()` only the log requests,
+  whose `parsed_query()` shows `since_time`, `container` and `previous`.
+- **Pod logs** answer like a real cluster for what Flint asks (`fake_api/logs.rs` cites the Kubernetes code each
+  rule comes from): per container (400 when a multi-container pod gets none, or an unknown name) and per instance
+  (`previous`; a CrashLoopBackOff container serves its last instance; a waiting one is a 400 "is waiting to start");
+  `tailLines` first, then `sinceSeconds`/`sinceTime` (to the second, a line at that instant kept); `timestamps` as
+  `2026-01-01T00:00:00.000000000Z ` prefixes; `limitBytes`; 422 for invalid options. `follow=true` stays open while
+  the container runs and ends cleanly when it stops; a stopped container or a previous instance is read to its end.
+  A log nobody wrote holds three canned lines from just before the server started; pods added by tests start empty.
+- **Driving logs:** a `ContainerLog::new(ns, pod)` (`.container(c)`, `.previous()`) names a log. `append_log`
+  writes lines stamped now, each strictly after the last line written now, and pushes them to open streams;
+  `append_log_at` stamps them at a given time (to script lines sharing a second for resume tests) and leaves "now"
+  alone. `set_log` / `set_container_log` replace a log. `end_log_streams` ends open streams cleanly (EOF, the pod
+  stays, so Flint reconnects from its last timestamp); `drop_log_streams` breaks them. `limitBytes` cuts at exactly
+  that many bytes (even inside a character) and ends the stream. `open_log_streams()` counts open followed streams (a
+  stream closes when its client goes away) and `wait_for_log_streams(n, within)` waits until exactly `n` are open,
+  for "closing the tab closes the stream". To refuse one pod's log, narrow a fault:
+  `Fault::forbidden().on(&pods).named(pod).subresource("log")`.
+- **Pod churn:** `pod(ns, name)` returns a pod's object as a `FakePod`; `.sibling(name)` makes another pod of the same
+  workload (labels, owner, spec; new uid, fresh running status), and `FakePod::new(ns, name, &containers)` builds one
+  (`.label`, `.owner`, `.waiting`, `.terminated`, `.restarted`). Phases follow the kubelet's `getPhase` and Table
+  cells its `printPod` (the Restarts age is rendered when served, as Age is). Every change below is a watch event
+  carrying the object as it was at that change.
+  - `add_pod` sends `ADDED`; a pod built `.waiting(c, "ContainerCreating")` is Pending until `start_container`, which
+    keeps its uid (`MODIFIED`).
+  - `crash_container` stops a container (exit 1): its streams end and, until `start_container` starts the next
+    instance, a log request reads the stopped one, as the kubelet serves it. `start_container` then keeps that log
+    as the previous one, with one more restart. `restart_container` does both at once.
+  - `delete_pod` deletes gracefully: `MODIFIED` with a `deletionTimestamp` (Terminating), then the containers stop
+    (exit 0, a terminal phase), their streams end and the pod and its logs stay readable until `finish_delete`
+    sends `DELETED`. `force_delete_pod` skips Terminating. `replace_pod` deletes and finishes the old pod, then adds
+    the new one (the same name gives a recreated pod with another uid).
 - **Wiring:** `write_kubeconfig(path, namespace)` writes a kubeconfig that trusts the server's CA.
   `write_kubeconfigs` puts several servers in one file under their own context names (UP-01, UP-06, UP-24).
 - **Timing:** `CoreConfig::watch_timing` shortens the core's retry waits; e2e tests use 10–50 ms.
@@ -447,7 +478,7 @@ Which tests cover each user path today, and what is missing, is in [`E2E-COVERAG
 short: with #100, M0 and M1 have app e2e tests for every automatable path. M2 is tested only below the app. Core tests
 read real streams on kind, and view tests feed the log buffer or a `FakeExec` directly. So no test has the real app
 reading a real log or exec stream. Two things block that. The automation `state` has no dock. The fake API server
-answers `/log` with one finite body (only `tailLines` is read), answers exec with 404 and writes with 405.
+answers exec with 404 and writes with 405. (Its logs stream since #120.)
 
 The Mac mini session owns the harness and macOS CI (#40, #100, #42, #117). Harness and fake-server work is in
 milestone T; feature tests are in their feature's milestone.

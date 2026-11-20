@@ -112,11 +112,63 @@ impl Clock {
         self.now_at_start + i64::try_from(self.started.elapsed().as_secs()).unwrap_or(0)
     }
 
+    /// The server's current time, to the nanosecond (log line timestamps).
+    pub fn now_precise(&self) -> Timestamp {
+        let elapsed = self.started.elapsed();
+        Timestamp::from_second(self.now_at_start)
+            .ok()
+            .and_then(|start| start.checked_add(elapsed).ok())
+            .unwrap_or(Timestamp::UNIX_EPOCH)
+    }
+
+    /// The instant the server started (fixture time [`FIXTURE_NOW`] in the server's time).
+    pub fn start(&self) -> Timestamp {
+        Timestamp::from_second(self.now_at_start).unwrap_or(Timestamp::UNIX_EPOCH)
+    }
+
+    /// The server's current time in fixture time, as objects are stored: new objects take
+    /// timestamps from here, and [`Clock::rebase`] shifts them to "now" on the way out.
+    pub fn fixture_now(&self) -> String {
+        format(self.now() - self.shift, 0)
+    }
+
     /// Shifts every timestamp in a response from fixture time to the server's time, and renders
     /// `Age` cells of a Table from the rows' creation times.
     pub fn rebase(&self, value: &mut Value) {
         map_timestamps(value, &|s| s + self.shift);
         self.render_ages(value);
+        self.render_restarts(value);
+    }
+
+    /// Renders `"<n> (<age> ago)"` in the Restarts cells of rows that carry their last restart
+    /// ([`super::FakeRow::with_last_restart`]), and drops that marker.
+    fn render_restarts(&self, value: &mut Value) {
+        let Some(rows) = value.get_mut("rows").and_then(Value::as_array_mut) else {
+            return;
+        };
+        let now = self.now();
+        for row in rows {
+            let Some(marker) = row
+                .as_object_mut()
+                .and_then(|r| r.remove(super::row::LAST_RESTART))
+            else {
+                continue;
+            };
+            let at = marker["at"].as_str().and_then(parse);
+            let index = marker["cell"]
+                .as_u64()
+                .and_then(|i| usize::try_from(i).ok());
+            if let (Some((at, _)), Some(cell)) =
+                (at, index.and_then(|i| row.get_mut("cells")?.get_mut(i)))
+            {
+                let count = cell.as_str().unwrap_or("0").to_owned();
+                *cell = format!(
+                    "{count} ({} ago)",
+                    flint_core::table::human_duration(now - at)
+                )
+                .into();
+            }
+        }
     }
 
     fn render_ages(&self, value: &mut Value) {
@@ -194,5 +246,16 @@ mod tests {
         );
         assert_eq!(table["eventTime"], format(1_900_000_000, 6));
         assert!(clock.now() >= 1_900_000_000);
+        // A restart five minutes before the start, rendered relative to now.
+        let mut rows = json!({"rows": [{"cells": ["web", "2"], "fakeLastRestart": {
+            "cell": 1, "at": format(FIXTURE_NOW_SECONDS - 300, 0)}}]});
+        clock.rebase(&mut rows);
+        assert_eq!(rows["rows"][0]["cells"][1], "2 (5m ago)");
+        assert!(rows["rows"][0].get("fakeLastRestart").is_none());
+        assert_eq!(clock.start().as_second(), 1_900_000_000);
+        assert!(clock.now_precise() >= clock.start());
+        // Fixture time runs from FIXTURE_NOW at the start.
+        let (fixture_now, _) = parse(&clock.fixture_now()).unwrap();
+        assert!((FIXTURE_NOW_SECONDS..FIXTURE_NOW_SECONDS + 60).contains(&fixture_now));
     }
 }

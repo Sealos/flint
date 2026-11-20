@@ -24,6 +24,7 @@ use super::clock::Clock;
 use super::faults::{self, Effect, Fault, Faults};
 use super::fixtures::{FIXTURES_DIR, Fixtures, Gvr, Layout};
 use super::kubeconfig;
+use super::logs::{self, Chunk, LogQuery, Logs};
 use super::route::{Query, Route, Verb};
 use super::row::FakeRow;
 use super::state::{ApiError, Change, State};
@@ -111,6 +112,8 @@ struct Inner {
     options: Options,
     clock: Clock,
     state: Arc<Mutex<State>>,
+    /// Pod logs and their open streams. Locked after `state` when both are needed.
+    logs: Mutex<Logs>,
     faults: Mutex<Faults>,
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
@@ -169,9 +172,11 @@ impl FakeApiServer {
             .context("binding the fake API server")?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown) = watch::channel(());
+        let clock = Clock::new(options.now);
         let inner = Arc::new(Inner {
             state: Arc::new(Mutex::new(State::new(&fixtures))),
-            clock: Clock::new(options.now),
+            logs: Mutex::new(Logs::new(clock.clone())),
+            clock,
             fixtures,
             options,
             faults: Mutex::default(),
@@ -345,11 +350,6 @@ impl FakeApiServer {
         self.remove_row(gvr, namespace, name)
     }
 
-    /// Sets the text `GET .../pods/<pod>/log` returns (default: three canned lines).
-    pub fn set_log(&self, namespace: &str, pod: &str, text: &str) {
-        lock(&self.inner.state).set_log(namespace, pod, text);
-    }
-
     /// Queues a script for the next watch request on `gvr`, in any namespace. Each watch takes
     /// the next queued script; after its steps (and without one), the stream stays open until
     /// the request's `timeoutSeconds`, sending only what [`FakeApiServer::send_watch`] sends.
@@ -388,9 +388,15 @@ impl FakeApiServer {
             Some(("DELETED", row)) if state.row(gvr, row.namespace(), row.name()).is_none() => {
                 return 0;
             }
-            Some((ty, row)) => Outgoing::Event(state.change(gvr, ty, row.clone())),
+            Some((ty, row)) => Outgoing::Event(Box::new(state.change(gvr, ty, row.clone()))),
             None => Outgoing::Step(step),
         };
+        self.broadcast(gvr, &outgoing)
+    }
+
+    /// Sends to every open watch on `gvr`; returns how many were open. Called with the state
+    /// locked, so watches get changes in the order they were made.
+    fn broadcast(&self, gvr: &Gvr, outgoing: &Outgoing) -> usize {
         let mut watchers = lock(&self.inner.watchers);
         let list = watchers.entry(gvr.clone()).or_default();
         list.retain(|w| w.tx.send(outgoing.clone()).is_ok());
@@ -698,9 +704,7 @@ fn respond(
             namespace: Some(ns),
             name,
             subresource,
-        } if *gvr == Gvr::core("pods") && subresource == "log" => lock(&inner.state)
-            .pod_log(ns, name, query.tail_lines)
-            .map(|text| full(200, "text/plain", text)),
+        } if *gvr == Gvr::core("pods") && subresource == "log" => open_log(inner, ns, name, query),
         Route::Subresource { subresource, .. } => Err(ApiError::not_found(format!(
             "subresource {subresource} is not recorded"
         ))),
@@ -709,6 +713,34 @@ fn respond(
         )),
     };
     result.unwrap_or_else(|e| error(&e))
+}
+
+/// A pod's log: checked as the API server and the kubelet check it (see [`logs`]), then streamed.
+fn open_log(
+    inner: &Inner,
+    namespace: &str,
+    pod: &str,
+    query: &Query,
+) -> Result<Response<Body>, ApiError> {
+    let query = LogQuery::parse(query, pod)?;
+    let state = lock(&inner.state);
+    let pods = Gvr::core("pods");
+    let object = state.object(&pods, Some(namespace), pod)?;
+    let container = logs::select_container(&object, query.container.as_deref())?;
+    let instance = logs::instance(&object, &container, query.previous)?;
+    let key = (namespace.to_owned(), pod.to_owned(), container);
+    let chunks = lock(&inner.logs).open(&key, instance, &query);
+    drop(state);
+    let frames = futures::stream::unfold(chunks, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk: Chunk| (chunk.map(hyper::body::Frame::data), rx))
+    });
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain")
+        .body(StreamBody::new(frames).boxed_unsync())
+        .expect("a valid response"))
 }
 
 /// The resource of a request, if the server serves it in that scope.
@@ -737,13 +769,14 @@ fn opening_events(
             .rows(gvr, namespace, query)
             .into_iter()
             .map(|row| {
-                Outgoing::Event(Change {
+                Outgoing::Event(Box::new(Change {
                     gvr: gvr.clone(),
                     resource_version: state.resource_version(),
                     ty: "ADDED",
+                    object: state.object_of(gvr, &row),
                     row,
                     previous: None,
-                })
+                }))
             })
             .collect::<Vec<_>>()
     };
@@ -764,7 +797,10 @@ fn opening_events(
                 )
             })?;
             Ok(match state.changes_since(gvr, rv) {
-                Some(changes) => changes.into_iter().map(Outgoing::Event).collect(),
+                Some(changes) => changes
+                    .into_iter()
+                    .map(|c| Outgoing::Event(Box::new(c)))
+                    .collect(),
                 None => vec![Outgoing::Step(WatchStep::Expired)],
             })
         }
@@ -849,6 +885,9 @@ fn start_watch(
         .body(StreamBody::new(frames).boxed_unsync())
         .expect("a valid response"))
 }
+
+#[path = "server_pods.rs"]
+mod pods;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

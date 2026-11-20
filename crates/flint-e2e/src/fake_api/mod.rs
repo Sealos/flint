@@ -2,11 +2,17 @@
 //!
 //! It replays the fixtures recorded from the kind dev cluster (`scripts/record-fixtures.sh`):
 //! version, aggregated discovery, OpenAPI v3, Table lists with `includeObject=Metadata`, plain
-//! lists, objects and pod logs, with timestamps shifted to the server's start
-//! ([`clock`]). Watches (including streaming lists) are served from the same rows and
-//! can be scripted ([`FakeApiServer::script_watch`]) or fed live
-//! ([`FakeApiServer::send_watch`]). Faults ([`Fault`]) refuse, delay or drop matching
-//! requests.
+//! lists and objects, with timestamps shifted to the server's start ([`clock`]). Watches
+//! (including streaming lists) are served from the same rows and can be scripted
+//! ([`FakeApiServer::script_watch`]) or fed live ([`FakeApiServer::send_watch`]). Faults
+//! ([`Fault`]) refuse, delay or drop matching requests.
+//!
+//! Pod logs behave like a real cluster's for what Flint asks (`logs`): per container and
+//! previous instance, `follow`, `tailLines`, `sinceSeconds`/`sinceTime`, `timestamps` and
+//! `limitBytes`. Tests write them ([`FakeApiServer::append_log`]), end or break the open streams,
+//! and churn pods ([`FakeApiServer::add_pod`], [`FakeApiServer::start_container`],
+//! [`FakeApiServer::crash_container`], [`FakeApiServer::delete_pod`],
+//! [`FakeApiServer::replace_pod`]) with the watch events a cluster sends.
 //!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {
@@ -18,6 +24,12 @@
 //! let configmaps = Gvr::core("configmaps");
 //! server.inject(Fault::forbidden().on(&Gvr::core("secrets")).verb(Verb::List).cluster_wide());
 //! server.script_watch(&configmaps, vec![WatchStep::Bookmark, WatchStep::Expired]);
+//!
+//! use flint_e2e::fake_api::ContainerLog;
+//! let web = ContainerLog::new("demo", "web-69c6f74b8b-qv4xv");
+//! server.append_log(&web, "GET / 200\n");
+//! let sibling = server.pod("demo", "web-69c6f74b8b-qv4xv").unwrap().sibling("web-69c6f74b8b-new");
+//! server.replace_pod("demo", "web-69c6f74b8b-x4gss", sibling);
 //! # Ok(())
 //! # }
 //! ```
@@ -26,6 +38,8 @@ pub mod clock;
 mod faults;
 pub mod fixtures;
 pub mod kubeconfig;
+mod logs;
+mod pods;
 pub mod resources;
 mod route;
 mod row;
@@ -38,6 +52,8 @@ mod watch;
 pub use faults::{Effect, Fault};
 pub use fixtures::{Fixtures, Gvr};
 pub use kubeconfig::CONTEXT;
+pub use logs::ContainerLog;
+pub use pods::FakePod;
 pub use route::{Query, Verb};
 pub use row::FakeRow;
 pub use server::{FakeApiServer, Options, RequestRecord, write_kubeconfigs};
