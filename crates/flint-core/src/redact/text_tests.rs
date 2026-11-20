@@ -3,15 +3,53 @@
 
 use super::*;
 
-/// Redacts `text`, checks the count, and returns the text.
+/// Placeholders for the prefixes secret scanners look for, so no token-shaped literal is in
+/// the source: [`unfold`] builds the real text at run time, and [`fold`] turns the parts that
+/// survive redaction back into placeholders, so expected outputs can be written with them.
+const PLACEHOLDERS: &[(&str, &[&str])] = &[
+    ("<<begin>>", &["-----", "BEGIN"]),
+    ("<<slack>>", &["hooks.", "slack.com"]),
+    ("<<aws>>", &["AK", "IA"]),
+    ("<<asia>>", &["AS", "IA"]),
+    ("<<aiza>>", &["AI", "za"]),
+    ("<<gh>>", &["g", "h"]),
+    ("<<ghpat>>", &["github", "_pat_"]),
+    ("<<gl>>", &["g", "l"]),
+    ("<<slk>>", &["xo", "x"]),
+    ("<<xapp>>", &["xa", "pp"]),
+    ("<<sk>>", &["s", "k"]),
+    ("<<rk>>", &["r", "k"]),
+];
+
+/// `text` with every placeholder replaced by the text it stands for.
+fn unfold(text: &str) -> String {
+    PLACEHOLDERS
+        .iter()
+        .fold(text.to_owned(), |text, (placeholder, parts)| {
+            text.replace(placeholder, &parts.concat())
+        })
+}
+
+/// Redacted output with the delimiters that survive redaction written as placeholders again.
+fn fold(text: &str) -> String {
+    PLACEHOLDERS[..2]
+        .iter()
+        .fold(text.to_owned(), |text, (placeholder, parts)| {
+            text.replace(&parts.concat(), placeholder)
+        })
+}
+
+/// Redacts `text` (unfolded), checks the count, and returns the text (folded).
 fn redacted(text: &str, count: usize) -> String {
-    let out = redact_credentials(text);
+    let text = unfold(text);
+    let out = redact_credentials(&text);
     assert_eq!(out.count, count, "count for {text:?} -> {:?}", out.text);
-    out.text.into_owned()
+    fold(&out.text)
 }
 
 fn same(text: &str) {
-    let out = redact_credentials(text);
+    let text = unfold(text);
+    let out = redact_credentials(&text);
     assert!(
         matches!(out.text, Cow::Borrowed(_)) && out.count == 0,
         "{text:?} changed to {:?}",
@@ -99,11 +137,11 @@ fn passwords_in_urls_keep_user_and_host() {
 #[test]
 fn aws_keys() {
     assert_eq!(
-        redacted("using key AKIAIOSFODNN7EXAMPLE for s3", 1),
+        redacted("using key <<aws>>IOSFODNN7EXAMPLE for s3", 1),
         "using key [REDACTED:aws-access-key-id] for s3"
     );
     assert_eq!(
-        redacted("AWS_ACCESS_KEY_ID=ASIAY34FZKBOKMUTVV7A", 1),
+        redacted("AWS_ACCESS_KEY_ID=<<asia>>Y34FZKBOKMUTVV7A", 1),
         "AWS_ACCESS_KEY_ID=[REDACTED:aws-access-key-id]"
     );
     for (line, want) in [
@@ -125,7 +163,7 @@ fn aws_keys() {
     // A secret next to its key id, as in a credentials CSV.
     assert_eq!(
         redacted(
-            "ci,AKIAIOSFODNN7EXAMPLE,wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "ci,<<aws>>IOSFODNN7EXAMPLE,wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             2
         ),
         "ci,[REDACTED:aws-access-key-id],[REDACTED:aws-secret-access-key]"
@@ -133,48 +171,63 @@ fn aws_keys() {
     // A git SHA next to a key id is lowercase hex, not a secret.
     assert_eq!(
         redacted(
-            "AKIAIOSFODNN7EXAMPLE commit 3f786850e387550fdab836ed7e6dc881de23001b",
+            "<<aws>>IOSFODNN7EXAMPLE commit 3f786850e387550fdab836ed7e6dc881de23001b",
             1
         ),
         "[REDACTED:aws-access-key-id] commit 3f786850e387550fdab836ed7e6dc881de23001b"
     );
     // Too short, or a word that only starts like a key id.
-    same("AKIA1234 is not a key, nor is Asia/Tokyo or ASIAN");
+    same("<<aws>>1234 is not a key, nor is Asia/Tokyo or <<asia>>N");
 }
 
 #[test]
 fn vendor_tokens() {
     // GitLab and Slack tokens are built at run time so the source holds nothing that
     // secret scanners would flag as a real credential.
-    let gitlab = format!("remote: {}-xxxxXXXX1234567890yy rejected", "glpat");
+    let gitlab = format!("remote: {}-xxxxXXXX1234567890yy rejected", "<<gl>>pat");
     let slack_bot = format!(
         "SLACK_TOKEN {}-123456789012-1234567890123-AbCdEfGhIjKlMnOp",
-        "xoxb"
+        "<<slk>>b"
     );
-    let slack_user = format!("{}-123456789012-123456789012-123456789012-abcdef", "xoxp");
+    let slack_user = format!(
+        "{}-123456789012-123456789012-123456789012-abcdef",
+        "<<slk>>p"
+    );
     for (line, kind) in [
         (
-            "token ghp_16C7e42F292c6912E7710c838347Ae178B4a in env",
+            "token <<gh>>p_16C7e42F292c6912E7710c838347Ae178B4a in env",
             "github-token",
         ),
-        ("gho_16C7e42F292c6912E7710c838347Ae178B4a", "github-token"),
-        ("ghs_16C7e42F292c6912E7710c838347Ae178B4a", "github-token"),
-        ("ghu_16C7e42F292c6912E7710c838347Ae178B4a", "github-token"),
-        ("ghr_16C7e42F292c6912E7710c838347Ae178B4a", "github-token"),
         (
-            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ",
+            "<<gh>>o_16C7e42F292c6912E7710c838347Ae178B4a",
+            "github-token",
+        ),
+        (
+            "<<gh>>s_16C7e42F292c6912E7710c838347Ae178B4a",
+            "github-token",
+        ),
+        (
+            "<<gh>>u_16C7e42F292c6912E7710c838347Ae178B4a",
+            "github-token",
+        ),
+        (
+            "<<gh>>r_16C7e42F292c6912E7710c838347Ae178B4a",
+            "github-token",
+        ),
+        (
+            "<<ghpat>>11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ",
             "github-token",
         ),
         (gitlab.as_str(), "gitlab-token"),
         (slack_bot.as_str(), "slack-token"),
         (slack_user.as_str(), "slack-token"),
-        ("xoxa-2-123456789012-abcdefghij", "slack-token"),
+        ("<<slk>>a-2-123456789012-abcdefghij", "slack-token"),
         (
-            "app token xapp-1-A0123456789-1234567890123-abcdef0123",
+            "app token <<xapp>>-1-A0123456789-1234567890123-abcdef0123",
             "slack-token",
         ),
         (
-            "maps key AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI ok",
+            "maps key <<aiza>>SyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI ok",
             "gcp-api-key",
         ),
     ] {
@@ -192,7 +245,7 @@ fn vendor_tokens() {
             ),
             1
         ),
-        "posting to https://hooks.slack.com/services/[REDACTED:slack-webhook] done"
+        "posting to https://<<slack>>/services/[REDACTED:slack-webhook] done"
     );
     assert_eq!(
         redacted(
@@ -201,7 +254,7 @@ fn vendor_tokens() {
         ),
         "GET https://acct.blob.core.windows.net/c/b?sv=2022-11-02&se=2026-01-01&sp=r&sig=[REDACTED:azure-sas-signature] 200"
     );
-    same("pushed ghp_short and xoxb- and the glpat- docs");
+    same("pushed <<gh>>p_short and <<slk>>b- and the <<gl>>pat- docs");
 }
 
 #[test]
@@ -229,22 +282,23 @@ fn jwts() {
 
 #[test]
 fn private_key_blocks() {
-    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nq83kd0==\n-----END RSA PRIVATE KEY-----";
+    let pem =
+        "<<begin>> RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nq83kd0==\n-----END RSA PRIVATE KEY-----";
     assert_eq!(
         redacted(&format!("loaded key:\n{pem}\nready\n"), 1),
-        "loaded key:\n-----BEGIN RSA PRIVATE KEY-----\n[REDACTED:private-key]\n-----END RSA PRIVATE KEY-----\nready\n"
+        "loaded key:\n<<begin>> RSA PRIVATE KEY-----\n[REDACTED:private-key]\n-----END RSA PRIVATE KEY-----\nready\n"
     );
     // Escaped inside JSON, as a service account key file is logged.
     assert_eq!(
         redacted(
-            r#"{"private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n"}"#,
+            r#"{"private_key": "<<begin>> PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n"}"#,
             1
         ),
-        r#"{"private_key": "-----BEGIN PRIVATE KEY-----[REDACTED:private-key]-----END PRIVATE KEY-----\n"}"#
+        r#"{"private_key": "<<begin>> PRIVATE KEY-----[REDACTED:private-key]-----END PRIVATE KEY-----\n"}"#
     );
     for kind in ["EC", "OPENSSH", "ENCRYPTED", "DSA"] {
         let text =
-            format!("-----BEGIN {kind} PRIVATE KEY-----\nabc\n-----END {kind} PRIVATE KEY-----");
+            format!("<<begin>> {kind} PRIVATE KEY-----\nabc\n-----END {kind} PRIVATE KEY-----");
         assert!(
             redacted(&text, 1).contains("[REDACTED:private-key]"),
             "{kind}"
@@ -260,16 +314,16 @@ fn private_key_blocks() {
     );
     // Cut off at the end.
     assert_eq!(
-        redacted("-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nq83", 1),
-        "-----BEGIN PRIVATE KEY-----\n[REDACTED:private-key]\n"
+        redacted("<<begin>> PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nq83", 1),
+        "<<begin>> PRIVATE KEY-----\n[REDACTED:private-key]\n"
     );
     // Lines around a block still get the line rules.
     assert_eq!(
         redacted(&format!("password=x1\n{pem}\ntoken: y2"), 3),
-        "password=[REDACTED:password]\n-----BEGIN RSA PRIVATE KEY-----\n[REDACTED:private-key]\n-----END RSA PRIVATE KEY-----\ntoken: [REDACTED:token]"
+        "password=[REDACTED:password]\n<<begin>> RSA PRIVATE KEY-----\n[REDACTED:private-key]\n-----END RSA PRIVATE KEY-----\ntoken: [REDACTED:token]"
     );
-    same("-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----");
-    same("-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYI\n-----END PUBLIC KEY-----");
+    same("<<begin>> CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----");
+    same("<<begin>> PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYI\n-----END PUBLIC KEY-----");
 }
 
 #[test]
@@ -383,11 +437,11 @@ fn values_with_punctuation_and_other_separators_are_hidden_whole() {
             "amqp://guest:[REDACTED:password]@rabbit",
         ),
         (
-            "aws_key_AKIAIOSFODNN7EXAMPLE",
+            "aws_key_<<aws>>IOSFODNN7EXAMPLE",
             "aws_key_[REDACTED:aws-access-key-id]",
         ),
         (
-            "GH_TOKEN_ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+            "GH_TOKEN_<<gh>>p_16C7e42F292c6912E7710c838347Ae178B4a",
             "GH_TOKEN_[REDACTED:github-token]",
         ),
     ] {
@@ -449,6 +503,221 @@ fn multi_byte_text_around_values_is_kept() {
     );
 }
 
+#[test]
+fn parameterized_authorization_values_are_hidden_to_their_last_parameter() {
+    let digest = r#"Authorization: Digest username="alice", realm="api", nonce="dcd98b7102dd2f0e", uri="/x", qop=auth, nc=00000001, cnonce="0a4f113b", response="6629fae49393a05397450978507c4ef1" next=1"#;
+    // Unquoted, a Digest value runs to the end of the line.
+    assert_eq!(
+        redacted(digest, 1),
+        "Authorization: Digest [REDACTED:authorization]"
+    );
+    for line in [
+        // An escaped quote inside a parameter.
+        r#"Authorization: Digest username="a\"b", response="6629fae49393a05397450978507c4ef1""#,
+        // Parameters separated by spaces, not commas.
+        r#"Authorization: Digest username="a" realm="api" response="6629fae49393a05397450978507c4ef1""#,
+    ] {
+        assert_eq!(
+            redacted(line, 1),
+            "Authorization: Digest [REDACTED:authorization]",
+            "{line}"
+        );
+    }
+    // Quoted in JSON, with an escaped quote in a parameter: up to the header's closing quote.
+    let json =
+        r#"{"Authorization":"Digest username=\"a\\\"b\" response=\"6629fae4\"","Accept":"*/*"}"#;
+    assert_eq!(
+        redacted(json, 1),
+        r#"{"Authorization":"Digest [REDACTED:authorization]","Accept":"*/*"}"#
+    );
+    // Built at run time: a SigV4 header names an access key id.
+    let sigv4 = format!(
+        "authorization={}4-HMAC-SHA256 Credential={}/20261120/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024 status=403",
+        "AWS", "<<aws>>0123456789ABCDEF"
+    );
+    let out = redacted(&sigv4, 1);
+    assert_eq!(
+        out,
+        "authorization=AWS4-HMAC-SHA256 [REDACTED:authorization] status=403"
+    );
+    // Inside JSON, with escaped quotes around the parameters.
+    let json = r#"{"Authorization":"Digest username=\"a\", response=\"6629fae49393a05397450978507c4ef1\"","Accept":"*/*"}"#;
+    let out = redacted(json, 1);
+    assert!(!out.contains("6629fae4"), "{out}");
+    assert!(out.ends_with(r#","Accept":"*/*"}"#), "{out}");
+}
+
+#[test]
+fn quoted_values_run_to_their_closing_quote_at_any_escape_level() {
+    for (line, want) in [
+        // JSON inside a JSON string, with a quote inside the password.
+        (
+            r#"{"log":"{\"password\":\"ab\\\"cd\",\"user\":\"x\"}"}"#,
+            r#"{"log":"{\"password\":\"[REDACTED:password]\",\"user\":\"x\"}"}"#,
+        ),
+        (
+            r#"{"password":"ab\"cd","token":"t1"}"#,
+            r#"{"password":"[REDACTED:password]","token":"[REDACTED:token]"}"#,
+        ),
+        // Punctuation inside quotes is part of the value.
+        (
+            r#"password="abc);" next"#,
+            r#"password="[REDACTED:password]" next"#,
+        ),
+        (r#"password=")]""#, r#"password="[REDACTED:password]""#),
+        // Unterminated: the rest of the line.
+        (r#"secret="abc def"#, r#"secret="[REDACTED:secret]"#),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+}
+
+#[test]
+fn an_at_sign_after_the_authority_is_not_a_password() {
+    for line in [
+        "https://api.example:8443/users/alice@example.com",
+        "GET https://example.com:8443/path?email=a@b.com 200",
+        "https://example.com/a:b@c",
+    ] {
+        same(line);
+    }
+    assert_eq!(
+        redacted(
+            "redis://:pa/ss@h:6379 and https://u:pw@host/users/a@b.com",
+            2
+        ),
+        "redis://:[REDACTED:password]@h:6379 and https://u:[REDACTED:password]@host/users/a@b.com"
+    );
+}
+
+#[test]
+fn prose_that_names_a_private_key_footer_is_kept() {
+    same("invalid PEM: missing -----END PRIVATE KEY----- in tls.key");
+    same("line one\nexpected -----END RSA PRIVATE KEY-----\nline three");
+    // A short word before the footer is not a key.
+    same("ok\n-----END PRIVATE KEY-----");
+    // A real cut-off block still is, also after ordinary lines.
+    assert_eq!(
+        redacted(
+            "starting\nMIIEowIBAAKCAQEAq83kd0abcdMIIEowIBAAKCAQEAq83kd0abcdMIIEowIBAAKCAQEA\nq83kd0==\n-----END PRIVATE KEY-----\nnext",
+            1
+        ),
+        "starting\n\n[REDACTED:private-key]\n-----END PRIVATE KEY-----\nnext"
+    );
+    assert_eq!(
+        redacted(
+            r#"{"k": "MIIEowIBAAKCAQEAq83kd0\nabc\n-----END PRIVATE KEY-----\n"}"#,
+            1
+        ),
+        r#"{"k": "[REDACTED:private-key]-----END PRIVATE KEY-----\n"}"#
+    );
+}
+
+#[test]
+fn redacting_twice_does_not_count_private_keys_again() {
+    let pem = unfold("<<begin>> PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----");
+    let once = redact_credentials(&pem);
+    assert_eq!(once.count, 1);
+    let twice = redact_credentials(&once.text);
+    assert_eq!((twice.count, twice.text.as_ref()), (0, once.text.as_ref()));
+}
+
+#[test]
+fn more_credential_key_names() {
+    for (line, want) in [
+        (
+            "secret_key_base: abc123",
+            "secret_key_base: [REDACTED:secret]",
+        ),
+        ("ENCRYPTION_KEY=k1", "ENCRYPTION_KEY=[REDACTED:key]"),
+        ("signing_key: k1", "signing_key: [REDACTED:key]"),
+        ("master-key=k1", "master-key=[REDACTED:key]"),
+        ("ssh_key=k1", "ssh_key=[REDACTED:key]"),
+        (
+            r#"{"credentials":"c1"}"#,
+            r#"{"credentials":"[REDACTED:secret]"}"#,
+        ),
+        ("DB_PASS=hunter2", "DB_PASS=[REDACTED:password]"),
+        ("pwd=hunter2", "pwd=[REDACTED:password]"),
+        ("smtp.pass: hunter2", "smtp.pass: [REDACTED:password]"),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        "PWD=/app",
+        "HOME=/root PWD=/app SHLVL=1",
+        "bypass=true for cache",
+        "compass=north",
+        "passed=12 failed=0",
+        // Counts in a test summary.
+        "pass=1 failed=0",
+        "PASS: 12",
+        // Paths to credentials files and working directories.
+        "credentials=/etc/creds.json",
+        "GOOGLE_APPLICATION_CREDENTIALS=/var/run/secrets/key.json",
+        "aws_credentials: ~/.aws/credentials",
+        "OLDPWD=/home/app",
+    ] {
+        same(line);
+    }
+    // The path exemption is for PWD alone; a password that starts with `/` is hidden.
+    for (line, want) in [
+        ("DB_PWD=/abcdef123", "DB_PWD=[REDACTED:password]"),
+        ("db_pass=12x45", "db_pass=[REDACTED:password]"),
+        // Numbers are exempt only after a bare `pass` key.
+        ("DB_PASS=123456", "DB_PASS=[REDACTED:password]"),
+        ("MYSQL_PWD=4321", "MYSQL_PWD=[REDACTED:password]"),
+        ("user.pwd: 99", "user.pwd: [REDACTED:password]"),
+        ("db-pass=7", "db-pass=[REDACTED:password]"),
+        ("password=123456", "password=[REDACTED:password]"),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+}
+
+#[test]
+fn more_vendor_prefixes() {
+    // Built at run time so the source holds no complete key.
+    for (prefix, rest, kind) in [
+        ("<<sk>>_live_", "4eC39HqLyjWDarjtT1zdp7dc", "stripe-key"),
+        ("<<rk>>_live_", "4eC39HqLyjWDarjtT1zdp7dc", "stripe-key"),
+        ("<<sk>>-proj-", "abcDEF123456ghiJKL789012mno", "openai-key"),
+        (
+            "<<sk>>-ant-",
+            "api03-abcDEF123456ghiJKL789012",
+            "anthropic-key",
+        ),
+        ("<<gl>>rt-", "abcDEF123456ghiJKL7890", "gitlab-token"),
+        ("<<gl>>dt-", "abcDEF123456ghiJKL7890", "gitlab-token"),
+    ] {
+        let line = format!("using {prefix}{rest} now");
+        assert_eq!(
+            redacted(&line, 1),
+            format!("using [REDACTED:{kind}] now"),
+            "{prefix}"
+        );
+    }
+    same("the <<sk>>_live_ prefix and <<sk>>-ant- docs");
+}
+
+#[test]
+fn credential_flags_name_the_next_argument() {
+    for (arg, kind) in [
+        ("--password", Some("password")),
+        ("-token", Some("token")),
+        ("--db-pass", Some("password")),
+        ("--api-key", Some("key")),
+        ("--client-secret", Some("secret")),
+        ("--password-file", None),
+        ("--password=x", None),
+        ("--verbose", None),
+        ("password", None),
+    ] {
+        assert_eq!(credential_flag(arg), kind, "{arg}");
+    }
+}
+
 /// About 10 MB of realistic log lines, with a few secrets.
 fn synthetic_log() -> String {
     let lines = [
@@ -463,7 +732,7 @@ fn synthetic_log() -> String {
     let secrets = [
         "DEBUG outgoing headers map[Authorization:[Bearer s3cr3t-t0ken-value-0123]]",
         "INFO connecting to postgres://app:hunter2@db.prod:5432/app",
-        "WARN using AWS key AKIAIOSFODNN7EXAMPLE",
+        "WARN using AWS key <<aws>>IOSFODNN7EXAMPLE",
     ];
     let mut out = String::with_capacity(10 * 1024 * 1024 + 1024);
     let mut i = 0;
@@ -477,7 +746,7 @@ fn synthetic_log() -> String {
         out.push('\n');
         i += 1;
     }
-    out
+    unfold(&out)
 }
 
 /// Throughput over a 10 MB log. The floor is low so unoptimized builds pass; run with
@@ -499,4 +768,20 @@ fn ten_megabytes_of_logs_are_fast() {
     );
     assert!(out.count > 0 && !out.text.contains("hunter2"));
     assert!(mb / secs > 20.0, "{:.1} MB/s", mb / secs);
+}
+
+/// One long line full of quoted values stays linear: each value is scanned once, so a line as
+/// long as the largest log fetch (1 MiB) takes milliseconds, not hours.
+#[test]
+fn long_lines_of_quoted_values_are_linear() {
+    const MIB: usize = 1024 * 1024;
+    for unit in [r#"token="a" "#, r#""password":"x","#] {
+        let line = unit.repeat(MIB / unit.len());
+        let start = std::time::Instant::now();
+        let out = redact_credentials(&line);
+        let secs = start.elapsed().as_secs_f64();
+        println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
+        assert_eq!(out.count, MIB / unit.len(), "{unit}");
+        assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
+    }
 }

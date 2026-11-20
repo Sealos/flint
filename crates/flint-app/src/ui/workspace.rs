@@ -1601,7 +1601,8 @@ fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogT
     let mut text = format!(
         "AI agents using Flint's MCP server will be able to read this cluster: resources, events \
          and pod logs. They cannot change anything. Secret values are hidden, and so are values in \
-         pod logs and event messages that look like credentials (tokens, passwords, keys). \
+         pod logs, event messages and container arguments that look like credentials (tokens, \
+         passwords, keys). \
          Everything else, ConfigMaps and env values included, reaches the agent as the cluster \
          returns it, and a credential in an unusual format can get through.\n\n\
          Context: {context}\nServer: {server}"
@@ -2049,7 +2050,11 @@ mod tests {
         );
         assert!(dialog.text.contains("cannot change anything"));
         assert!(dialog.text.contains("Secret values are hidden"));
-        assert!(dialog.text.contains("look like credentials"));
+        assert!(
+            dialog
+                .text
+                .contains("container arguments that look like credentials")
+        );
         assert!(dialog.text.contains("ConfigMaps and env values included"));
         assert!(!dialog.text.contains("different server"));
         let moved = super::expose_dialog(

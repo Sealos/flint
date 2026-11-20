@@ -259,7 +259,7 @@ impl FlintMcp {
     }
 
     #[tool(
-        description = "Get one object as YAML. managedFields are removed and Secret values redacted.",
+        description = "Get one object as YAML. managedFields are removed and Secret values redacted. Credentials in messages and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_resource(&self, Parameters(p): Parameters<GetResourceParams>) -> ToolResult {
@@ -286,7 +286,7 @@ impl FlintMcp {
 #[tool_handler(
     router = self.tool_router,
     name = "flint",
-    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted, and large outputs are cut short with truncated=true."
+    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
 impl ServerHandler for FlintMcp {}
 
@@ -554,7 +554,7 @@ impl FlintMcp {
         let mut out = String::new();
         if redacted > 0 {
             out.push_str(&format!(
-                "# redacted={redacted}: credentials in messages were replaced\n"
+                "# redacted={redacted}: credentials were replaced with [REDACTED:<kind>] markers\n"
             ));
         }
         if truncated {
@@ -652,19 +652,22 @@ impl FlintMcp {
             let complete = text.lines().count().saturating_sub(1) as i64;
             tail = complete.clamp(1, tail / 2);
         }
-        let (text, cut_lines) = policy::tail_lines(&text, lines as usize);
-        let (text, cut_bytes) = policy::tail_bytes(text, policy::LOG_BYTES);
-        let text = flint_core::redact::redact_credentials(text);
-        to_json(&json!({
+        let out = policy::log_output(&text, lines as usize, policy::LOG_BYTES);
+        let mut result = json!({
             "cluster": p.cluster,
             "namespace": p.namespace,
             "pod": p.pod,
             "container": p.container,
-            "lines": text.text.lines().count(),
-            "truncated": cut_lines || cut_bytes || cut_fetch,
-            "redacted": text.count,
-            "log": text.text,
-        }))
+            "lines": out.text.lines().count(),
+            "truncated": out.truncated || cut_fetch,
+            "redacted": out.redacted,
+            "log": out.text,
+        });
+        if let Some(note) = out.note {
+            // Says why `log` is empty: a line too long to return without cutting it.
+            result["note"] = json!(note);
+        }
+        to_json(&result)
     }
 }
 
@@ -714,6 +717,7 @@ fn table_rows(
     let mut redacted = 0;
     let mut rows = Vec::new();
     for row in &page.rows {
+        let mut row_redacted = 0;
         let value = {
             let cells: Vec<String> = (0..page.columns.len())
                 .map(|i| {
@@ -722,7 +726,7 @@ fn table_rows(
                         policy::REDACTED.to_owned()
                     } else {
                         let mut text = text.into_owned();
-                        redacted += policy::redact_text(&mut text);
+                        row_redacted += policy::redact_text(&mut text);
                         text
                     }
                 })
@@ -739,6 +743,8 @@ fn table_rows(
             cut = true;
             break;
         }
+        // Counted only for rows that are returned.
+        redacted += row_redacted;
         rows.push(value);
     }
     (columns, rows, cut, redacted)
@@ -858,6 +864,25 @@ mod tests {
 
     // covers UP-15
     #[test]
+    fn agents_are_told_about_the_markers_and_the_count() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(instructions.contains("[REDACTED:<kind>]"), "{instructions}");
+        assert!(instructions.contains("`redacted` count"), "{instructions}");
+        assert!(instructions.contains("container args"), "{instructions}");
+        let get = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "get_resource")
+            .expect("get_resource is listed");
+        let description = get.description.unwrap_or_default();
+        assert!(description.contains("[REDACTED:<kind>]"), "{description}");
+        assert!(description.contains("# redacted=N"), "{description}");
+    }
+
+    // covers UP-15
+    #[test]
     fn row_cells_are_redacted_and_counted() {
         // An Event row: the Message column shows the event message.
         let page = page(
@@ -874,6 +899,10 @@ mod tests {
         );
         let (_, rows, _, redacted) = table_rows(&page, false, 1_000, policy::LIST_BYTES);
         assert_eq!(redacted, 1);
+        // A row that does not fit is not returned, so its credentials are not counted.
+        let (_, rows_cut, cut, redacted) = table_rows(&page, false, 1_000, 10);
+        assert!(cut && rows_cut.is_empty());
+        assert_eq!(redacted, 0);
         assert_eq!(
             rows[0]["cells"],
             json!([

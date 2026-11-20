@@ -11,7 +11,7 @@
 
 mod text;
 
-pub use text::{Redacted, redact_credentials};
+pub use text::{Redacted, credential_flag, redact_credentials};
 
 use serde_json::Value;
 

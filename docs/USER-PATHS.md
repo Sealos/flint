@@ -125,9 +125,14 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-15 Credentials in logs don't reach the agent
 - **When** an agent reads pod logs or events that contain a token, a password pair, a private key or a cloud access
-  key, through `get_pod_logs`, `get_events`, `list_resources` or `get_resource`.
+  key, through `get_pod_logs`, `get_events`, `list_resources` or `get_resource` (messages, and container `args`
+  and `command`).
 - **Then** each value is replaced with a marker such as `[REDACTED:password]`, and the result says how many were
-  replaced. The rest of the line is unchanged: keys, URL users and hosts, header schemes.
+  replaced. The rest of the line is unchanged: keys, URL users and hosts, header schemes. The server's instructions
+  tell the agent about the markers and the count.
+- **And** a log line the 256 KiB cap would cut in the middle is left out whole, so no value is returned without its
+  label; when the last line alone is longer than the cap, the log is empty and a `note` says why. ConfigMap data
+  is shown as the cluster returns it.
 - **And** Flint's own log viewer and events still show the text as written.
 - Tests: unit (redactor patterns, ordinary lines untouched, throughput), mcp, core.
 

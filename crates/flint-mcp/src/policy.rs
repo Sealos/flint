@@ -129,20 +129,24 @@ pub fn exposed_cluster<'a>(
 }
 
 /// Makes an object safe to show: removes `metadata.managedFields`, redacts Secret values, and
-/// redacts credentials in message fields ([`redact_messages`]). Works on single objects and on
-/// lists (`items`). Returns how many credentials were replaced in messages.
+/// redacts credentials in message fields and container arguments ([`redact_object_text`]).
+/// Works on single objects and on lists (`items`). Returns how many credentials were replaced.
 pub fn sanitize(value: &mut Value) -> usize {
-    let mut count = 0;
+    strip(value);
+    redact_object_text(value)
+}
+
+/// The structural part of [`sanitize`]: managed fields and Secret values.
+fn strip(value: &mut Value) {
     if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
         for item in items {
-            count += sanitize(item);
+            strip(item);
         }
     }
     flint_core::read::strip_managed_fields(value);
     if flint_core::redact::is_secret_object(value) {
         flint_core::redact::mask_secret(value, REDACTED);
     }
-    count + redact_messages(value)
 }
 
 /// Whether an object field holds free text that a workload or controller wrote: an Event's
@@ -156,21 +160,52 @@ fn is_message_field(key: &str) -> bool {
             .is_some_and(|end| end.eq_ignore_ascii_case("message"))
 }
 
-/// Replaces credential-shaped values ([`flint_core::redact::redact_credentials`]) in every
-/// string under a `note` key or a key ending in `message`, at any depth. Returns how many were
-/// replaced.
-pub fn redact_messages(value: &mut Value) -> usize {
+/// Whether `object` is a core v1 ConfigMap, whose data is shown as the cluster returns it.
+fn is_config_map(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("kind").and_then(Value::as_str) == Some("ConfigMap")
+        && object.get("apiVersion").and_then(Value::as_str) == Some("v1")
+}
+
+/// Replaces credential-shaped values ([`flint_core::redact::redact_credentials`]), at any
+/// depth, in every string under a `note` key or a key ending in `message`, and in container
+/// `args` and `command` lists, where the element after a flag such as `--password` is hidden
+/// whole. ConfigMaps are left as they are. Returns how many values were replaced.
+pub fn redact_object_text(value: &mut Value) -> usize {
     match value {
+        Value::Object(map) if is_config_map(map) => 0,
         Value::Object(map) => map
             .iter_mut()
             .map(|(key, value)| match value {
                 Value::String(text) if is_message_field(key) => redact_text(text),
-                _ => redact_messages(value),
+                Value::Array(args) if key == "args" || key == "command" => redact_args(args),
+                _ => redact_object_text(value),
             })
             .sum(),
-        Value::Array(items) => items.iter_mut().map(redact_messages).sum(),
+        Value::Array(items) => items.iter_mut().map(redact_object_text).sum(),
         _ => 0,
     }
+}
+
+/// Redacts an argument list: each string through the text redactor, and the whole argument
+/// after a credential flag with no value of its own (`["--password", "hunter2"]`).
+fn redact_args(args: &mut [Value]) -> usize {
+    let mut count = 0;
+    let mut hide_next: Option<&'static str> = None;
+    for arg in args {
+        let Value::String(text) = arg else {
+            hide_next = None;
+            continue;
+        };
+        match hide_next.take() {
+            Some(kind) if !text.is_empty() && !text.starts_with("[REDACTED:") => {
+                *text = format!("[REDACTED:{kind}]");
+                count += 1;
+            }
+            _ => count += redact_text(text),
+        }
+        hide_next = flint_core::redact::credential_flag(text);
+    }
+    count
 }
 
 /// Redacts credentials in `text` in place. Returns how many were replaced.
@@ -196,8 +231,8 @@ pub fn truncate_bytes(text: &str, max_bytes: usize) -> (&str, bool) {
     (cut.rfind('\n').map_or(cut, |i| &cut[..=i]), true)
 }
 
-/// Keeps the last `max_bytes` of `text`, starting at a line boundary when possible. For logs,
-/// where the newest lines matter most.
+/// Keeps the last `max_bytes` of `text`, starting at a line boundary: a line cut in the middle
+/// is dropped, even when it is the only one. For logs, where the newest lines matter most.
 pub fn tail_bytes(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
@@ -207,7 +242,48 @@ pub fn tail_bytes(text: &str, max_bytes: usize) -> (&str, bool) {
         start += 1;
     }
     let cut = &text[start..];
-    (cut.find('\n').map_or(cut, |i| &cut[i + 1..]), true)
+    if text.as_bytes()[start - 1] == b'\n' {
+        return (cut, true);
+    }
+    // Drop the partial first line, so no value is kept without its `password=` label.
+    (cut.find('\n').map_or("", |i| &cut[i + 1..]), true)
+}
+
+/// What `get_pod_logs` returns of a fetched log.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogOutput {
+    pub text: String,
+    /// Whether lines or bytes were dropped.
+    pub truncated: bool,
+    /// How many credentials the returned text had replaced.
+    pub redacted: usize,
+    /// Why the text is empty although the log is not: its last line is longer than the cap.
+    pub note: Option<String>,
+}
+
+/// The last `max_lines` lines of `fetched`, with credentials redacted, then cut to `max_bytes`
+/// at a line boundary. Redacting before the byte cut sees each value next to its label, and the
+/// cap then applies to the text actually returned.
+pub fn log_output(fetched: &str, max_lines: usize, max_bytes: usize) -> LogOutput {
+    let (text, cut_lines) = tail_lines(fetched, max_lines);
+    let redacted = flint_core::redact::redact_credentials(text);
+    let (kept, cut_bytes) = tail_bytes(&redacted.text, max_bytes);
+    // Only markers the redactor wrote into the kept lines, not ones the workload logged.
+    let count = redacted.count_from(redacted.text.len() - kept.len());
+    let note = (kept.is_empty() && !redacted.text.is_empty()).then(|| {
+        let limit = if max_bytes.is_multiple_of(1024) {
+            format!("{} KiB", max_bytes / 1024)
+        } else {
+            format!("{max_bytes} bytes")
+        };
+        format!("the last line is longer than the {limit} limit and was left out")
+    });
+    LogOutput {
+        text: kept.to_owned(),
+        truncated: cut_lines || cut_bytes,
+        redacted: count,
+        note,
+    }
 }
 
 /// Keeps the last `n` lines of `text`. Returns whether lines were dropped.
@@ -487,7 +563,124 @@ mod tests {
         assert_eq!(truncate_bytes("short", 100), ("short", false));
         // "é" is two bytes; never split it.
         assert_eq!(truncate_bytes("éé", 3), ("é", true));
-        assert_eq!(tail_bytes("ab\ncd\nef", 5), ("ef", true));
+        assert_eq!(tail_bytes("ab\ncd\nef", 5), ("cd\nef", true));
+        assert_eq!(tail_bytes("ab\ncd\nef", 4), ("ef", true));
         assert_eq!(tail_bytes("ab\ncd\nef\n", 7), ("cd\nef\n", true));
+    }
+
+    // covers UP-15
+    #[test]
+    fn a_line_cut_by_the_byte_cap_is_dropped_whole() {
+        // The cap would keep "hunter2" without its label; the partial line goes.
+        let log = "ok\nconnecting with password=hunter2";
+        assert_eq!(tail_bytes(log, 10), ("", true));
+        assert_eq!(tail_bytes("password=hunter2\nnext\n", 9), ("next\n", true));
+        // One line longer than the cap: nothing of it is kept, not even after redaction.
+        let long = format!("{} password=hunter2 {}", "a".repeat(64), "b".repeat(64));
+        let out = log_output(&long, 100, 32);
+        assert_eq!(
+            (out.text.as_str(), out.truncated, out.redacted),
+            ("", true, 0)
+        );
+        assert_eq!(
+            out.note.as_deref(),
+            Some("the last line is longer than the 32 bytes limit and was left out")
+        );
+        let out = log_output(&long, 100, 64 * 1024);
+        assert_eq!((out.redacted, out.note), (1, None));
+        let out = log_output(&format!("{long}\nlast\n"), 100, 32);
+        assert_eq!((out.text.as_str(), out.redacted), ("last\n", 0));
+    }
+
+    // covers UP-15
+    #[test]
+    fn logs_are_redacted_before_the_byte_cap() {
+        // The value sits right after the cut: redacted while its label is still there.
+        let log = format!(
+            "{}\npassword=hunter2 {}\nlast\n",
+            "a".repeat(50),
+            "b".repeat(5)
+        );
+        let out = log_output(&log, 100, 40);
+        assert_eq!(out.text, "password=[REDACTED:password] bbbbb\nlast\n");
+        assert_eq!((out.truncated, out.redacted), (true, 1));
+        // Markers longer than the values they replace still respect the cap.
+        let log = "token=a\n".repeat(10);
+        let out = log_output(&log, 100, 64);
+        assert!(out.text.len() <= 64 && out.truncated, "{out:?}");
+        assert_eq!(out.redacted, out.text.lines().count());
+        // A credential only in a line the cap dropped is not counted.
+        let out = log_output("token=abc\nplain line\n", 100, 12);
+        assert_eq!((out.text.as_str(), out.redacted), ("plain line\n", 0));
+        // Markers the workload logged itself are not counted, cut or not.
+        let log = "old token=abc\nlogged [REDACTED:password] and token=def\n";
+        assert_eq!(log_output(log, 100, 1_000).redacted, 2);
+        let out = log_output(log, 100, 60);
+        assert_eq!(
+            (out.text.as_str(), out.redacted),
+            ("logged [REDACTED:password] and token=[REDACTED:token]\n", 1)
+        );
+    }
+
+    // covers UP-15
+    #[test]
+    fn container_args_and_commands_are_redacted() {
+        let mut pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "spec": {"containers": [{
+                "command": ["/bin/app", "--db-url=postgres://app:hunter2@db/app"],
+                "args": ["--password", "pw2", "--verbose", "--api-key", "k3", "token=t4", "--token"],
+                "env": [{"name": "PASSWORD", "value": "kept"}]
+            }]}
+        });
+        assert_eq!(sanitize(&mut pod), 4);
+        let container = &pod["spec"]["containers"][0];
+        assert_eq!(
+            container["command"],
+            json!([
+                "/bin/app",
+                "--db-url=postgres://app:[REDACTED:password]@db/app"
+            ])
+        );
+        assert_eq!(
+            container["args"],
+            json!([
+                "--password",
+                "[REDACTED:password]",
+                "--verbose",
+                "--api-key",
+                "[REDACTED:key]",
+                "token=[REDACTED:token]",
+                "--token"
+            ])
+        );
+        assert_eq!(container["env"][0]["value"], "kept");
+    }
+
+    // covers UP-15
+    #[test]
+    fn config_maps_are_shown_as_returned() {
+        let mut list = json!({"kind": "List", "items": [{
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "c"},
+            "data": {"message": "password=example", "note": "token=t", "args": "x"}
+        }]});
+        let before = list["items"][0]["data"].clone();
+        assert_eq!(sanitize(&mut list), 0);
+        assert_eq!(list["items"][0]["data"], before);
+    }
+
+    // covers UP-15
+    #[test]
+    fn list_items_are_redacted_once() {
+        // Built at run time, so the source holds no private key header.
+        let pem = format!(
+            "{}BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----",
+            "-----"
+        );
+        let mut list = json!({"kind": "List", "items": [{"kind": "Event", "message": pem}]});
+        assert_eq!(sanitize(&mut list), 1);
     }
 }

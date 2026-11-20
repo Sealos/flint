@@ -6,7 +6,10 @@
 //! text finds trigger words (`bearer`, `token`, `://`, `AKIA`, ...). Only a line holding a
 //! trigger is matched, and only against the rules that trigger can start. Private key blocks
 //! span lines, so they are found first, over the whole text. The `regex` crate runs in linear
-//! time, so no input can make a pattern backtrack catastrophically.
+//! time, so no input can make a pattern backtrack catastrophically, and no pattern captures a
+//! value of open-ended length: a quoted value's end is found by one forward scan, and the next
+//! match starts after it. So a line costs time linear in its length, however many values it
+//! holds.
 //!
 //! The rules err toward redacting: a harmless value next to `password=` is hidden too.
 
@@ -24,6 +27,21 @@ pub struct Redacted<'a> {
     pub text: Cow<'a, str>,
     /// How many values were replaced.
     pub count: usize,
+    /// Where markers were written in `text`: the byte offset of each replaced line (or private
+    /// key marker) and how many markers it holds, in order.
+    marks: Vec<(usize, usize)>,
+}
+
+impl Redacted<'_> {
+    /// How many of the replaced values are at or after byte `offset` of `text`, when `text` is
+    /// cut at the start of a line. Markers the input already held are not counted.
+    pub fn count_from(&self, offset: usize) -> usize {
+        self.marks
+            .iter()
+            .filter(|(at, _)| *at >= offset)
+            .map(|(_, n)| n)
+            .sum()
+    }
 }
 
 /// How every marker starts; the kind and `]` follow.
@@ -40,6 +58,8 @@ pub fn redact_credentials(text: &str) -> Redacted<'_> {
     for (span, replacement) in private_key_spans(text) {
         redact_lines(text, from..span.start, &mut out);
         out.replace(span.clone(), replacement);
+        let marker = out.written() - replacement.len() + replacement.find('[').unwrap_or(0);
+        out.marks.push((marker, 1));
         out.count += 1;
         from = span.end;
     }
@@ -54,6 +74,7 @@ struct Builder<'a> {
     /// Bytes of `src` already copied to (or replaced in) `out`.
     done: usize,
     count: usize,
+    marks: Vec<(usize, usize)>,
 }
 
 impl<'a> Builder<'a> {
@@ -63,6 +84,7 @@ impl<'a> Builder<'a> {
             out: None,
             done: 0,
             count: 0,
+            marks: Vec::new(),
         }
     }
 
@@ -76,6 +98,11 @@ impl<'a> Builder<'a> {
         self.done = range.end;
     }
 
+    /// Bytes written to the output so far.
+    fn written(&self) -> usize {
+        self.out.as_ref().map_or(0, String::len)
+    }
+
     fn finish(mut self) -> Redacted<'a> {
         let text = match self.out.take() {
             Some(mut out) => {
@@ -87,6 +114,7 @@ impl<'a> Builder<'a> {
         Redacted {
             text,
             count: self.count,
+            marks: self.marks,
         }
     }
 }
@@ -98,10 +126,13 @@ static PEM_BEGIN: LazyLock<Regex> =
 static PEM_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").unwrap());
 
+/// The marker that replaces a private key's body.
+const PRIVATE_KEY_MARKER: &str = "[REDACTED:private-key]";
+
 /// The bodies of private key blocks, between the BEGIN and END lines, and what replaces each.
-/// The BEGIN and END lines are kept. A block cut off by a log tail is redacted too: an END with
-/// no BEGIN before it hides everything from the start of the text (or the previous block), and
-/// a BEGIN with no END hides everything after it.
+/// The BEGIN and END lines are kept. A BEGIN with no END hides everything after it (a block cut
+/// off at the end). An END with no BEGIN hides only the key lines right before it (a block whose
+/// start a log tail cut off), so text that merely names the END line is kept.
 fn private_key_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     if memchr::memmem::find(text.as_bytes(), b"PRIVATE KEY").is_none() {
         return Vec::new();
@@ -119,10 +150,15 @@ fn private_key_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
         match (begin, open) {
             (true, None) => open = Some(end),
             (true, Some(_)) => {}
-            (false, from) => {
-                let from = from.unwrap_or(last_end);
+            (false, Some(from)) => {
                 spans.push(from..start);
                 open = None;
+                last_end = end;
+            }
+            (false, None) => {
+                if let Some(from) = cut_off_body_start(text, last_end, start) {
+                    spans.push(from..start);
+                }
                 last_end = end;
             }
         }
@@ -132,22 +168,82 @@ fn private_key_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     }
     spans
         .into_iter()
+        // Already redacted (the text went through here before): not counted again.
+        .filter(|span| text[span.clone()].trim() != PRIVATE_KEY_MARKER)
         .map(|span| {
             let multi_line = text[span.clone()].contains('\n');
             let with = if multi_line {
                 "\n[REDACTED:private-key]\n"
             } else {
-                "[REDACTED:private-key]"
+                PRIVATE_KEY_MARKER
             };
             (span, with)
         })
         .collect()
 }
 
+/// Shortest run of key characters an END with no BEGIN must follow to be taken as a cut-off
+/// block.
+const MIN_CUT_OFF_KEY: usize = 16;
+
+/// Where the body of a block cut off before its END at `end` starts: the base64 lines (and, in
+/// escaped JSON, `\n`-separated segments) right before it, each at least as wide as the one
+/// after it, no earlier than `floor`. `None` when there are fewer than [`MIN_CUT_OFF_KEY`] key
+/// characters, as in "missing -----END ...".
+fn cut_off_body_start(text: &str, floor: usize, end: usize) -> Option<usize> {
+    let key_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
+    let mut start = end;
+    let mut key_chars = 0;
+    let mut line_end = end;
+    let mut footer_line = true;
+    // Key lines have one width, and only the last one is shorter, so going back each line must
+    // be at least as long as the one after it: "starting" before a key line is not part of it.
+    let mut width = 0;
+    loop {
+        let line_start = memchr::memrchr(b'\n', &text.as_bytes()[floor..line_end])
+            .map_or(floor, |i| floor + i + 1);
+        let line = &text[line_start..line_end];
+        // Segments split at a literal `\n` (escaped JSON), from the last one back.
+        let mut segment_end = line.len();
+        let mut whole_line = true;
+        for (i, segment) in line.rsplit("\\n").enumerate() {
+            let segment_start = segment_end - segment.len();
+            let trimmed = segment.trim();
+            if trimmed.len() >= width && !trimmed.is_empty() && trimmed.bytes().all(key_byte) {
+                key_chars += trimmed.len();
+                width = trimmed.len();
+                start = line_start + segment_start;
+            } else if !(trimmed.is_empty() && i == 0 && footer_line) {
+                // A key line at the end of a longer segment: `"private_key": "MIIE...`.
+                let kept = segment.trim_end();
+                let tail = kept.bytes().rev().take_while(|&b| key_byte(b)).count();
+                if tail >= MIN_CUT_OFF_KEY {
+                    key_chars += tail;
+                    start = line_start + segment_start + kept.len() - tail;
+                }
+                whole_line = false;
+                break;
+            }
+            segment_end = segment_start.saturating_sub(2);
+        }
+        if !whole_line || line_start == floor {
+            break;
+        }
+        line_end = line_start - 1;
+        footer_line = false;
+    }
+    (key_chars >= MIN_CUT_OFF_KEY).then_some(start)
+}
+
 // --- Line rules --------------------------------------------------------------------------------
 
-/// One line rule: a regex whose `v` group (or `v1`..`v4`) is the value to replace, and the
-/// marker kind for a match, or `None` to leave that match alone.
+/// One line rule: a regex with the value to replace in one group, and the marker kind for a
+/// match, or `None` to leave that match alone. The value group is `v` (replaced as matched),
+/// `vt` (a bare value: closing punctuation after it is kept), `vq` (empty, right after an
+/// opening double quote: the value runs to its closing quote, with `q` holding the backslashes
+/// before the opening quote) or `vd` (empty: the value runs to the closing quote when `q`
+/// matched, else to the end of the line). The regex never scans an open-ended value itself;
+/// [`quoted_len`] finds its end in one forward pass, so each line costs linear time.
 struct Rule {
     regex: Regex,
     kind: fn(&Captures, &str) -> Option<&'static str>,
@@ -155,36 +251,39 @@ struct Rule {
 
 /// Rule bits, in the order the rules run: header and URL forms first, so `Authorization: Bearer
 /// eyJ...` becomes one marker, then vendor shapes, then generic key-value pairs.
-const AUTH: u16 = 1 << 0;
-const BEARER: u16 = 1 << 1;
-const URL_PASSWORD: u16 = 1 << 2;
-const SLACK_WEBHOOK: u16 = 1 << 3;
-const AZURE_SAS: u16 = 1 << 4;
-const AWS_KEY_ID: u16 = 1 << 5;
-const AWS_SECRET_NEAR_ID: u16 = 1 << 6;
-const AWS_SECRET: u16 = 1 << 7;
-const GITHUB: u16 = 1 << 8;
-const GITLAB: u16 = 1 << 9;
-const SLACK: u16 = 1 << 10;
-const GCP: u16 = 1 << 11;
-const JWT: u16 = 1 << 12;
-const FLAG: u16 = 1 << 13;
-const PAIR: u16 = 1 << 14;
+const AUTH: u32 = 1 << 0;
+const BEARER: u32 = 1 << 1;
+const URL_PASSWORD: u32 = 1 << 2;
+const URL_PASSWORD_LOOSE: u32 = 1 << 3;
+const SLACK_WEBHOOK: u32 = 1 << 4;
+const AZURE_SAS: u32 = 1 << 5;
+const AWS_KEY_ID: u32 = 1 << 6;
+const AWS_SECRET_NEAR_ID: u32 = 1 << 7;
+const AWS_SECRET: u32 = 1 << 8;
+const GITHUB: u32 = 1 << 9;
+const GITLAB: u32 = 1 << 10;
+const SLACK: u32 = 1 << 11;
+const GCP: u32 = 1 << 12;
+const VENDOR: u32 = 1 << 13;
+const JWT: u32 = 1 << 14;
+const FLAG: u32 = 1 << 15;
+const PAIR: u32 = 1 << 16;
 
 /// Trigger words (matched ignoring ASCII case) and the rules each one can start.
-const TRIGGERS: &[(&str, u16)] = &[
+const TRIGGERS: &[(&str, u32)] = &[
     ("authorization", AUTH),
     ("bearer", BEARER),
-    ("://", URL_PASSWORD),
+    ("://", URL_PASSWORD | URL_PASSWORD_LOOSE),
     ("hooks.slack.com", SLACK_WEBHOOK),
     ("sig=", AZURE_SAS),
     ("akia", AWS_KEY_ID | AWS_SECRET_NEAR_ID),
     ("asia", AWS_KEY_ID | AWS_SECRET_NEAR_ID),
     ("secret", AWS_SECRET | FLAG | PAIR),
-    ("password", FLAG | PAIR),
-    ("passwd", FLAG | PAIR),
+    ("pass", FLAG | PAIR),
+    ("pwd", PAIR),
     ("token", FLAG | PAIR),
     ("key", FLAG | PAIR),
+    ("credential", PAIR),
     ("ghp_", GITHUB),
     ("gho_", GITHUB),
     ("ghu_", GITHUB),
@@ -192,9 +291,15 @@ const TRIGGERS: &[(&str, u16)] = &[
     ("ghr_", GITHUB),
     ("github_pat_", GITHUB),
     ("glpat-", GITLAB),
+    ("glrt-", GITLAB),
+    ("gldt-", GITLAB),
     ("xox", SLACK),
     ("xapp-", SLACK),
     ("aiza", GCP),
+    ("sk_live_", VENDOR),
+    ("rk_live_", VENDOR),
+    ("sk-proj-", VENDOR),
+    ("sk-ant-", VENDOR),
     ("eyj", JWT),
 ];
 
@@ -220,15 +325,40 @@ fn rule(pattern: &str, kind: fn(&Captures, &str) -> Option<&'static str>) -> Rul
 /// optional `[` (Go's header maps). Each rule adds the opening quote it accepts.
 const SEP: &str = r#"\\*["']?[ \t]*(?:=>|:=|[:=]|%3[DdAa])[ \t]*\[?"#;
 
-static RULES: LazyLock<Vec<(u16, Rule)>> = LazyLock::new(|| {
+/// A value after a key: double-quoted (at any JSON escape level, to its closing quote),
+/// single-quoted, or bare.
+const VALUE: &str =
+    r#"(?:(?P<q>\\*)"(?P<vq>)|'(?P<v>[^'\n]*)'|\\*'?(?P<vt>[^\s"'\\=:>][^\s"'\\]*))"#;
+
+/// Credential key names. The key must end with one, so `token_count=5` is left alone; `pass`
+/// and `pwd` must be the whole key or follow a `_`, `-` or `.` (`DB_PASS`), so `bypass` is too.
+const KEYS: &str = r"[A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[_\-]?key|apikey|access[_\-]?key|secret[_\-]?key|private[_\-]?key|account[_\-]?key|secret[_\-]?key[_\-]?base|(?:encryption|signing|master|ssh)[_\-]?key|credentials?)|(?:[A-Za-z0-9_.\-]*[_.\-])?(?:pass|pwd)";
+
+/// Keys for command-line flags with the value in the next word.
+const FLAG_KEYS: &str = r"[A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_\-]?key|apikey|credentials?)|(?:[A-Za-z0-9_\-]*[_\-])?(?:pass|pwd)";
+
+/// A parameter of a Digest or AWS SigV4 `Authorization` value: `name=value` or `name="value"`.
+const AUTH_PARAM: &str = r#"[A-Za-z0-9_\-]+=(?:\\*"[^"\\\n]*\\*"|[^\s,"'\\\]]+)"#;
+
+static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
     vec![
         (
             AUTH,
+            // Digest values are hidden to the end of the header (the closing quote when the
+            // header is quoted, else the end of the line), however their parameters are
+            // separated or quoted, so a `response` never shows. SigV4 values are hidden through
+            // their last parameter, so a `Signature` never shows.
             rule(
                 &format!(
-                    r#"(?i)\b(?:proxy-)?authorization{SEP}\\?["']?(?P<s>(?:basic|bearer|digest|token|negotiate|ntlm|apikey|aws4-hmac-sha256)[ \t]+)?(?P<v>[^\s"'\\\],;]+)"#
+                    r#"(?i)\b(?:proxy-)?authorization{SEP}(?:(?P<q>\\*)"|\\*'?)(?:(?P<dg>digest)[ \t]+(?P<vd>)|(?P<sp>aws4-hmac-sha256)[ \t]+(?P<v>{AUTH_PARAM}(?:[ \t]*,[ \t]*{AUTH_PARAM})*)|(?:(?P<s>basic|bearer|token|negotiate|ntlm|apikey)[ \t]+)?(?P<vt>[^\s"'\\\],;]+))"#
                 ),
-                |c, v| (c.name("s").is_some() || v.len() >= 16).then_some("authorization"),
+                |c, v| {
+                    (c.name("dg").is_some()
+                        || c.name("sp").is_some()
+                        || c.name("s").is_some()
+                        || v.len() >= 16)
+                        .then_some("authorization")
+                },
             ),
         ),
         (
@@ -241,11 +371,26 @@ static RULES: LazyLock<Vec<(u16, Rule)>> = LazyLock::new(|| {
         ),
         (
             URL_PASSWORD,
+            // User info inside the authority: the password runs to the authority's last `@`,
+            // so one holding `@` is hidden whole, and an `@` in the path or query is not used.
             rule(
-                // The password runs to the last `@` of the URL, so one holding `@`, `/` or `#`
-                // is hidden whole.
-                r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@"'<>\[\]]*:(?P<v>[^\s"'<>]+)@[^\s/@"'<>]*"#,
+                r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@"'<>\[\]]*:(?P<v>[^\s/?#"'<>]+)@[^\s/?#@"'<>]*"#,
                 |_, _| Some("password"),
+            ),
+        ),
+        (
+            URL_PASSWORD_LOOSE,
+            // A password with an unencoded `/`, `?` or `#` splits the URL early. Taken as one
+            // only when the part after the colon is not a port (`:8443/`).
+            rule(
+                r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@"'<>\[\]]*:(?P<v>[^\s"'<>]+)@[^\s/@"'<>]*"#,
+                |_, v| {
+                    let split = v.contains(['/', '?', '#']);
+                    let digits = v.bytes().take_while(u8::is_ascii_digit).count();
+                    let port =
+                        digits > 0 && matches!(v.as_bytes().get(digits), Some(b'/' | b'?' | b'#'));
+                    (split && !port).then_some("password")
+                },
             ),
         ),
         (
@@ -285,7 +430,7 @@ static RULES: LazyLock<Vec<(u16, Rule)>> = LazyLock::new(|| {
             AWS_SECRET,
             rule(
                 &format!(
-                    r#"(?i)(?:aws_?)?secret_?access_?key{SEP}\\?["']?(?P<v>[A-Za-z0-9/+=]{{16,}})"#
+                    r#"(?i)(?:aws_?)?secret_?access_?key{SEP}\\*["']?(?P<v>[A-Za-z0-9/+=]{{16,}})"#
                 ),
                 |_, _| Some("aws-secret-access-key"),
             ),
@@ -300,7 +445,7 @@ static RULES: LazyLock<Vec<(u16, Rule)>> = LazyLock::new(|| {
         (
             GITLAB,
             rule(
-                r"(?:^|[^A-Za-z0-9])(?P<v>glpat-[A-Za-z0-9_\-]{20,})",
+                r"(?:^|[^A-Za-z0-9])(?P<v>gl(?:pat|rt|dt)-[A-Za-z0-9_\-]{20,})",
                 |_, _| Some("gitlab-token"),
             ),
         ),
@@ -319,6 +464,22 @@ static RULES: LazyLock<Vec<(u16, Rule)>> = LazyLock::new(|| {
             ),
         ),
         (
+            VENDOR,
+            // Stripe live secret and restricted keys, OpenAI project keys, Anthropic keys.
+            rule(
+                r"(?:^|[^A-Za-z0-9])(?P<v>[sr]k_live_[A-Za-z0-9]{16,}|sk-(?:proj|ant)-[A-Za-z0-9_\-]{20,})",
+                |_, v| {
+                    Some(if v.starts_with("sk-ant-") {
+                        "anthropic-key"
+                    } else if v.starts_with("sk-proj-") {
+                        "openai-key"
+                    } else {
+                        "stripe-key"
+                    })
+                },
+            ),
+        ),
+        (
             JWT,
             rule(
                 r"\b(?P<v>eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*)",
@@ -329,25 +490,36 @@ static RULES: LazyLock<Vec<(u16, Rule)>> = LazyLock::new(|| {
             FLAG,
             // `--password hunter2`: a command-line flag with its value after a space.
             rule(
-                r#"(?i)(?:^|[ \t])(?P<k>--?[A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_\-]?key|apikey))[ \t]+(?P<v>"[^"\n]*"|'[^'\n]*'|[^\s\-"'][^\s"']*)"#,
-                |c, _| Some(key_kind(c)),
+                &format!(
+                    r#"(?i)(?:^|[ \t])(?P<k>--?(?:{FLAG_KEYS}))[ \t]+(?:(?P<q>\\*)"(?P<vq>)|'(?P<v>[^'\n]*)'|(?P<vt>[^\s\-"'][^\s"']*))"#
+                ),
+                |c, v| (!v.is_empty()).then(|| key_kind(c)),
             ),
         ),
         (
             PAIR,
-            // The key must end with the keyword, so `token_count=5` is left alone. The value is
-            // a quoted string (plain, or escaped inside JSON) or a bare word.
             rule(
-                &format!(
-                    r#"(?i)(?P<k>[A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[_\-]?key|apikey|access[_\-]?key|secret[_\-]?key|private[_\-]?key|account[_\-]?key)){SEP}(?:\\+"(?P<v1>[^"\\\n]*)\\+"|"(?P<v2>(?:[^"\\\n]|\\.)*)"|'(?P<v3>[^'\n]*)'|\\*["']?(?P<v4>[^\s"'\\=:>][^\s"'\\]*))"#
-                ),
+                &format!(r#"(?i)(?:^|[^A-Za-z0-9_.\-])(?P<k>{KEYS}){SEP}{VALUE}"#),
                 |c, v| {
+                    let key = c.name("k").map_or("", |k| k.as_str()).to_ascii_lowercase();
+                    // A working directory (`PWD=/app`), or a credentials file path
+                    // (`GOOGLE_APPLICATION_CREDENTIALS=/path`).
+                    let path_key = key == "pwd"
+                        || key == "oldpwd"
+                        || key.ends_with("credential")
+                        || key.ends_with("credentials");
+                    // A count in a test summary (`pass=1 failed=0`): only a bare `pass` key, so
+                    // `DB_PASS=123456` is still hidden.
+                    let short_key = key == "pass";
                     // A private key's BEGIN line (the block itself is redacted whole), values
-                    // that are not values, and values already masked by the workload.
+                    // that are not values, values already masked by the workload, paths and
+                    // counts.
                     if v.is_empty()
                         || v.starts_with("-----")
                         || v.bytes().all(|b| b == b'*')
                         || NOT_VALUES.iter().any(|w| v.eq_ignore_ascii_case(w))
+                        || path_key && v.starts_with(['/', '~'])
+                        || short_key && v.bytes().all(|b| b.is_ascii_digit())
                     {
                         return None;
                     }
@@ -364,11 +536,11 @@ fn key_kind(caps: &Captures) -> &'static str {
         .name("k")
         .map_or("", |k| k.as_str())
         .to_ascii_lowercase();
-    if key.contains("pass") {
+    if key.contains("pass") || key.ends_with("pwd") {
         "password"
     } else if key.contains("token") {
         "token"
-    } else if key.contains("secret") {
+    } else if key.contains("secret") || key.contains("credential") {
         "secret"
     } else {
         "key"
@@ -395,6 +567,17 @@ const NOT_VALUES: &[&str] = &[
     ">+",
 ];
 
+static FLAG_ONLY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"(?i)^(?P<k>--?(?:{FLAG_KEYS}))$")).expect("flag rule builds")
+});
+
+/// When `arg` is a command-line flag naming a credential with no value of its own
+/// (`--password`), the marker kind for the argument after it. For argument lists, such as a
+/// container's `args`, where the value is the next element.
+pub fn credential_flag(arg: &str) -> Option<&'static str> {
+    FLAG_ONLY.captures(arg).map(|c| key_kind(&c))
+}
+
 /// Runs the line rules over the lines of `text[range]` that hold a trigger word.
 fn redact_lines(text: &str, range: Range<usize>, out: &mut Builder) {
     if range.is_empty() {
@@ -403,7 +586,7 @@ fn redact_lines(text: &str, range: Range<usize>, out: &mut Builder) {
     let bytes = text.as_bytes();
     let input = aho_corasick::Input::new(text).span(range.clone());
     // The line being collected: its range and the rules its triggers start.
-    let mut line: Option<(Range<usize>, u16)> = None;
+    let mut line: Option<(Range<usize>, u32)> = None;
     for m in TRIGGER_SEARCH.find_overlapping_iter(input) {
         let rules = TRIGGERS[m.pattern().as_usize()].1;
         if let Some((current, mask)) = &mut line
@@ -426,52 +609,109 @@ fn redact_lines(text: &str, range: Range<usize>, out: &mut Builder) {
     }
 }
 
-fn redact_line(text: &str, range: Range<usize>, mask: u16, out: &mut Builder) {
+fn redact_line(text: &str, range: Range<usize>, mask: u32, out: &mut Builder) {
     let mut line = Cow::Borrowed(&text[range.clone()]);
+    let mut count = 0;
     for (bit, rule) in RULES.iter() {
         if mask & bit != 0
-            && let Some(changed) = apply(rule, &line, &mut out.count)
+            && let Some(changed) = apply(rule, &line, &mut count)
         {
             line = Cow::Owned(changed);
         }
     }
     if let Cow::Owned(line) = line {
         out.replace(range, &line);
+        out.marks.push((out.written() - line.len(), count));
+        out.count += count;
     }
+}
+
+/// The byte range of a rule's value in `line` (see [`Rule`]).
+fn value_range(caps: &Captures, line: &str) -> Option<Range<usize>> {
+    if let Some(v) = caps.name("v") {
+        return Some(v.range());
+    }
+    if let Some(v) = caps.name("vt") {
+        // Bare values run to whitespace or a quote; closing punctuation after them stays.
+        let kept = v.as_str().trim_end_matches([',', ';', ')', '}', ']']);
+        return Some(v.start()..v.start() + kept.len());
+    }
+    if let Some(v) = caps.name("vd") {
+        let end = match caps.name("q") {
+            Some(q) => v.start() + quoted_len(&line[v.start()..], q.len()),
+            None => line.len(),
+        };
+        return Some(v.start()..end);
+    }
+    let v = caps.name("vq")?;
+    let level = caps.name("q").map_or(0, |q| q.len());
+    Some(v.start()..v.start() + quoted_len(&line[v.start()..], level))
+}
+
+/// The length of a double-quoted value that starts `rest`, up to its closing quote. `level` is
+/// how many backslashes escaped the opening quote: 0 in plain JSON, 1 in JSON inside a JSON
+/// string, and so on. A quote with fewer backslashes closes the value (an even number at level
+/// 0); one with more is part of it. With no closing quote the value runs to the end.
+fn quoted_len(rest: &str, level: usize) -> usize {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while let Some(at) = memchr::memchr(b'"', &bytes[i..]) {
+        let quote = i + at;
+        let backslashes = bytes[..quote]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+        let closes = if level == 0 {
+            backslashes % 2 == 0
+        } else {
+            backslashes <= level
+        };
+        if closes {
+            return quote - backslashes;
+        }
+        i = quote + 1;
+    }
+    rest.len()
 }
 
 /// Applies one rule to a line. Returns the new line, or `None` when nothing was replaced.
 fn apply(rule: &Rule, line: &str, count: &mut usize) -> Option<String> {
     let mut out = String::new();
     let mut done = 0;
-    for caps in rule.regex.captures_iter(line) {
-        let Some(value) = ["v", "v1", "v2", "v3", "v4"]
-            .iter()
-            .find_map(|name| caps.name(name))
-        else {
-            continue;
+    let mut at = 0;
+    while at <= line.len() {
+        let Some(caps) = rule.regex.captures_at(line, at) else {
+            break;
         };
-        // A marker from an earlier rule (a separator may have taken its `[`).
-        let before = value.start().saturating_sub(1);
-        if line.as_bytes()[before..].starts_with(MARKER_PREFIX.as_bytes())
-            || value.as_str().starts_with(MARKER_PREFIX)
-        {
-            continue;
+        let whole = caps.get(0).expect("group 0");
+        let mut next = whole.end().max(whole.start() + 1);
+        if let Some(value) = value_range(&caps, line) {
+            if caps.name("vq").is_some() || caps.name("vd").is_some() {
+                // The match stopped at the opening quote; the next one starts after the value.
+                next = value.end.max(whole.start() + 1);
+            }
+            let text = &line[value.clone()];
+            // A marker from an earlier rule (a separator may have taken its `[`).
+            let before = value.start.saturating_sub(1);
+            let marked = line.as_bytes()[before..].starts_with(MARKER_PREFIX.as_bytes())
+                || text.starts_with(MARKER_PREFIX);
+            if !marked
+                && !text.is_empty()
+                && let Some(kind) = (rule.kind)(&caps, text)
+            {
+                out.push_str(&line[done..value.start]);
+                out.push_str(MARKER_PREFIX);
+                out.push_str(kind);
+                out.push(']');
+                done = value.end;
+                *count += 1;
+            }
         }
-        // Bare values run to whitespace or a quote; closing punctuation around them stays.
-        let text = value.as_str().trim_end_matches([',', ';', ')', '}', ']']);
-        if text.is_empty() {
-            continue;
+        at = next;
+        while at < line.len() && !line.is_char_boundary(at) {
+            at += 1;
         }
-        let Some(kind) = (rule.kind)(&caps, text) else {
-            continue;
-        };
-        out.push_str(&line[done..value.start()]);
-        out.push_str(MARKER_PREFIX);
-        out.push_str(kind);
-        out.push(']');
-        done = value.start() + text.len();
-        *count += 1;
     }
     (done > 0).then(|| {
         out.push_str(&line[done..]);

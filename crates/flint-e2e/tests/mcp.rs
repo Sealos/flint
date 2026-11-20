@@ -221,7 +221,8 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
         .write_settings(&exposing(EXPOSED, &two.a.url()))?;
     let pod = "web-69c6f74b8b-qv4xv";
     let token = "s3cr3t-t0ken-value-0123";
-    let aws_key = "AKIAIOSFODNN7EXAMPLE";
+    // Built at run time, so the source holds no access key id.
+    let aws_key = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
     two.a.set_log(
         "demo",
         pod,
@@ -247,6 +248,22 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
             "message": message,
             "type": "Warning",
             "count": 1,
+        }),
+    );
+    // A pod whose container arguments carry a password.
+    let pods = two.a.gvr("pods");
+    two.a.set_object(
+        &pods,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "api-0", "namespace": "demo"},
+            "spec": {"containers": [{
+                "name": "web",
+                "image": "nginx",
+                "command": ["/bin/web", "--db-url=postgres://app:hunter3@db/app"],
+                "args": ["--password", "hunter4", "--port", "80"],
+            }]},
         }),
     );
     let mut mcp = two.mcp()?;
@@ -293,13 +310,27 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
     )?;
     assert!(!event.is_error, "{}", event.text);
     assert!(event.text.starts_with("# redacted=1"), "{}", event.text);
+    let spec = mcp.call(
+        "get_resource",
+        json!({"cluster": EXPOSED, "kind": "pod", "namespace": "demo", "name": "api-0"}),
+    )?;
+    assert!(!spec.is_error, "{}", spec.text);
+    assert!(spec.text.starts_with("# redacted=2"), "{}", spec.text);
+    assert!(
+        spec.text
+            .contains("--db-url=postgres://app:[REDACTED:password]@db/app"),
+        "{}",
+        spec.text
+    );
+    assert!(spec.text.contains("--port"), "{}", spec.text);
     for text in [
         logs.to_string(),
         got.to_string(),
         listed.to_string(),
         event.text,
+        spec.text,
     ] {
-        for secret in [token, aws_key, "hunter2"] {
+        for secret in [token, aws_key.as_str(), "hunter2", "hunter3", "hunter4"] {
             assert!(!text.contains(secret), "{secret} reached the agent: {text}");
         }
     }
