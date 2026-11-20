@@ -126,19 +126,25 @@ impl Inspected {
     }
 }
 
-/// A Secret applied as `kubectl apply` does (its value also in the last-applied annotation),
-/// deleted again on kind when dropped.
+/// A Secret created as `kubectl apply` leaves it (its value also in the last-applied
+/// annotation), under a name of its own, and deleted again on kind when dropped. It never
+/// touches an object it did not create.
 struct AppliedSecret<'a> {
     on: &'a Inspected,
+    /// `flint-test-mcp-<pid>-<millis>`: the cluster-e2e job checks no `flint-test` Secret is
+    /// left behind.
+    name: String,
 }
 
 impl<'a> AppliedSecret<'a> {
-    /// Named `flint-test-…`, which the cluster-e2e job checks is gone after the tests.
-    const NAME: &'static str = "flint-test-mcp-applied";
     const PLAINTEXT: &'static str = "flint-e2e-plaintext-value";
     const ENCODED: &'static str = "ZmxpbnQtZTJlLXBsYWludGV4dC12YWx1ZQ==";
 
     fn apply(on: &'a Inspected) -> Result<AppliedSecret<'a>> {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let name = format!("flint-test-mcp-{}-{millis}", std::process::id());
         match on.cluster.fake_server() {
             // What `kubectl apply` leaves on the cluster: the value encoded in `data`, and in
             // plain text in the last-applied annotation.
@@ -151,7 +157,7 @@ impl<'a> AppliedSecret<'a> {
                     "apiVersion": "v1",
                     "kind": "Secret",
                     "metadata": {
-                        "name": Self::NAME,
+                        "name": name,
                         "namespace": "demo",
                         "annotations": {
                             "kubectl.kubernetes.io/last-applied-configuration": annotation
@@ -162,19 +168,23 @@ impl<'a> AppliedSecret<'a> {
                 });
                 fake.set_object(&fake.gvr("secrets"), secret);
             }
-            // kubectl writes the annotation itself, with the plain-text value it was given.
+            // `create --save-config` writes the annotation as `apply` does, with the plain-text
+            // value it was given, and fails rather than change a Secret that already exists.
             None => {
                 let secret = json!({
                     "apiVersion": "v1",
                     "kind": "Secret",
-                    "metadata": {"name": Self::NAME, "namespace": "demo"},
+                    "metadata": {"name": name, "namespace": "demo"},
                     "type": "Opaque",
                     "stringData": {"password": Self::PLAINTEXT}
                 });
-                on.kubectl(&["apply", "-f", "-"], Some(&secret.to_string()))?;
+                on.kubectl(
+                    &["create", "--save-config", "-f", "-"],
+                    Some(&secret.to_string()),
+                )?;
             }
         }
-        Ok(AppliedSecret { on })
+        Ok(AppliedSecret { on, name })
     }
 }
 
@@ -187,7 +197,7 @@ impl Drop for AppliedSecret<'_> {
                     "demo",
                     "delete",
                     "secret",
-                    Self::NAME,
+                    &self.name,
                     "--ignore-not-found",
                 ],
                 None,
@@ -249,7 +259,7 @@ fn up_10_agent_inspects_a_cluster() -> Result<()> {
     };
     on.expose()?;
     let cluster = on.context();
-    let _secret = AppliedSecret::apply(&on)?;
+    let applied = AppliedSecret::apply(&on)?;
     if let Some(fake) = on.cluster.fake_server() {
         fake.set_log(
             "demo",
@@ -315,7 +325,7 @@ fn up_10_agent_inspects_a_cluster() -> Result<()> {
     // Secret values and their copy in the annotation are redacted.
     let secret = mcp.call(
         "get_resource",
-        json!({"cluster": cluster, "kind": "secret", "namespace": "demo", "name": AppliedSecret::NAME}),
+        json!({"cluster": cluster, "kind": "secret", "namespace": "demo", "name": applied.name}),
     )?;
     assert!(!secret.is_error, "{}", secret.text);
     assert!(secret.text.contains("password"), "{}", secret.text);
