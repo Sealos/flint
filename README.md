@@ -215,8 +215,8 @@ The app watches `settings.toml` and your kubeconfig files and picks up changes w
 
 Flint logs to stderr, warnings and errors only by default. `flint --verbose` (or `flint mcp --verbose`) adds info;
 `FLINT_LOG` sets the filter exactly, for example `FLINT_LOG=debug` or `FLINT_LOG=flint_core=debug`, and wins over
-`--verbose`. `RUST_LOG` is read when `FLINT_LOG` is not set. `flint --help` lists every environment variable Flint
-reads, the development aids below apart.
+`--verbose`. `RUST_LOG` is read when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists the commands, options
+and environment variables, with the development aids below under their own heading.
 
 `FLINT_CLUSTER=<context>` is a development and testing aid, for example for agents that take screenshots: at startup
 Flint activates that context exactly as a click would. It must name a context in the loaded kubeconfig; otherwise Flint
@@ -231,7 +231,8 @@ Two more development aids work together with `FLINT_CLUSTER`, so screenshots can
 
 - `FLINT_VIEW` opens a view once the cluster's discovery arrives: a kind (`pods`, `deployments.apps`,
   `widgets.example.com`; the group may be left out), `kind/name` for a cluster-scoped object, or
-  `namespace/kind/name`. Add `#yaml` to an object to open its YAML tab. Without `FLINT_CLUSTER` it is ignored.
+  `namespace/kind/name`. Add `#yaml` to an object to open its YAML tab, or `#logs` to a pod to open its logs.
+  Without `FLINT_CLUSTER` it is ignored.
 - `FLINT_APPEARANCE=light` or `dark` forces a theme over the `appearance` setting and macOS.
 
 ```sh

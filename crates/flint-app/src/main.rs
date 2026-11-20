@@ -17,19 +17,20 @@ usage: flint [--verbose]        start the app
        flint --version          print the version
 
 options:
-  -v, --verbose      log info to stderr as well as warnings and errors
+  --verbose          log info to stderr as well as warnings and errors
 
 environment:
   KUBECONFIG         kubeconfig files to load, separated by colons (default ~/.kube/config)
-  FLINT_CONFIG_DIR   where settings.toml and state.toml live (default ~/Library/Application
-                     Support/Flint on macOS, $XDG_CONFIG_HOME/flint or ~/.config/flint on Linux)
+  FLINT_CONFIG_DIR   where settings.toml and state.toml live. Default on macOS:
+                       ~/Library/Application Support/Flint
+                     on Linux: $XDG_CONFIG_HOME/flint, else ~/.config/flint
   FLINT_LOG          log filter, for example debug or flint_core=debug; overrides --verbose.
-                     RUST_LOG is read when FLINT_LOG is not set
+                     RUST_LOG is read when FLINT_LOG is unset, empty or invalid
 
 development and testing only:
   FLINT_CLUSTER      activate this kubeconfig context at startup, as a click would
   FLINT_VIEW         with FLINT_CLUSTER, open a view: kind, kind/name or namespace/kind/name,
-                     with #yaml for the YAML tab
+                     with #yaml for the YAML tab or #logs for a pod's logs
   FLINT_APPEARANCE   light or dark, over the appearance setting";
 
 /// Help for `flint mcp`. `exe` is this binary's absolute path, for the example.
@@ -73,14 +74,15 @@ struct Run {
 }
 
 /// What to run, from the command line (program name excluded). `Err` holds what to print and
-/// the exit code. `-v`/`--verbose` may come anywhere: `flint -v mcp` and `flint mcp -v` match.
+/// the exit code. `--verbose` may come anywhere: `flint --verbose mcp` and `flint mcp --verbose`
+/// match. There is no `-v`: `flint -v` meaning the version elsewhere, it would start the app.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Run, (String, u8)> {
     // Finder (LaunchServices) can add a process serial number, `-psn_0_12345`, when it starts
     // an app bundle; it is not an argument for us.
     let (flags, rest): (Vec<String>, Vec<String>) = args
         .into_iter()
         .filter(|a| !a.starts_with("-psn_"))
-        .partition(|a| matches!(a.as_str(), "-v" | "--verbose"));
+        .partition(|a| a == "--verbose");
     let verbose = !flags.is_empty();
     let run = |mode| Ok(Run { mode, verbose });
     match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
@@ -172,11 +174,13 @@ mod tests {
     #[test]
     fn verbose_turns_on_info_logs_for_the_app_and_the_server() {
         assert_eq!(parse(&["--verbose"]), verbose(Mode::App));
-        assert_eq!(parse(&["-v"]), verbose(Mode::App));
         assert_eq!(parse(&["mcp", "--verbose"]), verbose(Mode::Mcp));
-        assert_eq!(parse(&["-v", "mcp"]), verbose(Mode::Mcp));
-        assert_eq!(parse(&["-v", "bogus"]).unwrap_err().1, 2);
-        assert_eq!(parse(&["mcp", "-v", "bogus"]).unwrap_err().1, 2);
+        assert_eq!(parse(&["--verbose", "mcp"]), verbose(Mode::Mcp));
+        assert_eq!(parse(&["--verbose", "bogus"]).unwrap_err().1, 2);
+        assert_eq!(parse(&["mcp", "--verbose", "bogus"]).unwrap_err().1, 2);
+        // `-v` is no flag here: it must not start the app or a server that waits on stdin.
+        assert_eq!(parse(&["-v"]).unwrap_err().1, 2);
+        assert_eq!(parse(&["mcp", "-v"]).unwrap_err().1, 2);
     }
 
     #[test]
@@ -232,7 +236,7 @@ mod tests {
             );
         }
         assert_eq!(parse(&["mcp", "--help", "extra"]).unwrap_err().1, 0);
-        assert_eq!(parse(&["-v", "mcp", "--help"]).unwrap_err().1, 0);
+        assert_eq!(parse(&["--verbose", "mcp", "--help"]).unwrap_err().1, 0);
         assert_eq!(parse(&["mcp", "--version"]), Err((version(), 0)));
         assert!(
             parse(&["--help"])

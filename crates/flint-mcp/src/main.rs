@@ -10,16 +10,15 @@ const USAGE: &str = "\
 usage: flint-mcp [--verbose]  serve the read-only MCP server on stdio
        flint-mcp --version    print the version
 
--v, --verbose logs info to stderr as well as warnings. FLINT_LOG (or RUST_LOG) sets the filter
+--verbose logs info to stderr as well as warnings. FLINT_LOG (or RUST_LOG) sets the filter
 exactly, for example FLINT_LOG=debug.
 
 Same server as `flint mcp`, without the desktop app. Not shipped; register `flint mcp` in AI clients.";
 
 /// `Ok(verbose)` to serve; `Err` holds what to print and the exit code. Program name excluded.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<bool, (String, u8)> {
-    let (verbose, rest): (Vec<String>, Vec<String>) = args
-        .into_iter()
-        .partition(|a| matches!(a.as_str(), "-v" | "--verbose"));
+    let (verbose, rest): (Vec<String>, Vec<String>) =
+        args.into_iter().partition(|a| a == "--verbose");
     match rest.first().map(String::as_str) {
         None => Ok(!verbose.is_empty()),
         Some("-h" | "--help" | "help") => Err((USAGE.to_owned(), 0)),
@@ -66,7 +65,7 @@ mod tests {
     #[test]
     fn verbose_serves_with_more_logging() {
         assert_eq!(parse(&["--verbose"]), Ok(true));
-        assert_eq!(parse(&["-v"]), Ok(true));
+        assert_eq!(parse(&["-v"]).unwrap_err().1, 2);
         assert!(parse(&["--help"]).unwrap_err().0.contains("--verbose"));
         assert_eq!(parse(&["--verbose", "bogus"]).unwrap_err().1, 2);
     }
