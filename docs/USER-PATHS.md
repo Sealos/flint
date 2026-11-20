@@ -382,7 +382,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I connect to a remote cluster I have not trusted, and try to edit, delete, scale, restart, drain, exec or
   port-forward.
 - **Then** the action is disabled and says the cluster is protected, with an Unlock button in place. Browsing, logs and
-  details work as usual. A cluster on my machine (kind, minikube, Docker Desktop, OrbStack) starts unlocked.
+  details work as usual. A cluster whose API server kubeconfig names by a loopback address or name (kind, Docker
+  Desktop, OrbStack, minikube on macOS) starts unlocked. One on another address stays protected even if it runs on
+  my machine, such as minikube's Docker driver on Linux (`192.168.49.2`): I trust it once.
 - Tests: unit (core refuses writes on protected clusters), ui, e2e. Today exec is the only action that changes a
   cluster, so Shell is the one gated; the rest join the same gate as they are built.
 

@@ -165,13 +165,16 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   - clusters on the user's machine: an API server at `localhost` (or a name under `.localhost`), a loopback address
     (`127.0.0.0/8`, `::1`) or Docker Desktop's `kubernetes.docker.internal`, as the kubeconfig says it, never
     resolved (`protection::is_local_server`), and only when the cluster entry has no `proxy-url` (behind a proxy
-    a loopback address leads wherever the proxy sends it). `protect_local_clusters = true` in `settings.toml`
-    protects them too, for a local address that is a tunnel to a remote cluster;
+    a loopback address leads wherever the proxy sends it). That covers kind, Docker Desktop, OrbStack and minikube
+    on macOS; a local cluster served on another address, such as minikube's Docker driver on Linux
+    (`192.168.49.2`, a bridge address), stays protected and is trusted once. `protect_local_clusters = true` in
+    `settings.toml` protects them too, for a local address that is a tunnel to a remote cluster;
   - clusters in `trusted_clusters` in `settings.toml`, pinned to the context and API server URL like AI exposure
     (`settings::ClusterPin`), so a re-pointed context is protected again;
   - clusters unlocked for this session (`protection::SessionUnlocks`): one confirmation naming the context and its
     server, pinned to that server, until Flint quits or Lock Again. Nothing is written to disk.
-- **A `settings.toml` that does not parse** opens nothing up (`Settings::unreadable_fallback`), at launch and on a
+- **A `settings.toml` that does not parse** (or a symlink to one that is gone, which is not a fresh install) opens
+  nothing up (`Settings::unreadable_fallback`), at launch and on a
   reload alike: nothing is exposed or trusted, and clusters on this machine are protected too, since the file may
   have asked for that. The sidebar's banner says so. Unknown keys are ignored so newer files load; one within two
   edits of a known key (`protect_local_cluster`) is named in the log, since it would otherwise fail open silently.
@@ -181,8 +184,10 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   (`CoreHandle::exec`, failing with `ExecFailureKind::Protected`); edit, apply, delete, scale, restart, cordon, drain,
   Helm changes, port-forward and debug containers take the same gate when they are built (M3, M5). The session's
   unlocks are shared between the front end and the core (`CoreHandle::unlock`, `lock`, `unlocks`), so an unlock
-  takes effect before the next action is asked for; trust goes through `Command::SetTrusted`, which, like exposure,
-  writes nothing if the context moved since the user confirmed. `flint mcp` stays read-only either way.
+  takes effect before the next action is asked for. Stop Trusting (`CoreHandle::untrust`) revokes the trust in that
+  shared state at once, before `Command::SetTrusted` writes the file, since commands and the gate's requests take
+  separate queues; the revocation is dropped once the settings no longer trust the context. Trust goes through
+  `Command::SetTrusted`, which, like exposure, writes nothing if the context moved since the user confirmed. `flint mcp` stays read-only either way.
 - **In the app.** The sidebar shows a lock button per cluster (`lock-<context>`): a closed lock while protected, an
   open one (in the warning tone) while unlocked, a shield while trusted, nothing for a cluster on this machine. Its
   menu offers Unlock for This Session…, Lock Again, Trust This Cluster… and Stop Trusting (also Remove the Old Trust
@@ -191,7 +196,8 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   disabled with the reason ("alpha is protected (read-only in Flint) until you unlock it") in its tooltip and
   caption and an Unlock… button beside it; the row menu's Shell is disabled the same way, followed by Unlock alpha….
   An ended or failed shell tab's Restart shell is disabled the same way, with the refusal under it and Unlock…
-  beside it, and Restart Shell is unavailable from the keys and the palette (the workspace refuses it too, and the
+  beside it (no Unlock… when the tab's context left kubeconfig or lost its server: that is the reason shown then),
+  and Restart Shell is unavailable from the keys and the palette (the workspace refuses it too, and the
   core is the backstop). The unlock and trust confirmations take the button: Enter cancels, as closing and quitting
   do. Lock Again leaves running shells running; it stops new ones, and its menu entry, palette entry and dialog say
   so. Stop Trusting also locks the cluster, even if it was unlocked for the session. A trusted context whose
