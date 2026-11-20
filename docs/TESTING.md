@@ -243,7 +243,8 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   `Backend::from_env()`, so `FLINT_E2E_BACKEND=kind` runs them on kind; tests that script watches or inject faults
   use the fake server.
 - **Tests are named after user paths** (`up_03_connect_to_a_cluster`, `up_20_browse_pods_with_live_updates`, …) and
-  tagged `// covers UP-xx`. `tests/app/` holds the app paths (`m0.rs`, `m1.rs`, `m2.rs`), `tests/mcp.rs` the MCP
+  tagged `// covers UP-xx`. `tests/app/` holds the app paths (`m0.rs`, `m1.rs`, `m2.rs` for logs, `m2_shell.rs` for shells and
+  sessions across navigation), `tests/mcp.rs` the MCP
   paths. Paths
   left out say why at the top of their file: UP-05 (Finder launch, real cloud auth: manual), UP-14 to UP-16 (not
   built yet), UP-26 (a load test against kind), and UP-13's live switch with macOS (a test must not change the
@@ -555,9 +556,10 @@ runner images, so pixel diffs would be flaky.
 
 Which tests cover each user path today, and what is missing, is in [`E2E-COVERAGE.md`](./E2E-COVERAGE.md). In
 short: with #100, M0 and M1 have app e2e tests for every automatable path. In M2 the app reads real log streams from
-the fake server in `tests/app/m2.rs` (UP-40, UP-43, UP-45: #122, #125). Shells are tested only below the app: core
-tests run real exec on kind, and view tests feed a `FakeExec`, so no test has the real app reading a real exec stream. The automation `state` reports the dock since #119. The fake API server answers exec
-with 404 and writes with 405. (Its logs stream since #120.)
+the fake server in `tests/app/m2.rs` (UP-40, UP-43, UP-45: #122, #125), and runs shells over the fake's exec
+WebSocket in `tests/app/m2_shell.rs` (UP-41, UP-42, UP-24: #123, #124), with a smoke test of the same on kind. The
+automation `state` reports the dock since #119. The fake API server's logs stream since #120, and its exec runs a
+scripted shell since #121; it answers writes with 405.
 
 The Mac mini session owns the harness and macOS CI (#40, #100, #42, #117). Harness and fake-server work is in
 milestone T; feature tests are in their feature's milestone.
@@ -570,19 +572,20 @@ milestone T; feature tests are in their feature's milestone.
 | `state.dock`: tabs, status, bounded log lines and shell screen | 40–45 | automation | #119 | M |
 | Fake logs that follow: per container and previous, timestamps, `sinceTime`, end and drop, open-stream count; pod churn helpers | 40, 42, 43, 45 | fake API | #120 | M |
 | `up_40_read_pod_logs` smoke: detail, request, streamed line, reconnect without duplicates, timestamp toggle without a new request, stream closed with the tab | 40, 43, 42 | A + fake | #122 | M |
-| `up_41_shell_into_a_container` smoke against kind on the Mac mini (`demo` has bash and sh-only images), recorded in the M2 review | 41 | A + kind | #123 | S |
-| `up_42_sessions_outlive_navigation`: output keeps arriving across a cluster switch, closing ends the stream | 42, 24 | A + fake | #124 | S |
+| `up_41_*` on the fake exec, and `up_41_shell_on_kind` against kind (done) | 41 | A + fake, A + kind | #123 | S |
+| `up_42_sessions_outlive_navigation`: output keeps arriving across a cluster switch, closing ends the stream (done) | 42, 24 | A + fake | #124 | S |
 | `up_45_follow_workload_logs`, if workload logs ship in M2 (#62, #63) | 45 | A + fake | #125 | M |
 
 ### P1: before 1.0
 
-- **Harness (T):** fake exec websocket so `up_41` runs in CI (#121); teardown invariants for UP-90 and UP-91
+- **Harness (T):** teardown invariants for UP-90 and UP-91
   (#127); drift guard: MCP tests on both backends in `cluster-e2e` and a nightly fixture diff (#128); fake writes,
   a remote-looking cluster for protection, metrics, fixture variants, a fake `claude` and clock control (#129); the
   nightly memory soak test (#126).
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the
   debounce (UP-06, #131); keyboard-only use, palette and switcher (UP-33, UP-30, UP-31, #132); the whole app under
-  10,000 pods, nightly (UP-26, #133); relaunch and window close for UP-42 (#124).
+  10,000 pods, nightly (UP-26, #133); Close Window in the app (UP-42: the app under test has no active window, so
+  the action does nothing there; view tests cover it) and an exit observed apart from `App::quit` (#174).
 - **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram, dashboard and
   `get_cluster_summary` (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log and
   Claude analysis (#137), warm clusters and cluster sets (#138); M6 Homebrew cask smoke (#139).
