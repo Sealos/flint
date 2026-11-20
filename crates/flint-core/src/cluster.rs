@@ -247,8 +247,9 @@ impl SafeErrorText {
         SafeErrorText(text.into())
     }
 
-    /// Any text, reduced as [`redact::safe_error_summary`] does.
-    pub(crate) fn reduced(text: &str) -> Self {
+    /// Any text, reduced as [`redact::safe_error_summary`] does: safe whatever its source, so
+    /// public (the app's tests build failed states with it).
+    pub fn reduced(text: &str) -> Self {
         SafeErrorText(redact::safe_error_summary(text))
     }
 
