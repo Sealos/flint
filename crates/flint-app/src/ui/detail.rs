@@ -505,31 +505,26 @@ impl DetailView {
             );
         }
         let containers: Vec<PodContainer> = self.log_containers().to_vec();
-        let button = Button::new("detail-logs")
-            .xsmall()
-            .ghost()
-            .label("Logs")
-            .tooltip(format!(
-                "Open the logs in the dock ({})",
-                registry::key_hint("secondary-l")
-            ));
+        let keys = registry::key_hint("secondary-l");
+        let button = Button::new("detail-logs").xsmall().ghost().label("Logs");
         match containers.as_slice() {
             [] => None,
             [only] if !only.has_previous => Some(
                 button
+                    .tooltip(format!("Open the logs in the dock ({keys})"))
                     .on_click(registry::on_click(OpenLogs))
                     .into_any_element(),
             ),
             _ => Some(
                 button
+                    .tooltip(picker_hint(
+                        containers.iter().find(|c| c.default).map(|c| &c.name[..]),
+                        &keys,
+                    ))
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let mut menu = menu.label("Container");
                         for c in &containers {
-                            let label = if c.init {
-                                format!("{} (init)", c.name)
-                            } else {
-                                c.name.clone()
-                            };
+                            let label = container_label(&c.name, c.init, c.default);
                             menu = menu.item(PopupMenuItem::new(label).on_click(
                                 registry::on_click(OpenContainerLogs {
                                     container: c.name.clone(),
@@ -540,7 +535,8 @@ impl DetailView {
                         if containers.iter().any(|c| c.has_previous) {
                             menu = menu.separator().label("Previous instance");
                             for c in containers.iter().filter(|c| c.has_previous) {
-                                menu = menu.item(PopupMenuItem::new(c.name.clone()).on_click(
+                                let label = container_label(&c.name, c.init, c.default);
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
                                     registry::on_click(OpenContainerLogs {
                                         container: c.name.clone(),
                                         previous: true,
@@ -589,7 +585,9 @@ impl DetailView {
             // A pod still loading: Shell waits for it.
             _ => button.tooltip(format!("Open a shell in the dock ({keys})")),
         };
-        let containers = shell.map(|s| s.containers).unwrap_or_default();
+        let (pod, containers, default) = shell
+            .map(|s| (s.pod, s.containers, s.default))
+            .unwrap_or_default();
         if containers.len() < 2 {
             return Some(
                 button
@@ -599,14 +597,21 @@ impl DetailView {
         }
         Some(
             button
+                .tooltip(match self.subject {
+                    Subject::Workload(_) => {
+                        format!("In {pod}: {}", picker_hint(Some(&default), &keys))
+                    }
+                    _ => picker_hint(Some(&default), &keys),
+                })
                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                     let mut menu = menu.label("Container");
                     for name in &containers {
-                        menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                            registry::on_click(OpenContainerShell {
+                        let label = container_label(name, false, *name == default);
+                        menu = menu.item(PopupMenuItem::new(label).on_click(registry::on_click(
+                            OpenContainerShell {
                                 container: name.clone(),
-                            }),
-                        ));
+                            },
+                        )));
                     }
                     menu
                 })
@@ -1129,6 +1134,25 @@ fn key_value(
 }
 
 /// "5m" for an RFC 3339 timestamp five minutes ago.
+/// A container as a picker lists it: `app (default)`, `migrate (init)`. The default one is
+/// what the keys open (⌘L, ⇧⌘L, ⇧⌘E), so the picker says which it is.
+pub(in crate::ui) fn container_label(name: &str, init: bool, default: bool) -> String {
+    match (init, default) {
+        (true, _) => format!("{name} (init)"),
+        (false, true) => format!("{name} (default)"),
+        (false, false) => name.to_owned(),
+    }
+}
+
+/// The tooltip of a button that picks a container: the key skips the picker and opens the
+/// default container.
+fn picker_hint(default: Option<&str>, keys: &str) -> String {
+    match default {
+        Some(name) => format!("Choose a container ({keys} opens {name}, the default)"),
+        None => "Choose a container".to_owned(),
+    }
+}
+
 fn timestamp_age(text: &str, now: i64) -> Option<String> {
     let seconds = text
         .parse::<k8s_openapi::jiff::Timestamp>()
@@ -1224,7 +1248,18 @@ mod state;
 
 #[cfg(test)]
 mod tests {
-    use super::timestamp_age;
+    use super::{container_label, picker_hint, timestamp_age};
+
+    #[test]
+    fn pickers_mark_the_container_the_keys_open() {
+        assert_eq!(container_label("app", false, true), "app (default)");
+        assert_eq!(container_label("sidecar", false, false), "sidecar");
+        assert_eq!(container_label("migrate", true, false), "migrate (init)");
+        assert_eq!(
+            picker_hint(Some("app"), "⌘L"),
+            "Choose a container (⌘L opens app, the default)"
+        );
+    }
 
     #[test]
     fn ages_of_rfc3339_timestamps() {

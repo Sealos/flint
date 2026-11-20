@@ -249,8 +249,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: cluster, ui.
 
 ### UP-41 Shell into a container
-- **When** I open a shell on a pod (Shell in its detail pane or its row's context menu, or Shift-Cmd-E; a container
-  picker when it has several), or on a workload (in its first ready pod; UP-47).
+- **When** I open a shell on a pod (Shell in its detail pane or its row's context menu, or Shift-Cmd-E), or on a
+  workload (in its first ready pod; UP-47). When the pod has several containers, the button and the menu let me pick
+  one, the default marked; Shift-Cmd-E opens the default container at once.
 - **Then** a tab opens in the bottom dock with an interactive terminal that resizes with the dock and the window.
   Colors, bold, italic, underline, inverse and wide characters show as in other terminals, in both themes, and
   full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and
@@ -313,8 +314,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I right-click a pod or workload row (Deployment, StatefulSet, DaemonSet, ReplicaSet, Job), or select it
   and press Cmd-L, Shift-Cmd-L or Shift-Cmd-E (also from the palette).
 - **Then** the row is selected and its menu offers Logs, Previous Logs (pods) and Shell: a pod's logs and shell, a
-  workload's logs of all pods (UP-45) and a shell in its first ready pod, with a container picker when the pod has
-  several. Each opens its dock tab, or shows the one already open. A workload's shell opens in a pod listed when I
+  workload's logs of all pods (UP-45) and a shell in its first ready pod. When the pod has several containers, each
+  entry picks one, the default container marked (Previous Logs lists those that restarted); the keys open the default
+  container at once. Each opens its dock tab, or shows the one already open. A workload's shell opens in a pod listed when I
   ask, never in one listed earlier. Chosen before the row's pod has loaded, an entry waits for it, says so, and gives
   up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile, nor hide the dock tab I
   am typing in. What does not apply is disabled, with the reason under it in the menu and on the pane's button: a pod

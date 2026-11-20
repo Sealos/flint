@@ -383,6 +383,28 @@ fn click_entry(cx: &mut TestAppContext, t: &TestWorkspace, ix: usize) {
     draw(cx, t);
 }
 
+/// The open submenu's entries, after its "Container" label.
+fn submenu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        let sub = window.within("submenu");
+        (1usize..)
+            .map_while(|ix| sub.try_find(ix))
+            .map(|item| item.label().unwrap_or_default().to_owned())
+            .collect()
+    })
+    .unwrap()
+}
+
+/// Clicks the open submenu's entry `ix` (1 is the first container).
+fn click_submenu(cx: &mut TestAppContext, t: &TestWorkspace, ix: usize) {
+    cx.update_window(t.window, |_, window, cx| {
+        window.within("submenu").click(ix, cx)
+    })
+    .unwrap();
+    draw(cx, t);
+}
+
 /// The dock: its tabs' titles, left to right, and the active one's position.
 fn dock_tabs(cx: &mut TestAppContext, t: &TestWorkspace) -> (Vec<String>, Option<usize>) {
     t.workspace.read_with(cx, |ws, cx| {
@@ -447,10 +469,13 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     show_fetched(cx, &t, pod_detail("web"));
     assert_eq!(dock_tabs(cx, &t), (vec!["web · app".to_owned()], Some(0)));
 
-    // Loaded: Previous Logs applies (app restarted), Shell picks a container.
+    // Loaded, with two containers: each entry picks one, the default marked. Previous Logs
+    // lists the one that restarted.
     right_click(cx, &t, "web").await;
     assert_eq!(menu(cx, &t), ["Logs", "Previous Logs", "Shell"]);
     click_entry(cx, &t, 1);
+    assert_eq!(submenu(cx, &t), ["app (default)"]);
+    click_submenu(cx, &t, 1);
     assert_eq!(
         dock_tabs(cx, &t),
         (
@@ -460,33 +485,81 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     );
     right_click(cx, &t, "web").await;
     click_entry(cx, &t, 2);
-    let containers: Vec<String> = cx
-        .update_window(t.window, |_, window, _| {
-            let sub = window.within("submenu");
-            (1usize..)
-                .map_while(|ix| sub.try_find(ix))
-                .map(|item| item.label().unwrap_or_default().to_owned())
-                .collect()
-        })
-        .unwrap();
-    assert_eq!(containers, ["app", "sidecar"]);
-    cx.update_window(t.window, |_, window, cx| {
-        window.within("submenu").click(2usize, cx)
-    })
-    .unwrap();
-    draw(cx, &t);
+    assert_eq!(submenu(cx, &t), ["app (default)", "sidecar"]);
+    click_submenu(cx, &t, 2);
     assert_eq!(dock_tabs(cx, &t).0[2], "Shell: web · sidecar");
 
     // Logs again from the menu shows the open tab, not a second one; so does Previous Logs
     // (Shift-Cmd-L) from the list.
     right_click(cx, &t, "web").await;
     click_entry(cx, &t, 0);
+    assert_eq!(submenu(cx, &t), ["app (default)", "sidecar"]);
+    click_submenu(cx, &t, 1);
     assert_eq!(dock_tabs(cx, &t).1, Some(0));
     assert_eq!(dock_tabs(cx, &t).0.len(), 3);
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-l");
     let (titles, active) = dock_tabs(cx, &t);
     assert_eq!((titles.len(), active), (3, Some(1)));
+}
+
+// covers UP-47, UP-40, UP-41: on a pod with several containers the menu picks one, the default
+// marked, while the keys open the default container at once: the one the
+// `kubectl.kubernetes.io/default-container` annotation names, here the second.
+#[gpui_kit::test]
+async fn keys_open_the_default_container_and_the_menu_picks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {
+                "name": "web", "namespace": "demo", "uid": "uid-web",
+                "annotations": {"kubectl.kubernetes.io/default-container": "sidecar"}
+            },
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 2, "lastState": {"terminated": {"exitCode": 1}}},
+                {"name": "sidecar", "restartCount": 0}
+            ]}
+        })),
+    );
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-l");
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-e");
+    assert_eq!(dock_tabs(cx, &t).0, ["web · sidecar", "Shell: web · sidecar"]);
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 0);
+    assert_eq!(submenu(cx, &t), ["app", "sidecar (default)"]);
+    click_submenu(cx, &t, 1);
+    assert_eq!(dock_tabs(cx, &t).0[2], "web · app");
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 2);
+    assert_eq!(submenu(cx, &t), ["app", "sidecar (default)"]);
+    click_submenu(cx, &t, 1);
+    assert_eq!(dock_tabs(cx, &t).0[3], "Shell: web · app");
+    // The default container never restarted: the key says so, while the menu offers the one
+    // that did.
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-l");
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some(
+            "Can't open the previous logs: container sidecar has not restarted, so it has no \
+             previous logs."
+        )
+    );
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 1);
+    assert_eq!(submenu(cx, &t), ["app"]);
+    click_submenu(cx, &t, 1);
+    assert_eq!(dock_tabs(cx, &t).0[4], "web · app (previous)");
 }
 
 // covers UP-47, UP-40: keys and the registry act on the selected row too; an entry that does
@@ -1010,6 +1083,7 @@ async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
     assert_eq!(selected.as_deref(), Some("web"));
     show_fetched(cx, &t, pod_detail("web"));
     click_entry(cx, &t, 0);
+    click_submenu(cx, &t, 1);
     assert_eq!(dock_tabs(cx, &t).0, ["web · app"]);
 }
 

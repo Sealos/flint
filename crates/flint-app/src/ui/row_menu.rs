@@ -1,5 +1,9 @@
 //! The context menu of a pod or workload row (UP-47): Logs, Previous Logs and Shell.
 //!
+//! On a pod with several containers each entry is a container picker, the default container
+//! marked; the keys (⌘L, ⇧⌘L, ⇧⌘E) open the default container at once (see "From rows" in
+//! `docs/ARCHITECTURE.md`).
+//!
 //! Right-clicking a row selects it, as a click does, so the detail pane shows it; the menu's
 //! entries are then the detail pane's registered actions ([`OpenLogs`], [`OpenPreviousLogs`],
 //! [`OpenShell`], [`OpenContainerShell`]), performed through [`registry::on_click`], so the menu,
@@ -25,7 +29,8 @@ use flint_core::redact::first_line;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
 
-use super::detail::{Opening, Subject, reason, refused};
+use super::detail::{Opening, Subject, container_label, reason, refused};
+use super::object::PodContainer;
 use super::registry::{
     self, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell,
 };
@@ -57,8 +62,11 @@ pub struct RowActions {
     /// For pods only.
     pub previous: Option<Availability>,
     pub shell: Availability,
-    /// The pod a shell opens in, and its app containers, as far as known.
-    pub shell_pod: Option<(String, Vec<String>)>,
+    /// The pod a shell opens in, its app containers, and the default one, as far as known.
+    pub shell_pod: Option<(String, Vec<String>, String)>,
+    /// A pod's containers (init ones too), once fetched: what Logs and Previous Logs pick
+    /// from.
+    pub log_containers: Vec<PodContainer>,
 }
 
 /// What the selected row's actions can do now, if a pod or workload row is selected. The
@@ -81,7 +89,11 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         previous: (subject == Subject::Pod)
             .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
         shell: gate(detail.shell_check::<OpenShell>(None)),
-        shell_pod: detail.shell_pod().map(|p| (p.pod, p.containers)),
+        shell_pod: detail.shell_pod().map(|p| (p.pod, p.containers, p.default)),
+        log_containers: match subject {
+            Subject::Pod => detail.log_containers().to_vec(),
+            _ => Vec::new(),
+        },
         blocked,
         subject,
     })
@@ -159,39 +171,95 @@ fn fill(
     let says_why = a.blocked.is_none();
     let entry =
         |menu, label, action, can, says_why| entry(menu, label, action, can, says_why, workspace);
-    menu = entry(menu, "Logs".into(), Box::new(OpenLogs), &a.logs, says_why);
+    let workspace = workspace.clone();
+    // A pod with several containers: Logs and Previous Logs pick one, as Shell does.
+    let several = a.log_containers.len() > 1;
+    menu = if several && a.logs.is_ok() {
+        let containers = a.log_containers.clone();
+        log_picker(menu, "Logs", containers, false, &workspace, window, cx)
+    } else {
+        entry(menu, "Logs".into(), Box::new(OpenLogs), &a.logs, says_why)
+    };
     if let Some(previous) = &a.previous {
-        menu = entry(
-            menu,
-            "Previous Logs".into(),
-            Box::new(OpenPreviousLogs),
-            previous,
-            says_why,
-        );
+        // Only the containers that ran before have a previous instance.
+        let restarted: Vec<PodContainer> = a
+            .log_containers
+            .iter()
+            .filter(|c| c.has_previous)
+            .cloned()
+            .collect();
+        menu = if several && !restarted.is_empty() && a.blocked.is_none() {
+            log_picker(
+                menu,
+                "Previous Logs",
+                restarted,
+                true,
+                &workspace,
+                window,
+                cx,
+            )
+        } else {
+            entry(
+                menu,
+                "Previous Logs".into(),
+                Box::new(OpenPreviousLogs),
+                previous,
+                says_why,
+            )
+        };
     }
     let label = match (&a.shell_pod, a.subject) {
-        (Some((pod, _)), Subject::Workload(_)) => format!("Shell in {pod}"),
+        (Some((pod, _, _)), Subject::Workload(_)) => format!("Shell in {pod}"),
         _ => "Shell".to_owned(),
     };
-    let workspace = workspace.clone();
     match a.shell_pod {
         // The container picker.
-        Some((_, containers)) if a.shell.is_ok() && containers.len() > 1 => {
+        Some((_, containers, default)) if a.shell.is_ok() && containers.len() > 1 => {
             menu.submenu(label, window, cx, move |sub, _, _| {
                 containers.iter().fold(sub.label("Container"), |sub, name| {
                     sub.item(
-                        PopupMenuItem::new(name.clone()).on_click(registry::on_click_or(
-                            Box::new(OpenContainerShell {
-                                container: name.clone(),
-                            }),
-                            refuse_in(&workspace),
-                        )),
+                        PopupMenuItem::new(container_label(name, false, *name == default))
+                            .on_click(registry::on_click_or(
+                                Box::new(OpenContainerShell {
+                                    container: name.clone(),
+                                }),
+                                refuse_in(&workspace),
+                            )),
                     )
                 })
             })
         }
         _ => entry(menu, label.into(), Box::new(OpenShell), &a.shell, says_why),
     }
+}
+
+/// `label` as a submenu that picks one of `containers` for Logs (or Previous Logs, with
+/// `previous`).
+fn log_picker(
+    menu: PopupMenu,
+    label: &'static str,
+    containers: Vec<PodContainer>,
+    previous: bool,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let workspace = workspace.clone();
+    menu.submenu(label, window, cx, move |sub, _, _| {
+        containers.iter().fold(sub.label("Container"), |sub, c| {
+            sub.item(
+                PopupMenuItem::new(container_label(&c.name, c.init, c.default)).on_click(
+                    registry::on_click_or(
+                        Box::new(OpenContainerLogs {
+                            container: c.name.clone(),
+                            previous,
+                        }),
+                        refuse_in(&workspace),
+                    ),
+                ),
+            )
+        })
+    })
 }
 
 /// An entry for `action`, disabled with the reason under it when it cannot run.

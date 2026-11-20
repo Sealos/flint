@@ -395,9 +395,15 @@ documentation lists the steps.
 (`detail::OpenShell`, ⇧⌘E) act on the selected row, which the detail pane shows, so the keys, the palette, the pane's
 buttons and a row's context menu (`ui/row_menu.rs`) are one set of actions. `row_menu::row_actions` says what each can
 do now and why not, with the same checks as the guards; the menu, the pane's buttons and the automation `state` show
-it (a disabled entry carries its reason). A right-click selects the row first. For a pod they open its default
-container (a picker when it has several app containers); for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job,
-Logs opens the workload session (all pods, prefixed) and Shell opens in its first ready pod by name.
+it (a disabled entry carries its reason). A right-click selects the row first. On a pod with several containers the
+menu's Logs, Previous Logs (the containers that ran before) and Shell, and the pane's Logs and Shell buttons, are
+container pickers (`detail::OpenContainerLogs`, `detail::OpenContainerShell`) that mark the default container; the keys
+always open the default container at once, never a picker. The default is the one `kubectl` picks (the
+`kubectl.kubernetes.io/default-container` annotation, else the first app container), so ⌘L and ⇧⌘E do in one step what
+`kubectl logs` and `kubectl exec` do without `-c`, the same way every time and from the palette too, where no menu is
+open; the picker is one right-click or button away, and the buttons' tooltips say which container the key opens. For a
+Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs opens the workload session (all pods, prefixed) and Shell
+opens in its first ready pod by name.
 
 - **Workload pods** (`ui/detail_pods.rs`, `CoreHandle::workload_pods`): never listed on each update of the workload.
   A cached list (`resourceVersion=0`) shows which pod a shell would open in: a moment after the row is selected (so
