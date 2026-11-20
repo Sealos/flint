@@ -104,6 +104,14 @@ struct Press {
     started: bool,
 }
 
+/// Why a shell tab's Restart shell cannot run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RestartBlocked {
+    pub why: String,
+    /// The cluster is protected and has a server to pin an unlock to: Unlock… is offered.
+    pub unlock: bool,
+}
+
 pub struct TerminalView {
     request: ShellRequest,
     /// Dropping the view drops the session, which ends the command.
@@ -128,9 +136,10 @@ pub struct TerminalView {
     note: Option<Note>,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
-    /// Why Restart Shell cannot run: the tab's cluster is protected (ADR-0015), as the
-    /// workspace says it. Restart shell is disabled, saying so, with Unlock… beside it.
-    protected: Option<String>,
+    /// Why Restart Shell cannot run, as the workspace says it: the tab's cluster is protected
+    /// (ADR-0015), or its context is gone or has no server. Restart shell is disabled, saying
+    /// so, with Unlock… beside it when there is a server to unlock.
+    protected: Option<RestartBlocked>,
     /// The toolbar's cluster chip, as the dock names the tab's cluster: its label, its tooltip
     /// (the full context and server), and whether the context points elsewhere now.
     chip: (SharedString, SharedString, bool),
@@ -567,17 +576,21 @@ impl TerminalView {
             )
     }
 
-    /// Says why Restart Shell cannot run (the tab's cluster is protected), or `None` once it can.
-    pub(super) fn set_protected(&mut self, why: Option<String>, cx: &mut Context<Self>) {
-        if self.protected != why {
-            self.protected = why;
+    /// Says why Restart Shell cannot run, or `None` once it can.
+    pub(super) fn set_restart_blocked(
+        &mut self,
+        blocked: Option<RestartBlocked>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.protected != blocked {
+            self.protected = blocked;
             cx.notify();
         }
     }
 
-    /// Why Restart Shell cannot run now: the tab's cluster is protected.
-    pub(super) fn restart_blocked(&self) -> Option<&str> {
-        self.protected.as_deref()
+    /// Why Restart Shell cannot run now.
+    pub(super) fn restart_blocked(&self) -> Option<&RestartBlocked> {
+        self.protected.as_ref()
     }
 
     /// The strips under the toolbar: why the command ended, and the last copy.
@@ -588,7 +601,7 @@ impl TerminalView {
                 .xsmall()
                 .label("Restart shell")
                 .tab_stop(false);
-            let Some(why) = &self.protected else {
+            let Some(blocked) = &self.protected else {
                 return button
                     .tooltip(format!(
                         "Start a new shell in a tab beside this one ({})",
@@ -597,10 +610,17 @@ impl TerminalView {
                     .on_click(registry::on_click(RestartShell))
                     .into_any_element();
             };
-            // Disabled, saying why, with the unlock in place (UP-54).
+            // Disabled, saying why, with the unlock in place (UP-54) when there is a server
+            // to unlock.
+            if !blocked.unlock {
+                return button
+                    .disabled(true)
+                    .tooltip(blocked.why.clone())
+                    .into_any_element();
+            }
             h_flex()
                 .gap_1()
-                .child(button.disabled(true).tooltip(why.clone()))
+                .child(button.disabled(true).tooltip(blocked.why.clone()))
                 .child(
                     Button::new("terminal-unlock")
                         .xsmall()
@@ -657,11 +677,11 @@ impl TerminalView {
                     .into_any_element(),
             );
         }
-        if let (Some(why), true) = (&self.protected, self.can_restart()) {
+        if let (Some(blocked), true) = (&self.protected, self.can_restart()) {
             notes.push(
                 notice(
                     "terminal-protected",
-                    refused(Opening::RestartShell, why),
+                    refused(Opening::RestartShell, &blocked.why),
                     theme.muted_foreground,
                 )
                 .test_support()

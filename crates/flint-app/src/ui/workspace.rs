@@ -49,7 +49,7 @@ use super::registry::{
 use super::row_menu;
 use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
-use super::terminal_view::TerminalView;
+use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
@@ -663,16 +663,29 @@ impl Workspace {
         });
     }
 
-    /// Tells each shell tab whether its cluster is protected, so its Restart shell is disabled,
-    /// saying why, with Unlock… beside it (UP-54).
+    /// Tells each shell tab why its Restart shell cannot run, if it cannot: its context is
+    /// gone or has no server, or its cluster is protected, when Unlock… is offered beside it
+    /// (UP-54).
     fn tell_shells_protected(&mut self, cx: &mut Context<Self>) {
         let shells: Vec<_> = self.dock.read(cx).terminals().cloned().collect();
         for shell in shells {
             let cluster = shell.read(cx).tab_key().context().to_owned();
-            let why = self
-                .is_protected(&cluster, cx)
-                .then(|| protected_reason(&cluster));
-            shell.update(cx, |s, cx| s.set_protected(why, cx));
+            let blocked = self.restart_blocked(&cluster, cx);
+            shell.update(cx, |s, cx| s.set_restart_blocked(blocked, cx));
+        }
+    }
+
+    /// Why a shell on `cluster` cannot start again, as far as the context and its protection
+    /// say.
+    fn restart_blocked(&self, cluster: &str, cx: &App) -> Option<RestartBlocked> {
+        let blocked = |why: String, unlock| Some(RestartBlocked { why, unlock });
+        match self.cluster_summary(cluster, cx) {
+            None => blocked(format!("no kubeconfig context named {cluster}"), false),
+            Some(c) if c.info.server.is_none() => {
+                blocked(format!("{cluster} has no API server in kubeconfig"), false)
+            }
+            Some(_) if self.is_protected(cluster, cx) => blocked(protected_reason(cluster), true),
+            Some(_) => None,
         }
     }
 

@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use super::super::{trust_dialog, unlock_dialog};
 use crate::ui::dock::{DockItem as _, TabStatus};
 use crate::ui::registry::ActionError;
-use crate::ui::support_tests::{TestWorkspace, WAIT, alpha_and_beta, open_workspace_with};
+use crate::ui::support_tests::{
+    TestWorkspace, WAIT, alpha_and_beta, open_fake_shell, open_workspace_with,
+};
 
 const PROTECT_LOCAL: &str = "protect_local_clusters = true\n";
 
@@ -209,7 +211,7 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
         "the note is drawn"
     );
     assert_eq!(
-        shell.read_with(cx, |s, _| s.restart_blocked().map(str::to_owned)),
+        shell.read_with(cx, |s, _| s.restart_blocked().map(|b| b.why.clone())),
         Some(why.to_owned())
     );
     let tabs = t
@@ -303,9 +305,31 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;
 
-    t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "alpha"}))
-        .unwrap();
-    wait_for_protection(cx, &t, "alpha", Protection::Protected).await;
+    // Stop Trusting protects it at once, through the gate the core shares, before the new
+    // settings come back: the settings the app holds still trust it.
+    let (trusted_still, now) = t.model.update(cx, |m, cx| {
+        m.untrust_cluster("alpha".into(), cx);
+        (
+            m.settings
+                .trusted_clusters
+                .iter()
+                .any(|p| p.context == "alpha"),
+            m.protection_of("alpha"),
+        )
+    });
+    assert!(trusted_still);
+    assert_eq!(now, Protection::Protected);
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .settings
+            .trusted_clusters
+            .iter()
+            .all(|p| p.context != "alpha")
+    })
+    .await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
     t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "beta"}))
         .unwrap();
     let model = t.model.clone();
@@ -374,6 +398,56 @@ async fn an_old_trust_on_a_context_without_a_server_can_be_removed(cx: &mut Test
         Some(true),
         "nothing left to do"
     );
+}
+
+// covers UP-54: an ended shell whose context lost its server, or left kubeconfig, says so on
+// its disabled Restart shell, with no Unlock… (there is nothing to pin an unlock to).
+#[gpui_kit::test]
+async fn a_shell_whose_context_is_gone_offers_no_unlock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), "").await;
+    let (_, mut fake) = open_fake_shell(cx, &t);
+    fake.set_state(flint_core::ExecState::Exited { code: Some(0) });
+    fake.pump();
+    cx.run_until_parked();
+    assert_eq!(disabled(cx, &t, "terminal-restart"), Some(false));
+    let shell = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.dock.read(cx).active_terminal().cloned())
+        .unwrap();
+    let blocked = |cx: &mut TestAppContext| {
+        shell.read_with(cx, |s, _| {
+            s.restart_blocked().map(|b| (b.why.clone(), b.unlock))
+        })
+    };
+    let change = |cx: &mut TestAppContext, f: &dyn Fn(&mut Vec<flint_core::ClusterSummary>)| {
+        t.model.update(cx, |m, cx| {
+            f(&mut m.clusters);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    change(cx, &|clusters| {
+        clusters
+            .iter_mut()
+            .find(|c| c.info.name == "alpha")
+            .unwrap()
+            .info
+            .server = None
+    });
+    assert_eq!(
+        blocked(cx),
+        Some(("alpha has no API server in kubeconfig".to_owned(), false))
+    );
+    assert_eq!(disabled(cx, &t, "terminal-restart"), Some(true));
+    assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
+    change(cx, &|clusters| clusters.retain(|c| c.info.name != "alpha"));
+    assert_eq!(
+        blocked(cx),
+        Some(("no kubeconfig context named alpha".to_owned(), false))
+    );
+    assert_eq!(disabled(cx, &t, "terminal-restart"), Some(true));
+    assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
 }
 
 // covers UP-54: clusters on this machine start unlocked: no lock button, Shell enabled, and
