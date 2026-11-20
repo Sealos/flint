@@ -64,8 +64,9 @@ pub(crate) struct Kept {
     pub bytes: usize,
     /// How many of them are in sealed blocks.
     pub trimmable: usize,
-    /// Its oldest line.
-    pub first: LineId,
+    /// Its oldest line, when the trim took blocks out (else its own caps, not the budget,
+    /// dropped what is gone).
+    pub first: Option<LineId>,
 }
 
 impl LogBudget {
@@ -192,7 +193,9 @@ impl LogBudget {
         let target = entry.trim_to.take()?;
         let (kept, released) = trim(target);
         (entry.bytes, entry.trimmable) = (kept.bytes, kept.trimmable);
-        entry.kept_from = Some(kept.first);
+        if kept.first.is_some() {
+            entry.kept_from = kept.first;
+        }
         Some(released)
     }
 
@@ -401,7 +404,7 @@ mod tests {
         let kept = |t| Kept {
             bytes: t,
             trimmable: t,
-            first: 7,
+            first: Some(7),
         };
         assert_eq!(budget.set_shown(1, false), None, "never trimmed");
         // Tab 1 trims with the budget's lock held, so a tab shown meanwhile waits for it (and
@@ -416,6 +419,17 @@ mod tests {
         assert_eq!(released, Some("released"));
         assert_eq!(budget.apply_trim(1, |t| (kept(t), ())), None, "asked once");
         // Shown next: it learns which lines the trim kept.
+        assert_eq!(budget.set_shown(1, true), Some(7));
+        // A trim that took nothing out leaves that alone: lines its own caps dropped are not
+        // the budget's doing.
+        budget.set_shown(1, false);
+        budget.report(1, 6 * MIB, 6 * MIB, false);
+        let nothing = |t| Kept {
+            bytes: t,
+            trimmable: t,
+            first: None,
+        };
+        assert_eq!(budget.apply_trim(1, |t| (nothing(t), ())), Some(()));
         assert_eq!(budget.set_shown(1, true), Some(7));
         budget.set_shown(1, false);
 

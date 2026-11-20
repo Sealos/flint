@@ -318,7 +318,7 @@ impl Output {
         let kept = Kept {
             bytes: self.buffer.bytes(),
             trimmable: self.buffer.trimmable_bytes(),
-            first: self.buffer.first_id(),
+            first: (!blocks.is_empty()).then(|| self.buffer.first_id()),
         };
         (kept, blocks)
     }
@@ -458,6 +458,15 @@ pub(crate) async fn run(
                     if out.dirty {
                         out.publish(&tx);
                     }
+                    // Planned again from what it holds now, as a report would: the publish
+                    // above leaves the next tick nothing to report, and another tab may still
+                    // have to give back.
+                    b.budget.report(
+                        b.id,
+                        out.buffer.bytes(),
+                        out.buffer.trimmable_bytes(),
+                        out.frozen.is_some(),
+                    );
                 }
             }
             _ = tick.tick(), if out.dirty => {

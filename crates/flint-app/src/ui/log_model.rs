@@ -623,13 +623,21 @@ pub fn shown_snapshot(
         current.clone()
     };
     match kept_from {
-        Some(first) if snapshot.lines.first_id() < first => Arc::new(LogSnapshot {
-            lines: snapshot.lines.trimmed(first),
-            trimmed: true,
-            ..(*snapshot).clone()
-        }),
-        _ => snapshot,
+        Some(first) => clipped(snapshot, first),
+        None => snapshot,
     }
+}
+
+/// `snapshot` without lines before `first`, which a trim of its session dropped.
+pub fn clipped(snapshot: Arc<LogSnapshot>, first: LineId) -> Arc<LogSnapshot> {
+    if snapshot.lines.first_id() >= first {
+        return snapshot;
+    }
+    Arc::new(LogSnapshot {
+        lines: snapshot.lines.trimmed(first),
+        trimmed: true,
+        ..(*snapshot).clone()
+    })
 }
 
 pub fn has_ended(state: &LogState) -> bool {

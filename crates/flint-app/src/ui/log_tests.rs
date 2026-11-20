@@ -1960,3 +1960,27 @@ async fn a_copy_lands_after_its_tab_closes(cx: &mut TestAppContext) {
     assert!(released.upgrade().is_none(), "the tab is gone");
     assert_eq!(clipboard(cx).as_deref(), Some("line 5\nline 6"));
 }
+
+// covers UP-42: a tab shown after a trim made while it was hidden drops the lines that trim
+// took from every snapshot still on its way, until one starts after them (#296).
+#[gpui_kit::test]
+async fn snapshots_from_before_a_trim_are_shown_without_its_lines(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (_window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    let stale = lines.push(0, 10).streaming();
+    view.update(cx, |v, cx| {
+        v.kept_floor = Some(6);
+        v.set_snapshot(stale, cx);
+        assert_eq!(v.snapshot.lines.first_id(), 6);
+        assert!(v.snapshot.trimmed);
+        assert_eq!(v.kept_floor, Some(6), "until a snapshot starts there");
+    });
+    let mut after = Feed::new(4);
+    let fresh = after.push(0, 10).streaming();
+    view.update(cx, |v, cx| {
+        v.set_snapshot(fresh, cx);
+        assert_eq!(v.snapshot.lines.first_id(), 6);
+        assert_eq!(v.kept_floor, None);
+    });
+}
