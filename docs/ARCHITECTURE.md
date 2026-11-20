@@ -110,7 +110,12 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 - `flint-core` starts a multi-threaded tokio runtime on background threads when the app launches. GPUI keeps its own
   executor on the main thread ([ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md)).
 - The UI talks to the core only through `CoreHandle`. Commands go in over a channel that works with any runtime.
-  Events come back on another such channel, which a GPUI task drains to update entities.
+  Events come back through a queue (`flint_core::events`, #255) that a GPUI task drains to update entities. It is
+  bounded however slowly it is read: state events (the cluster list, the active cluster, settings, a cluster's
+  discovery, the activity log) keep only their latest form per kind and cluster, a connection its latest attempt
+  starting and where it settled, and errors the last 64 (older ones are dropped, counted and logged). The order of
+  what is left is the order of the last changes, so reading it ends where reading every event would. The reader owns
+  the queue: `CoreHandle::events` hands out readers, and once every reader is dropped the core stops queueing.
 - Watches can change faster than the UI should redraw. The core marks the store as changed and sends at most one
   change event per view per frame budget (about 100 ms). The view then reads the latest snapshot. Individual watch
   events are never forwarded to the UI one by one.

@@ -81,7 +81,7 @@ pub(super) fn init_logging() {
 
 pub(super) struct Core {
     pub(super) handle: CoreHandle,
-    events: async_channel::Receiver<Event>,
+    events: flint_core::events::Events,
 }
 
 impl Core {

@@ -1152,3 +1152,32 @@ async fn close_window_closes_the_window(cx: &mut TestAppContext) {
         assert!(cx.update_window(t.window, |_, _, _| ()).is_err(), "{how}");
     }
 }
+
+// covers UP-01: after a burst of changes (here, switching clusters back and forth faster than
+// the UI reads), the app shows the latest: the core's queue keeps only the newest state of each
+// kind, and the order of the last changes.
+#[gpui_kit::test]
+async fn a_burst_of_changes_ends_on_the_latest_state(cx: &mut TestAppContext) {
+    use flint_core::ConnectionState;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.model.update(cx, |m, _| {
+        for n in 0..40 {
+            m.activate(if n % 2 == 0 { "alpha" } else { "beta" }.into());
+        }
+    });
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).active.as_deref() == Some("beta")
+    })
+    .await;
+    // beta's server refuses: it settles on failed; alpha's never answers: still connecting.
+    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+        .await;
+    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connecting))
+        .await;
+    let names: Vec<String> = t.model.read_with(cx, |m, _| {
+        m.clusters.iter().map(|c| c.info.name.clone()).collect()
+    });
+    assert_eq!(names, ["alpha", "beta"]);
+}

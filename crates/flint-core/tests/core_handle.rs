@@ -19,7 +19,7 @@ fn kubeconfig(contexts: &[&str]) -> String {
     s
 }
 
-async fn next_clusters(events: &async_channel::Receiver<Event>) -> Vec<String> {
+async fn next_clusters(events: &flint_core::events::Events) -> Vec<String> {
     loop {
         match events.recv().await.unwrap() {
             Event::ClustersChanged(snapshot) => {
@@ -115,7 +115,7 @@ const SERVER: &str = "https://127.0.0.1:1";
 
 /// The next `SettingsChanged` event that satisfies `pred`.
 async fn settings_where(
-    events: &async_channel::Receiver<Event>,
+    events: &flint_core::events::Events,
     pred: impl Fn(&Settings, Option<&str>) -> bool,
 ) -> (Arc<Settings>, Option<String>) {
     loop {
@@ -300,6 +300,69 @@ async fn reports_the_agent_activity_log_as_it_grows() {
     .await
     .expect("an append is noticed");
     assert_eq!(*grown, [record(1), record(2)]);
+}
+
+/// Rewrites kubeconfig `times` times (a cloud CLI in a loop), with `contexts` contexts.
+async fn rewrite_kubeconfig(dir: &Path, times: usize, contexts: &[&str]) {
+    for n in 0..times {
+        let mut names: Vec<String> = contexts.iter().map(|c| (*c).to_owned()).collect();
+        names.push(format!("burst-{}", n % 3));
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        std::fs::write(dir.join("kubeconfig"), kubeconfig(&names)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The debounced reloads land.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+}
+
+// covers UP-06: a front end that holds the stream without reading it holds a few events,
+// however many reloads the core runs: the latest of each kind.
+#[tokio::test]
+async fn events_nobody_reads_stay_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    rewrite_kubeconfig(dir.path(), 50, &["one", "two"]).await;
+    // Clusters, settings, activity: one each, however many times they changed.
+    assert!(events.len() <= 4, "{} events queued", events.len());
+    let mut latest = None;
+    while !events.is_empty() {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            latest = Some(snapshot);
+        }
+    }
+    let names: Vec<_> = latest
+        .expect("the cluster list is there")
+        .clusters
+        .iter()
+        .map(|c| c.info.name.clone())
+        .collect();
+    assert!(
+        names.starts_with(&["one".to_owned(), "two".to_owned()]),
+        "{names:?}"
+    );
+}
+
+// covers UP-06: once the front end drops its stream, the core stops queueing events for it;
+// a new reader starts from what comes next.
+#[tokio::test]
+async fn dropping_the_reader_stops_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    next_clusters(&events).await;
+    drop(events);
+    rewrite_kubeconfig(dir.path(), 10, &["one"]).await;
+    let again = core.events();
+    assert_eq!(again.len(), 0, "nothing was queued while nobody read");
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one", "later"])).unwrap();
+    let names = tokio::time::timeout(Duration::from_secs(10), next_clusters(&again))
+        .await
+        .expect("events flow again");
+    assert_eq!(names, ["one", "later"]);
 }
 
 // covers UP-04

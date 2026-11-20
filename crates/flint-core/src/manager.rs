@@ -218,7 +218,7 @@ struct Changed {
 
 pub(crate) struct ClusterManager {
     config: CoreConfig,
-    events: async_channel::Sender<Event>,
+    events: crate::events::EventSender,
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: Option<mpsc::UnboundedReceiver<Internal>>,
     kubeconfig: Arc<LoadedKubeconfig>,
@@ -261,7 +261,7 @@ impl ClusterManager {
 
     pub(crate) fn new(
         config: CoreConfig,
-        events: async_channel::Sender<Event>,
+        events: crate::events::EventSender,
         hubs: HubRegistry,
         unlocks: SessionUnlocks,
     ) -> Self {
@@ -322,8 +322,7 @@ impl ClusterManager {
     }
 
     fn emit(&self, event: Event) {
-        // An unbounded channel only fails when the receiver is gone, i.e. the front end quit.
-        let _ = self.events.try_send(event);
+        self.events.send(event);
     }
 
     fn emit_settings(&self) {
@@ -1697,7 +1696,7 @@ mod tests {
     async fn manager_reading(dir: &Path, yaml: &str) -> ClusterManager {
         let path = dir.join("kubeconfig");
         std::fs::write(&path, yaml).unwrap();
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
@@ -1846,7 +1845,7 @@ mod tests {
             plugin.user_yaml()
         );
         std::fs::write(&path, yaml).unwrap();
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
@@ -1882,7 +1881,7 @@ mod tests {
     // protected, follows unlocks and trust, and is pinned to the server.
     #[tokio::test]
     async fn the_write_gate_refuses_protected_clusters() {
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
@@ -2163,7 +2162,7 @@ mod tests {
         ];
         for (name, steps) in cases {
             let dir = tempfile::tempdir().unwrap();
-            let (events, _rx) = async_channel::unbounded();
+            let (events, _rx) = crate::events::channel();
             let config = CoreConfig {
                 config_dir: dir.path().to_owned(),
                 settings: Settings::default(),
