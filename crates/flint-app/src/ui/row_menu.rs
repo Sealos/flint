@@ -25,8 +25,10 @@ use flint_core::redact::first_line;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
 
-use super::detail::{Subject, reason};
-use super::registry::{self, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell};
+use super::detail::{Opening, Subject, reason, refused};
+use super::registry::{
+    self, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell,
+};
 use super::workspace::Workspace;
 
 /// Builds a row's context menu (gpui-component's `context_menu` builder).
@@ -227,32 +229,41 @@ fn refuse_in(
     }
 }
 
-/// Why `action`, chosen in a row's menu, was refused, in the user's words: an action that is
-/// not available says why from what the row's actions are now, never by its internal name.
+/// Why `action`, chosen in a row's menu, was refused, as one sentence ("Can't open a shell:
+/// …."): an action that is not available says why from what the row's actions are now, never
+/// by its internal name.
 pub(in crate::ui) fn refusal(
     ws: &Workspace,
     action: &dyn Action,
     error: &registry::ActionError,
     cx: &App,
 ) -> String {
-    let registry::ActionError::NotAvailable(_) = error else {
-        return reason(error);
-    };
-    let label = registry::spec_of(action).map_or("This action", |spec| spec.label);
-    let why = row_actions(ws, cx).and_then(|a| {
-        let can = if action.as_any().is::<OpenLogs>() {
-            a.logs
-        } else if action.as_any().is::<OpenPreviousLogs>() {
-            a.previous?
+    let any = action.as_any();
+    let opening = if any.is::<OpenLogs>() {
+        Opening::Logs
+    } else if any.is::<OpenPreviousLogs>() {
+        Opening::PreviousLogs
+    } else if let Some(a) = any.downcast_ref::<OpenContainerLogs>() {
+        if a.previous {
+            Opening::PreviousLogs
         } else {
-            a.shell
+            Opening::Logs
+        }
+    } else {
+        Opening::Shell
+    };
+    let registry::ActionError::NotAvailable(_) = error else {
+        return refused(opening, &reason(error));
+    };
+    let why = row_actions(ws, cx).and_then(|a| {
+        let can = match opening {
+            Opening::Logs => a.logs,
+            Opening::PreviousLogs => a.previous?,
+            Opening::Shell => a.shell,
         };
         can.err()
     });
-    match why {
-        Some(why) => format!("{label}: {why}"),
-        None => format!("{label} cannot run now"),
-    }
+    refused(opening, why.as_deref().unwrap_or("it cannot run now"))
 }
 
 #[cfg(test)]

@@ -320,8 +320,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   am typing in. What does not apply is disabled, with the reason under it in the menu and on the pane's button: a pod
   that never restarted (Previous Logs), a workload with no ready pod (as last listed, until it changes), a pod that
   finished or is being deleted, a pod or workload that was deleted (Shell), or a cluster that is not connected. An
-  action that cannot run anyway (a key, or a wait that ended badly) says why over the dock, until the next one opens,
-  I select something else, or ten seconds pass.
+  action that cannot run anyway (a key, or a wait that ended badly) says what and why in one sentence ("Can't open a
+  shell: no pod of Deployment web is ready.") in a strip with a warning icon above the dock, covering nothing, until
+  the next one opens, I select something else, or ten seconds pass.
 - Tests: unit, cluster, ui.
 
 ---

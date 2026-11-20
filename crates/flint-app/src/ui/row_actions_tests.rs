@@ -559,7 +559,11 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     assert_eq!(refusal(cx, &t), None);
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-l");
-    assert_eq!(refusal(cx, &t).as_deref(), Some(why));
+    // The strip names what was refused, then why, as a sentence.
+    assert_eq!(
+        refusal(cx, &t),
+        Some(format!("Can't open the previous logs: {why}."))
+    );
     assert_eq!(dock_tabs(cx, &t).0.len(), 2);
 }
 
@@ -784,7 +788,7 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
     assert_eq!(dock_tabs(cx, &t).0.len(), 2);
     assert_eq!(
         refusal(cx, &t).as_deref(),
-        Some("pod web-c has no app container proxy")
+        Some("Can't open a shell: pod web-c has no app container proxy.")
     );
 }
 
@@ -865,7 +869,7 @@ async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
     pods.answer(cx, &t, Err("pods is forbidden".into()));
     assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new(), "not into web-a");
     let why = "the pods of Deployment web could not be listed: pods is forbidden";
-    assert_eq!(refusal(cx, &t).as_deref(), Some(why));
+    assert_eq!(refusal(cx, &t), Some(format!("Can't open a shell: {why}.")));
     assert_eq!(actions(cx, &t), [available("Logs"), available("Shell")]);
     assert_eq!(shell_button_disabled(cx, &t), Some(false));
 }
@@ -1054,7 +1058,7 @@ async fn a_late_action_keeps_focus_and_gives_up_in_time(cx: &mut TestAppContext)
     draw(cx, &t);
     assert_eq!(
         refusal(cx, &t).as_deref(),
-        Some("Shell: gave up waiting for web to load (30 s)")
+        Some("Can't open a shell: gave up waiting for web to load (30 s).")
     );
     let state = app_state(cx, &t).detail.unwrap();
     assert!(state.banners.iter().all(|b| b.id != "detail-pending"));
@@ -1081,7 +1085,7 @@ async fn a_pending_action_on_a_failed_fetch_says_why(cx: &mut TestAppContext) {
     draw(cx, &t);
     assert_eq!(
         refusal(cx, &t).as_deref(),
-        Some("the pod could not be fetched: the server is unavailable")
+        Some("Can't open a shell: the pod could not be fetched: the server is unavailable.")
     );
 }
 
@@ -1210,7 +1214,10 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     })
     .unwrap();
     let why = refusal(cx, &t).unwrap();
-    assert!(why.starts_with("Shell: alpha is not connected"), "{why}");
+    assert!(
+        why.starts_with("Can't open a shell: alpha is not connected"),
+        "{why}"
+    );
 }
 
 // covers UP-42, UP-47: a log tab opened from a row's menu frees everything once the tab closes
@@ -1475,6 +1482,44 @@ async fn a_refusal_goes_when_it_no_longer_applies(cx: &mut TestAppContext) {
     assert_eq!(refusal(cx, &t), None, "another list");
 }
 
+// covers UP-47: the strip that says why takes a row of its own under the list and the pane,
+// above the dock, so it covers none of them, and stays one line high however long the reason
+// is (the whole sentence is in its tooltip).
+#[gpui_kit::test]
+async fn the_refusal_strip_covers_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(cx, &t, pod_detail("web"));
+    // A dock tab, so the dock shows below the strip.
+    dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
+    draw(cx, &t);
+    let strip = |cx: &mut TestAppContext, why: String| {
+        let workspace = t.workspace.clone();
+        workspace.update(cx, |ws, cx| ws.refuse(why, cx));
+        draw(cx, &t);
+        cx.update_window(t.window, |_, window, _| {
+            let bounds = |id: &'static str| window.find(id).bounds();
+            (
+                bounds("action-error"),
+                bounds("detail"),
+                bounds("row-uid-web"),
+                bounds("dock-pane"),
+            )
+        })
+        .unwrap()
+    };
+    let (short, detail, row, dock) = strip(cx, "Can't open a shell: no.".into());
+    assert!(short.top() >= detail.bottom(), "{short:?} under {detail:?}");
+    assert!(short.top() >= row.bottom(), "{short:?} under {row:?}");
+    assert!(short.bottom() <= dock.top(), "{short:?} over {dock:?}");
+    let long = format!("Can't open a shell: {}.", "a long reason ".repeat(60));
+    let (long, ..) = strip(cx, long);
+    assert_eq!(long.size.height, short.size.height, "one line");
+}
+
 // covers UP-47, UP-41: a tab that opens late while the user types in a dock tab opens behind
 // it: the tab in use stays shown and keeps focus, so keys are not lost to a hidden tab.
 #[gpui_kit::test]
@@ -1592,6 +1637,6 @@ async fn a_refused_entry_says_why_in_words(cx: &mut TestAppContext) {
     });
     assert_eq!(
         why,
-        "Open Shell: alpha is not connected: connection refused"
+        "Can't open a shell: alpha is not connected: connection refused."
     );
 }

@@ -13,7 +13,7 @@ use flint_core::{
 };
 use gpui_kit::*;
 
-use super::super::detail::DetailView;
+use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::Dock;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
@@ -471,11 +471,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Err(e) = check_selector(action) {
-            self.refuse(format!("Logs: {}", super::super::detail::reason(&e)), cx);
+            let why = super::super::detail::reason(&e);
+            self.refuse(refused(Opening::Logs, &why), cx);
             return;
         }
         let Some(cluster) = self.cluster.clone() else {
-            self.refuse("Logs: no cluster is selected".to_owned(), cx);
+            self.refuse(refused(Opening::Logs, "no cluster is selected"), cx);
             return;
         };
         let request = LogRequest {

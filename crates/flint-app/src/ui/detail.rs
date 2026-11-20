@@ -90,8 +90,8 @@ pub enum DetailEvent {
     OpenLogs(LogRequest, TakeFocus),
     /// Open (or show) a shell tab in a container of the pod, or of a workload's ready pod.
     OpenShell(ShellRequest, TakeFocus),
-    /// Logs or Shell was refused, or could not be done once what it waited for loaded: why,
-    /// for the window to say.
+    /// Logs or Shell was refused, or could not be done once what it waited for loaded: one
+    /// sentence saying what and why ([`refused`]), for the window to say.
     Refused(String),
 }
 
@@ -1209,7 +1209,7 @@ mod actions;
 #[path = "detail_pods.rs"]
 mod pods;
 
-pub(in crate::ui) use actions::reason;
+pub(in crate::ui) use actions::{Opening, reason, refused};
 pub(in crate::ui) use pods::Pods;
 #[cfg(test)]
 pub(in crate::ui) use pods::RELIST_DELAY;

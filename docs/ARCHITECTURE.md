@@ -414,9 +414,12 @@ Logs opens the workload session (all pods, prefixed) and Shell opens in its firs
   opened late takes focus only if focus has not moved since the ask (one asked for at startup, `FLINT_VIEW=…#logs`,
   always does); if focus is in another dock tab, the new tab opens behind it (`Dock::add`). The open menu is rebuilt
   whenever what it shows changes, until it is dismissed.
-- **Refusals.** An action refused, at once or after waiting, says why in a strip over the dock (`action-error`),
-  cleared by the next tab opened, a change of selection, list or cluster, or after 10 seconds. A menu entry refused as
-  not available says why from the row's actions, never by the action's internal name. Shell is refused for a deleted pod or workload and for a pod
+- **Refusals.** An action refused, at once or after waiting, says why in a strip between the main area and the dock
+  (`action-error`): a row of its own, so it covers neither the list nor the pane, one line high with a warning icon
+  (the whole sentence in its tooltip). It is cleared by the next tab opened, a change of selection, list or cluster,
+  or after 10 seconds. Every refusal is one sentence worded by `detail::refused`, naming what was refused, then why
+  ("Can't open a shell: no pod of Deployment web is ready."). A menu entry refused as not available says why from
+  the row's actions, never by the action's internal name. Shell is refused for a deleted pod or workload and for a pod
   that finished (`Succeeded`, `Failed`) or is being deleted. While the row's cluster is not connected every entry is
   disabled and the menu says why with core's summary of the error (`ClusterError::summary`); an action's
   own reason (a refused pod list, say) is cut to one short line.
