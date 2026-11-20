@@ -1209,9 +1209,10 @@ fn exactness_ranks_stored_values_then_labels_case_first() {
         detail: None,
     };
     let plain = Choice::plain("cluster/prod");
-    assert!(exactness("cluster/prod", &plain) < exactness("cluster/prod", &arn));
-    assert!(exactness("abc", &Choice::plain("abc")) < exactness("abc", &Choice::plain("ABC")));
-    assert!(exactness("abc", &Choice::plain("ABC")) < exactness("abc", &Choice::plain("abcd")));
+    let rank = |typed: &str, choice: &Choice| exactness(typed, &typed.to_lowercase(), choice);
+    assert!(rank("cluster/prod", &plain) < rank("cluster/prod", &arn));
+    assert!(rank("abc", &Choice::plain("abc")) < rank("abc", &Choice::plain("ABC")));
+    assert!(rank("abc", &Choice::plain("ABC")) < rank("abc", &Choice::plain("abcd")));
 }
 
 // covers UP-30: an open step's choices follow the data: Open Kind… opened before discovery
@@ -1269,4 +1270,89 @@ async fn a_refreshed_step_keeps_the_selection(cx: &mut TestAppContext) {
     let palette = shown(cx, &t);
     assert_eq!(labels(&palette), ["demo", "default", "kube-system"]);
     assert_eq!(selected(&palette), "kube-system");
+}
+
+// Opening the palette closes an open popover (the namespace filter), which is drawn above
+// everything else; the palette then has focus.
+#[gpui_kit::test]
+async fn opening_the_palette_dismisses_a_popover(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+    t.click(cx, "ns-add");
+    assert_eq!(state(cx, &t).1, Focus::NamespaceInput);
+    open_palette(cx, &t).await;
+    assert!(t.find(cx, "ns-all").is_none(), "the popover closed");
+    assert_eq!(state(cx, &t).1, Focus::Palette);
+}
+
+// A menu that gives focus back as it closes (a row's context menu gives it to the list): the
+// palette runs from there, and Esc returns focus to the list.
+#[gpui_kit::test]
+async fn a_menu_that_gives_focus_back_is_where_the_palette_runs(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    let row = gpui_kit::SharedString::from("row-uid-web");
+    cx.update_window(t.window, |_, window, cx| window.right_click(row, cx))
+        .unwrap();
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    assert_eq!(state(cx, &t).1, Focus::Menu);
+    open_palette(cx, &t).await;
+    assert!(t.find(cx, "popup-menu").is_none(), "the row's menu closed");
+    // From the list: its actions are listed.
+    assert!(labels(&shown(cx, &t)).contains(&"Focus Filter"));
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    assert_eq!(state(cx, &t).1, Focus::List);
+}
+
+// A refresh does not keep a selection nobody chose: an exact match that arrives becomes the
+// selected row, so Enter on "prods" with `prods-eu` listed first picks `prods` once it appears.
+#[gpui_kit::test]
+async fn a_refresh_selects_an_exact_match_that_arrives(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{discovery, entry, section};
+    use flint_core::{Event, SectionKind};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let eu = entry("example.com", "prods-eu", "ProdEu", "Prods Eu", true);
+    t.connect_alpha(
+        cx,
+        vec![section("Custom", SectionKind::BuiltIn, vec![eu.clone()])],
+    )
+    .await;
+    ask(cx, &t, "open kind").await;
+    t.type_text(cx, "prods");
+    assert_eq!(selected(&shown(cx, &t)), "Prods Eu");
+    let prods = entry("", "prods", "Prod", "Prods", true);
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(Arc::new(discovery(vec![section(
+                "Custom",
+                SectionKind::BuiltIn,
+                vec![eu, prods],
+            )]))),
+            error: None,
+        },
+    );
+    let palette = shown(cx, &t);
+    assert_eq!(labels(&palette), ["Prods", "Prods Eu"]);
+    assert_eq!(selected(&palette), "Prods");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let workspace = t.workspace.clone();
+    let kind = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).list.map(|l| l.kind))
+        })
+        .unwrap();
+    assert_eq!(kind.as_deref(), Some("prods"));
 }

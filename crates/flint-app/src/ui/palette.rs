@@ -153,6 +153,9 @@ pub struct CommandPalette {
     candidates: Vec<Candidate>,
     rows: Vec<Row>,
     selected: usize,
+    /// The selection was moved with the arrows, so a refreshed list keeps it; else the best
+    /// row (row 0) is selected again.
+    chosen: bool,
     /// Why the last Enter did nothing (a selector that does not parse, a cluster that went away).
     error: Option<String>,
     scroll: UniformListScrollHandle,
@@ -206,6 +209,7 @@ impl CommandPalette {
             candidates: Vec::new(),
             rows: Vec::new(),
             selected: 0,
+            chosen: false,
             error: None,
             scroll: UniformListScrollHandle::new(),
             _subscriptions: vec![on_query, on_leave],
@@ -322,7 +326,8 @@ impl CommandPalette {
         if fresh == *input {
             return;
         }
-        let kept = match (self.rows.get(self.selected), input) {
+        let selected = self.rows.get(self.selected).filter(|_| self.chosen);
+        let kept = match (selected, input) {
             (Some(Row::Choice { index, .. }), ArgInput::Choices { items, .. }) => {
                 Some(Ok(items[*index].value.clone()))
             }
@@ -348,6 +353,7 @@ impl CommandPalette {
         });
         if let Some(at) = at {
             self.selected = at;
+            self.chosen = true;
             self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
         cx.notify();
@@ -386,7 +392,17 @@ impl CommandPalette {
                 if let ArgInput::Choices { items, .. } = input
                     && !typed.is_empty()
                 {
-                    hits.sort_by_key(|h| exactness(typed, &items[h.index]));
+                    // The typed text lowered once, and a sort only when something is exact.
+                    let folded = typed.to_lowercase();
+                    let keys: Vec<u8> = hits
+                        .iter()
+                        .map(|h| exactness(typed, &folded, &items[h.index]))
+                        .collect();
+                    if keys.iter().any(|&k| k < NOT_EXACT) {
+                        let mut keyed: Vec<_> = keys.into_iter().zip(hits).collect();
+                        keyed.sort_by_key(|(k, _)| *k);
+                        hits = keyed.into_iter().map(|(_, h)| h).collect();
+                    }
                 }
                 // Else what was typed comes first when it may be used as is: Enter on "kube"
                 // takes "kube", not "kube-system".
@@ -401,6 +417,7 @@ impl CommandPalette {
             }
         };
         self.selected = 0;
+        self.chosen = false;
         self.error = None;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
@@ -408,6 +425,7 @@ impl CommandPalette {
 
     fn move_by(&mut self, step: isize, cx: &mut Context<Self>) {
         self.selected = palette_model::step(self.selected, self.rows.len(), step);
+        self.chosen = true;
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         cx.notify();
@@ -842,11 +860,13 @@ fn candidates_of(input: &ArgInput) -> Vec<Candidate> {
     }
 }
 
-/// How exactly `choice` is what was `typed`, best first: its stored value as typed, the value
+/// [`exactness`] of a choice that is not what was typed.
+const NOT_EXACT: u8 = 4;
+
+/// How exactly `choice` is what was `typed` (`folded`: in lower case), best first: its stored value as typed, the value
 /// ignoring case, the label as typed, the label ignoring case, then neither. Case counts first,
 /// so contexts `ABC` and `abc` do not collide.
-fn exactness(typed: &str, choice: &Choice) -> u8 {
-    let folded = typed.to_lowercase();
+fn exactness(typed: &str, folded: &str, choice: &Choice) -> u8 {
     if choice.value == typed {
         0
     } else if choice.value.to_lowercase() == folded {
@@ -856,7 +876,7 @@ fn exactness(typed: &str, choice: &Choice) -> u8 {
     } else if choice.label.to_lowercase() == folded {
         3
     } else {
-        4
+        NOT_EXACT
     }
 }
 

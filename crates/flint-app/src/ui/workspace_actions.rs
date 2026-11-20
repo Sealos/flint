@@ -343,13 +343,16 @@ impl Workspace {
             cx.notify();
             return;
         }
-        // An open context menu or drop-down would stay drawn over the palette and could take a
-        // click meant for it: dismiss it first, as Esc would. A menu that knows where focus was
-        // gives it back, and the palette runs its actions from there; else (focus still on the
-        // closed menu) from the workspace.
+        // An open context menu, drop-down or popover (the namespace filter) is drawn over the
+        // palette and could take a click meant for it: dismiss it first, as Esc would. One that
+        // knows where focus was gives it back, and the palette runs its actions from there; else
+        // (focus still on the closed menu) from the workspace.
         let mut previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
         let mut contexts = window.context_stack();
-        if contexts.iter().any(|c| c.contains(POPUP_MENU)) {
+        if contexts
+            .iter()
+            .any(|c| c.contains(POPUP_MENU) || c.contains(POPOVER_CONTENT))
+        {
             previous.dispatch_action(&Cancel, window, cx);
             match window.focused(cx) {
                 Some(back) if back != previous => {
@@ -885,6 +888,9 @@ fn check_dock_height(action: &SetDockHeight) -> Result<(), ActionError> {
 
 /// The key context gpui-component's context menus and drop-downs draw their entries in.
 const POPUP_MENU: &str = "PopupMenu";
+/// The key context of an open popover's content (the namespace filter's), which Cancel
+/// dismisses, giving focus back.
+const POPOVER_CONTENT: &str = "PopoverContent";
 
 /// What About Flint says.
 pub(in crate::ui) fn about_dialog() -> DialogText {

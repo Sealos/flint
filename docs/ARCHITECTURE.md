@@ -796,14 +796,16 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     so far; Esc, or Backspace in the empty field, goes back a step keeping the earlier picks, and back to the actions
     with the query that found it; a click outside closes the palette. A refusal at the last step keeps the earlier
     picks, so Enter retries with them. An open step's choices follow the data it lists (the clusters, discovery, the
-    namespaces, the shown pod), keeping the query and the selected value: the palette observes the models already in
-    memory, and fetches nothing.
+    namespaces, the shown pod), keeping the query, and the selection when it was moved with the arrows (else the best
+    row, so an exact match that arrives is selected): the palette observes the models already in memory, and fetches
+    nothing.
   - The Edit actions are listed only where they act: in a text field, or in a shell tab, which handles Edit > Copy and
     Edit > Paste with its own copy and paste (the paste checks included). gpui-component's root handles Copy for text
     selected anywhere, so availability alone would list it everywhere.
   - The window going to the background (Cmd-Tab, Hide) keeps the palette open, as a dialog stays; focus moving
     elsewhere in the window closes it.
-  - Opening it dismisses an open context menu or drop-down, as Esc would, so none stays drawn over it. When the menu
+  - Opening it dismisses an open context menu, drop-down or popover (the namespace filter), as Esc would, so none
+    stays drawn over it. When the menu
     gives focus back, the palette runs from there; else from the workspace.
   - Speed: matching runs when the query changes, never while drawing, over labels prepared when the palette opens,
     with a cheap subsequence pass before the scoring; the rows are a virtual list, so long argument lists (thousands
