@@ -31,6 +31,10 @@ http.workspace = true
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 hyper-timeout.workspace = true
 tower.workspace = true
+# Exec auth plugins run by Flint (`auth_plugin`): kubeconfig secrets and token expiry, both
+# already in the tree through kube.
+secrecy.workspace = true
+jiff.workspace = true
 # Already in the tree through kube; names TLS handshake failures (`api_error`).
 rustls.workspace = true
 serde-saphyr.workspace = true

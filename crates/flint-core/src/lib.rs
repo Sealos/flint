@@ -6,6 +6,7 @@
 
 pub mod activity;
 pub mod api_error;
+mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;

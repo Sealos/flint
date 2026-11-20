@@ -232,7 +232,8 @@ impl ExecFailureKind {
             }
             ClusterError::UnknownContext(_)
             | ClusterError::Config { .. }
-            | ClusterError::ExecPluginNotFound { .. } => ExecFailureKind::SignIn,
+            | ClusterError::ExecPluginNotFound { .. }
+            | ClusterError::ExecPlugin { .. } => ExecFailureKind::SignIn,
             ClusterError::Kube(_) => ExecFailureKind::Other,
         }
     }
@@ -1904,6 +1905,24 @@ mod tests {
             kind(bad_request("container app is not valid for pod web")),
             ExecFailureKind::Server
         );
+        // The kubelet refuses a stopped container before the upgrade in plain text, which kube
+        // wraps in a `Status` of its own: the kubelet's phrase is the server's reason, any
+        // other plain body stays a bare HTTP code.
+        let plain = |message: &str| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code: 500,
+                reason: "Failed to parse error data".into(),
+                message: message.into(),
+                ..Default::default()
+            }))
+        };
+        let stopped = LaunchError::kube(plain("container not found (\"job\")"), "bash");
+        assert_eq!(stopped.kind, ExecFailureKind::Server);
+        assert_eq!(stopped.message, "container not found (\"job\")");
+        assert!(!stopped.missing_command);
+        let other = LaunchError::kube(plain("<html>secret page</html>"), "bash");
+        assert_eq!(other.kind, ExecFailureKind::Other);
+        assert!(!other.message.contains("secret"), "{}", other.message);
         let any = kube::Error::LinesCodecMaxLineLengthExceeded;
         let http = |code| ClusterError::Http { code, server: None };
         // A bare 404 (a proxy's page, a wrong server path) is not a pod problem; a bare 401

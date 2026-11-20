@@ -55,7 +55,9 @@ hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 # Already in the tree through kube; the rest of `cluster::build_client`'s stack, as kube builds it.
 hyper-timeout = "0.5.2"
-tower = { version = "0.5.3", default-features = false, features = ["util", "retry"] }
+tower = { version = "0.5.3", default-features = false, features = ["util", "retry", "filter"] }
+# Already in the tree through kube; the type of kubeconfig secrets Flint sets (`auth_plugin`).
+secrecy = "0.10.3"
 http-body-util = "0.1.5"
 bytes = "1.12.2"
 tokio-rustls = { version = "0.26.6", default-features = false }

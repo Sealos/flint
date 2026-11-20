@@ -508,6 +508,9 @@ impl CoreHandle {
     /// when it is closed or dropped. When the cluster is not connected, it fails at once. Never
     /// blocks.
     pub fn exec(&self, request: ExecRequest) -> ExecSession {
+        // Someone opened or restarted a shell: as a retry, it may run the cluster's resting exec
+        // auth plugin again (the cached client may hold it back after a timed-out refresh).
+        crate::auth_plugin::retry_now(&request.cluster);
         let (session, channels) = ExecSession::new(request.clone());
         let client = self.write_client(&request.cluster);
         self.runtime.spawn(async move {
@@ -900,6 +903,30 @@ mod tests {
         let stored = core.stored_snapshots("nowhere").await;
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].kind, KindId::pods());
+    }
+
+    #[tokio::test]
+    async fn requests_for_an_unknown_cluster_answer_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let err = core
+            .fetch_object("nowhere", &KindId::pods(), Some("ns"), "p")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not connected"), "{err}");
+        assert!(core.discovery("nowhere").await.is_none());
+        assert!(core.watched_kinds("nowhere").await.is_empty());
+    }
+
+    // covers UP-44: opening or restarting a shell is a retry: it ends the rest of the cluster's
+    // exec auth plugin, as Retry does.
+    #[tokio::test]
+    async fn a_shell_ends_the_rest_of_its_clusters_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let before = crate::auth_plugin::retry_epoch("shell-rest");
+        let _session = core.exec(crate::exec::ExecRequest::shell("shell-rest", "ns", "p"));
+        assert_eq!(crate::auth_plugin::retry_epoch("shell-rest"), before + 1);
     }
 
     #[tokio::test]
