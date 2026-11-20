@@ -512,10 +512,11 @@ impl Workspace {
         }
         let core = self.model.read(cx).core().clone();
         let cluster = self.tab_cluster(&request.cluster, cx);
+        let server = self.shown_server(&request.cluster, cx);
         self.open_tab(
             TabKey::Logs(request.clone()),
             cluster,
-            |window, cx| DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx))),
+            |window, cx| DockTab::Logs(cx.new(|cx| LogView::at(core, request, server, window, cx))),
             focus,
             window,
             cx,
@@ -573,6 +574,7 @@ impl Workspace {
         }
         self.clear_action_error(cx);
         let cluster = self.tab_cluster(key.context(), cx);
+        let server = self.shown_server(key.context(), cx);
         let core = self.model.read(cx).core().clone();
         self.dock.update(cx, |dock, cx| {
             dock.open_beside(
@@ -580,10 +582,11 @@ impl Workspace {
                 cluster,
                 move |window, cx| match key {
                     TabKey::Logs(request) => {
-                        DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx)))
+                        DockTab::Logs(cx.new(|cx| LogView::at(core, request, server, window, cx)))
                     }
                     TabKey::Shell(request) => {
-                        let session = core.exec(request.exec_request(Default::default()));
+                        let session =
+                            core.exec(request.exec_request(Default::default()).at(server));
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
@@ -645,11 +648,12 @@ impl Workspace {
         }
         let core = self.model.read(cx).core().clone();
         let cluster = self.tab_cluster(&request.cluster, cx);
+        let server = self.shown_server(&request.cluster, cx);
         self.open_tab(
             TabKey::Shell(request.clone()),
             cluster,
             |window, cx| {
-                let session = core.exec(request.exec_request(Default::default()));
+                let session = core.exec(request.exec_request(Default::default()).at(server));
                 DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
             },
             focus,
@@ -660,10 +664,14 @@ impl Workspace {
 
     /// The cluster a session opened on `context` now runs on: the context and its server.
     fn tab_cluster(&self, context: &str, cx: &App) -> TabCluster {
-        let server = self
-            .cluster_summary(context, cx)
-            .and_then(|c| c.info.server.as_deref());
-        TabCluster::new(context, server)
+        TabCluster::new(context, self.shown_server(context, cx).as_deref())
+    }
+
+    /// The server `context` shows now, as the cluster list has it: what a tab opened on it is
+    /// labelled with, and what its log session is pinned to.
+    fn shown_server(&self, context: &str, cx: &App) -> Option<String> {
+        self.cluster_summary(context, cx)
+            .and_then(|c| c.info.server.clone())
     }
 
     /// Tells the dock kubeconfig's contexts (its chips tell alike names apart), and ends the
