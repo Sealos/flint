@@ -80,6 +80,8 @@ pub(in crate::ui) enum Opening {
     Logs,
     PreviousLogs,
     Shell,
+    /// Both Logs and Shell, refused for the same reason (the pane's caption says it once).
+    LogsAndShell,
 }
 
 impl Opening {
@@ -89,6 +91,7 @@ impl Opening {
             Opening::Logs => "Can't open the logs",
             Opening::PreviousLogs => "Can't open the previous logs",
             Opening::Shell => "Can't open a shell",
+            Opening::LogsAndShell => "Can't open the logs or a shell",
         }
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use flint_core::read::event_time;
 use flint_core::table::{human_duration, unix_now};
 use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, WorkloadKind};
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -466,6 +466,7 @@ impl DetailView {
                             .on_click(registry::on_click(Close)),
                     ),
             )
+            .children(self.render_captions(theme))
             .child(
                 TabBar::new("detail-tabs")
                     .underline()
@@ -507,8 +508,23 @@ impl DetailView {
         let containers: Vec<PodContainer> = self.log_containers().to_vec();
         let keys = registry::key_hint("secondary-l");
         let button = Button::new("detail-logs").xsmall().ghost().label("Logs");
+        // Logs that cannot open (the pod could not be fetched, say) stay, disabled, saying why.
+        if let Err(e) = self.log_plan::<OpenLogs>(None, false) {
+            return Some(
+                button
+                    .disabled(true)
+                    .tooltip(actions::reason(&e))
+                    .into_any_element(),
+            );
+        }
         match containers.as_slice() {
-            [] => None,
+            // Still loading: Logs waits for the pod.
+            [] => Some(
+                button
+                    .tooltip(format!("Open the logs in the dock ({keys})"))
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            ),
             [only] if !only.has_previous => Some(
                 button
                     .tooltip(format!("Open the logs in the dock ({keys})"))
@@ -615,6 +631,61 @@ impl DetailView {
                     }
                     menu
                 })
+                .into_any_element(),
+        )
+    }
+
+    /// Why Logs or Shell cannot open, as the captions under the pane's buttons say it: one
+    /// sentence ([`refused`]) for each, or one for both when the reason is the same.
+    pub(in crate::ui) fn action_captions(&self) -> Vec<String> {
+        if self.subject == Subject::Other {
+            return Vec::new();
+        }
+        let logs = self
+            .log_plan::<OpenLogs>(None, false)
+            .err()
+            .map(|e| actions::reason(&e));
+        let shell = self
+            .shell_check::<OpenShell>(None)
+            .err()
+            .map(|e| actions::reason(&e));
+        match (logs, shell) {
+            (Some(logs), Some(shell)) if logs == shell => {
+                vec![refused(Opening::LogsAndShell, &logs)]
+            }
+            (logs, shell) => logs
+                .map(|why| refused(Opening::Logs, &why))
+                .into_iter()
+                .chain(shell.map(|why| refused(Opening::Shell, &why)))
+                .collect(),
+        }
+    }
+
+    /// The captions under the header: why Logs or Shell is disabled, in muted text, so the
+    /// reason shows without hovering the button (its tooltip says it too).
+    fn render_captions(&self, theme: &Theme) -> Option<AnyElement> {
+        let captions = self.action_captions();
+        if captions.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .id("detail-captions")
+                .px_3()
+                .pb_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .children(captions.into_iter().enumerate().map(|(ix, text)| {
+                    let full: SharedString = text.clone().into();
+                    div()
+                        .id(("detail-caption", ix))
+                        .min_w_0()
+                        .truncate()
+                        .child(text.clone())
+                        .test_text(text)
+                        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                }))
+                .test_support()
                 .into_any_element(),
         )
     }

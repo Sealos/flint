@@ -327,7 +327,7 @@ pub(in crate::ui) fn refusal(
         let can = match opening {
             Opening::Logs => a.logs,
             Opening::PreviousLogs => a.previous?,
-            Opening::Shell => a.shell,
+            Opening::Shell | Opening::LogsAndShell => a.shell,
         };
         can.err()
     });

@@ -316,15 +316,17 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** the row is selected and its menu offers Logs, Previous Logs (pods) and Shell: a pod's logs and shell, a
   workload's logs of all pods (UP-45) and a shell in its first ready pod. When the pod has several containers, each
   entry picks one, the default container marked (Previous Logs lists those that restarted); the keys open the default
-  container at once. Each opens its dock tab, or shows the one already open. A workload's shell opens in a pod listed when I
-  ask, never in one listed earlier. Chosen before the row's pod has loaded, an entry waits for it, says so, and gives
-  up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile, nor hide the dock tab I
-  am typing in. What does not apply is disabled, with the reason under it in the menu and on the pane's button: a pod
-  that never restarted (Previous Logs), a workload with no ready pod (as last listed, until it changes), a pod that
-  finished or is being deleted, a pod or workload that was deleted (Shell), or a cluster that is not connected. An
-  action that cannot run anyway (a key, or a wait that ended badly) says what and why in one sentence ("Can't open a
-  shell: no pod of Deployment web is ready.") in a strip with a warning icon above the dock, covering nothing, until
-  the next one opens, I select something else, or ten seconds pass.
+  container at once. Each opens its dock tab, or shows the one already open. A workload's shell opens in a pod listed
+  when I ask, never in one listed earlier. Chosen before the row's pod has loaded, an entry waits for it, says so,
+  and gives up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile, nor hide the
+  dock tab I am typing in. What does not apply is disabled, with the reason under it in the menu, and on the pane's
+  buttons both in their tooltips and in a caption under them that I can read without hovering (Logs and Shell stay,
+  disabled, when the pod could not be fetched): a pod that never restarted (Previous Logs), a workload with no ready
+  pod (as last listed, until it changes), a pod that finished or is being deleted, a pod or workload that was deleted
+  (Shell), or a cluster that is not connected. An action that cannot run anyway (a key, or a wait that ended badly)
+  says what and why in one sentence ("Can't open a shell: no pod of Deployment web is ready.") in a strip with a
+  warning icon above the dock, covering nothing, until the next one opens, I select something else, or ten seconds
+  pass.
 - Tests: unit, cluster, ui.
 
 ---

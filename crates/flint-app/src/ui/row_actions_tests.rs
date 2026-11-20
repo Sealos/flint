@@ -1556,6 +1556,71 @@ async fn a_refusal_goes_when_it_no_longer_applies(cx: &mut TestAppContext) {
     assert_eq!(refusal(cx, &t), None, "another list");
 }
 
+/// Whether the detail pane's Logs button is drawn disabled (`None`: not drawn).
+fn logs_button_disabled(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<bool> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .try_find("detail-logs")
+            .map(|b| b.disabled() == Some(true))
+    })
+    .unwrap()
+}
+
+/// The captions under the detail pane's buttons, as drawn.
+fn captions(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .map(|t| t.text().to_owned())
+            .filter(|t| t.starts_with("Can't"))
+            .collect()
+    })
+    .unwrap()
+}
+
+// covers UP-47: the pane says why Logs or Shell cannot open in a caption under its buttons, not
+// only in their tooltips; Logs stays, disabled, when the pod could not be fetched.
+#[gpui_kit::test]
+async fn the_pane_says_why_under_its_buttons(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let lister = FakePods::install(cx);
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    // Loading: both wait, so both are enabled and nothing is said.
+    show_loading(cx, &t);
+    assert_eq!(logs_button_disabled(cx, &t), Some(false));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+    // The fetch failed: both are disabled, the reason said once.
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    detail_view.update(cx, |d, cx| d.show_failed("Forbidden: no".into(), cx));
+    assert_eq!(logs_button_disabled(cx, &t), Some(true));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(
+        captions(cx, &t),
+        ["Can't open the logs or a shell: the pod could not be fetched: Forbidden: no."]
+    );
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(logs_button_disabled(cx, &t), Some(false));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+
+    // A Deployment with no ready pod: Shell alone.
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let_pods_list(cx, &t);
+    lister.answer(cx, &t, Ok(vec![workload_pod("web-a", false, &["app"])]));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(
+        captions(cx, &t),
+        ["Can't open a shell: no pod of Deployment web is ready."]
+    );
+}
+
 // covers UP-47: the strip that says why takes a row of its own under the list and the pane,
 // above the dock, so it covers none of them, and stays one line high however long the reason
 // is (the whole sentence is in its tooltip).
