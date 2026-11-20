@@ -127,23 +127,95 @@ pub fn exposed_cluster<'a>(
         .ok_or_else(|| PolicyError::ClusterNotFound(name.to_owned()))
 }
 
+/// Whether `name` can be sent as one segment of a request path, as client-go's
+/// `IsValidPathSegmentName` requires: not `.` or `..`, and no `/` or `%`. `?`, `#`, whitespace
+/// and control characters are refused as well, so a name can never end the path or add to it.
+fn is_path_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '%' | '?' | '#') || c.is_whitespace() || c.is_control())
+}
+
+/// Lowercase letters, digits and `-`, starting and ending with a letter or digit, of any
+/// non-zero length.
+fn is_dns1123_part(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    bytes.first().is_some_and(alnum)
+        && bytes.last().is_some_and(alnum)
+        && bytes.iter().all(|b| alnum(b) || *b == b'-')
+}
+
+/// A DNS-1123 label: at most 63 lowercase letters, digits and `-`, starting and ending with a
+/// letter or digit.
+fn is_dns1123_label(name: &str) -> bool {
+    name.len() <= 63 && is_dns1123_part(name)
+}
+
+/// A DNS-1123 subdomain as Kubernetes checks it: at most 253 characters, parts as in a label
+/// joined by `.`, with no limit on the length of one part.
+fn is_dns1123_subdomain(name: &str) -> bool {
+    name.len() <= 253 && name.split('.').all(is_dns1123_part)
+}
+
+/// Whether a caller may name a namespace or a container with `name`: a DNS-1123 label.
+pub fn is_label_name(name: &str) -> bool {
+    is_path_segment(name) && is_dns1123_label(name)
+}
+
+/// Whether a caller may name a pod with `name`: a DNS-1123 subdomain.
+pub fn is_pod_name(name: &str) -> bool {
+    is_path_segment(name) && is_dns1123_subdomain(name)
+}
+
+/// Whether a caller may name an object of any kind with `name`: a DNS-1123 subdomain, or, for
+/// the kinds whose names are only checked as path segments (RBAC roles and bindings such as
+/// `system:controller:job-controller`), at most 253 letters, digits, `-`, `.`, `_`, `:` and `@`.
+/// Always a single path segment.
+pub fn is_object_name(name: &str) -> bool {
+    is_path_segment(name)
+        && name.len() <= 253
+        && (is_dns1123_subdomain(name)
+            || name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '@')))
+}
+
 /// Makes an object safe to show: removes `metadata.managedFields`, redacts Secret values, and
 /// redacts credentials in message fields and container arguments ([`redact_object_text`]).
 /// Works on single objects and on lists (`items`). Returns how many credentials were replaced.
 pub fn sanitize(value: &mut Value) -> usize {
-    strip(value);
+    strip(value, false);
     redact_object_text(value)
 }
 
-/// The structural part of [`sanitize`]: managed fields and Secret values.
-fn strip(value: &mut Value) {
+/// [`sanitize`] for what was read as a core v1 Secret: the object, and every item if it is a
+/// list, is redacted as a Secret whatever its `kind` field says.
+pub fn sanitize_secret(value: &mut Value) -> usize {
+    strip(value, true);
+    redact_object_text(value)
+}
+
+/// Whether `value` is a list of Secrets. The items of a `SecretList` carry no `kind` or
+/// `apiVersion` of their own, so they are redacted as Secrets because of the list.
+fn is_secret_list(value: &Value) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some("SecretList")
+}
+
+/// The structural part of [`sanitize`]: managed fields and Secret values. `secret` says the
+/// value is a Secret (or a list of them) whatever its own `kind`.
+fn strip(value: &mut Value, secret: bool) {
+    let secret = secret || is_secret_list(value);
     if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
         for item in items {
-            strip(item);
+            strip(item, secret);
         }
     }
     flint_core::read::strip_managed_fields(value);
-    if flint_core::redact::is_secret_object(value) {
+    if secret || flint_core::redact::is_secret_object(value) {
         flint_core::redact::mask_secret(value, REDACTED);
     }
 }
@@ -810,5 +882,124 @@ mod tests {
         );
         let mut list = json!({"kind": "List", "items": [{"kind": "Event", "message": pem}]});
         assert_eq!(sanitize(&mut list), 1);
+    }
+
+    // covers UP-10
+    #[test]
+    fn names_must_be_single_path_segments() {
+        for ok in ["web", "web-1", "a", "0", &"a".repeat(63)] {
+            assert!(is_label_name(ok), "{ok}");
+            assert!(is_pod_name(ok), "{ok}");
+            assert!(is_object_name(ok), "{ok}");
+        }
+        for ok in ["web.1", "kube-dns.kube-system", "v1.apps"] {
+            assert!(is_pod_name(ok) && is_object_name(ok), "{ok}");
+            assert!(!is_label_name(ok), "{ok}");
+        }
+        for ok in [
+            "system:controller:job-controller",
+            "eks:node-bootstrapper",
+            "user@example.com",
+            "Admin_Role",
+        ] {
+            assert!(is_object_name(ok), "{ok}");
+            assert!(!is_pod_name(ok) && !is_label_name(ok), "{ok}");
+        }
+        let long_label = "a".repeat(64);
+        let long_name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        assert_eq!(long_name.len(), 254);
+        assert!(!is_label_name(&long_label));
+        assert!(is_pod_name(&long_name[1..]) && is_object_name(&long_name[1..]));
+        assert!(!is_pod_name(&long_name) && !is_object_name(&long_name));
+        // A subdomain's parts are not limited to 63 characters, only the whole name.
+        let long_pod = "a".repeat(70);
+        assert!(is_pod_name(&long_pod) && is_pod_name(&format!("{long_pod}.web")));
+        assert!(is_pod_name(&"a".repeat(253)) && !is_pod_name(&"a".repeat(254)));
+        let long_rbac = format!("system:{}", "a".repeat(247));
+        assert!(!is_object_name(&long_rbac));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "payments/secrets",
+            "x/../y",
+            "/",
+            "a%2Fb",
+            "%2F",
+            "%2e%2e",
+            "a?b",
+            "a#b",
+            "a b",
+            "a\nb",
+            "a\tb",
+            "a\u{0}b",
+            "a\u{7f}b",
+            "\u{0430}",
+        ] {
+            assert!(!is_label_name(bad), "{bad:?}");
+            assert!(!is_pod_name(bad), "{bad:?}");
+            assert!(!is_object_name(bad), "{bad:?}");
+        }
+        // Single path segments, but not DNS-1123: not a namespace, container or pod name.
+        for not_dns in ["Web", "-a", "a-", "a..b", "a_b"] {
+            assert!(
+                !is_label_name(not_dns) && !is_pod_name(not_dns),
+                "{not_dns}"
+            );
+        }
+    }
+
+    // covers UP-10
+    #[test]
+    fn secret_lists_are_redacted_although_their_items_have_no_kind() {
+        let mut list = json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "metadata": {"resourceVersion": "1"},
+            "items": [{
+                "metadata": {
+                    "name": "db",
+                    "namespace": "payments",
+                    "managedFields": [{}],
+                    "annotations": {LAST_APPLIED: "{\"data\":{\"password\":\"c2VjcmV0\"}}"}
+                },
+                "data": {"password": "c2VjcmV0"},
+                "stringData": {"token": "plain"},
+                "type": "Opaque"
+            }]
+        });
+        sanitize(&mut list);
+        let item = &list["items"][0];
+        assert_eq!(item["data"], json!({"password": REDACTED}));
+        assert_eq!(item["stringData"], json!({"token": REDACTED}));
+        assert_eq!(item["metadata"]["annotations"][LAST_APPLIED], REDACTED);
+        assert!(item["metadata"].get("managedFields").is_none());
+        let text = list.to_string();
+        assert!(
+            !text.contains("c2VjcmV0") && !text.contains("plain"),
+            "{text}"
+        );
+    }
+
+    // covers UP-10
+    #[test]
+    fn what_was_read_as_a_secret_is_redacted_whatever_its_kind_says() {
+        let mut lying = json!({"kind": "ConfigMap", "data": {"password": "c2VjcmV0"}});
+        sanitize_secret(&mut lying);
+        assert_eq!(lying["data"]["password"], REDACTED);
+        let mut list = json!({"kind": "List", "items": [{"data": {"a": "c2VjcmV0"}}]});
+        sanitize_secret(&mut list);
+        assert_eq!(list["items"][0]["data"]["a"], REDACTED);
+        // Without the hint, a kindless item outside a SecretList is not a Secret.
+        let mut plain = json!({"kind": "ConfigMapList", "items": [{"data": {"a": "b"}}]});
+        sanitize(&mut plain);
+        assert_eq!(plain["items"][0]["data"]["a"], "b");
     }
 }

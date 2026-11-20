@@ -134,6 +134,37 @@ fn kind_error(e: ResolveKindError) -> ToolError {
     }
 }
 
+/// What the API server answers for an object that does not exist (`NotFound: pods "x" not
+/// found`), where `resource` is the plural, with `.group` outside the core group. A name or
+/// namespace that is not a single valid path segment gets this answer without any request, so
+/// it can never reach another path, and the caller learns nothing it would not from a missing
+/// object.
+fn not_found(resource: &str, name: &str) -> ToolError {
+    ToolError(format!("NotFound: {resource} {name:?} not found"))
+}
+
+/// [`not_found`] for an object of `kind`.
+fn object_not_found(kind: &KindInfo, name: &str) -> ToolError {
+    if kind.group().is_empty() {
+        not_found(kind.plural(), name)
+    } else {
+        not_found(&format!("{}.{}", kind.plural(), kind.group()), name)
+    }
+}
+
+/// Refuses a namespace that is not a DNS-1123 label, as [`not_found`] for the namespace.
+fn check_namespace(namespace: Option<&str>) -> Result<(), ToolError> {
+    match namespace {
+        Some(ns) if !policy::is_label_name(ns) => Err(not_found("namespaces", ns)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `kind` is core v1 Secret, whose values are never shown.
+fn is_secret_kind(kind: &KindInfo) -> bool {
+    kind.group().is_empty() && kind.kind() == "Secret"
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String, ToolError> {
     Ok(serde_json::to_string_pretty(value)?)
 }
@@ -491,6 +522,7 @@ impl FlintMcp {
         let (conn, kind) = self
             .resolve(&p.cluster, &p.kind, p.api_version.as_deref())
             .await?;
+        check_namespace(p.namespace.as_deref())?;
         if !kind.is_listable() {
             return Err(ToolError(format!("{} cannot be listed", kind.kind())));
         }
@@ -508,7 +540,7 @@ impl FlintMcp {
         )
         .await
         .map_err(|e| conn.fail(e))?;
-        let is_secret = kind.group().is_empty() && kind.kind() == "Secret";
+        let is_secret = is_secret_kind(&kind);
         let (columns, rows, cut, redacted) =
             table_rows(&page, is_secret, table::unix_now(), policy::LIST_BYTES);
         let mut out = json!({
@@ -540,6 +572,14 @@ impl FlintMcp {
         let (conn, kind) = self
             .resolve(&p.cluster, &p.kind, p.api_version.as_deref())
             .await?;
+        // The name and namespace go into the request path: one segment each, or not found.
+        if !policy::is_object_name(&p.name)
+            || p.namespace
+                .as_deref()
+                .is_some_and(|ns| !policy::is_label_name(ns))
+        {
+            return Err(object_not_found(&kind, &p.name));
+        }
         let object = read::get(&conn.client, &kind, p.namespace.as_deref(), &p.name)
             .await
             .map_err(|e| conn.fail(e))?;
@@ -548,7 +588,12 @@ impl FlintMcp {
             value["apiVersion"] = json!(kind.api_version());
             value["kind"] = json!(kind.kind());
         }
-        let redacted = policy::sanitize(&mut value);
+        // Redacted as a Secret by what was asked for, not only by what came back.
+        let redacted = if is_secret_kind(&kind) {
+            policy::sanitize_secret(&mut value)
+        } else {
+            policy::sanitize(&mut value)
+        };
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
         let mut out = String::new();
@@ -570,6 +615,7 @@ impl FlintMcp {
     async fn do_get_events(&self, p: GetEventsParams) -> Result<String, ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
+        check_namespace(p.namespace.as_deref())?;
         let limit = policy::EVENTS.clamp(p.limit) as usize;
         let involved = read::InvolvedObject {
             kind: p.object_kind.clone(),
@@ -622,6 +668,15 @@ impl FlintMcp {
     async fn do_get_pod_logs(&self, p: GetPodLogsParams) -> Result<String, ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
+        // The namespace and pod go into the request path, the container into its query.
+        if !policy::is_label_name(&p.namespace)
+            || !policy::is_pod_name(&p.pod)
+            || p.container
+                .as_deref()
+                .is_some_and(|c| !policy::is_label_name(c))
+        {
+            return Err(not_found("pods", &p.pod));
+        }
         let lines = policy::LOG_LINES.clamp(p.tail_lines);
         // Ask for one extra line to learn whether older lines exist.
         let mut tail = i64::from(lines) + 1;
