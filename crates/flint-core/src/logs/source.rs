@@ -161,8 +161,9 @@ pub(crate) enum AfterEnd {
     Restarts,
     /// The container finished for good.
     Finished,
-    /// The pod is being deleted (it has a `deletionTimestamp`), whatever its phase: its
-    /// containers will not run again, though the pod and its logs may still be there.
+    /// The pod is being deleted (it has a `deletionTimestamp`) and the container stopped (or
+    /// the pod reached Succeeded or Failed): it will not run again, though the pod and its
+    /// logs may still be there.
     Deleting,
     /// The pod was deleted.
     Gone,
@@ -284,15 +285,19 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
     let Some(pod) = pod else {
         return AfterEnd::Gone;
     };
-    if pod.metadata.deletion_timestamp.is_some() {
-        return AfterEnd::Deleting;
-    }
+    // A pod being deleted (it has a `deletionTimestamp`) never runs its containers again, but
+    // one may still be shutting down and logging: until it stops, the stream is reopened.
+    let deleting = pod.metadata.deletion_timestamp.is_some();
     let status = pod.status.as_ref();
     if matches!(
         status.and_then(|s| s.phase.as_deref()),
         Some("Succeeded" | "Failed")
     ) {
-        return AfterEnd::Finished;
+        return if deleting {
+            AfterEnd::Deleting
+        } else {
+            AfterEnd::Finished
+        };
     }
     let spec = pod.spec.as_ref();
     let name = container.map(str::to_owned).or_else(|| {
@@ -329,6 +334,13 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         .find(|c| Some(&c.name) == name.as_ref())
         .and_then(|c| c.state.as_ref()?.terminated.as_ref())
         .map(|t| t.exit_code);
+    if deleting {
+        return if exit_code.is_some() {
+            AfterEnd::Deleting
+        } else {
+            AfterEnd::Restarts
+        };
+    }
     match (exit_code, policy) {
         (Some(_), "Never") | (Some(0), "OnFailure" | "Once") => AfterEnd::Finished,
         // A failed init container is retried unless the pod never restarts anything.
@@ -512,15 +524,31 @@ mod tests {
 
     // covers UP-40
     #[test]
-    fn a_pod_being_deleted_is_deleting_whatever_its_phase() {
-        for phase in ["Running", "Succeeded", "Failed"] {
-            let deleting = pod(json!({
+    fn a_pod_being_deleted_is_deleting_once_its_container_stopped() {
+        for phase in ["Succeeded", "Failed"] {
+            let done = pod(json!({
                 "metadata": {"deletionTimestamp": "2024-05-01T12:00:00Z"},
                 "spec": {"containers": [{"name": "app"}]},
                 "status": {"phase": phase},
             }));
-            assert_eq!(fate(Some(&deleting), None), AfterEnd::Deleting, "{phase}");
+            assert_eq!(fate(Some(&done), None), AfterEnd::Deleting, "{phase}");
         }
+        let terminating = |state: serde_json::Value| {
+            pod(json!({
+                "metadata": {"deletionTimestamp": "2024-05-01T12:00:00Z"},
+                "spec": {"restartPolicy": "Always", "containers": [{"name": "app"}]},
+                "status": {"phase": "Running", "containerStatuses": [
+                    {"name": "app", "image": "i", "imageID": "", "ready": false, "restartCount": 0,
+                     "state": state}]},
+            }))
+        };
+        // Still shutting down (and maybe logging): the stream is reopened, not ended.
+        let running = terminating(json!({"running": {}}));
+        assert_eq!(fate(Some(&running), Some("app")), AfterEnd::Restarts);
+        // Stopped: the pod is going and the container will not run again.
+        let stopped = terminating(json!({"terminated": {"exitCode": 0}}));
+        assert_eq!(fate(Some(&stopped), Some("app")), AfterEnd::Deleting);
+        assert_eq!(fate(Some(&stopped), None), AfterEnd::Deleting);
     }
 
     // covers UP-40

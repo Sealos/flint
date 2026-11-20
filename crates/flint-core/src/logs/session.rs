@@ -104,8 +104,14 @@ pub enum LogState {
     /// workload's streams keep running meanwhile. `error` is safe to show.
     Reconnecting { error: Option<String>, attempt: u32 },
     /// Nothing more will come: all lines were read (not following, or the previous instance),
-    /// the container finished, or an error retrying cannot fix. `error` is safe to show.
-    Ended { error: Option<String> },
+    /// the container finished, its pod was deleted, or an error retrying cannot fix. `error`
+    /// is safe to show. `pod_deleted`: a single-pod session ended because its pod was deleted
+    /// after everything it logged was read. That is an expected end, not a failure, and comes
+    /// with no `error`.
+    Ended {
+        error: Option<String>,
+        pod_deleted: bool,
+    },
 }
 
 /// What a front end shows of a session. Immutable and shared.
@@ -510,7 +516,13 @@ mod tests {
         let mut run = start(vec![Script::Lines(lines, None)], options, 100);
         let snapshot = run.until(ended).await;
         assert_eq!(texts(&snapshot), ["ERROR boom", "WARN slow"]);
-        assert_eq!(snapshot.state, LogState::Ended { error: None });
+        assert_eq!(
+            snapshot.state,
+            LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         assert!(snapshot.pods.is_none(), "a pod session has no pod set");
         let severities: Vec<_> = snapshot.lines.iter().map(|(_, l)| l.severity).collect();
         assert_eq!(
@@ -643,7 +655,13 @@ mod tests {
             .unwrap()
             .push_back(AfterEnd::Finished);
         let snapshot = run.until(ended).await;
-        assert_eq!(snapshot.state, LogState::Ended { error: None });
+        assert_eq!(
+            snapshot.state,
+            LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         assert_eq!(texts(&snapshot), ["run 1", "run 2"]);
         let requests = run.requests();
         assert_eq!(requests.len(), 2);
@@ -692,7 +710,8 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
-                error: Some("the pod was deleted".into())
+                error: None,
+                pod_deleted: true,
             }
         );
     }
@@ -711,7 +730,8 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
-                error: Some("NotFound: pods \"p\" not found".into())
+                error: Some("NotFound: pods \"p\" not found".into()),
+                pod_deleted: false,
             }
         );
 
@@ -725,7 +745,13 @@ mod tests {
             100,
         );
         let snapshot = run.until(ended).await;
-        assert_eq!(snapshot.state, LogState::Ended { error: None });
+        assert_eq!(
+            snapshot.state,
+            LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         let request = &run.requests()[0];
         assert!(request.previous && !request.follow);
     }

@@ -172,8 +172,12 @@ pub fn state_text(state: &LogState) -> (Tone, String) {
                 None => format!("Reconnecting (attempt {attempt})"),
             },
         ),
-        LogState::Ended { error: None } => (Tone::Muted, "Ended".to_owned()),
-        LogState::Ended { error: Some(e) } => (Tone::Danger, format!("Ended: {e}")),
+        LogState::Ended { error: Some(e), .. } => (Tone::Danger, format!("Ended: {e}")),
+        // An ordinary end, not a failure: the pod went after everything it logged was read.
+        LogState::Ended {
+            pod_deleted: true, ..
+        } => (Tone::Muted, "Ended · pod deleted".to_owned()),
+        LogState::Ended { .. } => (Tone::Muted, "Ended".to_owned()),
     }
 }
 
@@ -475,6 +479,7 @@ mod tests {
                 stream(LogState::Streaming),
                 stream(LogState::Ended {
                     error: Some("x".into()),
+                    pod_deleted: false,
                 }),
             ],
             max_streams: 50,
@@ -523,14 +528,25 @@ mod tests {
             "Reconnecting (attempt 1)"
         );
         assert_eq!(
-            state_text(&LogState::Ended { error: None }),
+            state_text(&LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }),
             (Tone::Muted, "Ended".into())
         );
         assert_eq!(
             state_text(&LogState::Ended {
-                error: Some("container not found".into())
+                error: Some("container not found".into()),
+                pod_deleted: false,
             }),
             (Tone::Danger, "Ended: container not found".into())
+        );
+        assert_eq!(
+            state_text(&LogState::Ended {
+                error: None,
+                pod_deleted: true,
+            }),
+            (Tone::Muted, "Ended · pod deleted".into())
         );
         assert_eq!(pause_text(0, false), "Paused");
         assert_eq!(pause_text(1, true), "Paused while selecting · 1 new line");

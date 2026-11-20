@@ -204,7 +204,38 @@ impl FakeApiServer {
         self.terminate_pod(&mut state, namespace, name)
     }
 
+    /// Starts a graceful deletion whose containers take their time to shut down: pod watches
+    /// get `MODIFIED` with a `deletionTimestamp` (Terminating), while the containers keep
+    /// running, and their logs keep growing, until [`FakeApiServer::finish_shutdown`]. Returns
+    /// how many pod watches were open. Panics like [`FakeApiServer::delete_pod`].
+    pub fn begin_delete_pod(&self, namespace: &str, name: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        self.mark_terminating(&mut state, namespace, name)
+    }
+
+    /// The containers of a pod [`FakeApiServer::begin_delete_pod`] started deleting stop (exit
+    /// 0): their open log streams end cleanly, and pod watches get `MODIFIED` with a terminal
+    /// phase. The pod stays readable until [`FakeApiServer::finish_delete`]. Returns how many
+    /// pod watches were open. Panics unless the pod is being deleted.
+    pub fn finish_shutdown(&self, namespace: &str, name: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        let object = self.held_pod(&state, namespace, name);
+        assert!(
+            object
+                .as_json()
+                .pointer("/metadata/deletionTimestamp")
+                .is_some(),
+            "pod {namespace}/{name} is not being deleted; call begin_delete_pod first"
+        );
+        self.stop_pod(&mut state, namespace, name)
+    }
+
     fn terminate_pod(&self, state: &mut State, namespace: &str, name: &str) -> usize {
+        self.mark_terminating(state, namespace, name);
+        self.stop_pod(state, namespace, name)
+    }
+
+    fn mark_terminating(&self, state: &mut State, namespace: &str, name: &str) -> usize {
         let now = self.inner.clock.fixture_now();
         let mut object = self.held_pod(state, namespace, name);
         assert!(
@@ -215,7 +246,12 @@ impl FakeApiServer {
             "pod {namespace}/{name} is already being deleted; call finish_delete"
         );
         object.mark_deleted(&now, 30);
-        self.apply_pod(state, "MODIFIED", object.clone());
+        self.apply_pod(state, "MODIFIED", object)
+    }
+
+    fn stop_pod(&self, state: &mut State, namespace: &str, name: &str) -> usize {
+        let now = self.inner.clock.fixture_now();
+        let mut object = self.held_pod(state, namespace, name);
         object.stop_all(&now);
         lock(&self.inner.logs).end_pod(namespace, name);
         self.apply_pod(state, "MODIFIED", object)

@@ -804,7 +804,7 @@ mod tests {
             loop {
                 assert!(session.changed().await, "core running");
                 let snapshot = session.latest();
-                if let crate::logs::LogState::Ended { error } = &snapshot.state {
+                if let crate::logs::LogState::Ended { error, .. } = &snapshot.state {
                     return error.clone();
                 }
             }
