@@ -346,6 +346,64 @@ Appearance actions; `FLINT_APPEARANCE` forces one theme at launch). CI uploads t
 artifact and links them from a PR comment. They are evidence for reviewers, not a gate: font rendering differs between
 runner images, so pixel diffs would be flaky.
 
+## E2E coverage plan
+
+Which tests cover each user path today, and what is missing, is in [`E2E-COVERAGE.md`](./E2E-COVERAGE.md). In
+short: with #100, M0 and M1 have app e2e tests for every automatable path. M2 is tested only below the app. Core tests
+read real streams on kind, and view tests feed the log buffer or a `FakeExec` directly. So no test has the real app
+reading a real log or exec stream. Two things block that. The automation `state` has no dock. The fake API server
+answers `/log` with one finite body (only `tailLines` is read), answers exec with 404 and writes with 405.
+
+The Mac mini session owns the harness and macOS CI (#40, #100, #42, #117). Harness and fake-server work is in
+milestone T; feature tests are in their feature's milestone.
+
+### P0: before v0.2.0 (M2)
+
+| Work | Paths | Layer | Issue | Cost |
+|---|---|---|---|---|
+| Run the app e2e tests in CI (they are `#[ignore]`d today) | M0, M1 | A, macOS | #42 (#117) | S |
+| `state.dock`: tabs, status, bounded log lines and shell screen | 40–45 | automation | #119 | M |
+| Fake logs that follow: per container and previous, timestamps, `sinceTime`, end and drop, open-stream count; pod churn helpers | 40, 42, 43, 45 | fake API | #120 | M |
+| `up_40_read_pod_logs` smoke: detail, request, streamed line, reconnect without duplicates, timestamp toggle without a new request, stream closed with the tab | 40, 43, 42 | A + fake | #122 | M |
+| `up_41_shell_into_a_container` smoke against kind on the Mac mini (`demo` has bash and sh-only images), recorded in the M2 review | 41 | A + kind | #123 | S |
+| `up_42_sessions_outlive_navigation`: output keeps arriving across a cluster switch, closing ends the stream | 42, 24 | A + fake | #124 | S |
+| `up_45_follow_workload_logs`, if workload logs ship in M2 (#62, #63) | 45 | A + fake | #125 | M |
+
+### P1: before 1.0
+
+- **Harness (T):** fake exec websocket so `up_41` runs in CI (#121); teardown invariants for UP-90 and UP-91
+  (#127); drift guard: MCP tests on both backends in `cluster-e2e` and a nightly fixture diff (#128); fake writes,
+  a remote-looking cluster for protection, metrics, fixture variants, a fake `claude` and clock control (#129); the
+  nightly memory soak test (#126).
+- **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the
+  debounce (UP-06, #131); keyboard-only use, palette and switcher (UP-33, UP-30, UP-31, #132); the whole app under
+  10,000 pods, nightly (UP-26, #133); relaunch and window close for UP-42 (#124).
+- **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram, dashboard and
+  `get_cluster_summary` (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log and
+  Claude analysis (#137), warm clusters and cluster sets (#138); M6 Homebrew cask smoke (#139).
+
+### P2
+
+Fleet actions (UP-100, UP-101), recordings (UP-110 to UP-116), a clipboard and save-path hook for automation, a fake
+port-forward, and a spike on running app e2e on Linux (with the AppImage's GPUI backend under Xvfb) so kind-backed
+app tests get cheap runners.
+
+### Rules
+
+- **One test per path**, named `up_XX_*` and tagged `// covers UP-xx`, so a failure names its path. Tests
+  dispatch registered actions by name; key bindings belong to view tests.
+- **Pick the lowest layer that proves the path.** E2E proves the seams: action, request, stream, visible state. It
+  does not repeat what view tests already assert (pause, search, copy, the save panel).
+- **Kind for real semantics:** dry-run, conflicts, admission, PodDisruptionBudgets, port-forward, Helm,
+  metrics-server, two clusters. Growing the fake into a mock of these would prove nothing.
+- **No sleeps.** Wait on `wait_for`, `wait_for_watches` and request counts. Push log lines and terminal output
+  explicitly and wait for them. Latency bounds stay generous under `CI`.
+- **CI cost.** macOS minutes cost about ten times Linux. Only app e2e runs on macOS, in the existing
+  `macos (flint-app)` job, on the binary it already built. Load, soak and idle-CPU checks run nightly. Fake-server,
+  MCP and kind tests run on Linux. Keep the PR app e2e step under 10 minutes.
+- **Never in e2e:** pure logic (redaction, severity rules, buffer limits, fuzzy matching, escape sequences),
+  pixel diffs, real cloud auth and Gatekeeper (manual), and any real cluster.
+
 ## Safety
 
 Tests never touch real clusters. Cluster tests and e2e tests require `FLINT_TEST_KUBECONFIG` or the fake server, and
