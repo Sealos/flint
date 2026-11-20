@@ -99,14 +99,11 @@ impl Inspected {
     }
 
     /// Runs kubectl with `args` (and `stdin`), on kind only: against the test's one-context copy
-    /// of the kind kubeconfig, whose server `TestCluster::kind` checked is on this machine, and
-    /// only for a `kind-*` context, so a tunnel to another cluster on 127.0.0.1 is refused.
+    /// of the kind kubeconfig, once `TestCluster::verify_local_kind` has checked it is the kind
+    /// cluster `kind` knows (no proxy, the same server), so a tunnel to another cluster on
+    /// 127.0.0.1 is refused.
     fn kubectl(&self, args: &[&str], stdin: Option<&str>) -> Result<()> {
-        anyhow::ensure!(
-            self.cluster.fake_server().is_none() && self.context().starts_with("kind-"),
-            "refusing to run kubectl against {:?}: not a kind cluster",
-            self.context()
-        );
+        self.cluster.verify_local_kind()?;
         let mut child = Command::new("kubectl")
             .arg("--kubeconfig")
             .arg(&self.cluster.kubeconfig)
