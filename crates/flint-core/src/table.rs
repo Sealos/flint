@@ -8,7 +8,7 @@
 //! computes it from `creationTimestamp`), and repeated strings are interned per kind.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use kube::Client;
@@ -449,9 +449,16 @@ const PRUNE_MIN: usize = 4096;
 /// last prune: by rows, or by the snapshot published last. The bound follows the live count at
 /// that prune, so after a big drop it shrinks only with the next one. Pruning walks the set
 /// once per `max(PRUNE_MIN, kept)` inserts: amortised O(1) per insert.
+///
+/// A relist marks every string its rows ask for ([`Interner::begin_relist`]); when it completes,
+/// [`Interner::keep_relisted`] drops the rest in one walk over the distinct strings, without
+/// hashing what the rows hold again.
 #[derive(Debug, Default)]
 pub(crate) struct Interner {
-    set: HashSet<Arc<str>>,
+    /// Each string, with the relist that last asked for it.
+    set: HashMap<Arc<str>, u64>,
+    /// The relist in progress, or the last one.
+    relist: u64,
     /// New strings since the last prune.
     inserts: usize,
     /// How many strings the last prune kept.
@@ -462,11 +469,18 @@ pub(crate) struct Interner {
 
 impl Interner {
     pub fn intern(&mut self, s: &str) -> Arc<str> {
-        if let Some(existing) = self.set.get(s) {
-            return existing.clone();
+        if let Some((existing, &last)) = self.set.get_key_value(s) {
+            let existing = existing.clone();
+            // Marked once per relist: a second lookup only for a string's first use in it.
+            if last != self.relist
+                && let Some(last) = self.set.get_mut(s)
+            {
+                *last = self.relist;
+            }
+            return existing;
         }
         let fresh: Arc<str> = s.into();
-        self.set.insert(fresh.clone());
+        self.set.insert(fresh.clone(), self.relist);
         self.inserts += 1;
         if self.inserts >= PRUNE_MIN.max(self.kept) {
             self.prune();
@@ -477,7 +491,7 @@ impl Interner {
     /// Drops strings no row uses any more. A string the last published snapshot still holds
     /// survives until a later prune.
     pub fn prune(&mut self) {
-        self.set.retain(|s| Arc::strong_count(s) > 1);
+        self.set.retain(|s, _| Arc::strong_count(s) > 1);
         self.kept = self.set.len();
         self.inserts = 0;
         // After a big drop, give the table back too, so later prunes walk what is left.
@@ -490,10 +504,16 @@ impl Interner {
         }
     }
 
-    /// Keeps exactly the strings in `used` (after a relist: what the store's rows use), so
-    /// strings only older snapshots hold leave the set at once and are freed with them.
-    pub fn keep_only<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
-        self.set = used.cloned().collect();
+    /// Starts marking the strings a relist's rows ask for.
+    pub fn begin_relist(&mut self) {
+        self.relist += 1;
+    }
+
+    /// Keeps only the strings the relist asked for, so strings only older snapshots hold leave
+    /// the set at once and are freed with them.
+    pub fn keep_relisted(&mut self) {
+        let relist = self.relist;
+        self.set.retain(|_, last| *last == relist);
         self.kept = self.set.len();
         self.inserts = 0;
         #[cfg(test)]
