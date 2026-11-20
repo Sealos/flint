@@ -38,6 +38,8 @@ pub struct ClustersModel {
     ahead: HashMap<ClusterId, Discovered>,
     /// The agent activity log, every cluster's, oldest first (UP-16).
     pub agent_activity: Arc<Vec<ActivityRecord>>,
+    /// The keys the log's servers are keyed by: none until the log is first read.
+    pub activity_keys: flint_core::activity::ServerKeys,
     /// The cluster to activate once kubeconfig is loaded (`FLINT_CLUSTER`). Taken on first load.
     startup_cluster: Option<String>,
     _events: Task<()>,
@@ -73,6 +75,7 @@ impl ClustersModel {
             discovery: HashMap::new(),
             ahead: HashMap::new(),
             agent_activity: Arc::default(),
+            activity_keys: Default::default(),
             startup_cluster,
             _events: task,
         }
@@ -142,7 +145,10 @@ impl ClustersModel {
                     }
                 }
             }
-            Event::AgentActivity(records) => self.agent_activity = records,
+            Event::AgentActivity(records, keys) => {
+                self.agent_activity = records;
+                self.activity_keys = keys;
+            }
             Event::Error(message) => {
                 tracing::warn!("{message}");
                 self.last_error = Some(message);

@@ -917,13 +917,28 @@ Rules:
   either way). The count and the cut-short flag are read from the reply's own fields, so they are what the agent saw.
   The returned content is never recorded. At 1 MiB the file is renamed to `agent-activity.1.jsonl` (replacing the one
   before) and a new one starts. Writers hold an exclusive `flock` on `agent-activity.lock` while they check, rotate
-  and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice; a write that
-  fails is logged and does not fail the call. The files are the owner's only (0600: they name clusters and objects),
+  and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice. Logging is
+  best-effort: a writer waits at most 1 s for the lock, then skips its record, so a stalled writer cannot hold up
+  other processes' replies; a write that fails is logged and does not fail the call. Readers take no lock: if the
+  log rotated while they read the two files (the previous file is then another one), they read both again. The
+  files, and the lock file, are the owner's only (0600: they name clusters and objects),
   and a line cut off before its newline is ended before the next record, so it costs only itself. Text fields hold
   what the agent wrote, so each is cut at 253 bytes: an agent cannot flush the log with a few huge names. Each record
-  also has stable keys (FNV-1a) of the full context and server, which the app matches by. The server is the one the
-  call's own settings and kubeconfig resolved. A call the router answers without running its tool (an unknown tool,
-  arguments that do not fit) is recorded as failed, with what its arguments name. A context re-pointed at another
+  also has keys of the full context and server, which the app matches by. The server is the one the call's own
+  settings and kubeconfig resolved; it is stored as shown (without credentials), and its key is of the endpoint the
+  cluster pin compares (the kubeconfig's URL without a trailing slash), so two servers that show alike are not taken
+  for one. That URL can hold a password or token, so the server key is an HMAC-SHA256 digest (ring, cut to 128 bits)
+  under a random 32-byte key in `activity.key` beside the log: owner-only, made on first use by whichever process
+  comes first (written to a file of its own, then linked into place without replacing one already there), and read
+  by the core with the log, off the UI thread, for the app to key the tab's own server. Without a usable key file, a record has no server key and its tab matches it
+  by context alone. The context key stays an unkeyed FNV-1a hash: context names are in the record anyway. Server
+  keys from before the keyed digest no longer match, so those calls no longer show in their cluster's tab. A server
+  key is never guessed from the shown server, which can drop a query or be a placeholder.
+  `list_clusters` names no cluster, so its record holds the keys of each cluster it probed (the first 256, and a
+  count of the rest, so one record stays far below the 1 MiB cap), and it shows in each of their tabs. When it
+  probed more than it lists, it also shows in the tab of every cluster it does not list, marked as one that may have
+  probed it, so no tab claims a call never happened. A call the router answers without running its tool (an unknown tool, arguments that do not fit) is
+  recorded as failed, with what its arguments name. A context re-pointed at another
   server is another cluster: its activity tab shows the calls on the server it was opened for, newest first, and
   offers Edit AI Scope only while the context still points there. The core watches both files beside `settings.toml` and sends
   the log to the app (`Event::AgentActivity`) at start and whenever it changes. The cluster's "AI" badge, or Show

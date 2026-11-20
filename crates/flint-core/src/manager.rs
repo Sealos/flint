@@ -1165,8 +1165,11 @@ impl ClusterManager {
     /// Reads the agent activity log and sends it to the front end.
     async fn reload_activity(&mut self) {
         let dir = self.config.config_dir.clone();
-        if let Ok(records) = tokio::task::spawn_blocking(move || activity::read(&dir)).await {
-            self.emit(Event::AgentActivity(Arc::new(records)));
+        let read = tokio::task::spawn_blocking(move || {
+            (activity::read(&dir), activity::ServerKeys::open(&dir))
+        });
+        if let Ok((records, keys)) = read.await {
+            self.emit(Event::AgentActivity(Arc::new(records), keys));
         }
     }
 
