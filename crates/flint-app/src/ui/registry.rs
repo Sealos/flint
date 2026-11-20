@@ -996,6 +996,7 @@ pub fn init(cx: &mut App) {
             Some(super::confirm::DEFAULT_CANCEL),
         ));
     }
+    super::confirm::init(cx);
     cx.bind_keys(bindings);
 }
 

@@ -20,14 +20,15 @@ pub struct DialogText {
     /// The element id of the description, for view tests.
     pub id: &'static str,
     /// Enter cancels instead of confirming, for a confirmation whose OK ends work that cannot be
-    /// got back (quitting, closing the window): only a click on the OK button confirms it, also
-    /// once Tab moved focus onto a button. Escape cancels either way.
+    /// got back (quitting, closing the window): only the OK button confirms it (a click, or Space
+    /// while it has focus), and Enter cancels wherever focus is. Escape cancels either way.
     pub default_cancel: bool,
 }
 
 /// The key context of a [`DialogText::default_cancel`] confirmation's description (which holds
 /// focus while it is open) and of its buttons: Enter and Escape are bound to Cancel there. The
-/// dialog's own keys (Enter confirms) are turned off, so they cannot answer for it either.
+/// dialog's own keys (Enter confirms) are turned off, so they cannot answer for it either; with
+/// focus on the dialog's own node, [`init`] answers them.
 pub const DEFAULT_CANCEL: &str = "DefaultCancel";
 
 /// Opens a confirmation saying `dialog`; confirming runs `on_ok` and closes it. Test builds open
@@ -44,6 +45,11 @@ pub fn open(
     // Focus moves into the description, whose key context turns Enter into Cancel.
     let default_cancel = dialog.default_cancel.then(|| cx.focus_handle());
     let focus = default_cancel.clone();
+    if let Some(focus) = &default_cancel {
+        cx.default_global::<DefaultCancels>()
+            .0
+            .push(focus.downgrade());
+    }
     window.open_alert_dialog(cx, move |alert, _, _| {
         let on_ok = on_ok.clone();
         #[cfg(feature = "automation")]
@@ -76,6 +82,41 @@ pub fn open(
     if let Some(focus) = focus {
         focus.focus(window, cx);
     }
+}
+
+/// The descriptions of the [`DialogText::default_cancel`] confirmations, while they are open
+/// (each handle dies with its dialog).
+#[derive(Default)]
+struct DefaultCancels(Vec<WeakFocusHandle>);
+
+impl Global for DefaultCancels {}
+
+/// Makes Enter and Escape cancel a [`DialogText::default_cancel`] confirmation also while focus
+/// is on the dialog's own node, outside [`DEFAULT_CANCEL`] (a click on the title-bar strip above
+/// it puts it there), where its keys are off and they would do nothing. Call once at startup.
+pub fn init(cx: &mut App) {
+    cx.intercept_keystrokes(|event, window, cx| {
+        let key = &event.keystroke;
+        if !matches!(key.key.as_str(), "enter" | "escape") || key.modifiers.modified() {
+            return;
+        }
+        let Some(cancels) = cx.try_global::<DefaultCancels>() else {
+            return;
+        };
+        let open: Vec<FocusHandle> = cancels.0.iter().filter_map(|d| d.upgrade()).collect();
+        // The dialog's node holds focus: an ancestor of its description, not the description.
+        let description = open
+            .into_iter()
+            .find(|d| d.within_focused(window, cx) && !d.is_focused(window));
+        cx.global_mut::<DefaultCancels>()
+            .0
+            .retain(|d| d.upgrade().is_some());
+        if let Some(description) = description {
+            cx.stop_propagation();
+            description.dispatch_action(&gpui_kit::base::actions::Cancel, window, cx);
+        }
+    })
+    .detach();
 }
 
 /// The buttons of a [`DialogText::default_cancel`] confirmation, as the dialog's own footer draws

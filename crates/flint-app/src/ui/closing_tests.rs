@@ -227,6 +227,87 @@ async fn enter_and_escape_cancel_the_quit_and_close_confirmations(cx: &mut TestA
     }
 }
 
+/// Waits for the open dialog to close.
+async fn closed(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+}
+
+// covers UP-42 (#177): Space on the focused confirm button confirms, as macOS keyboard access
+// does for any focused button; on the focused Cancel button it cancels.
+#[gpui_kit::test]
+async fn space_on_a_focused_button_answers_the_confirmation(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let (_, mut web) = open_fake_shell_in(cx, &t, "web");
+    focus_list(cx, &t);
+
+    // Tab reaches Cancel first.
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    t.press(cx, "tab");
+    t.press(cx, "space");
+    closed(cx, &t).await;
+    assert_eq!(quits(cx), 0, "Space on Cancel cancels");
+    assert!(!web.is_closed());
+
+    // Shift-Tab reaches Quit.
+    t.press_key_of(cx, "flint::Quit");
+    shown_dialog(cx, &t).await;
+    t.press(cx, "shift-tab");
+    t.press(cx, "space");
+    assert_eq!(quits(cx), 1, "Space on the focused Quit button quits");
+}
+
+// covers UP-42 (#177): a click on the title-bar strip above the dialog leaves focus on the dialog
+// itself; the very next Escape or Enter cancels there, and nothing confirms.
+#[gpui_kit::test]
+async fn escape_cancels_with_focus_on_the_dialog_itself(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let (_, mut web) = open_fake_shell_in(cx, &t, "web");
+    focus_list(cx, &t);
+    let click_strip = |cx: &mut TestAppContext| {
+        VisualTestContext::from_window(t.window, cx)
+            .simulate_click(point(px(300.), px(5.)), Modifiers::none());
+    };
+
+    for key in ["escape", "enter"] {
+        t.press_key_of(cx, "flint::CloseWindow");
+        shown_dialog(cx, &t).await;
+        // The key comes right after the click, with nothing drawn in between.
+        click_strip(cx);
+        t.press(cx, key);
+        closed(cx, &t).await;
+        assert!(window_is_open(cx, &t), "{key}");
+        assert!(!web.is_closed(), "{key}: the shell runs on");
+    }
+    assert_eq!(quits(cx), 0);
+}
+
+// covers UP-42 (#177): the confirmation the window's close button opens is answered the same
+// way: Enter and Escape cancel it.
+#[gpui_kit::test]
+async fn enter_and_escape_cancel_the_close_buttons_confirmation(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let (_, mut web) = open_fake_shell_in(cx, &t, "web");
+    focus_list(cx, &t);
+    for key in ["enter", "escape"] {
+        assert!(!VisualTestContext::from_window(t.window, cx).simulate_close());
+        cx.run_until_parked();
+        assert_eq!(shown_dialog(cx, &t).await.title, "Close the window?");
+        t.press(cx, key);
+        closed(cx, &t).await;
+        assert!(window_is_open(cx, &t), "{key}: the window stays");
+        assert_eq!(tab_count(cx, &t), 1, "{key}");
+        assert!(!web.is_closed(), "{key}: the shell runs on");
+    }
+    assert_eq!(quits(cx), 0);
+}
+
 // covers UP-42 (#177): Window > Close Dock Tab never closes the window. With no tab shown it is
 // unavailable (the menu disables it), and dispatching it as the menu does changes nothing;
 // Cmd-W still falls through to Close Window.
