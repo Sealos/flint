@@ -72,9 +72,10 @@ body:
     attributes:
       label: Log output of the MCP server (only for bugs in an AI client)
       description: |
-        Launching the app does not capture `flint mcp`, which your AI client starts itself. Add `--verbose` to the
-        `args` of Flint's entry in the client's MCP server settings, reproduce the bug, and copy the server's stderr
-        from the client's MCP log (the client's settings or log viewer says where). Do not set `FLINT_LOG=debug` for
-        the MCP server: the protocol library then logs full requests and tool results, which can include ConfigMap data
-        and pod environment values that Flint does not redact. Paste only the relevant lines.
+        Launching the app does not capture `flint mcp`, which your AI client starts itself. In Flint's entry in the
+        client's MCP server settings, set the environment variable `FLINT_LOG=info` (it overrides any `RUST_LOG` the
+        client passes on), reproduce the bug, and copy the server's stderr from the client's MCP log (the client's
+        settings or log viewer says where). Do not use a debug level for the MCP server: the protocol library then
+        logs full requests and tool results, which can include ConfigMap data and pod environment values that Flint
+        does not redact. Paste only the relevant lines.
       render: text
