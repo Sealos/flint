@@ -140,6 +140,76 @@ impl WheelLines {
     }
 }
 
+/// The most a single paste sends to a shell. The session's input queue is unbounded (#152), and
+/// a shell reads a paste as typed input, so a huge clipboard is refused instead of queued.
+pub const MAX_PASTE_BYTES: usize = 256 * 1024;
+
+/// What pasting a text into a shell takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteCheck {
+    /// Send it.
+    Paste,
+    /// Ask first: it holds `lines` lines and the program did not ask for bracketed paste, so
+    /// each line runs as it arrives.
+    Confirm { lines: usize },
+    /// Refuse it: it holds `bytes` bytes, more than [`MAX_PASTE_BYTES`].
+    TooLarge { bytes: usize },
+}
+
+/// Whether `text` can be pasted at once, given whether the program asked for bracketed paste
+/// (a shell like bash does; BusyBox `sh` never does). A line break at the very end does not
+/// count as another line.
+pub fn paste_check(text: &str, bracketed: bool) -> PasteCheck {
+    if text.len() > MAX_PASTE_BYTES {
+        return PasteCheck::TooLarge { bytes: text.len() };
+    }
+    if bracketed {
+        return PasteCheck::Paste;
+    }
+    let lines = text
+        .trim_end_matches(['\r', '\n'])
+        .split("\r\n")
+        .flat_map(|line| line.split(['\r', '\n']))
+        .count();
+    if lines > 1 {
+        PasteCheck::Confirm { lines }
+    } else {
+        PasteCheck::Paste
+    }
+}
+
+/// What the paste confirmation says.
+pub fn paste_question(lines: usize) -> (String, String) {
+    (
+        format!("Paste {lines} lines?"),
+        "Each line runs as it is pasted: this shell did not ask for bracketed paste, so it \
+         cannot tell a paste from typing."
+            .to_owned(),
+    )
+}
+
+/// Why a paste was refused.
+pub fn paste_too_large(bytes: usize) -> String {
+    format!(
+        "Not pasted: the clipboard holds {}, more than the {} a shell tab pastes at once.",
+        byte_size(bytes),
+        byte_size(MAX_PASTE_BYTES)
+    )
+}
+
+/// `512 bytes`, `256 KB`, `3.2 MB`.
+fn byte_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// How the cursor is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorLook {
@@ -364,6 +434,34 @@ mod tests {
         for shape in [Block, HollowBlock, Beam, Underline] {
             assert_eq!(cursor_look(shape, true, false), None, "{shape:?}");
         }
+    }
+
+    // covers UP-41: several lines pasted into a shell without bracketed paste would each run,
+    // so they are confirmed first; a huge clipboard is refused.
+    #[test]
+    fn pastes_are_checked_before_they_run() {
+        assert_eq!(paste_check("ls -la", false), PasteCheck::Paste);
+        assert_eq!(paste_check("ls -la\n", false), PasteCheck::Paste);
+        assert_eq!(
+            paste_check("echo a\necho b\r\necho c\n", false),
+            PasteCheck::Confirm { lines: 3 }
+        );
+        assert_eq!(paste_check("a\rb", false), PasteCheck::Confirm { lines: 2 });
+        assert_eq!(paste_check("echo a\necho b", true), PasteCheck::Paste);
+        let huge = "x".repeat(MAX_PASTE_BYTES + 1);
+        assert_eq!(
+            paste_check(&huge, true),
+            PasteCheck::TooLarge {
+                bytes: MAX_PASTE_BYTES + 1
+            }
+        );
+        assert_eq!(paste_question(3).0, "Paste 3 lines?");
+        assert_eq!(
+            paste_too_large(3 * 1024 * 1024 + 200 * 1024),
+            "Not pasted: the clipboard holds 3.2 MB, more than the 256 KB a shell tab pastes at \
+             once."
+        );
+        assert_eq!(byte_size(512), "512 bytes");
     }
 
     #[test]
