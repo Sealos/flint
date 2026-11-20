@@ -509,14 +509,29 @@ impl Interner {
         self.relist += 1;
     }
 
+    /// Marks again, for a new relist, exactly the strings in `used`: the relist's rows, when
+    /// some rows it asked for were replaced or removed before it completed, so their strings
+    /// are not kept for rows that are gone.
+    pub fn remark<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
+        self.relist += 1;
+        for s in used {
+            if let Some(last) = self.set.get_mut(&**s) {
+                *last = self.relist;
+            }
+        }
+    }
+
     /// Keeps only the strings the relist asked for, so strings only older snapshots hold leave
     /// the set at once and are freed with them.
     pub fn keep_relisted(&mut self) {
         let relist = self.relist;
+        let before = self.set.len();
         self.set.retain(|_, last| *last == relist);
         self.kept = self.set.len();
-        // After a big drop (a kind scaled down), give the table back too, as a prune does.
-        if self.set.capacity() > 4 * self.kept.max(PRUNE_MIN) {
+        // After a big drop (a kind scaled down, however small), give the table back too: when
+        // the relist let go of at least as many strings as it kept, and the table is well
+        // over what is left.
+        if before - self.kept >= self.kept && self.set.capacity() > 4 * self.kept.max(16) {
             self.set.shrink_to_fit();
         }
         self.inserts = 0;
@@ -1138,6 +1153,36 @@ pub(crate) mod tests {
             "{}",
             interner.set.capacity()
         );
+    }
+
+    // covers UP-20: a scale-down well under PRUNE_MIN strings gives the table back too.
+    #[test]
+    fn a_small_relist_after_a_drop_gives_the_table_back() {
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        let rows: Vec<Arc<str>> = (0..3_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
+        let big = interner.set.capacity();
+        interner.begin_relist();
+        for s in &rows[..10] {
+            interner.intern(s);
+        }
+        interner.keep_relisted();
+        assert_eq!(interner.len(), 10);
+        assert!(
+            interner.set.capacity() < big / 4,
+            "{}",
+            interner.set.capacity()
+        );
+        // A relist that keeps most of what it had keeps its table.
+        let kept = interner.set.capacity();
+        interner.begin_relist();
+        for s in &rows[..10] {
+            interner.intern(s);
+        }
+        interner.keep_relisted();
+        assert_eq!(interner.set.capacity(), kept);
     }
 
     // covers UP-20

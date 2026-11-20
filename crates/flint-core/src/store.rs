@@ -167,8 +167,22 @@ pub(crate) struct Store {
     /// snapshot never pairs new columns with old cells.
     pending_layout: Option<Layout>,
     interner: Interner,
+    /// A row of the list in progress was replaced or removed before it completed: the strings
+    /// the relist asked for include some of rows that are gone.
+    superseded: bool,
     /// The visible rows' revision ([`KindSnapshot::revision`]).
     revision: u64,
+}
+
+/// The interned strings a row uses: its namespace, label keys and values, and text cells.
+fn row_strings(row: &Row) -> impl Iterator<Item = &Arc<str>> {
+    row.namespace
+        .iter()
+        .chain(row.labels.iter().flat_map(|(k, v)| [k, v]))
+        .chain(row.cells.iter().filter_map(|cell| match cell {
+            crate::table::Cell::Text(s) => Some(s),
+            _ => None,
+        }))
 }
 
 /// What [`Store::apply`] did.
@@ -190,6 +204,7 @@ impl Store {
             pending: None,
             pending_layout: None,
             interner: Interner::default(),
+            superseded: false,
             revision: 0,
         }
     }
@@ -209,6 +224,7 @@ impl Store {
         self.pending = Some(HashMap::new());
         self.pending_layout = self.layout.clone();
         self.interner.begin_relist();
+        self.superseded = false;
     }
 
     /// Replaces the rows with the completed list.
@@ -222,6 +238,12 @@ impl Store {
             // rows' strings, so a prune by reference count would keep them. Keep what the
             // relist asked for: the old strings go when their last holder lets go, whenever
             // that is, with no further events needed.
+            // Rarely, rows the relist asked for were replaced or removed meanwhile: mark what
+            // the final rows use, walking them once, so those rows' strings go too.
+            if std::mem::take(&mut self.superseded) {
+                self.interner
+                    .remark(self.rows.values().flat_map(|row| row_strings(row)));
+            }
             self.interner.keep_relisted();
             self.revise();
         }
@@ -259,18 +281,26 @@ impl Store {
         let rows = table::rows_with(object, slot.as_ref(), &mut self.interner, now);
         let target = self.pending.as_mut().unwrap_or(&mut self.rows);
         let mut changed = false;
+        let mut superseded = false;
         for row in rows {
             if delete {
-                changed |= target.remove(&row.uid).is_some();
+                let removed = target.remove(&row.uid).is_some();
+                changed |= removed;
+                superseded |= removed;
             } else {
                 match target.get(&row.uid) {
                     Some(old) if **old == row => {}
-                    _ => {
+                    old => {
+                        superseded |= old.is_some();
                         target.insert(row.uid.clone(), Arc::new(row));
                         changed = true;
                     }
                 }
             }
+        }
+        // A deleted row's strings were asked for too, by this event if no row has them.
+        if !visible && (superseded || delete) {
+            self.superseded = true;
         }
         if changed && visible {
             self.revise();
@@ -549,6 +579,34 @@ mod tests {
             crate::table::Cell::Text(s) => assert!(Arc::ptr_eq(s, &status(0))),
             other => panic!("a status cell, not {other:?}"),
         }
+    }
+
+    // covers UP-20, UP-27: rows of the list in progress that an event replaced or deleted
+    // before it completed leave their strings behind with them.
+    #[test]
+    fn a_relist_drops_the_strings_of_rows_replaced_meanwhile() {
+        let mut store = Store::new(true);
+        store.apply(obj(&[("u1", "demo", "a", "Running")], "1"), false, 0);
+        store.begin_resync();
+        store.apply(obj(&[("u1", "demo", "a", "Starting")], "2"), false, 0);
+        store.apply(obj(&[("u2", "demo", "b", "Doomed")], "2"), false, 0);
+        // Before the list completes: u1 changes, u2 is deleted.
+        store.apply(obj(&[("u1", "demo", "a", "Running")], "3"), false, 0);
+        store.apply(obj(&[("u2", "demo", "b", "Doomed")], "3"), true, 0);
+        store.finish_resync();
+        let snapshot = store.snapshot(KindSnapshot::default());
+        let used: std::collections::HashSet<&str> = snapshot
+            .rows
+            .iter()
+            .flat_map(|row| row_strings(row))
+            .map(|s| &**s)
+            .collect();
+        assert!(!used.contains("Starting") && !used.contains("Doomed"));
+        assert_eq!(
+            store.interned(),
+            used.len(),
+            "only what the rows use: {used:?}"
+        );
     }
 
     // covers UP-27
