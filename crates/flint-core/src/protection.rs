@@ -11,7 +11,7 @@
 //! [`WriteRefusal::Protected`]. A front end shows the same state with [`protection`], but cannot
 //! open a way around it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -109,9 +109,26 @@ pub struct SessionUnlocks(Arc<Mutex<Unlocks>>);
 #[derive(Debug, Default)]
 struct Unlocks {
     pins: BTreeSet<ClusterPin>,
-    /// Contexts the user stopped trusting: their trust in `settings` does not count until
-    /// the settings no longer hold it ([`SessionUnlocks::settle`]).
-    revoked: BTreeSet<String>,
+    /// Trust and Stop Trusting requests per context, numbered in the order they were made.
+    trust: BTreeMap<String, TrustRequests>,
+    /// The last request number handed out, for every context alike: only ever grows.
+    generation: u64,
+}
+
+/// Where a context's Trust and Stop Trusting requests stand. Requests are numbered when they
+/// are made (synchronously, before their write is queued), so the outcome of a write can be
+/// judged against what the user asked for since.
+#[derive(Debug, Default)]
+struct TrustRequests {
+    /// The number of the newest request, Trust or Stop Trusting.
+    latest: u64,
+    /// The Stop Trusting in force: the context's trust in `settings` does not count while it
+    /// is set. Set by Stop Trusting at once; cleared only by a Trust whose pin was saved and
+    /// that is still the newest request, or by settings that no longer hold a pin when no
+    /// Trust made before the Stop Trusting can still write one.
+    revoked_at: Option<u64>,
+    /// Trust requests whose write has not finished.
+    in_flight: BTreeSet<u64>,
 }
 
 impl SessionUnlocks {
@@ -136,31 +153,73 @@ impl SessionUnlocks {
         self.set().pins.iter().any(|p| p.matches(context, server))
     }
 
-    /// Stops trusting `context` now (Stop Trusting), before `settings.toml` is written, and
-    /// locks it: nothing new that changes the cluster starts from this moment.
-    pub fn revoke_trust(&self, context: &str) {
+    /// Records a Trust request for `context`, before its write is queued, and returns its
+    /// number, which the write's outcome is reported with ([`SessionUnlocks::trust_written`]).
+    /// It changes nothing at the gate: a revocation in force stays until the pin is saved.
+    pub fn request_trust(&self, context: &str) -> u64 {
         let mut set = self.set();
-        set.pins.retain(|p| p.context != context);
-        set.revoked.insert(context.to_owned());
+        set.generation += 1;
+        let generation = set.generation;
+        let requests = set.trust.entry(context.to_owned()).or_default();
+        requests.latest = generation;
+        requests.in_flight.insert(generation);
+        generation
     }
 
-    /// Lets `context`'s trust count again: the user just confirmed trusting it.
-    pub fn restore_trust(&self, context: &str) {
-        self.set().revoked.remove(context);
+    /// Stops trusting `context` now (Stop Trusting), before `settings.toml` is written, and
+    /// locks it: nothing new that changes the cluster starts from this moment, whatever
+    /// writes are still on their way. Returns the request's number.
+    pub fn revoke_trust(&self, context: &str) -> u64 {
+        let mut set = self.set();
+        set.pins.retain(|p| p.context != context);
+        set.generation += 1;
+        let generation = set.generation;
+        let requests = set.trust.entry(context.to_owned()).or_default();
+        requests.latest = generation;
+        requests.revoked_at = Some(generation);
+        generation
+    }
+
+    /// The write of Trust request `generation` for `context` finished: `saved` when the pin
+    /// for the confirmed server is in `settings.toml`. A saved pin lifts a revocation only if
+    /// no request was made since; otherwise the newer request decides.
+    pub fn trust_written(&self, context: &str, generation: u64, saved: bool) {
+        let mut set = self.set();
+        let Some(requests) = set.trust.get_mut(context) else {
+            return;
+        };
+        requests.in_flight.remove(&generation);
+        if saved && requests.latest == generation {
+            requests.revoked_at = None;
+        }
     }
 
     /// Whether the user revoked `context`'s trust and the settings may still hold it.
     pub fn trust_revoked(&self, context: &str) -> bool {
-        self.set().revoked.contains(context)
+        self.set()
+            .trust
+            .get(context)
+            .is_some_and(|r| r.revoked_at.is_some())
     }
 
-    /// Forgets the revocations `settings` no longer need: those of contexts it trusts nowhere
-    /// (the write landed). A revocation whose write failed stays, so the cluster stays
+    /// Forgets the revocations `settings` (read or written, never a fallback) no longer need:
+    /// those of contexts it holds no pin for, when no Trust made before the revocation can
+    /// still write one. A revocation whose write failed stays, so the cluster stays
     /// protected.
     pub fn settle(&self, settings: &Settings) {
-        self.set()
-            .revoked
-            .retain(|c| settings.trusted_clusters.iter().any(|p| &p.context == c));
+        for (context, requests) in &mut self.set().trust {
+            let Some(revoked_at) = requests.revoked_at else {
+                continue;
+            };
+            let pinned = settings
+                .trusted_clusters
+                .iter()
+                .any(|p| &p.context == context);
+            let older_trust_pending = requests.in_flight.iter().any(|g| *g < revoked_at);
+            if !pinned && !older_trust_pending {
+                requests.revoked_at = None;
+            }
+        }
     }
 
     fn set(&self) -> std::sync::MutexGuard<'_, Unlocks> {
@@ -333,7 +392,13 @@ mod tests {
             .push(ClusterPin::new("prod", prod));
         assert_eq!(of(&settings), Protection::Trusted);
         unlocks.revoke_trust("prod");
-        unlocks.restore_trust("prod");
+        let trust = unlocks.request_trust("prod");
+        assert_eq!(
+            of(&settings),
+            Protection::Protected,
+            "not before the pin is saved"
+        );
+        unlocks.trust_written("prod", trust, true);
         assert_eq!(of(&settings), Protection::Trusted);
     }
 

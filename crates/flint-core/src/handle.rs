@@ -86,9 +86,14 @@ pub enum Command {
     /// Trust a cluster at `server` (`Some`), or stop trusting it (`None`), in `settings.toml`
     /// (ADR-0015). As with [`Command::SetAiExposed`], `server` is the URL the user confirmed; if
     /// the context no longer points there, nothing is written and an error is reported.
+    ///
+    /// `request` numbers the request among the context's Trust and Stop Trusting requests;
+    /// [`CoreHandle::trust`] and [`CoreHandle::untrust`] take it from the session's state, so
+    /// use those rather than sending this yourself.
     SetTrusted {
         cluster: ClusterId,
         server: Option<String>,
+        request: u64,
     },
     /// Reload the kubeconfig files now.
     ReloadKubeconfig,
@@ -481,20 +486,24 @@ impl CoreHandle {
     /// through [`Command::SetTrusted`]. A revocation of its trust earlier in the session is
     /// lifted once the core has checked the server and saved the pin, not before.
     pub fn trust(&self, cluster: &str, server: &str) {
+        let request = self.unlocks.request_trust(cluster);
         self.send(Command::SetTrusted {
             cluster: cluster.to_owned(),
             server: Some(server.to_owned()),
+            request,
         });
     }
 
     /// Stops trusting `cluster` and locks it: from this moment nothing new that changes the
     /// cluster starts, before `settings.toml` is written (commands and the core's gate take
-    /// separate queues). Shells already open keep running.
+    /// separate queues), and no Trust written before then lifts it. Shells already open keep
+    /// running.
     pub fn untrust(&self, cluster: &str) {
-        self.unlocks.revoke_trust(cluster);
+        let request = self.unlocks.revoke_trust(cluster);
         self.send(Command::SetTrusted {
             cluster: cluster.to_owned(),
             server: None,
+            request,
         });
     }
 

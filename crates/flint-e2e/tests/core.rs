@@ -990,10 +990,7 @@ async fn a_protected_cluster_refuses_shells_until_unlocked_or_trusted() {
     assert_eq!(server.exec_requests().len(), 1);
 
     let events = core.handle.events();
-    core.handle.send(Command::SetTrusted {
-        cluster: CONTEXT.to_owned(),
-        server: Some(server.url()),
-    });
+    core.handle.trust(CONTEXT, &server.url());
     tokio::time::timeout(WAIT, async {
         loop {
             match events.recv().await.expect("core running") {

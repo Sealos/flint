@@ -318,11 +318,13 @@ impl ClusterManager {
         match command {
             Command::Activate(id) => self.activate(id),
             Command::SetAiExposed { cluster, server } => {
-                self.set_pin(Pins::AiExposure, cluster, server).await
+                self.set_pin(Pins::AiExposure, cluster, server).await;
             }
-            Command::SetTrusted { cluster, server } => {
-                self.set_pin(Pins::Trust, cluster, server).await
-            }
+            Command::SetTrusted {
+                cluster,
+                server,
+                request,
+            } => self.set_trusted(cluster, server, request).await,
             Command::ReloadKubeconfig => self.reload_kubeconfig().await,
             Command::SetWatchMode { cluster, mode } => {
                 self.write_settings("the watch mode", move |dir| {
@@ -595,7 +597,24 @@ impl ClusterManager {
 
     /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
     /// `settings.toml`.
-    async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) {
+    /// Trusts `cluster` at `server` (`Some`) or stops trusting it (`None`): request `request`,
+    /// numbered when it was made ([`crate::protection::SessionUnlocks`]). A Trust reports how
+    /// its write went, which lifts an earlier Stop Trusting only if no request was made since.
+    async fn set_trusted(&mut self, cluster: ClusterId, server: Option<String>, request: u64) {
+        let trusting = server.is_some();
+        let saved = self.set_pin(Pins::Trust, cluster.clone(), server).await;
+        if trusting {
+            self.unlocks.trust_written(&cluster, request, saved);
+            if saved {
+                // The settings may be unchanged (the same pin again): say it anyway, so the
+                // front end shows the trust that counts again.
+                self.emit_settings();
+            }
+        }
+    }
+
+    /// Returns whether the change was saved.
+    async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
         if let Some(server) = &server {
             // The user confirmed this server. If the context moved since, do not pin the new
             // one on the strength of that confirmation.
@@ -609,7 +628,7 @@ impl ClusterManager {
                     "\"{cluster}\" now points to a different server; it was not {}. Review it and try again.",
                     pins.done()
                 )));
-                return;
+                return false;
             }
         }
         if let Some(error) = &self.settings_error {
@@ -619,12 +638,8 @@ impl ClusterManager {
                 pins.what(),
                 crate::redact::safe_error_summary(error)
             )));
-            return;
+            return false;
         }
-        // A trust confirmed for this server lifts an earlier Stop Trusting, but only once the
-        // pin is checked and saved: a failed write leaves the cluster protected.
-        let trusted = matches!(pins, Pins::Trust) && server.is_some();
-        let pinned = cluster.clone();
         let dir = self.config.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || match pins {
             Pins::AiExposure => settings::set_ai_exposed(&dir, &cluster, server.as_deref()),
@@ -633,15 +648,7 @@ impl ClusterManager {
         .await;
         match result {
             Ok(Ok(settings)) => {
-                if trusted {
-                    self.unlocks.restore_trust(&pinned);
-                }
                 self.apply_settings(Ok(settings)).await;
-                if trusted {
-                    // The settings may be unchanged (the same pin again): say it anyway, so the
-                    // front end shows the trust that counts again.
-                    self.emit_settings();
-                }
                 if self
                     .watcher
                     .as_ref()
@@ -650,12 +657,19 @@ impl ClusterManager {
                     // The write may have created the config directory.
                     self.rebuild_watcher();
                 }
+                true
             }
             // A settings write error can quote the file: one sanitized line.
-            Ok(Err(e)) => self.emit(Event::Error(crate::redact::safe_error_summary(
-                &e.to_string(),
-            ))),
-            Err(e) => self.emit(Event::Error(format!("settings write failed: {e}"))),
+            Ok(Err(e)) => {
+                self.emit(Event::Error(crate::redact::safe_error_summary(
+                    &e.to_string(),
+                )));
+                false
+            }
+            Err(e) => {
+                self.emit(Event::Error(format!("settings write failed: {e}")));
+                false
+            }
         }
     }
 
@@ -1637,7 +1651,8 @@ mod tests {
         // Stop Trusting refuses at once, before the settings change arrives.
         unlocks.revoke_trust("dev");
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
-        unlocks.restore_trust("dev");
+        let trust = unlocks.request_trust("dev");
+        unlocks.trust_written("dev", trust, true);
         assert_eq!(manager.write_client("dev").err(), Some(not_connected));
 
         // A settings.toml that stops parsing trusts nothing, as at startup: an entry removed
@@ -1648,77 +1663,230 @@ mod tests {
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
     }
 
-    // covers UP-55: a Stop Trusting stays in force until settings that were really read or
-    // written no longer hold the pin (never on the fallback for a broken file), and trusting
-    // again lifts it only once the pin for the confirmed server is saved.
+    /// A step of a trust interleaving ([`trust_and_stop_trusting_interleave_safely`]).
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        /// Trust This Cluster confirmed: the request is numbered and its write queued.
+        Trust,
+        /// Stop Trusting: the request is numbered, the gate refuses at once, the write is queued.
+        Stop,
+        /// The write of request `n` (0-based, in the order requested) runs and lands.
+        Write(usize),
+        /// The write of request `n` runs while settings.toml cannot be written: it fails.
+        Fail(usize),
+        /// settings.toml stops parsing and is reloaded.
+        Break,
+        /// settings.toml is put back as it was before [`Step::Break`] and reloaded.
+        Fix,
+        /// What the gate does now: `true` lets a new shell through.
+        Allows(bool),
+    }
+
+    // covers UP-55: whatever order Trust and Stop Trusting requests are made in, and their
+    // writes land or fail in, a shell is let through only while the newest request is a Trust
+    // whose pin is saved (or a trust no later request touched). Stop Trusting refuses at once,
+    // a Trust written before a later Stop Trusting never lifts it, and a broken settings.toml
+    // trusts nothing.
     #[tokio::test]
-    async fn a_revoked_trust_holds_until_the_pin_is_really_gone_or_saved_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = async_channel::unbounded();
-        let mut trusted = Settings::default();
-        trusted
-            .trusted_clusters
-            .push(settings::ClusterPin::new("dev", "https://dev"));
-        let config = CoreConfig {
-            config_dir: dir.path().to_owned(),
-            settings: trusted.clone(),
-            settings_error: None,
-            kubeconfig_base: Vec::new(),
-            home: None,
-            watch_files: false,
-            watch_timing: Default::default(),
-        };
-        let hubs = HubRegistry::default();
-        let unlocks = SessionUnlocks::default();
-        let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
-        manager.clusters.push(Cluster::new(
-            context(None),
-            None,
-            &hubs,
-            &manager.engine_config,
-        ));
-        let protected = Some(WriteRefusal::Protected {
-            cluster: "dev".into(),
-        });
-        let open = Some(WriteRefusal::NotConnected {
-            cluster: "dev".into(),
-        });
-        assert_eq!(manager.write_client("dev").err(), open);
-
-        // Stop Trusting, whose write failed: the file broke before it landed.
-        unlocks.revoke_trust("dev");
-        manager.apply_settings(Err("expected `=`".into())).await;
-        assert!(unlocks.trust_revoked("dev"), "the fallback proves nothing");
-        // The typo is fixed with the old pin still in the file: still protected.
-        manager.apply_settings(Ok(trusted.clone())).await;
-        assert!(unlocks.trust_revoked("dev"));
-        assert_eq!(manager.write_client("dev").err(), protected);
-
-        // Trusting a server the context does not point at saves nothing and lifts nothing.
-        manager
-            .set_pin(Pins::Trust, "dev".into(), Some("https://elsewhere".into()))
-            .await;
-        assert!(unlocks.trust_revoked("dev"));
-        // Nor does a write refused while settings.toml is broken.
-        manager.settings_error = Some("broken".into());
-        manager
-            .set_pin(Pins::Trust, "dev".into(), Some("https://dev".into()))
-            .await;
-        assert!(unlocks.trust_revoked("dev"));
-        assert_eq!(manager.write_client("dev").err(), protected);
-        // Saved for the confirmed server: the trust counts again.
-        manager.settings_error = None;
-        manager
-            .set_pin(Pins::Trust, "dev".into(), Some("https://dev".into()))
-            .await;
-        assert!(!unlocks.trust_revoked("dev"));
-        assert_eq!(manager.write_client("dev").err(), open);
-
-        // Stop Trusting that lands: settings without the pin settle the revocation.
-        unlocks.revoke_trust("dev");
-        manager.set_pin(Pins::Trust, "dev".into(), None).await;
-        assert!(!unlocks.trust_revoked("dev"));
-        assert_eq!(manager.write_client("dev").err(), protected);
+    async fn trust_and_stop_trusting_interleave_safely() {
+        use Step::*;
+        let cases: &[(&str, &[Step])] = &[
+            ("trust", &[Trust, Allows(false), Write(0), Allows(true)]),
+            (
+                "trust then stop, trust written first",
+                &[
+                    Trust,
+                    Stop,
+                    Allows(false),
+                    Write(0),
+                    Allows(false),
+                    Write(1),
+                    Allows(false),
+                ],
+            ),
+            (
+                "trust then stop, stop written first",
+                &[
+                    Trust,
+                    Stop,
+                    Write(1),
+                    Allows(false),
+                    Write(0),
+                    Allows(false),
+                ],
+            ),
+            (
+                "stop then trust",
+                &[
+                    Trust,
+                    Write(0),
+                    Allows(true),
+                    Stop,
+                    Allows(false),
+                    Trust,
+                    Allows(false),
+                    Write(1),
+                    Allows(false),
+                    Write(2),
+                    Allows(true),
+                ],
+            ),
+            (
+                "stop then trust, trust written first",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Trust,
+                    Write(2),
+                    Allows(true),
+                    Write(1),
+                    Allows(false),
+                ],
+            ),
+            (
+                "trust, stop, trust in order",
+                &[
+                    Trust,
+                    Stop,
+                    Trust,
+                    Write(0),
+                    Allows(false),
+                    Write(1),
+                    Allows(false),
+                    Write(2),
+                    Allows(true),
+                ],
+            ),
+            (
+                "trust, stop, trust, the last written first",
+                &[
+                    Trust,
+                    Stop,
+                    Trust,
+                    Write(2),
+                    Allows(true),
+                    Write(0),
+                    Allows(true),
+                    Write(1),
+                    Allows(false),
+                ],
+            ),
+            ("a failed trust", &[Trust, Fail(0), Allows(false)]),
+            (
+                "a failed stop keeps it protected",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Fail(1),
+                    Allows(false),
+                    Fix,
+                    Allows(false),
+                ],
+            ),
+            (
+                "a failed trust after a stop",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Write(1),
+                    Trust,
+                    Fail(2),
+                    Allows(false),
+                ],
+            ),
+            (
+                "the file breaks after a stop",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Break,
+                    Allows(false),
+                    Fail(1),
+                    Fix,
+                    Allows(false),
+                ],
+            ),
+            (
+                "the file breaks while trusted",
+                &[
+                    Trust,
+                    Write(0),
+                    Allows(true),
+                    Break,
+                    Allows(false),
+                    Fix,
+                    Allows(true),
+                ],
+            ),
+            (
+                "the file breaks between a trust and its write",
+                &[Trust, Break, Allows(false), Fail(0), Fix, Allows(false)],
+            ),
+        ];
+        for (name, steps) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (events, _rx) = async_channel::unbounded();
+            let config = CoreConfig {
+                config_dir: dir.path().to_owned(),
+                settings: Settings::default(),
+                settings_error: None,
+                kubeconfig_base: Vec::new(),
+                home: None,
+                watch_files: false,
+                watch_timing: Default::default(),
+            };
+            let hubs = HubRegistry::default();
+            let unlocks = SessionUnlocks::default();
+            let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
+            manager.clusters.push(Cluster::new(
+                context(None),
+                None,
+                &hubs,
+                &manager.engine_config,
+            ));
+            let file = dir.path().join(settings::SETTINGS_FILE);
+            let mut requests: Vec<(bool, u64)> = Vec::new();
+            let mut saved_text: Option<String> = None;
+            for (i, step) in steps.iter().enumerate() {
+                match *step {
+                    Trust => requests.push((true, unlocks.request_trust("dev"))),
+                    Stop => requests.push((false, unlocks.revoke_trust("dev"))),
+                    Write(n) | Fail(n) => {
+                        let (trust, request) = requests[n];
+                        let failing = matches!(step, Fail(_));
+                        let before = manager.settings_error.clone();
+                        if failing && before.is_none() {
+                            manager.settings_error = Some("cannot be written".into());
+                        }
+                        let server = trust.then(|| "https://dev".to_owned());
+                        manager.set_trusted("dev".into(), server, request).await;
+                        manager.settings_error = before;
+                    }
+                    Break => {
+                        saved_text = Some(std::fs::read_to_string(&file).unwrap_or_default());
+                        std::fs::write(&file, "watch_mode = ").unwrap();
+                        manager.reload_settings().await;
+                    }
+                    Fix => {
+                        if let Some(text) = saved_text.take() {
+                            std::fs::write(&file, text).unwrap();
+                        }
+                        manager.reload_settings().await;
+                    }
+                    Allows(wanted) => {
+                        let allows = !matches!(
+                            manager.write_client("dev"),
+                            Err(WriteRefusal::Protected { .. })
+                        );
+                        assert_eq!(allows, wanted, "{name}: step {i} ({step:?}) of {steps:?}");
+                    }
+                }
+            }
+        }
     }
 
     // covers UP-12: settings.toml as a symlink to a file that is gone is watched at its
