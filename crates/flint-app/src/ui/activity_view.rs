@@ -4,6 +4,8 @@
 //! the cluster model holds it. It says what was asked for and how much came back; what came back
 //! is never stored.
 
+use std::sync::Arc;
+
 use flint_core::ClusterId;
 use flint_core::activity::{ActivityRecord, Outcome};
 use gpui_kit::base::TestSupportExt as _;
@@ -46,19 +48,26 @@ impl ActivityRow {
     }
 }
 
-/// The calls on `cluster` in `records`, newest first, with times in `tz` and `now` deciding
-/// whether a date is shown.
+/// The calls on `cluster` at `server` in `records`, newest first, with times in `tz` and `now`
+/// deciding whether a date is shown. A context re-pointed at another server is another cluster:
+/// its calls there are not shown (a record without a server, from a context not exposed, is).
 pub fn rows(
     records: &[ActivityRecord],
     cluster: &str,
+    server: Option<&str>,
     tz: &TimeZone,
     now: Timestamp,
 ) -> Vec<ActivityRow> {
     let today = now.to_zoned(tz.clone()).date();
+    let server = server.map(same_server);
     records
         .iter()
         .rev()
         .filter(|r| r.cluster.as_deref() == Some(cluster))
+        .filter(|r| match (&r.server, &server) {
+            (Some(at), Some(server)) => same_server(at) == *server,
+            _ => true,
+        })
         .map(|r| ActivityRow {
             time: time(r.at_ms, tz, today),
             tool: r.tool.clone(),
@@ -67,6 +76,13 @@ pub fn rows(
             outcome: r.outcome,
         })
         .collect()
+}
+
+/// A server URL as records hold it (without credentials) and without a trailing slash.
+fn same_server(url: &str) -> String {
+    flint_core::redact::server_url(url)
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
@@ -136,6 +152,10 @@ fn size(bytes: u64) -> String {
 
 pub struct ActivityView {
     cluster: ClusterId,
+    /// The server the context pointed at when the tab opened.
+    server: Option<String>,
+    /// The log the rows were built from: rebuilt only when it changes.
+    shown: Option<Arc<Vec<ActivityRecord>>>,
     model: Entity<ClustersModel>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
@@ -146,13 +166,20 @@ pub struct ActivityView {
 }
 
 impl ActivityView {
-    pub fn new(model: Entity<ClustersModel>, cluster: ClusterId, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        model: Entity<ClustersModel>,
+        cluster: ClusterId,
+        server: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = cx.observe(&model, |view, _, cx| {
             view.refresh(cx);
             cx.notify();
         });
         let mut view = ActivityView {
             cluster,
+            server,
+            shown: None,
             model,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
@@ -166,7 +193,22 @@ impl ActivityView {
 
     fn refresh(&mut self, cx: &App) {
         let records = self.model.read(cx).agent_activity.clone();
-        self.rows = rows(&records, &self.cluster, &self.tz, Timestamp::now());
+        // The model also changes for connections, discovery and settings.
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, &records))
+        {
+            return;
+        }
+        self.rows = rows(
+            &records,
+            &self.cluster,
+            self.server.as_deref(),
+            &self.tz,
+            Timestamp::now(),
+        );
+        self.shown = Some(records);
     }
 
     /// The rows, newest first.
@@ -384,7 +426,7 @@ mod tests {
             clusters,
             denied,
         ];
-        let labels: Vec<String> = rows(&records, "prod", &tz, now)
+        let labels: Vec<String> = rows(&records, "prod", Some("https://prod:6443/"), &tz, now)
             .iter()
             .map(ActivityRow::label)
             .collect();
@@ -396,6 +438,26 @@ mod tests {
                  KB, cut short",
             ]
         );
+    }
+
+    // covers UP-16: a context re-pointed at another server shows only the calls on the server its
+    // tab is for.
+    #[test]
+    fn rows_are_for_the_tabs_server() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let at = |server: Option<&str>| ActivityRecord {
+            server: server.map(str::to_owned),
+            ..record(now.as_millisecond(), "prod")
+        };
+        let records = [
+            at(Some("https://old:6443")),
+            at(Some("https://prod:6443")),
+            at(None),
+        ];
+        let count = |server| rows(&records, "prod", server, &TimeZone::UTC, now).len();
+        assert_eq!(count(Some("https://prod:6443")), 2);
+        assert_eq!(count(Some("https://old:6443/")), 2);
+        assert_eq!(count(None), 3);
     }
 
     #[test]

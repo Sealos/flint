@@ -27,7 +27,6 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::activity_view::ActivityView;
 use super::closing;
 use super::clusters::{ClustersModel, Presence, state_label};
 use super::confirm::{self, DialogText};
@@ -540,7 +539,6 @@ impl Workspace {
         self.clear_action_error(cx);
         let cluster = self.tab_cluster(key.context(), cx);
         let core = self.model.read(cx).core().clone();
-        let model = self.model.clone();
         self.dock.update(cx, |dock, cx| {
             dock.open_beside(
                 id,
@@ -553,9 +551,8 @@ impl Workspace {
                         let session = core.exec(request.exec_request(Default::default()));
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
-                    TabKey::Activity(cluster) => {
-                        DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, cx)))
-                    }
+                    // It returned above: an activity tab has no session to start again.
+                    TabKey::Activity(_) => unreachable!("activity tabs do not restart"),
                 },
                 window,
                 cx,

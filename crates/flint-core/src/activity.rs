@@ -20,6 +20,10 @@ pub const ACTIVITY_FILE: &str = "agent-activity.jsonl";
 pub const PREVIOUS_FILE: &str = "agent-activity.1.jsonl";
 /// The size at which the log rotates: about four thousand records.
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// Writers hold an exclusive lock on this file while they append (and rotate).
+pub const LOCK_FILE: &str = "agent-activity.lock";
+/// The longest a text field is recorded: a DNS name's length, plenty for any Kubernetes name.
+pub const MAX_FIELD_BYTES: usize = 253;
 /// The most records [`read`] returns, newest kept: more than the two files hold, so this only
 /// bounds a log written with a larger cap.
 pub const MAX_RECORDS: usize = 10_000;
@@ -71,22 +75,69 @@ pub struct ActivityRecord {
 }
 
 /// Appends `record` to the log in `config_dir`, rotating it first if it would grow past
-/// [`MAX_FILE_BYTES`]. Creates the directory if needed.
+/// [`MAX_FILE_BYTES`]. Creates the directory if needed. Text fields are cut at
+/// [`MAX_FIELD_BYTES`]: they hold what the agent wrote, and a few huge ones must not flush the
+/// log. Writers take [`LOCK_FILE`] for the whole check, rotation and write, so two of them never
+/// rotate the same file twice.
 pub fn append(config_dir: &Path, record: &ActivityRecord) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(record)?;
+    let mut line = serde_json::to_vec(&capped(record))?;
     line.push(b'\n');
     std::fs::create_dir_all(config_dir)?;
+    let _lock = Lock::take(&config_dir.join(LOCK_FILE))?;
     let path = config_dir.join(ACTIVITY_FILE);
     let size = std::fs::metadata(&path).map_or(0, |m| m.len());
     if size > 0 && size + line.len() as u64 > MAX_FILE_BYTES {
-        // Another process may have rotated it a moment ago; then there is nothing to move.
-        match std::fs::rename(&path, config_dir.join(PREVIOUS_FILE)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        std::fs::rename(&path, config_dir.join(PREVIOUS_FILE))?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     file.write_all(&line)
+}
+
+/// `record` with each text field cut at [`MAX_FIELD_BYTES`], saying how much was left out.
+fn capped(record: &ActivityRecord) -> ActivityRecord {
+    let cap = |text: &String| {
+        if text.len() <= MAX_FIELD_BYTES {
+            return text.clone();
+        }
+        let mut end = MAX_FIELD_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…(+{} bytes)", &text[..end], text.len() - end)
+    };
+    let cap_opt = |text: &Option<String>| text.as_ref().map(cap);
+    ActivityRecord {
+        tool: cap(&record.tool),
+        cluster: cap_opt(&record.cluster),
+        server: cap_opt(&record.server),
+        kind: cap_opt(&record.kind),
+        namespace: cap_opt(&record.namespace),
+        name: cap_opt(&record.name),
+        container: cap_opt(&record.container),
+        ..record.clone()
+    }
+}
+
+/// An exclusive `flock` on a file, released when dropped (with the descriptor).
+struct Lock {
+    /// Closing it releases the lock.
+    _file: std::fs::File,
+}
+
+impl Lock {
+    fn take(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        // SAFETY: flock on a descriptor `file` owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Lock { _file: file })
+    }
 }
 
 /// The records in `config_dir`, oldest first, at most [`MAX_RECORDS`] (the newest). A missing
@@ -202,6 +253,59 @@ mod tests {
         assert_eq!(records.last(), Some(&record(total - 1)));
         assert!(records.len() as u64 > MAX_FILE_BYTES / line && (records.len() as u64) < total);
         assert!(records.windows(2).all(|w| w[0].at_ms + 1 == w[1].at_ms));
+    }
+
+    // covers UP-16: an agent cannot flush the log with huge names: each field is cut, so the
+    // records before stay.
+    #[test]
+    fn huge_fields_are_cut_and_do_not_flush_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..100 {
+            append(dir.path(), &record(n)).unwrap();
+        }
+        let huge = ActivityRecord {
+            name: Some("x".repeat(1_100_000)),
+            namespace: Some("é".repeat(300)),
+            ..record(100)
+        };
+        append(dir.path(), &huge).unwrap();
+        append(dir.path(), &huge).unwrap();
+        let records = read(dir.path());
+        assert_eq!(records.len(), 102);
+        let name = records[100].name.as_deref().unwrap();
+        assert_eq!(name, format!("{}…(+1099747 bytes)", "x".repeat(253)));
+        let namespace = records[100].namespace.as_deref().unwrap();
+        assert!(namespace.starts_with(&"é".repeat(126)) && namespace.ends_with("…(+348 bytes)"));
+    }
+
+    // covers UP-16: writers in several processes (and threads) rotate in turn: no record is
+    // lost but the ones the cap drops, and the kept ones are complete files' worth.
+    #[test]
+    fn concurrent_writers_rotate_without_losing_the_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_vec(&record(0)).unwrap().len() as u64 + 1;
+        let per_writer = MAX_FILE_BYTES / line;
+        std::thread::scope(|s| {
+            for w in 0..4u64 {
+                let dir = dir.path();
+                s.spawn(move || {
+                    for n in 0..per_writer {
+                        append(dir, &record(w * 1_000_000 + n)).unwrap();
+                    }
+                });
+            }
+        });
+        // About four files' worth written, so two rotations at least: the previous file is
+        // always a full one, never a near-empty one that replaced it.
+        let previous = std::fs::metadata(dir.path().join(PREVIOUS_FILE))
+            .unwrap()
+            .len();
+        assert!(previous > MAX_FILE_BYTES - 2 * line, "{previous}");
+        let records = read(dir.path());
+        let mut ids: Vec<i64> = records.iter().map(|r| r.at_ms).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), records.len(), "no record written twice");
     }
 
     #[test]
