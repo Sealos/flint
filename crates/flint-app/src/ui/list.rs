@@ -353,6 +353,7 @@ impl ResourceList {
             ),
         };
         self.sort_drawn = query.sort.is_some();
+        let job_sort = query.sort;
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
@@ -372,6 +373,19 @@ impl ResourceList {
             let (rows, widths, scoped, uid, position) = job.await;
             let _ = this.update(cx, |list, cx| {
                 list.computing = false;
+                // Sorted for a layout that has changed since (Wide toggled, the pane resized, the
+                // sort clicked): drawing these rows under the new header would show one order
+                // with the other's arrow. Sort again for the layout now.
+                let now = list_model::resolve_sort(
+                    &snapshot.columns,
+                    list.query.sort.as_ref(),
+                    &list.drawn_in(&snapshot.columns),
+                );
+                if now != job_sort {
+                    list.remeasure |= restart;
+                    list.recompute(cx);
+                    return;
+                }
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.apply(snapshot, rows, uid, position, cx);

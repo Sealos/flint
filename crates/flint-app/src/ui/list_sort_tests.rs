@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use flint_core::settings::{ListSort, STATE_FILE};
 use flint_core::{Cell, Column, ColumnRole, ColumnType, KindId, KindSnapshot, Row, SyncState};
-use gpui_kit::TestAppContext;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
 use super::support_tests::{TestWorkspace, WAIT, objects, open_workspace, pods};
@@ -406,4 +406,74 @@ async fn sorting_by_header_never_matches_a_key(cx: &mut TestAppContext) {
         )
         .is_err()
     );
+}
+
+// covers UP-20, UP-21: rows sorted for a layout that changed meanwhile are never drawn under the
+// new header.
+#[gpui_kit::test]
+async fn rows_and_their_sort_arrow_always_agree(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(STATE_FILE),
+        "[list_sorts.alpha]\npods = { column = \"server:Node\" }\n",
+    )
+    .unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, super::support_tests::standard_sections())
+        .await;
+    t.open_kind(cx, "pods", pods_with_nodes()).await;
+    t.dispatch(cx, "resource_list::ToggleWide", Value::Null)
+        .unwrap();
+    let by_node = (
+        sorted("Node", false),
+        vec!["web".into(), "db".into(), "api".into()],
+    );
+    let default = (None, vec!["db".into(), "api".into(), "web".into()]);
+    expect_rows(cx, &t, by_node.clone()).await;
+
+    // A new snapshot is sorted by Node while the pane narrows and leaves Node out: the rows
+    // sorted for the old layout are dropped, not shown under the new header. Every state that
+    // shows the new snapshot, one task at a time, is one of the two.
+    let list = t.list(cx).unwrap();
+    let newer = Arc::new(KindSnapshot {
+        version: 2,
+        ..(*pods_with_nodes()).clone()
+    });
+    list.update(cx, |list, cx| list.set_snapshot(newer, cx));
+    cx.simulate_window_resize(
+        t.window,
+        gpui_kit::size(gpui_kit::px(560.), gpui_kit::px(700.)),
+    );
+    // The narrow layout is drawn (twice: the width is known after the first layout) before the
+    // sort started above finishes.
+    for _ in 0..2 {
+        cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+    assert_eq!(
+        list.read_with(cx, |list, _| list.shown().0.version),
+        1,
+        "the sort is still running"
+    );
+    let mut seen = Vec::new();
+    let state = |cx: &mut TestAppContext| {
+        list.read_with(cx, |list, _| {
+            let version = list.shown().0.version;
+            let state = list.view_state();
+            let rows: Vec<String> = state.rows.into_iter().map(|r| r.name).collect();
+            (version, (state.sort, rows))
+        })
+    };
+    while cx.executor().tick() {
+        let (version, state) = state(cx);
+        if version == 2 {
+            seen.push(state);
+        }
+    }
+    cx.run_until_parked();
+    expect_rows(cx, &t, default.clone()).await;
+    assert!(!seen.is_empty());
+    for state in &seen {
+        assert!(*state == by_node || *state == default, "drawn: {state:?}");
+    }
 }
