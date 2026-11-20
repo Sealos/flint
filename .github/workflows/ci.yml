@@ -146,12 +146,18 @@ jobs:
   # and docs (also with the test-only automation channel), and a release build that catches
   # profile-only problems (LTO, strip) before release-please does, and proves the automation
   # channel is not in it.
+  # Also runs the app e2e tests (docs/TESTING.md, "Running app e2e"): macOS runners are costly,
+  # so they share this job's build instead of getting their own. Read-only; the PR comment that
+  # links the screenshots is posted by the Linux job below.
   macos:
     name: macos (flint-app)
     runs-on: macos-latest
     timeout-minutes: 60
     env:
       RUSTDOCFLAGS: -D warnings
+    outputs:
+      screenshots-url: ${{ steps.screenshots.outputs.artifact-url }}
+      e2e: ${{ steps.e2e.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -169,6 +175,16 @@ jobs:
       # build is still checked by clippy above.
       - name: Tests (with the automation channel)
         run: cargo test -p flint-app --features automation --locked
+      # The step above built target/debug/flint with the automation channel (the `flint mcp`
+      # integration test needs the binary). Reuse it rather than building again, but check it.
+      - name: App binary has the automation channel
+        run: |
+          if ! strings -a target/debug/flint | grep -c 'automation\.sock' > /dev/null; then
+            echo "::error::target/debug/flint was not built with --features automation"
+            exit 1
+          fi
+          # What GPUI renders with here, for diagnosing a screenshot or window failure.
+          system_profiler SPDisplaysDataType || true
       - name: Docs
         run: cargo doc -p flint-app --no-deps --document-private-items --locked
       - name: Release build
@@ -181,4 +197,88 @@ jobs:
           if strings -a ./target/release/flint | grep -E 'automation\.sock|automation channel|flint::ui::automation'; then
             echo "::error::the release binary contains the automation channel"
             exit 1
+          fi
+      # The real app, driven over its automation socket, one test per user path, against the
+      # fake API server. Failures fail the job; the screenshots are only uploaded. Last, so a
+      # failure here does not hide the docs and release checks above. It needs only
+      # target/debug/flint, which the release build does not touch.
+      - name: App e2e
+        id: e2e
+        # A hung window or socket wait must not hold the runner for the job's full hour.
+        timeout-minutes: 15
+        env:
+          FLINT_E2E_APP_BIN: ${{ github.workspace }}/target/debug/flint
+          FLINT_AUTOMATION_SCREENSHOTS: ${{ runner.temp }}/e2e-shots
+        run: cargo test -p flint-e2e --test app --locked -- --ignored
+      - name: Upload app e2e screenshots
+        id: screenshots
+        if: always() && steps.e2e.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-e2e-screenshots-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-shots/*.png
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Posts (or updates) one comment on the PR linking the app e2e screenshots. A cheap Linux job,
+  # so the macOS job keeps read-only permissions. Same-repo PRs only: a fork's token cannot
+  # write, and its screenshots need no comment to be found on the run page.
+  app-e2e-comment:
+    name: app e2e screenshots comment
+    needs: macos
+    # Also when an earlier macOS step failed (the comment then says e2e did not run, so it never
+    # shows an older result). Not for Dependabot: its runs get a read-only token.
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' && needs.macos.result != 'skipped'
+    # One comment writer per PR at a time, so two pushes cannot both post. Queued, not cancelled.
+    concurrency:
+      group: app-e2e-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post or update the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          URL: ${{ needs.macos.outputs.screenshots-url }}
+          OUTCOME: ${{ needs.macos.outputs.e2e }}
+          RUN_ID: ${{ github.run_id }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker='<!-- flint-app-e2e-screenshots -->'
+          # A newer push owns the comment: an older run finishing late must not overwrite it.
+          head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          if [ "$head" != "$SHA" ]; then
+            echo "PR head is now ${head:0:7}; not commenting for ${SHA:0:7}"
+            exit 0
+          fi
+          # The job outputs come from a job that ran PR code; accept only the expected shapes.
+          case "$OUTCOME" in
+            success|failure|cancelled) result="\`$OUTCOME\`" ;;
+            *) result="not run (an earlier step of \`macos (flint-app)\` failed)" ;;
+          esac
+          if [[ "$URL" =~ ^https://github\.com/${REPO}/actions/runs/${RUN_ID}/artifacts/[0-9]+$ ]]; then
+            link="[Download the screenshots]($URL) (light and dark, one per key view)."
+          else
+            link="No screenshots were uploaded; see [the run]($RUN)."
+          fi
+          body="$marker
+          **App e2e** for ${SHA:0:7}: $result ([run]($RUN)).
+
+          $link E2e failures fail \`macos (flint-app)\`; the screenshots are for review."
+          ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
+          id=$(printf '%s\n' "$ids" | head -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body" > /dev/null
           fi

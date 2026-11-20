@@ -399,8 +399,12 @@ fn up_27_recover_from_a_broken_watch() -> Result<()> {
     // The connection drops and the server stays away: "reconnecting", never "live".
     fake.inject(Fault::drop_connection().on(&pods));
     fake.send_watch(&pods, WatchStep::Drop);
-    let state = app.wait_for("/list/sync", Equals("reconnecting".into()))?;
+    app.wait_for("/list/sync", Equals("reconnecting".into()))?;
+    // The banner follows the chip by a frame or so (it was missing on a slower CI runner), so
+    // wait for it rather than reading the same state.
+    let state = app.wait_for("/list/banners", Any(json!({"id": "list-banner"})))?;
     // The rows it had stay, under the "reconnecting" chip and a banner, not as live data.
+    assert_eq!(state["list"]["sync"], "reconnecting", "{}", state["list"]);
     assert!(!row(&state, "missed-1").is_null(), "{}", state["list"]);
     let banners = state["list"]["banners"].to_string();
     assert!(banners.contains("Reconnecting"), "{banners}");
