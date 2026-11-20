@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.1](https://github.com/Sealos/flint/compare/v0.2.0...v0.2.1) (2026-11-20)
+
+
+### Features
+
+* **app:** command palette and standard macOS menus as registry actions ([#220](https://github.com/Sealos/flint/issues/220)) ([8eea2ba](https://github.com/Sealos/flint/commit/8eea2ba6424fb965bd3afef9f884a27feae54828))
+* **app:** protect clusters by default and gate exec ([#234](https://github.com/Sealos/flint/issues/234)) ([f62a2a8](https://github.com/Sealos/flint/commit/f62a2a87d182cc8abb348fd9050c2b56f6dafed5))
+* **app:** remember each list's sort per cluster and kind ([#237](https://github.com/Sealos/flint/issues/237)) ([e853061](https://github.com/Sealos/flint/commit/e853061e64532f12c4cacb1ac728c8350e340a57))
+* **cli:** list commands and environment variables in --help, quiet logs by default ([#230](https://github.com/Sealos/flint/issues/230)) ([a1fb27b](https://github.com/Sealos/flint/commit/a1fb27bc0521fe94f62f76551a0c676bc5cdffb6))
+* **mcp:** redact credentials in pod logs and events served to agents ([#221](https://github.com/Sealos/flint/issues/221)) ([0a69419](https://github.com/Sealos/flint/commit/0a694192d3e92ef2d86e27ff80e27dcae94d70c0))
+* **release:** ship Flint.app in a DMG with each release ([#193](https://github.com/Sealos/flint/issues/193)) ([85996d7](https://github.com/Sealos/flint/commit/85996d763933e7da03ceec9f4202e51bbfc15505))
+* **site:** switch the app icon to the flat faceted stone ([#233](https://github.com/Sealos/flint/issues/233)) ([dfe2adf](https://github.com/Sealos/flint/commit/dfe2adf57d67c89613c77ea6f818106014689e5e))
+
+
+### Bug Fixes
+
+* **app:** close the dock tab on Cmd-W, and ask before closing or quitting while sessions run ([#206](https://github.com/Sealos/flint/issues/206)) ([b6717e2](https://github.com/Sealos/flint/commit/b6717e2ee9771e8214601ac6001201cb234fe8c3))
+* **app:** palette context matching, popups and live choices ([#225](https://github.com/Sealos/flint/issues/225)) ([288f3fb](https://github.com/Sealos/flint/commit/288f3fbce2c7db2e48ed3ab3a96ba5d6b2799112))
+* **app:** release a closed view's focused text field ([#176](https://github.com/Sealos/flint/issues/176)) ([2e121f9](https://github.com/Sealos/flint/commit/2e121f92cf0fcb35a87090ed90ce56e8837cb47a))
+* **e2e:** count only requests on connections opened after the app launched ([#242](https://github.com/Sealos/flint/issues/242)) ([c34ab39](https://github.com/Sealos/flint/commit/c34ab39c1988662c7cf63ed036f7bc2244493c6e))
+* **mcp:** close credential redaction gaps from [#224](https://github.com/Sealos/flint/issues/224) ([#235](https://github.com/Sealos/flint/issues/235)) ([15daf11](https://github.com/Sealos/flint/commit/15daf1127566a32c130d27383750b0e0aa36b241))
+* **mcp:** close redaction gaps in dsn delimiters, set-cookie arrays and single-quoted cookies ([#240](https://github.com/Sealos/flint/issues/240)) ([84eb3e1](https://github.com/Sealos/flint/commit/84eb3e1b2cb25e74c9ddaa94e5fe7dc608964d2d))
+* **mcp:** refuse names that are not single path segments, and redact secret lists without item kinds ([#243](https://github.com/Sealos/flint/issues/243)) ([dd6b6cc](https://github.com/Sealos/flint/commit/dd6b6cc2a6ad48cbed45ba5ff8385f1dea90bb40))
+
 ## [0.2.0](https://github.com/Sealos/flint/compare/v0.1.1...v0.2.0) (2026-11-20)
 
 
