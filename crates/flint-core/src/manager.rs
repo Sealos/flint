@@ -605,11 +605,13 @@ impl ClusterManager {
         let saved = self.set_pin(Pins::Trust, cluster.clone(), server).await;
         if trusting {
             self.unlocks.trust_written(&cluster, request, saved);
-            if saved {
-                // The settings may be unchanged (the same pin again): say it anyway, so the
-                // front end shows the trust that counts again.
-                self.emit_settings();
-            }
+        } else if saved {
+            self.unlocks.trust_removed(&cluster, request);
+        }
+        if saved {
+            // The settings may be unchanged (the same pin again, or none to remove): say it
+            // anyway, so the front end shows the protection that holds now.
+            self.emit_settings();
         }
     }
 
@@ -700,11 +702,6 @@ impl ClusterManager {
                 (kept, Some(e))
             }
         };
-        // Revocations whose write landed are done with: judged only on settings that were read
-        // or written, never on the fallback, whose missing pins prove nothing.
-        if error.is_none() {
-            self.unlocks.settle(&settings);
-        }
         if *self.settings == settings && self.settings_error == error {
             return;
         }
@@ -1699,6 +1696,13 @@ mod tests {
         Break,
         /// settings.toml is put back as it was before [`Step::Break`] and reloaded.
         Fix,
+        /// A reload catches settings.toml empty (an editor truncating it before writing),
+        /// then reads it whole again.
+        Blank,
+        /// Unlock for this session, at the context's server.
+        Unlock,
+        /// Lock Again.
+        Lock,
         /// What the gate does now: `true` lets a new shell through.
         Allows(bool),
     }
@@ -1847,6 +1851,48 @@ mod tests {
                 "the file breaks between a trust and its write",
                 &[Trust, Break, Allows(false), Fail(0), Fix, Allows(false)],
             ),
+            (
+                "lock again while a trust is being written",
+                &[
+                    Unlock,
+                    Allows(true),
+                    Trust,
+                    Lock,
+                    Allows(false),
+                    Write(0),
+                    Allows(false),
+                ],
+            ),
+            (
+                "lock again then trust again",
+                &[
+                    Unlock,
+                    Trust,
+                    Lock,
+                    Trust,
+                    Write(0),
+                    Allows(false),
+                    Write(1),
+                    Allows(true),
+                ],
+            ),
+            (
+                "a blank read while a stop is not written",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Blank,
+                    Allows(false),
+                    Fail(1),
+                    Blank,
+                    Allows(false),
+                ],
+            ),
+            (
+                "a blank read after the stop is written",
+                &[Trust, Write(0), Stop, Write(1), Blank, Allows(false)],
+            ),
         ];
         for (name, steps) in cases {
             let dir = tempfile::tempdir().unwrap();
@@ -1897,6 +1943,17 @@ mod tests {
                             std::fs::write(&file, text).unwrap();
                         }
                         manager.reload_settings().await;
+                    }
+                    Blank => {
+                        let text = std::fs::read_to_string(&file).unwrap_or_default();
+                        std::fs::write(&file, "").unwrap();
+                        manager.reload_settings().await;
+                        std::fs::write(&file, text).unwrap();
+                        manager.reload_settings().await;
+                    }
+                    Unlock => unlocks.unlock("dev", "https://dev"),
+                    Lock => {
+                        unlocks.lock("dev");
                     }
                     Allows(wanted) => {
                         let allows = !matches!(

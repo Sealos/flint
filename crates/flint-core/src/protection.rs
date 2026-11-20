@@ -122,10 +122,10 @@ struct Unlocks {
 struct TrustRequests {
     /// The number of the newest request, Trust or Stop Trusting.
     latest: u64,
-    /// The Stop Trusting in force: the context's trust in `settings` does not count while it
-    /// is set. Set by Stop Trusting at once; cleared only by a Trust whose pin was saved and
-    /// that is still the newest request, or by settings that no longer hold a pin when no
-    /// Trust made before the Stop Trusting can still write one.
+    /// The revocation in force: the context's trust in `settings` does not count while it is
+    /// set. Set at once by Stop Trusting, and by Lock Again while a Trust is in flight; cleared
+    /// only by a Trust whose pin was saved and that is still the newest request, or by the
+    /// written removal of that same Stop Trusting when no older Trust can still write a pin.
     revoked_at: Option<u64>,
     /// Trust requests whose write has not finished.
     in_flight: BTreeSet<u64>,
@@ -140,12 +140,23 @@ impl SessionUnlocks {
         pins.insert(ClusterPin::new(context, server));
     }
 
-    /// Locks `context` again (Lock Again). Returns whether it was unlocked.
+    /// Locks `context` again (Lock Again). Returns whether it was unlocked. A Trust still
+    /// being written does not undo it: it counts as a newer request, and if a Trust is in
+    /// flight, its pin is revoked from now on, until the user trusts or stops trusting again.
     pub fn lock(&self, context: &str) -> bool {
-        let pins = &mut self.set().pins;
-        let before = pins.len();
-        pins.retain(|p| p.context != context);
-        pins.len() != before
+        let mut set = self.set();
+        let before = set.pins.len();
+        set.pins.retain(|p| p.context != context);
+        let was_unlocked = set.pins.len() != before;
+        set.generation += 1;
+        let generation = set.generation;
+        if let Some(requests) = set.trust.get_mut(context) {
+            requests.latest = generation;
+            if !requests.in_flight.is_empty() {
+                requests.revoked_at = Some(generation);
+            }
+        }
+        was_unlocked
     }
 
     /// Whether `context` is unlocked at `server`.
@@ -202,23 +213,18 @@ impl SessionUnlocks {
             .is_some_and(|r| r.revoked_at.is_some())
     }
 
-    /// Forgets the revocations `settings` (read or written, never a fallback) no longer need:
-    /// those of contexts it holds no pin for, when no Trust made before the revocation can
-    /// still write one. A revocation whose write failed stays, so the cluster stays
-    /// protected.
-    pub fn settle(&self, settings: &Settings) {
-        for (context, requests) in &mut self.set().trust {
-            let Some(revoked_at) = requests.revoked_at else {
-                continue;
-            };
-            let pinned = settings
-                .trusted_clusters
-                .iter()
-                .any(|p| &p.context == context);
-            let older_trust_pending = requests.in_flight.iter().any(|g| *g < revoked_at);
-            if !pinned && !older_trust_pending {
-                requests.revoked_at = None;
-            }
+    /// The write of Stop Trusting request `generation` for `context` removed its pin from
+    /// `settings.toml`. That ends the revocation if it is still the one in force and no Trust
+    /// made before it can still write a pin. Only the core's own write proves the pin is gone:
+    /// a reload that finds no pin (a file caught half-written, or replaced) proves nothing.
+    pub fn trust_removed(&self, context: &str, generation: u64) {
+        let mut set = self.set();
+        let Some(requests) = set.trust.get_mut(context) else {
+            return;
+        };
+        let older_trust_pending = requests.in_flight.iter().any(|g| *g < generation);
+        if requests.revoked_at == Some(generation) && !older_trust_pending {
+            requests.revoked_at = None;
         }
     }
 
@@ -360,8 +366,8 @@ mod tests {
     }
 
     // covers UP-55: Stop Trusting protects the cluster at once, before settings.toml is
-    // written; the revocation goes once the settings no longer trust it, and trusting again
-    // restores it.
+    // written; the revocation goes once its own removal is written, and trusting again
+    // (once saved) restores it.
     #[test]
     fn a_revoked_trust_stops_counting_at_once() {
         let unlocks = SessionUnlocks::default();
@@ -379,13 +385,17 @@ mod tests {
             Protection::Protected,
             "and the unlock went too"
         );
-        // An unrelated reload that still trusts it keeps the revocation.
-        unlocks.settle(&settings);
-        assert!(unlocks.trust_revoked("prod"));
-        assert_eq!(of(&settings), Protection::Protected);
-        // The write landed: nothing to revoke any more, and a trust added by hand counts.
+        // Settings without the pin prove nothing (a file caught half-written): only the
+        // removal written for this very Stop Trusting ends the revocation.
         settings.trusted_clusters.clear();
-        unlocks.settle(&settings);
+        assert!(unlocks.trust_revoked("prod"));
+        let stop = unlocks.revoke_trust("prod");
+        unlocks.trust_removed("prod", stop - 1);
+        assert!(
+            unlocks.trust_revoked("prod"),
+            "an older removal does not count"
+        );
+        unlocks.trust_removed("prod", stop);
         assert!(!unlocks.trust_revoked("prod"));
         settings
             .trusted_clusters

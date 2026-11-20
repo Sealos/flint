@@ -186,10 +186,12 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   unlocks are shared between the front end and the core (`CoreHandle::unlock`, `lock`, `unlocks`), so an unlock
   takes effect before the next action is asked for. Stop Trusting (`CoreHandle::untrust`) revokes the trust in that
   shared state at once, before `Command::SetTrusted` writes the file, since commands and the gate's requests take
-  separate queues. The revocation is dropped only when settings that were read or written (never the fallback for
-  a broken file) no longer hold a pin for the context, or once a new trust for the confirmed server is checked and
-  saved; a failed write leaves the cluster protected, and the lock menu offers the removal again while a pin is on
-  disk. Trust goes through
+  separate queues. Every Trust and Stop Trusting request is numbered when it is made, in that shared state: a Trust's
+  write lifts a revocation only if its pin was saved and it is still the newest request, and a revocation ends
+  otherwise only when the core's own write of that Stop Trusting removed the pin and no older Trust can still write
+  one (a reload that finds no pin, such as a file caught half-written, proves nothing). Lock Again also counts as a
+  newer request, and revokes a Trust still being written. A failed write leaves the cluster protected, and the lock
+  menu offers the removal again while a pin is on disk. Trust goes through
   `Command::SetTrusted`, which, like exposure, writes nothing if the context moved since the user confirmed. `flint mcp` stays read-only either way.
 - **In the app.** The sidebar shows a lock button per cluster (`lock-<context>`): a closed lock while protected, an
   open one (in the warning tone) while unlocked, a shield while trusted, nothing for a cluster on this machine. Its
