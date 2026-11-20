@@ -815,12 +815,12 @@ pub fn on_click<E: ?Sized, A: Action>(action: A) -> impl Fn(&E, &mut Window, &mu
 /// be older than the click (a menu left open), so the user learns why nothing happened.
 pub fn on_click_or<E: ?Sized>(
     action: Box<dyn Action>,
-    refused: impl Fn(&ActionError, &mut App) + 'static,
+    refused: impl Fn(&dyn Action, &ActionError, &mut App) + 'static,
 ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     move |_, window, cx| {
         if let Err(e) = perform(&*action, window, cx) {
             tracing::warn!("{e}");
-            refused(&e, cx);
+            refused(&*action, &e, cx);
         }
     }
 }

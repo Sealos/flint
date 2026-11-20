@@ -194,8 +194,9 @@ pub struct Workspace {
     /// Open the next detail view's pod logs (`FLINT_VIEW=…#logs`).
     startup_logs: bool,
     /// Why the last Logs or Shell did not open, shown over the dock until the next one does,
-    /// or another row is selected.
+    /// the selection, list or cluster changes, or [`ACTION_ERROR_SHOWN`] has passed.
     action_error: Option<String>,
+    _action_error: Task<()>,
     /// The last write of `state.toml`; the next one waits for it, so writes land in order.
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
@@ -306,6 +307,7 @@ impl Workspace {
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
+            _action_error: Task::ready(()),
             startup_view,
             saving: None,
             _save_panes: Task::ready(()),
@@ -446,28 +448,61 @@ impl Workspace {
             self.refuse(format!("Logs: {reason}"), cx);
             return;
         }
-        self.action_error = None;
         let core = self.model.read(cx).core().clone();
+        self.open_tab(
+            TabKey::Logs(request.clone()),
+            |window, cx| DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx))),
+            focus,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens (or shows) a dock tab. With `focus` it takes focus. Without, focus stays where it
+    /// is; and if that is in the dock, the tab the user is in stays shown and the new one opens
+    /// behind it, so focus is never left in a tab that is not drawn.
+    fn open_tab(
+        &mut self,
+        key: TabKey,
+        build: impl FnOnce(&mut Window, &mut Context<Dock>) -> DockTab,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_action_error(cx);
         let kept = (!focus).then(|| window.focused(cx)).flatten();
+        let in_dock = kept.is_some() && self.dock.read(cx).has_focus(window, cx);
         self.dock.update(cx, |dock, cx| {
-            dock.open(
-                TabKey::Logs(request.clone()),
-                |window, cx| DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx))),
-                window,
-                cx,
-            )
+            if in_dock {
+                dock.add(key, build, window, cx)
+            } else {
+                dock.open(key, build, window, cx)
+            }
         });
-        if let Some(kept) = kept {
+        if let Some(kept) = kept.filter(|_| !in_dock) {
             window.focus(&kept, cx);
         }
         cx.notify();
     }
 
-    /// Says why Logs or Shell did not open, over the dock.
+    /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
     pub(in crate::ui) fn refuse(&mut self, why: String, cx: &mut Context<Self>) {
         tracing::warn!("{why}");
         self.action_error = Some(why);
+        let timer = cx.background_executor().timer(ACTION_ERROR_SHOWN);
+        self._action_error = cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |ws, cx| ws.clear_action_error(cx));
+        });
         cx.notify();
+    }
+
+    /// Takes the reason a Logs or Shell did not open away: it no longer applies.
+    fn clear_action_error(&mut self, cx: &mut Context<Self>) {
+        if self.action_error.take().is_some() {
+            self._action_error = Task::ready(());
+            cx.notify();
+        }
     }
 
     /// Why the last Logs or Shell did not open, while it is shown.
@@ -490,28 +525,21 @@ impl Workspace {
             self.refuse(format!("Shell: {reason}"), cx);
             return;
         }
-        self.action_error = None;
-        let kept = (!focus).then(|| window.focused(cx)).flatten();
         let core = self.model.read(cx).core().clone();
         let key = TabKey::Shell(ShellKey {
             request: request.clone(),
             ended: None,
         });
-        self.dock.update(cx, |dock, cx| {
-            dock.open(
-                key,
-                |window, cx| {
-                    let session = core.exec(request.exec_request(Default::default()));
-                    DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
-                },
-                window,
-                cx,
-            )
-        });
-        if let Some(kept) = kept {
-            window.focus(&kept, cx);
-        }
-        cx.notify();
+        self.open_tab(
+            key,
+            |window, cx| {
+                let session = core.exec(request.exec_request(Default::default()));
+                DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
+            },
+            focus,
+            window,
+            cx,
+        );
     }
 
     /// Brings the navigation and main area in line with the model: the active cluster and its
@@ -532,7 +560,7 @@ impl Workspace {
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
             self.cluster = active.clone();
-            self.close_list();
+            self.close_list(cx);
             self.namespaces.clear();
             self.namespaces_state = SyncState::Idle;
             self._namespaces = match &active {
@@ -632,7 +660,9 @@ impl Workspace {
         })
     }
 
-    fn close_list(&mut self) {
+    fn close_list(&mut self, cx: &mut Context<Self>) {
+        // Another kind, list or cluster: a reason given for the rows left no longer applies.
+        self.clear_action_error(cx);
         self.list = None;
         self.detail = None;
         self._list_subscriptions.clear();
@@ -650,7 +680,7 @@ impl Workspace {
         {
             return;
         }
-        self.close_list();
+        self.close_list(cx);
         let core = self.model.read(cx).core().clone();
         let namespaces = self.ui_state.namespace_filter(&cluster).to_vec();
         let list =
@@ -680,6 +710,7 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
+                self.clear_action_error(cx);
                 self.detail = None;
                 self._detail_subscriptions.clear();
                 let focus = list.read(cx).focus_handle().clone();
@@ -711,7 +742,7 @@ impl Workspace {
                         .map_or(DetailTab::Overview, |d| d.read(cx).tab())
                 };
                 // A reason given for the row left no longer applies.
-                self.action_error = None;
+                self.clear_action_error(cx);
                 let core = self.model.read(cx).core().clone();
                 let startup_logs = std::mem::take(&mut self.startup_logs);
                 let detail = cx.new(|cx| {
@@ -1793,6 +1824,10 @@ impl Render for Workspace {
             )
     }
 }
+
+/// How long the reason a Logs or Shell did not open stays shown.
+pub(in crate::ui) const ACTION_ERROR_SHOWN: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 /// Whether a tab opened for a detail action takes focus (see [`TakeFocus`]).
 fn takes_focus(focus: &TakeFocus, window: &Window, cx: &App) -> bool {

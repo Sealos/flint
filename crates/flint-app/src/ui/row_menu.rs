@@ -98,8 +98,9 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
         detail.update(cx, |detail, cx| detail.ensure_pods_listed(cx));
         let shown = Rc::new(RefCell::new(row_actions(ws.read(cx), cx)));
         // Built again whenever what it shows changes while it is open (the object or the pods
-        // arrived, the cluster disconnected, another row got selected). Detached: each holds
-        // the menu and the workspace weakly, and ends with the menu.
+        // arrived, the cluster disconnected, another row got selected). gpui-component keeps a
+        // dismissed menu until the row's next right-click, so the observers are dropped when
+        // the menu is dismissed, not when it goes.
         let rebuild = {
             let workspace = workspace.clone();
             let shown = shown.clone();
@@ -112,6 +113,8 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
                     return;
                 }
                 *shown.borrow_mut() = now.clone();
+                #[cfg(test)]
+                tests::REBUILDS.with(|n| n.set(n.get() + 1));
                 let workspace = workspace.clone();
                 menu.rebuild(window, cx, move |menu, window, cx| {
                     fill(menu, now.clone(), &workspace, window, cx)
@@ -119,14 +122,18 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
             }
         };
         let on_detail = rebuild.clone();
-        cx.observe_in(&detail, window, move |menu, _, window, cx| {
-            on_detail(menu, window, cx)
-        })
-        .detach();
-        cx.observe_in(&ws, window, move |menu, _, window, cx| {
-            rebuild(menu, window, cx)
-        })
-        .detach();
+        let observers = vec![
+            cx.observe_in(&detail, window, move |menu, _, window, cx| {
+                on_detail(menu, window, cx)
+            }),
+            cx.observe_in(&ws, window, move |menu, _, window, cx| {
+                rebuild(menu, window, cx)
+            }),
+        ];
+        let observers = RefCell::new(observers);
+        // Holds the menu weakly and ends with it.
+        cx.subscribe_self(move |_, _: &DismissEvent, _| observers.borrow_mut().clear())
+            .detach();
         let now = shown.borrow().clone();
         fill(menu, now, &workspace, window, cx)
     })
@@ -210,9 +217,50 @@ fn entry(
 /// that no longer runs, and it says why, as the keys do.
 fn refuse_in(
     workspace: &WeakEntity<Workspace>,
-) -> impl Fn(&registry::ActionError, &mut App) + 'static {
+) -> impl Fn(&dyn Action, &registry::ActionError, &mut App) + 'static {
     let workspace = workspace.clone();
-    move |e, cx| {
-        let _ = workspace.update(cx, |ws, cx| ws.refuse(reason(e), cx));
+    move |action, e, cx| {
+        let _ = workspace.update(cx, |ws, cx| {
+            let why = refusal(ws, action, e, cx);
+            ws.refuse(why, cx)
+        });
+    }
+}
+
+/// Why `action`, chosen in a row's menu, was refused, in the user's words: an action that is
+/// not available says why from what the row's actions are now, never by its internal name.
+pub(in crate::ui) fn refusal(
+    ws: &Workspace,
+    action: &dyn Action,
+    error: &registry::ActionError,
+    cx: &App,
+) -> String {
+    let registry::ActionError::NotAvailable(_) = error else {
+        return reason(error);
+    };
+    let label = registry::spec_of(action).map_or("This action", |spec| spec.label);
+    let why = row_actions(ws, cx).and_then(|a| {
+        let can = if action.as_any().is::<OpenLogs>() {
+            a.logs
+        } else if action.as_any().is::<OpenPreviousLogs>() {
+            a.previous?
+        } else {
+            a.shell
+        };
+        can.err()
+    });
+    match why {
+        Some(why) => format!("{label}: {why}"),
+        None => format!("{label} cannot run now"),
+    }
+}
+
+#[cfg(test)]
+pub(in crate::ui) mod tests {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many times an open menu was built again, on this test's thread.
+        pub static REBUILDS: Cell<usize> = const { Cell::new(0) };
     }
 }

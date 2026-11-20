@@ -35,9 +35,15 @@ pub(in crate::ui) enum Pods {
     Failed(String),
 }
 
+/// How soon after the workload changed its pods are listed again, at most once in this time
+/// however often it changes (a rollout updates it many times a second).
+pub(in crate::ui) const RELIST_DELAY: Duration = Duration::from_secs(2);
+
 /// The pod list running.
 pub(super) struct Listing {
     pub freshness: Freshness,
+    /// [`DetailView::pods_generation`] when it started.
+    pub generation: u64,
     pub _task: Task<()>,
 }
 
@@ -72,6 +78,31 @@ impl DetailView {
             timer.await;
             let _ = this.update(cx, |view, cx| view.ensure_pods_listed(cx));
         });
+    }
+
+    /// The workload changed: the pods listed (or the failed list) are stale, and are listed
+    /// again soon.
+    pub(super) fn pods_changed(&mut self, cx: &mut Context<Self>) {
+        self.pods_generation += 1;
+        if !matches!(self.pods, Pods::NotListed) {
+            self.pods_stale = true;
+            self.relist_soon(cx);
+        }
+    }
+
+    /// Lists the stale pods once [`RELIST_DELAY`] has passed, unless that is already due.
+    fn relist_soon(&mut self, cx: &mut Context<Self>) {
+        if self._relist.is_some() {
+            return;
+        }
+        let timer = cx.background_executor().timer(RELIST_DELAY);
+        self._relist = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |view, cx| {
+                view._relist = None;
+                view.ensure_pods_listed(cx);
+            });
+        }));
     }
 
     /// Lists the workload's pods for showing if they are not at hand, failed, or were listed
@@ -121,6 +152,7 @@ impl DetailView {
         });
         self.listing = Some(Listing {
             freshness,
+            generation: self.pods_generation,
             _task: task,
         });
         cx.notify();
@@ -134,12 +166,20 @@ impl DetailView {
         listed: Result<Vec<WorkloadPod>, String>,
         cx: &mut Context<Self>,
     ) {
-        self.listing = None;
-        self.pods_stale = false;
+        let started = self.listing.take().map(|l| l.generation);
         self.pods = match listed {
             Ok(pods) => Pods::Listed(pods.into()),
             Err(error) => Pods::Failed(error),
         };
+        // One that ran while the workload changed is out of date: listed again soon. A failed
+        // one is stale too, so Shell still runs (listing them itself), but is retried only on
+        // the next change, menu or Shell, not on a timer, which a lasting error (RBAC) would
+        // turn into polling.
+        let changed = started != Some(self.pods_generation);
+        self.pods_stale = changed || matches!(self.pods, Pods::Failed(_));
+        if changed {
+            self.relist_soon(cx);
+        }
         if freshness == Freshness::Current {
             self.run_pending_listed(cx);
         }

@@ -297,11 +297,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   workload's logs of all pods (UP-45) and a shell in its first ready pod, with a container picker when the pod has
   several. Each opens its dock tab, or shows the one already open. A workload's shell opens in a pod listed when I
   ask, never in one listed earlier. Chosen before the row's pod has loaded, an entry waits for it, says so, and gives
-  up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile. What does not apply is
-  disabled, with the reason under it in the menu and on the pane's button: a pod that never restarted (Previous
-  Logs), a workload with no ready pod or whose pods could not be listed, a pod that finished or is being deleted, a
-  pod or workload that was deleted (Shell), or a cluster that is not connected. An action that cannot run anyway (a
-  key, or a wait that ended badly) says why over the dock.
+  up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile, nor hide the dock tab I
+  am typing in. What does not apply is disabled, with the reason under it in the menu and on the pane's button: a pod
+  that never restarted (Previous Logs), a workload with no ready pod (as last listed, until it changes), a pod that
+  finished or is being deleted, a pod or workload that was deleted (Shell), or a cluster that is not connected. An
+  action that cannot run anyway (a key, or a wait that ended badly) says why over the dock, until the next one opens,
+  I select something else, or ten seconds pass.
 - Tests: unit, cluster, ui.
 
 ---

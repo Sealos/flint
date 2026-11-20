@@ -320,16 +320,22 @@ Logs opens the workload session (all pods, prefixed) and Shell opens in its firs
 
 - **Workload pods** (`ui/detail_pods.rs`, `CoreHandle::workload_pods`): never listed on each update of the workload.
   A cached list (`resourceVersion=0`) shows which pod a shell would open in: a moment after the row is selected (so
-  key repeat through a list starts no request per row), and when its menu opens if the list is missing, failed or
-  older than the workload. Shell itself always runs a quorum list and opens in a pod of that list; a list that fails
-  then refuses Shell with its error, never falling back on an older list. One list runs at a time per pane (asking
-  again joins it). The selector comes from the fetched workload when it has one. Dropping the pane drops the request,
-  and dropping the core's future aborts its task.
+  key repeat through a list starts no request per row), when its menu opens if the list is missing, failed or
+  older than the workload, and 2 seconds after the workload changes (once however often it changes; a list that ran
+  across a change counts as older). A failed list is not retried on a timer, so a lasting error does not poll. A list
+  that is stale or failed decides nothing: Shell stays enabled, as it is when nothing is listed yet. Shell itself
+  always runs a quorum list and opens in a pod of that list; a list that fails then refuses Shell with its error,
+  never falling back on an older list. One list runs at a time per pane (asking again joins it). The selector comes
+  from the fetched workload when it has one. Dropping the pane drops the request, and dropping the core's future
+  aborts its task.
 - **Waiting.** Asked for before the pod (or the pods) has loaded, an action waits, shown in the pane, for 30 seconds
-  at most, then gives up saying so. A tab opened late takes focus only if focus has not moved since the ask. The open
-  menu is rebuilt whenever what it shows changes.
+  at most, then gives up saying so; a Shell that gives up drops its pod list, so the next one starts its own. A tab
+  opened late takes focus only if focus has not moved since the ask (one asked for at startup, `FLINT_VIEW=…#logs`,
+  always does); if focus is in another dock tab, the new tab opens behind it (`Dock::add`). The open menu is rebuilt
+  whenever what it shows changes, until it is dismissed.
 - **Refusals.** An action refused, at once or after waiting, says why in a strip over the dock (`action-error`),
-  cleared by the next tab opened or another row selected. Shell is refused for a deleted pod or workload and for a pod
+  cleared by the next tab opened, a change of selection, list or cluster, or after 10 seconds. A menu entry refused as
+  not available says why from the row's actions, never by the action's internal name. Shell is refused for a deleted pod or workload and for a pod
   that finished (`Succeeded`, `Failed`) or is being deleted. While the row's cluster is not connected every entry is
   disabled and the menu says why with core's summary of the error (`ClusterError::summary`); an action's
   own reason (a refused pod list, say) is cut to one short line.

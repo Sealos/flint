@@ -141,8 +141,9 @@ pub(in crate::ui) const PENDING_TIMEOUT: std::time::Duration = std::time::Durati
 /// An action waiting for what it needs.
 pub(in crate::ui) struct Waiting {
     pub action: Pending,
-    /// What had focus when it was asked for (see [`TakeFocus::IfStill`]).
-    pub focus: Option<FocusHandle>,
+    /// Whether its tab takes focus when it opens: for an ask from the user, only if focus
+    /// is still where it was then ([`TakeFocus::IfStill`]).
+    pub focus: TakeFocus,
     /// Gives up after [`PENDING_TIMEOUT`].
     pub _timeout: Task<()>,
 }
@@ -173,8 +174,13 @@ pub struct DetailView {
     show_managed_fields: bool,
     /// A workload's pods, for Shell ([`pods`]).
     pods: Pods,
-    /// The workload changed since its pods were listed.
+    /// The workload changed since its pods were listed (or the list failed): what they show
+    /// is not to be trusted, and they are listed again soon.
     pods_stale: bool,
+    /// Counts the workload's changes, so a list that ran across one stays stale.
+    pods_generation: u64,
+    /// A list of the stale pods is due ([`pods::RELIST_DELAY`]).
+    _relist: Option<Task<()>>,
     /// The pod list running.
     listing: Option<pods::Listing>,
     /// A current pod list was asked for while a cached one ran: it starts when that one ends.
@@ -221,6 +227,8 @@ impl DetailView {
             show_managed_fields: false,
             pods: Pods::NotListed,
             pods_stale: false,
+            pods_generation: 0,
+            _relist: None,
             listing: None,
             current_wanted: false,
             pending: None,
@@ -243,7 +251,8 @@ impl DetailView {
 
     /// Opens the logs once the object is fetched, as Logs would (`FLINT_VIEW=…#logs`).
     pub fn open_logs_when_loaded(&mut self, cx: &mut Context<Self>) {
-        self.wait_for(Pending::Logs { previous: false }, None, cx);
+        // Asked for at startup, not by a key: the tab takes focus when it opens.
+        self.wait_for(Pending::Logs { previous: false }, TakeFocus::Yes, cx);
     }
 
     /// What Logs and Shell act on.
@@ -253,11 +262,9 @@ impl DetailView {
 
     /// Fetches the object again. Calls while a fetch runs coalesce into one more fetch.
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The workload changed: the pods listed may be out of date. They are listed again when
-        // needed, not now (see `pods`).
-        if matches!(self.pods, Pods::Listed(_)) {
-            self.pods_stale = true;
-        }
+        // The workload changed: the pods listed may be out of date. They are listed again
+        // soon, at most once per `pods::RELIST_DELAY` (see `pods`).
+        self.pods_changed(cx);
         if self.fetching {
             self.refetch = true;
             return;
@@ -571,9 +578,14 @@ impl DetailView {
                 "Open a shell in {} in the dock ({keys})",
                 shell.pod
             )),
-            (None, Subject::Workload(_)) => {
-                button.tooltip(format!("Open a shell in a ready pod in the dock ({keys})"))
-            }
+            (None, Subject::Workload(_)) => match &self.pods {
+                // Shell lists them again, but the user should know why no pod is named.
+                Pods::Failed(e) => button.tooltip(format!(
+                    "Open a shell in a ready pod in the dock ({keys}). Listing the pods \
+                     failed: {e}"
+                )),
+                _ => button.tooltip(format!("Open a shell in a ready pod in the dock ({keys})")),
+            },
             // A pod still loading: Shell waits for it.
             _ => button.tooltip(format!("Open a shell in the dock ({keys})")),
         };
@@ -1199,6 +1211,8 @@ mod pods;
 
 pub(in crate::ui) use actions::reason;
 pub(in crate::ui) use pods::Pods;
+#[cfg(test)]
+pub(in crate::ui) use pods::RELIST_DELAY;
 #[cfg(test)]
 pub(in crate::ui) use pods::SHOW_DELAY as SHOW_PODS_DELAY;
 #[cfg(test)]

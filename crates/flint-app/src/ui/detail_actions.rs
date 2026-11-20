@@ -132,7 +132,7 @@ impl DetailView {
                     (&action, self.subject),
                     (Pending::Shell { .. }, Subject::Workload(_))
                 );
-                self.wait_for(action, window.focused(cx), cx);
+                self.wait_for(action, TakeFocus::IfStill(window.focused(cx)), cx);
                 // Where focus settles once this ask is handled (a menu the ask came from gives
                 // focus back as it closes) is what must still have it when the wait ends.
                 let this = cx.weak_entity();
@@ -140,7 +140,7 @@ impl DetailView {
                     let focus = window.focused(cx);
                     let _ = this.update(cx, |view, _| {
                         if let Some(waiting) = &mut view.pending {
-                            waiting.focus = focus;
+                            waiting.focus = TakeFocus::IfStill(focus);
                         }
                     });
                 });
@@ -157,12 +157,7 @@ impl DetailView {
     }
 
     /// Waits to run `action` until what it needs has loaded, for [`PENDING_TIMEOUT`] at most.
-    pub(super) fn wait_for(
-        &mut self,
-        action: Pending,
-        focus: Option<FocusHandle>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn wait_for(&mut self, action: Pending, focus: TakeFocus, cx: &mut Context<Self>) {
         let timer = cx.background_executor().timer(PENDING_TIMEOUT);
         // Replacing the wait drops this task, so it only ever ends its own wait.
         let timeout = cx.spawn(async move |this, cx| {
@@ -180,6 +175,11 @@ impl DetailView {
         let Some(waiting) = self.pending.take() else {
             return;
         };
+        // A list that hangs must not hold the next Shell: it starts its own.
+        if let (Pending::Shell { .. }, Subject::Workload(_)) = (&waiting.action, self.subject) {
+            self.listing = None;
+            self.current_wanted = false;
+        }
         let what = self.waiting_for(&waiting.action);
         let seconds = PENDING_TIMEOUT.as_secs();
         cx.emit(DetailEvent::Refused(format!(
@@ -238,7 +238,7 @@ impl DetailView {
             Ok(Plan::Wait) => {}
             Ok(Plan::Open(opened)) => {
                 let waiting = self.pending.take().expect("checked above");
-                cx.emit(opened.event(TakeFocus::IfStill(waiting.focus)));
+                cx.emit(opened.event(waiting.focus));
             }
             Err(e) => {
                 self.pending = None;
@@ -317,8 +317,10 @@ impl DetailView {
                     default,
                 })
             }
+            // Listed before the workload changed, a pod named could be gone: none is named
+            // until they are listed again.
             Subject::Workload(_) => match &self.pods {
-                Pods::Listed(pods) => shell_pod_of(pods),
+                Pods::Listed(pods) if !self.pods_stale => shell_pod_of(pods),
                 _ => None,
             },
             Subject::Other => None,
@@ -358,11 +360,11 @@ impl DetailView {
                     self.shell_pod()
                 }
             },
-            Subject::Workload(kind) => match &self.pods {
-                Pods::NotListed => return Ok(()),
-                Pods::Failed(e) => {
-                    return Err(ActionError::rejected::<A>(self.list_failed(kind, e)));
-                }
+            // Not known, or not to be trusted (listed before the workload changed, or the list
+            // failed): Shell lists the pods when asked, so it may run.
+            Subject::Workload(_) if self.pods_stale => return Ok(()),
+            Subject::Workload(_) => match &self.pods {
+                Pods::NotListed | Pods::Failed(_) => return Ok(()),
                 Pods::Listed(pods) => shell_pod_of(pods),
             },
         };

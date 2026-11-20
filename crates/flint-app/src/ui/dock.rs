@@ -210,8 +210,21 @@ impl Dock {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> u64 {
+        let id = self.add(key, build, window, cx);
+        self.activate(id, window, cx);
+        id
+    }
+
+    /// Adds the tab for `key` (built by `build`) behind the active one, unless it is open: for
+    /// a tab that opens while the user works in another tab, which keeps the dock and focus.
+    pub fn add(
+        &mut self,
+        key: TabKey,
+        build: impl FnOnce(&mut Window, &mut Context<Self>) -> DockTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         if let Some(id) = self.find(&key, cx) {
-            self.activate(id, window, cx);
             return id;
         }
         let tab = build(window, cx);
@@ -228,8 +241,17 @@ impl Dock {
             shown,
             _observe: observe,
         });
-        self.activate(id, window, cx);
+        if self.active.is_none() {
+            self.active = Some(id);
+            self.visible = true;
+        }
+        cx.notify();
         id
+    }
+
+    /// Whether keyboard focus is in the dock (one of its tabs).
+    pub fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
     }
 
     /// Redraws the tab bar when tab `id`'s title or status changed.
