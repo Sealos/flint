@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -81,6 +82,9 @@ pub struct RequestRecord {
     pub verb: Verb,
     /// `None` when the connection was dropped instead of answered.
     pub status: Option<u16>,
+    /// The connection it came on: connections are numbered from 1, in the order the server
+    /// accepts them ([`connection_mark_at`]).
+    pub connection: u64,
 }
 
 impl RequestRecord {
@@ -129,6 +133,12 @@ struct Inner {
     requests: Mutex<Vec<RequestRecord>>,
     /// Every request as it arrived, before faults or answers: what the app sent, and when.
     arrivals: Mutex<Vec<RequestRecord>>,
+    /// How many connections have been accepted: the number of the last one.
+    connections: AtomicU64,
+    /// Each accepted connection's number by its client's address, until
+    /// [`connection_mark_at`] looks its own probe up (the others are never removed; a test opens
+    /// few connections).
+    accepted: Mutex<HashMap<SocketAddr, u64>>,
     shutdown: watch::Receiver<()>,
 }
 
@@ -150,6 +160,43 @@ pub fn arrivals_at(url: &str) -> Option<Vec<RequestRecord>> {
         .and_then(|(_, inner)| inner.upgrade())?;
     drop(running);
     Some(lock(&inner.arrivals).clone())
+}
+
+/// A mark between the connections the fake server at `url` has accepted so far and those it
+/// accepts from now on: requests on connections numbered above it come from clients that
+/// connected after this call. `None` when no fake server runs there.
+///
+/// The server may still be reading requests sent on older connections (a client that has just
+/// exited, say), so counting requests is not enough to tell old clients from new ones. This
+/// opens a connection of its own and waits until the server has accepted it: connections are
+/// accepted in order, so every one opened before is numbered at or below the mark.
+pub fn connection_mark_at(url: &str) -> Option<u64> {
+    let url = url.trim_end_matches('/');
+    let inner = {
+        let running = lock(&RUNNING);
+        running
+            .iter()
+            .rev()
+            .find(|(u, _)| u == url)
+            .and_then(|(_, inner)| inner.upgrade())?
+    };
+    let addr: SocketAddr = url.strip_prefix("https://")?.parse().ok()?;
+    let Ok(probe) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
+        return Some(inner.connections.load(Ordering::SeqCst));
+    };
+    let Ok(local) = probe.local_addr() else {
+        return Some(inner.connections.load(Ordering::SeqCst));
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(id) = lock(&inner.accepted).remove(&local) {
+            return Some(id);
+        }
+        if std::time::Instant::now() > deadline {
+            return Some(inner.connections.load(Ordering::SeqCst));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -216,6 +263,8 @@ impl FakeApiServer {
             watchers: Mutex::default(),
             requests: Mutex::default(),
             arrivals: Mutex::default(),
+            connections: AtomicU64::new(0),
+            accepted: Mutex::default(),
             shutdown,
         });
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.clone());
@@ -541,9 +590,11 @@ async fn accept_loop(
     inner: Arc<Inner>,
 ) {
     loop {
-        let Ok((tcp, _)) = listener.accept().await else {
+        let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        let connection = inner.connections.fetch_add(1, Ordering::SeqCst) + 1;
+        lock(&inner.accepted).insert(peer, connection);
         let acceptor = acceptor.clone();
         let inner = inner.clone();
         let mut shutdown = inner.shutdown.clone();
@@ -551,7 +602,7 @@ async fn accept_loop(
             let Ok(tls) = acceptor.accept(tcp).await else {
                 return;
             };
-            let service = service_fn(move |req| handle(inner.clone(), req));
+            let service = service_fn(move |req| handle(inner.clone(), req, connection));
             let conn = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(tls), service)
                 .with_upgrades();
@@ -602,7 +653,11 @@ fn reason(code: u16) -> &'static str {
     }
 }
 
-async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Body>, io::Error> {
+async fn handle(
+    inner: Arc<Inner>,
+    req: Request<Incoming>,
+    connection: u64,
+) -> Result<Response<Body>, io::Error> {
     let route = Route::parse(req.uri().path());
     let query = Query::parse(req.uri().query());
     let verb = route.verb(req.method(), &query);
@@ -618,6 +673,7 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
         query: req.uri().query().unwrap_or("").to_owned(),
         verb,
         status: None,
+        connection,
     };
     lock(&inner.arrivals).push(record.clone());
     let upgrade = remote::is_websocket_upgrade(req.headers());
