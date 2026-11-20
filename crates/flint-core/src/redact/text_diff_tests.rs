@@ -219,6 +219,11 @@ fn shapes() -> Vec<String> {
         "Cookie: session=\"example-value\"; theme=dark",
         "app:it's private@tcp(db)/app",
         "Set-Cookie: a=1; Path=/x]y",
+        "dsn=app:it's-private@tcp(db)/app",
+        "app:p\\\"x@tcp(db)/app",
+        "Cookie='sid=example' status=200",
+        "Cookie: -----sid=example; session=sample",
+        "\"Set-Cookie\": [\n  \"a=s3cr3tA\",\n  \"b=s3cr3tB\"\n]",
     ]
     .iter()
     .map(|s| (*s).to_owned())

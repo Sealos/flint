@@ -694,14 +694,18 @@ Rules:
       are hidden together whatever its length, unless that word is the next field, a flag or `key=`);
     - `Cookie` and `Set-Cookie` header values, every cookie with its name: to the closing quote when quoted, to the
       closing bracket of a list (a JSON array, a Go header map, `[]string{...}`; a bracket inside a quoted cookie
-      does not end it), to the closing apostrophe of a single-quoted header (`curl -H 'Cookie: ...'`), or else to
-      the end of the line; a quoted cookie value (`session="v"`) does not end it. This header rule and the `Authorization` one also match right after an escaped `\n`, as
-      in a request dumped into a JSON string, where the value (a Digest one too) ends at the next escaped `\n`;
+      does not end it; quoted items become one quoted marker, `["[REDACTED:cookie]"]`, so JSON still parses), to
+      the closing apostrophe of a single-quoted header or value (`curl -H 'Cookie: ...'`, `Cookie='sid=...'`), or
+      else to the end of the line; a quoted cookie value (`session="v"`) does not end it. A JSON array that opens
+      at the end of its line (pretty-printed) is found over the whole text, and each item becomes
+      `"[REDACTED:cookie]"`. This header rule and the `Authorization` one also match right after an escaped `\n`,
+      as in a request dumped into a JSON string, where the value (a Digest one too) ends at the next escaped `\n`;
     - passwords in URLs (`scheme://user:pass@host`), up to the authority's last `@`; a password with an unencoded
       `/`, `?` or `#` is caught too, unless the part after the colon is a port (`:8443/`); and in Go MySQL DSNs,
       which have no `://` (`user:pass@tcp(host:3306)/db`, also `unix(` and `udp(`), from the DSN's first `:` to
-      the `@` before the protocol; a DSN in double quotes starts after the last one, so its password can hold
-      spaces, brackets and apostrophes;
+      the `@` before the protocol; what ends the DSN tells what opened it: a quote (with as many backslashes, in
+      escaped JSON) opens it at the last such quote before the `@`, so its password can hold spaces, brackets,
+      apostrophes and escaped quotes, and an unquoted DSN starts after the last space;
     - registry `auth` values in docker config JSON (`"auth": "<base64 user:pass>"`, at any escape level, and the
       same key in YAML, also `auth :`, or a Python dict), when the value decodes to `user:password`;
     - AWS access key ids (`AKIA`/`ASIA`) and secret access keys (by key name, or a 40-character mixed-case value on

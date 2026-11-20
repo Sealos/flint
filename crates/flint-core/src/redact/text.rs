@@ -57,7 +57,7 @@ const MARKER_PREFIX: &str = "[REDACTED:";
 pub fn redact_credentials(text: &str) -> Redacted<'_> {
     let mut out = Builder::new(text);
     let mut from = 0;
-    for (span, replacement) in private_key_spans(text) {
+    for (span, replacement) in whole_text_spans(text) {
         redact_lines(text, from..span.start, &mut out);
         out.replace(span.clone(), replacement);
         let marker = out.written() - replacement.len() + replacement.find('[').unwrap_or(0);
@@ -119,6 +119,65 @@ impl<'a> Builder<'a> {
             marks: self.marks,
         }
     }
+}
+
+/// What spans lines and is found over the whole text before the line rules run: private key
+/// bodies and the items of pretty-printed cookie arrays, in order, none overlapping.
+fn whole_text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
+    let mut spans = private_key_spans(text);
+    spans.extend(
+        cookie_array_items(text)
+            .into_iter()
+            .map(|item| (item, COOKIE_MARKER)),
+    );
+    spans.sort_by_key(|(span, _)| span.start);
+    let mut end = 0;
+    spans.retain(|(span, _)| {
+        let keep = span.start >= end;
+        if keep {
+            end = span.end;
+        }
+        keep
+    });
+    spans
+}
+
+// --- Cookie arrays over several lines ----------------------------------------------------------
+
+/// The marker for a cookie header value.
+const COOKIE_MARKER: &str = "[REDACTED:cookie]";
+
+/// A cookie header whose JSON array of values opens at the end of its line (pretty-printed).
+static COOKIE_ARRAY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?im)(?:set-)?cookie"[ \t]*:[ \t]*\[[ \t]*\r?$"#).expect("cookie array builds")
+});
+
+/// The contents of each quoted item of the pretty-printed cookie arrays in `text`, so each
+/// becomes `"[REDACTED:cookie]"` and the JSON still parses. An array on one line is the line
+/// rule's. One forward scan per array.
+fn cookie_array_items(text: &str) -> Vec<Range<usize>> {
+    let mut items = Vec::new();
+    let bytes = text.as_bytes();
+    let mut scanned = 0;
+    for m in COOKIE_ARRAY.find_iter(text) {
+        let mut i = m.end().max(scanned);
+        loop {
+            while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&b'"') {
+                break;
+            }
+            let len = quoted_len(&text[i + 1..], 0);
+            let item = i + 1..i + 1 + len;
+            if !item.is_empty() && &text[item.clone()] != COOKIE_MARKER {
+                items.push(item);
+            }
+            i += len + 2;
+        }
+        scanned = i;
+    }
+    items
 }
 
 // --- Private key blocks ------------------------------------------------------------------------
@@ -389,7 +448,7 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
             // escaped `\n`, as in a request dumped into a JSON string.
             rule(
                 &format!(
-                    r#"(?i)(?:\b|\\n)(?:set-)?cookie{SEP_NO_LIST}(?:(?P<b>\[\]string\{{|\[)(?P<vb>)|(?P<q>\\*)"(?P<vq>)|\\*'?(?P<vl>[^\s"'\\]))"#
+                    r#"(?i)(?:\b|\\n)(?:set-)?cookie{SEP_NO_LIST}(?:(?P<b>\[\]string\{{|\[)(?P<vb>)|(?P<q>\\*)"(?P<vq>)|\\*(?P<a>')?(?P<vl>[^\s"'\\]))"#
                 ),
                 |_, _| Some("cookie"),
             ),
@@ -434,8 +493,12 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
         (
             MYSQL_DSN,
             // Go's MySQL DSN, which has no `://`: `user:pass@tcp(host:3306)/db`. The match is the
-            // `@` before the protocol; [`dsn_password`] finds the password before it.
-            rule(r"(?P<vm>)@(?:tcp6?|udp|unix)\(", |_, _| Some("password")),
+            // `@` before the protocol and the rest of the DSN; [`dsn_password`] finds the
+            // password before it, from the delimiter that ends the DSN.
+            rule(
+                r#"(?P<vm>)@(?:tcp6?|udp|unix)\([^\s"'\\)]*\)?[^\s"'\\]*"#,
+                |_, _| Some("password"),
+            ),
         ),
         (
             SLACK_WEBHOOK,
@@ -720,7 +783,7 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
         return Some(v.range());
     }
     if let Some(v) = caps.name("vm") {
-        return dsn_password(line, floor, v.start());
+        return dsn_password(line, floor, v.start(), whole.end());
     }
     if let Some(v) = caps.name("vt") {
         return Some(word_value(line, v.range()));
@@ -736,13 +799,13 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
         let first = &line[v.start()..];
         let one_word = (name == "pass" && first.starts_with(|c: char| c.is_ascii_digit()))
             || (matches!(name.as_str(), "pwd" | "oldpwd") && first.starts_with(['/', '~']))
-            || first.starts_with("-----");
+            || key.is_some() && first.starts_with("-----");
         if one_word || key.is_some() && key_kind(caps) != "password" {
             return Some(word_value(line, v.start()..word_end(line, v.start())));
         }
         // A header in single quotes (`curl -H 'Cookie: a=b' url`) ends at the closing quote.
         let at = key.map_or(whole.start(), |k| k.start());
-        let quoted = at > 0 && line.as_bytes()[at - 1] == b'\'';
+        let quoted = at > 0 && line.as_bytes()[at - 1] == b'\'' || caps.name("a").is_some();
         let len = line_value_len(&line[v.start()..], quoted);
         return Some(v.start()..v.start() + len);
     }
@@ -752,7 +815,9 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
         } else {
             b']'
         };
-        return Some(v.start()..v.start() + list_len(&line[v.start()..], close));
+        let rest = &line[v.start()..];
+        let items = list_items(rest, close);
+        return Some(v.start() + items.start..v.start() + items.end);
     }
     if let Some(v) = caps.name("vd") {
         let end = match caps.name("q") {
@@ -771,29 +836,84 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
     Some(v.start()..v.start() + quoted_len(&line[v.start()..], level))
 }
 
-/// The password of a MySQL DSN whose `@` before the protocol is at `at`, searching no earlier
-/// than `floor`: from the first `:` of the DSN to `at`. A DSN in quotes starts after the last
-/// double quote before `at` (or, with none, the last apostrophe), so a password can hold spaces and brackets; a bare one starts after the
-/// last space. `None` when there is no `:` (no password) or the password already holds a
-/// marker (a URL rule hid it).
-fn dsn_password(line: &str, floor: usize, at: usize) -> Option<Range<usize>> {
-    let bytes = &line.as_bytes()[floor..at];
-    let start = floor
-        // A double quote encloses the DSN when there is one; an apostrophe can be in the
-        // password.
-        + match memchr::memrchr(b'"', bytes).or_else(|| memchr::memrchr(b'\'', bytes)) {
-            Some(quote) => quote + 1,
-            None => bytes
-                .iter()
-                .rposition(u8::is_ascii_whitespace)
-                .map_or(0, |i| i + 1),
-        };
+/// The password of a MySQL DSN whose `@` before the protocol is at `at` and whose text ends at
+/// `end`, searching no earlier than `floor`: from the first `:` of the DSN to `at`. What ends
+/// the DSN tells what opened it: a double quote or apostrophe (with as many backslashes, in
+/// escaped JSON) opens it at the last such quote before `at`, so the password can hold spaces,
+/// brackets, apostrophes and more escaped quotes; anything else, the last space. `None` when
+/// there is no `:` (no password) or the password already holds a marker (a URL rule hid it).
+fn dsn_password(line: &str, floor: usize, at: usize, end: usize) -> Option<Range<usize>> {
+    let bytes = line.as_bytes();
+    let escapes = bytes[end..].iter().take_while(|&&b| b == b'\\').count();
+    let start = match bytes.get(end + escapes) {
+        Some(&quote @ (b'"' | b'\'')) => opening_quote(&bytes[floor..at], quote, escapes)
+            .map(|i| floor + i + 1)
+            .unwrap_or(floor),
+        _ => bytes[floor..at]
+            .iter()
+            .rposition(u8::is_ascii_whitespace)
+            .map_or(floor, |i| floor + i + 1),
+    };
     // `"dsn": root:pw@tcp(...)`: the separator after a quoted key is not the DSN's.
     let dsn = line[start..at].trim_start_matches([' ', '\t', ':', '=']);
     let start = at - dsn.len();
     let colon = start + memchr::memchr(b':', dsn.as_bytes())?;
     let password = colon + 1..at;
     (!password.is_empty() && !line[password.clone()].contains(MARKER_PREFIX)).then_some(password)
+}
+
+/// Where the last `quote` in `bytes` with exactly `escapes` backslashes before it is (an even
+/// number when `escapes` is 0): the one that opens a string closed by the same quote. One
+/// backward scan.
+fn opening_quote(bytes: &[u8], quote: u8, escapes: usize) -> Option<usize> {
+    let mut to = bytes.len();
+    while let Some(i) = memchr::memrchr(quote, &bytes[..to]) {
+        let backslashes = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count();
+        let opens = if escapes == 0 {
+            backslashes % 2 == 0
+        } else {
+            backslashes == escapes
+        };
+        if opens {
+            return Some(i);
+        }
+        to = i;
+    }
+    None
+}
+
+/// The part of a list that starts `rest` to hide: from inside the first item's opening quote
+/// to the last item's closing quote when the items are quoted (a JSON array, `[]string{...}`),
+/// so one marker stays a quoted item and the list still parses; else every item.
+fn list_items(rest: &str, close: u8) -> Range<usize> {
+    let bytes = rest.as_bytes();
+    let len = list_len(rest, close);
+    let first = bytes[..len]
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(len);
+    let escapes = bytes[first..len]
+        .iter()
+        .take_while(|&&b| b == b'\\')
+        .count();
+    let last = bytes[..len]
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    let quoted = bytes.get(first + escapes) == Some(&b'"')
+        && last > first + escapes + 1
+        && bytes[last - 1] == b'"'
+        && bytes[..last - 1]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+            == escapes;
+    if quoted {
+        first + escapes + 1..last - 1 - escapes
+    } else {
+        0..len
+    }
 }
 
 /// The length of a list's items that start `rest`, up to the `close` byte that ends the list:
