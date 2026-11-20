@@ -45,21 +45,29 @@ impl ResourceList {
         }
     }
 
-    /// [`SortBy`] takes a column drawn now.
+    /// [`SortBy`] takes a column drawn now: by its `key` ([`flint_core::Column::key`]) when
+    /// given, else by its header.
     pub(in crate::ui) fn check_sort(&self, action: &SortBy) -> Result<(), ActionError> {
-        let columns = &self.shown.columns;
-        if self
-            .drawn
-            .iter()
-            .any(|&(col, _)| *columns[col].name == action.column)
-        {
+        if self.sort_key(action).is_some() {
             Ok(())
         } else {
             Err(ActionError::rejected::<SortBy>(format!(
                 "no column {} is drawn",
-                action.column
+                action.key.as_deref().unwrap_or(&action.column)
             )))
         }
+    }
+
+    /// The key of the drawn column `action` names: the one with its `key` when given, else the
+    /// first one headed `column`.
+    pub(in crate::ui) fn sort_key(&self, action: &SortBy) -> Option<String> {
+        let columns = &self.shown.columns;
+        let mut drawn = self.drawn.iter().map(|&(col, _)| &columns[col]);
+        let found = match &action.key {
+            Some(key) => drawn.find(|c| c.key() == *key),
+            None => drawn.find(|c| *c.name == *action.column),
+        };
+        found.map(|c| c.key())
     }
 
     /// The names of the columns drawn, left to right: what [`SortBy`] takes.
@@ -90,13 +98,15 @@ impl ResourceList {
 
     fn sort_by(&mut self, action: &SortBy, _: &mut Window, cx: &mut Context<Self>) {
         match self.check_sort(action) {
-            Ok(()) => self.toggle_sort(&action.column, cx),
+            Ok(()) => self.toggle_sort(action, cx),
             Err(e) => tracing::warn!("{e}"),
         }
     }
 
     fn toggle_wide(&mut self, _: &ToggleWide, _: &mut Window, cx: &mut Context<Self>) {
         self.show_wide = !self.show_wide;
+        // A remembered sort on a wide column applies only while Wide is on.
+        self.recompute(cx);
         cx.notify();
     }
 

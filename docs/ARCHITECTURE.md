@@ -149,7 +149,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   cold.
 - **Cluster sets (super mode):** Cmd-click clusters, or open a saved named set, to combine 2 to 5 clusters in one
   view ([ADR-0014](./adr/0014-cluster-sets-and-combined-views.md)). Lists interleave the members' rows with a
-  sortable, filterable Cluster column, or group them by cluster with a toggle. Columns are the union by name; the
+  sortable, filterable Cluster column, or group them by cluster with a toggle. Columns are the union by name (by column key once Flint computes columns of its own, #196); the
   resource tree lists every kind any member serves, with a `2/3` badge when only some do. Every member of an open set
   is connected and watched like the active cluster. Rows keep their cluster: details and actions act on the row's
   own cluster. Each cluster may have an optional colour tag, shown in the sidebar, the Cluster column and the detail
@@ -246,10 +246,11 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   nothing is probed. The resource switcher finds every kind.
 - **Flint-computed columns (planned, #195, #196):** a few columns are computed by Flint and layered on the server's
   Table. They are synthetic columns, built in `table.rs` beside the synthetic Namespace column (`Column::synthetic`,
-  with their own `ColumnRole`). Each has an identity of its own, apart from its header text, so a Flint column and a
-  server column with the same name (Flint's Ready and the server's Ready with Wide on) stay distinct for sorting, the
-  remembered sort (#205) and a cluster set's union of columns, which today match columns by name
-  (`list_model::resolve_sort`).
+  with their own `ColumnRole`). Each has an identity of its own, apart from its header text (`Column::key`: `flint:`
+  and the role for Flint's columns, `server:` and the header for the server's), so a Flint column and a server column
+  with the same name (Flint's Ready and the server's Ready with Wide on) stay distinct for sorting and the
+  remembered sort, which match columns by key (`list_model::resolve_sort`). A cluster set's union of columns
+  should match by key too.
   - **Row data:** Deployments, StatefulSets and DaemonSets are asked for with `includeObject=Object`, and only a few
     typed fields are kept per row (replica counts, the Progressing condition, `spec.paused`, the update strategy).
     ReplicaSets and ReplicationControllers need only their Table cells and metadata. Pods stay on
@@ -906,8 +907,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   analysis line limit, and a `claude` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, and the dock's height,
   which the user drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
-  filter of each cluster. Planned: per cluster, the expanded "… N more" rows of the tree, the old-revisions toggle,
-  and each list's sort.
+  filter of each cluster, and each list's sort per cluster and kind (`[list_sorts.<cluster>]`, the column's key and
+  direction; a column that is gone falls back to the kind's default order). Planned: per cluster, the expanded "… N
+  more" rows of the tree and the old-revisions toggle.
 - `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
   ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.

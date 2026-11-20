@@ -287,6 +287,19 @@ pub struct State {
     pub last_views: BTreeMap<String, String>,
     /// Pane sizes the user dragged, in points. Missing means the default.
     pub panes: PaneWidths,
+    /// The sort chosen per cluster (context name) and kind id, by column key
+    /// ([`crate::Column::key`]). Missing means the kind's default order.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub list_sorts: BTreeMap<String, BTreeMap<String, ListSort>>,
+}
+
+/// A list's sort as `state.toml` keeps it: the column's key ([`crate::Column::key`]), not its
+/// header, and the direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSort {
+    pub column: String,
+    #[serde(default)]
+    pub descending: bool,
 }
 
 /// Sizes of the window's resizable panes, in points: the widths of the side panes and the
@@ -1090,6 +1103,53 @@ mod tests {
         assert_eq!(loaded, s);
         let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(text.contains("future_key"), "unknown keys survive: {text}");
+    }
+
+    #[test]
+    fn list_sorts_round_trip_per_cluster_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let sort = ListSort {
+            column: "server:Restarts".into(),
+            descending: true,
+        };
+        state
+            .list_sorts
+            .entry("kind-dev".into())
+            .or_default()
+            .insert("pods".into(), sort);
+        // An EKS context name: colons and slashes in the table key.
+        let arn = "arn:aws:eks:eu-north-1:123456789012:cluster/payments";
+        state.list_sorts.entry(arn.into()).or_default().insert(
+            "widgets.example.com".into(),
+            ListSort {
+                column: "server:Phase".into(),
+                descending: true,
+            },
+        );
+        state
+            .list_sorts
+            .entry("kind-dev".into())
+            .or_default()
+            .insert(
+                "deployments.apps".into(),
+                ListSort {
+                    column: "flint:age".into(),
+                    descending: false,
+                },
+            );
+        save_state(dir.path(), &state).unwrap();
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        let text = std::fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(text.contains("server:Restarts"), "{text}");
+        // `descending` may be left out.
+        std::fs::write(
+            dir.path().join(STATE_FILE),
+            "[list_sorts.a]\npods = { column = \"flint:name\" }\n",
+        )
+        .unwrap();
+        let loaded = load_state(dir.path()).unwrap();
+        assert!(!loaded.list_sorts["a"]["pods"].descending);
     }
 
     #[test]

@@ -66,6 +66,9 @@ pub enum ListEvent {
     SelectedChanged,
     /// The selected object is gone from a synced list (deleted).
     SelectedGone,
+    /// The user changed the sort (`None`: back to the default order), to remember for the
+    /// cluster and kind.
+    SortChanged(Option<SortSpec>),
 }
 
 impl EventEmitter<ListEvent> for ResourceList {}
@@ -123,6 +126,16 @@ pub struct ResourceList {
     /// The pane width this frame was laid out for. The width is known only after layout, so
     /// when it changed, the next frame draws again with the new one.
     laid_out_width: Option<f32>,
+    /// Whether the last recompute applied the sort: its column was drawn then. When that
+    /// changes with the layout (Wide toggled, the pane resized), the rows are sorted again.
+    sort_drawn: bool,
+    /// Tests: each filter-and-sort job waits for a permit from here before it finishes
+    /// ([`ResourceList::hold_computes`]).
+    #[cfg(test)]
+    compute_gate: Option<async_channel::Receiver<()>>,
+    /// Tests: how many filter-and-sort jobs have come back (applied or dropped).
+    #[cfg(test)]
+    computes_done: usize,
     focus: FocusHandle,
     filter: Entity<InputState>,
     /// A row's context menu, for kinds that have one (pods and workloads: UP-47).
@@ -134,11 +147,14 @@ pub struct ResourceList {
 }
 
 impl ResourceList {
+    /// A list of `entry`'s kind on `cluster`, filtered to `namespaces` and sorted by `sort` (the
+    /// one remembered for the cluster and kind, if any).
     pub fn new(
         core: CoreHandle,
         cluster: ClusterId,
         entry: &NavEntry,
         namespaces: Vec<String>,
+        sort: Option<SortSpec>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -193,6 +209,7 @@ impl ResourceList {
             rows: Arc::from(Vec::new()),
             query: Query {
                 namespaces,
+                sort,
                 ..Default::default()
             },
             show_wide: false,
@@ -211,6 +228,11 @@ impl ResourceList {
             drawn: Vec::new(),
             dropped_wide: 0,
             laid_out_width: None,
+            sort_drawn: false,
+            #[cfg(test)]
+            compute_gate: None,
+            #[cfg(test)]
+            computes_done: 0,
             focus: cx.focus_handle(),
             filter,
             row_menu: None,
@@ -253,6 +275,21 @@ impl ResourceList {
     #[cfg(test)]
     pub fn shown(&self) -> (&Arc<KindSnapshot>, usize) {
         (&self.shown, self.rows.len())
+    }
+
+    /// Holds every filter-and-sort job started from now on until the test sends a permit on the
+    /// returned sender, one job per permit, so a test can act while a job is pending.
+    #[cfg(test)]
+    pub fn hold_computes(&mut self) -> async_channel::Sender<()> {
+        let (permits, gate) = async_channel::unbounded();
+        self.compute_gate = Some(gate);
+        permits
+    }
+
+    /// How many filter-and-sort jobs have come back, applied or dropped, for tests.
+    #[cfg(test)]
+    pub fn computes_done(&self) -> usize {
+        self.computes_done
     }
 
     /// Drops the core subscription, so a test can feed snapshots by hand.
@@ -335,14 +372,26 @@ impl ResourceList {
         let query = ViewQuery {
             namespaces: self.query.namespaces.clone(),
             text: self.query.text.clone(),
-            sort: list_model::resolve_sort(&snapshot.columns, self.query.sort.as_ref()),
+            sort: list_model::resolve_sort(
+                &snapshot.columns,
+                self.query.sort.as_ref(),
+                &self.drawn_in(&snapshot.columns),
+            ),
         };
+        self.sort_drawn = query.sort.is_some();
+        let job_sort = query.sort;
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
         let namespaces = self.query.namespaces.clone();
         let job_snapshot = snapshot.clone();
+        #[cfg(test)]
+        let gate = self.compute_gate.clone();
         let job = cx.background_spawn(async move {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.recv().await;
+            }
             let rows = view.await;
             let widths = list_model::measure_columns(&job_snapshot, &rows, unix_now());
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
@@ -356,6 +405,23 @@ impl ResourceList {
             let (rows, widths, scoped, uid, position) = job.await;
             let _ = this.update(cx, |list, cx| {
                 list.computing = false;
+                #[cfg(test)]
+                {
+                    list.computes_done += 1;
+                }
+                // Sorted for a layout that has changed since (Wide toggled, the pane resized, the
+                // sort clicked): drawing these rows under the new header would show one order
+                // with the other's arrow. Sort again for the layout now.
+                let now = list_model::resolve_sort(
+                    &snapshot.columns,
+                    list.query.sort.as_ref(),
+                    &list.drawn_in(&snapshot.columns),
+                );
+                if now != job_sort {
+                    list.remeasure |= restart;
+                    list.recompute(cx);
+                    return;
+                }
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
                 list.apply(snapshot, rows, uid, position, cx);
@@ -381,6 +447,7 @@ impl ResourceList {
         let (drawn, dropped) = self.layout(self.laid_out_width);
         self.drawn = drawn;
         self.dropped_wide = dropped;
+        self.resort_if_drawn_changed(cx);
         match &mut self.selected {
             None => self.selected_ix = None,
             Some(selected) if Some(&selected.uid) == uid.as_ref() => {
@@ -477,10 +544,43 @@ impl ResourceList {
         self.clear_selection(cx);
     }
 
-    fn toggle_sort(&mut self, column: &str, cx: &mut Context<Self>) {
-        self.query.sort = list_model::next_sort(self.query.sort.as_ref(), column);
+    /// Sorts by the drawn column `action` names, as a header click does, and reports the new
+    /// sort to remember.
+    fn toggle_sort(&mut self, action: &SortBy, cx: &mut Context<Self>) {
+        let Some(key) = self.sort_key(action) else {
+            return;
+        };
+        self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
+        cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
         cx.notify();
+    }
+
+    /// The columns of `columns` (the newest snapshot's) that are drawn now, matched by key: the
+    /// ones a sort may apply to. Before the first layout, the columns the Wide setting shows.
+    fn drawn_in(&self, columns: &[flint_core::Column]) -> Vec<usize> {
+        if self.drawn.is_empty() {
+            return list_model::visible_columns(columns, self.show_wide);
+        }
+        let drawn: Vec<usize> = self.drawn.iter().map(|&(col, _)| col).collect();
+        list_model::map_drawn(&self.shown.columns, &drawn, columns)
+    }
+
+    /// The drawn column the sort applies to, if it is drawn.
+    pub(super) fn drawn_sort_column(&self) -> Option<usize> {
+        let drawn: Vec<usize> = self.drawn.iter().map(|&(col, _)| col).collect();
+        list_model::sort_column(&self.shown.columns, self.query.sort.as_ref(), &drawn)
+    }
+
+    /// Sorts again when the sort's column came into view or left it with the layout, so a
+    /// remembered sort is suspended while its column is not drawn and applies when it is.
+    fn resort_if_drawn_changed(&mut self, cx: &mut Context<Self>) {
+        if self.query.sort.is_some()
+            && !self.drawn.is_empty()
+            && self.drawn_sort_column().is_some() != self.sort_drawn
+        {
+            self.recompute(cx);
+        }
     }
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
@@ -647,25 +747,27 @@ impl ResourceList {
             .border_color(theme.border)
             .text_xs()
             .font_semibold();
+        let sorted_col = self.drawn_sort_column();
         for &(col, width) in &self.drawn {
             let column = &self.shown.columns[col];
             let name = column.name.to_string();
-            let sorted = self
-                .query
-                .sort
-                .as_ref()
-                .filter(|s| s.column == name)
-                .map(|s| s.descending);
+            let sorted = (sorted_col == Some(col))
+                .then(|| self.query.sort.as_ref().map(|s| s.descending))
+                .flatten();
             let numeric = list_model::is_numeric(column);
             let tip = if column.description.is_empty() {
                 name.clone()
             } else {
                 format!("{name}\n{}", column.description)
             };
-            let click_name = name.clone();
+            // By key: a header shared by two columns sorts the one clicked.
+            let click = SortBy {
+                column: name.clone(),
+                key: Some(column.key()),
+            };
             header = header.child(
                 h_flex()
-                    .id(SharedString::from(format!("sort-{name}")))
+                    .id(SharedString::from(header_id(&self.shown.columns, col)))
                     .h_full()
                     .px_2()
                     .gap_1()
@@ -688,7 +790,7 @@ impl ResourceList {
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .on_click(registry::on_click(SortBy { column: click_name }))
+                    .on_click(registry::on_click(click))
                     .test_support(),
             );
         }
@@ -934,6 +1036,17 @@ fn cell_text(row: &Row, col: usize, now: i64) -> SharedString {
     }
 }
 
+/// The element id of column `col`'s header: `sort-<header>`, with the column's index appended
+/// when another column has the same header.
+fn header_id(columns: &[flint_core::Column], col: usize) -> String {
+    let name = &columns[col].name;
+    if columns.iter().filter(|c| c.name == *name).count() > 1 {
+        format!("sort-{name}-{col}")
+    } else {
+        format!("sort-{name}")
+    }
+}
+
 /// The row of `name` in `namespace`, found by binary search (rows are sorted by namespace,
 /// then name).
 pub fn find_row(snapshot: &KindSnapshot, namespace: Option<&str>, name: &str) -> Option<usize> {
@@ -998,6 +1111,7 @@ impl Render for ResourceList {
         let (drawn, dropped) = self.layout(available);
         self.drawn = drawn;
         self.dropped_wide = dropped;
+        self.resort_if_drawn_changed(cx);
         let total_width: f32 = self.drawn.iter().map(|(_, w)| w).sum();
 
         let cx: &Context<Self> = cx;

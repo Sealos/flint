@@ -116,8 +116,15 @@ fn open_sized(
             |window, cx| {
                 cx.new(|cx| {
                     let entry = crate::ui::support_tests::entry("", "pods", "Pod", label, true);
-                    let mut list =
-                        ResourceList::new(core, "test".into(), &entry, Vec::new(), window, cx);
+                    let mut list = ResourceList::new(
+                        core,
+                        "test".into(),
+                        &entry,
+                        Vec::new(),
+                        None,
+                        window,
+                        cx,
+                    );
                     list.stop_watching();
                     list
                 })

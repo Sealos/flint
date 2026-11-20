@@ -14,6 +14,13 @@ use super::super::view_state::{
 use super::{ResourceList, cell_text, limited_text, list_model};
 
 impl ResourceList {
+    /// The sort in effect, if its column is in the snapshot drawn: its header and direction.
+    fn sort_shown(&self) -> Option<(&str, bool)> {
+        let col = self.drawn_sort_column()?;
+        let descending = self.query.sort.as_ref()?.descending;
+        Some((&self.shown.columns[col].name, descending))
+    }
+
     /// The list as drawn: the columns on screen, the rows passing the filters (in order), and
     /// what replaces or tops them.
     pub fn view_state(&self) -> ListState {
@@ -70,9 +77,9 @@ impl ResourceList {
             rows,
             rows_truncated: self.rows.len() > ListState::ROW_LIMIT,
             filter: self.query.text.clone(),
-            sort: self.query.sort.as_ref().map(|s| SortState {
-                column: s.column.clone(),
-                descending: s.descending,
+            sort: self.sort_shown().map(|(column, descending)| SortState {
+                column: column.to_owned(),
+                descending,
             }),
             wide: self.show_wide,
             placeholder: self.placeholder_kind(),
