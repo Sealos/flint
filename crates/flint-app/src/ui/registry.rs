@@ -149,9 +149,9 @@ actions!(
         NextTab,
         /// Show the dock's previous tab.
         PrevTab,
-        /// Open the active log tab's stream again once it ended or failed, in the same tab.
+        /// Open the active log tab's stream again once it ended or failed, in a new tab beside it.
         ReconnectLogs,
-        /// Start a new shell in the active shell tab once its shell exited or failed.
+        /// Start a new shell once the active shell tab's exited or failed, in a new tab beside it.
         RestartShell
     ]
 );
@@ -1633,15 +1633,15 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .keys(&["secondary-shift-j"], Some(WORKSPACE)),
         Spec::unit::<ReconnectLogs>(
             "Reconnect Logs",
-            "Open the active log tab's stream again once it ended or failed, in the same tab, on \
-             the API server its context points at now.",
+            "Open the active log tab's stream again once it ended or failed, in a new tab beside \
+             it (the ended tab keeps its lines), on the API server its context points at now.",
         )
         .of(C::Logs, S::Dock)
         .keys(&["secondary-r"], Some(DOCK)),
         Spec::unit::<RestartShell>(
             "Restart Shell",
-            "Start a new shell in the active shell tab once its shell exited or failed, in the \
-             same tab, on the API server its context points at now.",
+            "Start a new shell once the active shell tab's exited or failed, in a new tab beside \
+             it (the ended tab keeps its output), on the API server its context points at now.",
         )
         .of(C::Terminal, S::Dock)
         .keys(RESTART_SHELL, Some(DOCK)),

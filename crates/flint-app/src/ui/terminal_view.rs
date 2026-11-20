@@ -590,7 +590,7 @@ impl TerminalView {
                 .label("Restart shell")
                 .tab_stop(false)
                 .tooltip(format!(
-                    "Start a new shell in this tab ({})",
+                    "Start a new shell in a tab beside this one ({})",
                     registry::key_hint(registry::RESTART_SHELL[0])
                 ))
                 .on_click(registry::on_click(RestartShell));

@@ -975,7 +975,7 @@ fn reconnect_button() -> Button {
         .label("Reconnect")
         .tab_stop(false)
         .tooltip(format!(
-            "Open the logs again in this tab ({})",
+            "Open the logs again in a new tab beside this one ({})",
             registry::key_hint("secondary-r")
         ))
         .on_click(registry::on_click(ReconnectLogs))

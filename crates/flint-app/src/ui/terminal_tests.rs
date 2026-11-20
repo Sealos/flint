@@ -448,7 +448,7 @@ async fn an_exited_shell_shows_its_code_and_keeps_its_screen(cx: &mut TestAppCon
         Some("exit 3")
     );
 
-    // An ended shell offers to start again, in the same tab.
+    // An ended shell offers to start again, in a new tab beside it.
     cx.update_window(shell.window, |_, window, _| {
         assert!(window.try_find("terminal-restart").is_some());
     })
