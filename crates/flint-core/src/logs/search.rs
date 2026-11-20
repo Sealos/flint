@@ -4,12 +4,17 @@
 //! snapshot scans only the lines that arrived since and forgets matches that were evicted, so
 //! following a chatty pod with a search open costs time proportional to the new lines, not to
 //! the buffer. There is no index: the query changes with every keystroke, and a full scan of a
-//! 100k-line buffer takes milliseconds, while an n-gram index would cost about as much memory as
-//! the buffer itself. Run the first scan of a new query off the UI thread
-//! ([`crate::CoreHandle::search_logs`]); incremental updates are cheap anywhere.
+//! 100k-line buffer takes a few milliseconds, while an n-gram index would cost about as much
+//! memory as the buffer itself. Lines are tested with a [`SearchMatcher`], prepared once per
+//! query, which allocates nothing per line. Run the first scan of a new query off the UI thread
+//! ([`crate::CoreHandle::search_logs`]); incremental updates are cheap anywhere, and
+//! [`LogSearch::pending`] says how far behind a search is that was left alone for a while.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::Range;
+
+use memchr::memmem;
 
 use super::buffer::LogLines;
 use super::line::{LineId, LogLine};
@@ -35,9 +40,90 @@ impl SearchQuery {
         }
     }
 
+    /// The query made ready to test many lines: what [`LogSearch`] scans with.
+    pub fn matcher(&self) -> SearchMatcher {
+        SearchMatcher::new(self)
+    }
+
     /// Whether `line` matches: its text, or its source when [`SearchQuery::sources`] is on.
     /// [`SearchQuery::match_ranges`] highlights the text; for a match in the prefix, pass it the
-    /// source's [`label`](crate::LineSource::label) too.
+    /// source's [`label`](crate::LineSource::label) too. To test many lines, use a
+    /// [`SearchMatcher`].
+    pub fn matches_line(&self, line: &LogLine) -> bool {
+        self.matcher().matches_line(line)
+    }
+
+    /// Byte ranges of every non-overlapping match in `text`, for highlighting. Empty for an
+    /// empty query.
+    pub fn match_ranges(&self, text: &str) -> Vec<Range<usize>> {
+        self.matcher().match_ranges(text)
+    }
+
+    /// Whether `text` contains the query. An empty query matches nothing.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.matcher().is_match(text)
+    }
+}
+
+/// A [`SearchQuery`] made ready to test many lines: the pattern is prepared once, and testing a
+/// line allocates nothing (the lowercased text goes into a buffer kept from line to line).
+///
+/// - **Case-sensitive**, or ASCII with no letters: a substring search ([`memmem`]).
+/// - **ASCII, either case**: the same search in the text with its ASCII lowercased, which keeps
+///   byte offsets.
+/// - **Other text, either case**: a substring search in the text lowercased char by char rules
+///   out most lines; where it finds the pattern, chars are compared with simple lowercase
+///   folding at each char boundary, so offsets stay those of the text.
+#[derive(Debug, Clone, Default)]
+pub struct SearchMatcher {
+    find: Find,
+    sources: bool,
+    /// The text being tested, lowercased.
+    scratch: RefCell<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default)]
+enum Find {
+    /// The empty query: matches nothing.
+    #[default]
+    Nothing,
+    Exact(memmem::Finder<'static>),
+    /// The pattern in lowercase ASCII.
+    AsciiFolded(memmem::Finder<'static>),
+    /// The pattern lowercased, as text and as chars.
+    Folded {
+        lower: memmem::Finder<'static>,
+        chars: Vec<char>,
+    },
+}
+
+impl SearchMatcher {
+    pub fn new(query: &SearchQuery) -> Self {
+        let text = query.text.as_str();
+        let find = if text.is_empty() {
+            Find::Nothing
+        } else if query.case_sensitive
+            || (text.is_ascii() && !text.bytes().any(|b| b.is_ascii_alphabetic()))
+        {
+            Find::Exact(memmem::Finder::new(text).into_owned())
+        } else if text.is_ascii() {
+            Find::AsciiFolded(memmem::Finder::new(&text.to_ascii_lowercase()).into_owned())
+        } else {
+            let chars: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+            let lower: String = chars.iter().collect();
+            Find::Folded {
+                lower: memmem::Finder::new(&lower).into_owned(),
+                chars,
+            }
+        };
+        SearchMatcher {
+            find,
+            sources: query.sources,
+            scratch: RefCell::default(),
+        }
+    }
+
+    /// Whether `line` matches: its text, or its source when the query covers sources.
     pub fn matches_line(&self, line: &LogLine) -> bool {
         self.is_match(&line.text)
             || (self.sources
@@ -47,76 +133,74 @@ impl SearchQuery {
                     .is_some_and(|s| self.is_match(s.label())))
     }
 
-    /// Byte ranges of every non-overlapping match in `text`, for highlighting. Empty for an
-    /// empty query.
+    /// Whether `text` contains the query.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.next_match(text, 0).is_some()
+    }
+
+    /// Byte ranges of every non-overlapping match in `text`.
     pub fn match_ranges(&self, text: &str) -> Vec<Range<usize>> {
-        let needle = self.text.as_str();
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        if self.case_sensitive {
-            return text
-                .match_indices(needle)
-                .map(|(at, m)| at..at + m.len())
-                .collect();
-        }
-        if needle.is_ascii() {
-            // Lowercasing ASCII keeps byte offsets, so ranges map back onto `text`.
-            let mut out = Vec::new();
-            let (hay, pat) = (text.as_bytes(), needle.as_bytes());
-            let mut at = 0;
-            while at + pat.len() <= hay.len() {
-                if hay[at..at + pat.len()].eq_ignore_ascii_case(pat) {
-                    out.push(at..at + pat.len());
-                    at += pat.len();
-                } else {
-                    at += 1;
-                }
-            }
-            return out;
-        }
-        // Non-ASCII queries: compare char by char with simple lowercase folding, so offsets
-        // stay those of `text`.
-        let pat: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
         let mut out = Vec::new();
-        let mut i = 0;
-        while i < chars.len() {
-            if let Some(len) = folded_prefix_len(&chars[i..], &pat) {
-                let start = chars[i].0;
-                let end = chars.get(i + len).map_or(text.len(), |(at, _)| *at);
-                out.push(start..end);
-                i += len.max(1);
-            } else {
-                i += 1;
-            }
+        let mut at = 0;
+        while let Some(found) = self.next_match(text, at) {
+            // Every pattern is at least one byte long, so this moves forward.
+            at = found.end;
+            out.push(found);
         }
         out
     }
 
-    /// Whether `text` contains the query. An empty query matches nothing.
-    pub fn is_match(&self, text: &str) -> bool {
-        let needle = self.text.as_str();
-        if needle.is_empty() {
-            false
-        } else if self.case_sensitive {
-            text.contains(needle)
-        } else if needle.is_ascii() {
-            let (hay, pat) = (text.as_bytes(), needle.as_bytes());
-            hay.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat))
-        } else {
-            !self.match_ranges(text).is_empty()
+    /// The first match in `text` starting at byte `from` (a char boundary) or later.
+    fn next_match(&self, text: &str, from: usize) -> Option<Range<usize>> {
+        let rest = text.get(from..)?;
+        match &self.find {
+            Find::Nothing => None,
+            Find::Exact(finder) => finder
+                .find(rest.as_bytes())
+                .map(|at| from + at..from + at + finder.needle().len()),
+            Find::AsciiFolded(finder) => {
+                let mut lower = self.scratch.borrow_mut();
+                lower.clear();
+                lower.extend(rest.bytes().map(|b| b.to_ascii_lowercase()));
+                finder
+                    .find(&lower)
+                    .map(|at| from + at..from + at + finder.needle().len())
+            }
+            Find::Folded { lower, chars } => {
+                {
+                    let mut text_lower = self.scratch.borrow_mut();
+                    text_lower.clear();
+                    let (bytes, mut i, mut utf8) = (rest.as_bytes(), 0, [0; 4]);
+                    while let Some(&b) = bytes.get(i) {
+                        // Log text is mostly ASCII: only other chars are decoded.
+                        if b.is_ascii() {
+                            text_lower.push(b.to_ascii_lowercase());
+                            i += 1;
+                            continue;
+                        }
+                        let c = rest[i..].chars().next().unwrap_or_default();
+                        for lc in c.to_lowercase() {
+                            text_lower.extend_from_slice(lc.encode_utf8(&mut utf8).as_bytes());
+                        }
+                        i += c.len_utf8();
+                    }
+                    // A match at a char boundary is also one in the lowercased text.
+                    lower.find(&text_lower)?;
+                }
+                rest.char_indices().find_map(|(at, _)| {
+                    folded_prefix_len(&rest[at..], chars).map(|len| from + at..from + at + len)
+                })
+            }
         }
     }
 }
 
-/// How many chars of `chars` match `pat` (already lowercased), if they all do.
-fn folded_prefix_len(chars: &[(usize, char)], pat: &[char]) -> Option<usize> {
+/// How many bytes at the start of `text` match `pat` (already lowercased), if they all do.
+fn folded_prefix_len(text: &str, pat: &[char]) -> Option<usize> {
     let mut p = 0;
-    let mut used = 0;
-    for (_, c) in chars {
+    for (at, c) in text.char_indices() {
         if p == pat.len() {
-            break;
+            return Some(at);
         }
         for lc in c.to_lowercase() {
             if pat.get(p) != Some(&lc) {
@@ -124,15 +208,15 @@ fn folded_prefix_len(chars: &[(usize, char)], pat: &[char]) -> Option<usize> {
             }
             p += 1;
         }
-        used += 1;
     }
-    (p == pat.len()).then_some(used)
+    (p == pat.len()).then_some(text.len())
 }
 
 /// The lines of one session that match a query, kept up to date snapshot by snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct LogSearch {
     query: SearchQuery,
+    matcher: SearchMatcher,
     /// Matching line ids, ascending.
     matches: VecDeque<LineId>,
     /// Lines below this id have been scanned.
@@ -142,6 +226,7 @@ pub struct LogSearch {
 impl LogSearch {
     pub fn new(query: SearchQuery) -> Self {
         LogSearch {
+            matcher: query.matcher(),
             query,
             matches: VecDeque::new(),
             scanned_to: 0,
@@ -163,11 +248,19 @@ impl LogSearch {
             self.matches.extend(
                 lines
                     .range(from, lines.end_id())
-                    .filter(|(_, line)| self.query.matches_line(line))
+                    .filter(|(_, line)| self.matcher.matches_line(line))
                     .map(|(id, _)| id),
             );
         }
         self.scanned_to = self.scanned_to.max(lines.end_id());
+    }
+
+    /// How many lines of `lines` the next [`LogSearch::update`] would scan: a front end that
+    /// put off scanning (for a hidden tab) can tell a short catch-up from a long one.
+    pub fn pending(&self, lines: &LogLines) -> u64 {
+        lines
+            .end_id()
+            .saturating_sub(self.scanned_to.max(lines.first_id()))
     }
 
     /// Matching line ids, oldest first.
@@ -286,6 +379,68 @@ mod tests {
         assert_eq!(search.matches(), &[0, 1, 2]);
     }
 
+    // covers UP-43: a search left alone (a hidden tab) catches up in one update, forgetting
+    // what was evicted meanwhile.
+    #[test]
+    fn a_search_left_behind_catches_up_in_one_update() {
+        let mut buffer = LogBuffer::new(5);
+        for t in ["error a", "ok", "ERROR b"] {
+            push(&mut buffer, t);
+        }
+        let mut search = LogSearch::new(SearchQuery::new("error"));
+        assert_eq!(search.pending(&buffer.view()), 3);
+        search.update(&buffer.view());
+        assert_eq!(search.pending(&buffer.view()), 0);
+        for t in ["ok", "ok", "error c", "ok", "error d"] {
+            push(&mut buffer, t);
+        }
+        // Lines 3..=7 are present; 3 to 7 were never scanned.
+        assert_eq!(search.pending(&buffer.view()), 5);
+        search.update(&buffer.view());
+        assert_eq!(search.matches(), &[5, 7]);
+        // Evicted before they were ever scanned: only what is present counts.
+        for n in 0..20 {
+            push(&mut buffer, &format!("error {n}"));
+        }
+        assert_eq!(search.pending(&buffer.view()), 5);
+        search.update(&buffer.view());
+        assert_eq!(search.matches(), &[23, 24, 25, 26, 27]);
+    }
+
+    #[test]
+    fn the_matcher_agrees_with_a_plain_search() {
+        // A letterless ASCII pattern takes the substring path; any case matches the same.
+        let q = SearchQuery::new("=5");
+        assert_eq!(q.match_ranges("a=5 b=50 =="), [1..3, 5..7]);
+        // The first byte in either case, then the rest; overlapping candidates are not lost.
+        let q = SearchQuery::new("aab");
+        assert_eq!(q.match_ranges("AAAB aab"), [1..4, 5..8]);
+        assert!(!q.is_match("aa"));
+        assert!(SearchQuery::new("b").is_match("aB"));
+        // Non-ASCII: a match after multi-byte chars keeps its byte offsets; a char that folds
+        // to two must match both.
+        let q = SearchQuery::new("straße");
+        let text = "öö STRAßE";
+        let ranges = q.match_ranges(text);
+        assert_eq!(&text[ranges[0].clone()], "STRAßE");
+        let q = SearchQuery::new("i\u{307}x");
+        assert!(q.is_match("\u{130}x"), "İ folds to i and a combining dot");
+        assert!(!q.is_match("\u{130}"));
+        // Case-sensitive non-ASCII is a byte search on char boundaries.
+        let mut sensitive = SearchQuery::new("ö");
+        sensitive.case_sensitive = true;
+        assert_eq!(sensitive.match_ranges("Öö ö"), [2..4, 5..7]);
+        // Sources are tested only when the query covers them.
+        let mut line = LogLine::parse("plain", false);
+        line.source = Some(std::sync::Arc::new(crate::logs::LineSource::new(
+            "web", "app",
+        )));
+        let mut q = SearchQuery::new("WEB");
+        assert!(!q.matcher().matches_line(&line));
+        q.sources = true;
+        assert!(q.matcher().matches_line(&line));
+    }
+
     #[test]
     fn match_ranges_point_into_the_original_text() {
         let q = SearchQuery::new("ab");
@@ -303,5 +458,45 @@ mod tests {
         let mut sensitive = SearchQuery::new("a");
         sensitive.case_sensitive = true;
         assert_eq!(sensitive.match_ranges("aAa"), [0..1, 2..3]);
+    }
+
+    /// A quick measure of a search's scan: 100k lines of about 100 bytes, for an ASCII query,
+    /// a non-ASCII one and a case-sensitive one. Ignored: run it in release mode with
+    /// `--ignored --nocapture` to compare changes to the matcher.
+    #[test]
+    #[ignore = "measurement: run with --release --ignored --nocapture"]
+    fn measure_scan_of_100k_lines() {
+        let mut buffer = LogBuffer::new(100_000);
+        for n in 0..100_000 {
+            push(
+                &mut buffer,
+                &format!(
+                    "level=info msg=\"request served\" path=/api/v1/items/{n} status=200 \
+                     duration=12ms user=someone@example.com"
+                ),
+            );
+        }
+        let lines = buffer.view();
+        let mut sensitive = SearchQuery::new("status=500");
+        sensitive.case_sensitive = true;
+        for query in [
+            SearchQuery::new("timeout"),
+            SearchQuery::new("größe"),
+            sensitive,
+        ] {
+            let rounds = 20;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let mut search = LogSearch::new(query.clone());
+                search.update(&lines);
+                assert_eq!(search.count(), 0);
+            }
+            eprintln!(
+                "scan of 100k lines for {:?} (case-sensitive: {}): {:?}",
+                query.text,
+                query.case_sensitive,
+                started.elapsed() / rounds
+            );
+        }
     }
 }

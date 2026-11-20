@@ -21,6 +21,7 @@ thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 libc.workspace = true
+memchr.workspace = true
 http.workspace = true
 # The client stack with TCP keepalive (`cluster::build_client`); all already in the tree through kube.
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }

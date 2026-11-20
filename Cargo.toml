@@ -25,6 +25,8 @@ async-channel = "2.5.0"
 # Already in the tree through kube; used to read log streams.
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
 libc = "0.2.191"
+# Already in the tree (through kube, tokio and GPUI); finds search matches in log lines.
+memchr = "2.8.3"
 notify = "8.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
