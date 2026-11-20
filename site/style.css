@@ -224,6 +224,17 @@ h3 { margin: 0 0 6px; font-size: 16px; }
 .code .c { color: var(--muted); }
 .hero-code { display: inline-block; max-width: 100%; margin-top: 24px; padding: 12px 18px; }
 
+.compare-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.compare { width: 100%; min-width: 640px; border-collapse: collapse; font-size: 14px; }
+.compare th,
+.compare td { padding: 12px 16px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+.compare tbody tr:last-child th,
+.compare tbody tr:last-child td { border-bottom: 0; }
+.compare thead th { font-weight: 600; }
+.compare tbody th { font-weight: 600; width: 9em; }
+.compare td { color: var(--muted); }
+.compare td:first-of-type { color: var(--text); }
+
 .roadmap { list-style: none; margin: 0; padding: 0; border-left: 2px solid var(--border); }
 .roadmap li { position: relative; display: flex; gap: 16px; padding: 8px 0 8px 22px; color: var(--muted); }
 .roadmap li::before {
