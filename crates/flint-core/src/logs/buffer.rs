@@ -150,22 +150,16 @@ impl LogBuffer {
     /// open tail block stays), for the shared budget ([`super::LogBudget`]). Returns whether any
     /// line was dropped.
     pub fn trim_to(&mut self, bytes: usize) -> bool {
-        !self.detach_to(bytes).is_empty()
-    }
-
-    /// As [`LogBuffer::trim_to`], but hands back the blocks it took out instead of freeing
-    /// them, so a caller holding a lock can free them after letting go of it.
-    pub fn detach_to(&mut self, bytes: usize) -> Vec<Arc<[LogLine]>> {
-        let mut detached = Vec::new();
+        let mut trimmed = false;
         while self.bytes > bytes
             && let Some(block) = self.chunks.pop_front()
         {
             self.bytes -= block.bytes;
             self.first = self.first.max(block.start + block.lines.len() as u64);
             self.dropped += 1;
-            detached.push(block.lines);
+            trimmed = true;
         }
-        detached
+        trimmed
     }
 
     /// How many blocks were dropped so far; changes exactly when memory was released.

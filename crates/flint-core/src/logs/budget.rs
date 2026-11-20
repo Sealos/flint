@@ -19,8 +19,6 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use super::line::LineId;
-
 /// The shared budget. Cheap to clone through `Arc`.
 #[derive(Debug)]
 pub struct LogBudget {
@@ -51,22 +49,7 @@ struct Entry {
     /// again from the measured sizes on every change ([`Inner::rebalance`]), so a tab shown
     /// since, or resumed, is never left with an old target.
     trim_to: Option<usize>,
-    /// The oldest line the session kept at its last trim: a snapshot published before that
-    /// trim may still show older ones ([`LogBudget::set_shown`]).
-    kept_from: Option<LineId>,
     wake: Arc<Notify>,
-}
-
-/// What a session holds after a trim ([`LogBudget::apply_trim`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Kept {
-    /// Bytes its buffer holds.
-    pub bytes: usize,
-    /// How many of them are in sealed blocks.
-    pub trimmable: usize,
-    /// Its oldest line, when the trim took blocks out (else its own caps, not the budget,
-    /// dropped what is gone).
-    pub first: Option<LineId>,
 }
 
 impl LogBudget {
@@ -95,7 +78,7 @@ impl LogBudget {
     }
 
     /// Session `id` starts; it trims when the returned [`Notify`] fires
-    /// ([`LogBudget::apply_trim`]). A new session counts as just viewed.
+    /// ([`LogBudget::take_trim`]). A new session counts as just viewed.
     pub(crate) fn register(&self, id: u64) -> Arc<Notify> {
         let mut inner = self.lock();
         inner.clock += 1;
@@ -110,7 +93,6 @@ impl LogBudget {
                 shown: false,
                 paused: false,
                 trim_to: None,
-                kept_from: None,
                 wake: wake.clone(),
             },
         );
@@ -128,22 +110,17 @@ impl LogBudget {
 
     /// Whether session `id`'s tab is the one shown. Hiding it counts as having viewed it until
     /// now, so the most recently hidden tab is trimmed last.
-    ///
-    /// Returns the oldest line the session kept at its last trim, if it was ever trimmed: a
-    /// trim done just before may not be published yet, so a tab being shown drops older lines
-    /// from the snapshot it has before showing it, rather than losing them on screen (UP-42).
-    pub fn set_shown(&self, id: u64, shown: bool) -> Option<LineId> {
+    pub fn set_shown(&self, id: u64, shown: bool) {
         let mut inner = self.lock();
         inner.clock += 1;
         let now = inner.clock;
-        let entry = inner.sessions.get_mut(&id)?;
-        let kept_from = entry.kept_from;
-        if entry.shown != shown {
+        if let Some(entry) = inner.sessions.get_mut(&id)
+            && entry.shown != shown
+        {
             entry.shown = shown;
             entry.viewed = now;
             inner.rebalance();
         }
-        kept_from
     }
 
     /// Whether session `id`'s tab is the one shown.
@@ -174,47 +151,23 @@ impl LogBudget {
         }
     }
 
-    /// Trims session `id` as planned, if a trim is: `trim` takes its oldest blocks out down to
-    /// the bytes given (moving block handles, nothing more: a tab being shown waits on this)
-    /// and returns what the session [`Kept`], and what it took out. It runs under the budget's
-    /// lock, so a tab shown, or resumed, meanwhile either withdraws the trim first or comes
-    /// after it, and then knows which lines it kept ([`LogBudget::set_shown`]). What was taken
-    /// out is returned, to be freed, and a paused view rebuilt, after the lock is let go.
-    ///
-    /// The result is recorded without planning again: what a session cannot give back would
+    /// Session `id` trimmed as asked and holds `bytes` now, `trimmable` of them in sealed
+    /// blocks. Recorded without planning again: what a session cannot give back would
     /// otherwise have it asked again at once, in a loop. The next change plans again.
-    pub(crate) fn apply_trim<R>(
-        &self,
-        id: u64,
-        trim: impl FnOnce(usize) -> (Kept, R),
-    ) -> Option<R> {
-        let mut inner = self.lock();
-        let entry = inner.sessions.get_mut(&id)?;
-        let target = entry.trim_to.take()?;
-        let (kept, released) = trim(target);
-        (entry.bytes, entry.trimmable) = (kept.bytes, kept.trimmable);
-        if kept.first.is_some() {
-            entry.kept_from = kept.first;
+    pub(crate) fn trimmed(&self, id: u64, bytes: usize, trimmable: usize) {
+        if let Some(entry) = self.lock().sessions.get_mut(&id) {
+            entry.bytes = bytes;
+            entry.trimmable = trimmable;
+            entry.trim_to = None;
         }
-        Some(released)
     }
 
     /// What session `id` should trim its buffer down to, if anything; asked once.
-    #[cfg(test)]
-    fn take_trim(&self, id: u64) -> Option<usize> {
+    pub(crate) fn take_trim(&self, id: u64) -> Option<usize> {
         self.lock()
             .sessions
             .get_mut(&id)
             .and_then(|e| e.trim_to.take())
-    }
-
-    /// Session `id` trimmed as asked and holds `bytes` now, `trimmable` of them in sealed
-    /// blocks.
-    #[cfg(test)]
-    fn trimmed(&self, id: u64, bytes: usize, trimmable: usize) {
-        if let Some(entry) = self.lock().sessions.get_mut(&id) {
-            (entry.bytes, entry.trimmable, entry.trim_to) = (bytes, trimmable, None);
-        }
     }
 
     /// Bytes all sessions hold as planned: what they reported, less the trims asked of them.
@@ -389,67 +342,6 @@ mod tests {
         budget.report(2, 6 * MIB, 6 * MIB, false);
         budget.unregister(2);
         assert_eq!(budget.take_trim(1), None, "6 MiB fits once 2 is closed");
-    }
-
-    // covers UP-42: a trim and showing the tab are never interleaved (#296).
-    #[test]
-    fn a_trim_applies_before_the_tab_is_shown_or_not_at_all() {
-        let budget = LogBudget::new(10 * MIB);
-        for id in 1..=2 {
-            budget.register(id);
-        }
-        budget.set_shown(2, true);
-        budget.report(1, 6 * MIB, 6 * MIB, false);
-        budget.report(2, 6 * MIB, 6 * MIB, false);
-        let kept = |t| Kept {
-            bytes: t,
-            trimmable: t,
-            first: Some(7),
-        };
-        assert_eq!(budget.set_shown(1, false), None, "never trimmed");
-        // Tab 1 trims with the budget's lock held, so a tab shown meanwhile waits for it (and
-        // what it took out is handed back, to free after).
-        let released = budget.apply_trim(1, |target| {
-            assert!(
-                budget.inner.try_lock().is_err(),
-                "the budget's lock is held"
-            );
-            (kept(target), "released")
-        });
-        assert_eq!(released, Some("released"));
-        assert_eq!(budget.apply_trim(1, |t| (kept(t), ())), None, "asked once");
-        // Shown next: it learns which lines the trim kept.
-        assert_eq!(budget.set_shown(1, true), Some(7));
-        // A trim that took nothing out leaves that alone: lines its own caps dropped are not
-        // the budget's doing.
-        budget.set_shown(1, false);
-        budget.report(1, 6 * MIB, 6 * MIB, false);
-        let nothing = |t| Kept {
-            bytes: t,
-            trimmable: t,
-            first: None,
-        };
-        assert_eq!(budget.apply_trim(1, |t| (nothing(t), ())), Some(()));
-        assert_eq!(budget.set_shown(1, true), Some(7));
-        budget.set_shown(1, false);
-
-        // Shown first: a trim planned while it was hidden is withdrawn, and applying it does
-        // nothing.
-        budget.set_shown(1, false);
-        budget.set_shown(2, true);
-        budget.report(1, 6 * MIB, 6 * MIB, false);
-        budget.report(2, 6 * MIB, 6 * MIB, false);
-        assert!(
-            budget.lock().sessions[&1].trim_to.is_some(),
-            "a trim is planned"
-        );
-        budget.set_shown(1, true);
-        let mut ran = false;
-        budget.apply_trim(1, |t| {
-            ran = true;
-            (kept(t), ())
-        });
-        assert!(!ran, "the shown tab keeps its lines");
     }
 
     #[test]

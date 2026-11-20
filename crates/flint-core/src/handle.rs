@@ -795,12 +795,8 @@ impl LogSession {
     /// Whether this session's tab is the one shown. The shared log memory budget trims the
     /// sessions viewed least recently first and never the shown one (see
     /// [`crate::logs::LogBudget`]).
-    ///
-    /// Returns the oldest line the session kept at its last trim, if it was trimmed: older
-    /// lines in a snapshot already taken are gone, and a tab being shown drops them before it
-    /// shows them (UP-42).
-    pub fn set_shown(&self, shown: bool) -> Option<crate::LineId> {
-        self.budget.set_shown(self.id, shown)
+    pub fn set_shown(&self, shown: bool) {
+        self.budget.set_shown(self.id, shown);
     }
 
     /// Whether [`LogSession::set_shown`] last said this tab is shown (once the core has started

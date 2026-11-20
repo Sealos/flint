@@ -159,10 +159,6 @@ pub struct LogView {
     laid_out_width: Option<f32>,
     focus: FocusHandle,
     _pump: Task<()>,
-    /// The oldest line the session kept at a trim made while the tab was hidden: snapshots
-    /// taken before it, still on their way, are shown without older lines, until one starts at
-    /// it or later ([`LogView::set_shown`]).
-    kept_floor: Option<LineId>,
     _search: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -240,7 +236,6 @@ impl LogView {
             laid_out_width: None,
             focus: cx.focus_handle(),
             _pump: pump,
-            kept_floor: None,
             _search: Task::ready(()),
             _subscriptions: vec![on_search],
         }
@@ -288,14 +283,6 @@ impl LogView {
     /// lines still present. The search catches up when the tab is drawn
     /// ([`LogView::catch_up_search`]).
     pub fn set_snapshot(&mut self, snapshot: Arc<LogSnapshot>, cx: &mut Context<Self>) {
-        // An older snapshot than the trim the tab was shown after, still on its way.
-        let snapshot = match self.kept_floor {
-            Some(floor) if snapshot.lines.first_id() < floor => log_model::clipped(snapshot, floor),
-            _ => {
-                self.kept_floor = None;
-                snapshot
-            }
-        };
         let old = &self.snapshot.lines;
         let new = &snapshot.lines;
         match log_model::list_change(old.first_id()..old.end_id(), new.first_id()..new.end_id()) {
@@ -342,20 +329,8 @@ impl LogView {
     }
 
     /// Whether this tab is the one shown, for the shared log memory budget (see the dock).
-    ///
-    /// Shown, it takes in the newest snapshot now rather than with the next frame, without
-    /// the lines a trim made while it was hidden: that trim may not have reached a snapshot
-    /// yet, and lines dropped from a tab on screen would read as lines that never came (UP-42).
-    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
-        let kept_from = self.session.set_shown(shown);
-        if !shown {
-            return;
-        }
-        self.kept_floor = kept_from;
-        let snapshot = log_model::shown_snapshot(&self.snapshot, self.session.peek(), kept_from);
-        if !Arc::ptr_eq(&snapshot, &self.snapshot) {
-            self.set_snapshot(snapshot, cx);
-        }
+    pub fn set_shown(&self, shown: bool) {
+        self.session.set_shown(shown);
     }
 
     #[cfg(test)]
