@@ -739,14 +739,21 @@ Rules:
       are hidden together whatever its length, unless that word is the next field, a flag or `key=`);
     - `Cookie` and `Set-Cookie` header values, every cookie with its name: to the closing quote when quoted, to the
       closing bracket of a list (a JSON array, a Go header map, `[]string{...}`; a bracket inside a quoted cookie
-      does not end it), to the closing apostrophe of a single-quoted header (`curl -H 'Cookie: ...'`), or else to
-      the end of the line; a quoted cookie value (`session="v"`) does not end it. This header rule and the `Authorization` one also match right after an escaped `\n`, as
-      in a request dumped into a JSON string, where the value (a Digest one too) ends at the next escaped `\n`;
+      does not end it; quoted items become one quoted marker, `["[REDACTED:cookie]"]`, so JSON still parses), to
+      the closing apostrophe of a single-quoted header or value (`curl -H 'Cookie: ...'`, `Cookie='sid=...'`), or
+      else to the end of the line; a quoted cookie value (`session="v"`) does not end it. A JSON array that opens
+      at the end of its line (pretty-printed) after a `"Cookie"` or `"Set-Cookie"` key is found over the whole
+      text, and each item becomes `"[REDACTED:cookie]"`; a list is skipped only when every item is already a
+      marker. This header rule and the `Authorization` one also match right after an escaped `\n`,
+      as in a request dumped into a JSON string, where the value (a Digest one too) ends at the next escaped `\n`;
     - passwords in URLs (`scheme://user:pass@host`), up to the authority's last `@`; a password with an unencoded
       `/`, `?` or `#` is caught too, unless the part after the colon is a port (`:8443/`); and in Go MySQL DSNs,
       which have no `://` (`user:pass@tcp(host:3306)/db`, also `unix(` and `udp(`), from the DSN's first `:` to
-      the `@` before the protocol; a DSN in double quotes starts after the last one, so its password can hold
-      spaces, brackets and apostrophes;
+      the `@` before the protocol; what ends the DSN tells what opened it: a quote (with as many backslashes, in
+      escaped JSON) opens it at the last such quote before the `@`, so its password can hold spaces, brackets,
+      apostrophes and escaped quotes (a closed address, such as a socket path, can hold spaces too); a bare DSN
+      starts after the last space, comma or opening brace and a field name (`"dsn":`, `dsn=`), or after the
+      last quote before it when that gives a longer password; DSNs in a comma list are each found;
     - registry `auth` values in docker config JSON (`"auth": "<base64 user:pass>"`, at any escape level, and the
       same key in YAML, also `auth :`, or a Python dict), when the value decodes to `user:password`;
     - AWS access key ids (`AKIA`/`ASIA`) and secret access keys (by key name, or a 40-character mixed-case value on
@@ -772,9 +779,10 @@ Rules:
       `GOOGLE_APPLICATION_CREDENTIALS=/var/run/key.json`), and a bare number after a bare `pass` key
       (`pass=1 failed=0`, `pass: 3 fail: 0`; `DB_PASS=123456` and `pass="123 example phrase"` are still hidden).
 
-    The patterns err toward redacting. A test keeps the redactor as it was before #224 and checks, over every
-    unit-test input and each credential shape in each wrapper a log puts it in, that every byte it hid is still
-    hidden.
+    The patterns err toward redacting. A test keeps the redactor as it was on master after #235 and checks, over
+    every unit-test input and each credential shape in each wrapper a log puts it in, that every byte it hid is
+    still hidden, apart from two intended narrowings: the quotes a quoted list keeps around its marker, and the
+    text after a single-quoted cookie value's closing apostrophe.
   - **Where it applies:** every line `get_pod_logs` returns; every event message `get_events` returns; every
     `list_resources` cell (printer columns show event, status and condition messages); every string, at any depth,
     under a `note` key or a key ending in `message` or `messages` (also each string of a list there) in

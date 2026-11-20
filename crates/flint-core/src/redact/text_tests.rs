@@ -822,11 +822,11 @@ fn cookie_headers() {
         ),
         (
             r#"{"Set-Cookie":["a=s3cr3tA; Path=/","b=s3cr3tB; Path=/"],"Vary":"Accept"}"#,
-            r#"{"Set-Cookie":[[REDACTED:cookie]],"Vary":"Accept"}"#,
+            r#"{"Set-Cookie":["[REDACTED:cookie]"],"Vary":"Accept"}"#,
         ),
         (
             r#"http.Header{"Cookie":[]string{"sid=abc123"}}"#,
-            r#"http.Header{"Cookie":[]string{[REDACTED:cookie]}}"#,
+            r#"http.Header{"Cookie":[]string{"[REDACTED:cookie]"}}"#,
         ),
         // A request dumped into a JSON string, and the same for `Authorization`.
         (
@@ -988,15 +988,15 @@ fn cookie_lists_end_at_their_closing_bracket_outside_quotes() {
     for (line, want) in [
         (
             r#"{"Set-Cookie":["a=1; Path=/x]y","b=s3cr3tB; Path=/"],"Vary":"Accept"}"#,
-            r#"{"Set-Cookie":[[REDACTED:cookie]],"Vary":"Accept"}"#,
+            r#"{"Set-Cookie":["[REDACTED:cookie]"],"Vary":"Accept"}"#,
         ),
         (
             r#"{\"Set-Cookie\":[\"a=1; Path=/]\",\"b=s3cr3tB\"],\"Vary\":\"Accept\"}"#,
-            r#"{\"Set-Cookie\":[[REDACTED:cookie]],\"Vary\":\"Accept\"}"#,
+            r#"{\"Set-Cookie\":[\"[REDACTED:cookie]\"],\"Vary\":\"Accept\"}"#,
         ),
         (
             r#"http.Header{"Cookie":[]string{"a=}b", "sid=s3cr3t"}, "Accept":[]string{"*/*"}}"#,
-            r#"http.Header{"Cookie":[]string{[REDACTED:cookie]}, "Accept":[]string{"*/*"}}"#,
+            r#"http.Header{"Cookie":[]string{"[REDACTED:cookie]"}, "Accept":[]string{"*/*"}}"#,
         ),
     ] {
         assert_eq!(redacted(line, 1), want, "{line}");
@@ -1139,7 +1139,158 @@ fn cookie_list_quote_level_skips_leading_spaces() {
             r#"{\"Set-Cookie\":[ \"a=1; Path=/]\",\"b=s3cr3tB\"],\"Vary\":\"Accept\"}"#,
             1
         ),
-        r#"{\"Set-Cookie\":[[REDACTED:cookie]],\"Vary\":\"Accept\"}"#
+        r#"{\"Set-Cookie\":[ \"[REDACTED:cookie]\"],\"Vary\":\"Accept\"}"#
+    );
+}
+
+#[test]
+fn a_dsn_opens_where_its_closing_delimiter_says() {
+    for (line, want) in [
+        (
+            "dsn=app:it's-private@tcp(db)/app",
+            "dsn=app:[REDACTED:password]@tcp(db)/app",
+        ),
+        (
+            r#"{"dsn":"app:p\"x@tcp(db)/app"}"#,
+            r#"{"dsn":"app:[REDACTED:password]@tcp(db)/app"}"#,
+        ),
+        (
+            r#"{\"dsn\":\"app:p\\\"x@tcp(db)/app\"}"#,
+            r#"{\"dsn\":\"app:[REDACTED:password]@tcp(db)/app\"}"#,
+        ),
+        (
+            "dsn='app:a\"b@tcp(db)/app' ok",
+            "dsn='app:[REDACTED:password]@tcp(db)/app' ok",
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        r#"{"msg":"it's up","addr":"user@tcp(db:3306)"}"#,
+        "dial user@tcp(db) it's fine",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn set_cookie_arrays_stay_valid_json() {
+    let one_line =
+        r#"{"headers":{"Set-Cookie":["a=s3cr3tA; Path=/x]y","b=s3cr3tB"],"Vary":"Accept"}}"#;
+    let pretty = "{\n  \"headers\": {\n    \"Set-Cookie\": [\n      \"a=s3cr3tA; Path=/\",\n      \"b=s3cr3tB; HttpOnly\"\n    ],\n    \"Vary\": \"Accept\"\n  }\n}\n";
+    for (text, count) in [(one_line, 1), (pretty, 2)] {
+        let out = redact_credentials(text);
+        assert_eq!(out.count, count, "{}", out.text);
+        assert!(!out.text.contains("s3cr3t"), "{}", out.text);
+        let parsed: serde_json::Value = serde_json::from_str(&out.text).expect("still JSON");
+        let cookies = parsed["headers"]["Set-Cookie"].as_array().expect("array");
+        assert!(
+            cookies.iter().all(|c| c == "[REDACTED:cookie]"),
+            "{cookies:?}"
+        );
+        assert_eq!(parsed["headers"]["Vary"], "Accept");
+        // Redacting again changes nothing.
+        let again = redact_credentials(&out.text);
+        assert_eq!((again.count, again.text.as_ref()), (0, out.text.as_ref()));
+    }
+    // Other arrays, and a cookie array of numbers, are left alone.
+    same("{\n  \"Accept\": [\n    \"*/*\"\n  ]\n}");
+    same("{\n  \"cookies\": [\n    \"a=1\"\n  ]\n}");
+}
+
+#[test]
+fn a_single_quoted_cookie_value_ends_at_its_apostrophe() {
+    assert_eq!(
+        redacted("Cookie='sid=example' status=200", 1),
+        "Cookie='[REDACTED:cookie]' status=200"
+    );
+    same("cookie='' status=200");
+}
+
+#[test]
+fn a_cookie_starting_with_dashes_is_hidden_whole() {
+    assert_eq!(
+        redacted("Cookie: -----sid=example; session=sample", 1),
+        "Cookie: [REDACTED:cookie]"
+    );
+    // After a credential key, a value of dashes is still one word, left alone.
+    same("password: ----- user=app");
+}
+
+#[test]
+fn a_cookie_list_with_a_masked_item_hides_the_rest() {
+    assert_eq!(
+        redacted(r#"{"Set-Cookie":["[REDACTED:cookie]","b=s3cr3tB"]}"#, 1),
+        r#"{"Set-Cookie":["[REDACTED:cookie]"]}"#
+    );
+    assert_eq!(
+        redacted(
+            r#"{"Set-Cookie":["a=s3cr3tA","[REDACTED:cookie]","c=s3cr3tC"]}"#,
+            1
+        ),
+        r#"{"Set-Cookie":["[REDACTED:cookie]"]}"#
+    );
+    same(r#"{"Set-Cookie":["[REDACTED:cookie]"]}"#);
+    same(r#"{"Set-Cookie":["[REDACTED:cookie]","[REDACTED:cookie]"]}"#);
+}
+
+#[test]
+fn dsns_with_spaces_in_the_address_and_lists_of_dsns() {
+    for (line, want) in [
+        (
+            r#"{"dsn":"app:p w@unix(/var/run/my sql.sock)/app"}"#,
+            r#"{"dsn":"app:[REDACTED:password]@unix(/var/run/my sql.sock)/app"}"#,
+        ),
+        (
+            "dsns=root:a@tcp(db)/x,root:b@tcp(db)/y",
+            "dsns=root:[REDACTED:password]@tcp(db)/x,root:[REDACTED:password]@tcp(db)/y",
+        ),
+        (
+            "dsns=root:a@tcp(db)/x, root:b@tcp(db)/y",
+            "dsns=root:[REDACTED:password]@tcp(db)/x, root:[REDACTED:password]@tcp(db)/y",
+        ),
+        (
+            r#"{"dsn":root:pw@tcp(db)/app}"#,
+            r#"{"dsn":root:[REDACTED:password]@tcp(db)/app}"#,
+        ),
+        (
+            r#""auth":"x" app:p w@unix(/tmp/my sql.sock)/app"#,
+            r#""auth":"x" app:[REDACTED:password]@unix(/tmp/my sql.sock)/app"#,
+        ),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+    for line in [
+        r#"{"addr":"user@unix(/var/run/my sql.sock)/app"}"#,
+        "dsns=root@tcp(db)/x,root@tcp(db)/y",
+        r#"{"dsn":root@tcp(db)/app}"#,
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn cookie_items_ending_in_an_escaped_backslash_stay_valid_json() {
+    let compact = r#"{"Set-Cookie":["a=x\\","b=s3cr3tB\\"]}"#;
+    let pretty = "{\n  \"Set-Cookie\": [\n    \"a=x\\\\\",\n    \"b=s3cr3tB\\\\\"\n  ]\n}";
+    for (text, count) in [(compact, 1), (pretty, 2)] {
+        let out = redact_credentials(text);
+        assert_eq!(out.count, count, "{}", out.text);
+        assert!(!out.text.contains("s3cr3t"), "{}", out.text);
+        let parsed: serde_json::Value = serde_json::from_str(&out.text).expect("still JSON");
+        let cookies = parsed["Set-Cookie"].as_array().expect("array");
+        assert!(
+            cookies.iter().all(|c| c == "[REDACTED:cookie]"),
+            "{cookies:?}"
+        );
+    }
+}
+
+#[test]
+fn only_cookie_headers_are_redacted_as_cookie_arrays() {
+    same(
+        "{\n  \"trackingCookie\": [\n    \"t=1\"\n  ],\n  \"cookieNames\": [\n    \"sid\"\n  ]\n}",
     );
 }
 
@@ -1215,6 +1366,11 @@ fn long_lines_of_quoted_values_are_linear() {
         r#"token=Bearer x="y" "#,
         "-H 'Cookie: a' ",
         r#"-H 'Cookie: a="b"' "#,
+        "Cookie='a' ",
+        "a:b'c@tcp(x)/y ",
+        "a:b@tcp(x)/y,",
+        "a:b@unix(/s s ",
+        r#""a:b\"c@tcp(x)/y" "#,
     ] {
         let line = unit.repeat(MIB / unit.len());
         let start = std::time::Instant::now();
