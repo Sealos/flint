@@ -248,6 +248,58 @@ async fn reloads_when_settings_change() {
     assert!(error.unwrap().contains("settings.toml"));
 }
 
+// covers UP-16: the activity log is read at start, and again whenever another process (`flint
+// mcp`) appends to it or rotates it, so the app shows an agent's calls while it works.
+#[tokio::test]
+async fn reports_the_agent_activity_log_as_it_grows() {
+    use flint_core::activity::{self, ActivityRecord, Outcome};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let config = dir.path().join("config");
+    let record = |n: i64| ActivityRecord {
+        at_ms: n,
+        tool: "list_resources".into(),
+        cluster: Some("one".into()),
+        server: Some(SERVER.into()),
+        kind: Some("pods".into()),
+        namespace: None,
+        name: None,
+        container: None,
+        items: Some(3),
+        bytes: 400,
+        truncated: false,
+        outcome: Outcome::Ok,
+    };
+    activity::append(&config, &record(1)).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    let next = || async {
+        loop {
+            if let Event::AgentActivity(records) = events.recv().await.unwrap() {
+                return records;
+            }
+        }
+    };
+    let first = tokio::time::timeout(Duration::from_secs(5), next())
+        .await
+        .expect("the log is read at start");
+    assert_eq!(*first, [record(1)]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    activity::append(&config, &record(2)).unwrap();
+    // Other reloads may come first (the watcher starting); the one after the append has it.
+    let grown = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let records = next().await;
+            if records.len() > 1 {
+                return records;
+            }
+        }
+    })
+    .await
+    .expect("an append is noticed");
+    assert_eq!(*grown, [record(1), record(2)]);
+}
+
 // covers UP-04
 #[tokio::test]
 async fn unreachable_cluster_fails_with_a_readable_error() {

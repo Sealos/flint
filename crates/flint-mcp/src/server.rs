@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use flint_core::activity;
 use flint_core::cache::{SlotMap, slot};
 use flint_core::cluster::{self, ClusterError, Target};
 use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
@@ -61,13 +62,28 @@ type Kinds = Arc<Vec<KindInfo>>;
 /// There is deliberately no `From<ClusterError>`: a cluster error must name its target first,
 /// through [`Conn::fail`], so it says which server timed out or which plugin is missing.
 #[derive(Debug)]
-struct ToolError(String);
+struct ToolError {
+    message: String,
+    /// The call named something the agent may not read: a cluster not exposed, or a namespace or
+    /// kind outside its scope. Only [`policy::PolicyError`] sets it. The agent cannot tell (the
+    /// message is the same as for a cluster that does not exist); the activity log can.
+    denied: bool,
+}
+
+impl ToolError {
+    fn new(message: impl Into<String>) -> Self {
+        ToolError {
+            message: message.into(),
+            denied: false,
+        }
+    }
+}
 
 macro_rules! tool_error_from {
     ($($t:ty),* $(,)?) => {$(
         impl From<$t> for ToolError {
             fn from(e: $t) -> Self {
-                ToolError(e.to_string())
+                ToolError::new(e.to_string())
             }
         }
     )*};
@@ -77,8 +93,16 @@ tool_error_from!(
     serde_json::Error,
     serde_saphyr::ser::Error,
     tokio::task::JoinError,
-    policy::PolicyError,
 );
+
+impl From<policy::PolicyError> for ToolError {
+    fn from(e: policy::PolicyError) -> Self {
+        ToolError {
+            message: e.to_string(),
+            denied: true,
+        }
+    }
+}
 
 /// A connection to an exposed cluster, with what its errors may name.
 struct Conn {
@@ -93,21 +117,134 @@ impl Conn {
     /// A cluster error as the agent reads it: naming the server and the exec plugin, with the
     /// server's own text cut to one short line ([`ClusterError::for_agent`]).
     fn fail(&self, e: ClusterError) -> ToolError {
-        ToolError(e.for_target(&self.target).for_agent())
+        ToolError::new(e.for_target(&self.target).for_agent())
     }
 }
 
 type ToolResult = Result<CallToolResult, rmcp::ErrorData>;
 
-fn finish(result: Result<String, ToolError>) -> ToolResult {
-    Ok(match result {
-        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        // A server's error text can quote what a workload wrote (webhooks, aggregated APIs).
-        Err(ToolError(mut msg)) => {
-            policy::redact_text(&mut msg);
-            CallToolResult::error(vec![ContentBlock::text(msg)])
+/// What a tool call named, as the agent wrote it: recorded in the activity log.
+#[derive(Debug, Default, Clone)]
+struct Named {
+    cluster: Option<String>,
+    kind: Option<String>,
+    namespace: Option<String>,
+    name: Option<String>,
+    container: Option<String>,
+}
+
+impl Named {
+    fn cluster(cluster: &str) -> Self {
+        Named {
+            cluster: Some(cluster.to_owned()),
+            ..Named::default()
         }
-    })
+    }
+}
+
+/// How many items a reply holds and whether it was cut short, read from the reply's own
+/// fields (what the agent saw): `count` (or `lines` for logs, `clusters` for list_clusters) and
+/// `truncated` in JSON, and a `# truncated=true` header line in get_resource's YAML.
+fn reply_size(tool: &str, text: &str) -> (Option<u64>, bool) {
+    if tool == "get_resource" {
+        let truncated = text
+            .lines()
+            .take_while(|l| l.starts_with('#'))
+            .any(|l| l.starts_with("# truncated=true"));
+        return (Some(1), truncated);
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return (None, false);
+    };
+    let items = value
+        .get("count")
+        .or_else(|| value.get("lines"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            let clusters = value.get("clusters")?.as_array()?;
+            u64::try_from(clusters.len()).ok()
+        });
+    let truncated = value.get("truncated").and_then(Value::as_bool) == Some(true);
+    (items, truncated)
+}
+
+impl FlintMcp {
+    /// Turns a tool's result into its reply, and records the call in the activity log
+    /// (ADR-0013, UP-16): what it named and how much came back, never the content.
+    async fn finish(
+        &self,
+        tool: &'static str,
+        named: Named,
+        result: Result<String, ToolError>,
+    ) -> ToolResult {
+        let (text, outcome, ok) = match result {
+            Ok(text) => (text, activity::Outcome::Ok, true),
+            // A server's error text can quote what a workload wrote (webhooks, aggregated APIs).
+            Err(ToolError {
+                mut message,
+                denied,
+            }) => {
+                policy::redact_text(&mut message);
+                let outcome = if denied {
+                    activity::Outcome::Denied
+                } else {
+                    activity::Outcome::Failed
+                };
+                (message, outcome, false)
+            }
+        };
+        let (items, truncated) = if ok {
+            reply_size(tool, &text)
+        } else {
+            (None, false)
+        };
+        self.record(activity::ActivityRecord {
+            at_ms: activity::now_ms(),
+            tool: tool.to_owned(),
+            server: None,
+            cluster: named.cluster,
+            kind: named.kind,
+            namespace: named.namespace,
+            name: named.name,
+            container: named.container,
+            items,
+            bytes: text.len() as u64,
+            truncated,
+            outcome,
+        })
+        .await;
+        let content = vec![ContentBlock::text(text)];
+        Ok(if ok {
+            CallToolResult::success(content)
+        } else {
+            CallToolResult::error(content)
+        })
+    }
+
+    /// Appends `record` to the activity log, with the server its cluster is exposed with. A
+    /// failure to write is logged and does not fail the call.
+    async fn record(&self, mut record: activity::ActivityRecord) {
+        let dir = self.inner.config_dir.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            if let Some(cluster) = &record.cluster {
+                record.server = settings::load_settings(&dir)
+                    .ok()
+                    .and_then(|s| {
+                        s.ai_exposed_clusters
+                            .into_iter()
+                            .find(|e| &e.context == cluster)
+                    })
+                    .map(|e| flint_core::redact::server_url(&e.server));
+            }
+            activity::append(&dir, &record)
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+            Err(e) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+        }
+    }
 }
 
 /// One row of list_resource_kinds. `shortNames` only when the kind has some.
@@ -130,9 +267,9 @@ fn kind_row(k: &KindInfo) -> Value {
 fn kind_error(e: ResolveKindError) -> ToolError {
     match e {
         ResolveKindError::NotFound(_) => {
-            ToolError(format!("{e}. Call list_resource_kinds for the kinds."))
+            ToolError::new(format!("{e}. Call list_resource_kinds for the kinds."))
         }
-        ResolveKindError::Ambiguous { .. } => ToolError(format!("{e}.")),
+        ResolveKindError::Ambiguous { .. } => ToolError::new(format!("{e}.")),
     }
 }
 
@@ -142,7 +279,7 @@ fn kind_error(e: ResolveKindError) -> ToolError {
 /// it can never reach another path, and the caller learns nothing it would not from a missing
 /// object.
 fn not_found(resource: &str, name: &str) -> ToolError {
-    ToolError(format!("NotFound: {resource} {name:?} not found"))
+    ToolError::new(format!("NotFound: {resource} {name:?} not found"))
 }
 
 /// Refuses a namespace that is not a DNS-1123 label, as [`not_found`] for the namespace.
@@ -260,7 +397,8 @@ impl FlintMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_clusters(&self) -> ToolResult {
-        finish(self.do_list_clusters().await)
+        let result = self.do_list_clusters().await;
+        self.finish("list_clusters", Named::default(), result).await
     }
 
     #[tool(
@@ -268,7 +406,9 @@ impl FlintMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_resource_kinds(&self, Parameters(p): Parameters<ClusterParams>) -> ToolResult {
-        finish(self.do_list_kinds(p).await)
+        let named = Named::cluster(&p.cluster);
+        let result = self.do_list_kinds(p).await;
+        self.finish("list_resource_kinds", named, result).await
     }
 
     #[tool(
@@ -279,7 +419,13 @@ impl FlintMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_resources(&self, Parameters(p): Parameters<ListResourcesParams>) -> ToolResult {
-        finish(self.do_list_resources(p).await)
+        let named = Named {
+            kind: Some(p.kind.clone()),
+            namespace: p.namespace.clone(),
+            ..Named::cluster(&p.cluster)
+        };
+        let result = self.do_list_resources(p).await;
+        self.finish("list_resources", named, result).await
     }
 
     #[tool(
@@ -287,7 +433,14 @@ impl FlintMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_resource(&self, Parameters(p): Parameters<GetResourceParams>) -> ToolResult {
-        finish(self.do_get_resource(p).await)
+        let named = Named {
+            kind: Some(p.kind.clone()),
+            namespace: p.namespace.clone(),
+            name: Some(p.name.clone()),
+            ..Named::cluster(&p.cluster)
+        };
+        let result = self.do_get_resource(p).await;
+        self.finish("get_resource", named, result).await
     }
 
     #[tool(
@@ -295,7 +448,14 @@ impl FlintMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_events(&self, Parameters(p): Parameters<GetEventsParams>) -> ToolResult {
-        finish(self.do_get_events(p).await)
+        let named = Named {
+            kind: p.object_kind.clone(),
+            namespace: p.namespace.clone(),
+            name: p.object_name.clone(),
+            ..Named::cluster(&p.cluster)
+        };
+        let result = self.do_get_events(p).await;
+        self.finish("get_events", named, result).await
     }
 
     #[tool(
@@ -303,7 +463,15 @@ impl FlintMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_pod_logs(&self, Parameters(p): Parameters<GetPodLogsParams>) -> ToolResult {
-        finish(self.do_get_pod_logs(p).await)
+        let named = Named {
+            kind: Some("pods".to_owned()),
+            namespace: Some(p.namespace.clone()),
+            name: Some(p.pod.clone()),
+            container: p.container.clone(),
+            ..Named::cluster(&p.cluster)
+        };
+        let result = self.do_get_pod_logs(p).await;
+        self.finish("get_pod_logs", named, result).await
     }
 }
 
@@ -329,7 +497,7 @@ impl FlintMcp {
         tokio::task::spawn_blocking(move || {
             // The full TOML error quotes lines of settings.toml; give the agent one line.
             let settings = settings::load_settings(&inner.config_dir).map_err(|e| {
-                ToolError(format!(
+                ToolError::new(format!(
                     "Flint's settings.toml is invalid ({}), so no cluster is exposed. Ask the \
                      user to fix it; the Flint app shows the details.",
                     flint_core::redact::safe_error_summary(&e.to_string())
@@ -355,7 +523,7 @@ impl FlintMcp {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
-            .ok_or_else(|| ToolError(format!("cluster \"{name}\" not found")))?;
+            .ok_or_else(|| ToolError::new(format!("cluster \"{name}\" not found")))?;
         // Derived from the same kubeconfig entries as the fingerprint, so it always matches the
         // cached client.
         let target = Target::of(&ctx.kubeconfig.merged, &info.name);
@@ -372,7 +540,7 @@ impl FlintMcp {
             })
             .await
             .map_err(|e| e.for_target(&target).for_agent())
-            .map_err(ToolError)?
+            .map_err(ToolError::new)?
             .clone();
         Ok(Conn {
             client,
@@ -525,13 +693,13 @@ impl FlintMcp {
                 let result = tokio::time::timeout(PROBE_TIMEOUT, probe)
                     .await
                     .unwrap_or_else(|_| {
-                        Err(ToolError(
+                        Err(ToolError::new(
                             ClusterError::timeout(PROBE_TIMEOUT, None)
                                 .for_target(&target)
                                 .to_string(),
                         ))
                     })
-                    .map_err(|e| e.0);
+                    .map_err(|e| e.message);
                 (name, result)
             });
         }
@@ -559,7 +727,7 @@ impl FlintMcp {
             })
             .await?;
         if !kind.is_listable() {
-            return Err(ToolError(format!("{} cannot be listed", kind.kind())));
+            return Err(ToolError::new(format!("{} cannot be listed", kind.kind())));
         }
         let limit = policy::OBJECTS.clamp(p.limit);
         let namespaces = policy::namespaces_for(
@@ -594,7 +762,7 @@ impl FlintMcp {
             .map_err(|e| conn.fail(e))?,
             policy::Namespaces::Only(namespaces) => {
                 if p.continue_token.is_some() {
-                    return Err(ToolError(
+                    return Err(ToolError::new(
                         "This cluster's objects are listed namespace by namespace: pass a \
                          namespace from list_clusters' scope to page through it."
                             .to_owned(),
@@ -811,7 +979,7 @@ impl FlintMcp {
         }
         if let Some(c) = p.container.as_deref().filter(|c| !policy::is_label_name(c)) {
             // As the API server words a container the pod does not have.
-            return Err(ToolError(format!(
+            return Err(ToolError::new(format!(
                 "BadRequest: container {c:?} is not valid for pod {:?}",
                 p.pod
             )));
@@ -1084,7 +1252,7 @@ mod tests {
     // covers UP-10
     #[test]
     fn kind_errors_point_to_list_resource_kinds_or_name_the_candidates() {
-        let missing = kind_error(ResolveKindError::NotFound("sprocket".into())).0;
+        let missing = kind_error(ResolveKindError::NotFound("sprocket".into())).message;
         assert_eq!(
             missing,
             "no resource kind matches \"sprocket\". Call list_resource_kinds for the kinds."
@@ -1093,7 +1261,7 @@ mod tests {
             query: "wd".into(),
             candidates: vec!["gadgets.example.org".into(), "widgets.example.com".into()],
         })
-        .0;
+        .message;
         assert_eq!(
             ambiguous,
             "\"wd\" matches several resource kinds. Pass one of these as kind: \
@@ -1232,6 +1400,23 @@ mod tests {
 
     /// A server exposing `contexts` (name, server, user YAML) from a kubeconfig in a scratch
     /// directory, never the user's files.
+    // covers UP-16: the activity log's item count and cut-short flag come from each reply's
+    // own fields, as the agent read them.
+    #[test]
+    fn reply_size_reads_what_the_agent_saw() {
+        let list = json!({"count": 3, "truncated": true, "items": []}).to_string();
+        assert_eq!(reply_size("list_resources", &list), (Some(3), true));
+        let logs = json!({"lines": 120, "truncated": false, "logs": "a"}).to_string();
+        assert_eq!(reply_size("get_pod_logs", &logs), (Some(120), false));
+        let clusters = json!({"clusters": [{}, {}]}).to_string();
+        assert_eq!(reply_size("list_clusters", &clusters), (Some(2), false));
+        let cut = "# redacted=0\n# truncated=true: output cut at 262144 bytes\nkind: Pod\n";
+        assert_eq!(reply_size("get_resource", cut), (Some(1), true));
+        let whole = "kind: Pod\nmetadata:\n  name: '# truncated=true'\n";
+        assert_eq!(reply_size("get_resource", whole), (Some(1), false));
+        assert_eq!(reply_size("list_resources", "not json"), (None, false));
+    }
+
     fn scratch_server(dir: &std::path::Path, contexts: &[(&str, &str, &str)]) -> FlintMcp {
         let mut kubeconfig = String::from("apiVersion: v1\nkind: Config\nclusters:\n");
         let mut settings = String::new();
@@ -1285,12 +1470,18 @@ mod tests {
             cluster: cluster.into(),
         };
 
-        let Err(ToolError(timeout)) = server.do_list_kinds(params("silent")).await else {
+        let Err(ToolError {
+            message: timeout, ..
+        }) = server.do_list_kinds(params("silent")).await
+        else {
             panic!("a silent server has no kinds");
         };
         assert_eq!(timeout, format!("timed out after 10s reaching {silent}"));
 
-        let Err(ToolError(missing)) = server.do_list_kinds(params("noplugin")).await else {
+        let Err(ToolError {
+            message: missing, ..
+        }) = server.do_list_kinds(params("noplugin")).await
+        else {
             panic!("a missing plugin cannot connect");
         };
         assert!(
