@@ -1,112 +1,194 @@
-//! Helpers shared by view tests that need the whole window.
+//! Helpers shared by view tests that need the whole window: the workspace over kubeconfig
+//! contexts on 127.0.0.1, core events fed in as the core sends them, and rows fed by hand.
+//!
+//! Views keep their state private. The few hooks these helpers need are inherent impls in test
+//! files that are children of the view's module: [`Workspace`]'s in `workspace_tests.rs`,
+//! [`ClustersModel`]'s in `clusters_tests.rs`.
 
+use std::cell::RefCell;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::{
-    Cell, Column, ColumnRole, ColumnType, CoreConfig, CoreHandle, KindId, KindSnapshot, Row,
-    Settings, SyncState,
+    Cell, ClusterDiscovery, Column, ColumnRole, ColumnType, ConnectionState, CoreConfig,
+    CoreHandle, Event, KindId, KindInfo, KindSnapshot, NavEntry, NavSection, Navigation, Row,
+    SectionKind, ServerVersion, Settings, SyncState,
 };
-use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::base::test_support::ElementSnapshot;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, ElementId, Entity, Point, Subscription,
+    TestAppContext, WindowBounds, WindowOptions, px, size,
 };
+use serde_json::{Value, json};
 
 use super::clusters::ClustersModel;
-use super::registry;
+use super::detail::DetailView;
+use super::list::ResourceList;
+use super::registry::{self, ActionError};
 use super::ui_state::UiState;
 use super::workspace::Workspace;
 
+/// How long a test waits for the UI to settle. Waiting advances the executor's clock in 10 ms
+/// steps; it never sleeps.
 pub const WAIT: Duration = Duration::from_secs(10);
 
-/// The main window over two contexts, once both are loaded. `alpha`'s server accepts
-/// connections and never answers, so it stays "connecting" and its views show; `beta`'s
-/// refuses them. Nothing outside this process is reached.
+/// The main window, once the core has loaded kubeconfig. With [`open_workspace`] it shows two
+/// contexts: `alpha`'s server accepts connections and never answers, so it stays "connecting"
+/// and its views show; `beta`'s refuses them. Nothing outside this process is reached.
 pub struct TestWorkspace {
     pub window: AnyWindowHandle,
     pub workspace: Entity<Workspace>,
     pub model: Entity<ClustersModel>,
+    /// The silent server's URL, as kubeconfig names it (`alpha`'s server).
+    pub server: String,
     /// `beta`'s server: a local port nothing listens on.
     pub refused_server: String,
-    /// Keeps `alpha`'s silent server listening.
-    _server: TcpListener,
+    /// The silent server. It never answers; tests can check that nothing connected to it.
+    listener: TcpListener,
+    /// The config dir, holding `settings.toml` and `state.toml`.
+    pub dir: PathBuf,
+    /// Every connection state each cluster has shown, in order (repeats collapsed).
+    states: Rc<RefCell<Vec<(String, ConnectionState)>>>,
+    _record_states: Subscription,
 }
 
+/// The workspace over `alpha` (silent) and `beta` (refused), with default settings.
 pub async fn open_workspace(cx: &mut TestAppContext, dir: &Path) -> TestWorkspace {
+    open_workspace_with(cx, dir, alpha_and_beta).await
+}
+
+/// The local servers a test's kubeconfig can point at.
+pub struct Servers {
+    /// Accepts connections and never answers.
+    pub silent: String,
+    /// A port nothing listens on: connections are refused.
+    pub refused: String,
+}
+
+/// One kubeconfig file with `alpha` on the silent server, and `beta` on the refused one.
+pub fn alpha_and_beta(dir: &Path, servers: &Servers) -> Vec<PathBuf> {
+    let kubeconfig = dir.join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        kubeconfig_yaml(&[("alpha", &servers.silent), ("beta", &servers.refused)]),
+    )
+    .unwrap();
+    vec![kubeconfig]
+}
+
+/// A kubeconfig with one context per (name, server), each with its own cluster entry.
+pub fn kubeconfig_yaml(contexts: &[(&str, &str)]) -> String {
+    let mut clusters = String::new();
+    let mut entries = String::new();
+    for (i, (name, server)) in contexts.iter().enumerate() {
+        clusters.push_str(&format!(
+            "- name: c{i}-{name}\n  cluster: {{server: \"{server}\"}}\n"
+        ));
+        entries.push_str(&format!(
+            "- name: \"{name}\"\n  context: {{cluster: \"c{i}-{name}\", user: u}}\n"
+        ));
+    }
+    format!(
+        "apiVersion: v1\nkind: Config\nclusters:\n{clusters}users:\n- name: u\n  user: {{token: \
+         t}}\ncontexts:\n{entries}"
+    )
+}
+
+/// The workspace over the kubeconfig files `kubeconfigs` writes into the config dir `dir` (it
+/// gets the local servers' URLs), with the settings in `dir/settings.toml` read as the app reads
+/// them at launch. Waits until the core has loaded kubeconfig.
+pub async fn open_workspace_with(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    kubeconfigs: impl FnOnce(&Path, &Servers) -> Vec<PathBuf>,
+) -> TestWorkspace {
     cx.executor().allow_parking();
-    let server = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = server.local_addr().unwrap().port();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
     // A port the OS just handed out, released again: nothing listens there.
     let refused_port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    let refused_server = format!("https://127.0.0.1:{refused_port}");
-    let kubeconfig = dir.join("kubeconfig");
-    std::fs::write(
-        &kubeconfig,
-        format!(
-            "apiVersion: v1
-kind: Config
-clusters:
-- name: silent
-  cluster: {{server: \"https://127.0.0.1:{port}\"}}
-- name: refused
-  cluster: {{server: \"{refused_server}\"}}
-users:
-- name: u
-  user: {{token: t}}
-contexts:
-- name: alpha
-  context: {{cluster: silent, user: u}}
-- name: beta
-  context: {{cluster: refused, user: u}}
-"
-        ),
-    )
-    .unwrap();
-    let (window, workspace, model) = open_window_over(cx, dir, kubeconfig);
+    let servers = Servers {
+        silent: server.clone(),
+        refused: format!("https://127.0.0.1:{refused_port}"),
+    };
+    let kubeconfig_base = kubeconfigs(dir, &servers);
+    let (window, workspace, model) = open_window_over(cx, dir, kubeconfig_base);
+    let states: Rc<RefCell<Vec<(String, ConnectionState)>>> = Rc::default();
+    let record = states.clone();
+    let record_states = cx.update(|cx| {
+        cx.observe(&model, move |model, cx| {
+            let mut states = record.borrow_mut();
+            for c in &model.read(cx).clusters {
+                let last = states
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| *name == c.info.name)
+                    .map(|(_, s)| s);
+                if last != Some(&c.state) {
+                    states.push((c.info.name.clone(), c.state.clone()));
+                }
+            }
+        })
+    });
     let loaded = model.clone();
-    cx.wait_for(window, WAIT, move |_, cx| {
-        loaded.read(cx).clusters.len() == 2
-    })
-    .await;
+    cx.wait_for(window, WAIT, move |_, cx| loaded.read(cx).loaded)
+        .await;
     TestWorkspace {
+        states,
+        _record_states: record_states,
         window,
         workspace,
         model,
-        refused_server,
-        _server: server,
+        server,
+        refused_server: servers.refused,
+        listener,
+        dir: dir.to_owned(),
     }
 }
 
-/// The main window over `kubeconfig`, which may not exist or hold no contexts.
+/// The main window over the kubeconfig files `kubeconfig_base` (which may not exist or hold no
+/// contexts), with the settings in `dir/settings.toml` read as the app reads them at launch.
 fn open_window_over(
     cx: &mut TestAppContext,
     dir: &Path,
-    kubeconfig: std::path::PathBuf,
+    kubeconfig_base: Vec<PathBuf>,
 ) -> (AnyWindowHandle, Entity<Workspace>, Entity<ClustersModel>) {
+    let (settings, settings_error) = match flint_core::settings::load_settings(dir) {
+        Ok(settings) => (settings, None),
+        Err(e) => (Settings::default(), Some(e.to_string())),
+    };
     let core = CoreHandle::start(CoreConfig {
         config_dir: dir.to_owned(),
-        settings: Settings::default(),
-        settings_error: None,
-        kubeconfig_base: vec![kubeconfig],
+        settings: settings.clone(),
+        settings_error,
+        kubeconfig_base,
         home: None,
         watch_files: false,
         watch_timing: Default::default(),
     })
     .unwrap();
+    let appearance = settings.appearance;
     cx.update(|cx| {
         gpui_kit::init(cx);
         registry::init(cx);
+        // The app menu's actions (Quit, Close Window), handled as in the app.
+        super::install_menus(appearance, cx);
     });
     let ui_state = UiState::load(dir.to_owned());
     cx.update(|cx| {
-        let model = cx.new(|cx| ClustersModel::new(core, Settings::default(), None, cx));
+        let model = cx.new(|cx| ClustersModel::new(core, settings, None, cx));
         let workspace_model = model.clone();
         let (window, workspace) = gpui_kit::open_window(
             WindowOptions {
@@ -134,11 +216,423 @@ pub async fn open_empty_workspace(
     cx.executor().allow_parking();
     let kubeconfig = dir.join("kubeconfig");
     std::fs::write(&kubeconfig, "apiVersion: v1\nkind: Config\n").unwrap();
-    let (window, workspace, model) = open_window_over(cx, dir, kubeconfig);
+    let (window, workspace, model) = open_window_over(cx, dir, vec![kubeconfig]);
     let loaded = model.clone();
     cx.wait_for(window, WAIT, move |_, cx| loaded.read(cx).loaded)
         .await;
     (window, workspace, model)
+}
+
+impl TestWorkspace {
+    /// Dispatches the registered action `name` from the focused element, as automation and the
+    /// palette do, and lets the UI settle.
+    pub fn dispatch(
+        &self,
+        cx: &mut TestAppContext,
+        name: &str,
+        args: Value,
+    ) -> Result<(), ActionError> {
+        let result = cx
+            .update_window(self.window, |_, window, cx| {
+                registry::dispatch(name, args, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        result
+    }
+
+    /// The registered actions available from the focused element.
+    pub fn available(&self, cx: &mut TestAppContext) -> Vec<&'static str> {
+        cx.update_window(self.window, |_, window, cx| {
+            registry::available(window, cx).map(|s| s.name).collect()
+        })
+        .unwrap()
+    }
+
+    /// Selects `cluster` through the registry and waits until the workspace shows it.
+    pub async fn activate(&self, cx: &mut TestAppContext, cluster: &'static str) {
+        self.dispatch(
+            cx,
+            "workspace::SelectCluster",
+            json!({ "cluster": cluster }),
+        )
+        .unwrap();
+        let workspace = self.workspace.clone();
+        cx.wait_for(self.window, WAIT, move |_, cx| {
+            workspace.read(cx).shown_cluster() == Some(cluster)
+        })
+        .await;
+    }
+
+    /// Feeds `event` to the model as if the core sent it.
+    pub fn feed(&self, cx: &mut TestAppContext, event: Event) {
+        self.model.update(cx, |model, cx| model.feed(event, cx));
+        cx.run_until_parked();
+    }
+
+    /// Waits until `cluster`'s connection state satisfies `wanted`.
+    pub async fn wait_for_state(
+        &self,
+        cx: &mut TestAppContext,
+        cluster: &'static str,
+        wanted: fn(&ConnectionState) -> bool,
+    ) {
+        let model = self.model.clone();
+        cx.wait_for(self.window, WAIT, move |_, cx| {
+            model
+                .read(cx)
+                .clusters
+                .iter()
+                .any(|c| c.info.name == cluster && wanted(&c.state))
+        })
+        .await;
+    }
+
+    /// How many times `cluster` has started connecting.
+    pub fn connection_attempts(&self, cluster: &str) -> usize {
+        self.states
+            .borrow()
+            .iter()
+            .filter(|(name, s)| name == cluster && matches!(s, ConnectionState::Connecting))
+            .count()
+    }
+
+    /// Waits until `cluster` has started connecting `attempts` times.
+    pub async fn wait_for_attempts(
+        &self,
+        cx: &mut TestAppContext,
+        cluster: &'static str,
+        attempts: usize,
+    ) {
+        let states = self.states.clone();
+        cx.wait_for(self.window, WAIT, move |_, _| {
+            states
+                .borrow()
+                .iter()
+                .filter(|(name, s)| name == cluster && matches!(s, ConnectionState::Connecting))
+                .count()
+                >= attempts
+        })
+        .await;
+    }
+
+    /// Activates `alpha` and makes it connected with `sections` as its navigation, as the core
+    /// reports a connect and a discovery. Also after a switch back to `alpha`: its state is
+    /// reset first, so only the core's own "connecting" for this activation satisfies the wait,
+    /// and that cannot land after the connect fed here.
+    pub async fn connect_alpha(&self, cx: &mut TestAppContext, sections: Vec<NavSection>) {
+        self.feed(
+            cx,
+            Event::ConnectionChanged {
+                cluster: "alpha".into(),
+                state: ConnectionState::Disconnected,
+            },
+        );
+        self.activate(cx, "alpha").await;
+        self.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connecting))
+            .await;
+        self.feed(
+            cx,
+            Event::ConnectionChanged {
+                cluster: "alpha".into(),
+                state: ConnectionState::Connected(ServerVersion {
+                    git_version: "v1.33.1".into(),
+                    platform: "linux/arm64".into(),
+                }),
+            },
+        );
+        self.feed(
+            cx,
+            Event::DiscoveryChanged {
+                cluster: "alpha".into(),
+                discovery: Some(Arc::new(discovery(sections))),
+                error: None,
+            },
+        );
+    }
+
+    /// Opens `kind` through the registry and feeds its list `snapshot` by hand, in place of
+    /// the silent cluster's watch.
+    pub async fn open_kind(
+        &self,
+        cx: &mut TestAppContext,
+        kind: &str,
+        snapshot: Arc<KindSnapshot>,
+    ) {
+        self.dispatch(cx, "workspace::OpenView", json!({ "kind": kind }))
+            .unwrap();
+        self.feed_list(cx, snapshot).await;
+    }
+
+    /// Feeds the open list `snapshot` with its watch stopped, and waits until the list shows
+    /// that very snapshot (filtered and sorted).
+    pub async fn feed_list(&self, cx: &mut TestAppContext, snapshot: Arc<KindSnapshot>) {
+        let list = self.list(cx).expect("a list is open");
+        let fed = snapshot.clone();
+        list.update(cx, |list, cx| {
+            list.stop_watching();
+            list.set_snapshot(snapshot, cx);
+        });
+        cx.wait_for(self.window, WAIT, move |_, cx| {
+            Arc::ptr_eq(list.read(cx).shown().0, &fed)
+        })
+        .await;
+        cx.run_until_parked();
+    }
+
+    /// Connects `alpha` with the standard navigation and opens Pods through the registry, with
+    /// `rows` fed by hand.
+    pub async fn open_pods(&self, cx: &mut TestAppContext, rows: &[(&str, &str, i64)]) {
+        self.connect_alpha(cx, standard_sections()).await;
+        self.open_kind(cx, "pods", pods(rows)).await;
+    }
+
+    pub fn list(&self, cx: &mut TestAppContext) -> Option<Entity<ResourceList>> {
+        self.workspace.read_with(cx, |ws, _| ws.list_view())
+    }
+
+    pub fn detail(&self, cx: &mut TestAppContext) -> Option<Entity<DetailView>> {
+        self.workspace.read_with(cx, |ws, _| ws.detail_view())
+    }
+
+    /// The name of the list's selected object.
+    pub fn selected(&self, cx: &mut TestAppContext) -> Option<String> {
+        let list = self.list(cx)?;
+        list.read_with(cx, |l, _| l.selected_name())
+    }
+
+    /// How many rows the list shows after its filters.
+    pub fn row_count(&self, cx: &mut TestAppContext) -> usize {
+        self.list(cx)
+            .map_or(0, |l| l.read_with(cx, |l, _| l.shown().1))
+    }
+
+    /// Focuses the workspace itself, as when nothing inside has focus.
+    pub fn focus_workspace(&self, cx: &mut TestAppContext) {
+        let focus = self
+            .workspace
+            .read_with(cx, |ws, _| ws.focus_handle_for_tests());
+        cx.update_window(self.window, |_, window, cx| window.focus(&focus, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Clicks the element `id`, as the user does.
+    pub fn click(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) {
+        let id = id.into();
+        cx.update_window(self.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Presses `key` (for example `down` or `cmd-1`) where focus is.
+    pub fn press(&self, cx: &mut TestAppContext, key: &str) {
+        cx.update_window(self.window, |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Presses the key the registry binds to the action `name`, so tests follow the bindings
+    /// across platforms (a `secondary-` binding is Cmd on macOS and Ctrl elsewhere).
+    pub fn press_key_of(&self, cx: &mut TestAppContext, name: &str) {
+        let spec = registry::find(name).unwrap_or_else(|| panic!("no action {name}"));
+        let key = spec
+            .keys
+            .first()
+            .unwrap_or_else(|| panic!("{name} has no key"));
+        self.press(cx, key);
+    }
+
+    /// Types `text` where focus is.
+    pub fn type_text(&self, cx: &mut TestAppContext, text: &str) {
+        cx.update_window(self.window, |_, window, cx| window.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// The observed element `id` in a freshly drawn frame, if it is there.
+    pub fn find(
+        &self,
+        cx: &mut TestAppContext,
+        id: impl Into<ElementId>,
+    ) -> Option<ElementSnapshot> {
+        let id = id.into();
+        cx.update_window(self.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(id)
+        })
+        .unwrap()
+    }
+
+    /// Waits until the element `id` is drawn.
+    pub async fn wait_for_element(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) {
+        let id = id.into();
+        cx.wait_for(self.window, WAIT, move |window, _| {
+            window.try_find(id.clone()).is_some()
+        })
+        .await;
+    }
+
+    /// The label of the element `id` (a button's text).
+    pub fn label(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<String> {
+        self.find(cx, id)?.label().map(str::to_owned)
+    }
+
+    /// The description of the element `id` (a button's tooltip).
+    pub fn description(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<String> {
+        self.find(cx, id)?.description().map(str::to_owned)
+    }
+
+    /// Waits until the element `id` has the label `label`.
+    pub async fn wait_for_label(
+        &self,
+        cx: &mut TestAppContext,
+        id: impl Into<ElementId>,
+        label: &str,
+    ) {
+        let (id, label) = (id.into(), label.to_owned());
+        cx.wait_for(self.window, WAIT, move |window, _| {
+            window
+                .try_find(id.clone())
+                .is_some_and(|e| e.label() == Some(label.as_str()))
+        })
+        .await;
+    }
+
+    pub fn has_dialog(&self, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.window, |_, window, cx| window.has_active_dialog(cx))
+            .unwrap()
+    }
+
+    /// The ids of the observed elements whose id starts with `prefix`, top to bottom.
+    pub fn ids_with_prefix(&self, cx: &mut TestAppContext, prefix: &str) -> Vec<String> {
+        use gpui_kit::test::TestQueryExt as _;
+        cx.update_window(self.window, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .elements()
+                .into_iter()
+                .filter_map(|e| match e.path().last() {
+                    Some(gpui_kit::ElementId::Name(name)) if name.starts_with(prefix) => {
+                        Some(name.to_string())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    /// `settings.toml` as written, or empty.
+    pub fn settings_toml(&self) -> String {
+        std::fs::read_to_string(self.dir.join("settings.toml")).unwrap_or_default()
+    }
+
+    /// Whether anything has connected to the silent server (`alpha`'s) so far.
+    pub fn server_was_contacted(&self) -> bool {
+        self.listener.set_nonblocking(true).unwrap();
+        match self.listener.accept() {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+}
+
+/// A navigation entry for `plural` in `group` (`""`: the core group).
+pub fn entry(group: &str, plural: &str, kind: &str, label: &str, namespaced: bool) -> NavEntry {
+    NavEntry {
+        id: KindId::new(group, plural),
+        label: label.into(),
+        kind: kind.into(),
+        api_version: if group.is_empty() {
+            "v1".into()
+        } else {
+            format!("{group}/v1")
+        },
+        namespaced,
+        listable: true,
+        watchable: true,
+    }
+}
+
+pub fn section(title: &str, kind: SectionKind, entries: Vec<NavEntry>) -> NavSection {
+    NavSection {
+        title: title.into(),
+        kind,
+        entries,
+    }
+}
+
+/// A discovery with exactly these navigation sections, serving their kinds (listable and
+/// watchable), so kind names resolve as they do against a real cluster.
+pub fn discovery(sections: Vec<NavSection>) -> ClusterDiscovery {
+    let kinds = sections
+        .iter()
+        .flat_map(|s| s.entries.iter())
+        .map(|e| {
+            let (group, version) = match e.api_version.split_once('/') {
+                Some((group, version)) => (group.to_owned(), version.to_owned()),
+                None => (String::new(), e.api_version.clone()),
+            };
+            KindInfo {
+                resource: kube::core::ApiResource {
+                    group,
+                    version,
+                    api_version: e.api_version.clone(),
+                    kind: e.kind.clone(),
+                    plural: e.id.plural().to_owned(),
+                },
+                namespaced: e.namespaced,
+                verbs: vec!["get".into(), "list".into(), "watch".into()],
+                singular: e.kind.to_lowercase(),
+                short_names: Vec::new(),
+            }
+        })
+        .collect();
+    ClusterDiscovery {
+        kinds,
+        navigation: Navigation { sections },
+    }
+}
+
+/// The navigation most view tests use: Workloads (Pods, Deployments), Network (Services),
+/// Config (Secrets), Cluster (Nodes, cluster-scoped), and the custom resources of
+/// `example.com` (Widgets).
+pub fn standard_sections() -> Vec<NavSection> {
+    vec![
+        section(
+            "Workloads",
+            SectionKind::BuiltIn,
+            vec![
+                entry("", "pods", "Pod", "Pods", true),
+                entry("apps", "deployments", "Deployment", "Deployments", true),
+            ],
+        ),
+        section(
+            "Network",
+            SectionKind::BuiltIn,
+            vec![entry("", "services", "Service", "Services", true)],
+        ),
+        section(
+            "Config",
+            SectionKind::BuiltIn,
+            vec![entry("", "secrets", "Secret", "Secrets", true)],
+        ),
+        section(
+            "Cluster",
+            SectionKind::BuiltIn,
+            vec![entry("", "nodes", "Node", "Nodes", false)],
+        ),
+        section(
+            "example.com",
+            SectionKind::ApiGroup,
+            vec![entry("example.com", "widgets", "Widget", "Widgets", true)],
+        ),
+    ]
 }
 
 fn column(name: &str, role: ColumnRole, ty: ColumnType, priority: i32) -> Column {
@@ -154,36 +648,62 @@ fn column(name: &str, role: ColumnRole, ty: ColumnType, priority: i32) -> Column
 
 /// A Pods list of (namespace, name, restarts), synced, in snapshot order.
 pub fn pods(rows: &[(&str, &str, i64)]) -> Arc<KindSnapshot> {
-    let columns: Arc<[Column]> = vec![
-        column("Name", ColumnRole::Name, ColumnType::String, 0),
-        column("Namespace", ColumnRole::Namespace, ColumnType::String, 0),
-        column("Restarts", ColumnRole::Value, ColumnType::Integer, 0),
-    ]
-    .into();
+    objects(KindId::pods(), rows, SyncState::Synced, 1)
+}
+
+/// A list of `kind` with (namespace, name, restarts) rows in `state`, in snapshot order. With
+/// every namespace `""`, the kind is cluster-scoped.
+pub fn objects(
+    kind: KindId,
+    rows: &[(&str, &str, i64)],
+    state: SyncState,
+    version: u64,
+) -> Arc<KindSnapshot> {
+    let namespaced = rows.is_empty() || rows.iter().any(|(ns, _, _)| !ns.is_empty());
+    let mut columns = vec![column("Name", ColumnRole::Name, ColumnType::String, 0)];
+    if namespaced {
+        columns.push(column(
+            "Namespace",
+            ColumnRole::Namespace,
+            ColumnType::String,
+            0,
+        ));
+    }
+    columns.push(column(
+        "Restarts",
+        ColumnRole::Value,
+        ColumnType::Integer,
+        0,
+    ));
     let mut rows: Vec<Arc<Row>> = rows
         .iter()
         .map(|(ns, name, restarts)| {
+            let mut cells = vec![Cell::Name];
+            if namespaced {
+                cells.push(Cell::Namespace);
+            }
+            cells.push(Cell::Int(*restarts));
             Arc::new(Row {
                 uid: format!("uid-{name}").into(),
                 name: (*name).into(),
-                namespace: Some((*ns).into()),
-                resource_version: "1".into(),
+                namespace: (!ns.is_empty()).then(|| (*ns).into()),
+                resource_version: version.to_string().into(),
                 generation: None,
                 created: Some(0),
                 labels: Box::new([]),
-                cells: Box::new([Cell::Name, Cell::Namespace, Cell::Int(*restarts)]),
+                cells: cells.into_boxed_slice(),
             })
         })
         .collect();
     rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Arc::new(KindSnapshot {
         cluster: "alpha".into(),
-        kind: KindId::pods(),
-        namespaced: true,
-        columns,
+        kind,
+        namespaced,
+        columns: columns.into(),
         rows,
-        state: SyncState::Synced,
-        version: 1,
+        state,
+        version,
         ..Default::default()
     })
 }

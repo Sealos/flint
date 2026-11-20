@@ -194,6 +194,8 @@ impl NavPanel {
         let open = entry.id.to_string();
         h_flex()
             .id(SharedString::from(format!("nav-{}", entry.id)))
+            // Named for assistive technology (and view tests).
+            .aria_label(entry.label.clone())
             .pl_5()
             .pr_2()
             .h(px(ROW_HEIGHT))
@@ -343,6 +345,7 @@ impl Render for NavPanel {
                         (h_flex()
                             .id(("nav-section", i))
                             .flex_none()
+                            .aria_label(section.title.clone())
                             .px_1()
                             .h(px(ROW_HEIGHT))
                             .gap_1()

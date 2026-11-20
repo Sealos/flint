@@ -61,6 +61,28 @@ enum Fetch {
     Failed(String),
 }
 
+/// A fetched object, read and rendered off the UI thread.
+struct Prepared {
+    detail: Arc<ObjectDetail>,
+    overview: Arc<Overview>,
+    /// The YAML tab's text, rendered with `managed` (whether managedFields were shown).
+    yaml: String,
+    managed: bool,
+}
+
+impl Prepared {
+    fn new(detail: Arc<ObjectDetail>, is_secret: bool, managed: bool) -> Self {
+        let overview = Arc::new(object::overview(&detail.object, is_secret));
+        let yaml = object::render_yaml(&detail, is_secret, managed);
+        Prepared {
+            detail,
+            overview,
+            yaml,
+            managed,
+        }
+    }
+}
+
 pub enum DetailEvent {
     Close,
     /// Open (or show) a log tab for one of the pod's containers.
@@ -170,31 +192,13 @@ impl DetailView {
             // thread.
             let prepared = cx
                 .background_spawn(async move {
-                    result.map(|detail| {
-                        let overview = object::overview(&detail.object, is_secret);
-                        let yaml = object::render_yaml(&detail, is_secret, managed);
-                        (detail, Arc::new(overview), yaml)
-                    })
+                    result.map(|detail| Prepared::new(detail, is_secret, managed))
                 })
                 .await;
             let _ = this.update_in(cx, |view, window, cx| {
                 view.fetching = false;
                 match prepared {
-                    Ok((detail, overview, yaml)) => {
-                        view.refresh_error = None;
-                        // A re-render of the previous copy must not land after this one.
-                        view._yaml = Task::ready(());
-                        view.fetch = Fetch::Loaded { detail, overview };
-                        if std::mem::take(&mut view.open_logs_when_loaded) {
-                            view.open_logs::<OpenLogs>(None, false, cx);
-                        }
-                        if view.show_managed_fields == managed {
-                            view.set_yaml(yaml, window, cx);
-                        } else {
-                            // Toggled while this fetch ran.
-                            view.rerender_yaml(window, cx);
-                        }
-                    }
+                    Ok(prepared) => view.loaded(prepared, window, cx),
                     Err(error) => match view.fetch {
                         Fetch::Loaded { .. } => view.refresh_error = Some(error),
                         _ => view.fetch = Fetch::Failed(error),
@@ -206,6 +210,29 @@ impl DetailView {
                 cx.notify();
             });
         });
+    }
+
+    /// Shows a fetched object: what a fetch that succeeded ends with.
+    fn loaded(&mut self, prepared: Prepared, window: &mut Window, cx: &mut Context<Self>) {
+        let Prepared {
+            detail,
+            overview,
+            yaml,
+            managed,
+        } = prepared;
+        self.refresh_error = None;
+        // A re-render of the previous copy must not land after this one.
+        self._yaml = Task::ready(());
+        self.fetch = Fetch::Loaded { detail, overview };
+        if std::mem::take(&mut self.open_logs_when_loaded) {
+            self.open_logs::<OpenLogs>(None, false, cx);
+        }
+        if self.show_managed_fields == managed {
+            self.set_yaml(yaml, window, cx);
+        } else {
+            // Toggled while this fetch ran.
+            self.rerender_yaml(window, cx);
+        }
     }
 
     fn set_yaml(&mut self, yaml: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -248,14 +275,20 @@ impl DetailView {
         cx.notify();
     }
 
-    /// Shows `detail` as if a fetch had just returned it: the test servers never answer.
+    /// Shows `detail` as a fetch that succeeds does, through the same code, after cancelling
+    /// the fetch that is running: the test servers never answer.
     #[cfg(test)]
-    pub fn show_fetched(&mut self, detail: ObjectDetail, cx: &mut Context<Self>) {
-        let overview = Arc::new(object::overview(&detail.object, self.is_secret));
-        self.fetch = Fetch::Loaded {
-            detail: Arc::new(detail),
-            overview,
-        };
+    pub fn show_fetched(
+        &mut self,
+        detail: ObjectDetail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._fetch = Task::ready(());
+        self.fetching = false;
+        self.refetch = false;
+        let prepared = Prepared::new(Arc::new(detail), self.is_secret, self.show_managed_fields);
+        self.loaded(prepared, window, cx);
         cx.notify();
     }
 

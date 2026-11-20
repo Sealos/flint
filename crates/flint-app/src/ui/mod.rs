@@ -172,8 +172,12 @@ pub fn run(boot: Bootstrap) {
 fn install_menus(appearance: Appearance, cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
+        // The action is dispatched through the front window, which cannot be updated until
+        // that dispatch ends: close it right after.
         if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_, window, _| window.remove_window());
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+            });
         }
     });
     set_menus(appearance, cx);

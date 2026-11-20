@@ -225,3 +225,7 @@ mod tests {
         assert_binds_scope(Scope::Detail, super::DetailView::bind_actions);
     }
 }
+
+#[cfg(test)]
+#[path = "detail_tests.rs"]
+mod view_tests;

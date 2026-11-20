@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use flint_core::table::unix_now;
 use flint_core::{
-    Cell, ClusterId, ColumnRole, CoreHandle, Feed, KindId, KindSnapshot, ListFormat, Row,
+    Cell, ClusterId, ColumnRole, CoreHandle, Feed, KindId, KindSnapshot, ListFormat, NavEntry, Row,
     SyncState, ViewQuery,
 };
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
@@ -81,6 +81,8 @@ pub struct ResourceList {
     cluster: ClusterId,
     kind: KindId,
     label: String,
+    /// Whether the kind is namespaced, as discovery says: known before the first rows arrive.
+    namespaced: bool,
     /// The newest snapshot from the subscription.
     latest: Arc<KindSnapshot>,
     /// The snapshot being drawn, and its rows in display order (indexes into `shown.rows`).
@@ -131,12 +133,12 @@ impl ResourceList {
     pub fn new(
         core: CoreHandle,
         cluster: ClusterId,
-        kind: KindId,
-        label: String,
+        entry: &NavEntry,
         namespaces: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let kind = entry.id.clone();
         let mut subscription = core.subscribe(&cluster, &kind);
         let latest = subscription.peek();
         let watch = cx.spawn(async move |this, cx| {
@@ -180,7 +182,8 @@ impl ResourceList {
             core,
             cluster,
             kind,
-            label,
+            label: entry.label.clone(),
+            namespaced: entry.namespaced,
             shown: latest.clone(),
             latest,
             rows: Arc::from(Vec::new()),
@@ -219,6 +222,11 @@ impl ResourceList {
         &self.kind
     }
 
+    /// Whether the kind is namespaced (known before any rows are listed).
+    pub fn namespaced(&self) -> bool {
+        self.namespaced
+    }
+
     pub fn cluster(&self) -> &str {
         &self.cluster
     }
@@ -231,7 +239,8 @@ impl ResourceList {
         &self.focus
     }
 
-    /// The snapshot being drawn and how many of its rows pass the filters.
+    /// The snapshot being drawn and how many of its rows pass the filters, for tests.
+    #[cfg(test)]
     pub fn shown(&self) -> (&Arc<KindSnapshot>, usize) {
         (&self.shown, self.rows.len())
     }
@@ -812,7 +821,7 @@ impl ResourceList {
             )),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
-                    || (snapshot.namespaced && !self.query.namespaces.is_empty());
+                    || (self.namespaced && !self.query.namespaces.is_empty());
                 Some(if snapshot.rows.is_empty() {
                     message(format!("No {label}"), None, theme.muted_foreground)
                 } else if filtered {
@@ -954,7 +963,11 @@ impl Render for ResourceList {
         let available = (width > px(0.)).then(|| f32::from(width));
         if available != self.laid_out_width {
             self.laid_out_width = available;
-            cx.on_next_frame(window, |_, _, cx| cx.notify());
+            // Weak: a closed list must not live on until the next frame.
+            let this = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
         }
         let (drawn, dropped) = self.layout(available);
         self.drawn = drawn;
