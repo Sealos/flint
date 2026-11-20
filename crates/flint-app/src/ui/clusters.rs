@@ -5,10 +5,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flint_core::settings::AiExposureState;
+use flint_core::settings::{AiExposureState, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
-    Event, Settings, WatchMode,
+    Event, Protection, Settings, WatchMode,
 };
 use gpui_kit::*;
 
@@ -177,6 +177,63 @@ impl ClustersModel {
     pub fn ai_exposure(&self, cluster: &ClusterSummary) -> AiExposureState {
         self.settings
             .ai_exposure(&cluster.info.name, cluster.info.server.as_deref())
+    }
+
+    /// Whether Flint may change `cluster` now (ADR-0015). The core keeps the same check for
+    /// every action that changes a cluster; this one is for showing it.
+    pub fn protection(&self, cluster: &ClusterSummary) -> Protection {
+        flint_core::protection::protection(
+            &self.settings,
+            self.core.unlocks(),
+            &cluster.info.name,
+            cluster.info.server.as_deref(),
+        )
+    }
+
+    /// [`ClustersModel::protection`] of the context named `cluster`; protected if there is none.
+    pub fn protection_of(&self, cluster: &str) -> Protection {
+        self.clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .map_or(Protection::Protected, |c| self.protection(c))
+    }
+
+    pub fn trust(&self, cluster: &ClusterSummary) -> TrustState {
+        self.settings
+            .trust(&cluster.info.name, cluster.info.server.as_deref())
+    }
+
+    /// Unlocks `cluster` at `server`, the URL the user confirmed, until Flint quits or Lock
+    /// Again. It takes effect at once, in the core too.
+    pub fn unlock(&mut self, cluster: &str, server: &str, cx: &mut Context<Self>) {
+        self.core.unlock(cluster, server);
+        cx.notify();
+    }
+
+    /// Locks `cluster` again (Lock Again).
+    pub fn lock(&mut self, cluster: &str, cx: &mut Context<Self>) {
+        self.core.lock(cluster);
+        cx.notify();
+    }
+
+    /// Trusts `cluster` at `server`, the URL the user confirmed. Written to `settings.toml`;
+    /// the change comes back as a settings event.
+    pub fn trust_cluster(&mut self, cluster: ClusterId, server: String) {
+        self.send(Command::SetTrusted {
+            cluster,
+            server: Some(server),
+        });
+    }
+
+    /// Stops trusting `cluster` (or removes a stale trust), and locks it: the user wants it
+    /// protected, even if it was also unlocked for this session.
+    pub fn untrust_cluster(&mut self, cluster: ClusterId, cx: &mut Context<Self>) {
+        self.core.lock(&cluster);
+        self.send(Command::SetTrusted {
+            cluster,
+            server: None,
+        });
+        cx.notify();
     }
 }
 

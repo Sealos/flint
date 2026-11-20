@@ -20,6 +20,7 @@ use crate::handle::{
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
+use crate::protection::{SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
 use crate::settings::{self, Settings};
 use crate::store::{KindSnapshot, SyncState};
@@ -174,6 +175,33 @@ enum Internal {
     },
 }
 
+/// A list of pinned clusters in `settings.toml` ([`crate::settings::ClusterPin`]).
+#[derive(Debug, Clone, Copy)]
+enum Pins {
+    /// `ai_exposed_clusters` (ADR-0009).
+    AiExposure,
+    /// `trusted_clusters` (ADR-0015).
+    Trust,
+}
+
+impl Pins {
+    /// What the list is, in errors.
+    fn what(self) -> &'static str {
+        match self {
+            Pins::AiExposure => "exposure",
+            Pins::Trust => "trust",
+        }
+    }
+
+    /// What pinning a cluster did, in errors.
+    fn done(self) -> &'static str {
+        match self {
+            Pins::AiExposure => "exposed",
+            Pins::Trust => "trusted",
+        }
+    }
+}
+
 /// Which watched files changed.
 #[derive(Debug, Clone, Copy, Default)]
 struct Changed {
@@ -207,6 +235,8 @@ pub(crate) struct ClusterManager {
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
+    /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
+    unlocks: SessionUnlocks,
 }
 
 struct FileWatcher {
@@ -220,6 +250,7 @@ impl ClusterManager {
         config: CoreConfig,
         events: async_channel::Sender<Event>,
         hubs: HubRegistry,
+        unlocks: SessionUnlocks,
     ) -> Self {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
         let kubeconfig_paths = kubeconfig::paths_for_settings(
@@ -245,6 +276,7 @@ impl ClusterManager {
             engine_config,
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
+            unlocks,
         }
     }
 
@@ -285,7 +317,12 @@ impl ClusterManager {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::Activate(id) => self.activate(id),
-            Command::SetAiExposed { cluster, server } => self.set_ai_exposed(cluster, server).await,
+            Command::SetAiExposed { cluster, server } => {
+                self.set_pin(Pins::AiExposure, cluster, server).await
+            }
+            Command::SetTrusted { cluster, server } => {
+                self.set_pin(Pins::Trust, cluster, server).await
+            }
             Command::ReloadKubeconfig => self.reload_kubeconfig().await,
             Command::SetWatchMode { cluster, mode } => {
                 self.write_settings("the watch mode", move |dir| {
@@ -403,6 +440,9 @@ impl ClusterManager {
             }
             Request::Client { cluster, reply } => {
                 let _ = reply.send(self.client(&cluster));
+            }
+            Request::WriteClient { cluster, reply } => {
+                let _ = reply.send(self.write_client(&cluster));
             }
             Request::FetchObject {
                 cluster,
@@ -553,9 +593,11 @@ impl ClusterManager {
         }
     }
 
-    async fn set_ai_exposed(&mut self, cluster: ClusterId, server: Option<String>) {
+    /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
+    /// `settings.toml`.
+    async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) {
         if let Some(server) = &server {
-            // The user confirmed this server. If the context moved since, do not expose the new
+            // The user confirmed this server. If the context moved since, do not pin the new
             // one on the strength of that confirmation.
             let current = self
                 .clusters
@@ -564,7 +606,8 @@ impl ClusterManager {
                 .and_then(|c| c.info.server.as_deref());
             if current != Some(server.as_str()) {
                 self.emit(Event::Error(format!(
-                    "\"{cluster}\" now points to a different server; it was not exposed. Review it and try again."
+                    "\"{cluster}\" now points to a different server; it was not {}. Review it and try again.",
+                    pins.done()
                 )));
                 return;
             }
@@ -572,14 +615,16 @@ impl ClusterManager {
         if let Some(error) = &self.settings_error {
             // Rewriting a file that does not parse would fail anyway; say why.
             self.emit(Event::Error(format!(
-                "settings.toml must be fixed before exposure can change: {}",
+                "settings.toml must be fixed before {} can change: {}",
+                pins.what(),
                 crate::redact::safe_error_summary(error)
             )));
             return;
         }
         let dir = self.config.config_dir.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            settings::set_ai_exposed(&dir, &cluster, server.as_deref())
+        let result = tokio::task::spawn_blocking(move || match pins {
+            Pins::AiExposure => settings::set_ai_exposed(&dir, &cluster, server.as_deref()),
+            Pins::Trust => settings::set_trusted(&dir, &cluster, server.as_deref()),
         })
         .await;
         match result {
@@ -887,6 +932,22 @@ impl ClusterManager {
 
     fn client(&self, cluster: &str) -> Option<Client> {
         self.cluster(cluster).and_then(|c| c.client.clone())
+    }
+
+    /// The gate every action that changes a cluster, or runs code in it, goes through
+    /// (ADR-0015): the cluster's client, unless the cluster is protected or not connected.
+    fn write_client(&self, cluster: &str) -> Result<Client, WriteRefusal> {
+        let slot = self.cluster(cluster);
+        let server = slot.and_then(|c| c.info.server.as_deref());
+        if !protection(&self.settings, &self.unlocks, cluster, server).allows_changes() {
+            return Err(WriteRefusal::Protected {
+                cluster: cluster.to_owned(),
+            });
+        }
+        slot.and_then(|c| c.client.clone())
+            .ok_or_else(|| WriteRefusal::NotConnected {
+                cluster: cluster.to_owned(),
+            })
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1455,7 +1516,8 @@ mod tests {
             watch_timing: Default::default(),
         };
         let hubs = HubRegistry::default();
-        let mut manager = ClusterManager::new(config, events, hubs.clone());
+        let mut manager =
+            ClusterManager::new(config, events, hubs.clone(), SessionUnlocks::default());
         let mut slot = Cluster::new(context(None), None, &hubs, &manager.engine_config);
         slot.state = ConnectionState::Failed(cluster::SafeErrorText::fixed("offline"));
         manager.clusters.push(slot);
@@ -1481,6 +1543,55 @@ mod tests {
         );
         let gone = manager.log_client("other", None).err().expect("no client");
         assert!(gone.is_cluster());
+    }
+
+    // covers UP-54, UP-55: the one gate for actions that change a cluster refuses while it is
+    // protected, follows unlocks and trust, and is pinned to the server.
+    #[test]
+    fn the_write_gate_refuses_protected_clusters() {
+        let (events, _rx) = async_channel::unbounded();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let hubs = HubRegistry::default();
+        let unlocks = SessionUnlocks::default();
+        let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
+        manager.clusters.push(Cluster::new(
+            context(None),
+            None,
+            &hubs,
+            &manager.engine_config,
+        ));
+        let protected = |c: &str| WriteRefusal::Protected { cluster: c.into() };
+        let not_connected = WriteRefusal::NotConnected {
+            cluster: "dev".into(),
+        };
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        // A context Flint does not know has no server: protected, never handed a client.
+        assert_eq!(manager.write_client("gone").err(), Some(protected("gone")));
+
+        unlocks.unlock("dev", "https://elsewhere");
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        unlocks.unlock("dev", "https://dev");
+        assert_eq!(
+            manager.write_client("dev").err(),
+            Some(not_connected.clone())
+        );
+        unlocks.lock("dev");
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+
+        let mut trusted = Settings::default();
+        trusted
+            .trusted_clusters
+            .push(settings::ClusterPin::new("dev", "https://dev/"));
+        manager.settings = Arc::new(trusted);
+        assert_eq!(manager.write_client("dev").err(), Some(not_connected));
     }
 
     // covers UP-24

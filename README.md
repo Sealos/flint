@@ -88,8 +88,9 @@ Flint is in early development.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
   columns, a namespace and text filter, and a detail view with metadata, conditions, events and read-only YAML.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
-  containers. Open them from a row's context menu, the detail pane or the keyboard. Shells open on any cluster
-  without asking, production included, until protected clusters arrive.
+  containers. Open them from a row's context menu, the detail pane or the keyboard.
+- Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
+  or trust it (the lock button in the sidebar, or the palette). Today that means shells; editing joins it.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
@@ -99,7 +100,7 @@ Flint is in early development.
 
 - A resource switcher.
 - Log filters (matching lines only, regex, errors only) and time ranges.
-- Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain; protected clusters.
+- Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
 - Cluster sets and warm clusters for instant switching, AI log analysis, and a tighter MCP server (scope by
@@ -272,6 +273,7 @@ kubeconfig_paths = ["~/work/kubeconfig"]
 # path = "/opt/homebrew/bin:/usr/bin:/bin"   # override the PATH taken from your login shell
 # helm = "/opt/homebrew/bin/helm"
 watch_mode = "all"                # or "on_view"
+# protect_local_clusters = false  # true protects clusters on this machine too (see trusted_clusters)
 
 [cluster_watch_mode]
 # big-prod-cluster = "on_view"
@@ -282,6 +284,14 @@ watch_mode = "all"                # or "on_view"
 # [[ai_exposed_clusters]]
 # context = "kind-flint-dev"
 # server = "https://127.0.0.1:6443"
+
+# Clusters Flint may change (and open shells in) without asking, written by Trust This Cluster in
+# the sidebar's lock menu. Pinned to the server like exposure: a re-pointed context is protected
+# again. Clusters on this machine (localhost, 127.0.0.1, ::1) are unlocked anyway, unless
+# protect_local_clusters is true (for a local tunnel to a remote cluster).
+# [[trusted_clusters]]
+# context = "staging"
+# server = "https://staging.example.com:6443"
 ```
 
 The app watches `settings.toml` and your kubeconfig files and picks up changes without a restart.

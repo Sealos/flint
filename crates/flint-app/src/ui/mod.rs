@@ -21,6 +21,7 @@ mod dock_model;
 #[cfg(test)]
 mod dock_tests;
 mod focus;
+mod icons;
 mod list;
 mod list_model;
 mod log_model;
@@ -121,7 +122,7 @@ pub fn run(boot: Bootstrap) {
 
     let settings = boot.settings.clone();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(icons::FlintAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             // The window is not open yet: start from the app's appearance; the workspace

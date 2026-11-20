@@ -31,7 +31,9 @@ use gpui_kit::*;
 
 use super::detail::{Opening, ShellPod, Subject, log_item, reason, refused, shell_item};
 use super::object::PodContainer;
-use super::registry::{self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell};
+use super::registry::{
+    self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell, UnlockCluster,
+};
 #[cfg(any(test, feature = "automation"))]
 use super::view_state::{MenuEntryState, SubmenuEntryState};
 use super::workspace::Workspace;
@@ -70,6 +72,9 @@ pub struct RowActions {
     /// A pod's containers (init ones too), once fetched: what Logs and Previous Logs pick
     /// from.
     pub log_containers: Vec<PodContainer>,
+    /// The row's cluster, when it is protected (ADR-0015): Shell is disabled, saying so, and
+    /// an Unlock entry follows it, so the unlock is offered in place.
+    pub unlock: Option<String>,
 }
 
 /// What the selected row's actions can do now, if a pod or workload row is selected. The
@@ -98,6 +103,8 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
             Subject::Pod => detail.log_containers().to_vec(),
             _ => Vec::new(),
         },
+        unlock: (blocked.is_none() && ws.is_protected(&detail.object().cluster, cx))
+            .then(|| detail.object().cluster.clone()),
         blocked,
         subject,
     })
@@ -216,7 +223,7 @@ fn fill(
         (Some(shell), Subject::Workload(_)) => format!("Shell in {}", shell.pod),
         _ => "Shell".to_owned(),
     };
-    match a.shell_pod {
+    let menu = match a.shell_pod {
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
             menu.submenu(label, window, cx, move |sub, _, _| {
@@ -234,7 +241,19 @@ fn fill(
             })
         }
         _ => entry(menu, label.into(), Box::new(OpenShell), &a.shell, says_why),
+    };
+    match a.unlock {
+        Some(cluster) => menu.item(
+            PopupMenuItem::new(unlock_label(&cluster))
+                .on_click(registry::on_click(UnlockCluster { cluster })),
+        ),
+        None => menu,
     }
+}
+
+/// The Unlock entry of a protected cluster's row menu.
+fn unlock_label(cluster: &str) -> String {
+    format!("Unlock {}…", flint_core::display::short_name(cluster))
 }
 
 /// `label` as a submenu that picks one of `containers` for Logs (or Previous Logs, with
@@ -405,6 +424,9 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
         ),
         _ => entry(label, &a.shell),
     });
+    if let Some(cluster) = &a.unlock {
+        entries.push(entry(unlock_label(cluster), &Ok(())));
+    }
     (a.blocked.clone(), entries)
 }
 
@@ -444,6 +466,7 @@ pub(in crate::ui) mod tests {
             shell_pod: None,
             shell_picker: false,
             log_containers: vec![container("app", true, false)],
+            unlock: None,
         }
     }
 
@@ -519,6 +542,21 @@ pub(in crate::ui) mod tests {
                 {"label": "Logs", "enabled": false, "reason": why, "checked": null, "submenu": []},
                 {"label": "Shell in web-1", "enabled": false, "reason": why, "checked": null, "submenu": []},
             ]})
+        );
+
+        // covers UP-54: on a protected cluster Shell says why, and Unlock follows it.
+        let why = "alpha is protected (read-only in Flint) until you unlock it".to_owned();
+        let protected = RowActions {
+            shell: Err(why.clone()),
+            unlock: Some("alpha".into()),
+            ..pod_actions()
+        };
+        assert_eq!(
+            state(&protected)["entries"].as_array().unwrap()[2..],
+            [
+                json!({"label": "Shell", "enabled": false, "reason": why, "checked": null, "submenu": []}),
+                json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
+            ]
         );
     }
 }

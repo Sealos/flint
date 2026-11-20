@@ -383,14 +383,15 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   port-forward.
 - **Then** the action is disabled and says the cluster is protected, with an Unlock button in place. Browsing, logs and
   details work as usual. A cluster on my machine (kind, minikube, Docker Desktop, OrbStack) starts unlocked.
-- Tests: unit (core refuses writes on protected clusters), ui, e2e.
+- Tests: unit (core refuses writes on protected clusters), ui, e2e. Today exec is the only action that changes a
+  cluster, so Shell is the one gated; the rest join the same gate as they are built.
 
 ### UP-55 Unlock or trust a cluster
 - **When** I unlock a protected cluster, or mark it trusted.
 - **Then** an unlock asks once, naming the cluster and its server, and lasts until Flint quits; the sidebar shows an open
   lock, and Lock Again relocks it. Trust lasts across restarts and is pinned to the server URL: if the context is
   re-pointed, the cluster is protected again.
-- Tests: unit (settings, pinning), ui.
+- Tests: unit (settings, pinning), ui, e2e.
 
 ---
 

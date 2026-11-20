@@ -182,6 +182,9 @@ pub struct ClusterState {
     pub error: Option<String>,
     /// `hidden`, `exposed` or `server_changed`.
     pub ai: &'static str,
+    /// `protected`, `local` (on this machine), `unlocked` (for this session) or `trusted`
+    /// (ADR-0015).
+    pub protection: &'static str,
 }
 
 /// What the main area shows.

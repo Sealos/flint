@@ -253,6 +253,40 @@ pub struct HideFromAi {
     pub cluster: String,
 }
 
+/// Ask to unlock a protected cluster until Flint quits: opens the confirmation naming its
+/// server (ADR-0015).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct UnlockCluster {
+    pub cluster: String,
+}
+
+/// Lock a cluster unlocked for this session again (Lock Again).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct LockCluster {
+    pub cluster: String,
+}
+
+/// Ask to trust a cluster, keeping it unlocked across restarts: opens the confirmation naming
+/// its server (ADR-0015).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct TrustCluster {
+    pub cluster: String,
+}
+
+/// Stop trusting a cluster, or remove a stale trust, and lock it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct UntrustCluster {
+    pub cluster: String,
+}
+
 /// Open the list of a kind on the active cluster. `kind` is matched like `FLINT_VIEW`: `pods`,
 /// `deployments`, `deployments.apps`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -1678,6 +1712,32 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<HideFromAi>(
             "Hide Cluster from AI…",
             "Stop exposing a cluster to Flint's MCP server, or remove a stale exposure.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<UnlockCluster>(
+            "Unlock Cluster…",
+            "Let Flint change a protected cluster and open shells in it until Flint quits, after \
+             a confirmation naming its server.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<LockCluster>(
+            "Lock Cluster Again…",
+            "Protect a cluster unlocked for this session again: read-only in Flint.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<TrustCluster>(
+            "Trust Cluster…",
+            "Keep a cluster unlocked across restarts, pinned to its server, after a \
+             confirmation naming it.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<UntrustCluster>(
+            "Stop Trusting Cluster…",
+            "Protect a trusted cluster again, or remove a stale trust.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),

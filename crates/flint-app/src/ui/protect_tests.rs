@@ -1,0 +1,329 @@
+//! View tests for protected clusters (ADR-0015): Shell is disabled on a protected cluster,
+//! saying why, with the unlock in place; an unlock asks first, naming the server, and lasts
+//! until Lock Again; trust is kept in `settings.toml`, pinned to the server. The test servers
+//! are on this machine, so the tests turn on `protect_local_clusters` to see a protected one.
+
+use flint_core::settings::TrustState;
+use flint_core::{ObjectDetail, Protection};
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{AppContext as _, TestAppContext};
+use serde_json::{Value, json};
+
+use super::super::{trust_dialog, unlock_dialog};
+use crate::ui::dock::{DockItem as _, TabStatus};
+use crate::ui::registry::ActionError;
+use crate::ui::support_tests::{TestWorkspace, WAIT, alpha_and_beta, open_workspace_with};
+
+const PROTECT_LOCAL: &str = "protect_local_clusters = true\n";
+
+async fn open_with_settings(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    settings: &str,
+) -> TestWorkspace {
+    std::fs::write(dir.join("settings.toml"), settings).unwrap();
+    open_workspace_with(cx, dir, alpha_and_beta).await
+}
+
+fn protection(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) -> Protection {
+    t.model.read_with(cx, |m, _| m.protection_of(cluster))
+}
+
+async fn wait_for_protection(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    cluster: &'static str,
+    wanted: Protection,
+) {
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).protection_of(cluster) == wanted
+    })
+    .await;
+}
+
+async fn wait_for_dialog(cx: &mut TestAppContext, t: &TestWorkspace, open: bool) {
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        gpui_kit::component::WindowExt::has_active_dialog(window, cx) == open
+    })
+    .await;
+}
+
+fn draw(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.run_until_parked();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+/// Whether element `id` is drawn disabled (`None`: not drawn).
+fn disabled(cx: &mut TestAppContext, t: &TestWorkspace, id: &'static str) -> Option<bool> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window.try_find(id).map(|b| b.disabled() == Some(true))
+    })
+    .unwrap()
+}
+
+/// The captions under the detail pane's buttons.
+fn captions(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+    let detail = t.detail(cx).unwrap();
+    detail.read_with(cx, |d, _| d.action_captions())
+}
+
+/// Selects pod `web` in `demo` and hands the pane the object: one running container.
+async fn show_web(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    let detail = t.detail(cx).expect("the detail pane is open");
+    let pod = ObjectDetail {
+        object: json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 0, "state": {"running": {}}}
+            ]}
+        }),
+        yaml: String::new(),
+        managed_fields: None,
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    };
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| d.show_fetched(pod, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// What the banner over the dock says, if anything.
+fn refusal(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    t.workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned))
+}
+
+// covers UP-54, UP-55: on a protected cluster Shell is disabled, saying why, and Unlock sits
+// beside it; Logs still work. Unlocking asks first, naming the cluster and its server; Esc
+// keeps it protected. Once unlocked, Shell opens; Lock Again protects it again, and Restart
+// Shell is refused, saying why.
+#[gpui_kit::test]
+async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    show_web(cx, &t).await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    let why = "alpha is protected (read-only in Flint) until you unlock it";
+    assert_eq!(disabled(cx, &t, "detail-shell"), Some(true));
+    assert_eq!(disabled(cx, &t, "detail-logs"), Some(false));
+    assert_eq!(disabled(cx, &t, "detail-unlock"), Some(false));
+    assert_eq!(captions(cx, &t), [format!("Can't open a shell: {why}.")]);
+    assert_eq!(
+        t.dispatch(cx, "detail::OpenShell", Value::Null),
+        Err(ActionError::NotAvailable("detail::OpenShell".into()))
+    );
+    assert!(
+        t.description(cx, "lock-alpha")
+            .unwrap_or_default()
+            .starts_with("Protected")
+    );
+    // Locking a protected cluster does nothing.
+    assert!(matches!(
+        t.dispatch(cx, "workspace::LockCluster", json!({"cluster": "alpha"})),
+        Err(ActionError::Rejected { .. })
+    ));
+
+    t.click(cx, "detail-unlock");
+    wait_for_dialog(cx, &t, true).await;
+    assert_eq!(
+        t.label(cx, "unlock-description"),
+        Some(unlock_dialog("alpha", &t.server).text)
+    );
+    assert_eq!(t.label(cx, "ok").as_deref(), Some("Unlock"));
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+
+    t.click(cx, "detail-unlock");
+    wait_for_dialog(cx, &t, true).await;
+    t.click(cx, "ok");
+    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    assert!(
+        t.model.read_with(cx, |m, _| m
+            .core()
+            .unlocks()
+            .is_unlocked("alpha", &t.server)),
+        "the core's gate sees the unlock"
+    );
+    assert_eq!(disabled(cx, &t, "detail-shell"), Some(false));
+    assert_eq!(disabled(cx, &t, "detail-unlock"), None);
+    assert!(captions(cx, &t).is_empty());
+    assert!(
+        t.description(cx, "lock-alpha")
+            .unwrap_or_default()
+            .starts_with("Unlocked")
+    );
+    // Only alpha: beta is still protected, and the unlock is not written anywhere.
+    assert_eq!(protection(cx, &t, "beta"), Protection::Protected);
+    assert!(!t.settings_toml().contains("alpha"));
+
+    // The shell opens (and fails at once: the test cluster never connects in the core).
+    t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    let shell = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.dock.read(cx).active_terminal().cloned())
+        .expect("a shell tab");
+    let failed = shell.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        failed.read(cx).tab_status() == TabStatus::Failed
+    })
+    .await;
+
+    t.dispatch(cx, "workspace::LockCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_protection(cx, &t, "alpha", Protection::Protected).await;
+    assert!(!t.model.read_with(cx, |m, _| {
+        m.core().unlocks().is_unlocked("alpha", &t.server)
+    }));
+    assert_eq!(disabled(cx, &t, "detail-shell"), Some(true));
+    let tabs = t
+        .workspace
+        .read_with(cx, |ws, cx| ws.dock.read(cx).tab_ids().len());
+    t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some(format!("Can't restart the shell: {why}.").as_str())
+    );
+    assert_eq!(
+        t.workspace
+            .read_with(cx, |ws, cx| ws.dock.read(cx).tab_ids().len()),
+        tabs,
+        "no tab opened"
+    );
+}
+
+// covers UP-55: trusting asks first, naming the server, and writes the trust to settings.toml,
+// pinned to the server; Stop Trusting protects the cluster again. A trust left at another
+// server counts as protected, and trusting again names both servers.
+#[gpui_kit::test]
+async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppContext) {
+    let old = "https://10.0.0.1:6443";
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(
+        cx,
+        dir.path(),
+        &format!(
+            "{PROTECT_LOCAL}trusted_clusters = [{{ context = \"beta\", server = \"{old}\" }}]\n"
+        ),
+    )
+    .await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "beta"), Protection::Protected);
+    let beta_trust = t.model.read_with(cx, |m, _| {
+        m.trust(m.clusters.iter().find(|c| c.info.name == "beta").unwrap())
+    });
+    assert_eq!(
+        beta_trust,
+        TrustState::ServerChanged {
+            trusted_server: old.into()
+        }
+    );
+    let row = t.description(cx, "cluster-beta").unwrap_or_default();
+    assert!(
+        row.contains(&format!("Cluster changed: trusted at {old}")),
+        "{row}"
+    );
+
+    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert_eq!(
+        t.label(cx, "trust-description"),
+        Some(trust_dialog("alpha", &t.server, None).text)
+    );
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+    let toml = t.settings_toml();
+    assert!(
+        toml.contains("trusted_clusters") && toml.contains(&t.server),
+        "{toml}"
+    );
+    assert!(
+        t.description(cx, "lock-alpha")
+            .unwrap_or_default()
+            .starts_with("Trusted")
+    );
+    assert!(matches!(
+        t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"})),
+        Err(ActionError::Rejected { .. })
+    ));
+
+    // Beta, trusted at its old server: trusting again names both.
+    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "beta"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert_eq!(
+        t.label(cx, "trust-description"),
+        Some(trust_dialog("beta", &t.refused_server, Some(old)).text)
+    );
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+
+    t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_protection(cx, &t, "alpha", Protection::Protected).await;
+    t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "beta"}))
+        .unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.trusted_clusters.is_empty()
+    })
+    .await;
+    assert!(matches!(
+        t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "alpha"})),
+        Err(ActionError::Rejected { .. })
+    ));
+}
+
+// covers UP-54: clusters on this machine start unlocked: no lock button, Shell enabled, and
+// nothing to unlock or trust.
+#[gpui_kit::test]
+async fn clusters_on_this_machine_start_unlocked(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), "").await;
+    show_web(cx, &t).await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Local);
+    assert_eq!(disabled(cx, &t, "lock-alpha"), None);
+    assert_eq!(disabled(cx, &t, "detail-shell"), Some(false));
+    assert_eq!(disabled(cx, &t, "detail-unlock"), None);
+    for action in [
+        "UnlockCluster",
+        "LockCluster",
+        "TrustCluster",
+        "UntrustCluster",
+    ] {
+        assert!(
+            matches!(
+                t.dispatch(
+                    cx,
+                    &format!("workspace::{action}"),
+                    json!({"cluster": "alpha"})
+                ),
+                Err(ActionError::Rejected { .. })
+            ),
+            "{action}"
+        );
+    }
+    let row = t.description(cx, "cluster-alpha").unwrap_or_default();
+    assert!(row.contains("On this machine: unlocked"), "{row}");
+}
