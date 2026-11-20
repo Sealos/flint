@@ -392,11 +392,13 @@ impl ExecSession {
         let _ = self.inputs.try_send(input);
     }
 
-    /// Reserves `bytes` of the input budget for input sent now.
+    /// Reserves `bytes` of the input budget for input sent now. The shell attempt is read
+    /// first, so input reserved while one shell runs is never counted as the next one's.
     fn reserve(&self, bytes: usize) -> Result<Sent, InputRefused> {
+        let attempt = self.attempt.load(Ordering::Acquire);
         Ok(Sent {
             charge: budget::reserve(&self.budget, bytes)?,
-            attempt: self.attempt.load(Ordering::Acquire),
+            attempt,
         })
     }
 
