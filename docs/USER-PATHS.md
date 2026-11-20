@@ -255,8 +255,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   dock's tab (a text field and a shell keep Tab for themselves). The pane with focus shows its cursor with the focus
   ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
   navigation the arrows move over sections and kinds, Enter opens a kind (its list takes focus) or opens and closes a
-  section, Right opens a section and Left closes it (from a kind, its own section). Cmd-[ goes back to the kind and
-  object shown before, on the active cluster.
+  section, Right opens a section and Left closes it (from a kind, its own section). In a list, Cmd-F moves to its text
+  filter, and Esc, Enter or Down there moves back to the rows, keeping the filter. Cmd-[ goes back to the kind and
+  object shown before, on the active cluster, never to the place already shown.
 - Tests: ui.
 
 ---

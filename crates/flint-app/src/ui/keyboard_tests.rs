@@ -108,6 +108,40 @@ async fn tab_and_shift_tab_cycle_the_panes(cx: &mut TestAppContext) {
     assert_ne!(focus(cx, &t), Focus::Sidebar);
 }
 
+// covers UP-33: from the list's filter, Esc, Enter and Down each move focus back to the rows,
+// and the filter keeps its text.
+#[gpui_kit::test]
+async fn keys_in_the_filter_return_to_the_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "we");
+    let list = t.list(cx).expect("a list is open");
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+    for key in ["escape", "enter", "down"] {
+        t.press_key_of(cx, "resource_list::FocusFilter");
+        assert_eq!(
+            focus(cx, &t),
+            Focus::ListFilter,
+            "{key}: the filter has focus"
+        );
+        t.press(cx, key);
+        assert_eq!(focus(cx, &t), Focus::List, "{key} returns to the rows");
+        assert_eq!(
+            list.read_with(cx, |l, _| l.shown().1),
+            1,
+            "{key} keeps the filter"
+        );
+    }
+    // Back in the rows, the list's own keys work again.
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+}
+
 // covers UP-33: Tab reaches a shell tab in the dock, where Tab then belongs to the shell.
 #[gpui_kit::test]
 async fn tab_reaches_the_dock(cx: &mut TestAppContext) {
@@ -361,12 +395,91 @@ async fn go_back_to_the_open_kind_focuses_the_list(cx: &mut TestAppContext) {
     )
     .unwrap();
     assert_eq!(t.selected(cx).as_deref(), Some("api"));
-    t.dispatch(cx, "resource_list::CloseDetail", serde_json::Value::Null)
-        .unwrap();
     t.focus_workspace(cx);
     t.press_key_of(cx, "workspace::GoBack");
     assert_eq!(t.selected(cx), None);
     assert_eq!(focus(cx, &t), Focus::List);
+}
+
+// covers UP-33: selecting a row records nothing, so the place remembered last can be the one
+// shown; Go Back skips it rather than spend a press staying put.
+#[gpui_kit::test]
+async fn go_back_skips_the_object_already_selected_again(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
+        .unwrap();
+    t.feed_list(
+        cx,
+        objects(
+            KindId::new("", "services"),
+            &[("demo", "front", 0)],
+            flint_core::SyncState::Synced,
+            1,
+        ),
+    )
+    .await;
+    // Back to pods: web, then api (remembering web), then web selected by hand.
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    t.feed_list(cx, pods(&[("demo", "api", 0), ("demo", "web", 0)]))
+        .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    // The top of the history is pods/web, the place shown: one press goes past it.
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    let list = t.list(cx).expect("a list is open");
+    assert_eq!(
+        list.read_with(cx, |l, _| l.kind().clone()),
+        KindId::new("", "services")
+    );
+}
+
+// covers UP-33: clearing the selection records nothing either; with only the place shown left
+// in the history, Go Back has nowhere to go.
+#[gpui_kit::test]
+async fn go_back_has_nowhere_to_go_from_the_place_remembered_last(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    t.dispatch(cx, "resource_list::CloseDetail", serde_json::Value::Null)
+        .unwrap();
+    assert_eq!(t.selected(cx), None);
+    assert!(!t.available(cx).contains(&"workspace::GoBack"));
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(t.selected(cx), None);
+    assert_eq!(
+        t.list(cx)
+            .expect("a list is open")
+            .read_with(cx, |l, _| l.kind().clone()),
+        KindId::pods()
+    );
 }
 
 // covers UP-33, UP-55: on a protected cluster the sidebar's cursor ring leaves its lock button

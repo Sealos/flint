@@ -200,18 +200,26 @@ impl Workspace {
         self.history.clear();
     }
 
-    /// Whether Go Back has somewhere to go.
+    /// Whether Go Back has somewhere to go: a place other than the one shown, of a kind the
+    /// cluster still serves.
     pub(super) fn can_go_back(&self, cx: &App) -> bool {
+        let here = self.place(cx);
         self.cluster.is_some()
             && self
                 .history
                 .places()
-                .any(|p| self.nav_entry(p.kind.as_str(), cx).is_some())
+                .any(|p| here.as_ref() != Some(p) && self.nav_entry(p.kind.as_str(), cx).is_some())
     }
 
     /// Go Back: shows the kind and object shown before.
     pub(super) fn go_back(&mut self, _: &GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        // Selecting a row or clearing the selection records nothing, so the last place
+        // remembered can be the one shown; a press never goes there.
+        let here = self.place(cx);
         while let Some(place) = self.history.pop() {
+            if here.as_ref() == Some(&place) {
+                continue;
+            }
             // A kind the cluster no longer serves is skipped.
             let Some(entry) = self.nav_entry(place.kind.as_str(), cx) else {
                 continue;

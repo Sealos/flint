@@ -22,12 +22,27 @@ use super::workspace::Workspace;
 const WAIT: Duration = Duration::from_secs(10);
 
 fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ClustersModel>, tempfile::TempDir) {
+    open_with(cx, None)
+}
+
+/// [`open`], with `settings.toml` holding `broken` when given: the core starts with the error
+/// it would have reported reading that file.
+fn open_with(
+    cx: &mut TestAppContext,
+    broken: Option<&str>,
+) -> (AnyWindowHandle, Entity<ClustersModel>, tempfile::TempDir) {
     cx.executor().allow_parking();
     let dir = tempfile::tempdir().unwrap();
+    let settings_error = broken.map(|text| {
+        std::fs::write(dir.path().join("settings.toml"), text).unwrap();
+        flint_core::settings::load_settings_or_fallback(dir.path())
+            .1
+            .expect("the settings file is broken")
+    });
     let core = CoreHandle::start(CoreConfig {
         config_dir: dir.path().to_owned(),
         settings: Settings::default(),
-        settings_error: None,
+        settings_error,
         kubeconfig_base: Vec::new(),
         home: None,
         watch_files: false,
@@ -171,4 +186,25 @@ async fn switching_appearance_keeps_the_last_error(cx: &mut TestAppContext) {
         error.as_deref(),
         Some("\"gone\" was removed from your kubeconfig files.")
     );
+}
+
+// covers UP-06: while settings.toml cannot be read, View > Appearance changes nothing on disk and
+// says the file must be fixed first.
+#[gpui_kit::test]
+async fn appearance_waits_for_a_broken_settings_file(cx: &mut TestAppContext) {
+    let broken = "appearance = \"dark\"\nwatch_mode = [\n";
+    let (window, model, dir) = open_with(cx, Some(broken));
+    cx.wait_for(window, WAIT, shows("Flint Light", ThemeMode::Light))
+        .await;
+    cx.update(|cx| cx.dispatch_action(&AppearanceDark));
+    let refused = model.clone();
+    cx.wait_for(window, WAIT, move |_, cx| {
+        refused.read(cx).last_error.as_deref().is_some_and(|e| {
+            e.starts_with("settings.toml must be fixed before the appearance can change")
+        })
+    })
+    .await;
+    let on_disk = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+    assert_eq!(on_disk, broken, "the file is left for its owner to fix");
+    assert_eq!(checked(cx), ["Use System Appearance"]);
 }
