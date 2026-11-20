@@ -183,33 +183,50 @@ jobs:
       - name: Upload to the draft release
         run: gh release upload "$TAG" "$APPIMAGE" "$APPIMAGE.sha256" --clobber
 
-  # Runs once, after every binary is on the draft. Unsigned until M6; 0.x is a pre-release.
+  # Runs once, after every binary is on the draft. A release is published only when complete,
+  # as a full release; it becomes Latest unless a newer release already is.
   publish:
     needs: [release-please, build-macos, build-linux]
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.release-please.outputs.tag_name }}
-      VERSION: ${{ needs.release-please.outputs.version }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Publish the release
+      # Every binary and its checksum must be on the draft, non-empty, and match: a name alone
+      # would pass a zero-size or half-uploaded (--clobber re-run) file.
+      - name: Check the draft has every binary, intact
         run: |
-          case "$VERSION" in
-            0.*) gh release edit "$TAG" --draft=false --prerelease ;;
-            *) gh release edit "$TAG" --draft=false ;;
-          esac
-      # Never leave a published release that nobody can install.
-      - name: Check the published release has its binaries
-        run: |
-          names=$(gh release view "$TAG" --json isDraft,assets --jq 'select(.isDraft == false) | .assets[].name')
+          mkdir -p assets && cd assets
           for file in \
             "flint-${TAG}-macos-universal.tar.gz" \
             "flint-${TAG}-macos-universal.dmg" \
             "flint-${TAG}-linux-x86_64.AppImage" \
             "flint-${TAG}-linux-aarch64.AppImage"; do
             for want in "$file" "$file.sha256"; do
-              grep -qxF "$want" <<<"$names" || { echo "::error::release $TAG is missing $want"; exit 1; }
+              gh release download "$TAG" --pattern "$want" --clobber ||
+                { echo "::error::release $TAG is missing $want"; exit 1; }
+              [ -s "$want" ] || { echo "::error::release $TAG has an empty $want"; exit 1; }
             done
+            sha256sum -c "$file.sha256" ||
+              { echo "::error::$file does not match $file.sha256"; exit 1; }
           done
+      # Latest only moves forward: retrying an older draft after a newer release has shipped must
+      # not send /releases/latest back to the older build.
+      - name: Publish the release
+        run: |
+          current=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          newest=$(printf '%s\n%s\n' "${current#v}" "${TAG#v}" | sed '/^$/d' | sort -V | tail -n1)
+          if [ -z "$current" ] || [ "$newest" = "${TAG#v}" ]; then latest=true; else latest=false; fi
+          echo "current Latest: ${current:-none}; marking $TAG Latest: $latest"
+          echo "LATEST=$latest" >> "$GITHUB_ENV"
+          gh release edit "$TAG" --draft=false --prerelease=false --latest="$latest"
+      - name: Check the release is published
+        run: |
+          gh release view "$TAG" --json isDraft,isPrerelease \
+            --jq 'if .isDraft or .isPrerelease then error("release \(env.TAG) is not a full release") else "ok" end'
+          if [ "$LATEST" = true ]; then
+            got=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+            [ "$got" = "$TAG" ] || { echo "::error::Latest is $got, not $TAG"; exit 1; }
+          fi
