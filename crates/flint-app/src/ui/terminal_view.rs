@@ -479,7 +479,10 @@ impl TerminalView {
                         .icon(IconName::ArrowDown)
                         .xsmall()
                         .ghost()
-                        .tooltip("Scroll to the bottom (⇧End)")
+                        .tooltip(format!(
+                            "Scroll to the bottom ({})",
+                            registry::key_hint("shift-end")
+                        ))
                         .on_click(registry::on_click(ScrollToBottom)),
                 )
             })
@@ -489,11 +492,10 @@ impl TerminalView {
                     .xsmall()
                     .ghost()
                     .disabled(!self.selection)
-                    .tooltip(if cfg!(target_os = "macos") {
-                        "Copy the selection (⌘C)"
-                    } else {
-                        "Copy the selection (Ctrl-Shift-C)"
-                    })
+                    .tooltip(format!(
+                        "Copy the selection ({})",
+                        registry::key_hint(registry::TERMINAL_COPY[0])
+                    ))
                     .on_click(registry::on_click(CopyText)),
             )
             .child(
@@ -502,11 +504,10 @@ impl TerminalView {
                     .ghost()
                     .label("Paste")
                     .disabled(!self.is_live())
-                    .tooltip(if cfg!(target_os = "macos") {
-                        "Paste into the shell (⌘V)"
-                    } else {
-                        "Paste into the shell (Ctrl-Shift-V)"
-                    })
+                    .tooltip(format!(
+                        "Paste into the shell ({})",
+                        registry::key_hint(registry::TERMINAL_PASTE[0])
+                    ))
                     .on_click(registry::on_click(PasteText)),
             )
     }
