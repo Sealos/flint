@@ -1847,8 +1847,6 @@ mod tests {
             ))),
             ExecFailureKind::SignIn
         );
-        // A bare 404 (a proxy's page, a wrong server path) is not a pod problem; a bare 401
-        // is signing in.
         // A proxy that strips the upgrade headers leaves the API server's 400; any other 400 is
         // the server's own refusal.
         let bad_request = |message: &str| {
@@ -1869,6 +1867,8 @@ mod tests {
         );
         let any = kube::Error::LinesCodecMaxLineLengthExceeded;
         let http = |code| ClusterError::Http { code, server: None };
+        // A bare 404 (a proxy's page, a wrong server path) is not a pod problem; a bare 401
+        // is signing in.
         assert_eq!(
             ExecFailureKind::of(&any, &http(404)),
             ExecFailureKind::Other

@@ -1045,7 +1045,9 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     assert_eq!(fake.wait_for_end(WAIT).await.unwrap(), ExecEnd::Exited(3));
     server.wait_for_exec_sessions(0, WAIT).await.unwrap();
     // Typing after the exit goes nowhere. The paste is answered after the write was handled
-    // (inputs are handled in order), and says no program takes input any more.
+    // (inputs are handled in order), and says no program takes input any more: that is the
+    // check that can fail. The screen and stdin checks below only document the outcome (Flint
+    // doesn't echo locally, and the fake has closed the session).
     shell.write(b"echo late\r".to_vec());
     assert!(!shell.paste_if_bracketed("x").await);
     let snap = shell.latest();
