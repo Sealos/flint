@@ -29,11 +29,9 @@ use flint_core::redact::first_line;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
 
-use super::detail::{Opening, Subject, container_label, reason, refused};
+use super::detail::{Opening, ShellPod, Subject, log_item, reason, refused, shell_item};
 use super::object::PodContainer;
-use super::registry::{
-    self, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell,
-};
+use super::registry::{self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell};
 use super::workspace::Workspace;
 
 /// Builds a row's context menu (gpui-component's `context_menu` builder).
@@ -63,7 +61,7 @@ pub struct RowActions {
     pub previous: Option<Availability>,
     pub shell: Availability,
     /// The pod a shell opens in, its app containers, and the default one, as far as known.
-    pub shell_pod: Option<(String, Vec<String>, String)>,
+    pub shell_pod: Option<ShellPod>,
     /// A pod's containers (init ones too), once fetched: what Logs and Previous Logs pick
     /// from.
     pub log_containers: Vec<PodContainer>,
@@ -89,7 +87,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         previous: (subject == Subject::Pod)
             .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
         shell: gate(detail.shell_check::<OpenShell>(None)),
-        shell_pod: detail.shell_pod().map(|p| (p.pod, p.containers, p.default)),
+        shell_pod: detail.shell_pod(),
         log_containers: match subject {
             Subject::Pod => detail.log_containers().to_vec(),
             _ => Vec::new(),
@@ -209,24 +207,24 @@ fn fill(
         };
     }
     let label = match (&a.shell_pod, a.subject) {
-        (Some((pod, _, _)), Subject::Workload(_)) => format!("Shell in {pod}"),
+        (Some(shell), Subject::Workload(_)) => format!("Shell in {}", shell.pod),
         _ => "Shell".to_owned(),
     };
     match a.shell_pod {
         // The container picker.
-        Some((_, containers, default)) if a.shell.is_ok() && containers.len() > 1 => {
+        Some(shell) if a.shell.is_ok() && shell.containers.len() > 1 => {
             menu.submenu(label, window, cx, move |sub, _, _| {
-                containers.iter().fold(sub.label("Container"), |sub, name| {
-                    sub.item(
-                        PopupMenuItem::new(container_label(name, false, *name == default))
-                            .on_click(registry::on_click_or(
-                                Box::new(OpenContainerShell {
-                                    container: name.clone(),
-                                }),
-                                refuse_in(&workspace),
-                            )),
-                    )
-                })
+                shell
+                    .containers
+                    .iter()
+                    .fold(sub.label("Container"), |sub, name| {
+                        let running = !shell.not_running.contains(name);
+                        let (item, action) = shell_item(name, *name == shell.default, running);
+                        sub.item(item.on_click(registry::on_click_or(
+                            Box::new(action),
+                            refuse_in(&workspace),
+                        )))
+                    })
             })
         }
         _ => entry(menu, label.into(), Box::new(OpenShell), &a.shell, says_why),
@@ -247,17 +245,11 @@ fn log_picker(
     let workspace = workspace.clone();
     menu.submenu(label, window, cx, move |sub, _, _| {
         containers.iter().fold(sub.label("Container"), |sub, c| {
-            sub.item(
-                PopupMenuItem::new(container_label(&c.name, c.init, c.default)).on_click(
-                    registry::on_click_or(
-                        Box::new(OpenContainerLogs {
-                            container: c.name.clone(),
-                            previous,
-                        }),
-                        refuse_in(&workspace),
-                    ),
-                ),
-            )
+            let (item, action) = log_item(c, previous);
+            sub.item(item.on_click(registry::on_click_or(
+                Box::new(action),
+                refuse_in(&workspace),
+            )))
         })
     })
 }

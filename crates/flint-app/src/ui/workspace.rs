@@ -622,10 +622,22 @@ impl Workspace {
         });
     }
 
+    /// Tells the detail pane whether sessions can open on its object's cluster, so its Logs and
+    /// Shell are disabled, saying why, while the cluster is not connected.
+    fn tell_detail_sessions_blocked(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        let cluster = detail.read(cx).object().cluster.clone();
+        let why = self.sessions_blocked(&cluster, cx);
+        detail.update(cx, |d, cx| d.set_sessions_blocked(why, cx));
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.check_dock_servers(cx);
+        self.tell_detail_sessions_blocked(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();
@@ -856,6 +868,7 @@ impl Workspace {
                         }),
                     ];
                 self.detail = Some(detail);
+                self.tell_detail_sessions_blocked(cx);
             }
             ListEvent::SelectedChanged => {
                 if let Some(detail) = &self.detail {

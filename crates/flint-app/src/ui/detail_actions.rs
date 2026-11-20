@@ -64,6 +64,9 @@ pub(in crate::ui) struct ShellPod {
     /// The app containers, in spec order.
     pub containers: Vec<String>,
     pub default: String,
+    /// Those of them whose status says they are not running (waiting, crash-looping,
+    /// terminated): a picker lists them disabled. Not known for a workload's pods.
+    pub not_running: Vec<String>,
 }
 
 /// Why an action was refused, in words for the user.
@@ -101,7 +104,8 @@ impl Opening {
 /// captions show is worded here.
 pub(in crate::ui) fn refused(opening: Opening, why: &str) -> String {
     let why = why.trim_end();
-    let end = if why.ends_with(['.', '!', '?']) {
+    // A reason cut short ends in "…", which ends the sentence too.
+    let end = if why.ends_with(['.', '!', '?', '…']) {
         ""
     } else {
         "."
@@ -359,10 +363,16 @@ impl DetailView {
                     .or_else(|| self.pod_shell_containers().next())?
                     .name
                     .clone();
+                let not_running = self
+                    .pod_shell_containers()
+                    .filter(|c| c.not_running)
+                    .map(|c| c.name.clone())
+                    .collect();
                 Some(ShellPod {
                     pod: self.object.name.clone(),
                     containers,
                     default,
+                    not_running,
                 })
             }
             // Listed before the workload changed, a pod named could be gone: none is named
@@ -650,6 +660,7 @@ fn shell_pod_of(pods: &[WorkloadPod]) -> Option<ShellPod> {
         pod: pod.name.clone(),
         containers: pod.containers.clone(),
         default: pod.default_container.clone()?,
+        not_running: Vec::new(),
     })
 }
 
@@ -696,6 +707,10 @@ mod tests {
         assert_eq!(
             refused(Opening::Logs, "the server said no."),
             "Can't open the logs: the server said no."
+        );
+        assert_eq!(
+            refused(Opening::Shell, "the pods could not be listed: a very long…"),
+            "Can't open a shell: the pods could not be listed: a very long…"
         );
         assert_eq!(
             refused(Opening::PreviousLogs, "container app has not restarted "),

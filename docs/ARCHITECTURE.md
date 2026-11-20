@@ -397,15 +397,22 @@ buttons and a row's context menu (`ui/row_menu.rs`) are one set of actions. `row
 do now and why not, with the same checks as the guards; the menu, the pane's buttons and the automation `state` show
 it (a disabled entry carries its reason). The pane says it without hovering too: a muted caption under its header
 (`DetailView::action_captions`) gives the refusal's sentence for Logs and for Shell, once when they share it; Logs and
-Shell stay, disabled, when the pod could not be fetched. A right-click selects the row first. On a pod with several
-containers the menu's Logs, Previous Logs (the containers that ran before) and Shell, and the pane's Logs and Shell
-buttons, are container pickers (`detail::OpenContainerLogs`, `detail::OpenContainerShell`) that mark the default
-container; the keys always open the default container at once, never a picker. The default is the one `kubectl` picks
-(the `kubectl.kubernetes.io/default-container` annotation, else the first app container), so ⌘L and ⇧⌘E do in one step
-what `kubectl logs` and `kubectl exec` do without `-c`, the same way every time and from the palette too, where no
-menu is open; the picker is one right-click or button away, and the buttons' tooltips say which container the key
-opens. For a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs opens the workload session (all pods,
-prefixed) and Shell opens in its first ready pod by name.
+Shell stay, disabled, when the pod could not be fetched. The caption never repeats what the pane already says: a pod
+that could not be fetched reads "Can't open the logs or a shell until the pod is fetched." (the body shows the
+server's error), and a deleted object gets no caption (its notice says so). While the object's cluster is not
+connected the workspace tells the pane (`DetailView::set_sessions_blocked`, from `Workspace::sessions_blocked`), and
+both buttons are disabled with that reason in their tooltips and the caption. Kinds other than pods and workloads have
+no Logs or Shell button. A right-click selects the row first. On a pod with several containers the menu's Logs,
+Previous Logs (the containers that ran before) and Shell, and the pane's Logs and Shell buttons, are container pickers
+(`detail::OpenContainerLogs`, `detail::OpenContainerShell`) that mark the default container, whose entry also carries
+the plain action so the menu shows its key beside it; a container whose status says it is waiting or terminated
+(crash-looping, say) is listed disabled in the Shell picker as "not running", and a native sidecar (an init container
+with `restartPolicy: Always`) counts as an app container; the keys always open the default container at once, never a
+picker. The default is the one `kubectl` picks (the `kubectl.kubernetes.io/default-container` annotation, else the
+first app container), so ⌘L and ⇧⌘E do in one step what `kubectl logs` and `kubectl exec` do without `-c`, the same
+way every time and from the palette too, where no menu is open; the picker is one right-click or button away, and the
+buttons' tooltips say which container the key opens. For a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs
+opens the workload session (all pods, prefixed) and Shell opens in its first ready pod by name.
 
 - **Workload pods** (`ui/detail_pods.rs`, `CoreHandle::workload_pods`): never listed on each update of the workload.
   A cached list (`resourceVersion=0`) shows which pod a shell would open in: a moment after the row is selected (so
@@ -467,9 +474,12 @@ opens in a tab in the bottom dock.
   without focus; none once the session ended); the bell flashes the
   screen. The grid size comes from the element's size and the font's advance; a change is sent after 80 ms without
   further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed;
-  why it failed is said once, in the banner under it, in plain words with the server's text as the detail
-  (`terminal_model::failure_words`: no permission, pod or exec not found, container not running, no shell in the
-  image, a broken connection). After the end the screen stays scrollable and copyable. Closing the tab drops the session.
+  why it failed is said once, in the banner under it: plain words, then "Details:" and what was said, in full and
+  wrapping, so a long RBAC message stays readable in a narrow dock. Core types where a failure came from
+  (`ExecFailureKind`: the server, signing in, reaching the cluster, the connection, a missing shell), and
+  `terminal_model::failure_words` words it from that: a local error (a missing auth plugin, an unreadable client
+  certificate) reads "Flint couldn't sign in to the cluster.", never as the pod's; only the server's own refusals are
+  told apart by their words (no permission, pod or exec not found, container not running). After the end the screen stays scrollable and copyable. Closing the tab drops the session.
 - **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,
   Space, the arrows, Home/End, Page Up/Down and Ctrl with a letter or symbol to nothing
   (`registry::TERMINAL_PASSTHROUGH`); it is the deepest context, so those keys skip the app's bindings (focus

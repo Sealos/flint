@@ -1220,13 +1220,35 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     draw(cx, &t);
     show_fetched(cx, &t, pod_detail("web"));
     assert_eq!(dispatch(cx, &t, "detail::OpenShell", Value::Null), Ok(()));
-    t.model.update(cx, |model, cx| {
-        for cluster in &mut model.clusters {
-            cluster.state = ConnectionState::Failed(SafeErrorText::reduced("connection refused"));
-        }
-        cx.notify();
-    });
-    draw(cx, &t);
+    // Disconnected, the list and the pane stay: the pane's buttons are disabled, saying why
+    // without hovering.
+    let set_state = |cx: &mut TestAppContext, state: ConnectionState| {
+        t.model.update(cx, |model, cx| {
+            for cluster in &mut model.clusters {
+                cluster.state = state.clone();
+            }
+            cx.notify();
+        });
+        draw(cx, &t);
+    };
+    set_state(cx, ConnectionState::Disconnected);
+    assert_eq!(logs_button_disabled(cx, &t), Some(true));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(
+        captions(cx, &t),
+        ["Can't open the logs or a shell: alpha is not connected."]
+    );
+    set_state(
+        cx,
+        ConnectionState::Failed(SafeErrorText::reduced("connection refused")),
+    );
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    assert_eq!(
+        detail_view.read_with(cx, |d, _| d.action_captions()),
+        ["Can't open the logs or a shell: alpha is not connected: connection refused."]
+    );
     for action in [
         "detail::OpenLogs",
         "detail::OpenPreviousLogs",
@@ -1601,9 +1623,10 @@ async fn the_pane_says_why_under_its_buttons(cx: &mut TestAppContext) {
     detail_view.update(cx, |d, cx| d.show_failed("Forbidden: no".into(), cx));
     assert_eq!(logs_button_disabled(cx, &t), Some(true));
     assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    // The body says what the server said; the caption does not repeat it.
     assert_eq!(
         captions(cx, &t),
-        ["Can't open the logs or a shell: the pod could not be fetched: Forbidden: no."]
+        ["Can't open the logs or a shell until the pod is fetched."]
     );
     show_fetched(cx, &t, pod_detail("web"));
     assert_eq!(logs_button_disabled(cx, &t), Some(false));
@@ -1619,6 +1642,111 @@ async fn the_pane_says_why_under_its_buttons(cx: &mut TestAppContext) {
         captions(cx, &t),
         ["Can't open a shell: no pod of Deployment web is ready."]
     );
+}
+
+// covers UP-47: a deleted pod's Shell is disabled, but the caption leaves the "deleted" to the
+// pane's notice instead of saying it again.
+#[gpui_kit::test]
+async fn a_deleted_pod_gets_no_caption(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(cx, &t, pod_detail("web"));
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    detail_view.update(cx, |d, cx| d.mark_gone(cx));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(captions(cx, &t), Vec::<String>::new());
+}
+
+// covers UP-47, UP-40, UP-41: on a multi-container pod each picker shows the key of the action
+// on its default container's entry, so the keys stay visible; the pane's picker marks the
+// default and its tooltip names what the key opens. A container that is not running is listed
+// disabled in the Shell picker, and a native sidecar is an app container.
+#[gpui_kit::test]
+async fn pickers_show_the_keys_and_which_containers_run(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {
+                "initContainers": [{"name": "mesh", "restartPolicy": "Always"}],
+                "containers": [{"name": "app"}, {"name": "worker"}]
+            },
+            "status": {
+                "initContainerStatuses": [{"name": "mesh", "state": {"running": {}}}],
+                "containerStatuses": [
+                    {"name": "app", "state": {"running": {}}},
+                    {"name": "worker", "restartCount": 4,
+                     "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+                ]
+            }
+        })),
+    );
+    // The pane's Logs picker: the default marked, the tooltip naming what Cmd-L opens.
+    let tooltip = t.description(cx, "detail-logs");
+    let keys = registry::key_hint("secondary-l");
+    assert_eq!(
+        tooltip.as_deref(),
+        Some(format!("Choose a container ({keys} opens app, the default)").as_str())
+    );
+    cx.update_window(t.window, |_, window, cx| window.click("detail-logs", cx))
+        .unwrap();
+    let entries: Vec<String> = menu(cx, &t).into_iter().filter(|e| !e.is_empty()).collect();
+    assert_eq!(
+        entries,
+        [
+            "Container",
+            "mesh",
+            "app (default)",
+            "worker",
+            "Previous instance",
+            "worker"
+        ]
+    );
+    press(cx, &t, "escape");
+
+    // The row's Shell picker: the sidecar is offered, the crash-looping one disabled; the
+    // default's entry shows Shift-Cmd-E.
+    right_click(cx, &t, "web").await;
+    click_entry(cx, &t, 2);
+    assert_eq!(
+        submenu(cx, &t),
+        ["mesh", "app (default)", "worker (not running)"]
+    );
+    let shown_keys = cx
+        .update_window(t.window, |_, window, _| {
+            gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .map(|t| t.text().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    let shell_keys = gpui_kit::component::kbd::Kbd::format(
+        &gpui_kit::Keystroke::parse(if cfg!(target_os = "macos") {
+            "cmd-shift-e"
+        } else {
+            "ctrl-shift-e"
+        })
+        .unwrap(),
+    );
+    assert!(
+        shown_keys.contains(&shell_keys),
+        "{shell_keys} in {shown_keys:?}"
+    );
+    // The disabled one does nothing.
+    click_submenu(cx, &t, 3);
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
 }
 
 // covers UP-47: the strip that says why takes a row of its own under the list and the pane,

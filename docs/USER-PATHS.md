@@ -251,18 +251,19 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-41 Shell into a container
 - **When** I open a shell on a pod (Shell in its detail pane or its row's context menu, or Shift-Cmd-E), or on a
   workload (in its first ready pod; UP-47). When the pod has several containers, the button and the menu let me pick
-  one, the default marked; Shift-Cmd-E opens the default container at once.
+  one, the default marked with Shift-Cmd-E beside it; a container that is not running is listed but disabled, and a
+  native sidecar is offered like any app container. Shift-Cmd-E opens the default container at once.
 - **Then** a tab opens in the bottom dock with an interactive terminal that resizes with the dock and the window.
   Colors, bold, italic, underline, inverse and wide characters show as in other terminals, in both themes, and
   full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and
   Cmd-V (Ctrl-Shift-C and Ctrl-Shift-V on Linux) copy the mouse selection and paste. The wheel scrolls back through
   the output. Images without `bash` fall back to `sh`. The tab says whether the shell is connecting, running, exited
   (with its exit code) or failed (and why, once, in plain words such as "You don't have permission to open a shell
-  in this pod.", with the server's text as the detail), and the output stays readable and copyable until I close
-  the tab; Restart shell (Cmd-R; Ctrl+Shift+R on Linux) starts a new shell in a tab beside it. The tab and its
-  toolbar name the cluster the shell runs on, and two clusters never read the same. Pasting several lines into a
-  shell that would run each one as it arrives asks first, and a huge clipboard is refused. If the context is
-  re-pointed at another API server, the shell ends and says why.
+  in this pod." or "Flint couldn't sign in to the cluster.", then what the server said in full), and the output
+  stays readable and copyable until I close the tab; Restart shell (Cmd-R; Ctrl+Shift+R on Linux) starts a new shell
+  in a tab beside it. The tab and its toolbar name the cluster the shell runs on, and two clusters never read the
+  same. Pasting several lines into a shell that would run each one as it arrives asks first, and a huge clipboard is
+  refused. If the context is re-pointed at another API server, the shell ends and says why.
 - Tests: unit (terminal model, session logic, key encoding, colors, grid size), cluster, ui.
 
 ### UP-42 Sessions outlive navigation
@@ -322,12 +323,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   and gives up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile, nor hide the
   dock tab I am typing in. What does not apply is disabled, with the reason under it in the menu, and on the pane's
   buttons both in their tooltips and in a caption under them that I can read without hovering (Logs and Shell stay,
-  disabled, when the pod could not be fetched): a pod that never restarted (Previous Logs), a workload with no ready
-  pod (as last listed, until it changes), a pod that finished or is being deleted, a pod or workload that was deleted
-  (Shell), or a cluster that is not connected. An action that cannot run anyway (a key, or a wait that ended badly)
-  says what and why in one sentence ("Can't open a shell: no pod of Deployment web is ready.") in a strip with a
-  warning icon above the dock, covering nothing, until the next one opens, I select something else, or ten seconds
-  pass.
+  disabled, when the pod could not be fetched, and while the cluster is not connected): a pod that never restarted
+  (Previous Logs), a workload with no ready pod (as last listed, until it changes), a pod that finished or is being
+  deleted, a pod or workload that was deleted (Shell), or a cluster that is not connected. An action that cannot run
+  anyway (a key, or a wait that ended badly) says what and why in one sentence ("Can't open a shell: no pod of
+  Deployment web is ready.") in a strip with a warning icon above the dock, covering nothing, until the next one
+  opens, I select something else, or ten seconds pass.
 - Tests: unit, cluster, ui.
 
 ---

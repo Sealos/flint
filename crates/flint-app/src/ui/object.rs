@@ -30,7 +30,12 @@ pub struct Overview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodContainer {
     pub name: String,
+    /// An init container that runs to completion before the app starts. A native sidecar (an
+    /// init container with `restartPolicy: Always`) runs beside the app, so it is not one.
     pub init: bool,
+    /// Its status says it is waiting (crash-looping, pulling, creating) or terminated, so a
+    /// shell cannot start in it. Without a status saying so it is taken to run.
+    pub not_running: bool,
     /// It ran before (it restarted or terminated), so its previous instance has logs.
     pub has_previous: bool,
     /// The container `kubectl logs` picks without `-c`: the
@@ -199,19 +204,20 @@ pub fn overview(object: &Value, is_secret: bool) -> Overview {
 /// A Pod's init and app containers, in spec order, with which one is the default and which
 /// ran before. Ephemeral (debug) containers are left out.
 pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
-    let names = |path: &str| -> Vec<String> {
+    let specs = |path: &str| -> Vec<Value> {
         pod.get("spec")
             .and_then(|s| s.get(path))
             .and_then(Value::as_array)
             .map(|cs| {
                 cs.iter()
-                    .filter_map(|c| c.get("name").and_then(Value::as_str))
-                    .map(str::to_owned)
+                    .filter(|c| c.get("name").and_then(Value::as_str).is_some())
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default()
     };
-    let ran_before = |status_path: &str, name: &str| -> bool {
+    let name_of = |c: &Value| c["name"].as_str().unwrap_or_default().to_owned();
+    let status = |status_path: &str, name: &str| -> Option<Value> {
         pod.get("status")
             .and_then(|s| s.get(status_path))
             .and_then(Value::as_array)
@@ -219,14 +225,23 @@ pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
                 ss.iter()
                     .find(|s| s.get("name").and_then(Value::as_str) == Some(name))
             })
-            .is_some_and(|s| {
-                s.get("restartCount").and_then(Value::as_i64).unwrap_or(0) > 0
-                    || s.get("lastState")
-                        .and_then(|l| l.get("terminated"))
-                        .is_some()
-            })
+            .cloned()
     };
-    let apps = names("containers");
+    let ran_before = |status_path: &str, name: &str| -> bool {
+        status(status_path, name).is_some_and(|s| {
+            s.get("restartCount").and_then(Value::as_i64).unwrap_or(0) > 0
+                || s.get("lastState")
+                    .and_then(|l| l.get("terminated"))
+                    .is_some()
+        })
+    };
+    let not_running = |status_path: &str, name: &str| -> bool {
+        status(status_path, name).is_some_and(|s| {
+            s.get("state")
+                .is_some_and(|st| st.get("waiting").is_some() || st.get("terminated").is_some())
+        })
+    };
+    let apps: Vec<String> = specs("containers").iter().map(name_of).collect();
     let annotated = str_at(
         pod,
         &[
@@ -239,17 +254,22 @@ pub fn pod_containers(pod: &Value) -> Vec<PodContainer> {
     let default = annotated
         .or(apps.first().map(String::as_str))
         .map(str::to_owned);
-    let mut out: Vec<PodContainer> = names("initContainers")
-        .into_iter()
-        .map(|name| PodContainer {
-            has_previous: ran_before("initContainerStatuses", &name),
-            name,
-            init: true,
-            default: false,
+    let mut out: Vec<PodContainer> = specs("initContainers")
+        .iter()
+        .map(|c| {
+            let name = name_of(c);
+            PodContainer {
+                has_previous: ran_before("initContainerStatuses", &name),
+                not_running: not_running("initContainerStatuses", &name),
+                init: c["restartPolicy"].as_str() != Some("Always"),
+                default: false,
+                name,
+            }
         })
         .collect();
     out.extend(apps.into_iter().map(|name| PodContainer {
         has_previous: ran_before("containerStatuses", &name),
+        not_running: not_running("containerStatuses", &name),
         default: default.as_deref() == Some(name.as_str()),
         name,
         init: false,
@@ -406,6 +426,48 @@ mod tests {
         assert!(pod_containers(&plain)[1].has_previous);
         // Only Pods have containers here.
         assert!(overview(&deployment(), false).containers.is_empty());
+    }
+
+    // covers UP-40, UP-41: a native sidecar (an init container that keeps running) is an app
+    // container for logs and a shell; a container waiting or terminated is not running.
+    #[test]
+    fn native_sidecars_are_app_containers_and_waiting_ones_do_not_run() {
+        let pod = json!({
+            "kind": "Pod",
+            "metadata": {"name": "web-1"},
+            "spec": {
+                "initContainers": [
+                    {"name": "migrate"},
+                    {"name": "mesh", "restartPolicy": "Always"}
+                ],
+                "containers": [{"name": "app"}, {"name": "worker"}]
+            },
+            "status": {
+                "initContainerStatuses": [
+                    {"name": "migrate", "state": {"terminated": {"exitCode": 0}}},
+                    {"name": "mesh", "state": {"running": {}}}
+                ],
+                "containerStatuses": [
+                    {"name": "app", "state": {"running": {}}},
+                    {"name": "worker", "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+                ]
+            }
+        });
+        let summary: Vec<(String, bool, bool, bool)> = pod_containers(&pod)
+            .into_iter()
+            .map(|c| (c.name, c.init, c.not_running, c.default))
+            .collect();
+        let row =
+            |name: &str, init, not_running, default| (name.to_owned(), init, not_running, default);
+        assert_eq!(
+            summary,
+            [
+                row("migrate", true, true, false),
+                row("mesh", false, false, false),
+                row("app", false, false, true),
+                row("worker", false, true, false),
+            ]
+        );
     }
 
     // covers UP-23
