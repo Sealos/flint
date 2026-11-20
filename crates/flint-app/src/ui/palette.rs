@@ -289,8 +289,11 @@ impl CommandPalette {
     /// The switcher's index once the objects in memory are read: the search starts over on
     /// it, with what was typed.
     pub fn set_index(&mut self, index: Arc<Index>, cx: &mut Context<Self>) {
-        // The item the user moved to, by what it is: its row may move as objects arrive.
-        let kept = match (self.rows.get(self.selected), &self.resources) {
+        // The item the user moved to with the arrows, by what it is: its row may move as
+        // objects arrive. A selection nobody moved goes to the best row, which may be new (the
+        // rule live refreshes follow).
+        let selected = self.rows.get(self.selected).filter(|_| self.chosen);
+        let kept = match (selected, &self.resources) {
             (Some(Row::Resource { item, .. }), Some(resources)) => {
                 let item = &resources.index.items[*item as usize];
                 Some((
@@ -322,6 +325,7 @@ impl CommandPalette {
         });
         // Gone from the results: the first row, as after typing.
         self.selected = at.unwrap_or(0);
+        self.chosen = at.is_some();
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
     }

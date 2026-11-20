@@ -209,6 +209,41 @@ async fn the_selection_follows_its_item_when_objects_arrive(cx: &mut TestAppCont
     assert_eq!(shown(cx, &t).selected, Some(0));
 }
 
+// covers UP-31: a selection nobody moved goes to the best row when objects arrive, a better
+// one included.
+#[gpui_kit::test]
+async fn an_unmoved_selection_takes_the_best_row_as_objects_arrive(cx: &mut TestAppContext) {
+    use crate::ui::switcher_model::Index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    let switcher = open_switcher(cx, &t).await;
+    t.type_text(cx, "web-");
+    assert_eq!(labels(&shown(cx, &t)), ["demo/web-7d9f"]);
+    let entries: Vec<flint_core::NavEntry> = standard_sections()
+        .into_iter()
+        .flat_map(|s| s.entries)
+        .collect();
+    let index = std::sync::Arc::new(Index::new(
+        &entries,
+        &[objects(
+            KindId::pods(),
+            &[("demo", "web-1", 0), ("demo", "web-7d9f", 0)],
+            SyncState::Synced,
+            2,
+        )],
+    ));
+    switcher.update(cx, |p, cx| p.set_index(index, cx));
+    let after = shown(cx, &t);
+    assert_eq!(labels(&after), ["demo/web-1", "demo/web-7d9f"]);
+    assert_eq!(
+        selected(&after),
+        "demo/web-1",
+        "the best row, not the old one"
+    );
+}
+
 fn selected(state: &PaletteState) -> &str {
     &state.rows[state.selected.expect("a row is selected")].label
 }
