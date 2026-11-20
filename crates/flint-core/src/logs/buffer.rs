@@ -108,14 +108,6 @@ impl LogBuffer {
         id
     }
 
-    /// Seals the open tail block, if it holds lines, so [`LogBuffer::trim_to`] can drop it: for
-    /// a stream that ended and adds no more lines. A line pushed after starts a new block.
-    pub fn seal_tail(&mut self) {
-        if !self.tail.is_empty() {
-            self.seal();
-        }
-    }
-
     fn seal(&mut self) {
         let lines: Arc<[LogLine]> = std::mem::take(&mut self.tail).into();
         let start = self.tail_start;
@@ -342,29 +334,6 @@ mod tests {
         // A tail with lines left is kept.
         let partial = buffer.view().trimmed(buffer.first_id());
         assert_eq!(partial.tail.len(), buffer.view().tail.len());
-    }
-
-    // covers UP-40, UP-42: a stream that ended seals its last block, so the shared budget can
-    // take it back (#296); lines after start a new block.
-    #[test]
-    fn a_sealed_tail_can_be_trimmed() {
-        let mut buffer = LogBuffer::new(10_000);
-        for n in 0..10 {
-            buffer.push(line(n));
-        }
-        assert_eq!(buffer.trimmable_bytes(), 0, "the open tail stays");
-        assert!(!buffer.trim_to(0));
-        buffer.seal_tail();
-        buffer.seal_tail();
-        assert_eq!(buffer.trimmable_bytes(), buffer.bytes());
-        let sealed = buffer.view();
-        assert_eq!(texts(&sealed).len(), 10);
-        assert!(buffer.trim_to(0));
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.bytes(), 0);
-        let id = buffer.push(line(10));
-        assert_eq!(id, 10);
-        assert_eq!(texts(&buffer.view()), [line(10).text.to_string()]);
     }
 
     // covers UP-40

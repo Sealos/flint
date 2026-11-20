@@ -1327,64 +1327,72 @@ impl LogView {
     /// What to show instead of lines, while there are none.
     fn render_empty(&self, theme: &Theme) -> AnyElement {
         let pod = !self.is_workload();
-        let (spinner, color, text, detail): (bool, Hsla, String, Option<String>) =
-            match &self.snapshot.state {
-                LogState::Connecting => (true, theme.muted_foreground, "Connecting…".into(), None),
-                LogState::Streaming if self.follows() => (
-                    false,
-                    theme.muted_foreground,
-                    "Waiting for log lines…".into(),
-                    None,
-                ),
-                LogState::Streaming => (false, theme.muted_foreground, "Reading…".into(), None),
-                LogState::Reconnecting { back_off: true, .. } => (
-                    true,
-                    theme.warning,
-                    format!("{}…", log_model::BACK_OFF),
-                    Some(
-                        "The container keeps crashing; the kubelet restarts it after a delay \
+        let (spinner, color, text, detail): (bool, Hsla, String, Option<String>) = match &self
+            .snapshot
+            .state
+        {
+            LogState::Connecting => (true, theme.muted_foreground, "Connecting…".into(), None),
+            LogState::Streaming if self.follows() => (
+                false,
+                theme.muted_foreground,
+                "Waiting for log lines…".into(),
+                None,
+            ),
+            LogState::Streaming => (false, theme.muted_foreground, "Reading…".into(), None),
+            LogState::Reconnecting { back_off: true, .. } => (
+                true,
+                theme.warning,
+                format!("{}…", log_model::BACK_OFF),
+                Some(
+                    "The container keeps crashing; the kubelet restarts it after a delay \
                          that grows with each crash."
-                            .to_owned(),
+                        .to_owned(),
+                ),
+            ),
+            LogState::Reconnecting { error, attempt, .. } => (
+                true,
+                theme.warning,
+                "Reconnecting…".into(),
+                Some(match error {
+                    Some(e) => {
+                        let explained = log_model::explain(e, pod);
+                        format!(
+                            "Attempt {attempt}. {} {}",
+                            explained.headline,
+                            explained.detail.unwrap_or_default()
+                        )
+                    }
+                    None => format!("Attempt {attempt}"),
+                }),
+            ),
+            state @ LogState::Ended { error: Some(e), .. } => {
+                match state.previous_not_available() {
+                    Some(kubelet) => (
+                        false,
+                        theme.warning,
+                        log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
+                        Some(format!(
+                            "The container may still be restarting. {} said: {kubelet}",
+                            log_model::previous_speaker(kubelet)
+                        )),
                     ),
-                ),
-                LogState::Reconnecting { error, attempt, .. } => (
-                    true,
-                    theme.warning,
-                    "Reconnecting…".into(),
-                    Some(match error {
-                        Some(e) => {
-                            let explained = log_model::explain(e, pod);
-                            format!(
-                                "Attempt {attempt}. {} {}",
-                                explained.headline,
-                                explained.detail.unwrap_or_default()
-                            )
-                        }
-                        None => format!("Attempt {attempt}"),
-                    }),
-                ),
-                state @ LogState::Ended { error: Some(e), .. } => {
-                    match state.previous_not_available() {
-                        Some(kubelet) => (
-                            false,
-                            theme.warning,
-                            log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
-                            Some(format!(
-                                "The container may still be restarting. {} said: {kubelet}",
-                                log_model::previous_speaker(kubelet)
-                            )),
-                        ),
-                        None => {
-                            let explained = log_model::explain(e, pod);
-                            (false, theme.danger, explained.headline, explained.detail)
-                        }
+                    None => {
+                        let explained = log_model::explain(e, pod);
+                        (false, theme.danger, explained.headline, explained.detail)
                     }
                 }
-                LogState::Ended { pod_deleted, .. } => {
-                    let (text, detail) = ended_empty(*pod_deleted, self.snapshot.trimmed);
-                    (false, theme.muted_foreground, text, detail)
-                }
-            };
+            }
+            // The log was read; the pod just logged nothing before it was deleted.
+            LogState::Ended {
+                pod_deleted: true, ..
+            } => (
+                false,
+                theme.muted_foreground,
+                "No log lines.".into(),
+                Some("The pod was deleted.".to_owned()),
+            ),
+            LogState::Ended { .. } => (false, theme.muted_foreground, "No log lines.".into(), None),
+        };
         v_flex()
             .id("log-empty")
             .flex_1()
@@ -1598,18 +1606,3 @@ mod state;
 #[cfg(test)]
 #[path = "log_tests.rs"]
 mod tests;
-
-/// What an ended tab with no lines says: that the shared budget dropped them, if it did (an
-/// ended stream's last block can go too), else that the stream logged nothing, and whether its
-/// pod was deleted.
-fn ended_empty(pod_deleted: bool, trimmed: bool) -> (String, Option<String>) {
-    if trimmed {
-        return (
-            "All lines dropped to save memory.".to_owned(),
-            Some(log_model::TRIMMED_TOOLTIP.to_owned()),
-        );
-    }
-    // The log was read; the pod just logged nothing (before it was deleted).
-    let detail = pod_deleted.then(|| "The pod was deleted.".to_owned());
-    ("No log lines.".to_owned(), detail)
-}

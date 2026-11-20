@@ -328,10 +328,6 @@ impl Output {
         if self.state != *state {
             self.state = state.clone();
             self.dirty = true;
-            // No line follows: the last block can be given back to the budget too.
-            if matches!(state, LogState::Ended { .. }) {
-                self.buffer.seal_tail();
-            }
         }
     }
 
@@ -601,27 +597,6 @@ mod tests {
 
     fn owned<const N: usize>(lines: [&str; N]) -> Vec<String> {
         lines.map(str::to_owned).into()
-    }
-
-    // covers UP-42: an ended stream's last block counts as something the budget can take back
-    // (#296).
-    #[test]
-    fn an_ended_stream_can_give_all_its_lines_back() {
-        let mut out = Output::new(&config(1_000));
-        for n in 0..10 {
-            out.append(LogLine::parse(&format!("line {n}"), false));
-        }
-        assert_eq!(
-            out.buffer.trimmable_bytes(),
-            0,
-            "a running stream keeps its tail"
-        );
-        out.set_state(&LogState::Ended {
-            error: None,
-            pod_deleted: false,
-        });
-        assert!(out.buffer.bytes() > 0);
-        assert_eq!(out.buffer.trimmable_bytes(), out.buffer.bytes());
     }
 
     fn ended(s: &LogSnapshot) -> bool {
