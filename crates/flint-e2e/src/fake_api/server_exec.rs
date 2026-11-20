@@ -17,7 +17,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -97,7 +97,8 @@ impl FakeApiServer {
         })
     }
 
-    /// Breaks every open exec session's connection without a close frame. Returns how many.
+    /// Closes every open exec session's connection abruptly ([`FakeExec::drop_connection`]).
+    /// Returns how many.
     pub fn drop_exec_sessions(&self) -> usize {
         self.exec_sessions()
             .iter()
@@ -127,9 +128,13 @@ pub(super) fn refused_upgrade() -> Response<Body> {
 
 /// An exec request: refused as the API server and the kubelet refuse it, or upgraded to a
 /// session.
+///
+/// `upgrade` says whether the request still asks for a WebSocket when it reaches the API server
+/// (a proxy may have stripped the headers).
 pub(super) fn open_exec(
     inner: &Arc<Inner>,
     req: Request<Incoming>,
+    upgrade: bool,
     namespace: &str,
     pod: &str,
     query: &Query,
@@ -155,19 +160,27 @@ pub(super) fn open_exec(
     if let Err(message) = exec::check_host(&object) {
         return error(&ApiError::new(400, "BadRequest", message));
     }
-    if !exec::is_websocket_upgrade(req.headers()) {
+    if !upgrade {
         return error(&ApiError::new(
             400,
             "BadRequest",
             "Upgrade request required",
         ));
     }
-    if let Some(message) = query.streams_error() {
-        return text(400, message);
-    }
-    if let Err(message) = exec::check_running(&object, &container) {
-        return text(500, &message);
-    }
+    // The kubelet's refusals: before the upgrade when it serves the WebSocket, else after it.
+    let kubelet = query
+        .streams_error()
+        .map(|m| (400, m.to_owned()))
+        .or_else(|| {
+            exec::check_running(&object, &container)
+                .err()
+                .map(|m| (500, m))
+        });
+    let refused_after = match kubelet {
+        Some((code, message)) if inner.options.kubelet_websockets => return text(code, &message),
+        Some((_, message)) => Some(exec::upgrade_failure(&message)),
+        None => None,
+    };
     let offered = req
         .headers()
         .get(http::header::SEC_WEBSOCKET_PROTOCOL)
@@ -191,7 +204,9 @@ pub(super) fn open_exec(
     let key = (namespace.to_owned(), pod.to_owned(), container);
     let mut execs = lock(&inner.execs);
     let image = execs.image(&key, &object);
-    let launch = exec::launch(&query.command, image, &execs.next_id());
+    let id = execs.next_id();
+    let launch =
+        refused_after.map_or_else(|| exec::launch(&query.command, image, &id), Launch::Fail);
     let (session, control) = FakeExec::new(&key, &query, protocol);
     execs.add(session.clone());
     drop(execs);
@@ -206,15 +221,22 @@ pub(super) fn open_exec(
         query,
         v5: protocol == V5,
         control,
-        shutdown: inner.shutdown.clone(),
     };
+    let mut shutdown = inner.shutdown.clone();
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let ws =
                     WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
                         .await;
-                run.serve(ws).await;
+                let session = run.session.clone();
+                // Whatever the session waits for (a client that does not read, a stall), the
+                // server stopping or a dropped connection ends it at once.
+                tokio::select! {
+                    () = run.serve(ws) => {}
+                    _ = shutdown.changed() => session.record_end(ExecEnd::Dropped),
+                    () = session.killed() => session.record_end(ExecEnd::Dropped),
+                }
             }
             Err(_) => run.session.record_end(ExecEnd::ClientGone),
         }
@@ -239,7 +261,6 @@ struct Run {
     query: ExecQuery,
     v5: bool,
     control: mpsc::UnboundedReceiver<Control>,
-    shutdown: watch::Receiver<()>,
 }
 
 /// The sending half of a session.
@@ -332,15 +353,18 @@ impl Run {
             stderr: self.query.stderr,
         };
         let end = self.drive(&mut out, &mut stream).await;
-        session.record_end(end.clone());
-        if end == ExecEnd::Dropped {
-            // Gone without a close frame or TLS's close_notify, as a broken network leaves it.
-            return;
-        }
+        session.record_end(end);
         // Wait for the client to answer the close frame or go away, then close the connection
-        // as Go's TLS does (close_notify), so the client reads a clean end.
+        // as Go's TLS does (close_notify), so the client reads a clean end. Stdin arriving
+        // meanwhile reaches no command, but is recorded, so a test can tell it was sent.
         let _ = tokio::time::timeout(CLOSE_WAIT, async {
-            while let Some(Ok(_)) = stream.next().await {}
+            while let Some(Ok(message)) = stream.next().await {
+                if let Message::Binary(bytes) = message
+                    && let Some((&STDIN, data)) = bytes.split_first()
+                {
+                    session.record_stdin(data);
+                }
+            }
         })
         .await;
         if let Ok(mut ws) = out.sink.reunite(stream) {
@@ -356,7 +380,6 @@ impl Run {
             query,
             v5,
             mut control,
-            mut shutdown,
         } = self;
         // The empty stdout frame a real server sends first.
         if out.send(STDOUT, b"").await.is_err() {
@@ -385,7 +408,6 @@ impl Run {
         loop {
             let events = tokio::select! {
                 biased;
-                _ = shutdown.changed() => return ExecEnd::Dropped,
                 control = control.recv() => match control {
                     Some(Control::Print(channel, bytes)) => {
                         if out.send(channel, &bytes).await.is_err() {
@@ -400,7 +422,10 @@ impl Run {
                             Err(Gone) => ExecEnd::ClientGone,
                         };
                     }
-                    Some(Control::Drop) | None => return ExecEnd::Dropped,
+                    // Neither read nor write until the connection is dropped (see `open_exec`).
+                    Some(Control::Stall) => std::future::pending().await,
+                    // The server is gone.
+                    None => return ExecEnd::Dropped,
                 },
                 message = stream.next() => match message {
                     Some(Ok(Message::Binary(bytes))) => match bytes.split_first() {

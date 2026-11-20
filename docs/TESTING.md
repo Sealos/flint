@@ -434,25 +434,34 @@ namespaces left by other tests are not.
   then output on channel 1 (2 without a TTY), and at the end one `Status` on channel 3 (`Success`, or
   `NonZeroExitCode` with the code) and a close frame. Refusals come before the upgrade as a cluster sends them: 404
   for a missing pod, 400 for a missing or unknown container, 400 "Upgrade request required" without an upgrade, and
-  the kubelet's plain-text 500 `container not found ("c")` for a container that is not running. A command the
-  container lacks is an `InternalError` status ending in `exec: "bash": executable file not found in $PATH`, or,
-  with `ExecImage::docker()`, printed on the TTY with exit 126. The image decides what is there (`ExecImage::of`):
-  the fixtures' nginx pods have bash, podinfo and `FakePod::new` (busybox) pods only `sh`;
+  the kubelet's plain-text 500 `container not found ("c")` for a container that is not running. That is the path
+  where the kubelet serves the WebSocket (recorded on kind v1.37); `Options::kubelet_websockets: false` serves the
+  API server's translating path instead (1.30 to 1.35, or `ExtendWebSocketsToKubelet` off), where the kubelet's
+  refusals arrive after the upgrade as an `InternalError` status (not recorded). A command the container lacks is an
+  `InternalError` status ending in `exec: "bash": executable file not found in $PATH`, or, with
+  `ExecImage::docker()`, printed on the TTY with exit 126. The image decides what is there (`ExecImage::of`): the
+  fixtures' nginx pods have bash, podinfo and `FakePod::new` (busybox) pods only `sh`;
   `set_exec_image(ns, pod, container, image)` overrides it.
 - **The scripted shell** answers like bash (`root@<pod>:/# ` with bracketed paste on) or busybox (`~ $ ` or `/ # `,
   asking for the cursor position): it echoes typing (Enter is `\r`, Backspace `\x7f`), runs `echo`, `exit N`,
-  `true`, `false`, `stty size` (the last resize), `seq N` and `yes` (floods until Ctrl-C), handles Ctrl-C, Ctrl-D and
-  bracketed pastes, and prints `command not found` (127) for anything else. With a TTY, closing stdin changes
-  nothing; without one it ends the shell.
+  `true`, `false`, `stty size` (the last resize), `seq N` and `yes` (floods until Ctrl-C), handles Ctrl-C (also
+  inside a paste), Ctrl-D and bracketed pastes, and prints `command not found` (127) for anything else. Typing while
+  a program runs is echoed and run once the shell is back, as typeahead. With a TTY, closing stdin changes nothing;
+  without one it ends the shell.
 - **Driving exec:** `last_exec()` / `exec_sessions()` return `FakeExec` handles: `stdin()` (every byte, Ctrl-C and
-  paste markers included; `last_exec_stdin()` for the newest), `resizes()` (Flint sends one at the start),
-  `stdin_closed()`, `stdout()`, `end()` (`Exited`, `Failed`, `Closed`, `Dropped` or `ClientGone`), and
-  `wait_for_stdin` / `wait_for_resizes` / `wait_for_end`. `print` pushes output; `exit(code)` ends the command,
-  `close()` sends a close frame without a status, and `drop_connection()` (or `drop_exec_sessions()`) breaks the
-  connection without one. `open_exec_sessions()` and `wait_for_exec_sessions(n, within)` count open sessions;
-  `exec_requests()` lists every exec request (the `bash`, then `/bin/sh` fallback is two). Faults:
-  `Fault::forbidden().on(&pods).subresource("exec")` is the RBAC 403, and `Fault::refuse_upgrade()` answers an
-  upgrade with a plain 200, as a proxy that blocks WebSockets does.
+  paste markers included, and bytes sent after the command ended; `last_exec_stdin()` for the newest), `resizes()`
+  (Flint sends one at the start, after it shows the session running: wait for it before breaking a session),
+  `stdin_closed()`, `stdout()` (the last 1 MiB) and `stdout_len()` (every byte), `end()` (`Exited`, `Failed`,
+  `Closed`, `Dropped` or `ClientGone`), and `wait_for_stdin` / `wait_for_resizes` / `wait_for_end`. `print` pushes
+  output; `exit(code)` ends the command, `close()` sends a close frame without a status, `drop_connection()` (or
+  `drop_exec_sessions()`) closes the connection abruptly (no close frame or close_notify: the client sees the end at
+  once), even while a write is stuck, and `stall()` goes silent without closing, as a dead network does (the keepalive
+  that would notice is not exercised here). `open_exec_sessions()` and `wait_for_exec_sessions(n, within)` count
+  open sessions; `exec_requests()` lists every exec request (the `bash`, then `/bin/sh` fallback is two). Faults:
+  `Fault::forbidden().on(&pods).subresource("exec")` is the RBAC 403 (`get`), `Fault::forbidden_as("create")` the one
+  `AuthorizePodWebsocketUpgradeCreatePermission` gives a role without `create`; `Fault::strip_upgrade()` drops the
+  upgrade headers on the way, as most blocking proxies do (the API server answers 400 "Upgrade request required"),
+  and `Fault::refuse_upgrade()` answers an upgrade with a plain 200. Both match only upgrade requests.
 - **Wiring:** `write_kubeconfig(path, namespace)` writes a kubeconfig that trusts the server's CA.
   `write_kubeconfigs` puts several servers in one file under their own context names (UP-01, UP-06, UP-24).
 - **Timing:** `CoreConfig::watch_timing` shortens the core's retry waits; e2e tests use 10–50 ms.

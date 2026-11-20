@@ -1013,7 +1013,10 @@ async fn a_container_without_bash_falls_back_to_sh() {
         .collect();
     assert_eq!(commands, [["bash"], ["/bin/sh"]]);
     let sessions = server.exec_sessions();
-    assert!(matches!(sessions[0].end(), Some(ExecEnd::Failed(_))));
+    assert!(matches!(
+        sessions[0].wait_for_end(WAIT).await.unwrap(),
+        ExecEnd::Failed(_)
+    ));
     // busybox asked where the cursor is, and the terminal answered.
     sessions[1]
         .wait_for_stdin(b"\x1b[1;5R", WAIT)
@@ -1041,9 +1044,16 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     let fake = server.last_exec().unwrap();
     assert_eq!(fake.wait_for_end(WAIT).await.unwrap(), ExecEnd::Exited(3));
     server.wait_for_exec_sessions(0, WAIT).await.unwrap();
-    // Typing after the exit goes nowhere.
+    // Typing after the exit goes nowhere. The paste is answered after the write was handled
+    // (inputs are handled in order), and says no program takes input any more.
     shell.write(b"echo late\r".to_vec());
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!shell.paste_if_bracketed("x").await);
+    let snap = shell.latest();
+    assert!(
+        !snap.terminal.text().contains("late"),
+        "{}",
+        snap.terminal.text()
+    );
     assert!(!String::from_utf8_lossy(&fake.stdin()).contains("late"));
 
     // Ctrl-D on an empty line ends bash with the last status.
@@ -1063,6 +1073,10 @@ async fn a_broken_connection_fails_the_session() {
     let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
     until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
     server.wait_for_exec_sessions(1, WAIT).await.unwrap();
+    // Flint shows Running before it sends the first resize; break the connection after it, so
+    // the resize does not fail on a connection already gone.
+    let fake = server.last_exec().unwrap();
+    fake.wait_for_resizes(1, WAIT).await.unwrap();
     assert_eq!(server.drop_exec_sessions(), 1);
     let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
     match &snap.state {
@@ -1077,7 +1091,10 @@ async fn a_broken_connection_fails_the_session() {
     let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
     until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
     server.wait_for_exec_sessions(1, WAIT).await.unwrap();
-    assert!(server.last_exec().unwrap().close());
+    // As above: closed before the first resize, the resize's failure would win.
+    let fake = server.last_exec().unwrap();
+    fake.wait_for_resizes(1, WAIT).await.unwrap();
+    assert!(fake.close());
     let snap = until_exec(&mut shell, "the end", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: None });
 }
@@ -1117,5 +1134,65 @@ async fn refused_upgrades_and_rbac_fail_with_their_cause() {
             );
         }
         other => panic!("{other:?}"),
+    }
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_that_strips_the_upgrade_is_an_upgrade_failure() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.inject(Fault::strip_upgrade().times(1));
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+    match &snap.state {
+        ExecState::Failed(failure) => {
+            assert_eq!(failure.kind, ExecFailureKind::Upgrade, "{failure}");
+            assert!(failure.contains("Upgrade request required"), "{failure}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(server.exec_requests().len(), 1);
+}
+
+// covers UP-41
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_container_fails_with_the_kubelets_reason_before_or_after_the_upgrade() {
+    for kubelet_websockets in [true, false] {
+        let server = FakeApiServer::start_with(Options {
+            kubelet_websockets,
+            ..Options::default()
+        })
+        .await
+        .unwrap();
+        let core = Core::start(&server, Some("demo")).await;
+        let mut shell = core
+            .handle
+            .exec(ExecRequest::shell(CONTEXT, "demo", "fixture-job-qd9jf"));
+        let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+        match &snap.state {
+            // After the upgrade, the status says why.
+            ExecState::Failed(failure) if !kubelet_websockets => {
+                assert_eq!(failure.kind, ExecFailureKind::Server, "{failure}");
+                assert!(
+                    failure.contains("container not found (\"job\")"),
+                    "{failure}"
+                );
+            }
+            // Before it, the kubelet's reason is plain text, which kube wraps as an unparsed
+            // body and Flint shows as a bare 500 (`ClusterError::Http`), dropping the reason.
+            // This pins today's behaviour; reported on #168.
+            ExecState::Failed(failure) => {
+                assert_eq!(failure.kind, ExecFailureKind::Other, "{failure}");
+                assert!(failure.contains("500"), "{failure}");
+            }
+            other => panic!("{kubelet_websockets}: {other:?}"),
+        }
+        // Not a missing shell: `/bin/sh` is not tried.
+        assert_eq!(server.exec_requests().len(), 1, "{kubelet_websockets}");
+        assert_eq!(
+            server.exec_sessions().len(),
+            usize::from(!kubelet_websockets)
+        );
     }
 }

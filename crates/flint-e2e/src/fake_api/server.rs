@@ -52,6 +52,11 @@ pub struct Options {
     /// Resources answered without Tables (plain lists and plain watch events), as aggregated
     /// API servers that ignore `as=Table` do.
     pub plain_only: Vec<Gvr>,
+    /// Whether the kubelet's exec refusals (no streams, a container not running) come before
+    /// the upgrade, as plain-text HTTP errors (the default, recorded on kind v1.37), or after
+    /// it, as an `InternalError` status on the error channel. See `exec`'s module docs for
+    /// which clusters do which.
+    pub kubelet_websockets: bool,
 }
 
 impl Default for Options {
@@ -61,6 +66,7 @@ impl Default for Options {
             streaming_lists: true,
             now: SystemTime::now(),
             plain_only: Vec::new(),
+            kubelet_websockets: true,
         }
     }
 }
@@ -592,6 +598,11 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
             "Forbidden",
             faults::forbidden_message(verb, &route),
         )),
+        Some(Effect::ForbiddenAs(rbac_verb)) => error(&ApiError::new(
+            403,
+            "Forbidden",
+            faults::forbidden_message_as(&rbac_verb, &route),
+        )),
         Some(Effect::Status(code)) => error(&ApiError::new(
             code,
             reason(code),
@@ -599,9 +610,10 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
         )),
         Some(Effect::Delay(delay)) => {
             tokio::time::sleep(delay).await;
-            serve(&inner, req, &route, verb, &query, &accept)
+            serve(&inner, req, upgrade, &route, verb, &query, &accept)
         }
-        None => serve(&inner, req, &route, verb, &query, &accept),
+        Some(Effect::StripUpgrade) => serve(&inner, req, false, &route, verb, &query, &accept),
+        None => serve(&inner, req, upgrade, &route, verb, &query, &accept),
     };
     record.status = Some(response.status().as_u16());
     lock(&inner.requests).push(record);
@@ -612,6 +624,7 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
 fn serve(
     inner: &Arc<Inner>,
     req: Request<Incoming>,
+    upgrade: bool,
     route: &Route,
     verb: Verb,
     query: &Query,
@@ -624,7 +637,7 @@ fn serve(
             name,
             subresource,
         } if *gvr == Gvr::core("pods") && subresource == "exec" => {
-            execs::open_exec(inner, req, ns, name, query)
+            execs::open_exec(inner, req, upgrade, ns, name, query)
         }
         _ => respond(inner, req.method(), route, verb, query, accept),
     }

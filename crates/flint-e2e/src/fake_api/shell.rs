@@ -11,8 +11,11 @@
 //!   character as `\b \b`; Enter (`\r`) echoes `\r\n`, and bash then turns bracketed paste off
 //!   (`\e[?2004l\r`) before the command's output. Escape sequences (arrows, the terminal's
 //!   answers) are swallowed.
-//! - **Ctrl-C** (`\x03`) drops the line, prints `^C` and a fresh prompt, and stops a running
-//!   program (bash's `$?` becomes 130). **Ctrl-D** (`\x04`) on an empty line ends the shell with
+//! - **Ctrl-C** (`\x03`) drops the line (or a bracketed paste in progress), prints `^C` and a
+//!   fresh prompt, and stops a running program (bash's `$?` becomes 130).
+//! - **Typing while a program runs** is echoed by the TTY (cooked mode) and kept; once the
+//!   program ends, the shell reads it, echoes it again and runs it, as bash does with
+//!   typeahead. Ctrl-C drops it. **Ctrl-D** (`\x04`) on an empty line ends the shell with
 //!   the last status (bash prints `exit`); on a non-empty line bash rings the bell.
 //! - **Bracketed paste** (bash only): a paste between `\e[200~` and `\e[201~` is shown in
 //!   reverse video and inserted into the line, newlines included; Enter then runs its lines
@@ -175,6 +178,8 @@ pub(crate) struct Shell {
     /// Commands still to run, each split into words.
     queue: VecDeque<Vec<String>>,
     flood: Option<Flood>,
+    /// What was typed while a program ran, for the shell to read once it is back.
+    typeahead: Vec<u8>,
     /// The process ended.
     done: bool,
 }
@@ -202,6 +207,7 @@ impl Shell {
             status: 0,
             queue: VecDeque::new(),
             flood: None,
+            typeahead: Vec::new(),
             done: false,
         };
         let mut events = Vec::new();
@@ -343,14 +349,17 @@ impl Shell {
             return;
         }
         if let Some(paste) = &mut self.paste {
-            paste.push(byte);
+            if byte == 0x03 {
+                // The TTY's Ctrl-C interrupts a paste too.
+                self.paste = None;
+                self.interrupt(events);
+            } else {
+                paste.push(byte);
+            }
             return;
         }
         if self.flood.is_some() || !self.interactive {
-            // A running program reads no input; only the TTY's Ctrl-C reaches it.
-            if self.tty && byte == 0x03 {
-                self.interrupt(events);
-            }
+            self.typed_while_running(byte, events);
             return;
         }
         if !self.tty {
@@ -464,10 +473,31 @@ impl Shell {
         self.run_queue(events);
     }
 
+    /// A byte typed while a program runs. The program reads none of it; a TTY in cooked mode
+    /// echoes it (Enter as `\r\n`) and keeps it for the shell, which reads it (and echoes it
+    /// again) once the program ends. Ctrl-C interrupts the program and drops the typeahead.
+    fn typed_while_running(&mut self, byte: u8, events: &mut Vec<Event>) {
+        if self.tty {
+            match byte {
+                0x03 => {
+                    self.interrupt(events);
+                    return;
+                }
+                b'\r' | b'\n' => events.push(Event::Stdout(b"\r\n".to_vec())),
+                b if b >= 0x20 && b != 0x7f => events.push(Event::Stdout(vec![b])),
+                _ => {}
+            }
+        }
+        if self.interactive {
+            self.typeahead.push(byte);
+        }
+    }
+
     /// Ctrl-C on the TTY: the line or the running program is dropped.
     fn interrupt(&mut self, events: &mut Vec<Event>) {
         self.line.clear();
         self.queue.clear();
+        self.typeahead.clear();
         let was_running = self.flood.take().is_some();
         if !self.interactive {
             // The program itself gets SIGINT and dies of it.
@@ -653,8 +683,16 @@ impl Shell {
         if ended {
             self.flood = None;
             self.run_queue(&mut events);
+            if self.flood.is_none() && !self.done {
+                for byte in std::mem::take(&mut self.typeahead) {
+                    if self.done {
+                        break;
+                    }
+                    self.byte(byte, &mut events);
+                }
+            }
         }
-        events
+        merge(events)
     }
 }
 
@@ -954,11 +992,58 @@ mod tests {
         shell.input(b"yes hello\r");
         let first = shell.pump();
         assert!(matches!(&first[..], [Event::Stdout(b)] if b.starts_with(b"hello\r\nhello\r\n")));
-        // Typing does not reach a running program; Ctrl-C stops it.
-        assert_eq!(shell.input(b"ls"), []);
+        // The TTY echoes typing while a program runs; Ctrl-C stops the program.
+        assert_eq!(shell.input(b"ls"), out("ls"));
         assert_eq!(shell.input(b"\x03"), out("^C\r\n\x1b[?2004hroot@web-1:/# "));
         assert!(!shell.is_flooding());
         assert_eq!(shell.pump(), []);
+    }
+
+    #[test]
+    fn typing_during_a_program_is_echoed_and_run_after_it() {
+        let mut shell = bash();
+        shell.input(b"seq 3000\r");
+        // The TTY echoes the typeahead at once; the program reads none of it.
+        assert_eq!(shell.input(b"echo x\r"), out("echo x\r\n"));
+        let mut printed = Vec::new();
+        while shell.is_flooding() {
+            for event in shell.pump() {
+                if let Event::Stdout(bytes) = event {
+                    printed.extend(bytes);
+                }
+            }
+        }
+        let text = String::from_utf8(printed).unwrap();
+        // Once bash is back, it reads the line, echoes it again and runs it.
+        let prompt = "\x1b[?2004hroot@web-1:/# ";
+        assert!(
+            text.ends_with(&format!(
+                "3000\r\n{prompt}echo x\r\n\x1b[?2004l\rx\r\n{prompt}"
+            )),
+            "{text:?}"
+        );
+        // Ctrl-C drops what was typed ahead.
+        shell.input(b"yes\r");
+        shell.input(b"echo lost");
+        shell.input(b"\x03");
+        assert_eq!(
+            shell.input(b"\r"),
+            out("\r\n\x1b[?2004l\r\x1b[?2004hroot@web-1:/# ")
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_a_bracketed_paste() {
+        let mut shell = bash();
+        assert_eq!(
+            shell.input(b"\x1b[200~echo a\x03"),
+            out("^C\x1b[?2004l\r\r\n\x1b[?2004hroot@web-1:/# ")
+        );
+        // The paste's end marker arrives on its own and is swallowed; the line is empty.
+        assert_eq!(
+            shell.input(b"\x1b[201~echo b\r").last(),
+            out("echo b\r\n\x1b[?2004l\rb\r\n\x1b[?2004hroot@web-1:/# ").last()
+        );
     }
 
     #[test]

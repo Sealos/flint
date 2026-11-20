@@ -39,6 +39,9 @@ use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, Terminal
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
+/// What the API server answers an exec that arrives without its upgrade headers.
+const UPGRADE_REQUIRED: &str = "Upgrade request required";
+
 /// Commands tried in order when the request names none.
 pub const DEFAULT_SHELLS: &[&str] = &["bash", "/bin/sh"];
 
@@ -162,7 +165,8 @@ pub enum ExecFailureKind {
     /// The exec connection broke after the command started.
     Connection,
     /// The connection to the cluster could not be upgraded to the WebSocket an exec needs: a
-    /// proxy answered the upgrade with a plain response, or dropped its headers.
+    /// proxy answered the upgrade with a plain response, or stripped its `Upgrade` and
+    /// `Connection` headers, so the API server answered 400 "Upgrade request required".
     Upgrade,
     /// Neither shell Flint tries is in the container.
     MissingShell,
@@ -203,6 +207,13 @@ impl ExecFailureKind {
                 return ExecFailureKind::SignIn;
             }
             kube::Error::UpgradeConnection(_) => return ExecFailureKind::Upgrade,
+            // The request reached the API server without its upgrade headers: a proxy on the
+            // way stripped them (`UpgradeAwareHandler` refuses a plain request this way).
+            kube::Error::Api(status)
+                if status.code == 400 && status.message == UPGRADE_REQUIRED =>
+            {
+                return ExecFailureKind::Upgrade;
+            }
             _ => {}
         }
         if crate::cluster::find_auth_error(err).is_some() {
@@ -1838,6 +1849,24 @@ mod tests {
         );
         // A bare 404 (a proxy's page, a wrong server path) is not a pod problem; a bare 401
         // is signing in.
+        // A proxy that strips the upgrade headers leaves the API server's 400; any other 400 is
+        // the server's own refusal.
+        let bad_request = |message: &str| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code: 400,
+                reason: "BadRequest".into(),
+                message: message.into(),
+                ..Default::default()
+            }))
+        };
+        assert_eq!(
+            kind(bad_request("Upgrade request required")),
+            ExecFailureKind::Upgrade
+        );
+        assert_eq!(
+            kind(bad_request("container app is not valid for pod web")),
+            ExecFailureKind::Server
+        );
         let any = kube::Error::LinesCodecMaxLineLengthExceeded;
         let http = |code| ClusterError::Http { code, server: None };
         assert_eq!(

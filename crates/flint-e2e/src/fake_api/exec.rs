@@ -11,12 +11,22 @@
 //!   `streamLocation`); and the request must be an upgrade (400 "Upgrade request required",
 //!   `UpgradeAwareHandler` in `k8s.io/apimachinery/pkg/util/proxy`). RBAC checks `get` on
 //!   `pods/exec` for a WebSocket upgrade (kind's 403 says "cannot get resource \"pods/exec\"").
+//!   With `AuthorizePodWebsocketUpgradeCreatePermission` it also checks `create`, and a role
+//!   granting only `get` is refused "cannot create resource \"pods/exec\""
+//!   ([`super::Fault::forbidden_as`]).
 //! - **The kubelet's refusals**, still before the upgrade, come back as plain text that kube
 //!   wraps in a `Status` it makes up (reason "Failed to parse error data"): 400 "you must
 //!   specify at least 1 of stdin, stdout, stderr" (`NewOptions` in the
 //!   kubelet's `cri/streaming/remotecommand/httpstream.go`, which also drops `stderr` with a
 //!   `tty`), and 500 `container not found ("c")` for a container that is not running, whether
-//!   it terminated or waits to start (`GetExec`, `pkg/kubelet/kubelet_pods.go`).
+//!   it terminated or waits to start (`GetExec`, `pkg/kubelet/kubelet_pods.go`). That is the
+//!   path where the kubelet serves the WebSocket itself (`ExtendWebSocketsToKubelet`, as on
+//!   the recorded v1.37 cluster). Where the API server holds the WebSocket and translates to
+//!   SPDY for the kubelet (Kubernetes 1.30 to 1.35, or that gate off), it upgrades first and
+//!   the same refusals arrive after the 101 as a 500 `InternalError` status, "Internal error
+//!   occurred: unable to upgrade connection: container not found (\"c\")". That shape follows
+//!   `StreamTranslatorHandler` and the SPDY executor's upgrade error; it was not recorded.
+//!   `Options::kubelet_websockets: false` serves it.
 //! - **Protocol:** kube 5.1 offers `v5.channel.k8s.io, v4.channel.k8s.io` in one header
 //!   (`kube-client/src/client/upgrade.rs`); the server takes the first it supports in the
 //!   client's order (`handshake`, `k8s.io/apimachinery/pkg/util/httpstream/wsstream/conn.go`).
@@ -37,13 +47,13 @@
 //!   for no command). Docker instead prints `OCI runtime exec failed: ...` on the TTY and exits
 //!   126 ([`ExecImage::docker`]), which Flint's `exec.rs` recognises too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::logs::Key;
 use super::route::Query;
@@ -287,6 +297,21 @@ fn launch_failure(exec_id: &str, why: &str) -> Value {
     })
 }
 
+/// The status the API server sends after the upgrade when it, not the kubelet, holds the
+/// WebSocket and the kubelet refuses (`Options::kubelet_websockets` off): its SPDY upgrade to
+/// the kubelet failed with the kubelet's text, wrapped in `NewInternalError`.
+pub(crate) fn upgrade_failure(kubelet: &str) -> Value {
+    let cause = format!("unable to upgrade connection: {kubelet}");
+    json!({
+        "metadata": {},
+        "status": "Failure",
+        "message": format!("Internal error occurred: {cause}"),
+        "reason": "InternalError",
+        "details": {"causes": [{"message": cause}]},
+        "code": 500,
+    })
+}
+
 /// What an upgraded exec does first.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Launch {
@@ -338,7 +363,8 @@ pub enum ExecEnd {
     Failed(String),
     /// [`FakeExec::close`]: a close frame without a status.
     Closed,
-    /// [`FakeExec::drop_connection`]: the connection broke without a close frame.
+    /// [`FakeExec::drop_connection`], or the server stopped: the connection was closed without a
+    /// close frame.
     Dropped,
     /// The client closed the WebSocket or went away first.
     ClientGone,
@@ -350,8 +376,12 @@ pub(crate) enum Control {
     Print(u8, Vec<u8>),
     Exit(i32),
     Close,
-    Drop,
+    /// Stop reading and writing, and keep the connection open.
+    Stall,
 }
+
+/// How much of a session's stdout is kept: the tail, so a flood does not pile up in memory.
+pub const STDOUT_KEPT: usize = 1024 * 1024;
 
 /// What a session saw and sent.
 #[derive(Debug, Default)]
@@ -359,7 +389,10 @@ struct Record {
     stdin: Vec<u8>,
     resizes: Vec<TtySize>,
     stdin_closed: bool,
-    stdout: Vec<u8>,
+    /// The last [`STDOUT_KEPT`] bytes of stdout.
+    stdout: VecDeque<u8>,
+    /// Every byte sent on stdout.
+    stdout_len: u64,
     end: Option<ExecEnd>,
 }
 
@@ -373,6 +406,8 @@ struct Session {
     protocol: &'static str,
     record: Mutex<Record>,
     control: mpsc::UnboundedSender<Control>,
+    /// Set to break the connection at once, whatever the session is doing.
+    kill: watch::Sender<bool>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -403,6 +438,7 @@ impl FakeExec {
             protocol,
             record: Mutex::default(),
             control,
+            kill: watch::Sender::new(false),
         };
         (FakeExec(Arc::new(session)), rx)
     }
@@ -451,9 +487,14 @@ impl FakeExec {
         lock(&self.0.record).stdin_closed
     }
 
-    /// Everything sent on stdout.
+    /// What was sent on stdout: all of it, or its last [`STDOUT_KEPT`] bytes after a flood.
     pub fn stdout(&self) -> Vec<u8> {
-        lock(&self.0.record).stdout.clone()
+        lock(&self.0.record).stdout.iter().copied().collect()
+    }
+
+    /// How many bytes were sent on stdout in all.
+    pub fn stdout_len(&self) -> u64 {
+        lock(&self.0.record).stdout_len
     }
 
     /// How the session ended; `None` while it is open.
@@ -490,9 +531,30 @@ impl FakeExec {
         self.control(Control::Close)
     }
 
-    /// Breaks the connection without a close frame, as a network failure does.
+    /// Closes the connection abruptly, at once, even while a write is stuck: no status, no
+    /// close frame and no TLS close_notify, just the TCP close. The client reads an unexpected
+    /// end straight away, as when a proxy or the API server dies. (A network that silently
+    /// stops delivering is [`FakeExec::stall`].)
     pub fn drop_connection(&self) -> bool {
-        self.control(Control::Drop)
+        if !self.is_open() {
+            return false;
+        }
+        self.0.kill.send_replace(true);
+        true
+    }
+
+    /// Stops reading and writing while keeping the connection open, as a network that silently
+    /// stops delivering does: the client sees no end, only silence (its writes fill the
+    /// buffers). Detecting that is left to the client's keepalives, which these tests do not
+    /// wait for; [`FakeExec::drop_connection`] ends a stalled session.
+    pub fn stall(&self) -> bool {
+        self.control(Control::Stall)
+    }
+
+    /// Resolves when [`FakeExec::drop_connection`] was called.
+    pub(crate) async fn killed(&self) {
+        let mut kill = self.0.kill.subscribe();
+        let _ = kill.wait_for(|k| *k).await;
     }
 
     /// Waits until stdin holds `bytes` (anywhere, so earlier input does not matter).
@@ -555,7 +617,12 @@ impl FakeExec {
     }
 
     pub(crate) fn record_stdout(&self, bytes: &[u8]) {
-        lock(&self.0.record).stdout.extend_from_slice(bytes);
+        let mut record = lock(&self.0.record);
+        record.stdout_len += bytes.len() as u64;
+        let kept = &bytes[bytes.len().saturating_sub(STDOUT_KEPT)..];
+        record.stdout.extend(kept);
+        let excess = record.stdout.len().saturating_sub(STDOUT_KEPT);
+        record.stdout.drain(..excess);
     }
 
     /// Records how the session ended; the first end counts.
@@ -722,6 +789,21 @@ mod tests {
     }
 
     #[test]
+    fn refusals_after_the_upgrade_wrap_the_kubelets_text() {
+        let status = upgrade_failure("container not found (\"done\")");
+        assert_eq!(status["code"], 500);
+        assert_eq!(status["reason"], "InternalError");
+        assert_eq!(
+            status["message"],
+            "Internal error occurred: unable to upgrade connection: container not found (\"done\")"
+        );
+        assert_eq!(
+            status["details"]["causes"][0]["message"],
+            "unable to upgrade connection: container not found (\"done\")"
+        );
+    }
+
+    #[test]
     fn launches_run_fail_or_print_by_runtime() {
         assert!(matches!(
             launch(&argv(&["bash"]), ExecImage::with_bash(), "1"),
@@ -796,6 +878,20 @@ mod tests {
         assert!(session.stdin_closed() && session.stdout() == b"out");
         assert!(session.print("x"));
         assert!(matches!(rx.recv().await, Some(Control::Print(STDOUT, b)) if b == b"x"));
+        // A flood keeps only its tail, and counts everything.
+        let mut flood = vec![b'a'; STDOUT_KEPT];
+        flood.extend_from_slice(b"tail");
+        session.record_stdout(&flood);
+        let kept = session.stdout();
+        assert_eq!(kept.len(), STDOUT_KEPT);
+        assert!(kept.ends_with(b"atail"));
+        assert_eq!(session.stdout_len(), 3 + flood.len() as u64);
+        session.record_stdout(b"!");
+        assert!(session.stdout().ends_with(b"tail!") && session.stdout().len() == STDOUT_KEPT);
+        assert!(session.stall());
+        assert!(matches!(rx.recv().await, Some(Control::Stall)));
+        assert!(session.drop_connection());
+        tokio::time::timeout(POLL, session.killed()).await.unwrap();
         assert!(session.wait_for_end(POLL).await.is_err());
         session.record_end(ExecEnd::Exited(3));
         session.record_end(ExecEnd::ClientGone);

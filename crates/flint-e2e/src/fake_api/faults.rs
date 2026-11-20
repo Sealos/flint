@@ -10,6 +10,10 @@ use super::route::{Route, Verb};
 pub enum Effect {
     /// 403 with the `Status` the API server sends when RBAC refuses.
     Forbidden,
+    /// 403 naming this RBAC verb instead of the request's: `create` for an exec under
+    /// `AuthorizePodWebsocketUpgradeCreatePermission` when the role grants `get` but not
+    /// `create` on `pods/exec`.
+    ForbiddenAs(String),
     /// Any other error status (500, 429, 404...).
     Status(u16),
     /// The response is sent normally after this delay.
@@ -20,6 +24,18 @@ pub enum Effect {
     /// that does not pass upgrades on answers it. Other requests pass the fault by, and do not
     /// count against [`Fault::times`].
     RefuseUpgrade,
+    /// A WebSocket upgrade reaches the API server without its `Upgrade` and `Connection`
+    /// headers, as a proxy that strips hop-by-hop headers forwards it: an exec gets the API
+    /// server's 400 "Upgrade request required". Like [`Effect::RefuseUpgrade`], only upgrades
+    /// match it.
+    StripUpgrade,
+}
+
+impl Effect {
+    /// Only WebSocket upgrades match it.
+    fn upgrades_only(&self) -> bool {
+        matches!(self, Effect::RefuseUpgrade | Effect::StripUpgrade)
+    }
 }
 
 /// A fault: an effect, which requests it applies to, and how often.
@@ -53,6 +69,11 @@ impl Fault {
         Fault::new(Effect::Forbidden)
     }
 
+    /// A 403 that names `verb` ([`Effect::ForbiddenAs`]).
+    pub fn forbidden_as(verb: &str) -> Self {
+        Fault::new(Effect::ForbiddenAs(verb.to_owned()))
+    }
+
     pub fn status(code: u16) -> Self {
         Fault::new(Effect::Status(code))
     }
@@ -69,6 +90,11 @@ impl Fault {
     /// Answers WebSocket upgrades with a plain 200 ([`Effect::RefuseUpgrade`]).
     pub fn refuse_upgrade() -> Self {
         Fault::new(Effect::RefuseUpgrade)
+    }
+
+    /// Strips WebSocket upgrades of their headers on the way ([`Effect::StripUpgrade`]).
+    pub fn strip_upgrade() -> Self {
+        Fault::new(Effect::StripUpgrade)
     }
 
     /// Only requests about this resource.
@@ -155,12 +181,12 @@ impl Faults {
     }
 
     /// The effect for a request, counting it against the fault's limit. A refused upgrade only
-    /// matches (and counts) a WebSocket `upgrade` request.
+    /// or stripped upgrade only matches (and counts) a WebSocket `upgrade` request.
     pub fn take(&mut self, verb: Verb, route: &Route, upgrade: bool) -> Option<Effect> {
         let fault = self
             .0
             .iter_mut()
-            .find(|f| f.matches(verb, route) && (upgrade || f.effect != Effect::RefuseUpgrade))?;
+            .find(|f| f.matches(verb, route) && (upgrade || !f.effect.upgrades_only()))?;
         if let Some(n) = &mut fault.remaining {
             *n -= 1;
         }
@@ -177,6 +203,11 @@ pub fn forbidden_message(verb: Verb, route: &Route) -> String {
         Verb::Get => "get",
         _ => "get",
     };
+    forbidden_message_as(verb, route)
+}
+
+/// [`forbidden_message`] naming the RBAC verb `verb`.
+pub fn forbidden_message_as(verb: &str, route: &Route) -> String {
     let Some(gvr) = route.gvr() else {
         return format!("forbidden: User \"flint-e2e\" cannot {verb} path");
     };
@@ -269,6 +300,16 @@ mod tests {
             Some(Effect::RefuseUpgrade)
         );
         assert_eq!(faults.take(Verb::Get, &route, true), None);
+        faults.add(Fault::strip_upgrade());
+        faults.add(Fault::forbidden_as("create"));
+        assert_eq!(
+            faults.take(Verb::Get, &route, false),
+            Some(Effect::ForbiddenAs("create".into()))
+        );
+        assert_eq!(
+            faults.take(Verb::Get, &route, true),
+            Some(Effect::StripUpgrade)
+        );
     }
 
     #[test]
@@ -288,7 +329,9 @@ mod tests {
             "pods \"web-1\" is forbidden: User \"flint-e2e\" cannot get resource \"pods/log\" \
              in API group \"\" in the namespace \"demo\""
         );
-        // Recorded on kind: a WebSocket exec is authorized as `get` on `pods/exec`.
+        // Recorded on kind: a service account with no rights is refused `get` on `pods/exec`,
+        // which a WebSocket exec needs. Under `AuthorizePodWebsocketUpgradeCreatePermission` it
+        // needs `create` too, and a role with only `get` is refused that.
         let msg = forbidden_message(
             Verb::Get,
             &Route::parse("/api/v1/namespaces/demo/pods/shell/exec"),
@@ -297,6 +340,14 @@ mod tests {
             msg,
             "pods \"shell\" is forbidden: User \"flint-e2e\" cannot get resource \"pods/exec\" \
              in API group \"\" in the namespace \"demo\""
+        );
+        let msg = forbidden_message_as(
+            "create",
+            &Route::parse("/api/v1/namespaces/demo/pods/shell/exec"),
+        );
+        assert!(
+            msg.contains("cannot create resource \"pods/exec\""),
+            "{msg}"
         );
         let msg = forbidden_message(Verb::Watch, &Route::parse("/api/v1/namespaces/demo/pods"));
         assert!(msg.ends_with("in the namespace \"demo\""));

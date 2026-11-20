@@ -19,8 +19,8 @@
 //! reports exit codes and missing commands as a real cluster does. Tests read what the client
 //! sent ([`FakeExec::stdin`], [`FakeExec::resizes`]), print, end or break sessions
 //! ([`FakeApiServer::last_exec`], [`FakeApiServer::wait_for_exec_sessions`]), say which
-//! containers lack bash ([`FakeApiServer::set_exec_image`]), and refuse upgrades
-//! ([`Fault::refuse_upgrade`]).
+//! containers lack bash ([`FakeApiServer::set_exec_image`]), and refuse or strip upgrades
+//! ([`Fault::refuse_upgrade`], [`Fault::strip_upgrade`]).
 //!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {
@@ -59,7 +59,7 @@ mod state;
 mod tls;
 mod watch;
 
-pub use exec::{ExecEnd, ExecImage, ExecRuntime, FakeExec, TtySize, V4, V5};
+pub use exec::{ExecEnd, ExecImage, ExecRuntime, FakeExec, STDOUT_KEPT, TtySize, V4, V5};
 pub use faults::{Effect, Fault};
 pub use fixtures::{Fixtures, Gvr};
 pub use kubeconfig::CONTEXT;
