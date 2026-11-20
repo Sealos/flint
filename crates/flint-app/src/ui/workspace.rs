@@ -192,6 +192,9 @@ pub struct Workspace {
     namespaces_state: SyncState,
     /// Types a namespace into the filter (for users who may not list namespaces).
     namespace_input: Entity<InputState>,
+    /// Whether the namespace filter's popover is open: held here, so opening the palette can
+    /// close it wherever focus is.
+    namespace_popover_open: bool,
     /// Pane widths, as dragged.
     panes: PaneWidths,
     /// `FLINT_VIEW`, until it has been opened.
@@ -313,6 +316,7 @@ impl Workspace {
             namespaces: Vec::new(),
             namespaces_state: SyncState::Idle,
             namespace_input,
+            namespace_popover_open: false,
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
@@ -1344,8 +1348,23 @@ impl Workspace {
     fn render_namespace_filter(&self, summary: &str, cx: &Context<Self>) -> impl IntoElement {
         let this = cx.weak_entity();
         let input = self.namespace_input.clone();
+        let on_open = this.clone();
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
+            .open(self.namespace_popover_open)
+            // After the change in hand: it may come while the workspace is being updated (the
+            // palette dismissing it).
+            .on_open_change(move |open, _, cx| {
+                let (open, this) = (*open, on_open.clone());
+                cx.defer(move |cx| {
+                    let _ = this.update(cx, |ws, cx| {
+                        if ws.namespace_popover_open != open {
+                            ws.namespace_popover_open = open;
+                            cx.notify();
+                        }
+                    });
+                });
+            })
             .trigger(
                 Button::new("namespace-filter-button")
                     .xsmall()

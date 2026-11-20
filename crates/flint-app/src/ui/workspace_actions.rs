@@ -369,6 +369,9 @@ impl Workspace {
                 }
             }
         }
+        // A popover open while focus is elsewhere (the namespace filter's, after Focus Filter)
+        // closes by its open state.
+        self.namespace_popover_open = false;
         let this = cx.weak_entity();
         let choices: ChoiceSource = Rc::new(move |spec, arg, cx| match this.upgrade() {
             Some(ws) => ws.read(cx).palette_choices(spec, arg, cx),

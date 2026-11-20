@@ -152,6 +152,8 @@ pub struct CommandPalette {
     /// What the query is matched against, for the current step.
     candidates: Vec<Candidate>,
     rows: Vec<Row>,
+    /// Counts each change of `rows`, so a click drawn on older rows is told apart.
+    rows_version: u64,
     selected: usize,
     /// The selection was moved with the arrows, so a refreshed list keeps it; else the best
     /// row (row 0) is selected again.
@@ -208,6 +210,7 @@ impl CommandPalette {
             step: Step::Actions,
             candidates: Vec::new(),
             rows: Vec::new(),
+            rows_version: 0,
             selected: 0,
             chosen: false,
             error: None,
@@ -416,6 +419,7 @@ impl CommandPalette {
                     .collect()
             }
         };
+        self.rows_version += 1;
         self.selected = 0;
         self.chosen = false;
         self.error = None;
@@ -432,6 +436,10 @@ impl CommandPalette {
     }
 
     fn pick(&mut self, action: &PalettePick, window: &mut Window, cx: &mut Context<Self>) {
+        // Drawn on rows that a live refresh has replaced since: the row may hold another entry.
+        if action.rows.is_some_and(|v| v != self.rows_version) {
+            return;
+        }
         if action.row < self.rows.len() {
             self.selected = action.row;
             self.confirm(window, cx);
@@ -704,7 +712,10 @@ impl CommandPalette {
                         .when(!selected, |el| el.hover(|el| el.bg(theme.list_hover)))
                         .on_click(registry::on_click_in(
                             self.focus.clone(),
-                            PalettePick { row: ix },
+                            PalettePick {
+                                row: ix,
+                                rows: Some(self.rows_version),
+                            },
                         ))
                         .child(
                             div()

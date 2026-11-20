@@ -805,7 +805,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   - The window going to the background (Cmd-Tab, Hide) keeps the palette open, as a dialog stays; focus moving
     elsewhere in the window closes it.
   - Opening it dismisses an open context menu, drop-down or popover (the namespace filter), as Esc would, so none
-    stays drawn over it. When the menu
+    stays drawn over it. The namespace filter's popover is closed by its open state, which the workspace holds, so it
+    closes also when focus has moved off it.
+  - A click carries the version of the rows it was drawn on (`palette::PalettePick { row, rows }`); when a live
+    refresh has replaced the rows since, it is dropped rather than pick the entry now in that row. When the menu
     gives focus back, the palette runs from there; else from the workspace.
   - Speed: matching runs when the query changes, never while drawing, over labels prepared when the palette opens,
     with a cheap subsequence pass before the scoring; the rows are a virtual list, so long argument lists (thousands

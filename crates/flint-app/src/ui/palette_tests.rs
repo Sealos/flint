@@ -1356,3 +1356,62 @@ async fn a_refresh_selects_an_exact_match_that_arrives(cx: &mut TestAppContext) 
         .unwrap();
     assert_eq!(kind.as_deref(), Some("prods"));
 }
+
+// A click drawn on rows that a live refresh has since reordered is dropped rather than pick
+// the entry now in that row; a click on the rows shown runs.
+#[gpui_kit::test]
+async fn a_click_on_replaced_rows_is_dropped(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    t.workspace.update(cx, |ws, _| {
+        ws.set_namespaces_for_tests(vec!["demo".into(), "kube-system".into()])
+    });
+    ask(cx, &t, "add namespace").await;
+    assert_eq!(labels(&shown(cx, &t)), ["demo", "kube-system"]);
+    let drawn = palette(cx, &t)
+        .unwrap()
+        .read_with(cx, |p, _| p.rows_version);
+    // A namespace appears above the one about to be clicked.
+    t.workspace.update(cx, |ws, cx| {
+        ws.set_namespaces_for_tests(vec!["alpha".into(), "demo".into(), "kube-system".into()]);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(labels(&shown(cx, &t)), ["alpha", "demo", "kube-system"]);
+    // The click on `kube-system` (row 1 when drawn) arrives now: dropped.
+    t.dispatch(cx, "palette::PalettePick", json!({"row": 1, "rows": drawn}))
+        .unwrap();
+    assert!(palette(cx, &t).is_some(), "nothing ran");
+    let filter = |cx: &mut TestAppContext| {
+        t.workspace
+            .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()))
+    };
+    assert!(filter(cx).is_empty());
+    // On the rows shown, row 2 is `kube-system`.
+    t.click(cx, ("palette-row", 2usize));
+    assert!(palette_closed(cx, &t));
+    assert_eq!(filter(cx), ["kube-system"]);
+}
+
+// The namespace filter's popover closes when the palette opens also when focus has moved off
+// it (Focus Filter), since it is closed by its open state, not through focus.
+#[gpui_kit::test]
+async fn a_popover_without_focus_closes_when_the_palette_opens(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    assert_eq!(state(cx, &t).1, Focus::ListFilter);
+    assert!(t.find(cx, "ns-all").is_some(), "the popover stays open");
+    open_palette(cx, &t).await;
+    assert!(t.find(cx, "ns-all").is_none(), "the popover closed");
+    assert_eq!(state(cx, &t).1, Focus::Palette);
+    // It opens again from its button once the palette is gone.
+    t.press(cx, "escape");
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+}
