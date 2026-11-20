@@ -273,8 +273,9 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
     (`ReloadLogs`).
   - **Lines:** a shown timestamp is `HH:MM:SS.mmm` in the system's time zone (UTC, said as such in the toggle's
     tooltip, when it cannot be read), muted and fixed-width. A dated separator row (inside the line's list item)
-    starts the first line shown and each change of day or UTC offset, so a tail spanning days, or a fall-back hour,
-    is unambiguous; a workload line's prefix is the
+    starts the first timestamped line shown and each line that moves the day or UTC offset on from the latest of the
+    recent timestamped lines (untimestamped lines are skipped; a workload pod's line slightly out of order never
+    starts a day), so a tail spanning days, or a fall-back hour, is unambiguous; a workload line's prefix is the
     pod name after the prefix all its pods share (the container only when the pod has several), padded to the
     widest, in a colour per pod (`theme::log_source_colors`, by first sight). Prefix, timestamp and text are
     separate elements, so wrapped text hangs past both; hovering over the timestamp or prefix shows the full value.

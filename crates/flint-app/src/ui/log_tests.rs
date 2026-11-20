@@ -1231,12 +1231,20 @@ async fn the_overflow_menu_stays_reachable_and_holds_save(cx: &mut TestAppContex
     })
     .await;
     cx.update_window(window, |_, window, _| {
-        let more = window.find("log-more").bounds();
+        // "⋯" and the search's arrows (among the controls when narrow) are all on screen.
+        for id in ["log-more", "log-prev-match", "log-next-match"] {
+            let b = window.find(id).bounds();
+            assert!(
+                f32::from(b.origin.x + b.size.width) <= 320. && f32::from(b.size.width) > 0.,
+                "{id} on screen: {b:?}"
+            );
+        }
+        let main = window.find("log-main").bounds();
+        let next = window.find("log-next-match").bounds();
         assert!(
-            f32::from(more.origin.x + more.size.width) <= 320.,
-            "⋯ on screen: {more:?}"
+            next.origin.x >= main.origin.x + main.size.width,
+            "not cut with the rest"
         );
-        assert!(f32::from(more.size.width) > 0.);
     })
     .unwrap();
     cx.update_window(window, |_, window, cx| window.click("log-more", cx))

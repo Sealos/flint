@@ -91,16 +91,54 @@ pub fn day_label(ts: Timestamp, tz: &TimeZone) -> String {
     local.strftime("%A %-d %B %Y · %Z (UTC%:z)").to_string()
 }
 
-/// The dated separator to draw above `line`, when timestamps are shown: above the first line
-/// shown (`prev` is `None`), and wherever the day or the UTC offset changes from the line
-/// before. Lines without a timestamp never start a day.
-pub fn day_separator(prev: Option<&LogLine>, line: &LogLine, tz: &TimeZone) -> Option<String> {
+/// Earlier timestamped lines [`day_separator`] compares with, and how far back it looks for
+/// them: lines of a workload's pods interleave slightly out of timestamp order, so the latest
+/// of a few recent ones stands for "the day so far".
+const DAY_RECENT: usize = 16;
+const DAY_LOOKBACK: usize = 256;
+
+/// The dated separator to draw above `line`, when timestamps are shown. `before` is the lines
+/// before it, newest first. A separator marks where the day (or the UTC offset) moves on from
+/// the latest of the recent timestamped lines: above the first timestamped line shown, and above
+/// a line later than all of those whose day or offset differs. A line out of order (a pod's line
+/// a few milliseconds older than its neighbours, across midnight) never starts a day, and lines
+/// without a timestamp are skipped over.
+pub fn day_separator<'a>(
+    before: impl Iterator<Item = &'a LogLine>,
+    line: &LogLine,
+    tz: &TimeZone,
+) -> Option<String> {
     let ts = line.timestamp?;
-    match prev.map(|p| p.timestamp) {
-        Some(Some(before)) if day_of(before, tz) == day_of(ts, tz) => None,
-        // The line before has no timestamp: no day to compare with.
-        Some(None) => None,
-        _ => Some(day_label(ts, tz)),
+    let mut latest: Option<Timestamp> = None;
+    let mut seen = 0;
+    let mut exhausted = true;
+    for (looked, prev) in before.enumerate() {
+        if looked == DAY_LOOKBACK || seen == DAY_RECENT {
+            exhausted = false;
+            break;
+        }
+        if let Some(t) = prev.timestamp {
+            seen += 1;
+            latest = Some(latest.map_or(t, |l| l.max(t)));
+        }
+    }
+    match latest {
+        // Nothing timestamped before it: the first of the lines shown, or too far to tell.
+        None => exhausted.then(|| day_label(ts, tz)),
+        Some(latest) if ts > latest && day_of(ts, tz) != day_of(latest, tz) => {
+            Some(day_label(ts, tz))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Who said why a previous instance's log is not available: the API server, when it found no
+/// previous terminated container, else the kubelet (its one-line answer instead of the log).
+pub fn previous_speaker(detail: &str) -> &'static str {
+    if detail.contains("previous terminated container") {
+        "The API server"
+    } else {
+        "The kubelet"
     }
 }
 
@@ -1136,34 +1174,65 @@ mod tests {
     fn a_dated_separator_starts_each_day_and_offset() {
         let rome = TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
         let line = |text: &str| LogLine::parse(text, false);
+        // `before` newest first, as the view passes it.
+        let sep = |before: &[&LogLine], l: &LogLine, tz: &TimeZone| {
+            day_separator(before.iter().rev().copied(), l, tz)
+        };
         let first = line("2026-11-19T22:59:00Z a");
         let same_day = line("2026-11-19T22:59:30Z b");
         let next_day = line("2026-11-19T23:00:00Z c");
         let bare = line("no timestamp");
         assert_eq!(
-            day_separator(None, &first, &rome).as_deref(),
+            sep(&[], &first, &rome).as_deref(),
             Some("Thursday 19 November 2026 · CET (UTC+01:00)")
         );
-        assert_eq!(day_separator(Some(&first), &same_day, &rome), None);
+        assert_eq!(sep(&[&first], &same_day, &rome), None);
         assert_eq!(
-            day_separator(Some(&same_day), &next_day, &rome).as_deref(),
+            sep(&[&first, &same_day], &next_day, &rome).as_deref(),
             Some("Friday 20 November 2026 · CET (UTC+01:00)")
         );
-        // In UTC the same two lines share a day.
+        // In UTC the same lines share a day.
+        assert_eq!(sep(&[&same_day], &next_day, &TimeZone::UTC), None);
+        assert_eq!(sep(&[&first], &bare, &rome), None);
+        // A line without a timestamp in between does not hide the change of day.
         assert_eq!(
-            day_separator(Some(&same_day), &next_day, &TimeZone::UTC),
+            sep(&[&same_day, &bare], &next_day, &rome).as_deref(),
+            Some("Friday 20 November 2026 · CET (UTC+01:00)")
+        );
+        // Untimestamped lines only before it: the first timestamped line starts the day.
+        assert!(sep(&[&bare], &first, &rome).is_some());
+        // A workload's pods interleave out of order across midnight: Thursday's late line after
+        // Friday's does not start Thursday again, and Friday is not marked twice.
+        let late_thursday = line("2026-11-19T22:59:59.990Z d");
+        let friday_again = line("2026-11-19T23:00:00.010Z e");
+        assert_eq!(sep(&[&same_day, &next_day], &late_thursday, &rome), None);
+        assert_eq!(
+            sep(
+                &[&same_day, &next_day, &late_thursday],
+                &friday_again,
+                &rome
+            ),
             None
         );
-        assert_eq!(day_separator(Some(&first), &bare, &rome), None);
-        assert_eq!(day_separator(Some(&bare), &next_day, &rome), None);
         // The fall-back hour: 02:30 shows twice on 25 October 2026; the second starts anew.
         let summer = line("2026-10-25T00:30:00Z d");
         let winter = line("2026-10-25T01:30:00Z e");
         assert_eq!(short_time(summer.timestamp.unwrap(), &rome), "02:30:00.000");
         assert_eq!(short_time(winter.timestamp.unwrap(), &rome), "02:30:00.000");
         assert_eq!(
-            day_separator(Some(&summer), &winter, &rome).as_deref(),
+            sep(&[&summer], &winter, &rome).as_deref(),
             Some("Sunday 25 October 2026 · CET (UTC+01:00)")
+        );
+        // Who said the previous instance's log is not available.
+        assert_eq!(
+            previous_speaker(
+                "BadRequest: previous terminated container \"app\" in pod \"p\" not found"
+            ),
+            "The API server"
+        );
+        assert_eq!(
+            previous_speaker("unable to retrieve container logs for containerd://c54f"),
+            "The kubelet"
         );
     }
 

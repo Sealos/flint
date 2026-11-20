@@ -276,6 +276,9 @@ impl Stream {
             Step::Opened(Ok(lines)) => {
                 self.opened = true;
                 self.fresh = true;
+                // A new read: an earlier read's "cannot read the log" no longer holds. If this
+                // one gets it again, it is set again.
+                self.notice = None;
                 self.set_state(LogState::Streaming);
                 Phase::Read(lines)
             }
@@ -858,6 +861,58 @@ mod tests {
             restarts.state(),
             LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false } if e == notice
         ));
+    }
+
+    // covers UP-40: a reopen that succeeds drops the kubelet's earlier answer, so a later end or
+    // wait does not report it.
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_reopen_forgets_the_kubelets_answer() {
+        let notice = "unable to retrieve container logs for containerd://c54f232e5b";
+        let mut s = Stream::new(
+            Arc::new(Fated {
+                lines: vec![notice.to_owned()],
+                fate: AfterEnd::Restarts,
+            }),
+            LogTarget {
+                namespace: "ns".into(),
+                pod: "p".into(),
+                container: Some("c".into()),
+            },
+            LogOptions::default(),
+            10,
+            Backoff {
+                first: Duration::from_secs(1),
+                max: Duration::from_secs(30),
+            },
+            None,
+        );
+        drain(&mut s).await;
+        assert!(matches!(
+            s.state(),
+            LogState::Reconnecting { error: Some(_), .. }
+        ));
+        // The container restarted: its log opens, holds nothing, and ends.
+        s.handle(Step::Opened(Ok(stream::empty().boxed())), &mut |_| {});
+        s.handle(Step::Eof, &mut |_| {});
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Restarts)), &mut |_| {});
+        assert!(
+            matches!(s.state(), LogState::Reconnecting { error: None, .. }),
+            "{:?}",
+            s.state()
+        );
+        // Finished: the last catch-up reads nothing more and ends without an error.
+        s.handle(Step::Opened(Ok(stream::empty().boxed())), &mut |_| {});
+        s.handle(Step::Eof, &mut |_| {});
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Finished)), &mut |_| {});
+        s.handle(Step::Opened(Ok(stream::empty().boxed())), &mut |_| {});
+        s.handle(Step::Eof, &mut |_| {});
+        assert_eq!(
+            s.state(),
+            &LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
     }
 
     // covers UP-40: a container in CrashLoopBackOff is waited for as the kubelet's back-off.

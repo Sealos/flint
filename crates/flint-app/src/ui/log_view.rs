@@ -730,8 +730,9 @@ impl LogView {
         let timestamp = has_time.then_some(line.timestamp).flatten();
         let day = has_time
             .then(|| {
-                let prev = ix.checked_sub(1).and_then(|p| self.snapshot.lines.at(p));
-                log_model::day_separator(prev.map(|(_, l)| l), line, &self.tz)
+                let lines = &self.snapshot.lines;
+                let before = (0..ix).rev().filter_map(|p| lines.at(p).map(|(_, l)| l));
+                log_model::day_separator(before, line, &self.tz)
             })
             .flatten();
         let tz = self.tz.clone();
@@ -1031,31 +1032,13 @@ impl LogView {
                                     .test_support(),
                             )
                         })
-                        .child(
-                            Button::new("log-prev-match")
-                                .icon(IconName::ChevronUp)
-                                .xsmall()
-                                .ghost()
-                                .disabled(!has_matches)
-                                .tooltip(format!(
-                                    "Previous match ({})",
-                                    registry::key_hint("secondary-shift-g")
-                                ))
-                                .on_click(registry::on_click(PrevMatch)),
-                        )
-                        .child(
-                            Button::new("log-next-match")
-                                .icon(IconName::ChevronDown)
-                                .xsmall()
-                                .ghost()
-                                .disabled(!has_matches)
-                                .tooltip(format!(
-                                    "Next match ({})",
-                                    registry::key_hint("secondary-g")
-                                ))
-                                .on_click(registry::on_click(NextMatch)),
-                        )
-                    }),
+                        // Beside the count while it shows; else among the controls, which
+                        // are never cut.
+                        .when(fit.match_count, |el| {
+                            el.children(Self::match_buttons(has_matches))
+                        })
+                    })
+                    .test_support(),
             )
             // The controls: one group that never wraps.
             .child(
@@ -1063,6 +1046,9 @@ impl LogView {
                     .id("log-controls")
                     .flex_none()
                     .gap_x_1()
+                    .when(has_query && !fit.match_count, |el| {
+                        el.children(Self::match_buttons(has_matches))
+                    })
                     .when(fit.toggles, |el| {
                         el.child(
                             Button::new("log-timestamps")
@@ -1184,6 +1170,32 @@ impl LogView {
                     .test_support(),
             )
             .test_support()
+    }
+
+    /// The search's previous and next buttons.
+    fn match_buttons(has_matches: bool) -> [Button; 2] {
+        [
+            Button::new("log-prev-match")
+                .icon(IconName::ChevronUp)
+                .xsmall()
+                .ghost()
+                .disabled(!has_matches)
+                .tooltip(format!(
+                    "Previous match ({})",
+                    registry::key_hint("secondary-shift-g")
+                ))
+                .on_click(registry::on_click(PrevMatch)),
+            Button::new("log-next-match")
+                .icon(IconName::ChevronDown)
+                .xsmall()
+                .ghost()
+                .disabled(!has_matches)
+                .tooltip(format!(
+                    "Next match ({})",
+                    registry::key_hint("secondary-g")
+                ))
+                .on_click(registry::on_click(NextMatch)),
+        ]
     }
 
     /// The strip under the toolbar: the last transient thing said (a copy or save note, else
@@ -1335,8 +1347,8 @@ impl LogView {
                             theme.warning,
                             log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
                             Some(format!(
-                                "The container may still be restarting. The kubelet said: \
-                                     {kubelet}"
+                                "The container may still be restarting. {} said: {kubelet}",
+                                log_model::previous_speaker(kubelet)
                             )),
                         )
                     }
