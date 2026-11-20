@@ -1022,3 +1022,11 @@ fn apply(rule: &Rule, line: &str, count: &mut usize) -> Option<String> {
 #[cfg(test)]
 #[path = "text_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "text_baseline_tests.rs"]
+mod baseline;
+
+#[cfg(test)]
+#[path = "text_diff_tests.rs"]
+mod diff_tests;
