@@ -201,7 +201,8 @@ impl Workspace {
     }
 
     /// The place shown, for Go Back to skip: none while an object opened by name waits for its
-    /// row, since going back to the bare list is what cancels that pick.
+    /// row or is shown missing, since going back to the bare list is what cancels that pick (or
+    /// dismisses the missing notice).
     fn shown_place(&self, cx: &App) -> Option<Place> {
         let picking = self.list.as_ref().is_some_and(|l| l.read(cx).picking());
         self.place(cx).filter(|_| !picking)

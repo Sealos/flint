@@ -504,6 +504,28 @@ async fn go_back_cancels_an_object_still_waiting_for_its_row(cx: &mut TestAppCon
     assert_eq!(t.selected(cx), None, "the pick was cancelled");
 }
 
+// covers UP-33: an object opened by name and found missing leaves a notice over the bare list;
+// Go Back to the bare list still dismisses it.
+#[gpui_kit::test]
+async fn go_back_dismisses_an_object_found_missing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "gone"}),
+    )
+    .unwrap();
+    t.feed_list(cx, pods(&[("demo", "api", 1)])).await;
+    let list = t.list(cx).expect("a list is open");
+    assert!(list.read_with(cx, |l, _| l.missing_text()).is_some());
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(list.read_with(cx, |l, _| l.missing_text()), None);
+}
+
 // covers UP-33: the Go Back key where Go Back has nowhere to go leaves the history alone, so a
 // later selection can still go back.
 #[gpui_kit::test]
