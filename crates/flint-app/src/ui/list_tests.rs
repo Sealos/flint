@@ -815,54 +815,20 @@ async fn measure_frame_cost_with_10k_rows(cx: &mut TestAppContext) {
     eprintln!("10k rows: {per_frame:?} per frame (headless, {frames} frames)");
 }
 
-// A closed list is freed, with its filter's input: when another kind replaces it, and when a
-// cluster switch closes it. Nothing it registered (for the next frame, its tasks) keeps it
-// alive. With GPUI_LEAK_DETECTION=1 a failure lists the live handles.
+// A closed list is freed, with its filter: when another kind replaces it (focus moves to the
+// new list), and when a cluster switch closes it (the workspace takes focus back). Each list is
+// closed with its filter focused, so the window holds the filter as its focused text field
+// (gpui-component's `WindowState`, a strong handle) until asked after focus moved on. Nothing
+// else the list registered (for the next frame, its tasks) keeps it alive either. With
+// GPUI_LEAK_DETECTION=1 a failure lists the live handles.
 //
 // Not `assert_no_new_leaks`: each cluster switch also rebuilds the other cluster's screen (its
 // Retry buttons' focus handles are new and alive), which is not the list's.
 #[gpui_kit::test]
 async fn a_closed_list_is_released(cx: &mut TestAppContext) {
-    use crate::ui::support_tests::{open_workspace, pods, standard_sections};
-
-    let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    t.connect_alpha(cx, standard_sections()).await;
-    let parts = |cx: &mut TestAppContext| {
-        let list = t.list(cx).unwrap();
-        let filter = list.read_with(cx, |l, _| l.filter.downgrade());
-        (list.downgrade(), filter)
+    use crate::ui::support_tests::{
+        assert_focused_input, open_workspace, pods, standard_sections, weaken,
     };
-
-    // Replaced by another kind.
-    t.open_kind(cx, "pods", pods(&[("demo", "api", 0)])).await;
-    let (pods_list, pods_filter) = parts(cx);
-    t.dispatch(
-        cx,
-        "workspace::OpenView",
-        serde_json::json!({"kind": "services"}),
-    )
-    .unwrap();
-    cx.run_until_parked();
-    pods_list.assert_released();
-    pods_filter.assert_released();
-
-    // Closed by a cluster switch.
-    let (services_list, services_filter) = parts(cx);
-    t.activate(cx, "beta").await;
-    cx.run_until_parked();
-    assert!(t.list(cx).is_none());
-    services_list.assert_released();
-    services_filter.assert_released();
-}
-
-// A list closed while its filter has focus is freed with it: replaced by another kind (focus
-// moves to the new list) and closed by a cluster switch (the workspace takes focus back). The
-// window keeps the focused text input registered (gpui-component's `WindowState`, a strong
-// handle) until asked after focus moved on.
-#[gpui_kit::test]
-async fn a_list_closed_while_filtering_is_released(cx: &mut TestAppContext) {
-    use crate::ui::support_tests::{open_workspace, pods, standard_sections};
 
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
@@ -870,22 +836,10 @@ async fn a_list_closed_while_filtering_is_released(cx: &mut TestAppContext) {
     let filtering = |cx: &mut TestAppContext| {
         t.press_key_of(cx, "resource_list::FocusFilter");
         cx.run_until_parked();
+        assert_focused_input(cx, t.window, "the filter");
         let list = t.list(cx).unwrap();
-        let filter = list.read_with(cx, |l, _| l.filter.clone());
-        let focused = cx
-            .update_window(t.window, |_, window, cx| {
-                gpui_kit::Focusable::focus_handle(filter.read(cx), cx).is_focused(window)
-            })
-            .unwrap();
-        assert!(focused, "the filter has focus");
-        let registered = cx
-            .update_window(t.window, |_, window, cx| {
-                use gpui_kit::component::WindowExt as _;
-                window.has_focused_input(cx)
-            })
-            .unwrap();
-        assert!(registered, "the filter is the window's focused text field");
-        (list.downgrade(), filter.downgrade())
+        let filter = list.read_with(cx, |l, _| l.filter.downgrade());
+        (weaken(list), filter)
     };
 
     // Replaced by another kind.
@@ -916,9 +870,10 @@ async fn a_list_closed_while_filtering_is_released(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppContext) {
     use crate::ui::log_view::LogRequest;
-    use crate::ui::support_tests::{open_workspace, pods, standard_sections};
+    use crate::ui::support_tests::{
+        assert_focused_input, open_workspace, pods, standard_sections, weaken,
+    };
     use flint_core::{LogSubject, LogTarget};
-    use gpui_kit::component::WindowExt as _;
 
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
@@ -926,17 +881,10 @@ async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppCon
     t.open_kind(cx, "pods", pods(&[("demo", "api", 0)])).await;
     t.press_key_of(cx, "resource_list::FocusFilter");
     cx.run_until_parked();
+    assert_focused_input(cx, t.window, "the filter");
     let list = t.list(cx).unwrap();
     let filter = list.read_with(cx, |l, _| l.filter.downgrade());
-    let list = {
-        let weak = list.downgrade();
-        drop(list);
-        weak
-    };
-    let registered = cx
-        .update_window(t.window, |_, window, cx| window.has_focused_input(cx))
-        .unwrap();
-    assert!(registered, "the filter is the window's focused text field");
+    let list = weaken(list);
 
     // A log tab takes focus, and the cluster switches before the list draws again.
     let workspace = t.workspace.clone();

@@ -22,7 +22,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, ElementId, Entity, Point, Subscription,
-    TestAppContext, WindowBounds, WindowOptions, px, size,
+    TestAppContext, WeakEntity, WindowBounds, WindowOptions, px, size,
 };
 use serde_json::{Value, json};
 
@@ -540,6 +540,21 @@ impl TestWorkspace {
             Err(e) => panic!("accept: {e}"),
         }
     }
+}
+
+/// Asserts that the window holds a focused text field (`what`) as gpui-component registers it:
+/// the strong handle a closed view's field must be released from
+/// (`ui::focus::release_unfocused_input`).
+pub fn assert_focused_input(cx: &mut TestAppContext, window: AnyWindowHandle, what: &str) {
+    let registered = cx
+        .update_window(window, |_, window, cx| window.has_focused_input(cx))
+        .unwrap();
+    assert!(registered, "{what} is the window's focused text field");
+}
+
+/// Gives up the test's strong handle to `entity`, keeping a weak one to assert its release.
+pub fn weaken<T: 'static>(entity: Entity<T>) -> WeakEntity<T> {
+    entity.downgrade()
 }
 
 /// A navigation entry for `plural` in `group` (`""`: the core group).
