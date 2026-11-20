@@ -390,7 +390,19 @@ served as a minimal object built from the row.
 **Recording:** `KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh`. It refuses to run unless `KUBECONFIG` names
 exactly one file whose current context is `kind-flint-dev` on an `https://` server at 127.0.0.1, localhost or ::1,
 with no proxy. The new set is written next to the old one and swapped in only when it is complete, loads, and holds
-no credentials, so a failed run changes nothing.
+no credentials, so a failed run changes nothing. With a directory argument the set is written there instead.
+
+**Drift guard (#128).** The fake is only as true as its fixtures. `flint_e2e::record::shape` reduces a fixtures
+directory to its structure: the files recorded (which kinds have Tables and objects, which OpenAPI documents), every
+discovery entry's kind, scope, verbs, short names and subresources and the fields discovery entries have, each
+Table's columns (name, type, format, priority) and the fields of a Table and its rows, the fields of `/version`, and
+each object list's kind (not the objects' fields, which follow their state). Values never count (names, cells, counts,
+versions, descriptions), and row fields are compared only when both sides have rows. Nightly, the `fixture-drift` job in `cluster-e2e` records from a fresh kind cluster into a scratch
+directory (`scripts/record-fixtures.sh "$RUNNER_TEMP/fixtures"`) and runs `fixture-drift <committed> <recorded>`,
+which fails with a list of what differs and, on failure, keeps the recording as an artifact. Then re-record, and update
+the fake and the tests that rely on what changed. The comparison's unit tests run with `flint-e2e`'s on every PR that
+changes Rust code. The `cluster-e2e` job also runs
+`flint-e2e`'s UP-09 and UP-10 MCP tests on kind (`FLINT_E2E_BACKEND=kind`), so their assertions hold on both backends.
 
 - Secrets are masked with `flint_core::redact::mask_secret` (values become base64 of `redacted`, keys stay), and
   Secret Table cells outside the safe columns are hidden. ConfigMaps labelled `owner=helm` (Helm's ConfigMap storage)
@@ -545,7 +557,7 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `macos-app (dmg)` | macOS | `macos-app.yml`, only on PRs that touch the macOS packaging (`scripts/package-macos-app.sh`, `scripts/smoke-macos-app.sh`, `scripts/smoke-macos-app-test.sh`, `scripts/check-no-automation.sh`, `packaging/macos/`, `assets/brand/Flint.icns`, `LICENSE`, `macos-app.yml`, `release-please.yml`) and by hand. A release build (the runner's arm64 only) packaged as `Flint.app` in a DMG with `scripts/package-macos-app.sh`, with the version from `Cargo.toml`. Then `scripts/smoke-macos-app.sh` mounts the DMG read-only and checks the bundle identifier and version (PlistBuddy), the icon and LICENSE, the ad-hoc signature (`codesign --verify --deep --strict`, identifier `se.redstack.flint`), `--version`, `mcp` answering `initialize` and exiting 0 through `Flint.app/Contents/MacOS/flint`, and that the bundled binary has no automation channel; every hdiutil, codesign and binary call is time-limited. `scripts/smoke-macos-app-test.sh` then checks that the smoke test fails on DMGs with a wrong bundle ID, version, signature or no LICENSE. The release's `build-macos` runs the packaging and smoke scripts on the universal binary before it uploads the DMG. Not required |
 | `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job on every PR that needs macOS |
 | `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
-| `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
+| `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`), MCP e2e, and `flint-e2e`'s UP-09 and UP-10 on kind. Nightly (and by hand), the `fixture-drift` job re-records the fixtures from a fresh kind cluster and fails on structural drift from the committed set (#128) |
 
 **Required checks.** Merging into master requires `fmt`, `clippy`, `test (flint-core)`, `test (flint-mcp)`, `docs`,
 `cargo-deny (bans licenses sources)`, `unused-deps`, `module-tests`, `typos`, `actionlint`, `conventional` and
@@ -554,7 +566,8 @@ included, on every PR. `macos (flint-app)` still runs on every PR that touches t
 macOS runners can queue for a long time; a PR whose macOS job has failed is held until it passes.
 
 `cluster-e2e` needs `flint-core` and `flint-mcp` to build on Linux, which is part of the portability goal.
-App e2e runs on PRs, inside `macos (flint-app)`. `cluster-e2e` runs on PRs that touch `flint-core` or `flint-mcp`, on master, and nightly.
+App e2e runs on PRs, inside `macos (flint-app)`. `cluster-e2e` runs on PRs that touch `flint-core`, `flint-mcp`, or the parts of `flint-e2e` it runs (the fake API
+server, the harness, the fixtures and their recorder, the MCP tests), on master, and nightly.
 
 **The MCP server without GPUI.** The `flint-mcp` crate has a binary target, `flint-mcp`, that runs the same
 `flint_mcp::serve_stdio_main` as `flint mcp` and links no GPUI. The MCP e2e tests (`crates/flint-mcp/tests/mcp_stdio.rs`)
@@ -617,7 +630,7 @@ milestone T; feature tests are in their feature's milestone.
 ### P1: before 1.0
 
 - **Harness (T):** teardown checks for UP-90 and UP-91 run in every app test (#127; its strict `TODO(#98)` wording
-  for UP-04 and UP-27 waits for #98); drift guard: MCP tests on both backends in `cluster-e2e` and a nightly fixture diff (#128); fake writes,
+  for UP-04 and UP-27 waits for #98); drift guard: UP-09 and UP-10 on both backends in `cluster-e2e` and a nightly fixture diff (#128, done); fake writes,
   a remote-looking cluster for protection, metrics, fixture variants, a fake `claude` and clock control (#129); the
   nightly memory soak test (#126).
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the

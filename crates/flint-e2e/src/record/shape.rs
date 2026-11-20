@@ -5,13 +5,14 @@
 //! The structure is what the fake serves and the tests rely on:
 //!
 //! - the files recorded: which kinds have Tables and objects, and which OpenAPI documents;
-//! - discovery: every group, version and resource, with its kind, scope and subresources, and
-//!   the fields a discovery entry has;
+//! - discovery: every group, version and resource, with its kind, scope, verbs, short names and
+//!   subresources, and the fields a discovery entry has;
 //! - each Table's columns (name, type, format, priority) and the fields of a Table and its rows;
-//! - the fields of `/version`, and the kind of each recorded object list.
+//! - the fields of `/version`, and the kind of each recorded object list (not the fields of the
+//!   objects, which depend on their state).
 //!
-//! Values are left out: names, cells, counts, versions, timestamps, verbs and descriptions
-//! differ between two recordings of the same cluster.
+//! Values are left out: names, cells, counts, versions, timestamps and descriptions differ
+//! between two recordings of the same cluster.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -74,6 +75,11 @@ impl Shape {
                     let subresources: Vec<String> = array(&resource["subresources"])
                         .map(|s| text_of(&s["subresource"]))
                         .collect();
+                    let sorted = |field: &str| {
+                        let mut list: Vec<String> = array(&resource[field]).map(text_of).collect();
+                        list.sort();
+                        list.join(",")
+                    };
                     self.insert(
                         format!(
                             "resource {}/{v}/{}",
@@ -81,9 +87,11 @@ impl Shape {
                             text_of(&resource["resource"])
                         ),
                         format!(
-                            "kind={} scope={} subresources=[{}]",
+                            "kind={} scope={} verbs=[{}] short=[{}] subresources=[{}]",
                             text_of(&resource["responseKind"]["kind"]),
                             text_of(&resource["scope"]),
+                            sorted("verbs"),
+                            sorted("shortNames"),
                             subresources.join(",")
                         ),
                     );
@@ -244,7 +252,9 @@ mod tests {
         assert!(shape.diff(&shape).is_empty());
         assert_eq!(
             shape.0["resource apps/v1/deployments"],
-            "kind=Deployment scope=Namespaced subresources=[scale,status]"
+            "kind=Deployment scope=Namespaced \
+             verbs=[create,delete,deletecollection,get,list,patch,update,watch] short=[deploy] \
+             subresources=[scale,status]"
         );
         assert!(
             shape.0["columns tables/apps/v1/deployments.json"]
@@ -282,7 +292,8 @@ mod tests {
             v["gitVersion"] = "v9.99.0".into();
         });
         edit(dir.path(), "discovery/apis.json", |d| {
-            d["items"][0]["versions"][0]["resources"][0]["verbs"] = serde_json::json!(["get"]);
+            d["items"][0]["metadata"]["resourceVersion"] = "42".into();
+            d["items"][0]["versions"][0]["freshness"] = "Stale".into();
         });
         edit(dir.path(), "objects/apps/v1/deployments.json", |o| {
             o["items"].as_array_mut().unwrap().clear();
@@ -306,6 +317,8 @@ mod tests {
             let resource = &mut d["items"][0]["versions"][0]["resources"][0];
             resource["scope"] = "Namespaced".into();
             resource["newField"] = true.into();
+            // A verb lost: the fake would refuse watches.
+            resource["verbs"] = serde_json::json!(["get", "list"]);
         });
         edit(dir.path(), "version.json", |v| {
             v.as_object_mut().unwrap().remove("platform");
@@ -328,6 +341,7 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
         assert!(text.contains("Ready:integer::0"), "{text}");
+        assert!(text.contains("scope=Namespaced verbs=[get,list]"), "{text}");
         assert!(text.starts_with(&format!("{} structural difference(s)", lines.len())));
     }
 }

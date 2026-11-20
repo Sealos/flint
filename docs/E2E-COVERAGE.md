@@ -23,8 +23,8 @@ review (#15). "#116" marks view tests that have since merged (aa59738). The app 
 | 06 | U, K | `core_handle.rs::reloads_when_kubeconfig_changes`; `app/m0.rs::up_06_kubeconfig_changes_on_disk` (A) | its half-written file lasts 30 ms, under the 300 ms debounce, so a file held half-written is untested | #131 |
 | 07 | U, ui | `core_handle.rs::set_ai_exposed_writes_context_and_server` (U); `ui/workspace_tests.rs::the_expose_dialog_answers_confirm_and_cancel` (V); `app/m0.rs::up_07_expose_a_cluster_to_ai` (A); #116 `expose_tests.rs` | — | — |
 | 08 | U, M, ui | `policy.rs::same_name_with_a_different_server_is_not_exposed` (U); `mcp_stdio.rs::mcp_policy_without_a_cluster` (M); `app/m0.rs::up_08_up_12_app_and_flint_mcp_agree_on_exposure` (A) | — | — |
-| 09 | M | `mcp_stdio.rs::mcp_over_stdio` (M+K); `e2e/mcp.rs::up_09_agent_lists_only_exposed_clusters` (M); `mcp_subcommand.rs::flint_mcp_answers_on_stdio` | — | — |
-| 10 | U, M+K | 28 tagged (U); `mcp_stdio.rs::mcp_over_stdio` (M+K); `e2e/mcp.rs::up_10_agent_inspects_a_cluster`, `up_10_agent_reads_current_data` (M) | `flint-e2e` MCP tests never run on kind | #128 |
+| 09 | M | `mcp_stdio.rs::mcp_over_stdio` (M+K); `e2e/mcp.rs::up_09_agent_lists_only_exposed_clusters` (M, and M+K in `cluster-e2e`); `mcp_subcommand.rs::flint_mcp_answers_on_stdio` | — | — |
+| 10 | U, M+K | 28 tagged (U); `mcp_stdio.rs::mcp_over_stdio` (M+K); `e2e/mcp.rs::up_10_agent_inspects_a_cluster` (M, and M+K in `cluster-e2e`), `up_10_agent_reads_current_data` (M) | — | — |
 | 11 | U, M | `policy.rs::unexposed_and_unknown_clusters_give_identical_errors` (U); `e2e/mcp.rs::up_11_…look_the_same` (M, no requests) | — | — |
 | 12 | U, M | `core_handle.rs::reloads_when_settings_change`; `e2e/mcp.rs::up_12_settings_edited_by_hand_apply_on_the_next_call` (M); `app/m0.rs::up_08_up_12_…` (A) | — | — |
 | 13 | ui | `ui/appearance_tests.rs::switching_appearance_swaps_the_theme_colors` (V); `app/m0.rs::up_13_light_and_dark_appearance` (A) | following macOS live | manual |

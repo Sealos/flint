@@ -1,13 +1,19 @@
 //! MCP user paths, end to end: Flint's MCP server (`flint-mcp`, the same server as `flint mcp`)
 //! over stdio, against fake API servers. No GUI and no cluster, so these run in plain
-//! `cargo test` on Linux too. The kind versions are in `crates/flint-mcp/tests/mcp_stdio.rs`.
+//! `cargo test` on Linux too. UP-09 and UP-10 also run on the kind dev cluster with
+//! `FLINT_E2E_BACKEND=kind FLINT_TEST_KUBECONFIG=…` (the `cluster-e2e` CI job), so the same
+//! assertions hold on the fake and on a real API server. More kind tests are in
+//! `crates/flint-mcp/tests/mcp_stdio.rs`.
 //!
 //! Each test gets scratch kubeconfigs and a scratch config directory; nothing reads the user's
 //! own files.
 
-use std::time::Duration;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use flint_e2e::backend::{Backend, TestCluster};
 use flint_e2e::fake_api::{FakeApiServer, Options, WatchStep, write_kubeconfigs};
 use flint_e2e::mcp::Mcp;
 use flint_e2e::scratch::Scratch;
@@ -48,12 +54,159 @@ impl Two {
     }
 }
 
+/// The cluster the agent inspects, from `Backend::from_env()` (the fake API server, or the kind
+/// dev cluster with `FLINT_E2E_BACKEND=kind`), beside a fake one it must never reach. UP-09 and
+/// UP-10 run on both, so the fake is checked against a real API server (#128).
+struct Inspected {
+    cluster: TestCluster,
+    hidden: FakeApiServer,
+    scratch: Scratch,
+}
+
+impl Inspected {
+    /// `None` when the backend is kind without `FLINT_TEST_KUBECONFIG`: the test is skipped,
+    /// with a message.
+    fn start() -> Result<Option<Inspected>> {
+        let Some(cluster) = Backend::from_env().start()? else {
+            return Ok(None);
+        };
+        let hidden = FakeApiServer::start_blocking(Options::default())?;
+        let scratch = Scratch::new()?;
+        write_kubeconfigs(&scratch.path().join("hidden"), &[(&hidden, HIDDEN, None)])?;
+        Ok(Some(Inspected {
+            cluster,
+            hidden,
+            scratch,
+        }))
+    }
+
+    /// The inspected cluster's context.
+    fn context(&self) -> &str {
+        &self.cluster.context
+    }
+
+    fn mcp(&self) -> Result<Mcp> {
+        let list = std::env::join_paths([
+            self.cluster.kubeconfig.clone(),
+            self.scratch.path().join("hidden"),
+        ])?;
+        Mcp::start(list, &self.scratch.config_dir())
+    }
+
+    fn expose(&self) -> Result<()> {
+        self.scratch
+            .write_settings(&exposing(self.context(), &self.cluster.server))
+    }
+
+    /// Runs kubectl with `args` (and `stdin`), on kind only: against the test's one-context copy
+    /// of the kind kubeconfig, whose server `TestCluster::kind` checked is on this machine, and
+    /// only for a `kind-*` context, so a tunnel to another cluster on 127.0.0.1 is refused.
+    fn kubectl(&self, args: &[&str], stdin: Option<&str>) -> Result<()> {
+        anyhow::ensure!(
+            self.cluster.fake_server().is_none() && self.context().starts_with("kind-"),
+            "refusing to run kubectl against {:?}: not a kind cluster",
+            self.context()
+        );
+        let mut child = Command::new("kubectl")
+            .arg("--kubeconfig")
+            .arg(&self.cluster.kubeconfig)
+            .arg("--context")
+            .arg(self.context())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()?;
+        if let Some(text) = stdin {
+            child
+                .stdin
+                .take()
+                .expect("kubectl's stdin")
+                .write_all(text.as_bytes())?;
+        }
+        let status = child.wait()?;
+        anyhow::ensure!(status.success(), "kubectl {args:?} failed: {status}");
+        Ok(())
+    }
+}
+
+/// A Secret applied as `kubectl apply` does (its value also in the last-applied annotation),
+/// deleted again on kind when dropped.
+struct AppliedSecret<'a> {
+    on: &'a Inspected,
+}
+
+impl<'a> AppliedSecret<'a> {
+    /// Named `flint-test-…`, which the cluster-e2e job checks is gone after the tests.
+    const NAME: &'static str = "flint-test-mcp-applied";
+    const PLAINTEXT: &'static str = "flint-e2e-plaintext-value";
+    const ENCODED: &'static str = "ZmxpbnQtZTJlLXBsYWludGV4dC12YWx1ZQ==";
+
+    fn apply(on: &'a Inspected) -> Result<AppliedSecret<'a>> {
+        match on.cluster.fake_server() {
+            // What `kubectl apply` leaves on the cluster: the value encoded in `data`, and in
+            // plain text in the last-applied annotation.
+            Some(fake) => {
+                let annotation = format!(
+                    "{{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"stringData\":{{\"password\":\"{}\"}}}}",
+                    Self::PLAINTEXT
+                );
+                let secret = json!({
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": Self::NAME,
+                        "namespace": "demo",
+                        "annotations": {
+                            "kubectl.kubernetes.io/last-applied-configuration": annotation
+                        }
+                    },
+                    "type": "Opaque",
+                    "data": {"password": Self::ENCODED}
+                });
+                fake.set_object(&fake.gvr("secrets"), secret);
+            }
+            // kubectl writes the annotation itself, with the plain-text value it was given.
+            None => {
+                let secret = json!({
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {"name": Self::NAME, "namespace": "demo"},
+                    "type": "Opaque",
+                    "stringData": {"password": Self::PLAINTEXT}
+                });
+                on.kubectl(&["apply", "-f", "-"], Some(&secret.to_string()))?;
+            }
+        }
+        Ok(AppliedSecret { on })
+    }
+}
+
+impl Drop for AppliedSecret<'_> {
+    fn drop(&mut self) {
+        if self.on.cluster.fake_server().is_none() {
+            let _ = self.on.kubectl(
+                &[
+                    "-n",
+                    "demo",
+                    "delete",
+                    "secret",
+                    Self::NAME,
+                    "--ignore-not-found",
+                ],
+                None,
+            );
+        }
+    }
+}
+
 // covers UP-09
 #[test]
 fn up_09_agent_lists_only_exposed_clusters() -> Result<()> {
-    let two = Two::start()?;
-    two.scratch.write_settings("")?;
-    let mut mcp = two.mcp()?;
+    let Some(on) = Inspected::start()? else {
+        return Ok(());
+    };
+    on.scratch.write_settings("")?;
+    let mut mcp = on.mcp()?;
     assert_eq!(
         mcp.tools()?,
         [
@@ -73,62 +226,49 @@ fn up_09_agent_lists_only_exposed_clusters() -> Result<()> {
     assert!(hint.contains("Expose to AI"), "{clusters}");
 
     // Exposed in settings (as the app writes it): listed, reachable, with its version.
-    two.scratch
-        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    on.expose()?;
     let clusters = mcp.call_json("list_clusters", json!({}))?;
     let listed = clusters["clusters"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{clusters}");
-    assert_eq!(listed[0]["name"], EXPOSED);
+    assert_eq!(listed[0]["name"], on.context());
     assert_eq!(listed[0]["reachable"], true, "{clusters}");
     assert!(listed[0]["server_version"].as_str().is_some(), "{clusters}");
     assert!(clusters.get("hint").is_none(), "{clusters}");
 
     // The hidden cluster's server never heard from the agent.
-    assert!(two.b.requests().is_empty(), "{:?}", two.b.requests());
+    assert!(
+        on.hidden.arrivals().is_empty(),
+        "{:?}",
+        on.hidden.arrivals()
+    );
     Ok(())
 }
 
 // covers UP-10
 #[test]
 fn up_10_agent_inspects_a_cluster() -> Result<()> {
-    let two = Two::start()?;
-    two.scratch
-        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
-    // A Secret applied with kubectl: its value also sits in the last-applied annotation.
-    let secrets = two.a.gvr("secrets");
-    let plaintext = "flint-e2e-plaintext-value";
-    let encoded = "ZmxpbnQtZTJlLXBsYWludGV4dC12YWx1ZQ==";
-    two.a.set_object(
-        &secrets,
-        json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": "applied",
-                "namespace": "demo",
-                "annotations": {
-                    "kubectl.kubernetes.io/last-applied-configuration":
-                        format!("{{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"stringData\":{{\"password\":\"{plaintext}\"}}}}")
-                }
-            },
-            "type": "Opaque",
-            "data": {"password": encoded}
-        }),
-    );
-    two.a.set_log(
-        "demo",
-        "web-69c6f74b8b-qv4xv",
-        "starting nginx\nlistening on :80\nGET / 200\n",
-    );
-    let mut mcp = two.mcp()?;
+    let Some(on) = Inspected::start()? else {
+        return Ok(());
+    };
+    on.expose()?;
+    let cluster = on.context();
+    let _secret = AppliedSecret::apply(&on)?;
+    if let Some(fake) = on.cluster.fake_server() {
+        fake.set_log(
+            "demo",
+            "web-69c6f74b8b-qv4xv",
+            "starting nginx\nlistening on :80\nGET / 200\n",
+        );
+    }
+    let mut mcp = on.mcp()?;
 
-    let kinds = mcp.call_json("list_resource_kinds", json!({"cluster": EXPOSED}))?;
+    let kinds = mcp.call_json("list_resource_kinds", json!({"cluster": cluster}))?;
     assert!(kinds["count"].as_u64().unwrap() > 20, "{kinds}");
 
     // Pods as kubectl get shows them, then page by page with the continue token.
     let pods = mcp.call_json(
         "list_resources",
-        json!({"cluster": EXPOSED, "kind": "po", "namespace": "demo"}),
+        json!({"cluster": cluster, "kind": "po", "namespace": "demo"}),
     )?;
     let columns: Vec<&str> = pods["columns"]
         .as_array()
@@ -142,14 +282,19 @@ fn up_10_agent_inspects_a_cluster() -> Result<()> {
         "{pods}"
     );
     let all: Vec<String> = names(&pods);
-    assert_eq!(all.len(), 7, "{pods}");
+    // The recorded demo namespace on the fake; on kind, whatever it holds now.
+    if on.cluster.fake_server().is_some() {
+        assert_eq!(all.len(), 7, "{pods}");
+    } else {
+        assert!(all.len() >= 4, "{pods}");
+    }
     assert_eq!(pods["truncated"], false);
     let mut paged = Vec::new();
     let mut token: Option<String> = None;
     loop {
         let page = mcp.call_json(
             "list_resources",
-            json!({"cluster": EXPOSED, "kind": "Pod", "namespace": "demo", "limit": 3, "continue": token}),
+            json!({"cluster": cluster, "kind": "Pod", "namespace": "demo", "limit": 3, "continue": token}),
         )?;
         paged.extend(names(&page));
         token = page["continue"].as_str().map(str::to_owned);
@@ -157,14 +302,14 @@ fn up_10_agent_inspects_a_cluster() -> Result<()> {
         if token.is_none() {
             break;
         }
-        assert!(paged.len() < 20, "paging does not end");
+        assert!(paged.len() < 50, "paging does not end");
     }
     assert_eq!(paged, all);
 
     // One object, by short kind name, without managedFields.
     let deploy = mcp.call(
         "get_resource",
-        json!({"cluster": EXPOSED, "kind": "deploy", "namespace": "demo", "name": "web"}),
+        json!({"cluster": cluster, "kind": "deploy", "namespace": "demo", "name": "web"}),
     )?;
     assert!(!deploy.is_error, "{}", deploy.text);
     assert!(deploy.text.contains("name: web"), "{}", deploy.text);
@@ -173,36 +318,49 @@ fn up_10_agent_inspects_a_cluster() -> Result<()> {
     // Secret values and their copy in the annotation are redacted.
     let secret = mcp.call(
         "get_resource",
-        json!({"cluster": EXPOSED, "kind": "secret", "namespace": "demo", "name": "applied"}),
+        json!({"cluster": cluster, "kind": "secret", "namespace": "demo", "name": AppliedSecret::NAME}),
     )?;
     assert!(!secret.is_error, "{}", secret.text);
     assert!(secret.text.contains("password"), "{}", secret.text);
     assert!(
-        !secret.text.contains(encoded) && !secret.text.contains(plaintext),
+        !secret.text.contains(AppliedSecret::ENCODED)
+            && !secret.text.contains(AppliedSecret::PLAINTEXT),
         "{}",
         secret.text
     );
 
-    // Events and logs.
-    let events = mcp.call_json(
-        "get_events",
-        json!({"cluster": EXPOSED, "namespace": "demo", "object_name": "crash-loop"}),
-    )?;
-    assert!(
-        events.to_string().contains("BackOff"),
-        "crash-loop's events: {events}"
-    );
+    // Events: crash-loop's back-off (on a fresh kind cluster, once it has crashed twice).
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let events = mcp.call_json(
+            "get_events",
+            json!({"cluster": cluster, "namespace": "demo", "object_name": "crash-loop"}),
+        )?;
+        if events.to_string().contains("BackOff") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "crash-loop's events: {events}");
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    // Logs of a web pod.
+    let web = all
+        .iter()
+        .find(|name| name.starts_with("web-"))
+        .expect("a web pod in demo");
     let logs = mcp.call(
         "get_pod_logs",
-        json!({"cluster": EXPOSED, "namespace": "demo", "pod": "web-69c6f74b8b-qv4xv"}),
+        json!({"cluster": cluster, "namespace": "demo", "pod": web}),
     )?;
     assert!(!logs.is_error, "{}", logs.text);
-    assert!(logs.text.contains("listening on :80"), "{}", logs.text);
+    if on.cluster.fake_server().is_some() {
+        assert!(logs.text.contains("listening on :80"), "{}", logs.text);
+    }
 
     // Errors are sentences, not debug dumps.
     let missing = mcp.call(
         "get_resource",
-        json!({"cluster": EXPOSED, "kind": "pod", "namespace": "demo", "name": "nope"}),
+        json!({"cluster": cluster, "kind": "pod", "namespace": "demo", "name": "nope"}),
     )?;
     assert!(missing.is_error);
     assert!(
