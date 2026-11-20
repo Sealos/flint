@@ -591,7 +591,7 @@ impl TerminalView {
                 .tab_stop(false)
                 .tooltip(format!(
                     "Start a new shell in this tab ({})",
-                    registry::key_hint("secondary-r")
+                    registry::key_hint(registry::RESTART_SHELL[0])
                 ))
                 .on_click(registry::on_click(RestartShell));
             notes.push(

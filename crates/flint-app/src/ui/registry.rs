@@ -1636,7 +1636,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
              same tab, on the API server its context points at now.",
         )
         .of(C::Terminal, S::Dock)
-        .keys(&["secondary-r"], Some(DOCK)),
+        .keys(RESTART_SHELL, Some(DOCK)),
         Spec::with_args::<ActivateTab>("Show Dock Tab…", "Show a dock tab by its id.", TAB)
             .of(C::View, S::Dock)
             .hidden(),
@@ -1817,6 +1817,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
     ];
     specs.into_iter().map(|s| s.0).collect()
 });
+
+/// Restart Shell: Cmd-R on macOS; Ctrl-Shift-R elsewhere, since a shell tab hands Ctrl-R to
+/// the shell (reverse search).
+pub(in crate::ui) const RESTART_SHELL: &[&str] = restart_shell_keys(cfg!(target_os = "macos"));
+
+/// [`RESTART_SHELL`] on macOS (`mac`) or elsewhere.
+const fn restart_shell_keys(mac: bool) -> &'static [&'static str] {
+    if mac {
+        &["secondary-r"]
+    } else {
+        &["secondary-shift-r"]
+    }
+}
 
 /// Copy in a shell tab: Cmd-C on macOS; Ctrl-Shift-C elsewhere, where Ctrl-C interrupts the
 /// program.
@@ -2171,6 +2184,20 @@ pub mod tests {
             "tab", "escape", "enter", "up", "ctrl-c", "ctrl-d", "ctrl-w", "ctrl-l",
         ] {
             assert!(super::TERMINAL_PASSTHROUGH.contains(&key), "{key}");
+        }
+        // Restart Shell's key reaches the dock from a shell tab on both systems: on Linux,
+        // where Cmd is Ctrl, Ctrl-R would go to the shell.
+        for (mac, os) in [
+            (true, gpui_kit::OperatingSystem::Mac),
+            (false, gpui_kit::OperatingSystem::Linux),
+        ] {
+            for key in super::restart_shell_keys(mac) {
+                let keystroke = gpui_kit::Keystroke::parse_with_os(key, os).unwrap();
+                let passed = super::TERMINAL_PASSTHROUGH
+                    .iter()
+                    .any(|p| gpui_kit::Keystroke::parse_with_os(p, os).unwrap() == keystroke);
+                assert!(!passed, "{key} on {os:?} goes to the shell");
+            }
         }
         // Copy and paste use Cmd on macOS; elsewhere Ctrl-C and Ctrl-V are the shell's.
         let mac = cfg!(target_os = "macos");

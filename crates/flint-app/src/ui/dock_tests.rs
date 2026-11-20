@@ -571,19 +571,20 @@ async fn an_exited_shell_asks_to_restart(cx: &mut TestAppContext) {
     assert_eq!(restartable(cx), (Some(id), None));
     dispatch(cx, window, "dock::RestartShell");
     assert_eq!(*restarts.borrow(), [id]);
-    // Cmd-R from the tab does the same on macOS (on Linux, Ctrl-R belongs to the shell).
-    if cfg!(target_os = "macos") {
-        cx.update_window(window, |_, window, cx| window.press("secondary-r", cx))
-            .unwrap();
-        draw(cx, window);
-        assert_eq!(*restarts.borrow(), [id, id]);
-    }
+    // Its key from the tab does the same (Cmd-R; Ctrl-Shift-R on Linux, where Ctrl-R is the
+    // shell's).
+    cx.update_window(window, |_, window, cx| {
+        window.press(registry::RESTART_SHELL[0], cx)
+    })
+    .unwrap();
+    draw(cx, window);
+    assert_eq!(*restarts.borrow(), [id, id]);
 }
 
 const PROD: &str = "arn:aws:eks:eu-west-1:111111111111:cluster/main";
 const STAGING: &str = "arn:aws:eks:eu-west-1:222222222222:cluster/main";
 
-/// Tab `id`'s cluster chip, as drawn: its view's shell toolbar chip, and the tab chip's width.
+/// Shell tab `id`'s toolbar chip: its label, tooltip, and whether it is marked re-pointed.
 fn shell_chip(dock: &Entity<Dock>, id: u64, cx: &mut TestAppContext) -> (String, String, bool) {
     dock.read_with(cx, |d, cx| match d.tab(id).unwrap() {
         DockTab::Shell(view) => {
