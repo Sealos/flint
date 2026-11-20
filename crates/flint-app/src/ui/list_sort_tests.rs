@@ -25,6 +25,24 @@ fn sort_and_rows(cx: &mut TestAppContext, t: &TestWorkspace) -> (Option<SortStat
     })
 }
 
+/// Waits until the open list shows `want`: its sort and its rows in order (the core sorts off
+/// the UI thread).
+async fn expect_rows(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    want: (Option<SortState>, Vec<String>),
+) {
+    let list = t.list(cx).expect("a list is open");
+    let seen = want.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let state = list.read(cx).view_state();
+        let rows: Vec<String> = state.rows.into_iter().map(|r| r.name).collect();
+        (state.sort, rows) == seen
+    })
+    .await;
+    assert_eq!(sort_and_rows(cx, t), want);
+}
+
 fn sorted(column: &str, descending: bool) -> Option<SortState> {
     Some(SortState {
         column: column.to_owned(),
@@ -50,11 +68,12 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, PODS).await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
+    expect_rows(
+        cx,
+        &t,
         (None, vec!["db".into(), "api".into(), "web".into()]),
-        "the default order: namespace, then name"
-    );
+    )
+    .await;
 
     // Two clicks: descending by Restarts, saved by the column's key.
     t.click(cx, "sort-Restarts");
@@ -77,10 +96,12 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
         objects(deployments, PODS, SyncState::Synced, 1),
     )
     .await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
-        (None, vec!["db".into(), "api".into(), "web".into()])
-    );
+    expect_rows(
+        cx,
+        &t,
+        (None, vec!["db".into(), "api".into(), "web".into()]),
+    )
+    .await;
 
     // A cluster-scoped list with nothing saved, as Namespaces is by default: by name.
     let nodes = &[("", "node-c", 0), ("", "node-a", 0), ("", "node-b", 0)];
@@ -90,23 +111,27 @@ async fn a_sort_is_remembered_per_cluster_and_kind(cx: &mut TestAppContext) {
         objects(KindId::new("", "nodes"), nodes, SyncState::Synced, 1),
     )
     .await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
+    expect_rows(
+        cx,
+        &t,
         (
             None,
-            vec!["node-a".into(), "node-b".into(), "node-c".into()]
-        )
-    );
+            vec!["node-a".into(), "node-b".into(), "node-c".into()],
+        ),
+    )
+    .await;
 
     // Back to Pods: sorted as left.
     t.open_kind(cx, "pods", pods(PODS)).await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
+    expect_rows(
+        cx,
+        &t,
         (
             sorted("Restarts", true),
-            vec!["db".into(), "web".into(), "api".into()]
-        )
-    );
+            vec!["db".into(), "web".into(), "api".into()],
+        ),
+    )
+    .await;
 
     // A third click goes back to the default order, and forgets the sort.
     t.click(cx, "sort-Restarts");
@@ -138,21 +163,25 @@ async fn a_saved_sort_on_a_column_that_is_gone_keeps_the_default_order(cx: &mut 
     .unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, PODS).await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
-        (None, vec!["db".into(), "api".into(), "web".into()])
-    );
+    expect_rows(
+        cx,
+        &t,
+        (None, vec!["db".into(), "api".into(), "web".into()]),
+    )
+    .await;
 
     // A click sorts as usual and replaces the stale choice.
     t.click(cx, "sort-Restarts");
     cx.run_until_parked();
-    assert_eq!(
-        sort_and_rows(cx, &t),
+    expect_rows(
+        cx,
+        &t,
         (
             sorted("Restarts", false),
-            vec!["api".into(), "web".into(), "db".into()]
-        )
-    );
+            vec!["api".into(), "web".into(), "db".into()],
+        ),
+    )
+    .await;
     wait_for_saved(cx, &t, "server:Restarts").await;
 
     // The Name sort is restored on a cluster-scoped list too, by key.
@@ -163,38 +192,36 @@ async fn a_saved_sort_on_a_column_that_is_gone_keeps_the_default_order(cx: &mut 
         objects(KindId::new("", "nodes"), nodes, SyncState::Synced, 1),
     )
     .await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
+    expect_rows(
+        cx,
+        &t,
         (
             sorted("Name", true),
-            vec!["node-c".into(), "node-b".into(), "node-a".into()]
-        )
-    );
+            vec!["node-c".into(), "node-b".into(), "node-a".into()],
+        ),
+    )
+    .await;
 }
 
-/// `PODS` with a wide Node column: web on node-a, db on node-b, api on node-c.
-fn pods_with_nodes() -> Arc<KindSnapshot> {
+/// `PODS` with one more column, `header`, of `priority` (1 and up: wide), whose cell for each
+/// pod is `cell(name)`.
+fn pods_with(header: &str, priority: i32, cell: fn(&str) -> &'static str) -> Arc<KindSnapshot> {
     let base = pods(PODS);
     let mut columns: Vec<Column> = base.columns.to_vec();
     columns.push(Column {
-        name: "Node".into(),
+        name: header.into(),
         ty: ColumnType::String,
         format: "".into(),
         description: "".into(),
-        priority: 1,
+        priority,
         role: ColumnRole::Value,
     });
     let rows = base
         .rows
         .iter()
         .map(|row| {
-            let node = match &*row.name {
-                "web" => "node-a",
-                "db" => "node-b",
-                _ => "node-c",
-            };
             let mut cells = row.cells.to_vec();
-            cells.push(Cell::Text(node.into()));
+            cells.push(Cell::Text(cell(&row.name).into()));
             Arc::new(Row {
                 cells: cells.into_boxed_slice(),
                 ..(**row).clone()
@@ -205,6 +232,15 @@ fn pods_with_nodes() -> Arc<KindSnapshot> {
         columns: columns.into(),
         rows,
         ..(*base).clone()
+    })
+}
+
+/// `PODS` with a wide Node column: web on node-a, db on node-b, api on node-c.
+fn pods_with_nodes() -> Arc<KindSnapshot> {
+    pods_with("Node", 1, |name| match name {
+        "web" => "node-a",
+        "db" => "node-b",
+        _ => "node-c",
     })
 }
 
@@ -222,31 +258,38 @@ async fn a_saved_sort_on_a_wide_column_waits_for_wide(cx: &mut TestAppContext) {
         .await;
     t.open_kind(cx, "pods", pods_with_nodes()).await;
     // Node is not shown: the default order, and no sort to see.
-    assert_eq!(
-        sort_and_rows(cx, &t),
-        (None, vec!["db".into(), "api".into(), "web".into()])
-    );
+    expect_rows(
+        cx,
+        &t,
+        (None, vec!["db".into(), "api".into(), "web".into()]),
+    )
+    .await;
 
     t.dispatch(cx, "resource_list::ToggleWide", Value::Null)
         .unwrap();
     cx.run_until_parked();
-    let list = t.list(cx).unwrap();
-    cx.wait_for(t.window, WAIT, move |_, cx| {
-        list.read(cx).view_state().sort.is_some()
-    })
-    .await;
-    assert_eq!(
-        sort_and_rows(cx, &t),
+    expect_rows(
+        cx,
+        &t,
         (
             sorted("Node", false),
-            vec!["web".into(), "db".into(), "api".into()]
-        )
-    );
+            vec!["web".into(), "db".into(), "api".into()],
+        ),
+    )
+    .await;
 
     // Sorting by header name, as the palette does, is saved by key too.
     t.dispatch(cx, "resource_list::SortBy", json!({"column": "Restarts"}))
         .unwrap();
     cx.run_until_parked();
     wait_for_saved(cx, &t, "server:Restarts").await;
-    assert_eq!(sort_and_rows(cx, &t).0, sorted("Restarts", false));
+    expect_rows(
+        cx,
+        &t,
+        (
+            sorted("Restarts", false),
+            vec!["api".into(), "web".into(), "db".into()],
+        ),
+    )
+    .await;
 }
