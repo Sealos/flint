@@ -64,21 +64,6 @@ const STATUS_WAIT: Duration = Duration::from_secs(2);
 /// loop then returns without ending the stream, which would otherwise never reach its end.
 const DRAIN_WAIT: Duration = Duration::from_millis(250);
 
-/// What a session sends a command that still runs when it is closed (the tab closed, or the
-/// handle dropped), one after the other: Ctrl-C ends what runs in the foreground (`yes`,
-/// `top`), and Ctrl-D then ends the shell at its prompt. Without them the remote shell, and
-/// what it ran, would stay alive blocked on the TTY after the connection is gone, as with
-/// `kubectl exec`.
-pub(crate) const HANG_UP: [u8; 2] = [0x03, 0x04];
-
-/// The pause between Ctrl-C and Ctrl-D, so the shell is back at its prompt (and has its TTY
-/// back) when Ctrl-D arrives.
-const HANG_UP_GAP: Duration = Duration::from_millis(50);
-
-/// How long closing a running session waits for [`HANG_UP`] to be sent and the command to end,
-/// at most. Closing is best effort: the session ends after this whatever the command does.
-const HANG_UP_WAIT: Duration = Duration::from_millis(500);
-
 /// What to run, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
@@ -937,8 +922,6 @@ impl Session {
                 input = self.inputs.recv() => {
                     let unconfirmed = pending.as_deref_mut().filter(|_| !started);
                     if self.handle_live(input, &remote, unconfirmed) == Flow::Close {
-                        let finish = connection.is_none().then_some(&mut finish);
-                        hang_up(remote, writer, &mut stdout, finish).await;
                         return Outcome::Done(ExecState::Closed);
                     }
                 }
@@ -1008,41 +991,6 @@ impl Session {
             }
         }
     }
-}
-
-/// Ends a command that still runs when its session is closed, best effort and within
-/// [`HANG_UP_WAIT`]: sends [`HANG_UP`] (with [`HANG_UP_GAP`] between its bytes), closes stdin
-/// once they are written, and reads (and drops) output until the command ends or the
-/// connection does (`finish`, unless it already resolved).
-async fn hang_up(
-    remote: mpsc::UnboundedSender<ToRemote>,
-    mut writer: AbortOnDrop<()>,
-    stdout: &mut Pin<Box<dyn AsyncRead + Send>>,
-    finish: Option<&mut BoxFuture<'static, Result<(), String>>>,
-) {
-    let ended = async {
-        for (i, byte) in HANG_UP.iter().enumerate() {
-            if i > 0 {
-                tokio::time::sleep(HANG_UP_GAP).await;
-            }
-            let _ = remote.send(ToRemote::Bytes(vec![*byte]));
-        }
-        // The writer sends what is queued, then shuts stdin down.
-        drop(remote);
-        let _ = (&mut writer.0).await;
-        let mut buf = vec![0; IO_BUFFER];
-        let drained = async { while matches!(stdout.read(&mut buf).await, Ok(n) if n > 0) {} };
-        match finish {
-            Some(finish) => {
-                tokio::select! {
-                    () = drained => {}
-                    _ = finish => {}
-                }
-            }
-            None => drained.await,
-        }
-    };
-    let _ = tokio::time::timeout(HANG_UP_WAIT, ended).await;
 }
 
 /// A spawned task that is aborted when this is dropped, so the work stops with whoever waits
@@ -1589,55 +1537,15 @@ mod tests {
         let mut session = open(&launcher, request());
         remote.next_resize().await;
         session.close();
-        // The command gets Ctrl-C and then Ctrl-D, and stdin reaches end of file.
-        let mut rest = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), remote.stdin.read_to_end(&mut rest))
-            .await
-            .expect("stdin closed")
-            .unwrap();
-        assert_eq!(rest, HANG_UP);
-        // The command ends, so closing does not wait out its bound.
-        let closing = Instant::now();
-        remote.stdout = None;
         wait_for(&mut session, "closed", |s| s.state == ExecState::Closed).await;
-        assert!(closing.elapsed() < HANG_UP_WAIT);
-        assert!(!session.changed().await, "the session task ended");
-    }
-
-    // covers UP-41: a command that ignores the hang-up (and its connection that stays up) does
-    // not keep the session: it ends within the bound.
-    #[tokio::test]
-    async fn closing_does_not_wait_for_a_command_that_stays() {
-        let launcher = FakeLauncher::default();
-        let (proc_, mut remote) = process();
-        launcher.push(Ok(proc_));
-        let mut session = open(&launcher, request());
-        remote.next_resize().await;
-        let closing = Instant::now();
-        session.close();
-        wait_for(&mut session, "closed", |s| s.state == ExecState::Closed).await;
-        assert!(closing.elapsed() < HANG_UP_WAIT + Duration::from_secs(1));
-        assert_eq!(remote.read_stdin(2).await, HANG_UP);
-        drop(remote);
-    }
-
-    // covers UP-41: a command that already ended gets nothing on close.
-    #[tokio::test]
-    async fn closing_after_the_command_ended_sends_nothing() {
-        let launcher = FakeLauncher::default();
-        let (proc_, mut remote) = process();
-        launcher.push(Ok(proc_));
-        let mut session = open(&launcher, request());
-        remote.next_resize().await;
-        remote.exit(exit_status("1"));
-        wait_for(&mut session, "exited", |s| s.state.is_finished()).await;
-        session.close();
+        // The writer is gone: stdin reaches end of file.
         let mut rest = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), remote.stdin.read_to_end(&mut rest))
             .await
             .expect("stdin closed")
             .unwrap();
         assert!(rest.is_empty());
+        assert!(!session.changed().await, "the session task ended");
     }
 
     // covers UP-41
@@ -1654,7 +1562,6 @@ mod tests {
             .await
             .expect("stdin closed")
             .unwrap();
-        assert_eq!(rest, HANG_UP);
     }
 
     // covers UP-41
