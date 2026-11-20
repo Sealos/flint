@@ -152,7 +152,12 @@ pub struct CommandPalette {
     /// What the query is matched against, for the current step.
     candidates: Vec<Candidate>,
     rows: Vec<Row>,
+    /// Counts each change of `rows`, so a click drawn on older rows is told apart.
+    rows_version: u64,
     selected: usize,
+    /// The selection was moved with the arrows, so a refreshed list keeps it; else the best
+    /// row (row 0) is selected again.
+    chosen: bool,
     /// Why the last Enter did nothing (a selector that does not parse, a cluster that went away).
     error: Option<String>,
     scroll: UniformListScrollHandle,
@@ -205,7 +210,9 @@ impl CommandPalette {
             step: Step::Actions,
             candidates: Vec::new(),
             rows: Vec::new(),
+            rows_version: 0,
             selected: 0,
+            chosen: false,
             error: None,
             scroll: UniformListScrollHandle::new(),
             _subscriptions: vec![on_query, on_leave],
@@ -302,6 +309,59 @@ impl CommandPalette {
         self.refilter(cx);
     }
 
+    /// Refreshes the asked argument's choices when `entity` changes (the clusters, discovery,
+    /// namespaces, the shown pod), so an open step does not keep a stale list.
+    pub fn watch<T: 'static>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) {
+        let watch = cx.observe(entity, |this, _, cx| this.refresh_choices(cx));
+        self._subscriptions.push(watch);
+    }
+
+    /// Asks the source again for the current step's choices; when they changed, lists the new
+    /// ones for the same query, keeping the selected row where it is still listed.
+    fn refresh_choices(&mut self, cx: &mut Context<Self>) {
+        let Step::Argument {
+            spec, arg, input, ..
+        } = &self.step
+        else {
+            return;
+        };
+        let fresh = (self.choices)(spec, &spec.args[*arg], cx);
+        if fresh == *input {
+            return;
+        }
+        let selected = self.rows.get(self.selected).filter(|_| self.chosen);
+        let kept = match (selected, input) {
+            (Some(Row::Choice { index, .. }), ArgInput::Choices { items, .. }) => {
+                Some(Ok(items[*index].value.clone()))
+            }
+            (Some(Row::Typed(text)), _) => Some(Err(text.clone())),
+            _ => None,
+        };
+        self.candidates = candidates_of(&fresh);
+        if let Step::Argument { input, .. } = &mut self.step {
+            *input = fresh;
+        }
+        let error = self.error.take();
+        self.refilter(cx);
+        self.error = error;
+        let Step::Argument { input, .. } = &self.step else {
+            return;
+        };
+        let at = self.rows.iter().position(|row| match (row, &kept, input) {
+            (Row::Choice { index, .. }, Some(Ok(value)), ArgInput::Choices { items, .. }) => {
+                items[*index].value == *value
+            }
+            (Row::Typed(text), Some(Err(kept)), _) => text == kept,
+            _ => false,
+        });
+        if let Some(at) = at {
+            self.selected = at;
+            self.chosen = true;
+            self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+    }
+
     /// Matches the query against the current step's candidates, and selects the first row.
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().to_string();
@@ -328,20 +388,23 @@ impl CommandPalette {
                         ArgInput::Text => true,
                     };
                 let mut hits = hits;
-                // A listed value equal to what was typed (ignoring case) comes first: with
-                // `abc` and `a-bc` listed, Enter on "abc" takes `abc`.
-                if let ArgInput::Choices { items, .. } = input {
-                    let exact = |i: usize| {
-                        let c = &items[i];
-                        c.value.to_lowercase() == typed.to_lowercase()
-                            || c.label.to_lowercase() == typed.to_lowercase()
-                    };
-                    if let Some(at) = hits
+                // Listed values equal to what was typed come first, the stored value before
+                // what is shown for it: with contexts `cluster/prod` and an EKS ARN shown as
+                // `cluster/prod`, Enter on "cluster/prod" takes the context of that name. The
+                // sort is stable, so the rest keep their fuzzy order.
+                if let ArgInput::Choices { items, .. } = input
+                    && !typed.is_empty()
+                {
+                    // The typed text lowered once, and a sort only when something is exact.
+                    let folded = typed.to_lowercase();
+                    let keys: Vec<u8> = hits
                         .iter()
-                        .position(|h| !typed.is_empty() && exact(h.index))
-                    {
-                        let hit = hits.remove(at);
-                        hits.insert(0, hit);
+                        .map(|h| exactness(typed, &folded, &items[h.index]))
+                        .collect();
+                    if keys.iter().any(|&k| k < NOT_EXACT) {
+                        let mut keyed: Vec<_> = keys.into_iter().zip(hits).collect();
+                        keyed.sort_by_key(|(k, _)| *k);
+                        hits = keyed.into_iter().map(|(_, h)| h).collect();
                     }
                 }
                 // Else what was typed comes first when it may be used as is: Enter on "kube"
@@ -356,7 +419,9 @@ impl CommandPalette {
                     .collect()
             }
         };
+        self.rows_version += 1;
         self.selected = 0;
+        self.chosen = false;
         self.error = None;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
@@ -364,12 +429,17 @@ impl CommandPalette {
 
     fn move_by(&mut self, step: isize, cx: &mut Context<Self>) {
         self.selected = palette_model::step(self.selected, self.rows.len(), step);
+        self.chosen = true;
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         cx.notify();
     }
 
     fn pick(&mut self, action: &PalettePick, window: &mut Window, cx: &mut Context<Self>) {
+        // Drawn on rows that a live refresh has replaced since: the row may hold another entry.
+        if action.rows.is_some_and(|v| v != self.rows_version) {
+            return;
+        }
         if action.row < self.rows.len() {
             self.selected = action.row;
             self.confirm(window, cx);
@@ -460,17 +530,7 @@ impl CommandPalette {
             return;
         };
         let input = (self.choices)(spec, &spec.args[arg], cx);
-        self.candidates = match &input {
-            ArgInput::Choices { items, .. } => items
-                .iter()
-                .map(|c| Candidate {
-                    label: c.label.clone(),
-                    alt: (c.value != c.label).then(|| c.value.clone()),
-                    recent: None,
-                })
-                .collect(),
-            ArgInput::Text => Vec::new(),
-        };
+        self.candidates = candidates_of(&input);
         self.step = Step::Argument {
             spec,
             arg,
@@ -652,7 +712,10 @@ impl CommandPalette {
                         .when(!selected, |el| el.hover(|el| el.bg(theme.list_hover)))
                         .on_click(registry::on_click_in(
                             self.focus.clone(),
-                            PalettePick { row: ix },
+                            PalettePick {
+                                row: ix,
+                                rows: Some(self.rows_version),
+                            },
                         ))
                         .child(
                             div()
@@ -790,6 +853,42 @@ struct RowTexts {
         expect(dead_code, reason = "for the automation state")
     )]
     action: Option<&'static str>,
+}
+
+/// What the query is matched against for an argument: each choice's label, and its stored
+/// value too where that differs.
+fn candidates_of(input: &ArgInput) -> Vec<Candidate> {
+    match input {
+        ArgInput::Choices { items, .. } => items
+            .iter()
+            .map(|c| Candidate {
+                label: c.label.clone(),
+                alt: (c.value != c.label).then(|| c.value.clone()),
+                recent: None,
+            })
+            .collect(),
+        ArgInput::Text => Vec::new(),
+    }
+}
+
+/// [`exactness`] of a choice that is not what was typed.
+const NOT_EXACT: u8 = 4;
+
+/// How exactly `choice` is what was `typed` (`folded`: in lower case), best first: its stored value as typed, the value
+/// ignoring case, the label as typed, the label ignoring case, then neither. Case counts first,
+/// so contexts `ABC` and `abc` do not collide.
+fn exactness(typed: &str, folded: &str, choice: &Choice) -> u8 {
+    if choice.value == typed {
+        0
+    } else if choice.value.to_lowercase() == folded {
+        1
+    } else if choice.label == typed {
+        2
+    } else if choice.label.to_lowercase() == folded {
+        3
+    } else {
+        NOT_EXACT
+    }
 }
 
 /// The first required argument of `spec` from `from` on.

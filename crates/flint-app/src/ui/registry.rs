@@ -485,12 +485,16 @@ pub struct SaveLines {
     pub timestamps: Option<bool>,
 }
 
-/// Run the palette entry shown in row `row` (a click on it).
+/// Run the palette entry shown in row `row` (a click on it). `rows` is the version of the
+/// rows the click was drawn on: when they have changed since (a live refresh reordered them),
+/// the click is dropped rather than pick another entry. Without it, the rows shown now.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = palette, no_json)]
 #[serde(deny_unknown_fields)]
 pub struct PalettePick {
     pub row: usize,
+    #[serde(default)]
+    pub rows: Option<u64>,
 }
 
 /// Which part of the app handles an action, and so where it is available.
@@ -1560,7 +1564,15 @@ const COLUMN: &[Arg] = &[
     },
 ];
 const KEY: &[Arg] = &[arg("key", "the data key", ArgKind::Text)];
-const PALETTE_ROW: &[Arg] = &[arg("row", "row, from the top, 0 and up", ArgKind::Number)];
+const PALETTE_ROW: &[Arg] = &[
+    arg("row", "row, from the top, 0 and up", ArgKind::Number),
+    Arg {
+        name: "rows",
+        description: "the version of the rows clicked; a stale one is dropped",
+        required: false,
+        kind: ArgKind::Number,
+    },
+];
 const CONTAINER: &[Arg] = &[
     arg("container", "container name", ArgKind::Container),
     Arg {

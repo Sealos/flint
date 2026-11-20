@@ -751,31 +751,22 @@ async fn an_empty_pick_list_says_so(cx: &mut TestAppContext) {
     assert_eq!(shown(cx, &t).footer.as_deref(), Some("Nothing matches"));
 }
 
-// covers UP-30: opened from a menu that closes as the palette takes focus, the palette lists
-// and runs actions from the workspace instead: a workspace action and an App one both work.
+/// Makes the focus the open palette came from one that is no longer drawn, as when the view
+/// that had it closes behind the palette.
+fn strand_palette(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let palette = palette(cx, t).expect("the palette is open");
+    palette.update(cx, |p, cx| p.previous = cx.focus_handle());
+}
+
+// covers UP-30: when the focus it came from is no longer drawn, the palette runs actions from
+// the workspace instead: a workspace action and an App one both work.
 #[gpui_kit::test]
-async fn a_closed_menu_behind_the_palette_does_not_strand_it(cx: &mut TestAppContext) {
+async fn a_stale_focus_behind_the_palette_does_not_strand_it(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let (_, _shell) = crate::ui::support_tests::open_fake_shell(cx, &t);
-    t.dispatch(cx, "dock::ShowTabList", Value::Null).unwrap();
-    assert_eq!(state(cx, &t).1, Focus::Menu);
     open_palette(cx, &t).await;
-    // The tab list closes behind the palette (its entry picked elsewhere, say): the focus the
-    // palette came from is no longer drawn.
-    close_tab_list(cx, &t);
-    let workspace = t.workspace.clone();
-    let menu = cx
-        .update_window(t.window, |_, window, cx| {
-            window.render_frame(cx);
-            workspace.update(cx, |ws, cx| ws.view_state(window, cx).menu)
-        })
-        .unwrap();
-    assert!(menu.is_none(), "{menu:?}");
-    let palette = shown(cx, &t);
-    let all = labels(&palette);
-    assert!(all.contains(&"Toggle Dock"), "{all:?}");
-    assert!(all.contains(&"Quit Flint"), "{all:?}");
+    strand_palette(cx, &t);
 
     // A workspace action.
     t.type_text(cx, "toggle dock");
@@ -785,10 +776,9 @@ async fn a_closed_menu_behind_the_palette_does_not_strand_it(cx: &mut TestAppCon
     assert!(!dock.read_with(cx, |d, _| d.is_visible()), "the dock hid");
     assert_eq!(state(cx, &t).1, Focus::Workspace);
 
-    // An App one, from the same stale focus: Quit asks first, since a shell runs.
-    t.dispatch(cx, "dock::ShowTabList", Value::Null).unwrap();
+    // An App one: Quit asks first, since a shell runs.
     open_palette(cx, &t).await;
-    close_tab_list(cx, &t);
+    strand_palette(cx, &t);
     t.type_text(cx, "quit flint");
     t.press(cx, "enter");
     assert!(palette_closed(cx, &t));
@@ -797,14 +787,42 @@ async fn a_closed_menu_behind_the_palette_does_not_strand_it(cx: &mut TestAppCon
     t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
 }
 
-/// Dismisses the dock's tab list, as picking an entry or clicking elsewhere does.
-fn close_tab_list(cx: &mut TestAppContext, t: &TestWorkspace) {
+// An open context menu or drop-down is dismissed as the palette opens, so it neither stays
+// drawn over the palette nor takes a click meant for it; focus goes back to where the menu
+// came from, which is where the palette's actions run.
+#[gpui_kit::test]
+async fn opening_the_palette_dismisses_an_open_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (_, _shell) = crate::ui::support_tests::open_fake_shell(cx, &t);
+    t.dispatch(cx, "dock::ShowTabList", Value::Null).unwrap();
+    assert_eq!(state(cx, &t).1, Focus::Menu);
+    open_palette(cx, &t).await;
+    let workspace = t.workspace.clone();
+    let menu = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).menu)
+        })
+        .unwrap();
+    assert!(menu.is_none(), "{menu:?}");
     let dock = t.workspace.read_with(cx, |ws, _| ws.dock_view());
-    let menu = dock
-        .read_with(cx, |d, _| d.tab_menu_for_tests())
-        .expect("the tab list is open");
-    menu.update(cx, |_, cx| cx.emit(gpui_kit::DismissEvent));
-    cx.run_until_parked();
+    assert!(dock.read_with(cx, |d, _| d.tab_menu_for_tests()).is_none());
+    assert_eq!(state(cx, &t).1, Focus::Palette);
+    // This menu keeps focus as it closes, so the palette runs from the workspace: nothing of
+    // the closed menu's (its Confirm and Cancel) is listed.
+    let all = labels(&shown(cx, &t))
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        !all.iter().any(|l| l == "Confirm" || l == "Cancel"),
+        "{all:?}"
+    );
+    assert!(all.iter().any(|l| l == "Toggle Dock"), "{all:?}");
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    assert_eq!(state(cx, &t).1, Focus::Workspace);
 }
 
 // covers UP-30: the window going to the background (Cmd-Tab) keeps the palette open, as a
@@ -1140,4 +1158,260 @@ async fn shortcuts_are_the_ones_that_fire_there(cx: &mut TestAppContext) {
         Some(registry::key_hint("secondary-r").as_str())
     );
     assert!(!labels(&palette).contains(&"Reconnect Logs"));
+}
+
+// covers UP-30: an exact stored value wins over what is shown for it, case first. With
+// contexts `cluster/prod` and an EKS ARN shown as `cluster/prod`, typing the name picks that
+// context; contexts `ABC` and `abc` each get their own.
+#[gpui_kit::test]
+async fn exact_stored_values_win(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{kubeconfig_yaml, open_workspace_with};
+    const ARN: &str = "arn:aws:eks:eu-west-1:123456789012:cluster/prod";
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let kubeconfig = dir.join("kubeconfig");
+        std::fs::write(
+            &kubeconfig,
+            kubeconfig_yaml(&[
+                (ARN, &servers.refused),
+                ("cluster/prod", &servers.refused),
+                ("ABC", &servers.refused),
+                ("abc", &servers.refused),
+            ]),
+        )
+        .unwrap();
+        vec![kubeconfig]
+    })
+    .await;
+    for (typed, wanted) in [
+        ("cluster/prod", "cluster/prod"),
+        ("abc", "abc"),
+        ("ABC", "ABC"),
+    ] {
+        ask(cx, &t, "select cluster").await;
+        t.type_text(cx, typed);
+        t.press(cx, "enter");
+        assert!(palette_closed(cx, &t), "{typed}");
+        let workspace = t.workspace.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            workspace.read(cx).shown_cluster() == Some(wanted)
+        })
+        .await;
+    }
+}
+
+#[test]
+fn exactness_ranks_stored_values_then_labels_case_first() {
+    use super::exactness;
+    let arn = Choice {
+        value: "arn:aws:eks:eu-west-1:1:cluster/prod".into(),
+        label: "cluster/prod".into(),
+        detail: None,
+    };
+    let plain = Choice::plain("cluster/prod");
+    let rank = |typed: &str, choice: &Choice| exactness(typed, &typed.to_lowercase(), choice);
+    assert!(rank("cluster/prod", &plain) < rank("cluster/prod", &arn));
+    assert!(rank("abc", &Choice::plain("abc")) < rank("abc", &Choice::plain("ABC")));
+    assert!(rank("abc", &Choice::plain("ABC")) < rank("abc", &Choice::plain("abcd")));
+}
+
+// covers UP-30: an open step's choices follow the data: Open Kind… opened before discovery
+// finishes lists the kinds once it does, for the query typed meanwhile.
+#[gpui_kit::test]
+async fn an_open_step_follows_its_data(cx: &mut TestAppContext) {
+    use flint_core::Event;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.activate(cx, "alpha").await;
+    let palette = ask(cx, &t, "open kind").await;
+    assert_eq!(
+        palette.footer.as_deref(),
+        Some("No kinds (discovery has not finished)")
+    );
+    t.type_text(cx, "pod");
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(Arc::new(crate::ui::support_tests::discovery(
+                crate::ui::support_tests::standard_sections(),
+            ))),
+            error: None,
+        },
+    );
+    let palette = shown(cx, &t);
+    assert_eq!(palette.query, "pod");
+    assert_eq!(palette.argument.as_deref(), Some("kind"));
+    assert_eq!(selected(&palette), "Pods");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+}
+
+// covers UP-30: a refreshed list keeps the selected value selected.
+#[gpui_kit::test]
+async fn a_refreshed_step_keeps_the_selection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    t.workspace.update(cx, |ws, _| {
+        ws.set_namespaces_for_tests(vec!["demo".into(), "kube-system".into()])
+    });
+    ask(cx, &t, "add namespace").await;
+    t.press(cx, "down");
+    assert_eq!(selected(&shown(cx, &t)), "kube-system");
+    // The namespace watch reports a new one, sorted before the selected.
+    t.workspace.update(cx, |ws, cx| {
+        ws.set_namespaces_for_tests(vec!["demo".into(), "default".into(), "kube-system".into()]);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let palette = shown(cx, &t);
+    assert_eq!(labels(&palette), ["demo", "default", "kube-system"]);
+    assert_eq!(selected(&palette), "kube-system");
+}
+
+// Opening the palette closes an open popover (the namespace filter), which is drawn above
+// everything else; the palette then has focus.
+#[gpui_kit::test]
+async fn opening_the_palette_dismisses_a_popover(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+    t.click(cx, "ns-add");
+    assert_eq!(state(cx, &t).1, Focus::NamespaceInput);
+    open_palette(cx, &t).await;
+    assert!(t.find(cx, "ns-all").is_none(), "the popover closed");
+    assert_eq!(state(cx, &t).1, Focus::Palette);
+}
+
+// A menu that gives focus back as it closes (a row's context menu gives it to the list): the
+// palette runs from there, and Esc returns focus to the list.
+#[gpui_kit::test]
+async fn a_menu_that_gives_focus_back_is_where_the_palette_runs(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    let row = gpui_kit::SharedString::from("row-uid-web");
+    cx.update_window(t.window, |_, window, cx| window.right_click(row, cx))
+        .unwrap();
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    assert_eq!(state(cx, &t).1, Focus::Menu);
+    open_palette(cx, &t).await;
+    assert!(t.find(cx, "popup-menu").is_none(), "the row's menu closed");
+    // From the list: its actions are listed.
+    assert!(labels(&shown(cx, &t)).contains(&"Focus Filter"));
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    assert_eq!(state(cx, &t).1, Focus::List);
+}
+
+// A refresh does not keep a selection nobody chose: an exact match that arrives becomes the
+// selected row, so Enter on "prods" with `prods-eu` listed first picks `prods` once it appears.
+#[gpui_kit::test]
+async fn a_refresh_selects_an_exact_match_that_arrives(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{discovery, entry, section};
+    use flint_core::{Event, SectionKind};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let eu = entry("example.com", "prods-eu", "ProdEu", "Prods Eu", true);
+    t.connect_alpha(
+        cx,
+        vec![section("Custom", SectionKind::BuiltIn, vec![eu.clone()])],
+    )
+    .await;
+    ask(cx, &t, "open kind").await;
+    t.type_text(cx, "prods");
+    assert_eq!(selected(&shown(cx, &t)), "Prods Eu");
+    let prods = entry("", "prods", "Prod", "Prods", true);
+    t.feed(
+        cx,
+        Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(Arc::new(discovery(vec![section(
+                "Custom",
+                SectionKind::BuiltIn,
+                vec![eu, prods],
+            )]))),
+            error: None,
+        },
+    );
+    let palette = shown(cx, &t);
+    assert_eq!(labels(&palette), ["Prods", "Prods Eu"]);
+    assert_eq!(selected(&palette), "Prods");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let workspace = t.workspace.clone();
+    let kind = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).list.map(|l| l.kind))
+        })
+        .unwrap();
+    assert_eq!(kind.as_deref(), Some("prods"));
+}
+
+// A click drawn on rows that a live refresh has since reordered is dropped rather than pick
+// the entry now in that row; a click on the rows shown runs.
+#[gpui_kit::test]
+async fn a_click_on_replaced_rows_is_dropped(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    t.workspace.update(cx, |ws, _| {
+        ws.set_namespaces_for_tests(vec!["demo".into(), "kube-system".into()])
+    });
+    ask(cx, &t, "add namespace").await;
+    assert_eq!(labels(&shown(cx, &t)), ["demo", "kube-system"]);
+    let drawn = palette(cx, &t)
+        .unwrap()
+        .read_with(cx, |p, _| p.rows_version);
+    // A namespace appears above the one about to be clicked.
+    t.workspace.update(cx, |ws, cx| {
+        ws.set_namespaces_for_tests(vec!["alpha".into(), "demo".into(), "kube-system".into()]);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(labels(&shown(cx, &t)), ["alpha", "demo", "kube-system"]);
+    // The click on `kube-system` (row 1 when drawn) arrives now: dropped.
+    t.dispatch(cx, "palette::PalettePick", json!({"row": 1, "rows": drawn}))
+        .unwrap();
+    assert!(palette(cx, &t).is_some(), "nothing ran");
+    let filter = |cx: &mut TestAppContext| {
+        t.workspace
+            .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()))
+    };
+    assert!(filter(cx).is_empty());
+    // On the rows shown, row 2 is `kube-system`.
+    t.click(cx, ("palette-row", 2usize));
+    assert!(palette_closed(cx, &t));
+    assert_eq!(filter(cx), ["kube-system"]);
+}
+
+// The namespace filter's popover closes when the palette opens also when focus has moved off
+// it (Focus Filter), since it is closed by its open state, not through focus.
+#[gpui_kit::test]
+async fn a_popover_without_focus_closes_when_the_palette_opens(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    assert_eq!(state(cx, &t).1, Focus::ListFilter);
+    assert!(t.find(cx, "ns-all").is_some(), "the popover stays open");
+    open_palette(cx, &t).await;
+    assert!(t.find(cx, "ns-all").is_none(), "the popover closed");
+    assert_eq!(state(cx, &t).1, Focus::Palette);
+    // It opens again from its button once the palette is gone.
+    t.press(cx, "escape");
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
 }
