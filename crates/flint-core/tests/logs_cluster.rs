@@ -7,8 +7,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use flint_core::handle::{Command, ConnectionState, Event};
 use flint_core::{
@@ -23,7 +22,9 @@ use serde_json::json;
 
 mod support;
 
-use support::{Core, client, init_logging, test_kubeconfig, two_context_kubeconfig};
+use support::{
+    Core, client, init_logging, name_of, test_kubeconfig, two_context_kubeconfig, unique_name,
+};
 
 fn start(kubeconfig: PathBuf, settings: Settings) -> (tempfile::TempDir, Core) {
     init_logging();
@@ -65,6 +66,25 @@ async fn until(
     .unwrap_or_else(|_| panic!("log condition not reached: {:?}", session.peek().state))
 }
 
+// Tests `support::unique_name`, here so it runs once rather than in every binary using support.
+#[test]
+fn namespace_names_are_unique_and_valid() {
+    let names: BTreeSet<String> = (0..1000).map(|_| unique_name("logs-test")).collect();
+    assert_eq!(names.len(), 1000);
+    let pid = format!("-{}-", std::process::id());
+    assert!(
+        names
+            .iter()
+            .all(|n| n.starts_with("logs-test-") && n.contains(&pid))
+    );
+    // A namespace name is a DNS label: at most 63 characters, even with every part at its
+    // largest.
+    for prefix in ["logs-test", "exec-test"] {
+        let longest = name_of(prefix, u64::MAX, u32::MAX, u32::MAX);
+        assert!(longest.len() <= 63, "{longest}");
+    }
+}
+
 /// Runs `body` in a fresh namespace and deletes the namespace afterwards, also when it panics.
 async fn in_namespace<F, Fut>(body: F)
 where
@@ -72,15 +92,7 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let kube = client(&test_kubeconfig()).await;
-    // The clock may tick in microseconds (macOS), so tests starting together also need the
-    // counter to get distinct names.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let ns = format!("logs-test-{}-{nanos}-{n}", std::process::id());
+    let ns = unique_name("logs-test");
     let namespaces: Api<Namespace> = Api::all(kube.clone());
     namespaces
         .create(

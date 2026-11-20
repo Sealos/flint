@@ -1,7 +1,8 @@
 //! Shared setup for integration tests against the dev cluster.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flint_core::handle::{ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::{Settings, cluster, kubeconfig};
@@ -36,6 +37,32 @@ pub(super) fn two_context_kubeconfig(dir: &Path, alias: Option<&str>) -> (PathBu
     // JSON is YAML, and kubeconfig is read as YAML.
     std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
     (path, first.name, second)
+}
+
+/// A name for an object a test creates (a namespace), unique among the tests of this process and
+/// of other test processes running at the same time: `prefix`, the process id and a counter. The
+/// time in milliseconds keeps it apart from leftovers of an earlier run whose process had the same
+/// id, and from a run in another PID namespace (a container) that got the same id and counter.
+/// The clock alone is not enough: it may tick in microseconds (macOS), so tests starting
+/// together could get the same name.
+#[allow(dead_code, reason = "not every cluster test creates its own objects")]
+pub(super) fn unique_name(prefix: &str) -> String {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    name_of(prefix, millis, std::process::id(), n)
+}
+
+/// The name [`unique_name`] builds from its parts.
+#[allow(
+    dead_code,
+    reason = "only logs_cluster's test of unique_name calls it directly"
+)]
+pub(super) fn name_of(prefix: &str, millis: u64, pid: u32, n: u32) -> String {
+    format!("{prefix}-{millis}-{pid}-{n}")
 }
 
 pub(super) async fn client(path: &Path) -> Client {

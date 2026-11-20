@@ -39,6 +39,54 @@ impl Backoff {
     }
 }
 
+/// Failed attempts in a row and the [`Backoff`] they wait by: what a stream and a workload's pod
+/// watch share when they reopen after a failure. The owner decides what counts as progress and
+/// calls [`Retry::reset`] then.
+#[derive(Debug)]
+pub(crate) struct Retry {
+    attempts: u32,
+    backoff: Backoff,
+}
+
+/// One failure counted by [`Retry::fail`]: the state to show and the wait before reopening.
+pub(crate) struct Reconnect {
+    /// [`LogState::Reconnecting`] with this attempt's number.
+    pub state: LogState,
+    pub delay: Duration,
+    /// Sleeps for `delay`; the owner parks in it.
+    pub sleep: Pin<Box<Sleep>>,
+}
+
+impl Retry {
+    pub fn new(backoff: Backoff) -> Self {
+        Retry {
+            attempts: 0,
+            backoff,
+        }
+    }
+
+    /// Progress was made: the next failure is the first again.
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+    }
+
+    /// Counts a failure and returns how to wait for the next attempt. `back_off`: the container
+    /// waits in `CrashLoopBackOff` (see [`LogState::Reconnecting`]).
+    pub fn fail(&mut self, error: Option<&LogError>, back_off: bool) -> Reconnect {
+        self.attempts += 1;
+        let delay = self.backoff.delay(self.attempts);
+        Reconnect {
+            state: LogState::Reconnecting {
+                error: error.map(|e| e.message.clone()),
+                attempt: self.attempts,
+                back_off,
+            },
+            delay,
+            sleep: Box::pin(tokio::time::sleep(delay)),
+        }
+    }
+}
+
 /// How long a stream of a deleted pod may keep reading before it is dropped. The kubelet closes
 /// the stream when the container stops, which normally comes first; this bounds a stream whose
 /// node went away without closing it.
@@ -97,15 +145,14 @@ pub(crate) struct Stream {
     options: LogOptions,
     /// `tail_lines` of the first request.
     tail: i64,
-    backoff: Backoff,
+    /// Failed attempts in a row, for the backoff. Reset when a line arrives (and on a revive).
+    retry: Retry,
     /// The pod set this stream belongs to (workload sessions).
     member: Option<Member>,
     phase: Phase,
     state: LogState,
     /// The state changed in the current [`Stream::handle`].
     changed: bool,
-    /// Failed attempts in a row, for the backoff. Reset when a line arrives.
-    attempts: u32,
     /// The newest timestamp shown, and the fingerprints of the newest lines shown with it (at most
     /// [`RESUME_GROUP`]).
     last_ts: Option<Timestamp>,
@@ -159,12 +206,11 @@ impl Stream {
             target,
             options,
             tail,
-            backoff,
+            retry: Retry::new(backoff),
             member,
             phase: Phase::Done,
             state: LogState::Connecting,
             changed: false,
-            attempts: 0,
             last_ts: None,
             last_group: Vec::new(),
             resume: None,
@@ -365,7 +411,7 @@ impl Stream {
         }
         self.draining = false;
         self.deleted = false;
-        self.attempts = 0;
+        self.retry.reset();
         self.set_state(LogState::Connecting);
         let request = self.resume_request();
         self.phase = Phase::Connect(self.source.open(&request));
@@ -446,7 +492,7 @@ impl Stream {
             self.last_group.push(fingerprint(&line.text));
         }
         line.source = self.tag().cloned();
-        self.attempts = 0;
+        self.retry.reset();
         out(line);
     }
 
@@ -468,17 +514,13 @@ impl Stream {
 
     /// Waits before reopening the stream; `back_off`: the container waits in `CrashLoopBackOff`.
     fn wait(&mut self, error: Option<LogError>, back_off: bool) -> Phase {
-        self.attempts += 1;
-        let delay = self.backoff.delay(self.attempts);
+        let next = self.retry.fail(error.as_ref(), back_off);
         if let Some(e) = &error {
+            let delay = next.delay;
             tracing::debug!(pod = self.target.pod, error = %e.message, ?delay, "log stream retry");
         }
-        self.set_state(LogState::Reconnecting {
-            error: error.map(|e| e.message),
-            attempt: self.attempts,
-            back_off,
-        });
-        Phase::Wait(Box::pin(tokio::time::sleep(delay)))
+        self.set_state(next.state);
+        Phase::Wait(next.sleep)
     }
 
     /// Ends after the last catch-up read: quietly for a container that finished, with
@@ -641,6 +683,58 @@ mod tests {
         let delays: Vec<_> = (1..=7).map(|a| backoff.delay(a).as_secs()).collect();
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
         assert_eq!(backoff.delay(u32::MAX).as_secs(), 30);
+    }
+
+    fn attempt_of(state: &LogState) -> u32 {
+        match state {
+            LogState::Reconnecting { attempt, .. } => *attempt,
+            other => panic!("not reconnecting: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_counts_attempts_and_waits_longer_up_to_the_cap() {
+        let mut retry = Retry::new(Backoff {
+            first: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        });
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let next = retry.fail(None, false);
+            let left = next.sleep.deadline() - tokio::time::Instant::now();
+            assert_eq!(left, next.delay, "parks for the delay");
+            seen.push((attempt_of(&next.state), next.delay.as_secs()));
+        }
+        assert_eq!(
+            seen,
+            [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 30), (7, 30)]
+        );
+        retry.reset();
+        assert_eq!(retry.fail(None, false).delay, Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_reports_the_error_and_the_back_off() {
+        let mut retry = Retry::new(Backoff {
+            first: Duration::from_millis(500),
+            max: Duration::from_secs(4),
+        });
+        assert_eq!(
+            retry.fail(Some(&LogError::retry("reset")), false).state,
+            LogState::Reconnecting {
+                error: Some("reset".into()),
+                attempt: 1,
+                back_off: false,
+            }
+        );
+        assert_eq!(
+            retry.fail(None, true).state,
+            LogState::Reconnecting {
+                error: None,
+                attempt: 2,
+                back_off: true,
+            }
+        );
     }
 
     // covers UP-45
@@ -949,6 +1043,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The time left in a waiting stream's backoff.
+    fn wait_left(s: &Stream) -> Duration {
+        match &s.phase {
+            Phase::Wait(sleep) => sleep.deadline() - tokio::time::Instant::now(),
+            _ => panic!("not waiting"),
+        }
+    }
+
+    fn attempt(s: &Stream) -> u32 {
+        match s.state() {
+            LogState::Reconnecting { attempt, .. } => *attempt,
+            other => panic!("not reconnecting: {other:?}"),
+        }
+    }
+
+    // covers UP-45: failures in a row wait longer and longer; only a new line resets the count.
+    #[tokio::test(start_paused = true)]
+    async fn retries_back_off_until_a_line_arrives() {
+        let mut s = stream(&[], None);
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+            waits.push((attempt(&s), wait_left(&s).as_secs()));
+        }
+        assert_eq!(
+            waits,
+            [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 30), (7, 30)]
+        );
+
+        // Opening again is not progress: the next failure counts on.
+        s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+        assert_eq!(s.state(), &LogState::Streaming);
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (8, 30));
+
+        // A line is: the next failure is the first again.
+        s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+        let mut out = Vec::new();
+        s.handle(
+            Step::Line(Ok(RawLine {
+                text: "news".into(),
+                truncated: false,
+            })),
+            &mut |l| out.push(l),
+        );
+        assert_eq!(out.len(), 1);
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (1, 1));
+        assert_eq!(
+            s.state(),
+            &LogState::Reconnecting {
+                error: Some("reset".into()),
+                attempt: 1,
+                back_off: false,
+            }
+        );
+    }
+
+    // covers UP-45: a revived stream starts its backoff afresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_revived_stream_backs_off_from_the_start() {
+        let mut s = stream(&[], Some(Arc::new(LineSource::new("p", "c"))));
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        assert_eq!(attempt(&s), 2);
+        s.handle(
+            Step::Opened(Err(LogError::fatal("gone for now"))),
+            &mut |_| {},
+        );
+        assert!(s.is_done());
+        s.revive();
+        assert_eq!(s.state(), &LogState::Connecting);
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (1, 1));
     }
 
     // covers UP-40

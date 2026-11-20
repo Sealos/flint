@@ -29,7 +29,7 @@ use super::line::LineSource;
 use super::pods::{ContainerInfo, PodEvent, PodEvents, PodInfo, PodSet, PodSource, WorkloadTarget};
 use super::session::{Feed, LogOptions, LogState, LogTarget, Output, SessionConfig};
 use super::source::{LogError, LogSource};
-use super::stream::{Member, Stream};
+use super::stream::{Member, Retry, Stream};
 
 /// What a workload session reads: its pods and the state of each stream. Rebuilt only when
 /// something in it changes, not for every line.
@@ -142,8 +142,9 @@ pub(crate) struct WorkloadFeed {
     config: SessionConfig,
     watch: Watch,
     selector: Option<String>,
-    /// Failed watch attempts in a row, for the backoff. Reset by a complete list.
-    attempts: u32,
+    /// Failed watch attempts in a row, for the backoff. Reset by a complete list only, not by
+    /// events after it.
+    retry: Retry,
     state: LogState,
     /// The pods of a (re)list in progress, between `Init` and `InitDone`.
     listing: Option<Vec<PodInfo>>,
@@ -179,7 +180,7 @@ impl WorkloadFeed {
             config,
             watch: Watch::Done,
             selector: None,
-            attempts: 0,
+            retry: Retry::new(config.backoff),
             state: LogState::Connecting,
             listing: None,
             synced: false,
@@ -245,11 +246,11 @@ impl WorkloadFeed {
                 if e.is_fatal() {
                     self.fail(e.message);
                 } else {
-                    self.retry(Some(e));
+                    self.retry_watch(Some(e));
                 }
             }
             // kube's watcher never ends; a fake or a future one might.
-            WatchStep::Event(None) => self.retry(None),
+            WatchStep::Event(None) => self.retry_watch(None),
             WatchStep::Event(Some(Ok(event))) => self.apply_event(event),
             WatchStep::Retry => {
                 self.watch = match (&self.selector, &self.target.pods) {
@@ -264,18 +265,14 @@ impl WorkloadFeed {
     }
 
     /// The pod watch broke: reopen it after a backoff. Streams keep running meanwhile.
-    fn retry(&mut self, error: Option<LogError>) {
-        self.attempts += 1;
-        let delay = self.config.backoff.delay(self.attempts);
+    fn retry_watch(&mut self, error: Option<LogError>) {
+        let next = self.retry.fail(error.as_ref(), false);
         if let Some(e) = &error {
+            let delay = next.delay;
             tracing::debug!(error = %e.message, ?delay, "pod watch retry");
         }
-        self.state = LogState::Reconnecting {
-            error: error.map(|e| e.message),
-            attempt: self.attempts,
-            back_off: false,
-        };
-        self.watch = Watch::Wait(Box::pin(tokio::time::sleep(delay)));
+        self.state = next.state;
+        self.watch = Watch::Wait(next.sleep);
     }
 
     /// Ends the session: an error retrying cannot fix (the workload does not exist, access is
@@ -344,7 +341,7 @@ impl WorkloadFeed {
         for pod in listed {
             self.apply_pod(pod);
         }
-        self.attempts = 0;
+        self.retry.reset();
         self.state = LogState::Streaming;
         self.status_dirty = true;
         if !self.following() {
@@ -636,6 +633,8 @@ mod tests {
         selector: Mutex<Option<Result<String, LogError>>>,
         watches: Mutex<VecDeque<mpsc::UnboundedReceiver<Result<PodEvent, LogError>>>>,
         selectors: Mutex<Vec<String>>,
+        /// When each `watch` was opened.
+        opens: Mutex<Vec<tokio::time::Instant>>,
         /// What `check` answers (`None`: fine), and how often it was asked.
         check: Mutex<Option<LogError>>,
         checks: Mutex<u32>,
@@ -663,6 +662,7 @@ mod tests {
             selector: &str,
         ) -> BoxFuture<'static, Result<PodEvents, LogError>> {
             self.selectors.lock().unwrap().push(selector.to_owned());
+            self.opens.lock().unwrap().push(tokio::time::Instant::now());
             let rx = self.watches.lock().unwrap().pop_front();
             async move {
                 match rx {
@@ -1077,6 +1077,81 @@ mod tests {
             ["web-a/app", "web-b/app"],
             "web-a kept its stream"
         );
+    }
+
+    // covers UP-45: a pod watch failing in a row waits longer each time (capped); only a
+    // complete list resets the count, not the events after it nor a list that never completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_pod_watch_backs_off_until_a_complete_list() {
+        let mut run = start(32);
+        let mut watches = Vec::new();
+        for _ in 0..6 {
+            let (tx, events) = mpsc::unbounded();
+            run.pods.watches.lock().unwrap().push_back(events);
+            watches.push(tx);
+        }
+        let attempt = |s: &LogSnapshot| match s.state {
+            LogState::Reconnecting { attempt, .. } => attempt,
+            _ => 0,
+        };
+        // Each watch after the first breaks at once: the waits between opens grow, then cap.
+        for tx in &watches[..5] {
+            tx.unbounded_send(Err(LogError::retry("watch reset")))
+                .unwrap();
+        }
+        run.watch
+            .unbounded_send(Err(LogError::retry("watch reset")))
+            .unwrap();
+        for n in 1..=6 {
+            let s = run.until(|s| attempt(s) == n).await;
+            assert_eq!(
+                s.state,
+                LogState::Reconnecting {
+                    back_off: false,
+                    error: Some("watch reset".into()),
+                    attempt: n
+                }
+            );
+        }
+        let opens = run.pods.opens.lock().unwrap().clone();
+        let waits: Vec<_> = opens
+            .windows(2)
+            .map(|w| (w[1] - w[0]).as_millis())
+            .collect();
+        assert_eq!(waits, [500, 1000, 2000, 4000, 4000]);
+
+        // A complete list: the next break is the first again.
+        let last = watches.pop().unwrap();
+        last.unbounded_send(Ok(PodEvent::Init)).unwrap();
+        last.unbounded_send(Ok(PodEvent::InitDone)).unwrap();
+        run.until(|s| s.state == LogState::Streaming).await;
+        // The next watches deliver an event, then break: a pod change after the list, then a
+        // relist that never completes. Neither resets the count.
+        let (after_list, events) = mpsc::unbounded();
+        run.pods.watches.lock().unwrap().push_back(events);
+        let (relist, events) = mpsc::unbounded();
+        run.pods.watches.lock().unwrap().push_back(events);
+        after_list
+            .unbounded_send(Ok(PodEvent::Apply(pod("web-a", "a", &[("app", false)]))))
+            .unwrap();
+        after_list
+            .unbounded_send(Err(LogError::retry("watch reset")))
+            .unwrap();
+        relist.unbounded_send(Ok(PodEvent::Init)).unwrap();
+        relist
+            .unbounded_send(Err(LogError::retry("watch reset")))
+            .unwrap();
+        last.unbounded_send(Err(LogError::retry("watch reset")))
+            .unwrap();
+        for n in 1..=3 {
+            run.until(|s| attempt(s) == n).await;
+        }
+        let opens = run.pods.opens.lock().unwrap().clone();
+        let waits: Vec<_> = opens[6..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).as_millis())
+            .collect();
+        assert_eq!(waits, [500, 1000], "the backoff grew again from the start");
     }
 
     // covers UP-45
