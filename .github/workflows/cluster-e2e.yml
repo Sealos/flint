@@ -12,8 +12,11 @@ on:
       - crates/flint-mcp/**
       # The fake API server, the harness and fixtures the kind-run MCP tests and the drift
       # check use; app-test-only changes stay off kind.
+      - crates/flint-e2e/src/lib.rs
       - crates/flint-e2e/src/backend.rs
+      - crates/flint-e2e/src/binaries.rs
       - crates/flint-e2e/src/mcp.rs
+      - crates/flint-e2e/src/scratch.rs
       - crates/flint-e2e/src/fake_api/**
       - crates/flint-e2e/src/record/**
       - crates/flint-e2e/src/bin/**
