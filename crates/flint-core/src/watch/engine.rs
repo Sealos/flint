@@ -320,8 +320,6 @@ impl Engine {
         };
         let snapshot = self.store.snapshot(base);
         self.hub.publish(self.epoch, snapshot);
-        // The hub dropped the snapshot it held before: after a relist, its strings can go.
-        self.store.published();
         self.dirty = false;
         self.last_publish = Some(Instant::now());
     }

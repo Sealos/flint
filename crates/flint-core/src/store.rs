@@ -146,9 +146,17 @@ pub(crate) struct Store {
     /// snapshot never pairs new columns with old cells.
     pending_layout: Option<Layout>,
     interner: Interner,
-    /// A relist replaced the rows while the snapshot published before it still held the old
-    /// rows' strings: prune once that snapshot is replaced ([`Store::published`]).
-    prune_after_publish: bool,
+}
+
+/// The interned strings a row uses: its namespace, label keys and values, and text cells.
+fn row_strings(row: &Row) -> impl Iterator<Item = &Arc<str>> {
+    row.namespace
+        .iter()
+        .chain(row.labels.iter().flat_map(|(k, v)| [k, v]))
+        .chain(row.cells.iter().filter_map(|cell| match cell {
+            crate::table::Cell::Text(s) => Some(s),
+            _ => None,
+        }))
 }
 
 /// What [`Store::apply`] did.
@@ -170,7 +178,6 @@ impl Store {
             pending: None,
             pending_layout: None,
             interner: Interner::default(),
-            prune_after_publish: false,
         }
     }
 
@@ -192,18 +199,12 @@ impl Store {
             if self.pending_layout.is_some() {
                 self.layout = self.pending_layout.take();
             }
-            self.interner.prune();
-            // The snapshot published last still holds the old rows' strings, so they survived
-            // that prune: prune again once a new snapshot has replaced it.
-            self.prune_after_publish = true;
-        }
-    }
-
-    /// A snapshot of these rows has replaced the one published before: after a relist, the
-    /// strings only the old snapshot held can go now, on an idle kind too.
-    pub fn published(&mut self) {
-        if std::mem::take(&mut self.prune_after_publish) {
-            self.interner.prune();
+            // Snapshots published before (the hub's, a view's still on screen) hold the old
+            // rows' strings, so a prune by reference count would keep them. Keep exactly what
+            // the new rows use: the old strings go when their last holder lets go, whenever
+            // that is, with no further events needed.
+            self.interner
+                .keep_only(self.rows.values().flat_map(|row| row_strings(row)));
         }
     }
 
@@ -392,31 +393,37 @@ mod tests {
         assert_eq!(store.len(), 50);
     }
 
-    // covers UP-20, UP-27: a relist that finds a big scale-down on a kind that then stays idle
-    // gives the old strings back once the next snapshot replaces the old one (#257).
+    // covers UP-20, UP-27: a relist that finds a big scale-down, while a view still holds the
+    // old snapshot past the next publish, keeps none of the old strings once the view lets go,
+    // with no further events (#257).
     #[test]
-    fn an_idle_kind_drops_relisted_strings_when_its_snapshot_is_replaced() {
+    fn relisted_strings_go_when_their_last_holder_lets_go() {
         let mut store = Store::new(true);
         for i in 0..5_000 {
             let uid = format!("old-{i}");
             let status = format!("old-status-{i}");
             store.apply(obj(&[(&uid, "demo", &uid, &status)], "1"), false, 0);
         }
-        // The hub holds the snapshot published before the relist.
-        let old = store.snapshot(KindSnapshot::default());
+        // A list on screen holds the snapshot from before the relist.
+        let on_screen = store.snapshot(KindSnapshot::default());
+        // One of the old rows' statuses (cells: name, namespace, ready, status).
+        let old: Arc<str> = match &on_screen.rows[0].cells[3] {
+            crate::table::Cell::Text(s) => s.clone(),
+            other => panic!("a status cell, not {other:?}"),
+        };
+        assert!(old.starts_with("old-status-"), "{old}");
         store.begin_resync();
         store.apply(obj(&[("new", "demo", "new", "Running")], "2"), false, 0);
         store.finish_resync();
-        assert!(store.interned() > 5_000, "{}", store.interned());
-        // Publishing replaces it; nothing else ever arrives.
-        let held = store.snapshot(KindSnapshot::default());
-        drop(old);
-        store.published();
+        // The store keeps only what its rows use, though the old strings are still held.
         assert!(store.interned() < 10, "{}", store.interned());
-        assert_eq!(held.rows.len(), 1);
-        // Once only.
-        store.published();
-        assert!(store.interned() < 10);
+        // The hub publishes the new rows; the view keeps the old snapshot a while longer.
+        let published = store.snapshot(KindSnapshot::default());
+        assert_eq!(published.rows.len(), 1);
+        assert_eq!(Arc::strong_count(&old), 2, "the view's row and this test");
+        // The view lets go: nothing else holds the old string, with no event after it.
+        drop(on_screen);
+        assert_eq!(Arc::strong_count(&old), 1, "only this test");
     }
 
     // covers UP-20, UP-27: a burst after a relist, before the old snapshot is replaced, does
@@ -442,7 +449,6 @@ mod tests {
         }
         let held = store.snapshot(KindSnapshot::default());
         drop(old);
-        store.published();
         assert!(store.interned() < 100, "{}", store.interned());
         assert_eq!(held.rows.len(), 1);
         // The next automatic prune comes after PRUNE_MIN new strings, not after 5,000 more.

@@ -490,6 +490,18 @@ impl Interner {
         }
     }
 
+    /// Keeps exactly the strings in `used` (after a relist: what the store's rows use), so
+    /// strings only older snapshots hold leave the set at once and are freed with them.
+    pub fn keep_only<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
+        self.set = used.cloned().collect();
+        self.kept = self.set.len();
+        self.inserts = 0;
+        #[cfg(test)]
+        {
+            self.prunes += 1;
+        }
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.set.len()
