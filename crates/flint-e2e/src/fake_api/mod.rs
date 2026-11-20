@@ -67,5 +67,7 @@ pub use logs::ContainerLog;
 pub use pods::FakePod;
 pub use route::{Query, Verb};
 pub use row::FakeRow;
-pub use server::{FakeApiServer, Options, RequestRecord, arrivals_at, write_kubeconfigs};
+pub use server::{
+    FakeApiServer, Options, RequestRecord, arrivals_at, connection_mark_at, write_kubeconfigs,
+};
 pub use watch::WatchStep;
