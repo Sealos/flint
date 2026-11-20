@@ -988,6 +988,11 @@ async fn stored_rows_are_read_without_another_request() {
     let stored = registry.stored("c", Duration::from_secs(1)).await;
     assert_eq!(stored.len(), 1);
     assert_eq!(names(&stored[0]), ["a", "b"]);
+    // Read again: built anew (a new version), but the same rows (the same revision).
+    let again = registry.stored("c", Duration::from_secs(1)).await;
+    assert_ne!(again[0].version, stored[0].version);
+    assert_eq!(again[0].revision, stored[0].revision);
+    assert!(stored[0].revision > 0);
     assert_eq!(fake.list_calls("pods"), lists, "no list");
     assert_eq!(fake.watch_requests("pods").len(), watches, "no watch");
     assert_eq!(hub.listeners(), 0, "the call let go of the hub");

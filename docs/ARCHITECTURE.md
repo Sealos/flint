@@ -955,8 +955,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     kept. An Enter names the cluster and server its row was listed on, and Open Kind… and Open Object… refuse it
     once another is active, so a row of one cluster never opens a same-named object on another.
   - On a namespace-limited list, an object opened is judged gone only once its own namespace was listed anew:
-    the merged list says which list of each namespace it holds (`NamespaceLimit::versions`), since it can be
-    published again from a namespace's old rows.
+    the merged list says which rows of each namespace it holds (`NamespaceLimit::revisions`, each the
+    `KindSnapshot::revision` of that namespace's list), since it can be published again from a namespace's old
+    rows. A revision moves only when a list completes or a row changes, never on a republish of the same rows; a
+    quiet namespace is not proven gone until it is listed again, and the pick waits (clearing the selection drops
+    it).
   - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
     in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.
 - **Panes and Go Back (UP-33, `workspace_keys.rs`):** the cluster sidebar (key context `ClusterSidebar`) and the

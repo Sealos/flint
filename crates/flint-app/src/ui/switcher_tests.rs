@@ -834,7 +834,7 @@ async fn a_limited_list_proves_an_object_gone_only_when_its_namespace_is_listed_
             listed: vec!["demo".into()],
             denied: Vec::new(),
             reason: "pods is forbidden".into(),
-            versions: vec![demo],
+            revisions: vec![demo],
         }));
         snapshot
     };

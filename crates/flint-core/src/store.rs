@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cluster::ClusterId;
 use crate::read::KindId;
@@ -65,6 +66,10 @@ pub struct KindSnapshot {
     /// Increases with every snapshot published, and never repeats within the process: cache
     /// derived data (such as [`crate::CoreHandle::compute_view`] results) by it.
     pub version: u64,
+    /// The rows' revision: it moves only when a list completes (the first list, a relist) or
+    /// a row changes, never when the same rows are published again, and never repeats within
+    /// the process. 0 for a snapshot no watch built. Tells rows listed anew from a republish.
+    pub revision: u64,
     /// Set when the user may not list this kind in all namespaces, so it is listed namespace
     /// by namespace instead: the rows come only from these namespaces.
     pub limited_to: Option<Arc<NamespaceLimit>>,
@@ -79,19 +84,23 @@ pub struct NamespaceLimit {
     pub denied: Vec<String>,
     /// Why the list is limited: the server's answer to the all-namespaces list.
     pub reason: String,
-    /// For each of `listed`, the version of that namespace's rows merged in
-    /// ([`KindSnapshot::version`] of its own list). A merged list can be published again from
-    /// rows that did not change; these tell a namespace listed anew from one that was not.
-    pub versions: Vec<u64>,
+    /// For each of `listed`, the [`KindSnapshot::revision`] of that namespace's rows merged
+    /// in. A merged list can be published again from rows that did not change; these tell a
+    /// namespace listed anew (or changed) from one that was not.
+    pub revisions: Vec<u64>,
 }
 
 impl NamespaceLimit {
-    /// The version of `namespace`'s rows merged in, if it is listed.
-    pub fn version_of(&self, namespace: &str) -> Option<u64> {
+    /// The revision of `namespace`'s rows merged in, if it is listed.
+    pub fn revision_of(&self, namespace: &str) -> Option<u64> {
         let at = self.listed.iter().position(|n| n == namespace)?;
-        self.versions.get(at).copied()
+        self.revisions.get(at).copied()
     }
 }
+
+/// Row revisions come from one counter for the whole process, so a revision never repeats,
+/// even for a watch started again.
+static REVISION: AtomicU64 = AtomicU64::new(0);
 
 impl KindSnapshot {
     pub(crate) fn empty(cluster: ClusterId, kind: KindId, state: SyncState) -> Self {
@@ -158,6 +167,8 @@ pub(crate) struct Store {
     /// snapshot never pairs new columns with old cells.
     pending_layout: Option<Layout>,
     interner: Interner,
+    /// The visible rows' revision ([`KindSnapshot::revision`]).
+    revision: u64,
 }
 
 /// What [`Store::apply`] did.
@@ -179,7 +190,13 @@ impl Store {
             pending: None,
             pending_layout: None,
             interner: Interner::default(),
+            revision: 0,
         }
+    }
+
+    /// The visible rows changed, or were listed anew.
+    fn revise(&mut self) {
+        self.revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
     }
 
     #[cfg(test)]
@@ -201,6 +218,7 @@ impl Store {
                 self.layout = self.pending_layout.take();
             }
             self.interner.prune();
+            self.revise();
         }
     }
 
@@ -248,6 +266,9 @@ impl Store {
                     }
                 }
             }
+        }
+        if changed && visible {
+            self.revise();
         }
         Applied {
             changed: changed && visible,
@@ -313,6 +334,7 @@ impl Store {
             columns,
             rows,
             format: self.format(),
+            revision: self.revision,
             ..base
         }
     }
@@ -335,6 +357,38 @@ mod tests {
 
     fn obj(rows: &[(&str, &str, &str, &str)], rv: &str) -> WireObject {
         serde_json::from_value(pod_table(rows, true, rv)).unwrap()
+    }
+
+    // covers UP-31: the revision moves when rows change or a list completes, and never when
+    // the same rows are applied or published again.
+    #[test]
+    fn the_revision_moves_only_on_a_list_or_a_change() {
+        let mut store = Store::new(true);
+        let revision = |store: &Store| store.snapshot(KindSnapshot::default()).revision;
+        assert_eq!(revision(&store), 0);
+        store.apply_changed(obj(&[("u1", "a", "x", "Running")], "1"), false, 0);
+        let first = revision(&store);
+        assert!(first > 0);
+        // The same row again, and publishing twice: no change.
+        store.apply_changed(obj(&[("u1", "a", "x", "Running")], "1"), false, 0);
+        assert_eq!(revision(&store), first);
+        assert_eq!(revision(&store), first);
+        // A changed row.
+        store.apply_changed(obj(&[("u1", "a", "x", "Pending")], "2"), false, 0);
+        let changed = revision(&store);
+        assert!(changed > first);
+        // A list in progress changes nothing visible; once complete, even with the same rows,
+        // it is a list anew.
+        store.begin_resync();
+        store.apply_changed(obj(&[("u1", "a", "x", "Pending")], "3"), false, 0);
+        assert_eq!(revision(&store), changed);
+        store.finish_resync();
+        assert!(revision(&store) > changed);
+        // An abandoned list does not count.
+        let listed = revision(&store);
+        store.begin_resync();
+        store.abandon_resync();
+        assert_eq!(revision(&store), listed);
     }
 
     // covers UP-20

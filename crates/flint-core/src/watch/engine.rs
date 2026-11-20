@@ -947,8 +947,8 @@ fn merge_lanes(
         /// snapshots) when rows are not merged.
         state: SyncState,
         feed: Feed,
-        /// The version of the lane's rows merged in.
-        version: u64,
+        /// The revision of the lane's rows merged in.
+        revision: u64,
     }
     let views: Vec<View> = lanes
         .iter()
@@ -962,16 +962,16 @@ fn merge_lanes(
                 Some(s) => (s.state.clone(), s.feed),
                 None => (lane.hub.state(), lane.hub.feed()),
             };
-            let version = match &snap {
-                Some(s) => s.version,
-                None => lane.rx.borrow().version,
+            let revision = match &snap {
+                Some(s) => s.revision,
+                None => lane.rx.borrow().revision,
             };
             View {
                 ns,
                 snap,
                 state,
                 feed,
-                version,
+                revision,
             }
         })
         .collect();
@@ -1043,7 +1043,7 @@ fn merge_lanes(
             listed: open.iter().map(|v| v.ns.clone()).collect(),
             denied: denied.iter().map(|v| v.ns.clone()).collect(),
             reason: reason.to_owned(),
-            versions: open.iter().map(|v| v.version).collect(),
+            revisions: open.iter().map(|v| v.revision).collect(),
         })),
         ..Default::default()
     }
@@ -1091,6 +1091,8 @@ mod tests {
                 .collect(),
             state,
             format: ListFormat::Table,
+            // A revision of its own per namespace, as its store would give.
+            revision: u64::from(ns.as_bytes()[0]),
             ..Default::default()
         };
         hub.take_over(snapshot);
@@ -1139,10 +1141,10 @@ mod tests {
             (vec!["a".to_owned(), "b".to_owned()], vec!["c".to_owned()])
         );
         // Each listed namespace says which of its lists was merged in.
-        let lane_version = |ns: &str| lanes[ns].rx.borrow().version;
-        assert_eq!(limit.versions, [lane_version("a"), lane_version("b")]);
-        assert_eq!(limit.version_of("b"), Some(lane_version("b")));
-        assert_eq!(limit.version_of("c"), None, "denied");
+        let lane_revision = |ns: &str| lanes[ns].rx.borrow().revision;
+        assert_eq!(limit.revisions, [lane_revision("a"), lane_revision("b")]);
+        assert_eq!(limit.revision_of("b"), Some(lane_revision("b")));
+        assert_eq!(limit.revision_of("c"), None, "denied");
 
         // The least ready lane decides the state.
         lanes.insert("d".to_owned(), lane(SyncState::Loading, &[], &cols, "d"));

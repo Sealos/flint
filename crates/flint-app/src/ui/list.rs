@@ -406,14 +406,14 @@ impl ResourceList {
         let (Some(limit), Some(namespace)) = (&self.latest.limited_to, namespace) else {
             return true;
         };
-        let Some(now) = limit.version_of(namespace) else {
+        let Some(now) = limit.revision_of(namespace) else {
             // Not a namespace this list covers: it cannot tell.
             return false;
         };
         let then = self
             .subscribed_lanes
             .as_ref()
-            .and_then(|l| l.version_of(namespace))
+            .and_then(|l| l.revision_of(namespace))
             .unwrap_or(0);
         now > then
     }

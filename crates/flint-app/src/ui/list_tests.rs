@@ -716,7 +716,7 @@ async fn banners_say_what_the_rows_cover(cx: &mut TestAppContext) {
         listed: vec!["demo".into(), "team-a".into()],
         denied: Vec::new(),
         reason: "pods is forbidden".into(),
-        versions: vec![1, 1],
+        revisions: vec![1, 1],
     }));
     list.update(cx, |list, cx| list.set_snapshot(Arc::new(limited), cx));
     cx.wait_for(window, WAIT, |window, _| {
