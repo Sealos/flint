@@ -132,12 +132,12 @@ fn default_cancel_footer(dialog: &DialogText, focus: &FocusHandle) -> impl IntoE
     div().w_full().key_context(DEFAULT_CANCEL).child(
         DialogFooter::new()
             .child(
-                Button::new("confirm-cancel")
+                Button::new("cancel")
                     .label(dialog.cancel.clone())
                     .on_click(registry::on_click_in(focus.clone(), Cancel)),
             )
             .child(
-                Button::new("confirm-ok")
+                Button::new("ok")
                     .label(dialog.ok.clone())
                     .primary()
                     .on_click(registry::on_click_in(
@@ -332,6 +332,21 @@ mod tests {
             for key in keys {
                 cx.update_window(window, |_, window, cx| window.press(key, cx))
                     .unwrap();
+                // Tab and Shift-Tab reach Cancel and OK: the key that follows lands on a button.
+                let expected = match *key {
+                    "tab" => Some("cancel"),
+                    "shift-tab" => Some("ok"),
+                    _ => continue,
+                };
+                let focused = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        ["ok", "cancel"]
+                            .into_iter()
+                            .find(|id| window.find(*id).focused() == Some(true))
+                    })
+                    .unwrap();
+                assert_eq!(focused, expected, "{keys:?}: after {key}");
             }
             assert_eq!(shown_title(cx, window), None, "{keys:?} closes it");
             assert_eq!(
@@ -352,7 +367,7 @@ mod tests {
         })
         .unwrap();
         shown_title(cx, window);
-        cx.update_window(window, |_, window, cx| window.click("confirm-ok", cx))
+        cx.update_window(window, |_, window, cx| window.click("ok", cx))
             .unwrap();
         assert_eq!(shown_title(cx, window), None);
         assert!(confirmed.get());

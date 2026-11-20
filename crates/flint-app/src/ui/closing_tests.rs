@@ -201,8 +201,18 @@ async fn enter_and_escape_cancel_the_quit_and_close_confirmations(cx: &mut TestA
         ] {
             t.press_key_of(cx, ask);
             assert_eq!(shown_dialog(cx, &t).await.title, title, "{ask}");
+            assert_eq!(focused_button(cx, &t), None, "the description has focus");
+            let mut focus = None;
             for key in keys {
                 t.press(cx, key);
+                if key.ends_with("tab") {
+                    focus = next_button(focus, key);
+                    assert_eq!(
+                        focused_button(cx, &t),
+                        focus,
+                        "{ask}, {keys:?}: after {key}"
+                    );
+                }
             }
             cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
                 .await;
@@ -214,16 +224,38 @@ async fn enter_and_escape_cancel_the_quit_and_close_confirmations(cx: &mut TestA
         // Its buttons answer it: Cancel keeps everything, the confirm button ends the sessions.
         t.press_key_of(cx, ask);
         shown_dialog(cx, &t).await;
-        t.click(cx, "confirm-cancel");
+        t.click(cx, "cancel");
         assert!(!t.has_dialog(cx), "{ask}: Cancel closes the dialog");
         assert!(window_is_open(cx, &t) && !web.is_closed() && quits(cx) == 0);
         t.press_key_of(cx, ask);
         shown_dialog(cx, &t).await;
-        t.click(cx, "confirm-ok");
+        t.click(cx, "ok");
         match ask {
             "flint::Quit" => assert_eq!(quits(cx), 1, "the Quit button quits"),
             _ => assert!(!window_is_open(cx, &t), "Close Window closes it"),
         }
+    }
+}
+
+/// The dialog button that has keyboard focus, `ok` or `cancel`, if one has.
+fn focused_button(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<&'static str> {
+    use gpui_kit::test::TestWindowExt as _;
+
+    cx.update_window(t.window, |_, window, cx| {
+        window.render_frame(cx);
+        ["ok", "cancel"]
+            .into_iter()
+            .find(|id| window.find(*id).focused() == Some(true))
+    })
+    .unwrap()
+}
+
+/// Where Tab or Shift-Tab moves focus among the buttons, Cancel then OK, from `from`.
+fn next_button(from: Option<&'static str>, key: &str) -> Option<&'static str> {
+    match (key, from) {
+        ("tab", Some("cancel")) | ("shift-tab", None | Some("cancel")) => Some("ok"),
+        ("tab" | "shift-tab", _) => Some("cancel"),
+        _ => from,
     }
 }
 
@@ -246,6 +278,7 @@ async fn space_on_a_focused_button_answers_the_confirmation(cx: &mut TestAppCont
     t.press_key_of(cx, "flint::Quit");
     shown_dialog(cx, &t).await;
     t.press(cx, "tab");
+    assert_eq!(focused_button(cx, &t), Some("cancel"));
     t.press(cx, "space");
     closed(cx, &t).await;
     assert_eq!(quits(cx), 0, "Space on Cancel cancels");
@@ -255,6 +288,7 @@ async fn space_on_a_focused_button_answers_the_confirmation(cx: &mut TestAppCont
     t.press_key_of(cx, "flint::Quit");
     shown_dialog(cx, &t).await;
     t.press(cx, "shift-tab");
+    assert_eq!(focused_button(cx, &t), Some("ok"));
     t.press(cx, "space");
     assert_eq!(quits(cx), 1, "Space on the focused Quit button quits");
 }
