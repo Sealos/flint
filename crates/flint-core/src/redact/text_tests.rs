@@ -1217,6 +1217,83 @@ fn a_cookie_starting_with_dashes_is_hidden_whole() {
     same("password: ----- user=app");
 }
 
+#[test]
+fn a_cookie_list_with_a_masked_item_hides_the_rest() {
+    assert_eq!(
+        redacted(r#"{"Set-Cookie":["[REDACTED:cookie]","b=s3cr3tB"]}"#, 1),
+        r#"{"Set-Cookie":["[REDACTED:cookie]"]}"#
+    );
+    assert_eq!(
+        redacted(
+            r#"{"Set-Cookie":["a=s3cr3tA","[REDACTED:cookie]","c=s3cr3tC"]}"#,
+            1
+        ),
+        r#"{"Set-Cookie":["[REDACTED:cookie]"]}"#
+    );
+    same(r#"{"Set-Cookie":["[REDACTED:cookie]"]}"#);
+    same(r#"{"Set-Cookie":["[REDACTED:cookie]","[REDACTED:cookie]"]}"#);
+}
+
+#[test]
+fn dsns_with_spaces_in_the_address_and_lists_of_dsns() {
+    for (line, want) in [
+        (
+            r#"{"dsn":"app:p w@unix(/var/run/my sql.sock)/app"}"#,
+            r#"{"dsn":"app:[REDACTED:password]@unix(/var/run/my sql.sock)/app"}"#,
+        ),
+        (
+            "dsns=root:a@tcp(db)/x,root:b@tcp(db)/y",
+            "dsns=root:[REDACTED:password]@tcp(db)/x,root:[REDACTED:password]@tcp(db)/y",
+        ),
+        (
+            "dsns=root:a@tcp(db)/x, root:b@tcp(db)/y",
+            "dsns=root:[REDACTED:password]@tcp(db)/x, root:[REDACTED:password]@tcp(db)/y",
+        ),
+        (
+            r#"{"dsn":root:pw@tcp(db)/app}"#,
+            r#"{"dsn":root:[REDACTED:password]@tcp(db)/app}"#,
+        ),
+        (
+            r#""auth":"x" app:p w@unix(/tmp/my sql.sock)/app"#,
+            r#""auth":"x" app:[REDACTED:password]@unix(/tmp/my sql.sock)/app"#,
+        ),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+    for line in [
+        r#"{"addr":"user@unix(/var/run/my sql.sock)/app"}"#,
+        "dsns=root@tcp(db)/x,root@tcp(db)/y",
+        r#"{"dsn":root@tcp(db)/app}"#,
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn cookie_items_ending_in_an_escaped_backslash_stay_valid_json() {
+    let compact = r#"{"Set-Cookie":["a=x\\","b=s3cr3tB\\"]}"#;
+    let pretty = "{\n  \"Set-Cookie\": [\n    \"a=x\\\\\",\n    \"b=s3cr3tB\\\\\"\n  ]\n}";
+    for (text, count) in [(compact, 1), (pretty, 2)] {
+        let out = redact_credentials(text);
+        assert_eq!(out.count, count, "{}", out.text);
+        assert!(!out.text.contains("s3cr3t"), "{}", out.text);
+        let parsed: serde_json::Value = serde_json::from_str(&out.text).expect("still JSON");
+        let cookies = parsed["Set-Cookie"].as_array().expect("array");
+        assert!(
+            cookies.iter().all(|c| c == "[REDACTED:cookie]"),
+            "{cookies:?}"
+        );
+    }
+}
+
+#[test]
+fn only_cookie_headers_are_redacted_as_cookie_arrays() {
+    same(
+        "{\n  \"trackingCookie\": [\n    \"t=1\"\n  ],\n  \"cookieNames\": [\n    \"sid\"\n  ]\n}",
+    );
+}
+
 /// About 10 MB of realistic log lines, with a few secrets.
 fn synthetic_log() -> String {
     let lines = [
@@ -1291,6 +1368,8 @@ fn long_lines_of_quoted_values_are_linear() {
         r#"-H 'Cookie: a="b"' "#,
         "Cookie='a' ",
         "a:b'c@tcp(x)/y ",
+        "a:b@tcp(x)/y,",
+        "a:b@unix(/s s ",
         r#""a:b\"c@tcp(x)/y" "#,
     ] {
         let line = unit.repeat(MIB / unit.len());
