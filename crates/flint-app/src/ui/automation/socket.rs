@@ -260,6 +260,23 @@ mod tests {
         assert_eq!(fs::read_to_string(&other).unwrap(), "not a socket");
     }
 
+    // A file that took over the socket's device and inode (Linux reuses a freed inode number
+    // at once) is not the socket: built from the file's own identity, so this needs no luck.
+    #[test]
+    fn a_file_with_the_sockets_identity_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automation.sock");
+        fs::write(&path, "theirs").unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let file = SocketFile {
+            path: path.clone(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        file.remove();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+    }
+
     #[test]
     fn removes_only_its_own_socket() {
         let dir = tempfile::tempdir().unwrap();
