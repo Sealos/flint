@@ -357,6 +357,11 @@ impl ResourceList {
     ) {
         self.shown = snapshot;
         self.rows = rows;
+        // `drawn` indexes into the snapshot's columns, and the automation state and `SortBy` read
+        // it before the next frame lays it out, so lay it out again for these columns now.
+        let (drawn, dropped) = self.layout(self.laid_out_width);
+        self.drawn = drawn;
+        self.dropped_wide = dropped;
         match &mut self.selected {
             None => self.selected_ix = None,
             Some(selected) if Some(&selected.uid) == uid.as_ref() => {
