@@ -591,9 +591,18 @@ impl Workspace {
         TabCluster::new(context, server)
     }
 
-    /// Ends the shells whose context was re-pointed at another server (see
-    /// [`Dock::check_servers`]).
+    /// Tells the dock kubeconfig's contexts (its chips tell alike names apart), and ends the
+    /// shells whose context was re-pointed at another server (see [`Dock::check_servers`]).
     fn check_dock_servers(&mut self, cx: &mut Context<Self>) {
+        let contexts: Vec<String> = self
+            .model
+            .read(cx)
+            .clusters
+            .iter()
+            .map(|c| c.info.name.clone())
+            .collect();
+        self.dock
+            .update(cx, |dock, cx| dock.set_contexts(contexts, cx));
         if self.dock.read(cx).tab_count() == 0 {
             return;
         }

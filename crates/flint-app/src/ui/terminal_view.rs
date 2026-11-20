@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::terminal::{Cell, CursorShape, SelectionKind, Side, TermMode, TerminalSize};
-use flint_core::{ExecSession, ExecSnapshot, display};
+use flint_core::{ExecSession, ExecSnapshot};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tooltip::Tooltip;
@@ -42,6 +42,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::dock::{DockItem, TabKey, TabStatus, cluster_chip};
+use super::dock_model;
 use super::log_model::Tone;
 use super::log_view::Note;
 use super::notice::{notice, notice_with};
@@ -125,6 +126,9 @@ pub struct TerminalView {
     note: Option<Note>,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
+    /// The toolbar's cluster chip, as the dock names the tab's cluster: its label, its tooltip
+    /// (the full context and server), and whether the context points elsewhere now.
+    chip: (SharedString, SharedString, bool),
     focus: FocusHandle,
     _pump: Task<()>,
     _resize: Task<()>,
@@ -157,6 +161,14 @@ impl TerminalView {
             cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
         ];
+        let chip = (
+            dock_model::chip_labels(std::slice::from_ref(&request.cluster))
+                .remove(&request.cluster)
+                .unwrap_or_default()
+                .into(),
+            format!("Context {}", request.cluster).into(),
+            false,
+        );
         TerminalView {
             size: session.request().size,
             snapshot: session.peek(),
@@ -172,6 +184,7 @@ impl TerminalView {
             bell: false,
             note: None,
             ended: None,
+            chip,
             focus,
             _pump: pump,
             _resize: Task::ready(()),
@@ -223,6 +236,27 @@ impl TerminalView {
                 cx.notify();
             });
         });
+    }
+
+    /// Sets the toolbar's cluster chip (the dock calls it as the tab's cluster changes).
+    pub fn set_cluster(
+        &mut self,
+        label: String,
+        tooltip: String,
+        repointed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let chip = (label.into(), tooltip.into(), repointed);
+        if chip != self.chip {
+            self.chip = chip;
+            cx.notify();
+        }
+    }
+
+    /// The toolbar's cluster chip.
+    #[cfg(test)]
+    pub fn chip(&self) -> &(SharedString, SharedString, bool) {
+        &self.chip
     }
 
     /// Ends the session, saying why in the tab (its context was re-pointed at another server).
@@ -472,8 +506,9 @@ impl TerminalView {
             // Which cluster the shell runs on, beside its state (the tab says it too).
             .child(cluster_chip(
                 "terminal-cluster",
-                display::short_name(&self.request.cluster),
-                self.ended.is_some(),
+                self.chip.0.clone(),
+                self.chip.2,
+                Some(self.chip.1.clone()),
                 theme,
             ))
             .when_some(title, |el, title| {

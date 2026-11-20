@@ -60,8 +60,12 @@ fn shell_request() -> ShellRequest {
 }
 
 fn shell_request_in(pod: &str) -> ShellRequest {
+    shell_request_on("test", pod)
+}
+
+fn shell_request_on(context: &str, pod: &str) -> ShellRequest {
     ShellRequest {
-        cluster: "test".into(),
+        cluster: context.into(),
         namespace: "demo".into(),
         pod: pod.into(),
         container: Some("app".into()),
@@ -113,16 +117,27 @@ fn open_shell_in(
     dock: &Entity<Dock>,
     pod: &str,
 ) -> (u64, FakeExec) {
+    open_shell_on(cx, window, dock, "test", pod)
+}
+
+/// [`open_shell`] in pod `pod` of context `context`.
+fn open_shell_on(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    dock: &Entity<Dock>,
+    context: &str,
+    pod: &str,
+) -> (u64, FakeExec) {
     let (session, mut fake) =
-        FakeExec::open(shell_request_in(pod).exec_request(TerminalSize::default()));
+        FakeExec::open(shell_request_on(context, pod).exec_request(TerminalSize::default()));
     let id = cx
         .update_window(window, |_, window, cx| {
             dock.update(cx, |dock, cx| {
-                let request = shell_request_in(pod);
+                let request = shell_request_on(context, pod);
                 let key = TabKey::Shell(request.clone());
                 dock.open(
                     key,
-                    TabCluster::new("test", None),
+                    TabCluster::new(context, Some("https://10.0.0.1:6443")),
                     |window, cx| {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     },
@@ -291,7 +306,9 @@ async fn a_shell_ends_when_its_context_is_re_pointed(cx: &mut TestAppContext) {
         dock.read_with(cx, |d, cx| d.tab(shell).unwrap().item(cx).tab_status())
     };
     dock.update(cx, |d, cx| d.check_servers(|_| None, cx));
-    dock.update(cx, |d, cx| d.check_servers(|_| Some(None), cx));
+    dock.update(cx, |d, cx| {
+        d.check_servers(|_| Some(Some("https://10.0.0.1:6443/".into())), cx)
+    });
     draw(cx, window);
     assert_eq!(status(cx), super::dock::TabStatus::Live);
     assert!(!fake.is_closed());
@@ -561,4 +578,92 @@ async fn an_exited_shell_asks_to_restart(cx: &mut TestAppContext) {
         draw(cx, window);
         assert_eq!(*restarts.borrow(), [id, id]);
     }
+}
+
+const PROD: &str = "arn:aws:eks:eu-west-1:111111111111:cluster/main";
+const STAGING: &str = "arn:aws:eks:eu-west-1:222222222222:cluster/main";
+
+/// Tab `id`'s cluster chip, as drawn: its view's shell toolbar chip, and the tab chip's width.
+fn shell_chip(dock: &Entity<Dock>, id: u64, cx: &mut TestAppContext) -> (String, String, bool) {
+    dock.read_with(cx, |d, cx| match d.tab(id).unwrap() {
+        DockTab::Shell(view) => {
+            let (label, tooltip, repointed) = view.read(cx).chip().clone();
+            (label.to_string(), tooltip.to_string(), repointed)
+        }
+        DockTab::Logs(_) => panic!("a shell"),
+    })
+}
+
+// covers UP-41, UP-42: two contexts whose cluster names read alike (one EKS cluster name in
+// two accounts) get different chips, on the tabs and in the shell's toolbar, whose tooltip
+// names the full context and server; a re-pointed context's chips are marked alike.
+#[gpui_kit::test]
+async fn alike_clusters_get_different_chips(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let (prod, _prod_fake) = open_shell_on(cx, window, &dock, PROD, "web-1");
+    let (staging, _staging_fake) = open_shell_on(cx, window, &dock, STAGING, "web-1");
+    dock.update(cx, |d, cx| {
+        d.set_contexts(vec![PROD.to_owned(), STAGING.to_owned()], cx)
+    });
+    draw(cx, window);
+    let (prod_chip, tooltip, _) = shell_chip(&dock, prod, cx);
+    assert_eq!(prod_chip, "main · 111111111111");
+    assert_eq!(shell_chip(&dock, staging, cx).0, "main · 222222222222");
+    assert_eq!(
+        tooltip,
+        format!("Context {PROD}\nAPI server https://10.0.0.1:6443")
+    );
+    let tab_chip = |cx: &mut TestAppContext, id: u64| {
+        dock.read_with(cx, |d, cx| d.list_entry(id, cx).unwrap())
+    };
+    assert_eq!(
+        tab_chip(cx, staging),
+        "Shell: web-1 · app — main · 222222222222 · live"
+    );
+
+    // Re-pointing staging marks its tab and its toolbar chip alike; prod's stay as they were.
+    dock.update(cx, |d, cx| {
+        d.check_servers(
+            |context| {
+                Some(Some(
+                    if context == STAGING {
+                        "https://10.9.9.9"
+                    } else {
+                        "https://10.0.0.1:6443"
+                    }
+                    .to_owned(),
+                ))
+            },
+            cx,
+        )
+    });
+    draw(cx, window);
+    assert!(shell_chip(&dock, staging, cx).2);
+    assert!(dock.read_with(cx, |d, _| d.is_repointed(staging)));
+    assert!(!shell_chip(&dock, prod, cx).2);
+    assert!(!dock.read_with(cx, |d, _| d.is_repointed(prod)));
+}
+
+// covers UP-42: a long context and a long title stay short enough that about two and a half
+// tabs fit in a dock 860 points wide (345 points on macOS; the bound leaves room for other
+// fonts).
+#[gpui_kit::test]
+async fn a_long_context_and_title_keep_the_tab_narrow(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let context = "gke_acme-platform-production-eu_europe-west1-b_payments-core-cluster";
+    let (id, _fake) = open_shell_on(
+        cx,
+        window,
+        &dock,
+        context,
+        "checkout-api-7d9f8b6c5d-x2x9z-with-a-long-suffix",
+    );
+    draw(cx, window);
+    let width = cx
+        .update_window(window, |_, window, _| {
+            f32::from(window.find(("dock-tab", id as usize)).bounds().size.width)
+        })
+        .unwrap();
+    assert!(width <= 360., "a tab is {width} wide");
+    assert_eq!(shell_chip(&dock, id, cx).0, "payment…-cluster");
 }

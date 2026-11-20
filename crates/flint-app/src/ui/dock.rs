@@ -21,6 +21,8 @@
 //!    them to the active tab of that kind (see `Workspace::register_actions`, which does it for
 //!    [`Dock::active_log`] and [`Dock::active_terminal`]) and guard them, as for any view.
 
+use std::collections::HashMap;
+
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -30,7 +32,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub use super::dock_model::TabStatus;
-use super::dock_model::{self, TabCluster};
+use super::dock_model::{self, TabCluster, chip_labels, chip_tooltip};
 use super::log_view::{LogRequest, LogView};
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
@@ -163,6 +165,9 @@ pub struct Dock {
     focus: FocusHandle,
     /// The tab strip's scroll position: the active tab is scrolled into view.
     strip: ScrollHandle,
+    /// Every kubeconfig context, and the chip each one's tabs show ([`chip_labels`]).
+    contexts: Vec<String>,
+    labels: HashMap<String, String>,
 }
 
 impl Dock {
@@ -174,6 +179,8 @@ impl Dock {
             next_id: 1,
             focus: cx.focus_handle(),
             strip: ScrollHandle::new(),
+            contexts: Vec::new(),
+            labels: HashMap::new(),
         }
     }
 
@@ -285,6 +292,7 @@ impl Dock {
                 shown,
             },
         );
+        self.show_cluster(ix + 1, cx);
         self.activate(new, window, cx);
         Some(new)
     }
@@ -297,6 +305,61 @@ impl Dock {
         Some(dock_model::full_title(&title, &tab.cluster))
     }
 
+    /// What the tab list says of tab `id`: its title, its cluster's chip and its status.
+    pub fn list_entry(&self, id: u64, cx: &App) -> Option<String> {
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        let item = tab.tab.item(cx);
+        Some(dock_model::list_label(
+            &item.tab_title(),
+            &self.label(&tab.cluster.context),
+            item.tab_status(),
+        ))
+    }
+
+    /// Whether tab `id`'s context was re-pointed at another server since it opened.
+    #[cfg(test)]
+    pub fn is_repointed(&self, id: u64) -> bool {
+        self.tabs.iter().any(|t| t.id == id && t.repointed)
+    }
+
+    /// The chip of `context`'s tabs: told apart from every other context in kubeconfig.
+    fn label(&self, context: &str) -> String {
+        match self.labels.get(context) {
+            Some(label) => label.clone(),
+            None => chip_labels(&[context.to_owned()])
+                .remove(context)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Takes in kubeconfig's contexts, so chips tell apart contexts whose names read alike, and
+    /// updates the shells' toolbars.
+    pub fn set_contexts(&mut self, contexts: Vec<String>, cx: &mut Context<Self>) {
+        if contexts == self.contexts {
+            return;
+        }
+        self.labels = chip_labels(&contexts);
+        self.contexts = contexts;
+        for ix in 0..self.tabs.len() {
+            self.show_cluster(ix, cx);
+        }
+        cx.notify();
+    }
+
+    /// Tells tab `ix`'s view (a shell's toolbar) its chip: label, tooltip, and whether its
+    /// context points elsewhere now.
+    fn show_cluster(&self, ix: usize, cx: &mut Context<Self>) {
+        let tab = &self.tabs[ix];
+        if let DockTab::Shell(view) = &tab.tab {
+            let label = self.label(&tab.cluster.context);
+            let tooltip = chip_tooltip(&tab.cluster);
+            let repointed = tab.repointed;
+            view.update(cx, |view, cx| {
+                view.set_cluster(label, tooltip, repointed, cx)
+            });
+        }
+    }
+
     /// Ends the shells whose context now points at another API server than when they opened
     /// (`server_of` gives a context's server now, `None` for a context that is gone, which is
     /// left alone). A shell stays connected to the server it started on; its tab would
@@ -307,7 +370,8 @@ impl Dock {
         server_of: impl Fn(&str) -> Option<Option<String>>,
         cx: &mut Context<Self>,
     ) {
-        for tab in &mut self.tabs {
+        for ix in 0..self.tabs.len() {
+            let tab = &mut self.tabs[ix];
             if tab.repointed {
                 continue;
             }
@@ -325,6 +389,7 @@ impl Dock {
                 let note = dock_model::repointed_note(&tab.cluster.context);
                 view.update(cx, |view, cx| view.end(note, cx));
             }
+            self.show_cluster(ix, cx);
             cx.notify();
         }
     }
@@ -377,6 +442,7 @@ impl Dock {
             repointed: false,
             shown,
         });
+        self.show_cluster(self.tabs.len() - 1, cx);
         if self.active.is_none() {
             self.active = Some(id);
             self.visible = true;
@@ -542,7 +608,7 @@ impl Dock {
             .flex_none()
             .pl_2()
             .pr_1()
-            .gap_1p5()
+            .gap_1()
             .text_xs()
             .border_r_1()
             .border_color(theme.border)
@@ -572,10 +638,12 @@ impl Dock {
             .on_click(registry::on_click(ActivateTab { tab: id }))
             .child(div().size_1p5().flex_none().rounded_full().bg(dot))
             // The cluster first: a shell on production must not pass for one on a dev cluster.
+            // The tab's own tooltip names the context and server.
             .child(cluster_chip(
                 ("dock-tab-cluster", id as usize),
-                tab.cluster.label(),
+                self.label(&tab.cluster.context),
                 tab.repointed,
+                None,
                 theme,
             ))
             .child(
@@ -606,16 +674,21 @@ pub fn cluster_chip(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     repointed: bool,
+    tooltip: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
     div()
         .id(id)
+        .when_some(tooltip, |el, tooltip| {
+            el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        })
         .flex_none()
         .px_1()
         .rounded_sm()
         .border_1()
         .border_color(theme.border)
         .whitespace_nowrap()
+        .text_size(px(10.))
         .text_color(if repointed {
             theme.warning
         } else {
@@ -633,14 +706,9 @@ impl Dock {
         let entries: Vec<(u64, String, bool)> = self
             .tabs
             .iter()
-            .map(|tab| {
-                let item = tab.tab.item(cx);
-                let label = dock_model::list_label(
-                    &item.tab_title(),
-                    &tab.cluster.label(),
-                    item.tab_status(),
-                );
-                (tab.id, label, self.active == Some(tab.id))
+            .filter_map(|tab| {
+                let label = self.list_entry(tab.id, cx)?;
+                Some((tab.id, label, self.active == Some(tab.id)))
             })
             .collect();
         Button::new("dock-tab-list")
