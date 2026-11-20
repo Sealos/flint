@@ -499,7 +499,7 @@ adds a `DockTab` and `TabKey` variant; the module documentation lists the steps.
   Opening a request on the same cluster shows its tab while the tab answers for it (`dock_model::reopens`): while its
   session starts, runs or retries, and for previous logs read to their end. A tab that failed, or a stream or shell
   that ended, keeps its output, and a fresh tab opens beside it. When a context is re-pointed at another server, a
-  shell on it ends and says why (exec sessions do not recheck their context; log sessions do, every 30 s, and end on
+  shell on it ends and says why (the core's log and exec sessions also recheck their context every 30 s, and end on
   their own), and its tab stops answering for its request, so Logs or Shell opens on the new server.
 - **Restarting.** Reconnect Logs and Restart Shell (`dock::ReconnectLogs`, Cmd-R in the dock;
   `dock::RestartShell`, Cmd-R, or Ctrl+Shift+R on Linux, where a shell tab hands Ctrl-R to the shell) start the
@@ -583,6 +583,12 @@ opens in a tab in the bottom dock.
   position reports) go straight back to the pod, and the UI reads immutable screen snapshots, at most one per frame
   (16 ms; the first after a quiet spell at once). Keystrokes, pastes (bracketed when asked for), resizes, scrolling and
   selections go back through the session. The screen stays scrollable and selectable after the command exits.
+- **Pinned to its server.** A session is pinned to the API server its client was built for (the context's server when
+  the cluster manager handed out the client). While it connects or runs, it asks the manager every 30 s
+  (`recheck::RECHECK_EVERY`, shared with log sessions) whether the context still points there, never the server. A
+  context re-pointed elsewhere or removed ends it with `ExecFailureKind::ContextChanged` and the reason, worded as a
+  log session's (`recheck::moved`). Ending drops the exec connection, as closing the session does, so no stream stays
+  open on the old server.
 - **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.

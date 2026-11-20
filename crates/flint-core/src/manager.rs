@@ -23,6 +23,7 @@ use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
+use crate::recheck::{self, Pinned};
 use crate::settings::{self, AiScope, Settings};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
@@ -470,7 +471,16 @@ impl ClusterManager {
                 let _ = reply.send(self.client(&cluster));
             }
             Request::WriteClient { cluster, reply } => {
-                let _ = reply.send(self.write_client(&cluster));
+                // The client's own server, which a shell is pinned to (`CheckContext`).
+                let server = self.cluster(&cluster).and_then(|c| c.info.server.clone());
+                let _ = reply.send(self.write_client(&cluster).map(|client| (client, server)));
+            }
+            Request::CheckContext {
+                cluster,
+                server,
+                reply,
+            } => {
+                let _ = reply.send(self.moved(Pinned::Shell, &cluster, server.as_deref()));
             }
             Request::FetchObject {
                 cluster,
@@ -999,17 +1009,12 @@ impl ClusterManager {
     /// context that now points at another API server than `server` (the one the session was
     /// opened against) ends the session.
     fn log_client(&mut self, cluster: &str, server: Option<&str>) -> Result<Client, LogError> {
-        let Some(slot) = self.cluster(cluster) else {
-            return Err(LogError::cluster(format!(
-                "\"{cluster}\" is no longer in your kubeconfig files"
-            )));
-        };
-        if slot.info.server.as_deref() != server {
-            return Err(LogError::cluster(format!(
-                "\"{cluster}\" now points to a different API server; open the logs again to read \
-                 from it"
-            )));
+        if let Some(reason) = self.moved(Pinned::Logs, cluster, server) {
+            return Err(LogError::cluster(reason));
         }
+        let slot = self
+            .cluster(cluster)
+            .expect("a context that is gone has moved");
         if let Some(client) = &slot.client {
             return Ok(client.clone());
         }
@@ -1025,6 +1030,13 @@ impl ClusterManager {
                 Err(LogError::retry(format!("connecting to \"{cluster}\"")))
             }
         }
+    }
+
+    /// Why a session opened on `cluster` when it pointed at `server` must end: the context
+    /// is gone or points elsewhere now ([`recheck::moved`]).
+    fn moved(&self, session: Pinned, cluster: &str, server: Option<&str>) -> Option<String> {
+        let current = self.cluster(cluster).map(|c| c.info.server.as_deref());
+        recheck::moved(session, cluster, server, current)
     }
 
     fn client(&self, cluster: &str) -> Option<Client> {
@@ -1752,6 +1764,44 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(plugin.starts(), [leader]);
+    }
+
+    // covers UP-06, UP-41: a shell's check (`Request::CheckContext`) compares the context with
+    // the server the shell opened on, whatever the context says now.
+    #[test]
+    fn a_shell_ends_once_its_context_points_elsewhere_or_is_gone() {
+        let (events, _rx) = async_channel::unbounded();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let hubs = HubRegistry::default();
+        let mut manager =
+            ClusterManager::new(config, events, hubs.clone(), SessionUnlocks::default());
+        manager.clusters.push(Cluster::new(
+            context(None),
+            None,
+            &hubs,
+            &manager.engine_config,
+        ));
+        assert_eq!(
+            manager.moved(Pinned::Shell, "dev", Some("https://dev")),
+            None
+        );
+        let moved = manager
+            .moved(Pinned::Shell, "dev", Some("https://old"))
+            .expect("re-pointed");
+        assert!(moved.contains("different API server"), "{moved}");
+        assert!(moved.contains("open the shell again"), "{moved}");
+        let gone = manager
+            .moved(Pinned::Shell, "other", Some("https://other"))
+            .expect("removed");
+        assert!(gone.contains("no longer in your kubeconfig"), "{gone}");
     }
 
     // covers UP-54, UP-55: the one gate for actions that change a cluster refuses while it is

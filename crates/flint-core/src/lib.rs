@@ -21,6 +21,7 @@ mod manager;
 pub mod paging;
 pub mod protection;
 pub mod read;
+mod recheck;
 pub mod redact;
 pub mod settings;
 pub mod store;

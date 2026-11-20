@@ -15,7 +15,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
-use crate::exec::{ExecRequest, ExecSession};
+use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
     Freshness, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget, PodSet,
@@ -24,6 +24,7 @@ use crate::logs::{
 use crate::manager::ClusterManager;
 use crate::protection::{SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
+use crate::recheck::RECHECK_EVERY;
 use crate::settings::{Appearance, Settings, WatchMode};
 use crate::store::{Feed, KindSnapshot, SyncState};
 use crate::view::{self, ViewQuery};
@@ -183,9 +184,18 @@ pub(crate) enum Request {
     },
     /// The cluster's client for an action that changes the cluster or runs code in it, if the
     /// cluster is connected and not protected (ADR-0015). Every such action asks through this.
+    /// Answered with the API server the client was built for, which a session started with it
+    /// is pinned to.
     WriteClient {
         cluster: ClusterId,
-        reply: oneshot::Sender<Result<kube::Client, WriteRefusal>>,
+        reply: oneshot::Sender<Result<(kube::Client, Option<String>), WriteRefusal>>,
+    },
+    /// Why a session opened on `cluster` when it pointed at `server` must end (the context is
+    /// gone or points to another server now), or `None`. Never contacts the server.
+    CheckContext {
+        cluster: ClusterId,
+        server: Option<String>,
+        reply: oneshot::Sender<Option<String>>,
     },
 }
 
@@ -475,18 +485,26 @@ impl CoreHandle {
         crate::auth_plugin::retry_now(&request.cluster);
         let (session, channels) = ExecSession::new(request.clone());
         let client = self.write_client(&request.cluster);
+        let requests = self.requests.clone();
+        let cluster = request.cluster.clone();
         self.runtime.spawn(async move {
-            crate::exec::start(client.await, request, channels).await;
+            let client = client.await.map(|(client, server)| {
+                let check = context_check(requests, cluster, server);
+                (client, ContextWatch::new(check, RECHECK_EVERY))
+            });
+            crate::exec::start(client, request, channels).await;
         });
         session
     }
 
-    /// The client for an action that changes `cluster` or runs code in it: refused while the
-    /// cluster is protected (ADR-0015) or not connected. Never blocks.
+    /// The client for an action that changes `cluster` or runs code in it, with the API server
+    /// it was built for: refused while the cluster is protected (ADR-0015) or not connected.
+    /// Never blocks.
     fn write_client(
         &self,
         cluster: &str,
-    ) -> impl Future<Output = Result<kube::Client, WriteRefusal>> + Send + 'static {
+    ) -> impl Future<Output = Result<(kube::Client, Option<String>), WriteRefusal>> + Send + 'static
+    {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::WriteClient {
             cluster: cluster.to_owned(),
@@ -796,6 +814,29 @@ impl Drop for RuntimeGuard {
             rt.shutdown_background();
         }
     }
+}
+
+/// Asks the cluster manager whether `cluster` still points at `server`, for a session pinned
+/// there. While the core is busy or stopped, the session goes on: it has its own client.
+fn context_check(
+    requests: async_channel::Sender<Request>,
+    cluster: ClusterId,
+    server: Option<String>,
+) -> ContextCheck {
+    Arc::new(move || {
+        let (reply, rx) = oneshot::channel();
+        let sent = requests.try_send(Request::CheckContext {
+            cluster: cluster.clone(),
+            server: server.clone(),
+            reply,
+        });
+        Box::pin(async move {
+            if sent.is_err() {
+                return None;
+            }
+            rx.await.ok().flatten()
+        })
+    })
 }
 
 /// Runs `task` on `runtime`. The returned future yields its output (`None` if the runtime
