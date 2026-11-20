@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-use crate::fake_api::{RequestRecord, requests_at};
+use crate::fake_api::{RequestRecord, arrivals_at};
 
 /// How many of a server's unexpected requests a violation lists.
 const LISTED: usize = 5;
@@ -27,7 +27,8 @@ const LISTED: usize = 5;
 /// One fake server the app could reach.
 #[derive(Debug)]
 struct Server {
-    /// Its requests when the app launched (or when the kubeconfig first named it).
+    /// The requests that had arrived when the app launched (or when the kubeconfig first named
+    /// it). Counted on arrival, so a request a fault delays counts from when it was sent.
     baseline: usize,
     selected: bool,
 }
@@ -71,6 +72,19 @@ impl Teardown {
         self.refresh_contexts();
     }
 
+    /// The app is about to read `files` (settings the test is about to write list them): their
+    /// bytes, and the request counts of the fake servers they name, are taken now, before the
+    /// app can read or contact them.
+    pub fn expect_files(&mut self, files: Vec<PathBuf>) {
+        for path in files {
+            if !self.kubeconfigs.iter().any(|(p, _)| *p == path) {
+                let bytes = std::fs::read(&path).ok();
+                self.kubeconfigs.push((path, bytes));
+            }
+        }
+        self.refresh_contexts();
+    }
+
     /// The test selects `context` now: checks that the app has not contacted its servers yet,
     /// and allows requests to them from here on.
     pub fn selecting(&mut self, context: &str) {
@@ -84,7 +98,7 @@ impl Teardown {
                 continue;
             }
             server.selected = true;
-            let requests = requests_at(&url).unwrap_or_default();
+            let requests = arrivals_at(&url).unwrap_or_default();
             if requests.len() > server.baseline {
                 self.violations.push(unexpected(
                     &format!("before the test selected {context:?}"),
@@ -104,7 +118,7 @@ impl Teardown {
             if server.selected {
                 continue;
             }
-            let requests = requests_at(url).unwrap_or_default();
+            let requests = arrivals_at(url).unwrap_or_default();
             if requests.len() > server.baseline {
                 violations.push(unexpected(
                     &format!(
@@ -173,7 +187,7 @@ impl Teardown {
             let Some(url) = context.server else { continue };
             let url = url.trim_end_matches('/').to_owned();
             if !self.servers.contains_key(&url)
-                && let Some(requests) = requests_at(&url)
+                && let Some(requests) = arrivals_at(&url)
             {
                 let selected = self.contexts.get(&context.name).is_some_and(|urls| {
                     urls.iter()
@@ -207,7 +221,11 @@ fn unexpected(when: &str, url: &str, requests: &[RequestRecord]) -> String {
         requests.len()
     );
     for request in requests.iter().take(LISTED) {
-        let _ = write!(text, "\n    {request}");
+        let _ = write!(
+            text,
+            "\n    {} {}?{}",
+            request.method, request.path, request.query
+        );
     }
     if requests.len() > LISTED {
         let _ = write!(text, "\n    … and {} more", requests.len() - LISTED);
@@ -394,6 +412,53 @@ mod tests {
         let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("later changed"), "{violations:?}");
+    }
+
+    #[test]
+    fn files_expected_before_settings_name_them_count_from_then() {
+        let two = Two::start();
+        let path = two.kubeconfig();
+        let only_a = two.dir.path().join("only-a");
+        write_kubeconfigs(&only_a, &[(&two.a, "a", None)]).unwrap();
+        let mut teardown = files(vec![only_a]);
+        // Settings are about to add the file with b: its bytes and b's count are taken now.
+        teardown.expect_files(vec![path.clone()]);
+        two.contact(&two.b);
+        std::fs::write(&path, "rewritten").unwrap();
+        let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations[0].contains("never selected \"b\""),
+            "{violations:?}"
+        );
+        assert!(violations[1].starts_with("UP-90"), "{violations:?}");
+    }
+
+    #[test]
+    fn a_request_still_delayed_at_selection_counts_as_before_it() {
+        let two = Two::start();
+        let mut teardown = two.teardown();
+        two.a
+            .inject(crate::fake_api::Fault::delay(std::time::Duration::from_secs(2)).times(1));
+        // The request arrives before the selection but is answered after it.
+        let started = std::time::Instant::now();
+        let a = &two.a;
+        std::thread::scope(|scope| {
+            scope.spawn(|| two.contact(a));
+            while a.arrivals().is_empty() {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(a.requests().is_empty(), "not answered yet");
+            teardown.selecting("a");
+        });
+        let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("before the test selected \"a\"")
+                && violations[0].contains("GET /version"),
+            "{violations:?}"
+        );
     }
 
     #[test]

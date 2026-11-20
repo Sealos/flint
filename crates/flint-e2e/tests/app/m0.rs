@@ -385,7 +385,7 @@ fn up_08_up_12_app_and_flint_mcp_agree_on_exposure() -> Result<()> {
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
     let config_dir = app.config_dir();
-    let settings = |extra: &str| flint_e2e::scratch::write_settings(&config_dir, extra);
+    let settings = |extra: &str| app.write_settings(extra);
     let mut mcp = Mcp::flint(app.binary(), two.kubeconfig(), &config_dir)?;
     let listed = |mcp: &mut Mcp| -> Result<Vec<String>> {
         let clusters = mcp.call_json("list_clusters", json!({}))?;

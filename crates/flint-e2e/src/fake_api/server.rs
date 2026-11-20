@@ -127,6 +127,8 @@ struct Inner {
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
+    /// Every request as it arrived, before faults or answers: what the app sent, and when.
+    arrivals: Mutex<Vec<RequestRecord>>,
     shutdown: watch::Receiver<()>,
 }
 
@@ -134,9 +136,10 @@ struct Inner {
 /// of the servers a kubeconfig names ([`requests_at`]).
 static RUNNING: Mutex<Vec<(String, Weak<Inner>)>> = Mutex::new(Vec::new());
 
-/// The requests received so far by the fake server at `url` in this process, oldest first, or
-/// `None` when no fake server runs there (another cluster, such as kind, or a closed port).
-pub fn requests_at(url: &str) -> Option<Vec<RequestRecord>> {
+/// The requests that have reached the fake server at `url` in this process so far, as they
+/// arrived (before any fault delays them, and without a status), oldest first; `None` when no
+/// fake server runs there (another cluster, such as kind, or a closed port).
+pub fn arrivals_at(url: &str) -> Option<Vec<RequestRecord>> {
     let url = url.trim_end_matches('/');
     let running = lock(&RUNNING);
     // The newest first: a port can be reused while a stopped server's tasks still wind down.
@@ -146,7 +149,7 @@ pub fn requests_at(url: &str) -> Option<Vec<RequestRecord>> {
         .find(|(u, _)| u == url)
         .and_then(|(_, inner)| inner.upgrade())?;
     drop(running);
-    Some(lock(&inner.requests).clone())
+    Some(lock(&inner.arrivals).clone())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -212,6 +215,7 @@ impl FakeApiServer {
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
+            arrivals: Mutex::default(),
             shutdown,
         });
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.clone());
@@ -475,9 +479,15 @@ impl FakeApiServer {
         lock(&self.inner.faults).clear();
     }
 
-    /// Every request so far, oldest first.
+    /// Every request answered (or dropped) so far, oldest first.
     pub fn requests(&self) -> Vec<RequestRecord> {
         lock(&self.inner.requests).clone()
+    }
+
+    /// Every request that has arrived so far, oldest first, including those still delayed by a
+    /// fault or not yet answered (their `status` is `None`).
+    pub fn arrivals(&self) -> Vec<RequestRecord> {
+        lock(&self.inner.arrivals).clone()
     }
 
     fn last_requests(&self, n: usize) -> String {
@@ -609,6 +619,7 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
         verb,
         status: None,
     };
+    lock(&inner.arrivals).push(record.clone());
     let upgrade = remote::is_websocket_upgrade(req.headers());
     let effect = lock(&inner.faults).take(verb, &route, upgrade);
     let response = match effect {

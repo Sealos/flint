@@ -276,9 +276,11 @@ pub struct App {
     screenshots: PathBuf,
     binary: PathBuf,
     next_id: std::sync::atomic::AtomicU64,
-    /// A request the test sent timed out or lost the app: the test is likely failing with that
-    /// error, which a teardown panic would hide.
-    failed: std::sync::atomic::AtomicBool,
+    /// The test said it is failing ([`App::mark_failing`]): the teardown prints its report
+    /// instead of panicking over the test's own error.
+    failing: std::sync::atomic::AtomicBool,
+    /// The `KUBECONFIG` the app runs with, for [`App::write_settings`].
+    kubeconfig: Option<OsString>,
     teardown: Mutex<Teardown>,
     _turn: MutexGuard<'static, ()>,
 }
@@ -365,7 +367,8 @@ impl App {
             screenshots,
             binary,
             next_id: Default::default(),
-            failed: Default::default(),
+            failing: Default::default(),
+            kubeconfig: options.kubeconfig.clone(),
             teardown: Mutex::new(teardown),
             _turn: turn,
         };
@@ -449,14 +452,7 @@ impl App {
             .map_or(ANSWER, |ms| {
                 Duration::from_millis(ms) + Duration::from_secs(30)
             });
-        let result = self.request_within(cmd, args, timeout);
-        if let Err(error) = &result
-            && matches!(error.code.as_str(), "timeout" | "transport")
-        {
-            self.failed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+        self.request_within(cmd, args, timeout)
     }
 
     fn request_within(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, AppError> {
@@ -521,6 +517,26 @@ impl App {
         let result = edit();
         self.teardown().kubeconfig_edited();
         result
+    }
+
+    /// Writes the app's `settings.toml` (see [`crate::scratch::write_settings`]). Kubeconfig
+    /// files the new settings add (`kubeconfig_paths`) are snapshotted first, with the request
+    /// counts of the servers they name, before the app can read them (UP-90, UP-91). Tests
+    /// change settings through this, not by writing the file.
+    pub fn write_settings(&self, settings: &str) -> Result<()> {
+        let staged = tempfile::tempdir()?;
+        crate::scratch::write_settings(staged.path(), settings)?;
+        let files = kubeconfig_files_in(self.kubeconfig.as_deref(), &self.home(), staged.path());
+        self.teardown().expect_files(files);
+        crate::scratch::write_settings(&self.config_dir(), settings)
+    }
+
+    /// Says the test is failing with an error it is about to return: dropping the app then
+    /// prints the teardown's violations instead of panicking, so that error is the one shown.
+    /// The teardown is otherwise fatal, whatever requests failed on the way.
+    pub fn mark_failing(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn teardown(&self) -> MutexGuard<'_, Teardown> {
@@ -743,15 +759,17 @@ fn report(violations: &[String]) -> String {
 fn kubeconfig_files(kubeconfig: Option<OsString>, scratch: &Scratch) -> teardown::Files {
     let home = scratch.home();
     let config_dir = scratch.config_dir();
-    Box::new(move || {
-        let base = flint_core::kubeconfig::base_paths(kubeconfig.as_deref(), Some(&home));
-        match flint_core::settings::load_settings(&config_dir) {
-            Ok(settings) => {
-                flint_core::kubeconfig::paths_for_settings(&base, &settings, Some(&home))
-            }
-            Err(_) => base,
-        }
-    })
+    Box::new(move || kubeconfig_files_in(kubeconfig.as_deref(), &home, &config_dir))
+}
+
+/// The kubeconfig files the app reads with `KUBECONFIG` set to `kubeconfig`, `HOME` at `home`
+/// and the `settings.toml` in `config_dir`.
+fn kubeconfig_files_in(kubeconfig: Option<&OsStr>, home: &Path, config_dir: &Path) -> Vec<PathBuf> {
+    let base = flint_core::kubeconfig::base_paths(kubeconfig, Some(home));
+    match flint_core::settings::load_settings(config_dir) {
+        Ok(settings) => flint_core::kubeconfig::paths_for_settings(&base, &settings, Some(home)),
+        Err(_) => base,
+    }
 }
 
 impl Drop for App {
@@ -774,9 +792,9 @@ impl Drop for App {
         let report = report(&violations);
         // A second panic would abort the test binary: the first failure stands, and this one
         // is in the test's output.
-        // So does a test failing with an error from a timed-out request: its error is the one to
+        // So does a test that said it is failing (`App::mark_failing`): its error is the one to
         // read, and the report is printed after the log.
-        if std::thread::panicking() || self.failed.load(std::sync::atomic::Ordering::Relaxed) {
+        if std::thread::panicking() || self.failing.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("{report}");
         } else {
             panic!("{report}");

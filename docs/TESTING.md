@@ -245,23 +245,26 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
 - **Teardown checks** (`flint_e2e::teardown`, #127). When the app goes away, by `App::quit` or by dropping it,
   every app test checks what must always hold, whatever it did:
   - UP-91: no fake API server received a request from the app before the test selected a cluster on it, and a server
-    the test never selected received none. Counts start at the launch, per server, for the fake servers the app's
+    the test never selected received none. Requests count when they arrive at the server, so one a fault delays past
+    the selection still counts as before it. Counts start at the launch, per server, for the fake servers the app's
     kubeconfig names (servers a test adds later count from when it adds them). A kind cluster has no request log and
     is not checked.
   - UP-90: every kubeconfig file the app reads (the `KUBECONFIG` list, or the scratch `HOME`'s `.kube/config` when it
-    is unset, and `kubeconfig_paths` in its `settings.toml`, including paths added during the test) is byte-identical
-    at the end, and a missing one is still missing.
+    is unset, and `kubeconfig_paths` in its `settings.toml`) is byte-identical at the end, and a missing one is still
+    missing. Tests change settings with `App::write_settings`, which takes the bytes of the files the new settings
+    add, and the request counts of their servers, before the app can read them.
   - The app exited cleanly on Quit (not killed) and removed its automation socket.
 
-  `App::quit` returns the violations as an error; dropping the app panics with them, or only prints them when the test
-  is already panicking or a request timed out or lost the app (the test's own error is the one to read). A launch that
-  fails is not checked. The exceptions are explicit: `App::select_cluster` marks the cluster selected,
-  `App::mark_selected` does so for a selection made another way (the switcher, the palette), a cluster the test
-  exposes to AI, or a request the test sends itself, `App::edit_kubeconfig(|| …)` wraps the test's own kubeconfig changes (UP-06), and
+  `App::quit` returns the violations as an error. Dropping the app panics with them, or only prints them when the test
+  is already panicking or has called `App::mark_failing` before returning its own error; a request that failed on the
+  way does not soften the check. A launch that fails is not checked. The exceptions are explicit:
+  `App::select_cluster` marks the cluster selected, `App::mark_selected` does so for a selection made another way
+  (the switcher, the palette), a cluster the test exposes to AI, or a request the test sends itself,
+  `App::edit_kubeconfig(|| …)` wraps the test's own kubeconfig changes (UP-06), and
   `AppOptions::cluster_at_startup` sets `FLINT_CLUSTER` and counts that cluster as selected from the launch
-  (`AppOptions::env` refuses `FLINT_CLUSTER`). Requests are recorded when the fake server answers them, so a request
-  delayed by a fault past the selection counts as after it. `tests/app/harness.rs` breaks UP-90 and UP-91 on purpose in the app
-  and asserts that the test fails; the unit tests in `teardown.rs` also cover a killed app and a socket left behind.
+  (`AppOptions::env` refuses `FLINT_CLUSTER`). `tests/app/harness.rs` breaks UP-90 and UP-91 on purpose in the app
+  (including a delayed request, a file added through settings and a handled timeout) and asserts that the test
+  fails; the unit tests in `teardown.rs` also cover a killed app and a socket left behind.
 - **`Mcp`** (`flint_e2e::mcp`): `Mcp::start` runs `flint-mcp`; `Mcp::flint` runs `flint mcp` from the app binary,
   for tests that check the app and the server agree. Both get the given kubeconfig (an empty one is refused), the
   given config directory (with a fixed-`path` `settings.toml` if it has none) and a scratch `HOME`. JSON-RPC over
