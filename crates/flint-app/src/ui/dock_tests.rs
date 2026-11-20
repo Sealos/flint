@@ -194,7 +194,7 @@ fn close(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) {
     draw(cx, window);
 }
 
-// covers UP-42: closing a shell tab frees its view and ends its session.
+// covers UP-42: closing a shell tab frees its view, ends its session and hangs up its command.
 #[gpui_kit::test]
 async fn closing_a_shell_tab_leaks_nothing(cx: &mut TestAppContext) {
     let (window, dock) = open_dock(cx);
@@ -209,6 +209,12 @@ async fn closing_a_shell_tab_leaks_nothing(cx: &mut TestAppContext) {
     cx.update(|cx| cx.assert_no_new_leaks(&snapshot));
     assert_eq!(dock.read_with(cx, |d, _| d.tab_count()), 0);
     assert!(fake.is_closed(), "closing the tab ends the session");
+    // The command still ran: it gets Ctrl-C, then Ctrl-D, so nothing stays alive on the pod.
+    assert!(
+        fake.written().ends_with(b"\x03\x04"),
+        "{:?}",
+        fake.written()
+    );
 }
 
 // covers UP-42: closing a log tab frees its view (its search field and list included).

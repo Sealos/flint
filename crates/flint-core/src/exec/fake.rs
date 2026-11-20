@@ -110,16 +110,30 @@ impl FakeExec {
                 Input::SelectionText(reply) => {
                     let _ = reply.send(self.channels.model.selection_text());
                 }
-                Input::Close => {
-                    self.closed = true;
-                    self.state = ExecState::Closed;
-                }
+                Input::Close => self.close(),
             }
+        }
+        if self.channels.inputs.is_closed() {
+            self.close();
         }
         self.publish();
     }
 
-    /// The keystrokes and pastes sent so far, as bytes.
+    /// The handle closed the session or was dropped: a command still running gets
+    /// [`super::HANG_UP`], as from a live session.
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        if matches!(self.state, ExecState::Running { .. }) {
+            self.written.extend_from_slice(&super::HANG_UP);
+        }
+        self.closed = true;
+        self.state = ExecState::Closed;
+    }
+
+    /// The keystrokes and pastes sent so far, as bytes, with [`super::HANG_UP`] last when the
+    /// session was closed while its command ran.
     pub fn written(&self) -> &[u8] {
         &self.written
     }
@@ -142,7 +156,7 @@ impl FakeExec {
     /// Whether the handle closed the session, or was dropped.
     pub fn is_closed(&mut self) -> bool {
         self.pump();
-        self.closed || self.channels.inputs.is_closed()
+        self.closed
     }
 
     /// The snapshot the session shows now.
@@ -198,5 +212,27 @@ mod tests {
         assert!(!fake.is_closed());
         drop(session);
         assert!(fake.is_closed());
+        assert!(fake.written().is_empty(), "nothing runs to hang up");
+    }
+
+    // covers UP-41
+    #[test]
+    fn closing_a_running_command_hangs_it_up() {
+        let (session, mut fake) = open();
+        fake.set_state(ExecState::Running {
+            command: vec!["sh".into()],
+        });
+        session.write(b"yes\r".to_vec());
+        session.close();
+        assert!(fake.is_closed());
+        assert_eq!(fake.written(), b"yes\r\x03\x04");
+
+        let (session, mut fake) = open();
+        fake.set_state(ExecState::Running {
+            command: vec!["sh".into()],
+        });
+        drop(session);
+        assert!(fake.is_closed());
+        assert_eq!(fake.written(), super::super::HANG_UP);
     }
 }
