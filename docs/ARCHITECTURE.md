@@ -431,7 +431,14 @@ history is not taken for a quiet pod (#254).
   are not interpreted, so lines show, copy and save as plain text, and `\x1b[33mWARN` still reads as a warning.
   Only a line with something to strip costs an extra allocation.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
-  following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
+  following with a search open scans only new lines; there is no index. A search is plain text or, with the regex
+  toggle, a regular expression (the `regex` crate: no look-around, size-limited; an invalid one matches nothing and
+  the toolbar says why). **Filtering** (`LogFilter`, #264) works the same way: "Matching lines only" (with 0 to 100
+  lines of context, as `grep -C`) and "Errors" (warnings and errors, by the severity rules below) keep the ids of
+  the lines shown, scan only new lines when the tab is drawn, and run their first scan, and any catch-up of more than
+  20,000 lines, on the core's threads (`CoreHandle::filter_logs`), so a 100k-line buffer filters without holding up
+  a frame. The list then has one item per row shown; copies and saves
+  of a filtered tab write the rows it shows. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.
 - **Highlighting:** the view colors each line by its severity with the theme's error and warning tokens. The rules
   live in `logs::classify`: case-insensitive whole words; `ERROR`, `FATAL`, `panic`, and any word ending in

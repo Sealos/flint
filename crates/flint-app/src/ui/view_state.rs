@@ -479,6 +479,8 @@ pub struct LogTabState {
     pub sources: bool,
     pub wrap: bool,
     pub search: SearchState,
+    /// The filtered view (UP-48).
+    pub filter: FilterState,
     pub selection: Option<SelectionState>,
     /// A workload's streams.
     pub streams: Option<StreamCounts>,
@@ -489,6 +491,23 @@ pub struct LogTabState {
 impl LogTabState {
     /// The most lines `state` reports of a tab: enough to wait for a line, never the buffer.
     pub const LINE_LIMIT: usize = 50;
+}
+
+/// A log tab's filtered view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FilterState {
+    pub matching_only: bool,
+    pub errors_only: bool,
+    /// The search is a regular expression.
+    pub regex: bool,
+    /// Lines shown around each line that passes.
+    pub context: usize,
+    /// Rows shown while filtered (`None`: every line is shown).
+    pub rows: Option<usize>,
+    /// The first scan of a new filter runs on the core's threads.
+    pub filtering: bool,
+    /// Why the regular expression matches nothing.
+    pub regex_error: Option<String>,
 }
 
 /// A log tab's search.

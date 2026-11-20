@@ -234,6 +234,12 @@ actions!(
         ToggleWrap,
         /// Show or hide a workload line's pod and container.
         ToggleSources,
+        /// Show only the lines matching the search (with context), or every line.
+        ToggleMatchingOnly,
+        /// Search with a regular expression, or for plain text.
+        ToggleRegex,
+        /// Show only warnings and errors, or every line.
+        ToggleErrorsOnly,
         /// Move focus to the log search field.
         FocusSearch,
         /// Go to the next line matching the search.
@@ -587,6 +593,15 @@ pub struct SaveLines {
     pub lines: SaveScope,
     #[serde(default)]
     pub timestamps: Option<bool>,
+}
+
+/// How many lines to show before and after each line a filtered log tab shows (0 to 100), as
+/// `grep -C` does.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = logs, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct SetLogContext {
+    pub lines: u32,
 }
 
 /// Run the palette entry shown in row `row` (a click on it). `rows` is the version of the
@@ -1698,6 +1713,11 @@ const COLUMN: &[Arg] = &[
     },
 ];
 const KEY: &[Arg] = &[arg("key", "the data key", ArgKind::Text)];
+const LOG_CONTEXT: &[Arg] = &[arg(
+    "lines",
+    "lines before and after, 0 to 100",
+    ArgKind::Number,
+)];
 const PALETTE_ROW: &[Arg] = &[
     arg("row", "row, from the top, 0 and up", ArgKind::Number),
     Arg {
@@ -2277,6 +2297,30 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<ToggleWrap>("Toggle Line Wrap", "Wrap long lines, or cut them at the edge.")
             .of(C::Logs, S::Logs)
             .keys(&["w"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleMatchingOnly>(
+            "Toggle Matching Lines Only",
+            "Show only the lines matching the search, with their context, or every line.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["m"], Some(LOG_PLAIN)),
+        Spec::unit::<ToggleRegex>(
+            "Toggle Regex Search",
+            "Search with a regular expression, or for plain text.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["secondary-alt-x"], Some(LOG_VIEW)),
+        Spec::unit::<ToggleErrorsOnly>(
+            "Toggle Errors Only",
+            "Show only warnings and errors, or every line.",
+        )
+        .of(C::Logs, S::Logs)
+        .keys(&["e"], Some(LOG_PLAIN)),
+        Spec::with_args::<SetLogContext>(
+            "Set Context Lines…",
+            "How many lines to show around each line a filtered log tab shows.",
+            LOG_CONTEXT,
+        )
+        .of(C::Logs, S::Logs),
         Spec::unit::<FocusSearch>("Search Logs", "Move focus to the log search field.")
             .of(C::Logs, S::Logs)
             .keys(&["secondary-f"], Some(LOG_VIEW)),

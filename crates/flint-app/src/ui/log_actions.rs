@@ -9,8 +9,8 @@ use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
     ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, OnView,
     PrevMatch, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
-    SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, TogglePause, ToggleSources,
-    ToggleTimestamps, ToggleWrap,
+    SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, SetLogContext, ToggleErrorsOnly,
+    ToggleMatchingOnly, TogglePause, ToggleRegex, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
@@ -61,6 +61,31 @@ impl LogView {
                 view.list.remeasure();
                 cx.notify();
             })
+            .bind::<ToggleMatchingOnly>(|view, _, _, cx| {
+                view.matching_only = !view.matching_only;
+                view.refilter(None, cx);
+            })
+            .bind::<ToggleErrorsOnly>(|view, _, _, cx| {
+                view.errors_only = !view.errors_only;
+                view.refilter(None, cx);
+            })
+            .bind::<ToggleRegex>(|view, _, _, cx| {
+                view.regex = !view.regex;
+                let text = std::mem::take(&mut view.query.text);
+                view.query = Default::default();
+                view.set_query(text, cx);
+                cx.notify();
+            })
+            .bind::<SetLogContext>(|view, action, _, cx| {
+                let context = (action.lines as usize).min(flint_core::logs::MAX_CONTEXT);
+                if context != view.context {
+                    view.context = context;
+                    if view.is_filtered() {
+                        view.refilter(None, cx);
+                    }
+                    cx.notify();
+                }
+            })
             .bind::<FocusSearch>(|view, _, window, cx| {
                 let focus = view.search_input.focus_handle(cx);
                 window.focus(&focus, cx);
@@ -72,8 +97,7 @@ impl LogView {
             .bind::<ExtendSelectionUp>(|view, _, window, cx| view.move_line(-1, true, window, cx))
             .bind::<ExtendSelectionDown>(|view, _, window, cx| view.move_line(1, true, window, cx))
             .bind::<SelectAllLines>(|view, _, window, cx| {
-                if let Some(last) = view.last_line() {
-                    let first = view.snapshot.lines.first_id();
+                if let (Some(first), Some(last)) = (view.row_id(0), view.last_line()) {
                     view.select(LineSelection::new(first, last), false, window, cx);
                 }
             })
@@ -120,10 +144,9 @@ impl LogView {
         Self::bind_actions(OnView::new(element, cx)).into_element()
     }
 
-    /// The newest line shown.
+    /// The newest line shown (in a filtered tab, the newest row).
     fn last_line(&self) -> Option<LineId> {
-        let lines = &self.snapshot.lines;
-        (!lines.is_empty()).then(|| lines.end_id() - 1)
+        self.last_row()
     }
 
     /// Lines are shown, so there is something to select, search or save.
@@ -139,16 +162,28 @@ impl LogView {
     /// scan and not evicted ones: what Next and Previous Match, and Save Matching Lines, need.
     /// `false` while a scan runs on the core's threads, whose matches are not known yet.
     pub(in crate::ui) fn has_matches(&self) -> bool {
-        !self.searching && self.search.has_match_in(&self.snapshot.lines)
+        if self.searching {
+            return false;
+        }
+        match self.filter_rows() {
+            None => self.search.has_match_in(&self.snapshot.lines),
+            // Filtered: a match among the rows shown.
+            Some(_) => self
+                .search
+                .matches()
+                .iter()
+                .any(|id| self.row_index(*id).is_some()),
+        }
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
     pub(in crate::ui) fn check_line<A: Action>(&self, line: LineId) -> Result<(), ActionError> {
-        if self.snapshot.lines.contains(line) {
+        if self.row_index(line).is_some() {
             Ok(())
         } else {
             Err(ActionError::rejected::<A>(format!(
-                "line {line} is not shown (it left the buffer, or has not arrived)"
+                "line {line} is not shown (it left the buffer, has not arrived, or is filtered \
+                 out)"
             )))
         }
     }
@@ -206,10 +241,7 @@ impl LogView {
             return;
         }
         self.catch_up_now();
-        let next = self
-            .search
-            .next_after(self.current_match)
-            .or_else(|| self.search.next_after(None));
+        let next = self.shown_match(self.current_match, true);
         self.go_to_match(next, cx);
     }
 
@@ -219,11 +251,29 @@ impl LogView {
             return;
         }
         self.catch_up_now();
-        let prev = self
-            .search
-            .prev_before(self.current_match)
-            .or_else(|| self.search.prev_before(None));
+        let prev = self.shown_match(self.current_match, false);
         self.go_to_match(prev, cx);
+    }
+
+    /// The next (or previous) match after `from` that is shown, wrapping around: in a tab
+    /// filtered to errors, matches that are not errors are skipped.
+    fn shown_match(&self, from: Option<LineId>, forward: bool) -> Option<LineId> {
+        let step = |at: Option<LineId>| {
+            if forward {
+                self.search.next_after(at)
+            } else {
+                self.search.prev_before(at)
+            }
+        };
+        let mut at = step(from).or_else(|| step(None));
+        for _ in 0..self.search.count() {
+            let id = at?;
+            if self.row_index(id).is_some() {
+                return Some(id);
+            }
+            at = step(Some(id)).or_else(|| step(None));
+        }
+        None
     }
 
     fn go_to_match(&mut self, id: Option<LineId>, cx: &mut Context<Self>) {
@@ -243,6 +293,17 @@ impl LogView {
         let lines = &self.snapshot.lines;
         let selection = match self.selection {
             None => LineSelection::line(last),
+            // A filtered tab moves from row to row, over the lines it hides.
+            Some(s) if self.is_filtered() => {
+                let Some(head) = self.row_from(s.head, delta) else {
+                    return;
+                };
+                if extend {
+                    s.extend_to(head)
+                } else {
+                    LineSelection::line(head)
+                }
+            }
             Some(s) if extend => s.move_head(delta, lines),
             Some(s) => LineSelection::line(s.move_head(delta, lines).head),
         };
@@ -287,12 +348,27 @@ impl LogView {
             return;
         };
         let lines = self.snapshot.lines.clone();
-        let count = selection.present_len(&lines);
         let format = self.format();
+        // A filtered tab copies the selected rows it shows, not the lines it hides between.
+        let rows = self
+            .is_filtered()
+            .then(|| self.rows_between(selection.start(), selection.end()));
+        let count = rows
+            .as_ref()
+            .map_or_else(|| selection.present_len(&lines), |r| r.len() as u64);
         let copy = LatestCopy::start(cx);
         cx.spawn(async move |this, cx| {
             let text = cx
-                .background_spawn(async move { selection.text_as(&lines, format) })
+                .background_spawn(async move {
+                    match rows {
+                        Some(rows) => {
+                            log_model::save_text(&lines, SaveScope::Matches, &rows, None, format)
+                                .map(|(text, _)| text)
+                                .unwrap_or_default()
+                        }
+                        None => selection.text_as(&lines, format),
+                    }
+                })
                 .await;
             if !cx.update(|cx| LatestCopy::land(copy, text, cx)) {
                 return;

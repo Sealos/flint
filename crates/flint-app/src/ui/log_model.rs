@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use flint_core::{
     LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogSearch, LogState,
-    LogSubject, PodSet, PodSetStatus, SearchQuery, WorkloadTarget,
+    LogSubject, PodSet, PodSetStatus, SearchMatcher, WorkloadTarget,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -313,7 +313,7 @@ pub struct ShownLine {
 pub fn shown_line(
     line: &LogLine,
     view: LineView<'_>,
-    query: &SearchQuery,
+    query: &SearchMatcher,
     max_bytes: Option<usize>,
 ) -> ShownLine {
     let mut text = String::new();
@@ -322,7 +322,7 @@ pub fn shown_line(
     if let Some(source) = line.source.as_ref().filter(|_| view.format.source) {
         let short = view.labels.short(source);
         text.push('[');
-        if query.sources {
+        if query.covers_sources() {
             let found = query.match_ranges(&short);
             if !found.is_empty() {
                 matches.extend(found.into_iter().map(|r| r.start + 1..r.end + 1));
@@ -687,6 +687,31 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+/// The context sizes the toolbar offers (any up to 100 from the palette).
+pub const CONTEXT_CHOICES: [usize; 6] = [0, 1, 2, 3, 5, 10];
+
+/// What a filtered tab with no rows says: which toggles filter it.
+pub fn filter_empty_text(spec: &flint_core::FilterSpec) -> String {
+    match (spec.query.is_some(), spec.errors_only) {
+        (true, true) => "No warnings or errors match the search".to_owned(),
+        (true, false) => "No lines match the search".to_owned(),
+        (false, true) => "No warnings or errors".to_owned(),
+        (false, false) => "No lines".to_owned(),
+    }
+}
+
+/// The toolbar's count: "1,234 lines", or "12 of 1,234 lines" while filtered.
+pub fn shown_count(shown: Option<usize>, total: usize) -> String {
+    match shown {
+        None => line_count(total as u64),
+        Some(shown) => format!(
+            "{} of {}",
+            thousands(shown as u64),
+            line_count(total as u64)
+        ),
+    }
+}
+
 /// "3 of 17" when `current` is a match, "17 matches" otherwise, "No matches" for none.
 pub fn match_text(search: &LogSearch, current: Option<LineId>) -> String {
     let count = search.count();
@@ -705,6 +730,7 @@ pub enum Toggle {
     Timestamps,
     Sources,
     Wrap,
+    ErrorsOnly,
 }
 
 /// A row of a log tab's toolbar menu (Save, or "⋯" in a narrow tab).
@@ -735,6 +761,8 @@ pub struct MenuFacts {
     pub has_lines: bool,
     pub has_matches: bool,
     pub has_selection: bool,
+    /// Only warnings and errors are shown.
+    pub errors_only: bool,
 }
 
 /// The Save menu: how lines are written, then a Save entry per scope.
@@ -780,6 +808,11 @@ pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
         rows.push(toggle("Pod Prefix", f.sources, Toggle::Sources));
     }
     rows.push(toggle("Wrap Lines", f.wrap, Toggle::Wrap));
+    rows.push(toggle(
+        "Errors and Warnings Only",
+        f.errors_only,
+        Toggle::ErrorsOnly,
+    ));
     rows.push(MenuRow::Separator);
     if f.has_lines {
         rows.extend(save_menu(f));
@@ -922,6 +955,7 @@ mod tests {
     use flint_core::{LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
 
     use super::*;
+    use flint_core::SearchQuery;
 
     /// Timestamps on or off, no source prefix.
     fn ts(timestamps: bool) -> LineFormat {
@@ -944,7 +978,7 @@ mod tests {
             labels: &labels,
             tz: &TimeZone::UTC,
         };
-        shown_line(line, view, query, max)
+        shown_line(line, view, &query.matcher(), max)
     }
 
     fn lines(texts: &[&str]) -> LogLines {
@@ -1412,7 +1446,7 @@ mod tests {
             sources: true,
             ..SearchQuery::new("cd27k")
         };
-        let shown = shown_line(&line, view, &query, None);
+        let shown = shown_line(&line, view, &query.matcher(), None);
         let pad = labels.width() - "79db669d5-cd27k".len();
         assert_eq!(
             shown.text,
@@ -1426,7 +1460,7 @@ mod tests {
             sources: true,
             ..SearchQuery::new("api-79db")
         };
-        let shown = shown_line(&line, view, &query, None);
+        let shown = shown_line(&line, view, &query.matcher(), None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "79db669d5-cd27k");
         // The three drawn parts carry their own runs.
         assert_eq!(

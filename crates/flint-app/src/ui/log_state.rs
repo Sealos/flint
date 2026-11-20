@@ -9,8 +9,8 @@ use gpui_kit::*;
 
 use super::super::log_model;
 use super::super::view_state::{
-    Focus, LogLineState, LogTabState, SearchState, SelectionState, StreamCounts, StreamState,
-    TabStatusState, error_text,
+    FilterState, Focus, LogLineState, LogTabState, SearchState, SelectionState, StreamCounts,
+    StreamState, TabStatusState, error_text,
 };
 use super::LogView;
 
@@ -40,14 +40,41 @@ impl LogView {
                 }),
                 searching: self.searching,
             },
+            filter: FilterState {
+                matching_only: self.matching_only,
+                errors_only: self.errors_only,
+                regex: self.regex,
+                context: self.context,
+                rows: self.is_filtered().then(|| self.row_count()),
+                filtering: self.filtering,
+                regex_error: self.regex_error.clone(),
+            },
             selection: self.selection.map(|s| SelectionState {
                 first: s.start(),
                 last: s.end(),
                 // As the hint counts them: the selected lines still shown.
-                lines: s.present_len(&self.snapshot.lines),
+                // The rows shown, in a filtered tab.
+                lines: if self.is_filtered() {
+                    self.rows_between(s.start(), s.end()).len() as u64
+                } else {
+                    s.present_len(&self.snapshot.lines)
+                },
             }),
             streams: self.snapshot.pods.as_deref().map(stream_counts),
-            last_lines: last_lines(&self.snapshot.lines, LogTabState::LINE_LIMIT),
+            // The newest lines drawn: the newest rows while filtered.
+            last_lines: match self.filter_rows() {
+                None => last_lines(&self.snapshot.lines, LogTabState::LINE_LIMIT),
+                Some(rows) => rows
+                    .iter()
+                    .skip(rows.len().saturating_sub(LogTabState::LINE_LIMIT))
+                    .filter_map(|id| {
+                        self.snapshot
+                            .lines
+                            .get(*id)
+                            .map(|line| line_state(*id, line))
+                    })
+                    .collect(),
+            },
         }
     }
 
@@ -164,13 +191,17 @@ pub fn last_lines(lines: &LogLines, limit: usize) -> Vec<LogLineState> {
     let ids = tail_ids(lines, limit);
     lines
         .range(ids.start, ids.end)
-        .map(|(id, line)| LogLineState {
-            id,
-            text: line.text.to_string(),
-            severity: severity_word(line.severity),
-            source: line.source.as_ref().map(|s| s.label().to_owned()),
-        })
+        .map(|(id, line)| line_state(id, line))
         .collect()
+}
+
+fn line_state(id: u64, line: &flint_core::LogLine) -> LogLineState {
+    LogLineState {
+        id,
+        text: line.text.to_string(),
+        severity: severity_word(line.severity),
+        source: line.source.as_ref().map(|s| s.label().to_owned()),
+    }
 }
 
 /// The ids of the newest `limit` lines of `lines`: a range read line by line, so `state` never
