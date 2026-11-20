@@ -143,6 +143,8 @@ actions!(
         ToggleDock,
         /// Close the dock's active tab, ending its session.
         CloseActiveTab,
+        /// List every dock tab, with its cluster and status, to show one.
+        ShowTabList,
         /// Show the dock's next tab.
         NextTab,
         /// Show the dock's previous tab.
@@ -1623,6 +1625,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<PrevTab>("Previous Dock Tab", "Show the dock's previous tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-shift-tab"], Some(DOCK)),
+        Spec::unit::<ShowTabList>(
+            "Show Dock Tabs",
+            "List every dock tab, with its cluster and status, and show the one picked.",
+        )
+        .of(C::View, S::Dock)
+        .keys(&["secondary-shift-j"], Some(WORKSPACE)),
         Spec::unit::<ReconnectLogs>(
             "Reconnect Logs",
             "Open the active log tab's stream again once it ended or failed, in the same tab, on \

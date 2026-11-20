@@ -741,6 +741,63 @@ async fn a_failed_shell_restarts_beside_itself(cx: &mut TestAppContext) {
     assert_ne!(now.entity_id(), first.entity_id(), "a new session");
 }
 
+// covers UP-42: the tab list opens from the keyboard (Shift-Cmd-J) and the palette, wherever
+// focus is, and shows the tab picked.
+#[gpui_kit::test]
+async fn the_tab_list_opens_from_the_keyboard(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    assert_eq!(
+        t.dispatch(cx, "dock::ShowTabList", Value::Null),
+        Err(ActionError::NotAvailable("dock::ShowTabList".into())),
+        "no tab yet"
+    );
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    t.dispatch(
+        cx,
+        "detail::OpenContainerLogs",
+        json!({"container": "sidecar"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    t.focus_workspace(cx);
+    press(cx, &t, "secondary-shift-j");
+    let entries = cx
+        .update_window(t.window, |_, window, _| {
+            let menu = window.within("popup-menu");
+            (0usize..)
+                .map_while(|ix| menu.try_find(ix))
+                .map(|item| item.label().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries[0].starts_with("web · app — alpha · "),
+        "{entries:?}"
+    );
+    assert!(
+        entries[1].starts_with("web · sidecar — alpha · "),
+        "{entries:?}"
+    );
+    cx.update_window(t.window, |_, window, cx| {
+        window.within("popup-menu").click(0usize, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (first, active) = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        (dock.tab_ids()[0], dock.active_id())
+    });
+    assert_eq!(active, Some(first));
+    cx.update_window(t.window, |_, window, _| {
+        assert!(window.try_find("popup-menu").is_none(), "the list closed");
+    })
+    .unwrap();
+}
+
 // covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.
 #[gpui_kit::test]
 async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {

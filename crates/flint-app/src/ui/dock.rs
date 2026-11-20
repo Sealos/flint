@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -38,7 +38,7 @@ use super::dock_model::{self, TabCluster, chip_labels, chip_tooltip};
 use super::log_view::{LogRequest, LogView};
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
-    ReconnectLogs, RestartShell, ToggleDock,
+    ReconnectLogs, RestartShell, ShowTabList, ToggleDock,
 };
 use super::terminal_model::ShellRequest;
 use super::terminal_view::TerminalView;
@@ -170,6 +170,10 @@ pub struct Dock {
     /// The tab bar's width when last painted, and whether it changed since: the next frame
     /// scrolls the active tab into view again.
     strip_width: Rc<(Cell<f32>, Cell<bool>)>,
+    /// The tab bar's bounds when last painted: where the tab list opens.
+    bar: Rc<Cell<Bounds<Pixels>>>,
+    /// The open tab list, until it is dismissed.
+    tab_menu: Option<(Entity<PopupMenu>, Subscription)>,
     /// Every kubeconfig context, and the chip each one's tabs show ([`chip_labels`]).
     contexts: Vec<String>,
     labels: HashMap<String, String>,
@@ -185,6 +189,8 @@ impl Dock {
             focus: cx.focus_handle(),
             strip: ScrollHandle::new(),
             strip_width: Rc::default(),
+            bar: Rc::default(),
+            tab_menu: None,
             contexts: Vec::new(),
             labels: HashMap::new(),
         }
@@ -555,9 +561,47 @@ impl Dock {
         self.activate(id, window, cx);
     }
 
+    /// Opens the tab list under the tab bar's end: every tab with its cluster and status;
+    /// picking one shows it. Shows the dock first if it is hidden.
+    fn show_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.visible = true;
+        let entries: Vec<(u64, String, bool)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let label = self.list_entry(tab.id, cx)?;
+                Some((tab.id, label, self.active == Some(tab.id)))
+            })
+            .collect();
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            entries.iter().fold(menu, |menu, (id, label, active)| {
+                menu.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(*active)
+                        .on_click(registry::on_click(ActivateTab { tab: *id })),
+                )
+            })
+        });
+        menu.focus_handle(cx).focus(window, cx);
+        let dismissed = cx.subscribe_in(&menu, window, |dock, _, _: &DismissEvent, window, cx| {
+            dock.tab_menu = None;
+            // Escape leaves focus nowhere: back to the tab shown.
+            if window.focused(cx).is_none() {
+                dock.focus_active(window, cx);
+            }
+            cx.notify();
+        });
+        self.tab_menu = Some((menu, dismissed));
+        cx.notify();
+    }
+
     /// Every dock action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<ToggleDock>(|dock, _, window, cx| dock.toggle(window, cx))
+            .bind::<ShowTabList>(|dock, _, window, cx| dock.show_tab_list(window, cx))
             .bind::<CloseActiveTab>(|dock, _, window, cx| {
                 match dock.active.filter(|_| dock.visible) {
                     Some(id) => dock.close(id, window, cx),
@@ -708,31 +752,18 @@ pub fn cluster_chip(
 
 impl Dock {
     /// The button that lists every tab (title, cluster and status) and shows the one picked:
-    /// how to reach a tab scrolled out of the strip.
-    fn render_tab_list(&self, cx: &App) -> impl IntoElement {
-        let entries: Vec<(u64, String, bool)> = self
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                let label = self.list_entry(tab.id, cx)?;
-                Some((tab.id, label, self.active == Some(tab.id)))
-            })
-            .collect();
+    /// how to reach a tab scrolled out of the strip ([`ShowTabList`]).
+    fn render_tab_list(&self) -> impl IntoElement {
         Button::new("dock-tab-list")
             .icon(IconName::ChevronsUpDown)
             .xsmall()
             .ghost()
             .tab_stop(false)
-            .tooltip("All tabs")
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                entries.iter().fold(menu, |menu, (id, label, active)| {
-                    menu.item(
-                        PopupMenuItem::new(label.clone())
-                            .checked(*active)
-                            .on_click(registry::on_click(ActivateTab { tab: *id })),
-                    )
-                })
-            })
+            .tooltip(format!(
+                "All tabs ({})",
+                registry::key_hint("secondary-shift-j")
+            ))
+            .on_click(registry::on_click(ShowTabList))
     }
 
     fn render_hide(&self) -> impl IntoElement {
@@ -810,8 +841,10 @@ impl Render for Dock {
         }
         let watch_width = {
             let watch = self.strip_width.clone();
+            let bar = self.bar.clone();
             canvas(
                 move |bounds, window, _| {
+                    bar.set(bounds);
                     let now = f32::from(bounds.size.width);
                     let before = watch.0.replace(now);
                     if before > 0. && (now - before).abs() > 0.5 {
@@ -848,11 +881,21 @@ impl Render for Dock {
                     h_flex()
                         .px_1()
                         .flex_none()
-                        .child(self.render_tab_list(cx))
+                        .child(self.render_tab_list())
                         .child(self.render_hide()),
                 ),
         )
         .child(content)
+        .when_some(self.tab_menu.as_ref(), |el, (menu, _)| {
+            let bar = self.bar.get();
+            el.child(deferred(
+                anchored()
+                    .anchor(Anchor::TopRight)
+                    .position(point(bar.right(), bar.bottom()))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu.clone()),
+            ))
+        })
         .test_support()
     }
 }

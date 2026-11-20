@@ -29,10 +29,10 @@ use super::super::registry::{
     SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
     SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
     SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAllNamespaces, ShowOverview, ShowYaml, SortBy, ToggleAnnotations, ToggleLabels,
-    ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause, ToggleSecretValue,
-    ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds,
-    WatchOpenViewsOnly,
+    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
+    ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause,
+    ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
@@ -238,6 +238,7 @@ impl Workspace {
                 let dock = ws.dock.read(cx);
                 dock.is_visible() && dock.tab_count() > 1
             })
+            .when::<ShowTabList>(|ws, cx| ws.dock.read(cx).tab_count() > 0)
             .when::<ReconnectLogs>(|ws, cx| ws.dock.read(cx).restartable(true, cx).is_some())
             .when::<RestartShell>(|ws, cx| ws.dock.read(cx).restartable(false, cx).is_some())
             .add::<ActivateTab>(
