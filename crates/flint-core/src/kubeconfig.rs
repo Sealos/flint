@@ -24,6 +24,9 @@ pub struct ContextInfo {
     pub namespace: Option<String>,
     /// The API server URL, if the referenced cluster entry exists.
     pub server: Option<String>,
+    /// The cluster entry's `proxy-url`, if it has one: requests go through it, so the server's
+    /// address alone does not say where they lead.
+    pub proxy_url: Option<String>,
     /// The file whose definition of this context won the merge.
     pub source: PathBuf,
 }
@@ -190,20 +193,22 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
                 user: named.context.as_ref().and_then(|c| c.user.clone()),
                 namespace: named.context.as_ref().and_then(|c| c.namespace.clone()),
                 server: None,
+                proxy_url: None,
                 name: named.name,
                 source: path.clone(),
             });
         }
     }
     for info in &mut contexts {
-        info.server = info.cluster.as_ref().and_then(|cluster| {
+        let entry = info.cluster.as_ref().and_then(|cluster| {
             merged
                 .clusters
                 .iter()
                 .find(|c| &c.name == cluster)
                 .and_then(|c| c.cluster.as_ref())
-                .and_then(|c| c.server.clone())
         });
+        info.server = entry.and_then(|c| c.server.clone());
+        info.proxy_url = entry.and_then(|c| c.proxy_url.clone());
     }
     LoadedKubeconfig {
         merged,
@@ -339,6 +344,23 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].as_os_str().as_bytes(), b"/tmp/\xffscratch");
         assert!(!paths.contains(&PathBuf::from("/home/me/.kube/config")));
+    }
+
+    // covers UP-54: a cluster entry's `proxy-url` is kept, so a loopback server behind a proxy
+    // is not taken for a cluster on this machine.
+    #[test]
+    fn the_proxy_url_of_a_cluster_entry_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "proxied",
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: p\n  cluster:\n    server: https://127.0.0.1:6443\n    proxy-url: socks5://bastion:1080\n- name: d\n  cluster:\n    server: https://127.0.0.1:7443\nusers:\n- name: u\n  user:\n    token: t\ncontexts:\n- name: prod\n  context:\n    cluster: p\n    user: u\n- name: kind\n  context:\n    cluster: d\n    user: u\n",
+        );
+        let loaded = load(&[path]);
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let prod = loaded.context("prod").unwrap();
+        assert_eq!(prod.proxy_url.as_deref(), Some("socks5://bastion:1080"));
+        assert_eq!(loaded.context("kind").unwrap().proxy_url, None);
     }
 
     // covers UP-01

@@ -272,6 +272,9 @@ pub fn failure_words(failure: &ExecFailure) -> (&'static str, String) {
         ExecFailureKind::Unreachable => "Flint couldn't reach the cluster.",
         ExecFailureKind::Connection => "The connection to the shell broke.",
         ExecFailureKind::MissingShell => "Neither bash nor sh is in this container.",
+        ExecFailureKind::Protected => {
+            "This cluster is protected (read-only in Flint): unlock it to open a shell."
+        }
         ExecFailureKind::Upgrade => {
             "The connection to the cluster can't carry a shell (a proxy may be blocking \
              WebSocket upgrades)."
@@ -610,6 +613,11 @@ mod tests {
         assert_eq!(
             words(ExecFailureKind::Unreachable, "not connected"),
             "Flint couldn't reach the cluster."
+        );
+        // covers UP-54
+        assert_eq!(
+            words(ExecFailureKind::Protected, "prod is protected"),
+            "This cluster is protected (read-only in Flint): unlock it to open a shell."
         );
         assert_eq!(
             words(

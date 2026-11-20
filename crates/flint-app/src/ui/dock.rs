@@ -247,6 +247,14 @@ impl Dock {
     }
 
     /// The shell tab shown, if the dock is visible and showing one: where terminal actions go.
+    /// Every shell tab's view, shown or not.
+    pub fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
+        self.tabs.iter().filter_map(|t| match &t.tab {
+            DockTab::Shell(view) => Some(view),
+            DockTab::Logs(_) => None,
+        })
+    }
+
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),

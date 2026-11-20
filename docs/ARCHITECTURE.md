@@ -160,10 +160,53 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   partial. A chevron shows one child row per member, and clicking the row opens a set-scoped namespace overview with
   a card per member ([ADR-0020](./adr/0020-namespace-columns-and-overview.md)). The merged row is a view over the
   members' per-namespace aggregates, keyed by the namespace name; every other list keeps one row per object.
-- **Protection (planned, M3, #81):** every cluster will be protected (read-only in Flint) by default, except clusters on the user's machine
-  and clusters marked trusted. A session unlock (one confirmation naming the cluster and server) will last until Flint
-  quits ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)). Not built yet: today shells open on any
-  cluster without a confirmation.
+- **Protection (#81):** every cluster is protected (read-only in Flint) by default
+  ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)), except:
+  - clusters on the user's machine: an API server at `localhost` (or a name under `.localhost`), a loopback address
+    (`127.0.0.0/8`, `::1`) or Docker Desktop's `kubernetes.docker.internal`, as the kubeconfig says it, never
+    resolved (`protection::is_local_server`), and only when the cluster entry has no `proxy-url` (behind a proxy
+    a loopback address leads wherever the proxy sends it). That covers kind, Docker Desktop, OrbStack and minikube
+    on macOS; a local cluster served on another address, such as minikube's Docker driver on Linux
+    (`192.168.49.2`, a bridge address), stays protected and is trusted once. `protect_local_clusters = true` in
+    `settings.toml` protects them too, for a local address that is a tunnel to a remote cluster;
+  - clusters in `trusted_clusters` in `settings.toml`, pinned to the context and API server URL like AI exposure
+    (`settings::ClusterPin`), so a re-pointed context is protected again;
+  - clusters unlocked for this session (`protection::SessionUnlocks`): one confirmation naming the context and its
+    server, pinned to that server, until Flint quits or Lock Again. Nothing is written to disk.
+- **A `settings.toml` that does not parse** (or a symlink to one that is gone, which is not a fresh install, and
+  whose target is watched so restoring it reloads) opens nothing up (`Settings::unreadable_fallback`), at launch and on a
+  reload alike: nothing is exposed or trusted, and clusters on this machine are protected too, since the file may
+  have asked for that. The sidebar's banner says so. Unknown keys are ignored so newer files load; one within two
+  edits of a known key (`protect_local_cluster`) is named in the log, since it would otherwise fail open silently.
+- **One gate in the core.** Every action that changes a cluster or runs code in it gets its client from the cluster
+  manager through `Request::WriteClient`, answered by `ClusterManager::write_client`, which refuses a protected
+  cluster with `WriteRefusal::Protected` before anything is sent. Exec is the only such action today
+  (`CoreHandle::exec`, failing with `ExecFailureKind::Protected`); edit, apply, delete, scale, restart, cordon, drain,
+  Helm changes, port-forward and debug containers take the same gate when they are built (M3, M5). The session's
+  unlocks are shared between the front end and the core (`CoreHandle::unlock`, `lock`, `unlocks`), so an unlock
+  takes effect before the next action is asked for. Stop Trusting (`CoreHandle::untrust`) revokes the trust in that
+  shared state at once, before `Command::SetTrusted` writes the file, since commands and the gate's requests take
+  separate queues. Every Trust and Stop Trusting request is numbered when it is made, in that shared state: a Trust's
+  write lifts a revocation only if its pin was saved and it is still the newest request, and a revocation ends
+  otherwise only when the core's own write of that Stop Trusting removed the pin and no older Trust can still write
+  one (a reload that finds no pin, such as a file caught half-written, proves nothing). Lock Again also counts as a
+  newer request, and revokes a Trust still being written. A failed write leaves the cluster protected, and the lock
+  menu offers the removal again while a pin is on disk. Trust goes through
+  `Command::SetTrusted`, which, like exposure, writes nothing if the context moved since the user confirmed. `flint mcp` stays read-only either way.
+- **In the app.** The sidebar shows a lock button per cluster (`lock-<context>`): a closed lock while protected, an
+  open one (in the warning tone) while unlocked, a shield while trusted, nothing for a cluster on this machine. Its
+  menu offers Unlock for This Session…, Lock Again, Trust This Cluster… and Stop Trusting (also Remove the Old Trust
+  for a trust left at another server), each a registered action (`workspace::UnlockCluster`, `LockCluster`,
+  `TrustCluster`, `UntrustCluster`) the palette lists too. On a protected cluster the detail pane's Shell is
+  disabled with the reason ("alpha is protected (read-only in Flint) until you unlock it") in its tooltip and
+  caption and an Unlock… button beside it; the row menu's Shell is disabled the same way, followed by Unlock alpha….
+  An ended or failed shell tab's Restart shell is disabled the same way, with the refusal under it and Unlock…
+  beside it (no Unlock… when the tab's context left kubeconfig or lost its server: that is the reason shown then),
+  and Restart Shell is unavailable from the keys and the palette (the workspace refuses it too, and the
+  core is the backstop). The unlock and trust confirmations take the button: Enter cancels, as closing and quitting
+  do. Lock Again leaves running shells running; it stops new ones, and its menu entry, palette entry and dialog say
+  so. Stop Trusting also locks the cluster, even if it was unlocked for the session. A trusted context whose
+  cluster entry is gone (no server) cannot be unlocked or trusted, but its lock menu still removes the old trust.
 - Sessions the user started (log streams, exec terminals, port-forwards) keep running when the user switches to
   another cluster, warm or cold. They end only when the user closes them or quits Flint.
 
@@ -592,8 +635,9 @@ opens in a tab in the bottom dock.
    Helm and controllers.
 
 Delete, scale, rollout restart, cordon, and drain are typed actions in `flint-core`, each with a confirmation in the
-UI. Every write refuses on a protected cluster ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)), and
-the UI offers a session unlock in its place. Destructive actions show the cluster and namespace in the confirmation. Kubernetes has no drain API, so drain
+UI. Every write refuses on a protected cluster ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)): it
+asks for its client through the core's one gate (see "Protection" above), and the UI offers a session unlock in its
+place. Destructive actions show the cluster and namespace in the confirmation. Kubernetes has no drain API, so drain
 works like `kubectl drain`: cordon the node, then evict its pods through the Eviction API. Pods blocked by a
 PodDisruptionBudget are reported back to the user instead of being retried forever.
 
@@ -856,7 +900,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   on macOS and `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux. `state.toml` stays beside
   `settings.toml` on Linux too, rather than in `$XDG_STATE_HOME`, so one directory and one override hold everything
   ([ADR-0016](./adr/0016-linux-appimage.md)).
-- `settings.toml`: `appearance`, `ai_exposed_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
+- `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
   analysis line limit, and a `claude` binary override.

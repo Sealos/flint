@@ -17,6 +17,7 @@ pub mod kubeconfig;
 pub mod logs;
 mod manager;
 pub mod paging;
+pub mod protection;
 pub mod read;
 pub mod redact;
 pub mod settings;
@@ -42,6 +43,7 @@ pub use logs::{
     LogSearch, LogSince, LogSnapshot, LogState, LogSubject, LogTarget, PodSet, PodSetStatus,
     SearchQuery, Severity, StreamStatus, WorkloadKind, WorkloadPod, WorkloadTarget,
 };
+pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};
 pub use store::{Feed, KindSnapshot, NamespaceLimit, SyncState};

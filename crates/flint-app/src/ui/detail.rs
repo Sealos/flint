@@ -24,6 +24,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::icons::FlintIcon;
 use super::list::tabular_figures;
 use super::log_view::LogRequest;
 use super::menu_record;
@@ -32,7 +33,7 @@ use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
     self, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell,
     Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
-    ToggleSecretValue,
+    ToggleSecretValue, UnlockCluster,
 };
 use super::terminal_model::ShellRequest;
 
@@ -192,6 +193,9 @@ pub struct DetailView {
     /// Why no session can open on the object's cluster (it is not connected), as the workspace
     /// says it (`Workspace::sessions_blocked`): Logs and Shell are disabled, saying so.
     sessions_blocked: Option<String>,
+    /// The object's cluster is protected (ADR-0015), as the workspace says it: Shell is
+    /// disabled, saying so, with Unlock beside it. Logs and browsing are not affected.
+    protected: bool,
     _fetch: Task<()>,
     _show_pods: Task<()>,
     _yaml: Task<()>,
@@ -238,6 +242,7 @@ impl DetailView {
             current_wanted: false,
             pending: None,
             sessions_blocked: None,
+            protected: false,
             _fetch: Task::ready(()),
             _show_pods: Task::ready(()),
             _yaml: Task::ready(()),
@@ -255,6 +260,14 @@ impl DetailView {
     ) {
         if self.sessions_blocked != why {
             self.sessions_blocked = why;
+            cx.notify();
+        }
+    }
+
+    /// Says whether the object's cluster is protected (ADR-0015).
+    pub(in crate::ui) fn set_protected(&mut self, protected: bool, cx: &mut Context<Self>) {
+        if self.protected != protected {
+            self.protected = protected;
             cx.notify();
         }
     }
@@ -611,6 +624,31 @@ impl DetailView {
                 button
                     .disabled(true)
                     .tooltip(why.clone())
+                    .into_any_element(),
+            );
+        }
+        if self.protected {
+            // Disabled, saying why, with the unlock in place (UP-54).
+            let why = protected_reason(&self.object.cluster);
+            return Some(
+                h_flex()
+                    .gap_1()
+                    .child(button.disabled(true).tooltip(why))
+                    .child(
+                        Button::new("detail-unlock")
+                            .xsmall()
+                            .ghost()
+                            .icon(FlintIcon::Lock)
+                            .label("Unlock…")
+                            .tooltip(format!(
+                                "Unlock {} until Flint quits, after a confirmation naming its \
+                                 server",
+                                self.object.cluster
+                            ))
+                            .on_click(registry::on_click(UnlockCluster {
+                                cluster: self.object.cluster.clone(),
+                            })),
+                    )
                     .into_any_element(),
             );
         }
@@ -1434,7 +1472,7 @@ mod actions;
 #[path = "detail_pods.rs"]
 mod pods;
 
-pub(in crate::ui) use actions::{Opening, ShellPod, reason, refused};
+pub(in crate::ui) use actions::{Opening, ShellPod, protected_reason, reason, refused};
 pub(in crate::ui) use pods::Pods;
 #[cfg(test)]
 pub(in crate::ui) use pods::RELIST_DELAY;

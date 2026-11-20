@@ -62,6 +62,7 @@ impl Workspace {
                         AiExposureState::Exposed => "exposed",
                         AiExposureState::ServerChanged { .. } => "server_changed",
                     },
+                    protection: model.protection(cluster).name(),
                 }
             })
             .collect();

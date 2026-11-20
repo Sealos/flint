@@ -20,6 +20,7 @@ use crate::handle::{
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
+use crate::protection::{SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
 use crate::settings::{self, Settings};
 use crate::store::{KindSnapshot, SyncState};
@@ -174,6 +175,33 @@ enum Internal {
     },
 }
 
+/// A list of pinned clusters in `settings.toml` ([`crate::settings::ClusterPin`]).
+#[derive(Debug, Clone, Copy)]
+enum Pins {
+    /// `ai_exposed_clusters` (ADR-0009).
+    AiExposure,
+    /// `trusted_clusters` (ADR-0015).
+    Trust,
+}
+
+impl Pins {
+    /// What the list is, in errors.
+    fn what(self) -> &'static str {
+        match self {
+            Pins::AiExposure => "exposure",
+            Pins::Trust => "trust",
+        }
+    }
+
+    /// What pinning a cluster did, in errors.
+    fn done(self) -> &'static str {
+        match self {
+            Pins::AiExposure => "exposed",
+            Pins::Trust => "trusted",
+        }
+    }
+}
+
 /// Which watched files changed.
 #[derive(Debug, Clone, Copy, Default)]
 struct Changed {
@@ -207,6 +235,8 @@ pub(crate) struct ClusterManager {
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
+    /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
+    unlocks: SessionUnlocks,
 }
 
 struct FileWatcher {
@@ -220,6 +250,7 @@ impl ClusterManager {
         config: CoreConfig,
         events: async_channel::Sender<Event>,
         hubs: HubRegistry,
+        unlocks: SessionUnlocks,
     ) -> Self {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
         let kubeconfig_paths = kubeconfig::paths_for_settings(
@@ -245,6 +276,7 @@ impl ClusterManager {
             engine_config,
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
+            unlocks,
         }
     }
 
@@ -285,7 +317,14 @@ impl ClusterManager {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::Activate(id) => self.activate(id),
-            Command::SetAiExposed { cluster, server } => self.set_ai_exposed(cluster, server).await,
+            Command::SetAiExposed { cluster, server } => {
+                self.set_pin(Pins::AiExposure, cluster, server).await;
+            }
+            Command::SetTrusted {
+                cluster,
+                server,
+                request,
+            } => self.set_trusted(cluster, server, request).await,
             Command::ReloadKubeconfig => self.reload_kubeconfig().await,
             Command::SetWatchMode { cluster, mode } => {
                 self.write_settings("the watch mode", move |dir| {
@@ -403,6 +442,9 @@ impl ClusterManager {
             }
             Request::Client { cluster, reply } => {
                 let _ = reply.send(self.client(&cluster));
+            }
+            Request::WriteClient { cluster, reply } => {
+                let _ = reply.send(self.write_client(&cluster));
             }
             Request::FetchObject {
                 cluster,
@@ -553,9 +595,30 @@ impl ClusterManager {
         }
     }
 
-    async fn set_ai_exposed(&mut self, cluster: ClusterId, server: Option<String>) {
+    /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
+    /// `settings.toml`.
+    /// Trusts `cluster` at `server` (`Some`) or stops trusting it (`None`): request `request`,
+    /// numbered when it was made ([`crate::protection::SessionUnlocks`]). A Trust reports how
+    /// its write went, which lifts an earlier Stop Trusting only if no request was made since.
+    async fn set_trusted(&mut self, cluster: ClusterId, server: Option<String>, request: u64) {
+        let trusting = server.is_some();
+        let saved = self.set_pin(Pins::Trust, cluster.clone(), server).await;
+        if trusting {
+            self.unlocks.trust_written(&cluster, request, saved);
+        } else if saved {
+            self.unlocks.trust_removed(&cluster, request);
+        }
+        if saved {
+            // The settings may be unchanged (the same pin again, or none to remove): say it
+            // anyway, so the front end shows the protection that holds now.
+            self.emit_settings();
+        }
+    }
+
+    /// Returns whether the change was saved.
+    async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
         if let Some(server) = &server {
-            // The user confirmed this server. If the context moved since, do not expose the new
+            // The user confirmed this server. If the context moved since, do not pin the new
             // one on the strength of that confirmation.
             let current = self
                 .clusters
@@ -564,22 +627,25 @@ impl ClusterManager {
                 .and_then(|c| c.info.server.as_deref());
             if current != Some(server.as_str()) {
                 self.emit(Event::Error(format!(
-                    "\"{cluster}\" now points to a different server; it was not exposed. Review it and try again."
+                    "\"{cluster}\" now points to a different server; it was not {}. Review it and try again.",
+                    pins.done()
                 )));
-                return;
+                return false;
             }
         }
         if let Some(error) = &self.settings_error {
             // Rewriting a file that does not parse would fail anyway; say why.
             self.emit(Event::Error(format!(
-                "settings.toml must be fixed before exposure can change: {}",
+                "settings.toml must be fixed before {} can change: {}",
+                pins.what(),
                 crate::redact::safe_error_summary(error)
             )));
-            return;
+            return false;
         }
         let dir = self.config.config_dir.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            settings::set_ai_exposed(&dir, &cluster, server.as_deref())
+        let result = tokio::task::spawn_blocking(move || match pins {
+            Pins::AiExposure => settings::set_ai_exposed(&dir, &cluster, server.as_deref()),
+            Pins::Trust => settings::set_trusted(&dir, &cluster, server.as_deref()),
         })
         .await;
         match result {
@@ -593,12 +659,19 @@ impl ClusterManager {
                     // The write may have created the config directory.
                     self.rebuild_watcher();
                 }
+                true
             }
             // A settings write error can quote the file: one sanitized line.
-            Ok(Err(e)) => self.emit(Event::Error(crate::redact::safe_error_summary(
-                &e.to_string(),
-            ))),
-            Err(e) => self.emit(Event::Error(format!("settings write failed: {e}"))),
+            Ok(Err(e)) => {
+                self.emit(Event::Error(crate::redact::safe_error_summary(
+                    &e.to_string(),
+                )));
+                false
+            }
+            Err(e) => {
+                self.emit(Event::Error(format!("settings write failed: {e}")));
+                false
+            }
         }
     }
 
@@ -616,16 +689,16 @@ impl ClusterManager {
         let (settings, error) = match result {
             Ok(s) => (s, None),
             Err(e) => {
-                // Expose nothing (as the MCP server does), but keep the other settings, so a
-                // typo does not make clusters from extra kubeconfig files disappear.
+                // Expose nothing (as the MCP server does), trust nothing and protect local
+                // clusters too (as at startup), but keep the other settings, so a typo does
+                // not make clusters from extra kubeconfig files disappear. An entry removed by
+                // hand behind the typo must not stay in force.
                 tracing::warn!(
-                    "settings.toml unreadable; nothing is exposed to AI: {}",
+                    "settings.toml unreadable; nothing is exposed to AI or trusted, and local \
+                     clusters are protected: {}",
                     crate::redact::safe_error_summary(&e)
                 );
-                let kept = Settings {
-                    ai_exposed_clusters: Vec::new(),
-                    ..(*self.settings).clone()
-                };
+                let kept = (*self.settings).clone().unreadable_fallback();
                 (kept, Some(e))
             }
         };
@@ -889,6 +962,23 @@ impl ClusterManager {
         self.cluster(cluster).and_then(|c| c.client.clone())
     }
 
+    /// The gate every action that changes a cluster, or runs code in it, goes through
+    /// (ADR-0015): the cluster's client, unless the cluster is protected or not connected.
+    fn write_client(&self, cluster: &str) -> Result<Client, WriteRefusal> {
+        let not_connected = || WriteRefusal::NotConnected {
+            cluster: cluster.to_owned(),
+        };
+        // A context Flint does not know has no client either: say that, not "protected".
+        let slot = self.cluster(cluster).ok_or_else(not_connected)?;
+        let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
+        if !protection(&self.settings, &self.unlocks, cluster, server, proxy).allows_changes() {
+            return Err(WriteRefusal::Protected {
+                cluster: cluster.to_owned(),
+            });
+        }
+        slot.client.clone().ok_or_else(not_connected)
+    }
+
     fn cluster(&self, id: &str) -> Option<&Cluster> {
         self.clusters.iter().find(|c| c.info.name == id)
     }
@@ -1092,27 +1182,7 @@ impl ClusterManager {
             .collect();
         let settings_path = self.config.config_dir.join(settings::SETTINGS_FILE);
         let settings_files: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
-        let dirs: HashSet<PathBuf> = kube_files
-            .iter()
-            .chain(&settings_files)
-            .filter_map(|f| f.parent().map(Path::to_path_buf))
-            .collect();
-
-        // A directory that does not exist yet cannot be watched: watch its nearest existing
-        // ancestor instead, and rebuild the watcher once a directory on the way is created.
-        let mut watch_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut pending: HashSet<PathBuf> = HashSet::new();
-        for dir in &dirs {
-            match missing_dirs(dir) {
-                Some((ancestor, missing)) => {
-                    watch_dirs.insert(ancestor);
-                    pending.extend(missing);
-                }
-                None => {
-                    watch_dirs.insert(dir.clone());
-                }
-            }
-        }
+        let (watch_dirs, pending) = watch_plan(kube_files.iter().chain(&settings_files));
 
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
         let (kube_watched, settings_watched) = (kube_files.clone(), settings_files.clone());
@@ -1122,12 +1192,7 @@ impl ClusterManager {
                 if matches!(event.kind, EventKind::Access(_)) {
                     return;
                 }
-                let rearm = event.paths.iter().any(|p| pending.contains(p));
-                let changed = Changed {
-                    kubeconfig: rearm || event.paths.iter().any(|p| kube_watched.contains(p)),
-                    settings: event.paths.iter().any(|p| settings_watched.contains(p)),
-                    rearm,
-                };
+                let changed = classify(&event.paths, &pending, &kube_watched, &settings_watched);
                 if changed.kubeconfig || changed.settings {
                     let _ = raw_tx.send(changed);
                 }
@@ -1150,12 +1215,58 @@ impl ClusterManager {
         let settings_dir_watched = settings_files
             .iter()
             .filter_map(|f| f.parent())
-            .any(|d| watched_dirs.contains(d));
+            .any(|d| watched_dirs.contains(&resolved(d)));
         tokio::spawn(debounce(raw_rx, self.internal_tx.clone()));
         Some(FileWatcher {
             _watcher: watcher,
             settings_dir_watched,
         })
+    }
+}
+
+/// `dir` resolved (symlinks, `..`), or as given if it cannot be.
+fn resolved(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// The directories to watch so `files` are noticed, each once by its resolved name (inotify
+/// merges a directory's aliases into one watch, and removing one alias's watch would remove
+/// the other's), and the missing directories whose creation means the watcher is rebuilt. A
+/// directory that does not exist yet cannot be watched: its nearest existing ancestor is.
+fn watch_plan<'a>(
+    files: impl Iterator<Item = &'a PathBuf>,
+) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    let dirs: HashSet<&Path> = files.filter_map(|f| f.parent()).collect();
+    let mut watch_dirs = HashSet::new();
+    let mut pending = HashSet::new();
+    for dir in dirs {
+        match missing_dirs(dir) {
+            Some((ancestor, missing)) => {
+                watch_dirs.insert(resolved(&ancestor));
+                pending.extend(missing);
+            }
+            None => {
+                watch_dirs.insert(resolved(dir));
+            }
+        }
+    }
+    (watch_dirs, pending)
+}
+
+/// What an event on `paths` changed. A missing directory that appeared (`pending`) may
+/// already hold kubeconfig files or `settings.toml` (a symlink's target directory restored
+/// with the file in it), so both are read again, besides rebuilding the watcher.
+fn classify(
+    paths: &[PathBuf],
+    pending: &HashSet<PathBuf>,
+    kube: &HashSet<PathBuf>,
+    settings: &HashSet<PathBuf>,
+) -> Changed {
+    let rearm = paths.iter().any(|p| pending.contains(p));
+    Changed {
+        kubeconfig: rearm || paths.iter().any(|p| kube.contains(p)),
+        settings: rearm || paths.iter().any(|p| settings.contains(p)),
+        rearm,
     }
 }
 
@@ -1184,6 +1295,21 @@ fn missing_dirs(dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
 fn watch_names(path: &Path) -> Vec<PathBuf> {
     let mut names = vec![path.to_path_buf()];
     if let Ok(target) = std::fs::canonicalize(path) {
+        names.push(target);
+    }
+    // A symlink whose target is missing cannot be canonicalized: name its target as the link
+    // says it (relative to the link's directory), and with that directory resolved, so
+    // restoring the target is noticed.
+    if let Ok(link) = std::fs::read_link(path) {
+        let target = match path.parent() {
+            Some(dir) if link.is_relative() => dir.join(link),
+            _ => link,
+        };
+        if let (Some(dir), Some(name)) = (target.parent(), target.file_name())
+            && let Ok(dir) = std::fs::canonicalize(dir)
+        {
+            names.push(dir.join(name));
+        }
         names.push(target);
     }
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
@@ -1410,6 +1536,7 @@ mod tests {
             user: None,
             namespace: namespace.map(str::to_owned),
             server: Some("https://dev".into()),
+            proxy_url: None,
             source: PathBuf::from("/k"),
         }
     }
@@ -1455,7 +1582,8 @@ mod tests {
             watch_timing: Default::default(),
         };
         let hubs = HubRegistry::default();
-        let mut manager = ClusterManager::new(config, events, hubs.clone());
+        let mut manager =
+            ClusterManager::new(config, events, hubs.clone(), SessionUnlocks::default());
         let mut slot = Cluster::new(context(None), None, &hubs, &manager.engine_config);
         slot.state = ConnectionState::Failed(cluster::SafeErrorText::fixed("offline"));
         manager.clusters.push(slot);
@@ -1481,6 +1609,432 @@ mod tests {
         );
         let gone = manager.log_client("other", None).err().expect("no client");
         assert!(gone.is_cluster());
+    }
+
+    // covers UP-54, UP-55: the one gate for actions that change a cluster refuses while it is
+    // protected, follows unlocks and trust, and is pinned to the server.
+    #[tokio::test]
+    async fn the_write_gate_refuses_protected_clusters() {
+        let (events, _rx) = async_channel::unbounded();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let hubs = HubRegistry::default();
+        let unlocks = SessionUnlocks::default();
+        let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
+        manager.clusters.push(Cluster::new(
+            context(None),
+            None,
+            &hubs,
+            &manager.engine_config,
+        ));
+        let protected = |c: &str| WriteRefusal::Protected { cluster: c.into() };
+        let not_connected = WriteRefusal::NotConnected {
+            cluster: "dev".into(),
+        };
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        // A context Flint does not know is never handed a client.
+        assert_eq!(
+            manager.write_client("gone").err(),
+            Some(WriteRefusal::NotConnected {
+                cluster: "gone".into()
+            })
+        );
+
+        unlocks.unlock("dev", "https://elsewhere");
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        unlocks.unlock("dev", "https://dev");
+        assert_eq!(
+            manager.write_client("dev").err(),
+            Some(not_connected.clone())
+        );
+        unlocks.lock("dev");
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+
+        let mut trusted = Settings::default();
+        trusted
+            .trusted_clusters
+            .push(settings::ClusterPin::new("dev", "https://dev/"));
+        manager.settings = Arc::new(trusted);
+        assert_eq!(
+            manager.write_client("dev").err(),
+            Some(not_connected.clone())
+        );
+        // Stop Trusting refuses at once, before the settings change arrives.
+        unlocks.revoke_trust("dev");
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        let trust = unlocks.request_trust("dev");
+        unlocks.trust_written("dev", trust, true);
+        assert_eq!(manager.write_client("dev").err(), Some(not_connected));
+
+        // A settings.toml that stops parsing trusts nothing, as at startup: an entry removed
+        // by hand behind a typo is not kept in force.
+        manager.apply_settings(Err("expected `=`".into())).await;
+        assert!(manager.settings.trusted_clusters.is_empty());
+        assert!(manager.settings.protect_local_clusters);
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+    }
+
+    /// A step of a trust interleaving ([`trust_and_stop_trusting_interleave_safely`]).
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        /// Trust This Cluster confirmed: the request is numbered and its write queued.
+        Trust,
+        /// Stop Trusting: the request is numbered, the gate refuses at once, the write is queued.
+        Stop,
+        /// The write of request `n` (0-based, in the order requested) runs and lands.
+        Write(usize),
+        /// The write of request `n` runs while settings.toml cannot be written: it fails.
+        Fail(usize),
+        /// settings.toml stops parsing and is reloaded.
+        Break,
+        /// settings.toml is put back as it was before [`Step::Break`] and reloaded.
+        Fix,
+        /// A reload catches settings.toml empty (an editor truncating it before writing),
+        /// then reads it whole again.
+        Blank,
+        /// Unlock for this session, at the context's server.
+        Unlock,
+        /// Lock Again.
+        Lock,
+        /// What the gate does now: `true` lets a new shell through.
+        Allows(bool),
+    }
+
+    // covers UP-55: whatever order Trust and Stop Trusting requests are made in, and their
+    // writes land or fail in, a shell is let through only while the newest request is a Trust
+    // whose pin is saved (or a trust no later request touched). Stop Trusting refuses at once,
+    // a Trust written before a later Stop Trusting never lifts it, and a broken settings.toml
+    // trusts nothing.
+    #[tokio::test]
+    async fn trust_and_stop_trusting_interleave_safely() {
+        use Step::*;
+        let cases: &[(&str, &[Step])] = &[
+            ("trust", &[Trust, Allows(false), Write(0), Allows(true)]),
+            (
+                "trust then stop, trust written first",
+                &[
+                    Trust,
+                    Stop,
+                    Allows(false),
+                    Write(0),
+                    Allows(false),
+                    Write(1),
+                    Allows(false),
+                ],
+            ),
+            (
+                "trust then stop, stop written first",
+                &[
+                    Trust,
+                    Stop,
+                    Write(1),
+                    Allows(false),
+                    Write(0),
+                    Allows(false),
+                ],
+            ),
+            (
+                "stop then trust",
+                &[
+                    Trust,
+                    Write(0),
+                    Allows(true),
+                    Stop,
+                    Allows(false),
+                    Trust,
+                    Allows(false),
+                    Write(1),
+                    Allows(false),
+                    Write(2),
+                    Allows(true),
+                ],
+            ),
+            (
+                "stop then trust, trust written first",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Trust,
+                    Write(2),
+                    Allows(true),
+                    Write(1),
+                    Allows(false),
+                ],
+            ),
+            (
+                "trust, stop, trust in order",
+                &[
+                    Trust,
+                    Stop,
+                    Trust,
+                    Write(0),
+                    Allows(false),
+                    Write(1),
+                    Allows(false),
+                    Write(2),
+                    Allows(true),
+                ],
+            ),
+            (
+                "trust, stop, trust, the last written first",
+                &[
+                    Trust,
+                    Stop,
+                    Trust,
+                    Write(2),
+                    Allows(true),
+                    Write(0),
+                    Allows(true),
+                    Write(1),
+                    Allows(false),
+                ],
+            ),
+            ("a failed trust", &[Trust, Fail(0), Allows(false)]),
+            (
+                "a failed stop keeps it protected",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Fail(1),
+                    Allows(false),
+                    Fix,
+                    Allows(false),
+                ],
+            ),
+            (
+                "a failed trust after a stop",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Write(1),
+                    Trust,
+                    Fail(2),
+                    Allows(false),
+                ],
+            ),
+            (
+                "the file breaks after a stop",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Break,
+                    Allows(false),
+                    Fail(1),
+                    Fix,
+                    Allows(false),
+                ],
+            ),
+            (
+                "the file breaks while trusted",
+                &[
+                    Trust,
+                    Write(0),
+                    Allows(true),
+                    Break,
+                    Allows(false),
+                    Fix,
+                    Allows(true),
+                ],
+            ),
+            (
+                "the file breaks between a trust and its write",
+                &[Trust, Break, Allows(false), Fail(0), Fix, Allows(false)],
+            ),
+            (
+                "lock again while a trust is being written",
+                &[
+                    Unlock,
+                    Allows(true),
+                    Trust,
+                    Lock,
+                    Allows(false),
+                    Write(0),
+                    Allows(false),
+                ],
+            ),
+            (
+                "lock again then trust again",
+                &[
+                    Unlock,
+                    Trust,
+                    Lock,
+                    Trust,
+                    Write(0),
+                    Allows(false),
+                    Write(1),
+                    Allows(true),
+                ],
+            ),
+            (
+                "a blank read while a stop is not written",
+                &[
+                    Trust,
+                    Write(0),
+                    Stop,
+                    Blank,
+                    Allows(false),
+                    Fail(1),
+                    Blank,
+                    Allows(false),
+                ],
+            ),
+            (
+                "a blank read after the stop is written",
+                &[Trust, Write(0), Stop, Write(1), Blank, Allows(false)],
+            ),
+        ];
+        for (name, steps) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (events, _rx) = async_channel::unbounded();
+            let config = CoreConfig {
+                config_dir: dir.path().to_owned(),
+                settings: Settings::default(),
+                settings_error: None,
+                kubeconfig_base: Vec::new(),
+                home: None,
+                watch_files: false,
+                watch_timing: Default::default(),
+            };
+            let hubs = HubRegistry::default();
+            let unlocks = SessionUnlocks::default();
+            let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
+            manager.clusters.push(Cluster::new(
+                context(None),
+                None,
+                &hubs,
+                &manager.engine_config,
+            ));
+            let file = dir.path().join(settings::SETTINGS_FILE);
+            let mut requests: Vec<(bool, u64)> = Vec::new();
+            let mut saved_text: Option<String> = None;
+            for (i, step) in steps.iter().enumerate() {
+                match *step {
+                    Trust => requests.push((true, unlocks.request_trust("dev"))),
+                    Stop => requests.push((false, unlocks.revoke_trust("dev"))),
+                    Write(n) | Fail(n) => {
+                        let (trust, request) = requests[n];
+                        let failing = matches!(step, Fail(_));
+                        let before = manager.settings_error.clone();
+                        if failing && before.is_none() {
+                            manager.settings_error = Some("cannot be written".into());
+                        }
+                        let server = trust.then(|| "https://dev".to_owned());
+                        manager.set_trusted("dev".into(), server, request).await;
+                        manager.settings_error = before;
+                    }
+                    Break => {
+                        saved_text = Some(std::fs::read_to_string(&file).unwrap_or_default());
+                        std::fs::write(&file, "watch_mode = ").unwrap();
+                        manager.reload_settings().await;
+                    }
+                    Fix => {
+                        if let Some(text) = saved_text.take() {
+                            std::fs::write(&file, text).unwrap();
+                        }
+                        manager.reload_settings().await;
+                    }
+                    Blank => {
+                        let text = std::fs::read_to_string(&file).unwrap_or_default();
+                        std::fs::write(&file, "").unwrap();
+                        manager.reload_settings().await;
+                        std::fs::write(&file, text).unwrap();
+                        manager.reload_settings().await;
+                    }
+                    Unlock => unlocks.unlock("dev", "https://dev"),
+                    Lock => {
+                        unlocks.lock("dev");
+                    }
+                    Allows(wanted) => {
+                        let allows = !matches!(
+                            manager.write_client("dev"),
+                            Err(WriteRefusal::Protected { .. })
+                        );
+                        assert_eq!(allows, wanted, "{name}: step {i} ({step:?}) of {steps:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    // covers UP-06: a directory named with `..` and by its resolved name is watched once, by
+    // the resolved name, so on Linux one inotify watch serves both and none is lost.
+    #[test]
+    fn watched_directories_are_resolved_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(real.join("kube")).unwrap();
+        std::fs::create_dir(real.join("other")).unwrap();
+        let files = [
+            real.join("kube/config"),
+            real.join("other/../kube/extra"),
+            dir.path().join("kube/third"),
+            // Missing: watched at its nearest ancestor, resolved too.
+            real.join("other/../gone/deeper/config"),
+        ];
+        let (watch, pending) = watch_plan(files.iter());
+        assert_eq!(
+            watch,
+            HashSet::from([real.join("kube"), real.clone()]),
+            "{watch:?}"
+        );
+        assert!(pending.contains(&real.join("other/../gone")), "{pending:?}");
+    }
+
+    // covers UP-12: a missing directory that appears (a symlink's target directory restored
+    // with settings.toml in it) reloads the settings too, not only kubeconfig.
+    #[test]
+    fn a_directory_that_appears_reloads_settings_and_kubeconfig() {
+        let pending = HashSet::from([PathBuf::from("/cfg/dotfiles")]);
+        let kube = HashSet::from([PathBuf::from("/k/config")]);
+        let settings = HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]);
+        let changed = classify(
+            &[PathBuf::from("/cfg/dotfiles")],
+            &pending,
+            &kube,
+            &settings,
+        );
+        assert!(changed.rearm && changed.settings && changed.kubeconfig);
+        let changed = classify(&[PathBuf::from("/k/config")], &pending, &kube, &settings);
+        assert!(!changed.rearm && !changed.settings && changed.kubeconfig);
+        let changed = classify(
+            &[PathBuf::from("/cfg/dotfiles/flint.toml")],
+            &pending,
+            &kube,
+            &settings,
+        );
+        assert!(!changed.rearm && changed.settings && !changed.kubeconfig);
+    }
+
+    // covers UP-12: settings.toml as a symlink to a file that is gone is watched at its
+    // target too, so restoring the target reloads it.
+    #[test]
+    fn a_dangling_symlink_is_watched_at_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("dotfiles")).unwrap();
+        let link = dir.path().join("settings.toml");
+        std::os::unix::fs::symlink("dotfiles/flint.toml", &link).unwrap();
+        let names = watch_names(&link);
+        assert!(
+            names.contains(&real.join("dotfiles/flint.toml")),
+            "{names:?}"
+        );
+        assert!(names.contains(&dir.path().join("dotfiles/flint.toml")));
+        // An absolute target, in a directory that does exist.
+        let absolute = dir.path().join("abs.toml");
+        std::os::unix::fs::symlink(real.join("dotfiles/other.toml"), &absolute).unwrap();
+        assert!(watch_names(&absolute).contains(&real.join("dotfiles/other.toml")));
     }
 
     // covers UP-24

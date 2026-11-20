@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flint_core::redact::safe_error_summary;
-use flint_core::settings::{AiExposureState, PaneWidths, State};
+use flint_core::settings::{AiExposureState, PaneWidths, State, TrustState};
 use flint_core::{
-    ClusterId, ClusterSummary, ConnectionState, KindId, NavEntry, SyncState, WatchMode,
+    ClusterId, ClusterSummary, ConnectionState, KindId, NavEntry, Protection, SyncState, WatchMode,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -30,23 +30,26 @@ use gpui_kit::*;
 use super::closing;
 use super::clusters::{ClustersModel, Presence, state_label};
 use super::confirm::{self, DialogText};
-use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, refused};
-use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
+use super::detail::{
+    DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
+};
+use super::dock::{self, Dock, DockEvent, DockItem as _, DockTab, TabKey};
 use super::dock_model::{LiveSessions, TabCluster};
 use super::focus::release_unfocused_input;
+use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
 use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
-    RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
-    WatchAllKinds, WatchOpenViewsOnly,
+    LockCluster, RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, TrustCluster,
+    UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::row_menu;
 use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
-use super::terminal_view::TerminalView;
+use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
@@ -521,6 +524,10 @@ impl Workspace {
             self.refuse(refused(opening, &reason), cx);
             return;
         }
+        if matches!(key, TabKey::Shell(_)) && self.is_protected(key.context(), cx) {
+            self.refuse(refused(opening, &protected_reason(key.context())), cx);
+            return;
+        }
         self.clear_action_error(cx);
         let cluster = self.tab_cluster(key.context(), cx);
         let core = self.model.read(cx).core().clone();
@@ -583,6 +590,14 @@ impl Workspace {
             self.refuse(refused(Opening::Shell, &reason), cx);
             return;
         }
+        // The core refuses too; this says so without opening a tab that fails at once.
+        if self.is_protected(&request.cluster, cx) {
+            self.refuse(
+                refused(Opening::Shell, &protected_reason(&request.cluster)),
+                cx,
+            );
+            return;
+        }
         let core = self.model.read(cx).core().clone();
         let cluster = self.tab_cluster(&request.cluster, cx);
         self.open_tab(
@@ -641,7 +656,37 @@ impl Workspace {
         };
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
-        detail.update(cx, |d, cx| d.set_sessions_blocked(why, cx));
+        let protected = self.is_protected(&cluster, cx);
+        detail.update(cx, |d, cx| {
+            d.set_sessions_blocked(why, cx);
+            d.set_protected(protected, cx);
+        });
+    }
+
+    /// Tells each shell tab why its Restart shell cannot run, if it cannot: its context is
+    /// gone or has no server, or its cluster is protected, when Unlock… is offered beside it
+    /// (UP-54).
+    fn tell_shells_protected(&mut self, cx: &mut Context<Self>) {
+        let shells: Vec<_> = self.dock.read(cx).terminals().cloned().collect();
+        for shell in shells {
+            let cluster = shell.read(cx).tab_key().context().to_owned();
+            let blocked = self.restart_blocked(&cluster, cx);
+            shell.update(cx, |s, cx| s.set_restart_blocked(blocked, cx));
+        }
+    }
+
+    /// Why a shell on `cluster` cannot start again, as far as the context and its protection
+    /// say.
+    fn restart_blocked(&self, cluster: &str, cx: &App) -> Option<RestartBlocked> {
+        let blocked = |why: String, unlock| Some(RestartBlocked { why, unlock });
+        match self.cluster_summary(cluster, cx) {
+            None => blocked(format!("no kubeconfig context named {cluster}"), false),
+            Some(c) if c.info.server.is_none() => {
+                blocked(format!("{cluster} has no API server in kubeconfig"), false)
+            }
+            Some(_) if self.is_protected(cluster, cx) => blocked(protected_reason(cluster), true),
+            Some(_) => None,
+        }
     }
 
     /// Brings the navigation and main area in line with the model: the active cluster and its
@@ -649,6 +694,7 @@ impl Workspace {
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
+        self.tell_shells_protected(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();
@@ -937,7 +983,7 @@ impl Workspace {
         if let Some(error) = &model.settings_error {
             list = list.child(sidebar_error(
                 "settings-error",
-                "settings.toml is invalid. Nothing is exposed to AI until it is fixed.",
+                "settings.toml is invalid. Until it is fixed, nothing is exposed to AI or trusted, and clusters on this machine are protected too.",
                 error,
                 theme,
             ));
@@ -957,10 +1003,12 @@ impl Workspace {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
             let exposure = model.ai_exposure(cluster);
             let settings_ok = model.settings_error.is_none();
+            let protection = (model.protection(cluster), model.trust(cluster));
             list = list.child(self.render_cluster_row(
                 cluster,
                 is_active,
                 exposure,
+                protection,
                 settings_ok,
                 theme,
             ));
@@ -1034,6 +1082,7 @@ impl Workspace {
         cluster: &ClusterSummary,
         is_active: bool,
         exposure: AiExposureState,
+        (protection, trust): (Protection, TrustState),
         settings_ok: bool,
         theme: &Theme,
     ) -> AnyElement {
@@ -1060,10 +1109,11 @@ impl Workspace {
             ),
         };
         let hover_text = format!(
-            "{}\n{}\n{}\n{}\nfrom {}",
+            "{}\n{}\n{}\n{}\n{}\nfrom {}",
             name,
             server.as_deref().unwrap_or("no server"),
             state_text,
+            protection_text(protection, &trust),
             exposure_text,
             cluster.info.source.display()
         );
@@ -1147,6 +1197,13 @@ impl Workspace {
             .when(exposure.is_exposed(), |row| {
                 row.child(Tag::secondary().outline().xsmall().flex_none().child("AI"))
             })
+            .children(render_lock_button(
+                &name,
+                server.is_some(),
+                protection,
+                &trust,
+                settings_ok,
+            ))
             .child(self.render_exposure_toggle(&name, server, exposure, settings_ok))
             .test_support()
             .into_any_element()
@@ -1586,6 +1643,240 @@ impl Workspace {
     }
 }
 
+/// What a cluster's protection is, in its row's tooltip.
+fn protection_text(protection: Protection, trust: &TrustState) -> String {
+    let text = match protection {
+        Protection::Protected => "Protected: read-only in Flint until you unlock or trust it",
+        Protection::Local => "On this machine: unlocked",
+        Protection::Unlocked => "Unlocked until Flint quits",
+        Protection::Trusted => "Trusted: unlocked across restarts",
+    };
+    match trust {
+        TrustState::ServerChanged { trusted_server } if protection != Protection::Trusted => {
+            format!("{text}. Cluster changed: trusted at {trusted_server}, now points elsewhere")
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// An entry of a cluster's lock menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockEntry {
+    Unlock,
+    LockAgain,
+    Trust,
+    /// Remove the context's pin from `settings.toml`: Stop Trusting, or Remove the Old Trust
+    /// when the pin is for another server.
+    Untrust {
+        stale: bool,
+    },
+}
+
+impl LockEntry {
+    fn label(self) -> &'static str {
+        match self {
+            LockEntry::Unlock => "Unlock for This Session…",
+            LockEntry::LockAgain => "Lock Again",
+            LockEntry::Trust => "Trust This Cluster…",
+            LockEntry::Untrust { stale: false } => "Stop Trusting",
+            LockEntry::Untrust { stale: true } => "Remove the Old Trust",
+        }
+    }
+
+    fn action(self, cluster: String) -> Box<dyn Action> {
+        match self {
+            LockEntry::Unlock => Box::new(UnlockCluster { cluster }),
+            LockEntry::LockAgain => Box::new(LockCluster { cluster }),
+            LockEntry::Trust => Box::new(TrustCluster { cluster }),
+            LockEntry::Untrust { .. } => Box::new(UntrustCluster { cluster }),
+        }
+    }
+}
+
+/// What a cluster's lock menu offers. Removing the trust is offered whenever `settings.toml`
+/// holds a pin for the context (`trust` is not `NotTrusted`), whether or not it grants access
+/// now: a pin whose removal failed after Stop Trusting (the cluster is protected meanwhile),
+/// or one for another server. Unlocking and trusting need a server to pin to.
+fn lock_menu(
+    has_server: bool,
+    protection: Protection,
+    trust: &TrustState,
+    settings_ok: bool,
+) -> Vec<LockEntry> {
+    let protected = protection == Protection::Protected && has_server;
+    let unlocked = protection == Protection::Unlocked;
+    let mut entries = Vec::new();
+    if protected {
+        entries.push(LockEntry::Unlock);
+    }
+    if unlocked {
+        entries.push(LockEntry::LockAgain);
+    }
+    if (protected || unlocked) && settings_ok {
+        entries.push(LockEntry::Trust);
+    }
+    if !matches!(trust, TrustState::NotTrusted) && settings_ok {
+        entries.push(LockEntry::Untrust {
+            stale: matches!(trust, TrustState::ServerChanged { .. }),
+        });
+    }
+    entries
+}
+
+/// The lock button of a cluster's row (UP-55): a closed lock while protected, an open one while
+/// unlocked for this session, a shield while trusted, and nothing for a cluster on this machine
+/// (unless an old trust is left to remove). Its menu ([`lock_menu`]) unlocks, locks again,
+/// trusts or stops trusting. It is not a tab stop, so a stray Space or Enter cannot open it.
+fn render_lock_button(
+    name: &str,
+    has_server: bool,
+    protection: Protection,
+    trust: &TrustState,
+    settings_ok: bool,
+) -> Option<AnyElement> {
+    let entries = lock_menu(has_server, protection, trust, settings_ok);
+    let button = Button::new(SharedString::from(format!("lock-{name}")))
+        .xsmall()
+        .tab_stop(false);
+    let pinned = !matches!(trust, TrustState::NotTrusted);
+    let (button, tip) = match protection {
+        Protection::Local if entries.is_empty() => return None,
+        Protection::Local => (
+            button.ghost().icon(FlintIcon::LockOpen),
+            "On this machine: unlocked. Click to remove an old trust.",
+        ),
+        Protection::Protected if entries.is_empty() => {
+            return Some(
+                button
+                    .ghost()
+                    .icon(FlintIcon::Lock)
+                    .disabled(true)
+                    .tooltip("Protected. This context has no API server, so it cannot be unlocked.")
+                    .into_any_element(),
+            );
+        }
+        Protection::Protected if !has_server => (
+            button.ghost().icon(FlintIcon::Lock),
+            "Protected. This context has no API server now. Click to remove its old trust.",
+        ),
+        Protection::Protected if pinned => (
+            button.ghost().icon(FlintIcon::Lock),
+            "Protected: read-only in Flint, though settings.toml still holds a trust for it. \
+             Click to unlock it, trust it, or remove that trust.",
+        ),
+        Protection::Protected => (
+            button.ghost().icon(FlintIcon::Lock),
+            "Protected: read-only in Flint. Click to unlock or trust it.",
+        ),
+        Protection::Unlocked => (
+            button.warning().icon(FlintIcon::LockOpen),
+            "Unlocked until Flint quits. Click to lock it again (shells already open keep \
+             running) or trust it.",
+        ),
+        Protection::Trusted => (
+            button.ghost().icon(FlintIcon::ShieldCheck),
+            "Trusted: unlocked across restarts. Click to stop trusting it (shells already open \
+             keep running).",
+        ),
+    };
+    let cluster = name.to_owned();
+    let menu =
+        button
+            .tooltip(tip)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                entries.iter().fold(menu, |menu, entry| {
+                    menu.item(
+                        PopupMenuItem::new(entry.label()).on_click(registry::on_click_or(
+                            entry.action(cluster.clone()),
+                            |_, _, _| {},
+                        )),
+                    )
+                })
+            });
+    Some(
+        div()
+            .flex_none()
+            // not-an-action: keeps the click on the menu button from selecting the row.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(menu)
+            .into_any_element(),
+    )
+}
+
+/// Asks before unlocking a protected cluster until Flint quits, naming the context and its
+/// server (UP-55).
+fn confirm_unlock(
+    window: &mut Window,
+    cx: &mut App,
+    model: Entity<ClustersModel>,
+    context: String,
+    server: String,
+) {
+    let dialog = unlock_dialog(&context, &server);
+    confirm::open(window, cx, dialog, move |_, cx| {
+        model.update(cx, |m, cx| m.unlock(&context, &server, cx));
+    });
+}
+
+/// The unlock confirmation, naming the context and the server it points at.
+fn unlock_dialog(context: &str, server: &str) -> DialogText {
+    DialogText {
+        title: format!("Unlock {}?", display::short_name(context)),
+        text: format!(
+            "Until Flint quits, or until you lock it again, actions that change this cluster or \
+             run code in it work without asking again: opening a shell, today. It stays unlocked \
+             only while the context points at this server. Locking it again stops new shells; \
+             shells already open keep running.\n\n\
+             Context: {context}\nServer: {server}"
+        ),
+        ok: "Unlock".into(),
+        cancel: "Cancel".into(),
+        id: "unlock-description",
+        // Unlocking takes the button: Enter cancels, as closing and quitting do.
+        default_cancel: true,
+    }
+}
+
+/// Asks before trusting a cluster, naming the context and its server (UP-55).
+fn confirm_trust(
+    window: &mut Window,
+    cx: &mut App,
+    model: Entity<ClustersModel>,
+    context: String,
+    server: String,
+    previous: Option<String>,
+) {
+    let dialog = trust_dialog(&context, &server, previous.as_deref());
+    confirm::open(window, cx, dialog, move |_, cx| {
+        model.update(cx, |m, _| m.trust_cluster(context.clone(), server.clone()));
+    });
+}
+
+/// The trust confirmation, naming the context and the server it points at (and the server it
+/// was trusted at before, when the context moved).
+fn trust_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let mut text = format!(
+        "A trusted cluster stays unlocked when Flint restarts: actions that change it or run \
+         code in it work without asking. Trust is kept in settings.toml and pinned to this \
+         server: if the context is pointed at another one, the cluster is protected again.\n\n\
+         Context: {context}\nServer: {server}"
+    );
+    if let Some(previous) = previous {
+        text.push_str(&format!(
+            "\n\nThis context was trusted at {previous}, which is a different server."
+        ));
+    }
+    DialogText {
+        title: format!("Trust {}?", display::short_name(context)),
+        text,
+        ok: "Trust".into(),
+        cancel: "Cancel".into(),
+        id: "trust-description",
+        // Trusting takes the button: Enter cancels.
+        default_cancel: true,
+    }
+}
+
 /// Asks before exposing a cluster to AI agents, naming the context and the server it points at.
 fn confirm_expose(
     window: &mut Window,
@@ -2002,11 +2293,77 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, MIN_LIST_WIDTH, layout, mode_name, namespace_summary, no_contexts_text,
-        watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, layout, lock_menu, mode_name, namespace_summary,
+        no_contexts_text, watch_mode_label,
     };
-    use flint_core::WatchMode;
-    use flint_core::settings::PaneWidths;
+    use flint_core::settings::{PaneWidths, TrustState};
+    use flint_core::{Protection, WatchMode};
+
+    // covers UP-55: the lock menu offers removing a trust whenever settings.toml holds a pin
+    // for the context, also when it grants nothing now (a Stop Trusting whose write failed, a
+    // pin for another server, a context without a server), so the removal can be retried.
+    #[test]
+    fn the_lock_menu_offers_removal_while_a_pin_is_on_disk() {
+        use LockEntry::*;
+        let stale = TrustState::ServerChanged {
+            trusted_server: "https://old".into(),
+        };
+        let none = TrustState::NotTrusted;
+        let pinned = TrustState::Trusted;
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &none, true),
+            [Unlock, Trust]
+        );
+        assert_eq!(
+            lock_menu(true, Protection::Unlocked, &none, true),
+            [LockAgain, Trust]
+        );
+        assert_eq!(
+            lock_menu(true, Protection::Trusted, &pinned, true),
+            [Untrust { stale: false }]
+        );
+        // Revoked while the pin is still on disk.
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &pinned, true),
+            [Unlock, Trust, Untrust { stale: false }]
+        );
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &stale, true),
+            [Unlock, Trust, Untrust { stale: true }]
+        );
+        assert_eq!(
+            lock_menu(false, Protection::Protected, &stale, true),
+            [Untrust { stale: true }]
+        );
+        assert_eq!(lock_menu(false, Protection::Protected, &none, true), []);
+        assert_eq!(
+            lock_menu(true, Protection::Local, &pinned, true),
+            [Untrust { stale: false }]
+        );
+        assert_eq!(lock_menu(true, Protection::Local, &none, true), []);
+        // An invalid settings.toml cannot be written: nothing that writes it.
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &pinned, false),
+            [Unlock]
+        );
+        assert_eq!(
+            [
+                Unlock,
+                LockAgain,
+                Trust,
+                Untrust { stale: false },
+                Untrust { stale: true }
+            ]
+            .map(LockEntry::label),
+            [
+                "Unlock for This Session…",
+                "Lock Again",
+                "Trust This Cluster…",
+                "Stop Trusting",
+                "Remove the Old Trust"
+            ]
+        );
+    }
 
     fn list_width(widths: Layout, window: f32) -> f32 {
         window - widths.clusters - widths.navigation - widths.detail

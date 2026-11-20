@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::cluster::{ClusterError, ClusterId};
+use crate::protection::WriteRefusal;
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -170,6 +171,9 @@ pub enum ExecFailureKind {
     Upgrade,
     /// Neither shell Flint tries is in the container.
     MissingShell,
+    /// The cluster is protected (ADR-0015): Flint opens no shell in it until the user unlocks
+    /// or trusts it. Nothing reached the cluster.
+    Protected,
     /// Anything else: no cause Flint can name (the full text says what happened).
     Other,
 }
@@ -562,7 +566,7 @@ impl Launcher for KubeLauncher {
 /// Runs a session on the core runtime: with a client, against the cluster; without one, the
 /// session fails at once with the given reason (the cluster is not connected, say).
 pub(crate) async fn start(
-    client: Result<Client, String>,
+    client: Result<Client, WriteRefusal>,
     request: ExecRequest,
     channels: SessionChannels,
 ) {
@@ -575,11 +579,17 @@ pub(crate) async fn start(
             };
             run(launcher, request, channels).await;
         }
-        Err(message) => {
+        Err(refusal) => {
+            let kind = match refusal {
+                WriteRefusal::Protected { .. } => ExecFailureKind::Protected,
+                WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => {
+                    ExecFailureKind::Unreachable
+                }
+            };
             let mut session = Session::new(channels);
             session.set_state(ExecState::Failed(ExecFailure::new(
-                ExecFailureKind::Unreachable,
-                message,
+                kind,
+                refusal.to_string(),
             )));
             session.linger().await;
         }
@@ -1667,13 +1677,35 @@ mod tests {
     #[tokio::test]
     async fn without_a_client_the_session_fails_at_once() {
         let (mut session, channels) = ExecSession::new(request());
-        tokio::spawn(start(Err("not connected".to_owned()), request(), channels));
+        let refusal = WriteRefusal::NotConnected {
+            cluster: "dev".into(),
+        };
+        tokio::spawn(start(Err(refusal.clone()), request(), channels));
         let snap = wait_for(&mut session, "failure", |s| s.state.is_finished()).await;
         assert_eq!(
             snap.state,
             ExecState::Failed(ExecFailure::new(
                 ExecFailureKind::Unreachable,
-                "not connected"
+                refusal.to_string()
+            ))
+        );
+    }
+
+    // covers UP-54: on a protected cluster the session fails at once, saying so, and nothing
+    // reaches the cluster.
+    #[tokio::test]
+    async fn on_a_protected_cluster_the_session_is_refused() {
+        let (mut session, channels) = ExecSession::new(request());
+        let refusal = WriteRefusal::Protected {
+            cluster: "dev".into(),
+        };
+        tokio::spawn(start(Err(refusal.clone()), request(), channels));
+        let snap = wait_for(&mut session, "failure", |s| s.state.is_finished()).await;
+        assert_eq!(
+            snap.state,
+            ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::Protected,
+                refusal.to_string()
             ))
         );
     }

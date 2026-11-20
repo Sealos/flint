@@ -22,6 +22,7 @@ use crate::logs::{
     WorkloadPod,
 };
 use crate::manager::ClusterManager;
+use crate::protection::{SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
 use crate::settings::{Appearance, Settings, WatchMode};
 use crate::store::{Feed, KindSnapshot, SyncState};
@@ -81,6 +82,18 @@ pub enum Command {
     SetAiExposed {
         cluster: ClusterId,
         server: Option<String>,
+    },
+    /// Trust a cluster at `server` (`Some`), or stop trusting it (`None`), in `settings.toml`
+    /// (ADR-0015). As with [`Command::SetAiExposed`], `server` is the URL the user confirmed; if
+    /// the context no longer points there, nothing is written and an error is reported.
+    ///
+    /// `request` numbers the request among the context's Trust and Stop Trusting requests;
+    /// [`CoreHandle::trust`] and [`CoreHandle::untrust`] take it from the session's state, so
+    /// use those rather than sending this yourself.
+    SetTrusted {
+        cluster: ClusterId,
+        server: Option<String>,
+        request: u64,
     },
     /// Reload the kubeconfig files now.
     ReloadKubeconfig,
@@ -150,6 +163,12 @@ pub(crate) enum Request {
     Client {
         cluster: ClusterId,
         reply: oneshot::Sender<Option<kube::Client>>,
+    },
+    /// The cluster's client for an action that changes the cluster or runs code in it, if the
+    /// cluster is connected and not protected (ADR-0015). Every such action asks through this.
+    WriteClient {
+        cluster: ClusterId,
+        reply: oneshot::Sender<Result<kube::Client, WriteRefusal>>,
     },
 }
 
@@ -223,6 +242,7 @@ pub struct CoreHandle {
     events: async_channel::Receiver<Event>,
     hubs: HubRegistry,
     next_subscription: Arc<AtomicU64>,
+    unlocks: SessionUnlocks,
     runtime: tokio::runtime::Handle,
     _runtime: Arc<RuntimeGuard>,
 }
@@ -239,13 +259,18 @@ impl CoreHandle {
         let (req_tx, req_rx) = async_channel::unbounded();
         let (event_tx, event_rx) = async_channel::unbounded();
         let hubs = HubRegistry::default();
-        runtime.spawn(ClusterManager::new(config, event_tx, hubs.clone()).run(cmd_rx, req_rx));
+        let unlocks = SessionUnlocks::default();
+        runtime.spawn(
+            ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone())
+                .run(cmd_rx, req_rx),
+        );
         Ok(Self {
             commands: cmd_tx,
             requests: req_tx,
             events: event_rx,
             hubs,
             next_subscription: Arc::new(AtomicU64::new(1)),
+            unlocks,
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })
@@ -418,23 +443,73 @@ impl CoreHandle {
     /// blocks.
     pub fn exec(&self, request: ExecRequest) -> ExecSession {
         let (session, channels) = ExecSession::new(request.clone());
-        let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::Client {
-            cluster: request.cluster.clone(),
-            reply,
-        });
+        let client = self.write_client(&request.cluster);
         self.runtime.spawn(async move {
-            let client = match sent {
-                Ok(()) => match rx.await {
-                    Ok(Some(client)) => Ok(client),
-                    Ok(None) => Err(format!("\"{}\" is not connected", request.cluster)),
-                    Err(_) => Err("the core stopped before answering".to_owned()),
-                },
-                Err(_) => Err("the core is not running".to_owned()),
-            };
-            crate::exec::start(client, request, channels).await;
+            crate::exec::start(client.await, request, channels).await;
         });
         session
+    }
+
+    /// The client for an action that changes `cluster` or runs code in it: refused while the
+    /// cluster is protected (ADR-0015) or not connected. Never blocks.
+    fn write_client(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Result<kube::Client, WriteRefusal>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::WriteClient {
+            cluster: cluster.to_owned(),
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err(WriteRefusal::Stopped);
+            }
+            rx.await.unwrap_or(Err(WriteRefusal::Stopped))
+        }
+    }
+
+    /// Unlocks `cluster` at `server` (the URL the user confirmed) until Flint quits or
+    /// [`CoreHandle::lock`] (ADR-0015). It takes effect at once. If the context now points
+    /// elsewhere, the unlock does not cover it: the pin is to `server`.
+    pub fn unlock(&self, cluster: &str, server: &str) {
+        self.unlocks.unlock(cluster, server);
+    }
+
+    /// Locks `cluster` again (Lock Again). Sessions already running keep running; nothing new
+    /// that changes the cluster starts. Returns whether it was unlocked.
+    pub fn lock(&self, cluster: &str) -> bool {
+        self.unlocks.lock(cluster)
+    }
+
+    /// Trusts `cluster` at `server` (the URL the user confirmed), written to `settings.toml`
+    /// through [`Command::SetTrusted`]. A revocation of its trust earlier in the session is
+    /// lifted once the core has checked the server and saved the pin, not before.
+    pub fn trust(&self, cluster: &str, server: &str) {
+        let request = self.unlocks.request_trust(cluster);
+        self.send(Command::SetTrusted {
+            cluster: cluster.to_owned(),
+            server: Some(server.to_owned()),
+            request,
+        });
+    }
+
+    /// Stops trusting `cluster` and locks it: from this moment nothing new that changes the
+    /// cluster starts, before `settings.toml` is written (commands and the core's gate take
+    /// separate queues), and no Trust written before then lifts it. Shells already open keep
+    /// running.
+    pub fn untrust(&self, cluster: &str) {
+        let request = self.unlocks.revoke_trust(cluster);
+        self.send(Command::SetTrusted {
+            cluster: cluster.to_owned(),
+            server: None,
+            request,
+        });
+    }
+
+    /// The session's unlocks, for showing each cluster's [`crate::Protection`].
+    pub fn unlocks(&self) -> &SessionUnlocks {
+        &self.unlocks
     }
 
     /// Lists the pods of a workload (or a label selector) in `namespace` on a connected

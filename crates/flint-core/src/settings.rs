@@ -54,14 +54,35 @@ pub enum Appearance {
     Dark,
 }
 
-/// One cluster the user exposed to AI agents (ADR-0009): the context name and the API server URL
-/// it pointed to when the user exposed it. Both must match for the cluster to count as exposed,
-/// so a context that is re-pointed, or has the same name in another `KUBECONFIG`, is not exposed.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct AiExposure {
+/// A cluster as the user chose it: the context name and the API server URL it pointed to when
+/// the user chose it. Both must match for the choice to hold, so a context that is re-pointed,
+/// or has the same name in another `KUBECONFIG`, is not covered by it. AI exposure (ADR-0009),
+/// trust and session unlocks (ADR-0015) all pin a cluster this way.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClusterPin {
     pub context: String,
     pub server: String,
 }
+
+impl ClusterPin {
+    pub fn new(context: impl Into<String>, server: impl Into<String>) -> Self {
+        Self {
+            context: context.into(),
+            server: server.into(),
+        }
+    }
+
+    /// Whether this pin is `context` at `server` (a trailing slash aside).
+    pub fn matches(&self, context: &str, server: &str) -> bool {
+        self.context == context && same_server(&self.server, server)
+    }
+}
+
+/// One cluster the user exposed to AI agents (ADR-0009), pinned to its server.
+pub type AiExposure = ClusterPin;
+
+/// One cluster the user trusts (ADR-0015): unlocked across restarts, pinned to its server.
+pub type TrustedCluster = ClusterPin;
 
 /// Whether a context is exposed to AI agents, per [`Settings::ai_exposure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +100,43 @@ impl AiExposureState {
     pub fn is_exposed(&self) -> bool {
         matches!(self, AiExposureState::Exposed)
     }
+}
+
+/// Whether a context is trusted, per [`Settings::trust`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustState {
+    NotTrusted,
+    Trusted,
+    /// The context name is trusted, but for a different API server URL. It counts as not
+    /// trusted (so the cluster is protected) until the user trusts it again. `trusted_server` is
+    /// the URL that was trusted.
+    ServerChanged {
+        trusted_server: String,
+    },
+}
+
+impl TrustState {
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, TrustState::Trusted)
+    }
+}
+
+/// Where `context`, now at `server`, stands in a list of pins: `None` when the list does not
+/// name it, `Some(Ok(()))` when a pin matches, `Some(Err(pinned))` when it names the context
+/// only at another server (`pinned`). A context with no server never matches.
+fn pin_state(
+    pins: &[ClusterPin],
+    context: &str,
+    server: Option<&str>,
+) -> Option<Result<(), String>> {
+    let mut changed = None;
+    for pin in pins.iter().filter(|p| p.context == context) {
+        if server.is_some_and(|s| pin.matches(context, s)) {
+            return Some(Ok(()));
+        }
+        changed.get_or_insert_with(|| pin.server.clone());
+    }
+    changed.map(Err)
 }
 
 /// Lines a log session keeps by default ([`Settings::log_buffer_lines`]).
@@ -101,6 +159,13 @@ pub struct Settings {
     /// Clusters the MCP server may see (ADR-0009), as context name plus API server URL. Empty by
     /// default: nothing is exposed.
     pub ai_exposed_clusters: Vec<AiExposure>,
+    /// Clusters Flint may change without a session unlock (ADR-0015), as context name plus API
+    /// server URL. Empty by default: every cluster not on this machine is protected.
+    pub trusted_clusters: Vec<TrustedCluster>,
+    /// Protect clusters whose API server is on this machine too (`localhost`, a loopback
+    /// address). Off by default, so kind, minikube, Docker Desktop and OrbStack start unlocked;
+    /// turn it on when a local address is a tunnel to a remote cluster.
+    pub protect_local_clusters: bool,
     /// Extra kubeconfig files, loaded after `KUBECONFIG` or `~/.kube/config`. `~` is expanded.
     pub kubeconfig_paths: Vec<PathBuf>,
     /// Overrides the `PATH` resolved from the login shell.
@@ -125,6 +190,8 @@ impl Default for Settings {
         Settings {
             appearance: Appearance::default(),
             ai_exposed_clusters: Vec::new(),
+            trusted_clusters: Vec::new(),
+            protect_local_clusters: false,
             kubeconfig_paths: Vec::new(),
             path: None,
             helm: None,
@@ -164,20 +231,34 @@ impl Settings {
     /// Whether `context`, currently pointing at `server`, is exposed to AI agents. A context with
     /// no server (its cluster entry is missing) is never exposed.
     pub fn ai_exposure(&self, context: &str, server: Option<&str>) -> AiExposureState {
-        let mut changed = None;
-        for entry in self
-            .ai_exposed_clusters
-            .iter()
-            .filter(|e| e.context == context)
-        {
-            if server.is_some_and(|s| same_server(s, &entry.server)) {
-                return AiExposureState::Exposed;
-            }
-            changed.get_or_insert_with(|| entry.server.clone());
-        }
-        match changed {
-            Some(exposed_server) => AiExposureState::ServerChanged { exposed_server },
+        match pin_state(&self.ai_exposed_clusters, context, server) {
+            Some(Ok(())) => AiExposureState::Exposed,
+            Some(Err(exposed_server)) => AiExposureState::ServerChanged { exposed_server },
             None => AiExposureState::Hidden,
+        }
+    }
+
+    /// Whether `context`, currently pointing at `server`, is trusted (ADR-0015). A context with
+    /// no server (its cluster entry is missing) is never trusted.
+    pub fn trust(&self, context: &str, server: Option<&str>) -> TrustState {
+        match pin_state(&self.trusted_clusters, context, server) {
+            Some(Ok(())) => TrustState::Trusted,
+            Some(Err(trusted_server)) => TrustState::ServerChanged { trusted_server },
+            None => TrustState::NotTrusted,
+        }
+    }
+
+    /// What applies while `settings.toml` cannot be read, keeping the harmless parts of `self`
+    /// (the settings in force before, or the defaults): nothing is exposed to AI agents or
+    /// trusted, and clusters on this machine are protected too, since the file may have said
+    /// `protect_local_clusters = true` (a local tunnel to a remote cluster). Every choice that
+    /// opens something up is dropped until the file parses again.
+    pub fn unreadable_fallback(self) -> Settings {
+        Settings {
+            ai_exposed_clusters: Vec::new(),
+            trusted_clusters: Vec::new(),
+            protect_local_clusters: true,
+            ..self
         }
     }
 
@@ -278,7 +359,79 @@ fn config_dir_from(
 }
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
-    load_toml(&dir.join(SETTINGS_FILE))
+    let path = dir.join(SETTINGS_FILE);
+    let settings = load_toml(&path)?;
+    // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
+    // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(table) = toml::from_str::<toml::Table>(&text)
+    {
+        for (unknown, known) in misspelled_keys(&table) {
+            tracing::warn!(
+                "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
+            );
+        }
+    }
+    Ok(settings)
+}
+
+/// The top-level keys of [`Settings`].
+const SETTINGS_KEYS: &[&str] = &[
+    "appearance",
+    "ai_exposed_clusters",
+    "trusted_clusters",
+    "protect_local_clusters",
+    "kubeconfig_paths",
+    "path",
+    "helm",
+    "watch_mode",
+    "cluster_watch_mode",
+    "log_buffer_lines",
+    "log_buffer_mib",
+];
+
+/// The keys of `table` that are not settings but look like a misspelt one (at most two edits
+/// away, or one with an `s` added or dropped), each with the key it resembles.
+fn misspelled_keys(table: &toml::Table) -> Vec<(String, &'static str)> {
+    table
+        .keys()
+        .filter(|k| !SETTINGS_KEYS.contains(&k.as_str()))
+        .filter_map(|k| {
+            SETTINGS_KEYS
+                .iter()
+                .find(|known| known.len() > 4 && edit_distance(k, known) <= 2)
+                .map(|known| (k.clone(), *known))
+        })
+        .collect()
+}
+
+/// Levenshtein distance, by characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+/// [`load_settings`], or, when the file cannot be read, the defaults made safe with
+/// [`Settings::unreadable_fallback`] and why it could not be read. A missing file is the
+/// defaults, with no error.
+pub fn load_settings_or_fallback(dir: &Path) -> (Settings, Option<String>) {
+    match load_settings(dir) {
+        Ok(s) => (s, None),
+        Err(e) => (
+            Settings::default().unreadable_fallback(),
+            Some(e.to_string()),
+        ),
+    }
 }
 
 pub fn load_state(dir: &Path) -> Result<State, SettingsError> {
@@ -305,8 +458,31 @@ pub fn set_ai_exposed(
     context: &str,
     server: Option<&str>,
 ) -> Result<Settings, SettingsError> {
+    set_pin(dir, "ai_exposed_clusters", context, server)
+}
+
+/// Trusts `context` at `server` (`Some`), or stops trusting it (`None`), and writes
+/// `settings.toml`, as [`set_ai_exposed`] does for exposure: trusting replaces any older entry
+/// for the same context, and untrusting removes every entry for it. Returns the settings as
+/// written.
+pub fn set_trusted(
+    dir: &Path,
+    context: &str,
+    server: Option<&str>,
+) -> Result<Settings, SettingsError> {
+    set_pin(dir, "trusted_clusters", context, server)
+}
+
+/// Pins `context` at `server` in the list of pins under `key` (`Some`, replacing the context's
+/// older pins), or removes the context's pins (`None`), and writes `settings.toml`.
+fn set_pin(
+    dir: &Path,
+    key: &str,
+    context: &str,
+    server: Option<&str>,
+) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, path| {
-        let mut current: Vec<AiExposure> = match table.get("ai_exposed_clusters") {
+        let mut current: Vec<ClusterPin> = match table.get(key) {
             Some(value) => value
                 .clone()
                 .try_into()
@@ -318,16 +494,10 @@ pub fn set_ai_exposed(
         };
         current.retain(|e| e.context != context);
         if let Some(server) = server {
-            current.push(AiExposure {
-                context: context.to_owned(),
-                server: server.to_owned(),
-            });
+            current.push(ClusterPin::new(context, server));
         }
         current.sort();
-        table.insert(
-            "ai_exposed_clusters".into(),
-            toml::Value::try_from(&current)?,
-        );
+        table.insert(key.into(), toml::Value::try_from(&current)?);
         Ok(())
     })
 }
@@ -430,7 +600,12 @@ fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, S
             path: path.to_owned(),
             source,
         }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        // A missing file is a fresh install. A symlink whose target is missing is not: the
+        // user keeps the file elsewhere, and it may have said something (such as
+        // `protect_local_clusters`) that defaults would quietly undo.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && path.symlink_metadata().is_err() => {
+            Ok(T::default())
+        }
         Err(source) => Err(SettingsError::Read {
             path: path.to_owned(),
             source,
@@ -734,6 +909,148 @@ mod tests {
         let loaded = load_settings(dir.path()).unwrap();
         assert_eq!(loaded, s);
         assert_eq!(loaded.watch_mode, WatchMode::OnView);
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(raw.contains("future"));
+    }
+
+    // covers UP-55: trust is pinned to the context and its server, like AI exposure.
+    #[test]
+    fn trust_needs_name_and_server() {
+        let settings: Settings = toml::from_str(
+            r#"
+            protect_local_clusters = true
+            [[trusted_clusters]]
+            context = "staging"
+            server = "https://staging.example:6443"
+            "#,
+        )
+        .unwrap();
+        assert!(settings.protect_local_clusters);
+        assert!(!Settings::default().protect_local_clusters);
+        assert!(Settings::default().trusted_clusters.is_empty());
+        assert!(
+            settings
+                .trust("staging", Some("https://staging.example:6443/"))
+                .is_trusted()
+        );
+        assert_eq!(
+            settings.trust("staging", Some("https://prod.example:6443")),
+            TrustState::ServerChanged {
+                trusted_server: "https://staging.example:6443".into()
+            }
+        );
+        assert!(!settings.trust("staging", None).is_trusted());
+        assert_eq!(
+            settings.trust("prod", Some("https://staging.example:6443")),
+            TrustState::NotTrusted
+        );
+        // Exposure and trust are separate lists.
+        assert_eq!(
+            settings.ai_exposure("staging", Some("https://staging.example:6443")),
+            AiExposureState::Hidden
+        );
+        assert!(toml::from_str::<Settings>("trusted_clusters = [\"staging\"]").is_err());
+    }
+
+    // covers UP-54: a settings.toml that does not parse opens nothing up. It may have said
+    // `protect_local_clusters = true` for a tunnel to production on a loopback address, so that
+    // address is protected until the file parses again; a missing or valid file keeps the
+    // exemption.
+    #[test]
+    fn an_unreadable_file_protects_local_clusters_and_trusts_nothing() {
+        use crate::protection::{Protection, SessionUnlocks, protection};
+        let unlocks = SessionUnlocks::default();
+        let tunnel = Some("https://127.0.0.1:8443");
+        let of = |s: &Settings| protection(s, &unlocks, "prod-tunnel", tunnel, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (missing, error) = load_settings_or_fallback(dir.path());
+        assert_eq!(error, None);
+        assert_eq!(of(&missing), Protection::Local);
+
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "protect_local_clusters = true\n\
+             trusted_clusters = [{ context = \"prod-tunnel\", server = \"https://127.0.0.1:8443\" }]\n\
+             watch_mode = ",
+        )
+        .unwrap();
+        let (broken, error) = load_settings_or_fallback(dir.path());
+        assert!(error.is_some());
+        assert!(broken.trusted_clusters.is_empty() && broken.ai_exposed_clusters.is_empty());
+        assert_eq!(of(&broken), Protection::Protected);
+
+        std::fs::write(dir.path().join(SETTINGS_FILE), "watch_mode = \"all\"\n").unwrap();
+        let (valid, error) = load_settings_or_fallback(dir.path());
+        assert_eq!(error, None);
+        assert_eq!(of(&valid), Protection::Local);
+    }
+
+    // covers UP-54: settings.toml as a symlink to a file that is gone (a dotfiles checkout not
+    // mounted) is unreadable, not a fresh install, so local clusters stay protected.
+    #[test]
+    fn a_dangling_symlink_is_unreadable_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), dir.path().join(SETTINGS_FILE))
+            .unwrap();
+        assert!(matches!(
+            load_settings(dir.path()),
+            Err(SettingsError::Read { .. })
+        ));
+        let (settings, error) = load_settings_or_fallback(dir.path());
+        assert!(error.is_some());
+        assert!(settings.protect_local_clusters);
+        // State has no such stake, but reads the same way.
+        std::os::unix::fs::symlink(dir.path().join("gone2.toml"), dir.path().join(STATE_FILE))
+            .unwrap();
+        assert!(load_state(dir.path()).is_err());
+    }
+
+    // covers UP-54: a misspelt key is ignored like any unknown one, so it is named in the log.
+    #[test]
+    fn misspelt_keys_are_found_and_new_ones_are_not() {
+        let table: toml::Table = toml::from_str(
+            "protect_local_cluster = true\nprotect_locale_clusters = true\n\
+             trusted_cluster = []\nwatch_mode = \"all\"\nsome_future_key = 3\npth = \"/bin\"\n",
+        )
+        .unwrap();
+        let mut found = misspelled_keys(&table);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("protect_local_cluster".to_owned(), "protect_local_clusters"),
+                (
+                    "protect_locale_clusters".to_owned(),
+                    "protect_local_clusters"
+                ),
+                ("trusted_cluster".to_owned(), "trusted_clusters"),
+            ]
+        );
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "abc"), 3);
+    }
+
+    // covers UP-55
+    #[test]
+    fn set_trusted_round_trips_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "protect_local_clusters = true\nfuture = 1\n",
+        )
+        .unwrap();
+        set_ai_exposed(dir.path(), "a", Some("https://a")).unwrap();
+        let s = set_trusted(dir.path(), "a", Some("https://a")).unwrap();
+        assert!(s.trust("a", Some("https://a")).is_trusted());
+        let s = set_trusted(dir.path(), "a", Some("https://a2")).unwrap();
+        assert_eq!(s.trusted_clusters, vec![ClusterPin::new("a", "https://a2")]);
+        let s = set_trusted(dir.path(), "a", None).unwrap();
+        assert_eq!(s.trust("a", Some("https://a2")), TrustState::NotTrusted);
+        assert!(s.ai_exposure("a", Some("https://a")).is_exposed());
+        assert!(s.protect_local_clusters);
+        let loaded = load_settings(dir.path()).unwrap();
+        assert_eq!(loaded, s);
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(raw.contains("future"));
     }

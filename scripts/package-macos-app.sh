@@ -11,7 +11,8 @@
 # The bundle is ad-hoc signed (`codesign -s -`), not Developer ID signed or notarized: that waits
 # on the Apple Developer account (#25). Signing later replaces the ad-hoc signature at the same
 # bundle identifier. The Info.plist comes from packaging/macos/Info.plist, the icon from
-# assets/brand/Flint.icns, and LICENSE goes into Contents/Resources. scripts/smoke-macos-app.sh checks the DMG.
+# assets/brand/Flint.icns, and LICENSE and LICENSE-LUCIDE (for the Lucide icons compiled into the binary) go
+# into Contents/Resources. scripts/smoke-macos-app.sh checks the DMG.
 set -euo pipefail
 
 if [ $# -ne 3 ]; then
@@ -55,6 +56,9 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 install -m 755 "$binary" "$app/Contents/MacOS/flint"
 install -m 644 "$repo/assets/brand/Flint.icns" "$app/Contents/Resources/Flint.icns"
 install -m 644 "$repo/LICENSE" "$app/Contents/Resources/LICENSE"
+# The Lucide icons compiled into the binary (crates/flint-app/src/ui/icons.rs) are ISC: their
+# notice travels with the app.
+install -m 644 "$repo/crates/flint-app/assets/icons/LICENSE-LUCIDE" "$app/Contents/Resources/LICENSE-LUCIDE"
 sed "s/@VERSION@/$version/g" "$repo/packaging/macos/Info.plist" >"$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 plutil -lint "$app/Contents/Info.plist"

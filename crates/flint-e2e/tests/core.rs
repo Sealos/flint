@@ -28,12 +28,21 @@ struct Core {
 
 impl Core {
     async fn start(server: &FakeApiServer, namespace: Option<&str>) -> Core {
+        Core::start_with(server, namespace, Settings::default()).await
+    }
+
+    /// [`Core::start`] with `settings` (watching only what is open).
+    async fn start_with(
+        server: &FakeApiServer,
+        namespace: Option<&str>,
+        settings: Settings,
+    ) -> Core {
         let dir = tempfile::tempdir().unwrap();
         let kubeconfig = dir.path().join("kubeconfig");
         server.write_kubeconfig(&kubeconfig, namespace).unwrap();
         let settings = Settings {
             watch_mode: WatchMode::OnView,
-            ..Settings::default()
+            ..settings
         };
         let handle = CoreHandle::start(CoreConfig {
             config_dir: dir.path().join("config"),
@@ -930,6 +939,76 @@ fn running(command: &str) -> ExecState {
 
 /// The pod of the fixtures' web deployment: nginx, which has bash.
 const WEB: &str = "web-69c6f74b8b-qv4xv";
+
+/// Opens a shell in [`WEB`] and waits until it fails, returning its failure's kind.
+async fn shell_failure(core: &Core) -> ExecFailureKind {
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
+    match &snap.state {
+        ExecState::Failed(failure) => failure.kind,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Opens a shell in [`WEB`] and waits for its bash prompt.
+async fn shell_runs(core: &Core) {
+    let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
+    let prompt = format!("root@{WEB}:/#");
+    until_exec(&mut shell, "the bash prompt", |s| {
+        s.state == running("bash") && has_line(s, &prompt)
+    })
+    .await;
+}
+
+// covers UP-54, UP-55: the core refuses a shell on a protected cluster before anything reaches
+// the API server; an unlock pinned to the server lets it through until Lock Again, and so
+// does trust, written to settings.toml. (The fake server is on this machine, which starts
+// unlocked; `protect_local_clusters` protects it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protected_cluster_refuses_shells_until_unlocked_or_trusted() {
+    let server = FakeApiServer::start().await.unwrap();
+    let settings = Settings {
+        protect_local_clusters: true,
+        ..Settings::default()
+    };
+    let core = Core::start_with(&server, Some("demo"), settings).await;
+    assert_eq!(shell_failure(&core).await, ExecFailureKind::Protected);
+    assert!(
+        server.exec_requests().is_empty(),
+        "nothing reached the cluster"
+    );
+
+    // An unlock at another server does not cover it.
+    core.handle
+        .unlock(CONTEXT, "https://elsewhere.example:6443");
+    assert_eq!(shell_failure(&core).await, ExecFailureKind::Protected);
+    core.handle.unlock(CONTEXT, &server.url());
+    shell_runs(&core).await;
+    assert_eq!(server.exec_requests().len(), 1);
+    assert!(core.handle.lock(CONTEXT));
+    assert_eq!(shell_failure(&core).await, ExecFailureKind::Protected);
+    assert_eq!(server.exec_requests().len(), 1);
+
+    let events = core.handle.events();
+    core.handle.trust(CONTEXT, &server.url());
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match events.recv().await.expect("core running") {
+                Event::SettingsChanged { settings, .. }
+                    if !settings.trusted_clusters.is_empty() =>
+                {
+                    return;
+                }
+                Event::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("trusted in time");
+    shell_runs(&core).await;
+    assert_eq!(server.exec_requests().len(), 2);
+}
 
 // covers UP-41
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

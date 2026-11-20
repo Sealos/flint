@@ -5,7 +5,7 @@
 #
 # Mounts the DMG read-only at a private mount point and checks that it holds Flint.app and an
 # Applications link; that the bundle has the bundle identifier se.redstack.flint, <version>, its
-# icon and LICENSE; that its signature verifies and is the ad-hoc one for se.redstack.flint; that
+# icon, LICENSE and LICENSE-LUCIDE; that its signature verifies and is the ad-hoc one for se.redstack.flint; that
 # `Flint.app/Contents/MacOS/flint --version` prints "flint <version>" and `flint mcp` answers
 # `initialize` and exits cleanly; and that the bundled binary has no automation channel. Detaches
 # the DMG on exit. Exits 1 when a check fails, 2 for bad arguments.
@@ -65,6 +65,8 @@ exe=$app/Contents/MacOS/flint
 [ -x "$exe" ] || fail "Flint.app has no executable Contents/MacOS/flint"
 [ -f "$app/Contents/Resources/Flint.icns" ] || fail "Flint.app has no Contents/Resources/Flint.icns"
 cmp -s "$app/Contents/Resources/LICENSE" "$repo/LICENSE" || fail "Flint.app has no Contents/Resources/LICENSE"
+cmp -s "$app/Contents/Resources/LICENSE-LUCIDE" "$repo/crates/flint-app/assets/icons/LICENSE-LUCIDE" ||
+  fail "Flint.app has no Contents/Resources/LICENSE-LUCIDE"
 
 plist=$app/Contents/Info.plist
 plutil -lint "$plist" || fail "Info.plist does not parse"

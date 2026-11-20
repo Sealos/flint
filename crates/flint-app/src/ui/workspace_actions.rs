@@ -7,9 +7,10 @@
 //! the active log or shell tab's actions to them, and installs their guards, so those work and
 //! are checked wherever focus is.
 
-use flint_core::settings::AiExposureState;
+use flint_core::settings::{AiExposureState, TrustState};
 use flint_core::{
-    ClusterSummary, ConnectionState, LogSubject, NavEntry, PodSet, WatchMode, WorkloadTarget,
+    ClusterSummary, ConnectionState, LogSubject, NavEntry, PodSet, Protection, WatchMode,
+    WorkloadTarget,
 };
 use gpui_kit::*;
 
@@ -40,9 +41,10 @@ use super::super::registry::{
     ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
     UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::super::registry::{LockCluster, TrustCluster, UnlockCluster, UntrustCluster};
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
-use super::{Pane, Workspace, confirm_expose, expose_dialog};
+use super::{Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog};
 
 /// A guard: the view `$view` returns (`log`, `shell`, `detail` or `list_wide`) is open and,
 /// given `$check`, passes it. It expands to a closure that captures nothing, so it is the plain
@@ -64,6 +66,10 @@ impl Workspace {
             .bind::<SelectCluster>(Self::select_cluster)
             .bind::<ExposeToAi>(Self::expose_to_ai)
             .bind::<HideFromAi>(Self::hide_from_ai)
+            .bind::<UnlockCluster>(Self::unlock_cluster)
+            .bind::<LockCluster>(Self::lock_cluster)
+            .bind::<TrustCluster>(Self::trust_cluster)
+            .bind::<UntrustCluster>(Self::untrust_cluster)
             .bind::<RetryConnection>(Self::retry_connection)
             .bind::<WatchAllKinds>(|this, _, _, cx| {
                 this.set_watch_mode(true, Some(WatchMode::All), cx)
@@ -138,6 +144,12 @@ impl Workspace {
             )
             .add::<ExposeToAi>(Self::settings_ok, |ws, a, cx| ws.check_expose(a, cx))
             .add::<HideFromAi>(Self::settings_ok, |ws, a, cx| ws.check_hide(a, cx))
+            .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
+            .add::<LockCluster>(|_, _| true, |ws, a, cx| ws.check_lock(a, cx))
+            .add::<TrustCluster>(Self::settings_ok, |ws, a, cx| {
+                ws.trust_change(a, cx).map(drop)
+            })
+            .add::<UntrustCluster>(Self::settings_ok, |ws, a, cx| ws.check_untrust(a, cx))
             .when::<RetryConnection>(|ws, cx| ws.retry_enabled(cx))
             .when::<WatchAllKinds>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
             .when::<WatchOpenViewsOnly>(|ws, cx| ws.cluster.is_some() && ws.settings_ok(cx))
@@ -261,7 +273,11 @@ impl Workspace {
             })
             .when::<ShowTabList>(|ws, cx| ws.dock.read(cx).tab_count() > 0)
             .when::<ReconnectLogs>(|ws, cx| ws.dock.read(cx).restartable(true, cx).is_some())
-            .when::<RestartShell>(|ws, cx| ws.dock.read(cx).restartable(false, cx).is_some())
+            // Not on a protected cluster: the tab says why, with Unlock… beside it.
+            .when::<RestartShell>(|ws, cx| {
+                ws.dock.read(cx).restartable(false, cx).is_some()
+                    && shell(ws, cx).is_some_and(|s| s.restart_blocked().is_none())
+            })
             .add::<ActivateTab>(
                 |ws, cx| ws.dock.read(cx).tab_count() > 0,
                 |ws, a, cx| ws.dock.read(cx).check_tab::<ActivateTab>(a.tab),
@@ -575,6 +591,97 @@ impl Workspace {
         }
     }
 
+    /// Whether `cluster` is protected (ADR-0015): Shell (and every later action that changes
+    /// the cluster) is refused there, saying so. A context Flint does not know is protected.
+    pub(in crate::ui) fn is_protected(&self, cluster: &str, cx: &App) -> bool {
+        !self.model.read(cx).protection_of(cluster).allows_changes()
+    }
+
+    /// The context `cluster`, with its server: what unlocking and trusting pin.
+    fn pinnable<A: Action>(&self, cluster: &str, cx: &App) -> Result<String, ActionError> {
+        self.check_cluster::<A>(cluster, cx)?;
+        let summary = self.cluster_summary(cluster, cx).expect("checked");
+        summary
+            .info
+            .server
+            .clone()
+            .ok_or_else(|| ActionError::rejected::<A>("the context has no API server"))
+    }
+
+    /// [`UnlockCluster`]: a protected context with a server. Returns the server.
+    fn unlock_target(&self, action: &UnlockCluster, cx: &App) -> Result<String, ActionError> {
+        let server = self.pinnable::<UnlockCluster>(&action.cluster, cx)?;
+        let why = match self.model.read(cx).protection_of(&action.cluster) {
+            Protection::Protected => return Ok(server),
+            Protection::Local => "the cluster is on this machine, so it is not protected",
+            Protection::Unlocked => "the cluster is unlocked already",
+            Protection::Trusted => "the cluster is trusted, so it is not protected",
+        };
+        Err(ActionError::rejected::<UnlockCluster>(why))
+    }
+
+    /// [`LockCluster`]: a cluster unlocked for this session.
+    fn check_lock(&self, action: &LockCluster, cx: &App) -> Result<(), ActionError> {
+        self.check_cluster::<LockCluster>(&action.cluster, cx)?;
+        match self.model.read(cx).protection_of(&action.cluster) {
+            Protection::Unlocked => Ok(()),
+            Protection::Trusted => Err(ActionError::rejected::<LockCluster>(
+                "the cluster is trusted; stop trusting it to protect it",
+            )),
+            _ => Err(ActionError::rejected::<LockCluster>(
+                "the cluster is not unlocked for this session",
+            )),
+        }
+    }
+
+    /// [`TrustCluster`]: a context with a server, not trusted already. Returns the server and
+    /// the one trusted before, if the context moved.
+    fn trust_change(
+        &self,
+        action: &TrustCluster,
+        cx: &App,
+    ) -> Result<(String, Option<String>), ActionError> {
+        if !self.settings_ok(cx) {
+            return Err(ActionError::rejected::<TrustCluster>(
+                "settings.toml is invalid",
+            ));
+        }
+        let server = self.pinnable::<TrustCluster>(&action.cluster, cx)?;
+        let model = self.model.read(cx);
+        let summary = self.cluster_summary(&action.cluster, cx).expect("checked");
+        if model.protection(summary) == Protection::Local {
+            return Err(ActionError::rejected::<TrustCluster>(
+                "the cluster is on this machine, so it is not protected",
+            ));
+        }
+        match model.trust(summary) {
+            // A pin whose removal failed after Stop Trusting does not count: trusting again
+            // (after the confirmation) is how to make it count.
+            TrustState::Trusted if model.protection(summary) == Protection::Trusted => Err(
+                ActionError::rejected::<TrustCluster>("the cluster is trusted already"),
+            ),
+            TrustState::Trusted | TrustState::NotTrusted => Ok((server, None)),
+            TrustState::ServerChanged { trusted_server } => Ok((server, Some(trusted_server))),
+        }
+    }
+
+    /// [`UntrustCluster`]: a trusted context (or a stale trust).
+    fn check_untrust(&self, action: &UntrustCluster, cx: &App) -> Result<(), ActionError> {
+        if !self.settings_ok(cx) {
+            return Err(ActionError::rejected::<UntrustCluster>(
+                "settings.toml is invalid",
+            ));
+        }
+        self.check_cluster::<UntrustCluster>(&action.cluster, cx)?;
+        let summary = self.cluster_summary(&action.cluster, cx).expect("checked");
+        match self.model.read(cx).trust(summary) {
+            TrustState::NotTrusted => Err(ActionError::rejected::<UntrustCluster>(
+                "the cluster is not trusted",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// [`RetryConnection`]: the active cluster's connection or discovery failed.
     fn retry_enabled(&self, cx: &App) -> bool {
         let model = self.model.read(cx);
@@ -682,6 +789,58 @@ impl Workspace {
                 let model = self.model.clone();
                 let dialog = expose_dialog(&action.cluster, &server, previous.as_deref());
                 confirm_expose(window, cx, model, action.cluster.clone(), server, dialog);
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// Opens the confirmation naming the context and its server; confirming unlocks it until
+    /// Flint quits.
+    fn unlock_cluster(
+        &mut self,
+        action: &UnlockCluster,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.unlock_target(action, cx) {
+            Ok(server) => {
+                let model = self.model.clone();
+                confirm_unlock(window, cx, model, action.cluster.clone(), server);
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    fn lock_cluster(&mut self, action: &LockCluster, _: &mut Window, cx: &mut Context<Self>) {
+        match self.check_lock(action, cx) {
+            Ok(()) => self.model.update(cx, |m, cx| m.lock(&action.cluster, cx)),
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// Opens the confirmation naming the context and its server (and the previous server, when
+    /// the context moved); confirming trusts it.
+    fn trust_cluster(
+        &mut self,
+        action: &TrustCluster,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.trust_change(action, cx) {
+            Ok((server, previous)) => {
+                let model = self.model.clone();
+                confirm_trust(window, cx, model, action.cluster.clone(), server, previous);
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    fn untrust_cluster(&mut self, action: &UntrustCluster, _: &mut Window, cx: &mut Context<Self>) {
+        match self.check_untrust(action, cx) {
+            Ok(()) => {
+                let cluster = action.cluster.clone();
+                self.model
+                    .update(cx, |m, cx| m.untrust_cluster(cluster, cx));
             }
             Err(e) => tracing::warn!("{e}"),
         }
@@ -936,6 +1095,10 @@ mod header_tests;
 #[cfg(test)]
 #[path = "expose_tests.rs"]
 mod expose_tests;
+
+#[cfg(test)]
+#[path = "protect_tests.rs"]
+mod protect_tests;
 
 #[cfg(test)]
 #[path = "row_actions_tests.rs"]

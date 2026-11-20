@@ -16,4 +16,5 @@ mod m0;
 mod m1;
 mod m2;
 mod m2_shell;
+mod m3;
 mod support;
