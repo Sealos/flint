@@ -56,6 +56,8 @@ const STDERR_CAP: usize = 64 * 1024;
 pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// How often a running plugin is checked for having exited, while its output is still open.
 const EXIT_POLL: Duration = Duration::from_millis(25);
+/// How often a plugin that must prompt checks whether Flint came to the foreground.
+const FOREGROUND_POLL: Duration = Duration::from_millis(100);
 /// How long a prompting plugin waits for another one to give the terminal back.
 pub(crate) const TERMINAL_WAIT: Duration = Duration::from_millis(1500);
 /// After a refresh of a plugin that may prompt timed out, refreshes fail at once for this long,
@@ -164,10 +166,10 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     // plugin's login. `Always` must prompt, so it waits as long as its caller does.
     let must_prompt = exec.interactive_mode == Some(ExecInteractiveMode::Always);
     let terminal = if interactive {
-        let wait = (!must_prompt).then_some(TERMINAL_WAIT);
-        match Terminal::acquire(wait).await {
+        match Terminal::acquire(must_prompt).await {
             Acquired::Terminal(terminal) => Some(terminal),
-            Acquired::Busy => {
+            // It could not prompt now: it runs without (and may have what it needs cached).
+            Acquired::Busy | Acquired::Background => {
                 interactive = false;
                 None
             }
@@ -374,6 +376,10 @@ struct Terminal {
     /// The terminal's settings when the plugin got it: put back when Flint takes it back, so a
     /// plugin killed in a password prompt does not leave echo off or the terminal raw.
     saved: Option<libc::termios>,
+    /// How SIGTTOU was handled before the plugin got the terminal. Meanwhile Flint is in the
+    /// background of it, where with `stty tostop` a write to it (a log line) would stop the
+    /// whole app; SIGTTOU is ignored then, which lets the write through.
+    ttou: Option<libc::sigaction>,
 }
 
 /// What [`Terminal::acquire`] got.
@@ -381,15 +387,20 @@ enum Acquired {
     Terminal(Terminal),
     /// Another plugin has had the terminal for [`TERMINAL_WAIT`]: this one may not prompt.
     Busy,
-    /// No terminal Flint is in the foreground of: as before, the plugin inherits Flint's stdin.
+    /// Flint runs in the background of its terminal (a shell job): a plugin reading it would
+    /// stop, and `fg` would not continue it. An `IfAvailable` plugin may not prompt then.
+    Background,
+    /// No terminal at all (started from Finder or the Dock): as before, the plugin inherits
+    /// Flint's stdin.
     None,
 }
 
 impl Terminal {
-    /// Flint's controlling terminal, once no other plugin has it (waiting `wait` at most, or as
-    /// long as the caller does), if Flint's group is its foreground group (otherwise no one Flint starts may read
-    /// it anyway).
-    async fn acquire(wait: Option<Duration>) -> Acquired {
+    /// Flint's controlling terminal, once no other plugin has it and Flint is in its
+    /// foreground. A plugin that must prompt (`must_prompt`, `interactiveMode: Always`) waits for
+    /// both as long as its caller does; another waits [`TERMINAL_WAIT`] for the terminal, and
+    /// does not wait for Flint to come to the foreground.
+    async fn acquire(must_prompt: bool) -> Acquired {
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -399,23 +410,29 @@ impl Terminal {
         };
         let fd = OwnedFd::from(file);
         let lock = TERMINAL.clone().lock_owned();
-        let owner = match wait {
-            Some(wait) => match tokio::time::timeout(wait, lock).await {
+        let owner = if must_prompt {
+            lock.await
+        } else {
+            match tokio::time::timeout(TERMINAL_WAIT, lock).await {
                 Ok(owner) => owner,
                 Err(_) => return Acquired::Busy,
-            },
-            None => lock.await,
+            }
         };
         // SAFETY: plain calls on a descriptor this function owns.
-        if unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() } {
-            Acquired::Terminal(Terminal {
-                fd,
-                _owner: owner,
-                saved: None,
-            })
-        } else {
-            Acquired::None
+        let foreground = || unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() };
+        while !foreground() {
+            if !must_prompt {
+                return Acquired::Background;
+            }
+            // Until someone brings Flint to the foreground (`fg`).
+            tokio::time::sleep(FOREGROUND_POLL).await;
         }
+        Acquired::Terminal(Terminal {
+            fd,
+            _owner: owner,
+            saved: None,
+            ttou: None,
+        })
     }
 }
 
@@ -458,6 +475,16 @@ impl Running {
             if unsafe { libc::tcgetattr(terminal.fd.as_raw_fd(), &raw mut saved) } == 0 {
                 terminal.saved = Some(saved);
             }
+            // SAFETY: an all-zero sigaction is valid; sigaction writes the old one into it. The
+            // plugin was started before, so it does not inherit the ignored disposition.
+            unsafe {
+                let mut ignore: libc::sigaction = std::mem::zeroed();
+                ignore.sa_sigaction = libc::SIG_IGN;
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(libc::SIGTTOU, &raw const ignore, &raw mut old) == 0 {
+                    terminal.ttou = Some(old);
+                }
+            }
             set_foreground(terminal.fd.as_raw_fd(), pgid);
             // SAFETY: killpg takes plain integers; the plugin is not reaped.
             unsafe { libc::killpg(pgid, libc::SIGCONT) };
@@ -491,6 +518,11 @@ fn give_back(terminal: &Terminal, plugin: libc::pid_t) {
             // SAFETY: a plain call on a descriptor `terminal` owns; Flint is in the foreground.
             unsafe { libc::tcsetattr(fd, libc::TCSANOW, saved) };
         }
+    }
+    if let Some(old) = &terminal.ttou {
+        // SAFETY: puts back the disposition sigaction gave; one plugin has the terminal at a time,
+        // so no other hand-over changed it meanwhile.
+        unsafe { libc::sigaction(libc::SIGTTOU, old, std::ptr::null_mut()) };
     }
 }
 

@@ -162,13 +162,21 @@ pub fn server_url(url: &str) -> String {
 }
 
 /// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
-/// its directory (which can name the user's home), arguments or environment. A command written
-/// with its arguments (`aws eks get-token`) keeps only the first word.
+/// its directory (which can name the user's home), arguments or environment. kubeconfig's
+/// `command` is a path, which may hold spaces: one that names a file is shown by its file name
+/// (`/opt/Cloud Tools/kubelogin` is `kubelogin`). Otherwise a command written with its arguments
+/// (`aws eks get-token`) keeps only the first word, so no argument shows, slashes and all.
 pub fn command_name(command: &str) -> String {
-    let program = command.split_whitespace().next().unwrap_or_default();
-    std::path::Path::new(program)
-        .file_name()
-        .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
+    let path = std::path::Path::new(command.trim());
+    let program = if path.is_file() {
+        path
+    } else {
+        std::path::Path::new(command.split_whitespace().next().unwrap_or_default())
+    };
+    program.file_name().map_or_else(
+        || program.to_string_lossy().into_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -267,5 +275,18 @@ mod tests {
             "aws"
         );
         assert_eq!(command_name(""), "");
+        // An argument's slashes do not make it the name.
+        assert_eq!(command_name("aws --token=abc/def"), "aws");
+    }
+
+    // A plugin path with a space names the plugin, not a directory.
+    #[test]
+    fn command_names_keep_a_path_with_spaces_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("Cloud Tools");
+        std::fs::create_dir(&tools).unwrap();
+        let plugin = tools.join("kubelogin");
+        std::fs::write(&plugin, "").unwrap();
+        assert_eq!(command_name(&plugin.display().to_string()), "kubelogin");
     }
 }
