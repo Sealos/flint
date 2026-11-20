@@ -33,8 +33,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use flint_core::{
-    ClusterId, CoreHandle, LineFormat, LineId, LineSelection, LogOptions, LogSearch, LogSession,
-    LogSnapshot, LogState, LogSubject, SearchQuery, Severity,
+    ClusterId, CoreHandle, LineFormat, LineId, LineSelection, LogFilter, LogOptions, LogSearch,
+    LogSession, LogSnapshot, LogState, LogSubject, SearchQuery, Severity,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -59,7 +59,8 @@ use super::menu_record;
 use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
-    SelectLine, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
+    SelectLine, SetLogContext, ToggleErrorsOnly, ToggleMatchingOnly, TogglePause, ToggleSources,
+    ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
 
@@ -135,12 +136,45 @@ pub struct LogView {
     drag_selecting: bool,
     query: SearchQuery,
     search: LogSearch,
+    /// The matches among the rows shown in a filtered tab, kept until the search or the rows
+    /// change ([`LogView::shown_matches`]).
+    shown_matches: std::cell::RefCell<
+        Option<(
+            actions::ShownMatchesKey,
+            Arc<std::collections::VecDeque<LineId>>,
+        )>,
+    >,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
     /// catch-up.
     searching: bool,
     current_match: Option<LineId>,
+    /// Show only the lines matching the search, with `context` lines around each (UP-48).
+    matching_only: bool,
+    /// Show only warnings and errors.
+    errors_only: bool,
+    /// Lines shown before and after each line a filter shows.
+    context: usize,
+    /// The filtered view's rows, while a filter is on ([`LogView::is_filtered`]); the list has
+    /// one item per row then.
+    filter: Option<LogFilter>,
+    /// The first scan of a new filter runs on the core's threads; `filter` (or every line)
+    /// stays on screen until it lands.
+    filtering: bool,
+    /// A long catch-up of `filter` (a tab far behind, after a pause) runs on the core's
+    /// threads; the rows shown stay until it lands.
+    catching_up: bool,
+    _catch_up: Task<()>,
+    /// Bumped with every new filter, so a slow scan of an old one is dropped.
+    filter_generation: u64,
+    /// Bumped whenever `filter` is replaced (a scan or catch-up landing, the filter turned
+    /// off), so what was found from the old rows is found again ([`LogView::shown_matches`]).
+    rows_generation: u64,
+    /// Where the list was when a filter left it with no rows: where it goes back to when rows
+    /// return, unless the tail is followed meanwhile.
+    held_anchor: Option<LineId>,
+    _filter: Task<()>,
     search_input: Entity<InputState>,
     note: Option<Note>,
     /// Clears a muted note after [`NOTE_TIMEOUT`]; replaced with every note.
@@ -223,9 +257,21 @@ impl LogView {
             drag_selecting: false,
             query: SearchQuery::default(),
             search: LogSearch::default(),
+            shown_matches: Default::default(),
             search_generation: 0,
             searching: false,
             current_match: None,
+            matching_only: false,
+            errors_only: false,
+            context: 0,
+            filter: None,
+            filtering: false,
+            catching_up: false,
+            _catch_up: Task::ready(()),
+            filter_generation: 0,
+            rows_generation: 0,
+            held_anchor: None,
+            _filter: Task::ready(()),
             search_input,
             note: None,
             _note_timer: Task::ready(()),
@@ -285,7 +331,20 @@ impl LogView {
     pub fn set_snapshot(&mut self, snapshot: Arc<LogSnapshot>, cx: &mut Context<Self>) {
         let old = &self.snapshot.lines;
         let new = &snapshot.lines;
-        match log_model::list_change(old.first_id()..old.end_id(), new.first_id()..new.end_id()) {
+        // A filtered list follows its rows instead ([`LogView::catch_up_filter`]); rows of
+        // lines that left the buffer go at once, so the list never starts with a missing row.
+        let change = if let Some(filter) = &mut self.filter {
+            match filter.evict(new.first_id()) {
+                0 => ListChange::Unchanged,
+                evicted => ListChange::Splice {
+                    evicted,
+                    appended: 0,
+                },
+            }
+        } else {
+            log_model::list_change(old.first_id()..old.end_id(), new.first_id()..new.end_id())
+        };
+        match change {
             ListChange::Unchanged => {}
             ListChange::Splice { evicted, appended } => {
                 if evicted > 0 {
@@ -365,6 +424,12 @@ impl LogView {
         self.current_match = None;
         self.search_generation += 1;
         self.search = LogSearch::new(query.clone());
+        // The matching lines shown follow the search, once it has stayed for a moment; a filter
+        // of the old query on its way is dropped, and what is shown stays until the new one
+        // lands.
+        if self.matching_only {
+            self.refilter(Some(SEARCH_DELAY), cx);
+        }
         if query.text.is_empty() {
             self.searching = false;
             self._search = Task::ready(());
@@ -464,9 +529,12 @@ impl LogView {
             workload: self.is_workload(),
             sources: self.sources,
             wrap: self.wrap,
-            has_lines: !self.snapshot.lines.is_empty(),
+            has_lines: self.has_lines(),
             has_matches: self.has_matches(),
-            has_selection: self.selection.is_some(),
+            has_selection: self.has_selection(),
+            errors_only: self.errors_only,
+            matching_only: self.matching_only,
+            context: self.filter_spec().is_active().then_some(self.context),
         }
     }
 
@@ -521,11 +589,9 @@ impl LogView {
     /// By index, not by `scroll_to_reveal_item`: that measures the way by the heights of the rows
     /// in between, and rows never drawn have none yet, so a far jump could stop short.
     fn reveal(&mut self, id: LineId) {
-        let lines = &self.snapshot.lines;
-        if !lines.contains(id) {
+        let Some(ix) = self.row_index(id) else {
             return;
-        }
-        let ix = (id - lines.first_id()) as usize;
+        };
         self.list.pause_following_tail();
         let shown = self.list.item_is_above_viewport(ix) == Some(false)
             && self.list.item_is_below_viewport(ix) == Some(false);
@@ -557,6 +623,26 @@ impl LogView {
         cx: &mut Context<Self>,
     ) {
         self.catch_up_now();
+        // A filtered tab writes the rows it shows: all of them, the selected ones, or the
+        // matches among them, as a list of lines.
+        let (scope, matches) = match (self.filter_rows(), scope) {
+            (None, SaveScope::Matches) => (scope, self.search.matches().iter().copied().collect()),
+            (None, _) => (scope, Vec::new()),
+            (Some(rows), SaveScope::All) => (SaveScope::Matches, rows.iter().copied().collect()),
+            (Some(rows), SaveScope::Matches) => (
+                SaveScope::Matches,
+                rows.iter()
+                    .copied()
+                    .filter(|id| self.search.is_match(*id))
+                    .collect(),
+            ),
+            (Some(_), SaveScope::Selection) => (
+                SaveScope::Matches,
+                self.selection
+                    .map(|s| self.rows_between(s.start(), s.end()))
+                    .unwrap_or_default(),
+            ),
+        };
         let save = PendingSave {
             scope,
             format: LineFormat {
@@ -564,10 +650,7 @@ impl LogView {
                 ..self.format()
             },
             lines: self.snapshot.lines.clone(),
-            matches: match scope {
-                SaveScope::Matches => self.search.matches().iter().copied().collect(),
-                _ => Vec::new(),
-            },
+            matches,
             selection: self.selection,
         };
         // Counted, not built: the file's text is built off the UI thread once a path is chosen.
@@ -730,7 +813,11 @@ impl LogView {
 
     fn render_line(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let Some((id, line)) = self.snapshot.lines.at(ix) else {
+        // The item's row: a line still in the buffer.
+        let Some((id, line)) = self
+            .row_id(ix)
+            .and_then(|id| Some((id, self.snapshot.lines.get(id)?)))
+        else {
             return div().into_any_element();
         };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
@@ -770,7 +857,9 @@ impl LogView {
         let day = has_time
             .then(|| {
                 let lines = &self.snapshot.lines;
-                let before = (0..ix).rev().filter_map(|p| lines.at(p).map(|(_, l)| l));
+                let before = (0..ix)
+                    .rev()
+                    .filter_map(|p| self.row_id(p).and_then(|id| lines.get(id)));
                 log_model::day_separator(before, line, &self.tz)
             })
             .flatten();
@@ -907,7 +996,12 @@ impl LogView {
         let workload = self.is_workload();
         let sources = self.sources;
         let wrap = self.wrap;
-        let count = log_model::line_count(lines.len() as u64);
+        let filtering = self.filtering || self.catching_up;
+        let count = if filtering {
+            "Filtering…".to_owned()
+        } else {
+            log_model::shown_count(self.is_filtered().then(|| self.row_count()), lines.len())
+        };
         let streams = self
             .snapshot
             .pods
@@ -930,6 +1024,8 @@ impl LogView {
         };
         let facts = self.menu_facts();
         let has_lines = !lines.is_empty();
+        // Save writes the rows shown: none when a filter hides every line.
+        let can_save = facts.has_lines;
         h_flex()
             .id("log-toolbar")
             .h(px(super::workspace::HEADER_HEIGHT))
@@ -1000,6 +1096,18 @@ impl LogView {
                             })
                             .test_support(),
                     )
+                    // Too narrow for the count: a filter on its way still says so, since the
+                    // rows shown until it lands are not yet the filter's.
+                    .when(!fit.counts && filtering, |el| {
+                        el.child(
+                            div()
+                                .id("log-filtering")
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child("Filtering…")
+                                .test_support(),
+                        )
+                    })
                     .when(fit.counts, |el| {
                         el.child(
                             div()
@@ -1056,7 +1164,8 @@ impl LogView {
                                     .child(if self.searching {
                                         "Searching…".to_owned()
                                     } else {
-                                        log_model::match_text(&self.search, self.current_match)
+                                        let (count, at) = self.shown_match_count();
+                                        log_model::match_count_text(count, at)
                                     })
                                     .test_support(),
                             )
@@ -1075,6 +1184,47 @@ impl LogView {
                     .id("log-controls")
                     .flex_none()
                     .gap_x_1()
+                    // How the search reads, and whether it filters: never cut, and in the "⋯"
+                    // menu when the tab is too narrow.
+                    .when(fit.toggles, |el| {
+                        el.child(
+                            Button::new("log-matching-only")
+                                .xsmall()
+                                .ghost()
+                                .label("Matching")
+                                .selected(self.matching_only)
+                                .tooltip("Show only the lines matching the search (M)")
+                                .on_click(registry::on_click(ToggleMatchingOnly)),
+                        )
+                        .when(self.filter_spec().is_active(), |el| {
+                            let context = self.context;
+                            el.child(
+                                Button::new("log-context")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(format!("±{context}"))
+                                    .tooltip("Lines shown around each line that passes the filter")
+                                    .dropdown_menu(move |menu, _, _| {
+                                        log_model::CONTEXT_CHOICES.iter().fold(
+                                            menu,
+                                            |menu, &lines| {
+                                                menu.item(
+                                                    PopupMenuItem::new(match lines {
+                                                        0 => "No context".to_owned(),
+                                                        1 => "1 line around".to_owned(),
+                                                        n => format!("{n} lines around"),
+                                                    })
+                                                    .checked(lines == context)
+                                                    .on_click(registry::on_click(SetLogContext {
+                                                        lines: lines as u32,
+                                                    })),
+                                                )
+                                            },
+                                        )
+                                    }),
+                            )
+                        })
+                    })
                     .when(has_query && !fit.match_count, |el| {
                         el.children(Self::match_buttons(has_matches))
                     })
@@ -1110,6 +1260,15 @@ impl LogView {
                                 .selected(wrap)
                                 .tooltip("Wrap long lines (W)")
                                 .on_click(registry::on_click(ToggleWrap)),
+                        )
+                        .child(
+                            Button::new("log-errors-only")
+                                .xsmall()
+                                .ghost()
+                                .label("Errors")
+                                .selected(self.errors_only)
+                                .tooltip("Show only warnings and errors (E)")
+                                .on_click(registry::on_click(ToggleErrorsOnly)),
                         )
                     })
                     .when(self.can_pause(), |el| {
@@ -1159,7 +1318,7 @@ impl LogView {
                                     .xsmall()
                                     .ghost()
                                     .tooltip("Save to a file")
-                                    .disabled(!has_lines)
+                                    .disabled(!can_save)
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
                                         move |menu, _, cx| {
@@ -1242,7 +1401,7 @@ impl LogView {
         }
         let selection = self.selection?;
         let lines = &self.snapshot.lines;
-        let count = selection.present_len(lines);
+        let count = self.selected_rows();
         let mut text = format!(
             "{} selected. {} copies and Save writes them as shown, not redacted. Esc clears.",
             log_model::line_count(count),
@@ -1424,6 +1583,42 @@ impl LogView {
             .test_support()
             .into_any_element()
     }
+
+    /// A filtered tab with no rows: still filtering, or nothing passes (yet: new lines that
+    /// pass show as they come).
+    fn render_filtered_empty(&self, theme: &Theme) -> AnyElement {
+        let (spinner, text) = if self.filtering || self.catching_up {
+            (true, "Filtering…".to_owned())
+        } else {
+            (false, log_model::filter_empty_text(&self.filter_spec()))
+        };
+        v_flex()
+            .id("log-filter-empty")
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .p_4()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .when(spinner, |el| el.child(Spinner::new().small()))
+                    .child(text),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{} in the buffer; new lines that pass show as they come.",
+                        log_model::line_count(self.snapshot.lines.len() as u64)
+                    )),
+            )
+            .test_support()
+            .into_any_element()
+    }
 }
 
 /// Reconnect Logs, in an ended or failed tab's banner.
@@ -1460,6 +1655,11 @@ fn fill_menu(
                 Toggle::Timestamps => item.on_click(registry::on_click(ToggleTimestamps)),
                 Toggle::Sources => item.on_click(registry::on_click(ToggleSources)),
                 Toggle::Wrap => item.on_click(registry::on_click(ToggleWrap)),
+                Toggle::ErrorsOnly => item.on_click(registry::on_click(ToggleErrorsOnly)),
+                Toggle::MatchingOnly => item.on_click(registry::on_click(ToggleMatchingOnly)),
+                Toggle::Context(lines) => item.on_click(registry::on_click(SetLogContext {
+                    lines: lines as u32,
+                })),
             })
         }
         MenuRow::Save {
@@ -1532,6 +1732,7 @@ impl DockItem for LogView {
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.catch_up_search(cx);
+        self.catch_up_filter(cx);
         let theme = cx.theme().clone();
         // The toolbar needs the tab's width, known only after layout: when it changed, draw
         // again with the new one.
@@ -1547,6 +1748,8 @@ impl Render for LogView {
         }
         let body = if self.snapshot.lines.is_empty() {
             self.render_empty(&theme)
+        } else if self.is_filtered() && self.row_count() == 0 {
+            self.render_filtered_empty(&theme)
         } else {
             div()
                 .relative()
@@ -1598,6 +1801,9 @@ impl Render for LogView {
 
 #[path = "log_actions.rs"]
 mod actions;
+
+#[path = "log_filter.rs"]
+mod filter;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "log_state.rs"]

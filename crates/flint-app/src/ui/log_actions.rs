@@ -2,6 +2,9 @@
 //! workspace's guards share with them. The toolbar's buttons, the save menu and clicks on lines
 //! dispatch these actions.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
 use flint_core::{LineId, LineSelection};
 use gpui_kit::*;
 
@@ -9,11 +12,28 @@ use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
     ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, OnView,
     PrevMatch, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
-    SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, TogglePause, ToggleSources,
-    ToggleTimestamps, ToggleWrap,
+    SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, SetLogContext, ToggleErrorsOnly,
+    ToggleMatchingOnly, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
+
+/// How many times longer than the other the rows or the matches must be for
+/// [`LogView::shown_matches`] to look the shorter's ids up rather than walk both: about the cost
+/// of a lookup in a million.
+const SPARSE_RATIO: usize = 20;
+
+/// What [`LogView::shown_matches`] was found from: when any of it changes, it is found again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) struct ShownMatchesKey {
+    search: u64,
+    matches: (usize, Option<LineId>, Option<LineId>),
+    filter: u64,
+    /// Bumped when rows are replaced: rows with the same ends can differ in between.
+    rows_generation: u64,
+    rows: (usize, Option<LineId>, Option<LineId>),
+    first: LineId,
+}
 
 impl LogView {
     /// Every log action and its handler, for [`Bind`].
@@ -27,6 +47,7 @@ impl LogView {
                     view.sync_pause();
                 }
                 view.list.set_follow_mode(FollowMode::Tail);
+                view.held_anchor = None;
                 cx.notify();
             })
             .bind::<JumpToStart>(|view, _, _, cx| {
@@ -61,6 +82,25 @@ impl LogView {
                 view.list.remeasure();
                 cx.notify();
             })
+            .bind::<ToggleMatchingOnly>(|view, _, _, cx| {
+                view.matching_only = !view.matching_only;
+                view.refilter(None, cx);
+            })
+            .bind::<ToggleErrorsOnly>(|view, _, _, cx| {
+                view.errors_only = !view.errors_only;
+                view.refilter(None, cx);
+            })
+            .bind::<SetLogContext>(|view, action, _, cx| {
+                let context = (action.lines as usize).min(flint_core::logs::MAX_CONTEXT);
+                if context != view.context {
+                    view.context = context;
+                    // Also while a first scan runs: it restarts with the new context.
+                    if view.filter_spec().is_active() {
+                        view.refilter(None, cx);
+                    }
+                    cx.notify();
+                }
+            })
             .bind::<FocusSearch>(|view, _, window, cx| {
                 let focus = view.search_input.focus_handle(cx);
                 window.focus(&focus, cx);
@@ -72,8 +112,7 @@ impl LogView {
             .bind::<ExtendSelectionUp>(|view, _, window, cx| view.move_line(-1, true, window, cx))
             .bind::<ExtendSelectionDown>(|view, _, window, cx| view.move_line(1, true, window, cx))
             .bind::<SelectAllLines>(|view, _, window, cx| {
-                if let Some(last) = view.last_line() {
-                    let first = view.snapshot.lines.first_id();
+                if let (Some(first), Some(last)) = (view.row_id(0), view.last_line()) {
                     view.select(LineSelection::new(first, last), false, window, cx);
                 }
             })
@@ -120,35 +159,183 @@ impl LogView {
         Self::bind_actions(OnView::new(element, cx)).into_element()
     }
 
-    /// The newest line shown.
+    /// The newest line shown (in a filtered tab, the newest row).
     fn last_line(&self) -> Option<LineId> {
-        let lines = &self.snapshot.lines;
-        (!lines.is_empty()).then(|| lines.end_id() - 1)
+        self.last_row()
     }
 
-    /// Lines are shown, so there is something to select, search or save.
+    /// Lines are shown (rows, in a filtered tab), so there is something to select, search or
+    /// save.
     pub(in crate::ui) fn has_lines(&self) -> bool {
-        !self.snapshot.lines.is_empty()
+        self.row_count() > 0
     }
 
-    pub(in crate::ui) fn has_selection(&self) -> bool {
+    /// Jump to Newest applies: there are rows, or a filter shows none yet (following the tail
+    /// again shows what comes).
+    pub(in crate::ui) fn can_jump_to_end(&self) -> bool {
+        self.has_lines() || self.is_filtered()
+    }
+
+    /// A selection exists, shown or hidden by a filter: clearing it also ends the pause it
+    /// started.
+    pub(in crate::ui) fn is_selecting(&self) -> bool {
         self.selection.is_some()
+    }
+
+    /// Lines are selected, and some of them shown (a filter can hide them all).
+    pub(in crate::ui) fn has_selection(&self) -> bool {
+        self.selected_rows() > 0
+    }
+
+    /// How many selected lines are shown: what copy and save would write. Counted from where
+    /// the selection's ends fall among the rows, without listing them.
+    pub(in crate::ui) fn selected_rows(&self) -> u64 {
+        match self.selection {
+            None => 0,
+            Some(s) if self.is_filtered() => self.rows_count_between(s.start(), s.end()) as u64,
+            Some(s) => s.present_len(&self.snapshot.lines),
+        }
+    }
+
+    /// The matches among the rows shown in a filtered tab, oldest first. Found again only when
+    /// the search's matches or the rows changed, in one walk over both (they are sorted), so a
+    /// redraw does not go over every match. While lines only come and go (same search, filter
+    /// and rows), only the end is walked again: see [`LogView::shown_matches_from`].
+    pub(in crate::ui) fn shown_matches(&self) -> Arc<VecDeque<LineId>> {
+        let rows = self.filter_rows();
+        let matches = self.search.matches();
+        let key = ShownMatchesKey {
+            search: self.search_generation,
+            matches: (
+                matches.len(),
+                matches.front().copied(),
+                matches.back().copied(),
+            ),
+            filter: self.filter_generation,
+            rows_generation: self.rows_generation,
+            rows: rows.map_or((0, None, None), |r| {
+                (r.len(), r.front().copied(), r.back().copied())
+            }),
+            first: self.snapshot.lines.first_id(),
+        };
+        let mut cache = self.shown_matches.borrow_mut();
+        if let Some((cached, shown)) = &*cache
+            && *cached == key
+        {
+            return shown.clone();
+        }
+        let Some(rows) = rows else {
+            let shown = Arc::new(VecDeque::new());
+            *cache = Some((key, shown.clone()));
+            return shown;
+        };
+        // Same search, filter and rows: the matches found are kept in place, less the evicted
+        // ones and the end that may change, and only that end is found again.
+        let (mut shown, from) = match cache.take() {
+            Some((old, mut shown))
+                if old.search == key.search
+                    && old.filter == key.filter
+                    && old.rows_generation == key.rows_generation =>
+            {
+                let from = self.shown_matches_from(&old);
+                let kept = Arc::make_mut(&mut shown);
+                let evicted = kept.partition_point(|id| *id < key.first);
+                kept.drain(..evicted);
+                let end = kept.partition_point(|id| *id < from);
+                kept.truncate(end);
+                (shown, from)
+            }
+            _ => (Arc::new(VecDeque::new()), 0),
+        };
+        let (all_rows, all_matches) = (rows, matches);
+        let rows = rows.range(rows.partition_point(|id| *id < from)..);
+        let matches = matches.range(matches.partition_point(|id| *id < from)..);
+        let lines = &self.snapshot.lines;
+        let kept = Arc::make_mut(&mut shown);
+        // Both are sorted. One much shorter than the other (few rows shown, or few matches):
+        // each of its ids is looked up in the other, so the work follows the shorter. Else one
+        // walk over both.
+        let (short, long) = (rows.len().min(matches.len()), rows.len().max(matches.len()));
+        if short.saturating_mul(SPARSE_RATIO) < long {
+            if rows.len() <= matches.len() {
+                kept.extend(
+                    rows.copied()
+                        .filter(|id| all_matches.binary_search(id).is_ok() && lines.contains(*id)),
+                );
+            } else {
+                kept.extend(
+                    matches
+                        .copied()
+                        .filter(|id| all_rows.binary_search(id).is_ok() && lines.contains(*id)),
+                );
+            }
+        } else {
+            let mut rows = rows.peekable();
+            kept.extend(matches.copied().filter(|id| {
+                while rows.next_if(|row| **row < *id).is_some() {}
+                rows.peek().is_some_and(|row| **row == *id) && lines.contains(*id)
+            }));
+        }
+        *cache = Some((key, shown.clone()));
+        shown
+    }
+
+    /// From which line [`LogView::shown_matches`] found from `old` can change while only lines
+    /// come and go: line ids only grow, a new match comes after the last one scanned, and a new
+    /// row at most `context` lines before the last row (the context before a new match). Before
+    /// that, only evicted lines drop out.
+    fn shown_matches_from(&self, old: &ShownMatchesKey) -> LineId {
+        let context = self.filter.as_ref().map_or(0, |f| f.spec().context) as LineId;
+        let rows = old.rows.2.map_or(0, |back| back.saturating_sub(context));
+        let matches = old.matches.2.map_or(0, |back| back + 1);
+        rows.min(matches)
     }
 
     /// Whether a line shown matches the search, counting lines that arrived since the last
     /// scan and not evicted ones: what Next and Previous Match, and Save Matching Lines, need.
     /// `false` while a scan runs on the core's threads, whose matches are not known yet.
     pub(in crate::ui) fn has_matches(&self) -> bool {
-        !self.searching && self.search.has_match_in(&self.snapshot.lines)
+        if self.searching {
+            return false;
+        }
+        match self.filter_rows() {
+            None => self.search.has_match_in(&self.snapshot.lines),
+            // Filtered: a match among the rows shown.
+            Some(_) => !self.shown_matches().is_empty(),
+        }
+    }
+
+    /// The matches Next and Previous Match go to: every match, or in a filtered tab those
+    /// among the rows shown. How many there are, and which of them is the current one.
+    pub(in crate::ui) fn shown_match_count(&self) -> (usize, Option<usize>) {
+        let count = if self.is_filtered() {
+            self.shown_matches().len()
+        } else {
+            self.search.count_in(&self.snapshot.lines)
+        };
+        (count, self.current_match_index())
+    }
+
+    /// Which of the matches [`LogView::shown_match_count`] counts is the current one, from the
+    /// matches found so far: lines not scanned yet come after it, so nothing is scanned.
+    pub(in crate::ui) fn current_match_index(&self) -> Option<usize> {
+        let id = self.current_match?;
+        if self.is_filtered() {
+            return self.shown_matches().binary_search(&id).ok();
+        }
+        let matches = self.search.matches();
+        let evicted = matches.partition_point(|m| *m < self.snapshot.lines.first_id());
+        matches.binary_search(&id).ok().map(|ix| ix - evicted)
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
     pub(in crate::ui) fn check_line<A: Action>(&self, line: LineId) -> Result<(), ActionError> {
-        if self.snapshot.lines.contains(line) {
+        if self.row_index(line).is_some() {
             Ok(())
         } else {
             Err(ActionError::rejected::<A>(format!(
-                "line {line} is not shown (it left the buffer, or has not arrived)"
+                "line {line} is not shown (it left the buffer, has not arrived, or is filtered \
+                 out)"
             )))
         }
     }
@@ -162,6 +349,9 @@ impl LogView {
             SaveScope::Matches if !self.has_matches() => Some("no lines match the search"),
             SaveScope::Matches => None,
             SaveScope::Selection if self.selection.is_none() => Some("no lines are selected"),
+            SaveScope::Selection if !self.has_selection() => {
+                Some("no selected line is shown (the filter hides them)")
+            }
             SaveScope::Selection => None,
         };
         match reason {
@@ -206,10 +396,7 @@ impl LogView {
             return;
         }
         self.catch_up_now();
-        let next = self
-            .search
-            .next_after(self.current_match)
-            .or_else(|| self.search.next_after(None));
+        let next = self.shown_match(self.current_match, true);
         self.go_to_match(next, cx);
     }
 
@@ -219,11 +406,44 @@ impl LogView {
             return;
         }
         self.catch_up_now();
-        let prev = self
-            .search
-            .prev_before(self.current_match)
-            .or_else(|| self.search.prev_before(None));
+        let prev = self.shown_match(self.current_match, false);
         self.go_to_match(prev, cx);
+    }
+
+    /// The next (or previous) match after `from` that is shown, wrapping around: in a tab
+    /// filtered to errors, matches that are not errors are skipped.
+    fn shown_match(&self, from: Option<LineId>, forward: bool) -> Option<LineId> {
+        let step = |at: Option<LineId>| {
+            if forward {
+                self.search.next_after(at)
+            } else {
+                self.search.prev_before(at)
+            }
+        };
+        if !self.is_filtered() {
+            // Over matches already evicted.
+            let mut at = step(from).or_else(|| step(None));
+            for _ in 0..self.search.count() {
+                let id = at?;
+                if self.row_index(id).is_some() {
+                    return Some(id);
+                }
+                at = step(Some(id)).or_else(|| step(None));
+            }
+            return None;
+        }
+        // Filtered: the next match among the rows shown, wrapping around.
+        let shown = self.shown_matches();
+        let next = match (from, forward) {
+            (Some(at), true) => shown.get(shown.partition_point(|id| *id <= at)),
+            (Some(at), false) => shown
+                .partition_point(|id| *id < at)
+                .checked_sub(1)
+                .and_then(|ix| shown.get(ix)),
+            (None, _) => None,
+        };
+        next.or(if forward { shown.front() } else { shown.back() })
+            .copied()
     }
 
     fn go_to_match(&mut self, id: Option<LineId>, cx: &mut Context<Self>) {
@@ -243,6 +463,17 @@ impl LogView {
         let lines = &self.snapshot.lines;
         let selection = match self.selection {
             None => LineSelection::line(last),
+            // A filtered tab moves from row to row, over the lines it hides.
+            Some(s) if self.is_filtered() => {
+                let Some(head) = self.row_from(s.head, delta) else {
+                    return;
+                };
+                if extend {
+                    s.extend_to(head)
+                } else {
+                    LineSelection::line(head)
+                }
+            }
             Some(s) if extend => s.move_head(delta, lines),
             Some(s) => LineSelection::line(s.move_head(delta, lines).head),
         };
@@ -287,12 +518,43 @@ impl LogView {
             return;
         };
         let lines = self.snapshot.lines.clone();
-        let count = selection.present_len(&lines);
         let format = self.format();
+        // A filtered tab copies the selected rows it shows, not the lines it hides between.
+        let rows = self
+            .is_filtered()
+            .then(|| self.rows_between(selection.start(), selection.end()));
+        let count = rows
+            .as_ref()
+            .map_or_else(|| selection.present_len(&lines), |r| r.len() as u64);
+        if count == 0 {
+            self.set_note(
+                Tone::Muted,
+                "Nothing copied: no selected line is shown.".to_owned(),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let copy = LatestCopy::start(cx);
         cx.spawn(async move |this, cx| {
             let text = cx
-                .background_spawn(async move { selection.text_as(&lines, format) })
+                .background_spawn(async move {
+                    match rows {
+                        Some(rows) => {
+                            // As `text_as` copies: newlines between lines, none after the last,
+                            // so a pasted line is not sent as typed and entered.
+                            log_model::save_text(&lines, SaveScope::Matches, &rows, None, format)
+                                .map(|(mut text, _)| {
+                                    if text.ends_with('\n') {
+                                        text.pop();
+                                    }
+                                    text
+                                })
+                                .unwrap_or_default()
+                        }
+                        None => selection.text_as(&lines, format),
+                    }
+                })
                 .await;
             if !cx.update(|cx| LatestCopy::land(copy, text, cx)) {
                 return;

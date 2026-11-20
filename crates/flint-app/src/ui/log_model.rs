@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use flint_core::{
-    LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogSearch, LogState,
-    LogSubject, PodSet, PodSetStatus, SearchQuery, WorkloadTarget,
+    LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogState, LogSubject, PodSet,
+    PodSetStatus, SearchQuery, WorkloadTarget,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -687,10 +687,49 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+/// The context sizes the toolbar offers (any up to 100 from the palette).
+pub const CONTEXT_CHOICES: [usize; 6] = [0, 1, 2, 3, 5, 10];
+/// The same, as the "⋯" menu lists them.
+const CONTEXT_LABELS: [&str; 6] = [
+    "No context",
+    "1 line",
+    "2 lines",
+    "3 lines",
+    "5 lines",
+    "10 lines",
+];
+
+/// What a filtered tab with no rows says: which toggles filter it.
+pub fn filter_empty_text(spec: &flint_core::FilterSpec) -> String {
+    match (spec.query.is_some(), spec.errors_only) {
+        (true, true) => "No warnings or errors match the search".to_owned(),
+        (true, false) => "No lines match the search".to_owned(),
+        (false, true) => "No warnings or errors".to_owned(),
+        (false, false) => "No lines".to_owned(),
+    }
+}
+
+/// The toolbar's count: "1,234 lines", or "12 of 1,234 lines" while filtered.
+pub fn shown_count(shown: Option<usize>, total: usize) -> String {
+    match shown {
+        None => line_count(total as u64),
+        Some(shown) => format!(
+            "{} of {}",
+            thousands(shown as u64),
+            line_count(total as u64)
+        ),
+    }
+}
+
 /// "3 of 17" when `current` is a match, "17 matches" otherwise, "No matches" for none.
-pub fn match_text(search: &LogSearch, current: Option<LineId>) -> String {
-    let count = search.count();
+#[cfg(test)]
+pub fn match_text(search: &flint_core::LogSearch, current: Option<LineId>) -> String {
     let at = current.and_then(|id| search.matches().binary_search(&id).ok());
+    match_count_text(search.count(), at)
+}
+
+/// "3 of 17" when the current match is the `at`-th (from 0) of `count`, "17 matches" otherwise.
+pub fn match_count_text(count: usize, at: Option<usize>) -> String {
     match (count, at) {
         (0, _) => "No matches".to_owned(),
         (n, Some(i)) => format!("{} of {}", thousands(i as u64 + 1), thousands(n as u64)),
@@ -705,6 +744,10 @@ pub enum Toggle {
     Timestamps,
     Sources,
     Wrap,
+    ErrorsOnly,
+    MatchingOnly,
+    /// Lines of context around each row a filter shows.
+    Context(usize),
 }
 
 /// A row of a log tab's toolbar menu (Save, or "⋯" in a narrow tab).
@@ -735,6 +778,12 @@ pub struct MenuFacts {
     pub has_lines: bool,
     pub has_matches: bool,
     pub has_selection: bool,
+    /// Only warnings and errors are shown.
+    pub errors_only: bool,
+    /// Only the lines matching the search are shown.
+    pub matching_only: bool,
+    /// Lines of context, while a filter is on.
+    pub context: Option<usize>,
 }
 
 /// The Save menu: how lines are written, then a Save entry per scope.
@@ -780,6 +829,24 @@ pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
         rows.push(toggle("Pod Prefix", f.sources, Toggle::Sources));
     }
     rows.push(toggle("Wrap Lines", f.wrap, Toggle::Wrap));
+    rows.push(toggle(
+        "Errors and Warnings Only",
+        f.errors_only,
+        Toggle::ErrorsOnly,
+    ));
+    // The search's toggle, which a narrow toolbar leaves out.
+    rows.push(MenuRow::Separator);
+    rows.push(toggle(
+        "Matching Lines Only",
+        f.matching_only,
+        Toggle::MatchingOnly,
+    ));
+    if let Some(context) = f.context {
+        rows.push(MenuRow::Label("Lines around each:"));
+        for (lines, label) in CONTEXT_CHOICES.into_iter().zip(CONTEXT_LABELS) {
+            rows.push(toggle(label, lines == context, Toggle::Context(lines)));
+        }
+    }
     rows.push(MenuRow::Separator);
     if f.has_lines {
         rows.extend(save_menu(f));
@@ -922,6 +989,7 @@ mod tests {
     use flint_core::{LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
 
     use super::*;
+    use flint_core::LogSearch;
 
     /// Timestamps on or off, no source prefix.
     fn ts(timestamps: bool) -> LineFormat {
