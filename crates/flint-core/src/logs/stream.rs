@@ -41,6 +41,9 @@ impl Backoff {
 /// node went away without closing it.
 pub(crate) const GONE_GRACE: Duration = Duration::from_secs(10);
 
+/// Why a single-pod stream ended when its pod was deleted.
+pub(crate) const POD_DELETED: &str = "the pod was deleted";
+
 /// Lines of the newest timestamp remembered for resuming. Enough to recognise where the shown
 /// lines end in a replay; a longer run of lines sharing one timestamp is matched on its end.
 const RESUME_GROUP: usize = 64;
@@ -113,6 +116,9 @@ pub(crate) struct Stream {
     draining: bool,
     /// The pod was deleted: finish the current read, then end instead of reconnecting.
     gone: bool,
+    /// The pod is being deleted (single-pod sessions): the last catch-up read ends the stream
+    /// with [`POD_DELETED`] as its reason.
+    deleted: bool,
     deadline: Option<Pin<Box<Sleep>>>,
     /// The stream ended on an error about the cluster rather than this container.
     cluster_error: bool,
@@ -153,6 +159,7 @@ impl Stream {
             resume: None,
             draining: false,
             gone: false,
+            deleted: false,
             deadline: None,
             cluster_error: false,
         };
@@ -259,29 +266,30 @@ impl Stream {
             }
             Step::Expired => return false,
             // The last catch-up of a finished container: what was read is all there is.
-            Step::Opened(Err(e)) if e.is_fatal() && self.draining => self.end(None),
+            Step::Opened(Err(e)) if e.is_fatal() && self.draining => self.end(self.drained()),
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => {
                 self.end(Some(e.message))
             }
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
                 self.retry(Some(e))
             }
-            Step::Eof if !self.options.follow || self.options.previous || self.draining => {
-                self.end(None)
-            }
+            Step::Eof if self.draining => self.end(self.drained()),
+            Step::Eof if !self.options.follow || self.options.previous => self.end(None),
             Step::Eof => {
                 let uid = self.member.as_ref().map(|m| m.uid.as_str());
                 Phase::CheckEnd(self.source.after_end(&self.target, uid))
             }
             Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(None),
-            Step::AfterEnd(Ok(AfterEnd::Finished)) => {
+            Step::AfterEnd(Ok(end @ (AfterEnd::Finished | AfterEnd::Deleting))) => {
+                // Pods of a workload come and go; a deleted one ends its stream quietly.
+                self.deleted = end == AfterEnd::Deleting && self.member.is_none();
                 self.draining = true;
                 let request = self.resume_request();
                 Phase::Connect(self.source.open(&request))
             }
             // Pods of a workload come and go; that is no error.
             Step::AfterEnd(Ok(AfterEnd::Gone)) if self.member.is_some() => self.end(None),
-            Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end(Some("the pod was deleted".to_owned())),
+            Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end(Some(POD_DELETED.to_owned())),
             Step::Retry => {
                 let request = self.resume_request();
                 Phase::Connect(self.source.open(&request))
@@ -306,6 +314,7 @@ impl Stream {
             return;
         }
         self.draining = false;
+        self.deleted = false;
         self.attempts = 0;
         self.set_state(LogState::Connecting);
         let request = self.resume_request();
@@ -410,6 +419,11 @@ impl Stream {
             attempt: self.attempts,
         });
         Phase::Wait(Box::pin(tokio::time::sleep(delay)))
+    }
+
+    /// Why a stream ends after its last catch-up read: no reason for a container that finished.
+    fn drained(&self) -> Option<String> {
+        self.deleted.then(|| POD_DELETED.to_owned())
     }
 
     fn end(&mut self, error: Option<String>) -> Phase {
@@ -605,6 +619,33 @@ mod tests {
             }
         );
         assert_eq!(*plain.uids.lock().unwrap(), [None]);
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_being_deleted_ends_its_session_with_a_reason_after_a_last_read() {
+        let mut s = stream(&[], None);
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Deleting)), &mut |_| {});
+        // The stopped container is read to its end once more before the session ends.
+        assert!(!s.is_done() && matches!(s.phase, Phase::Connect(_)));
+        s.handle(Step::Eof, &mut |_| {});
+        let deleted = LogState::Ended {
+            error: Some(POD_DELETED.into()),
+        };
+        assert_eq!(s.state(), &deleted);
+
+        // The pod went before that last read: the reason stays.
+        let mut early = stream(&[], None);
+        early.handle(Step::AfterEnd(Ok(AfterEnd::Deleting)), &mut |_| {});
+        early.handle(Step::Opened(Err(LogError::fatal("not found"))), &mut |_| {});
+        assert_eq!(early.state(), &deleted);
+
+        // A workload's pod comes and goes: its stream ends quietly.
+        let tag = Arc::new(LineSource::new("web-1", "app"));
+        let mut member = stream(&[], Some(tag));
+        member.handle(Step::AfterEnd(Ok(AfterEnd::Deleting)), &mut |_| {});
+        member.handle(Step::Eof, &mut |_| {});
+        assert_eq!(member.state(), &LogState::Ended { error: None });
     }
 
     // covers UP-45

@@ -161,6 +161,9 @@ pub(crate) enum AfterEnd {
     Restarts,
     /// The container finished for good.
     Finished,
+    /// The pod is being deleted (it has a `deletionTimestamp`), whatever its phase: its
+    /// containers will not run again, though the pod and its logs may still be there.
+    Deleting,
     /// The pod was deleted.
     Gone,
 }
@@ -281,6 +284,9 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
     let Some(pod) = pod else {
         return AfterEnd::Gone;
     };
+    if pod.metadata.deletion_timestamp.is_some() {
+        return AfterEnd::Deleting;
+    }
     let status = pod.status.as_ref();
     if matches!(
         status.and_then(|s| s.phase.as_deref()),
@@ -502,6 +508,19 @@ mod tests {
 
     fn pod(value: serde_json::Value) -> Pod {
         serde_json::from_value(value).unwrap()
+    }
+
+    // covers UP-40
+    #[test]
+    fn a_pod_being_deleted_is_deleting_whatever_its_phase() {
+        for phase in ["Running", "Succeeded", "Failed"] {
+            let deleting = pod(json!({
+                "metadata": {"deletionTimestamp": "2024-05-01T12:00:00Z"},
+                "spec": {"containers": [{"name": "app"}]},
+                "status": {"phase": phase},
+            }));
+            assert_eq!(fate(Some(&deleting), None), AfterEnd::Deleting, "{phase}");
+        }
     }
 
     // covers UP-40
