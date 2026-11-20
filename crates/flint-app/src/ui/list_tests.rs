@@ -692,6 +692,14 @@ async fn new_columns_are_reported_before_the_next_frame(cx: &mut TestAppContext)
     });
     assert_eq!(state.columns, ["Name", "Age"]);
     assert_eq!(state.rows[0].cells, ["api", "1d"]);
+    // And back to more columns, which the stale indexes reported only in part.
+    let state = list.update(cx, |list, cx| {
+        let more = pods(&[("demo", "api", 3)], SyncState::Synced, 3);
+        list.apply(more, vec![0].into(), None, None, cx);
+        list.view_state()
+    });
+    assert_eq!(state.columns, ["Name", "Namespace", "Restarts"]);
+    assert_eq!(state.rows[0].cells, ["api", "demo", "3"]);
 }
 
 /// A quick measure of what one frame of a 10,000-row list costs on the UI thread (layout and
