@@ -13,7 +13,7 @@ body:
     id: flint-version
     attributes:
       label: Flint version
-      description: Run `--version` on the Flint you use, for example `flint --version`, `./flint-vX.Y.Z-linux-x86_64.AppImage --version`, `cargo run -p flint-app -- --version`, or, for the DMG, `/Applications/Flint.app/Contents/MacOS/flint --version`.
+      description: Run `--version` on the Flint you use, for example `flint --version`, `./flint-vX.Y.Z-linux-x86_64.AppImage --version`, `cargo run -p flint-app -- --version`, or, for the DMG, `/Applications/Flint.app/Contents/MacOS/flint --version`. If Flint cannot start, give the release tag or download filename, or `unknown`.
       placeholder: "0.2.1"
     validations:
       required: true
@@ -76,7 +76,7 @@ body:
       description: |
         Launching the app does not capture `flint mcp`, which your AI client starts itself. In Flint's entry in the
         client's MCP server settings, set the environment variable
-        `FLINT_LOG=off,flint=info,flint_app=info,flint_core=info,flint_mcp=info` (it overrides any `RUST_LOG` the
+        `FLINT_LOG=off,flint=info,flint_app=info,flint_core=info,flint_mcp=info,rmcp::transport=error` (it overrides any `RUST_LOG` the
         client passes on), reproduce the bug, and copy the server's stderr from the client's MCP log (the client's
         settings or log viewer says where). Keep the leading `off`: other libraries log client metadata, raw
         Kubernetes responses and, at `debug`, full requests and tool results, which can include ConfigMap data and pod
