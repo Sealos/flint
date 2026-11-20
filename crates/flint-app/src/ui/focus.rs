@@ -1,16 +1,22 @@
-//! Focus housekeeping for views that close or hide others.
+//! Focus housekeeping for views that close others.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::{App, Window};
 
-/// Lets the window drop the text input it last saw focused, once focus has moved on from it.
+/// Lets the window drop the text field it last saw focused, once focus has moved off it.
 ///
 /// gpui-component's window state keeps a strong handle to the focused text field (a list's
-/// filter, a log tab's search, a detail pane's YAML) and forgets it only when that field draws again without focus,
-/// or when something asks which field has focus. A field closed with its view, or hidden
-/// with its dock tab, never draws again, so without this it stays alive with its text until
-/// another field takes focus. Call after moving focus away from a view that closed or went
-/// out of sight; a field that still has focus is kept.
+/// filter, a log tab's search, a detail pane's YAML). It forgets the field when the field draws
+/// again without focus, or lazily when asked which field has focus
+/// (`WindowExt::focused_input`, which drops an entry whose field no longer has focus). This
+/// relies on that lazy drop; the leak tests closing views with a focused field are what would
+/// catch upstream changing it.
+///
+/// A field whose view was dropped never draws again, and nor does one in a dock tab that is not
+/// active (`Dock::render` draws only the active tab) until that tab is shown. Without this, a
+/// dropped view's field stays alive with its text until another field takes focus. Call after
+/// a view that owns a text field is dropped and focus has moved off it; a field that still has
+/// focus is kept.
 ///
 /// `window` must be one gpui-kit opened (`gpui_kit::open_window`), which installs the root that
 /// holds that state; in a bare test window this panics.

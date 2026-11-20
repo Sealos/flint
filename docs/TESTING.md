@@ -478,9 +478,11 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
   View tests that close something assert it was freed: take `cx.leak_detector_snapshot()` before opening a list,
   detail pane, dock tab or terminal, close it, run until parked, then `cx.assert_no_new_leaks(&snapshot)` (or
   `weak.assert_released()` for one entity). Every view that can be closed gets such a test; the dock's, the log tab's and the shell
-  tab's are in `ui/dock_tests.rs`. A view with a text field (a list's filter, a log tab's search, a detail pane's YAML) is also closed
-  with the field focused: the window keeps the focused field until focus moves on and it is asked
-  (`ui::focus::release_unfocused_input`), so a view that closes or hides another calls that. CI builds the app
+  tab's are in `ui/dock_tests.rs`. The window keeps a strong handle to its focused text field (a list's filter, a log
+  tab's search, a detail pane's YAML) until it is asked after focus moved off it. So after a view that owns a text field
+  is dropped and focus has moved off it, call `ui::focus::release_unfocused_input`, as `Dock::close`,
+  `Workspace::open_kind`, `Workspace::sync`, the detail pane's close and replace in `Workspace::on_list_event`, and
+  `Workspace::reclaim_focus` do; and test such a view closed with its field focused. CI builds the app
   tests with `GPUI_LEAK_DETECTION=1`, so a failure lists each leaked handle; locally add `LEAK_BACKTRACE=1` to
   see where it was created. Never capture `cx.entity()` in a frame, timer or task callback: capture
   `cx.weak_entity()` and `update` it, so a closed view can be dropped.
