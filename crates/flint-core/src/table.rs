@@ -1121,14 +1121,17 @@ pub(crate) mod tests {
     fn a_relist_after_a_drop_gives_the_table_back() {
         let mut interner = Interner::default();
         interner.begin_relist();
-        for i in 0..100_000 {
-            interner.intern(&format!("s-{i}"));
-        }
+        // Held by rows, so no prune drops them meanwhile.
+        let rows: Vec<Arc<str>> = (0..100_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
         let big = interner.set.capacity();
         interner.begin_relist();
         let kept = interner.intern("s-1");
         interner.keep_relisted();
+        // The old snapshot still holds the rest; the interner lets go of them anyway.
         assert_eq!(interner.len(), 1);
+        drop(rows);
         assert!(Arc::ptr_eq(&kept, &interner.intern("s-1")));
         assert!(
             interner.set.capacity() < big / 4,
