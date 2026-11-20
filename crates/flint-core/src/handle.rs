@@ -477,6 +477,28 @@ impl CoreHandle {
         self.unlocks.lock(cluster)
     }
 
+    /// Trusts `cluster` at `server` (the URL the user confirmed), written to `settings.toml`
+    /// through [`Command::SetTrusted`]. A revocation of its trust earlier in the session is
+    /// lifted now.
+    pub fn trust(&self, cluster: &str, server: &str) {
+        self.unlocks.restore_trust(cluster);
+        self.send(Command::SetTrusted {
+            cluster: cluster.to_owned(),
+            server: Some(server.to_owned()),
+        });
+    }
+
+    /// Stops trusting `cluster` and locks it: from this moment nothing new that changes the
+    /// cluster starts, before `settings.toml` is written (commands and the core's gate take
+    /// separate queues). Shells already open keep running.
+    pub fn untrust(&self, cluster: &str) {
+        self.unlocks.revoke_trust(cluster);
+        self.send(Command::SetTrusted {
+            cluster: cluster.to_owned(),
+            server: None,
+        });
+    }
+
     /// The session's unlocks, for showing each cluster's [`crate::Protection`].
     pub fn unlocks(&self) -> &SessionUnlocks {
         &self.unlocks

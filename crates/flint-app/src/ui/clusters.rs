@@ -220,20 +220,16 @@ impl ClustersModel {
     /// Trusts `cluster` at `server`, the URL the user confirmed. Written to `settings.toml`;
     /// the change comes back as a settings event.
     pub fn trust_cluster(&mut self, cluster: ClusterId, server: String) {
-        self.send(Command::SetTrusted {
-            cluster,
-            server: Some(server),
-        });
+        self.last_error = None;
+        self.core.trust(&cluster, &server);
     }
 
     /// Stops trusting `cluster` (or removes a stale trust), and locks it: the user wants it
-    /// protected, even if it was also unlocked for this session.
+    /// protected, even if it was also unlocked for this session. It is protected from this
+    /// moment, in the core's gate too, before `settings.toml` is written.
     pub fn untrust_cluster(&mut self, cluster: ClusterId, cx: &mut Context<Self>) {
-        self.core.lock(&cluster);
-        self.send(Command::SetTrusted {
-            cluster,
-            server: None,
-        });
+        self.last_error = None;
+        self.core.untrust(&cluster);
         cx.notify();
     }
 }

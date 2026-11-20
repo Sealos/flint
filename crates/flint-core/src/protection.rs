@@ -61,7 +61,7 @@ pub fn protection(
     let Some(server) = server else {
         return Protection::Protected;
     };
-    if settings.trust(context, Some(server)).is_trusted() {
+    if settings.trust(context, Some(server)).is_trusted() && !unlocks.trust_revoked(context) {
         Protection::Trusted
     } else if !settings.protect_local_clusters && proxy_url.is_none() && is_local_server(server) {
         Protection::Local
@@ -99,35 +99,71 @@ pub fn is_local_server(server: &str) -> bool {
 }
 
 /// The clusters the user unlocked for this session, each pinned to the server the user saw
-/// when unlocking. Shared between the front end and the core: an unlock takes effect at once,
-/// before the next action is asked for. Cheap to clone; nothing is written to disk, so every
-/// unlock ends when Flint quits.
+/// when unlocking, and the contexts whose trust the user revoked while the change to
+/// `settings.toml` is on its way. Shared between the front end and the core: an unlock, a lock
+/// or a revocation takes effect at once, before the next action is asked for. Cheap to clone;
+/// nothing is written to disk, so every unlock ends when Flint quits.
 #[derive(Debug, Clone, Default)]
-pub struct SessionUnlocks(Arc<Mutex<BTreeSet<ClusterPin>>>);
+pub struct SessionUnlocks(Arc<Mutex<Unlocks>>);
+
+#[derive(Debug, Default)]
+struct Unlocks {
+    pins: BTreeSet<ClusterPin>,
+    /// Contexts the user stopped trusting: their trust in `settings` does not count until
+    /// the settings no longer hold it ([`SessionUnlocks::settle`]).
+    revoked: BTreeSet<String>,
+}
 
 impl SessionUnlocks {
     /// Unlocks `context` at `server` until Flint quits or [`SessionUnlocks::lock`]. An older
     /// unlock of the same context at another server is dropped.
     pub fn unlock(&self, context: &str, server: &str) {
-        let mut set = self.set();
-        set.retain(|p| p.context != context);
-        set.insert(ClusterPin::new(context, server));
+        let pins = &mut self.set().pins;
+        pins.retain(|p| p.context != context);
+        pins.insert(ClusterPin::new(context, server));
     }
 
     /// Locks `context` again (Lock Again). Returns whether it was unlocked.
     pub fn lock(&self, context: &str) -> bool {
-        let mut set = self.set();
-        let before = set.len();
-        set.retain(|p| p.context != context);
-        set.len() != before
+        let pins = &mut self.set().pins;
+        let before = pins.len();
+        pins.retain(|p| p.context != context);
+        pins.len() != before
     }
 
     /// Whether `context` is unlocked at `server`.
     pub fn is_unlocked(&self, context: &str, server: &str) -> bool {
-        self.set().iter().any(|p| p.matches(context, server))
+        self.set().pins.iter().any(|p| p.matches(context, server))
     }
 
-    fn set(&self) -> std::sync::MutexGuard<'_, BTreeSet<ClusterPin>> {
+    /// Stops trusting `context` now (Stop Trusting), before `settings.toml` is written, and
+    /// locks it: nothing new that changes the cluster starts from this moment.
+    pub fn revoke_trust(&self, context: &str) {
+        let mut set = self.set();
+        set.pins.retain(|p| p.context != context);
+        set.revoked.insert(context.to_owned());
+    }
+
+    /// Lets `context`'s trust count again: the user just confirmed trusting it.
+    pub fn restore_trust(&self, context: &str) {
+        self.set().revoked.remove(context);
+    }
+
+    /// Whether the user revoked `context`'s trust and the settings may still hold it.
+    pub fn trust_revoked(&self, context: &str) -> bool {
+        self.set().revoked.contains(context)
+    }
+
+    /// Forgets the revocations `settings` no longer need: those of contexts it trusts nowhere
+    /// (the write landed). A revocation whose write failed stays, so the cluster stays
+    /// protected.
+    pub fn settle(&self, settings: &Settings) {
+        self.set()
+            .revoked
+            .retain(|c| settings.trusted_clusters.iter().any(|p| &p.context == c));
+    }
+
+    fn set(&self) -> std::sync::MutexGuard<'_, Unlocks> {
         // A panic while holding the lock leaves a valid set: take it anyway.
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -262,6 +298,43 @@ mod tests {
             ),
             Protection::Unlocked
         );
+    }
+
+    // covers UP-55: Stop Trusting protects the cluster at once, before settings.toml is
+    // written; the revocation goes once the settings no longer trust it, and trusting again
+    // restores it.
+    #[test]
+    fn a_revoked_trust_stops_counting_at_once() {
+        let unlocks = SessionUnlocks::default();
+        let prod = "https://prod.example:6443";
+        let mut settings = Settings::default();
+        settings
+            .trusted_clusters
+            .push(ClusterPin::new("prod", prod));
+        let of = |s: &Settings| protection(s, &unlocks, "prod", Some(prod), None);
+        assert_eq!(of(&settings), Protection::Trusted);
+        unlocks.unlock("prod", prod);
+        unlocks.revoke_trust("prod");
+        assert_eq!(
+            of(&settings),
+            Protection::Protected,
+            "and the unlock went too"
+        );
+        // An unrelated reload that still trusts it keeps the revocation.
+        unlocks.settle(&settings);
+        assert!(unlocks.trust_revoked("prod"));
+        assert_eq!(of(&settings), Protection::Protected);
+        // The write landed: nothing to revoke any more, and a trust added by hand counts.
+        settings.trusted_clusters.clear();
+        unlocks.settle(&settings);
+        assert!(!unlocks.trust_revoked("prod"));
+        settings
+            .trusted_clusters
+            .push(ClusterPin::new("prod", prod));
+        assert_eq!(of(&settings), Protection::Trusted);
+        unlocks.revoke_trust("prod");
+        unlocks.restore_trust("prod");
+        assert_eq!(of(&settings), Protection::Trusted);
     }
 
     #[test]

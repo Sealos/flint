@@ -674,6 +674,8 @@ impl ClusterManager {
                 (kept, Some(e))
             }
         };
+        // Revocations whose write landed are done with.
+        self.unlocks.settle(&settings);
         if *self.settings == settings && self.settings_error == error {
             return;
         }
@@ -1598,6 +1600,14 @@ mod tests {
             .trusted_clusters
             .push(settings::ClusterPin::new("dev", "https://dev/"));
         manager.settings = Arc::new(trusted);
+        assert_eq!(
+            manager.write_client("dev").err(),
+            Some(not_connected.clone())
+        );
+        // Stop Trusting refuses at once, before the settings change arrives.
+        unlocks.revoke_trust("dev");
+        assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        unlocks.restore_trust("dev");
         assert_eq!(manager.write_client("dev").err(), Some(not_connected));
 
         // A settings.toml that stops parsing trusts nothing, as at startup: an entry removed
