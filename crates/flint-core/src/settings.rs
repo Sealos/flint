@@ -600,7 +600,12 @@ fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, S
             path: path.to_owned(),
             source,
         }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        // A missing file is a fresh install. A symlink whose target is missing is not: the
+        // user keeps the file elsewhere, and it may have said something (such as
+        // `protect_local_clusters`) that defaults would quietly undo.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && path.symlink_metadata().is_err() => {
+            Ok(T::default())
+        }
         Err(source) => Err(SettingsError::Read {
             path: path.to_owned(),
             source,
@@ -979,6 +984,26 @@ mod tests {
         let (valid, error) = load_settings_or_fallback(dir.path());
         assert_eq!(error, None);
         assert_eq!(of(&valid), Protection::Local);
+    }
+
+    // covers UP-54: settings.toml as a symlink to a file that is gone (a dotfiles checkout not
+    // mounted) is unreadable, not a fresh install, so local clusters stay protected.
+    #[test]
+    fn a_dangling_symlink_is_unreadable_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), dir.path().join(SETTINGS_FILE))
+            .unwrap();
+        assert!(matches!(
+            load_settings(dir.path()),
+            Err(SettingsError::Read { .. })
+        ));
+        let (settings, error) = load_settings_or_fallback(dir.path());
+        assert!(error.is_some());
+        assert!(settings.protect_local_clusters);
+        // State has no such stake, but reads the same way.
+        std::os::unix::fs::symlink(dir.path().join("gone2.toml"), dir.path().join(STATE_FILE))
+            .unwrap();
+        assert!(load_state(dir.path()).is_err());
     }
 
     // covers UP-54: a misspelt key is ignored like any unknown one, so it is named in the log.
