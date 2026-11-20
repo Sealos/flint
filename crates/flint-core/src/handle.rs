@@ -479,9 +479,8 @@ impl CoreHandle {
 
     /// Trusts `cluster` at `server` (the URL the user confirmed), written to `settings.toml`
     /// through [`Command::SetTrusted`]. A revocation of its trust earlier in the session is
-    /// lifted now.
+    /// lifted once the core has checked the server and saved the pin, not before.
     pub fn trust(&self, cluster: &str, server: &str) {
-        self.unlocks.restore_trust(cluster);
         self.send(Command::SetTrusted {
             cluster: cluster.to_owned(),
             server: Some(server.to_owned()),

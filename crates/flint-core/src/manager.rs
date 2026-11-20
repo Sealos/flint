@@ -621,6 +621,10 @@ impl ClusterManager {
             )));
             return;
         }
+        // A trust confirmed for this server lifts an earlier Stop Trusting, but only once the
+        // pin is checked and saved: a failed write leaves the cluster protected.
+        let trusted = matches!(pins, Pins::Trust) && server.is_some();
+        let pinned = cluster.clone();
         let dir = self.config.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || match pins {
             Pins::AiExposure => settings::set_ai_exposed(&dir, &cluster, server.as_deref()),
@@ -629,7 +633,15 @@ impl ClusterManager {
         .await;
         match result {
             Ok(Ok(settings)) => {
+                if trusted {
+                    self.unlocks.restore_trust(&pinned);
+                }
                 self.apply_settings(Ok(settings)).await;
+                if trusted {
+                    // The settings may be unchanged (the same pin again): say it anyway, so the
+                    // front end shows the trust that counts again.
+                    self.emit_settings();
+                }
                 if self
                     .watcher
                     .as_ref()
@@ -674,8 +686,11 @@ impl ClusterManager {
                 (kept, Some(e))
             }
         };
-        // Revocations whose write landed are done with.
-        self.unlocks.settle(&settings);
+        // Revocations whose write landed are done with: judged only on settings that were read
+        // or written, never on the fallback, whose missing pins prove nothing.
+        if error.is_none() {
+            self.unlocks.settle(&settings);
+        }
         if *self.settings == settings && self.settings_error == error {
             return;
         }
@@ -1250,6 +1265,21 @@ fn watch_names(path: &Path) -> Vec<PathBuf> {
     if let Ok(target) = std::fs::canonicalize(path) {
         names.push(target);
     }
+    // A symlink whose target is missing cannot be canonicalized: name its target as the link
+    // says it (relative to the link's directory), and with that directory resolved, so
+    // restoring the target is noticed.
+    if let Ok(link) = std::fs::read_link(path) {
+        let target = match path.parent() {
+            Some(dir) if link.is_relative() => dir.join(link),
+            _ => link,
+        };
+        if let (Some(dir), Some(name)) = (target.parent(), target.file_name())
+            && let Ok(dir) = std::fs::canonicalize(dir)
+        {
+            names.push(dir.join(name));
+        }
+        names.push(target);
+    }
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
         && let Ok(dir) = std::fs::canonicalize(dir)
     {
@@ -1616,6 +1646,100 @@ mod tests {
         assert!(manager.settings.trusted_clusters.is_empty());
         assert!(manager.settings.protect_local_clusters);
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+    }
+
+    // covers UP-55: a Stop Trusting stays in force until settings that were really read or
+    // written no longer hold the pin (never on the fallback for a broken file), and trusting
+    // again lifts it only once the pin for the confirmed server is saved.
+    #[tokio::test]
+    async fn a_revoked_trust_holds_until_the_pin_is_really_gone_or_saved_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = async_channel::unbounded();
+        let mut trusted = Settings::default();
+        trusted
+            .trusted_clusters
+            .push(settings::ClusterPin::new("dev", "https://dev"));
+        let config = CoreConfig {
+            config_dir: dir.path().to_owned(),
+            settings: trusted.clone(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let hubs = HubRegistry::default();
+        let unlocks = SessionUnlocks::default();
+        let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
+        manager.clusters.push(Cluster::new(
+            context(None),
+            None,
+            &hubs,
+            &manager.engine_config,
+        ));
+        let protected = Some(WriteRefusal::Protected {
+            cluster: "dev".into(),
+        });
+        let open = Some(WriteRefusal::NotConnected {
+            cluster: "dev".into(),
+        });
+        assert_eq!(manager.write_client("dev").err(), open);
+
+        // Stop Trusting, whose write failed: the file broke before it landed.
+        unlocks.revoke_trust("dev");
+        manager.apply_settings(Err("expected `=`".into())).await;
+        assert!(unlocks.trust_revoked("dev"), "the fallback proves nothing");
+        // The typo is fixed with the old pin still in the file: still protected.
+        manager.apply_settings(Ok(trusted.clone())).await;
+        assert!(unlocks.trust_revoked("dev"));
+        assert_eq!(manager.write_client("dev").err(), protected);
+
+        // Trusting a server the context does not point at saves nothing and lifts nothing.
+        manager
+            .set_pin(Pins::Trust, "dev".into(), Some("https://elsewhere".into()))
+            .await;
+        assert!(unlocks.trust_revoked("dev"));
+        // Nor does a write refused while settings.toml is broken.
+        manager.settings_error = Some("broken".into());
+        manager
+            .set_pin(Pins::Trust, "dev".into(), Some("https://dev".into()))
+            .await;
+        assert!(unlocks.trust_revoked("dev"));
+        assert_eq!(manager.write_client("dev").err(), protected);
+        // Saved for the confirmed server: the trust counts again.
+        manager.settings_error = None;
+        manager
+            .set_pin(Pins::Trust, "dev".into(), Some("https://dev".into()))
+            .await;
+        assert!(!unlocks.trust_revoked("dev"));
+        assert_eq!(manager.write_client("dev").err(), open);
+
+        // Stop Trusting that lands: settings without the pin settle the revocation.
+        unlocks.revoke_trust("dev");
+        manager.set_pin(Pins::Trust, "dev".into(), None).await;
+        assert!(!unlocks.trust_revoked("dev"));
+        assert_eq!(manager.write_client("dev").err(), protected);
+    }
+
+    // covers UP-12: settings.toml as a symlink to a file that is gone is watched at its
+    // target too, so restoring the target reloads it.
+    #[test]
+    fn a_dangling_symlink_is_watched_at_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("dotfiles")).unwrap();
+        let link = dir.path().join("settings.toml");
+        std::os::unix::fs::symlink("dotfiles/flint.toml", &link).unwrap();
+        let names = watch_names(&link);
+        assert!(
+            names.contains(&real.join("dotfiles/flint.toml")),
+            "{names:?}"
+        );
+        assert!(names.contains(&dir.path().join("dotfiles/flint.toml")));
+        // An absolute target, in a directory that does exist.
+        let absolute = dir.path().join("abs.toml");
+        std::os::unix::fs::symlink(real.join("dotfiles/other.toml"), &absolute).unwrap();
+        assert!(watch_names(&absolute).contains(&real.join("dotfiles/other.toml")));
     }
 
     // covers UP-24
