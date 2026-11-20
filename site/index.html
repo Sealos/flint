@@ -41,7 +41,9 @@
         <a class="btn btn-primary" href="https://github.com/Sealos/flint">View on GitHub</a>
         <a class="btn" href="https://github.com/Sealos/flint/releases">Releases</a>
       </div>
-      <p class="fineprint">Built for macOS first. Releases after v0.2.0 include Flint.app in a DMG for Apple Silicon and Intel; releases after v0.1.1 also include a best-effort Linux AppImage (x86_64 and arm64). Until the first public release the app is not signed with a Developer ID or notarized, so macOS asks you to allow it once (<a href="https://github.com/Sealos/flint#install-from-a-release">install steps</a>).</p>
+      <pre class="code hero-code" role="region" aria-label="Command to register flint mcp with Claude Code" tabindex="0"><code><span class="c"># give Claude Code read-only access</span>
+claude mcp add flint -- flint mcp</code></pre>
+      <p class="fineprint">Built for macOS first. v0.2.0 ships a universal macOS binary for Apple Silicon and Intel and a best-effort Linux AppImage (x86_64 and arm64); releases after it add Flint.app in a DMG. Until the first public release the app is not signed with a Developer ID or notarized, so macOS asks you to allow it once (<a href="https://github.com/Sealos/flint#install-from-a-release">install steps</a>).</p>
     </section>
 
     <div class="wrap">
@@ -85,6 +87,28 @@
 
     <section id="features" class="wrap section">
       <h2>What it does today</h2>
+      <div class="grid grid-2 shots">
+        <article class="card">
+          <h3>Pod and workload logs</h3>
+          <p>Logs open in a bottom dock from a row, the detail pane or the keyboard. Follow, search, timestamps,
+            previous logs, and save to a file. A workload's tab follows its pods as they come and go.</p>
+          <picture>
+            <source srcset="img/logs-dark.png" media="(prefers-color-scheme: dark)">
+            <img src="img/logs-light.png" width="1200" height="738" loading="lazy"
+              alt="Flint with a podinfo pod selected and its log tab open in the dock, showing streamed log lines">
+          </picture>
+        </article>
+        <article class="card">
+          <h3>A shell in any container</h3>
+          <p>An interactive terminal tab in the same dock, with a container picker for multi-container pods. Tabs
+            keep running while you browse other views.</p>
+          <picture>
+            <source srcset="img/shell-dark.png" media="(prefers-color-scheme: dark)">
+            <img src="img/shell-light.png" width="1200" height="738" loading="lazy"
+              alt="Flint with a shell tab open in the dock, running commands inside a web pod">
+          </picture>
+        </article>
+      </div>
       <div class="grid">
         <article class="card">
           <h3>Every kind, CRDs included</h3>
@@ -112,8 +136,8 @@
         </article>
         <article class="card">
           <h3>Follows macOS light and dark</h3>
-          <p>Switches with the system appearance, or set it yourself. Zed-style themes, a command palette and a
-            resource switcher come next.</p>
+          <p>Flint Light and Flint Dark switch with the system appearance, or set one yourself. A command palette
+            and a resource switcher come next.</p>
         </article>
       </div>
     </section>
@@ -130,7 +154,7 @@
         </ul>
       </div>
       <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># register it with Claude Code</span>
-claude mcp add flint -- /path/to/flint mcp
+claude mcp add flint -- flint mcp
 
 <span class="c"># other MCP clients take the same command</span>
 /path/to/flint mcp</code></pre>
@@ -141,8 +165,8 @@ claude mcp add flint -- /path/to/flint mcp
       <ol class="roadmap">
         <li class="done"><b>M0</b><span>Cluster sidebar, connect and health check, read-only MCP server</span></li>
         <li class="done"><b>M1</b><span>Every kind with live lists, namespace filter, detail and YAML view</span></li>
-        <li class="next"><b>M1.5</b><span>Flint Light and Dark themes, command palette, resource switcher</span></li>
-        <li><b>M2</b><span>Streaming pod logs with search, timestamps and error highlighting; exec terminal</span></li>
+        <li class="next"><b>M1.5</b><span>Command palette and resource switcher (the Flint Light and Dark themes are in)</span></li>
+        <li class="done"><b>M2</b><span>Streaming pod and workload logs with search, timestamps and save to file; shells in a dock (v0.2.0)</span></li>
         <li><b>M3</b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
         <li><b>M4</b><span>Curated views for core kinds, CPU and memory from metrics-server, resource diagram</span></li>
         <li><b>M5</b><span>Port-forward panel with open in browser, Helm releases</span></li>
