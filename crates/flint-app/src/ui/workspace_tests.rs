@@ -798,6 +798,208 @@ async fn the_tab_list_opens_from_the_keyboard(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// Opens a running shell on `alpha` in the dock, over a session the test drives.
+fn open_fake_shell(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+) -> (u64, flint_core::exec::fake::FakeExec) {
+    use crate::ui::dock_model::TabCluster;
+    use crate::ui::terminal_model::ShellRequest;
+    use crate::ui::terminal_view::TerminalView;
+    let request = ShellRequest {
+        cluster: "alpha".into(),
+        namespace: "demo".into(),
+        pod: "web".into(),
+        container: Some("app".into()),
+    };
+    let (session, mut fake) = flint_core::exec::fake::FakeExec::open(
+        request.exec_request(flint_core::TerminalSize::default()),
+    );
+    let server = t.server.clone();
+    let id = cx
+        .update_window(t.window, |_, window, cx| {
+            let dock = t.workspace.read(cx).dock.clone();
+            dock.update(cx, |dock, cx| {
+                dock.open(
+                    crate::ui::dock::TabKey::Shell(request.clone()),
+                    TabCluster::new("alpha", Some(&server)),
+                    |window, cx| {
+                        DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
+                    },
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    fake.set_state(flint_core::ExecState::Running {
+        command: vec!["bash".into()],
+    });
+    fake.pump();
+    cx.run_until_parked();
+    (id, fake)
+}
+
+fn tab_status(cx: &mut TestAppContext, t: &TestWorkspace, id: u64) -> TabStatus {
+    t.workspace.read_with(cx, |ws, cx| {
+        ws.dock.read(cx).tab(id).unwrap().item(cx).tab_status()
+    })
+}
+
+/// Points `context` at another server, or sets its connection, as a kubeconfig reload or the
+/// core would.
+fn change_cluster(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    context: &str,
+    change: impl FnOnce(&mut flint_core::ClusterSummary),
+) {
+    t.model.update(cx, |model, cx| {
+        let cluster = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == context)
+            .unwrap();
+        change(cluster);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+// covers UP-41: when a kubeconfig reload re-points a context, the workspace ends the running
+// shells on it (the model's change reaches the dock), and says why.
+#[gpui_kit::test]
+async fn a_re_pointed_context_ends_its_shells(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (id, mut fake) = open_fake_shell(cx, &t);
+    assert_eq!(tab_status(cx, &t, id), TabStatus::Live);
+    // Another change to the context (its connection) leaves the shell alone.
+    change_cluster(cx, &t, "alpha", |c| {
+        c.state = flint_core::ConnectionState::Disconnected
+    });
+    assert_eq!(tab_status(cx, &t, id), TabStatus::Live);
+    assert!(!fake.is_closed());
+    change_cluster(cx, &t, "alpha", |c| {
+        c.info.server = Some("https://10.0.0.9:6443".into())
+    });
+    assert!(fake.is_closed(), "the shell's session ends");
+    assert_eq!(tab_status(cx, &t, id), TabStatus::Ended);
+}
+
+// covers UP-41, UP-45: Restart Shell and Reconnect Logs are refused, saying why, while the
+// tab's cluster is not connected; no tab opens.
+#[gpui_kit::test]
+async fn restarting_waits_for_a_connected_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (id, mut fake) = open_fake_shell(cx, &t);
+    fake.set_state(flint_core::ExecState::Exited { code: Some(0) });
+    fake.pump();
+    cx.run_until_parked();
+    change_cluster(cx, &t, "alpha", |c| {
+        c.state = flint_core::ConnectionState::Disconnected
+    });
+    t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
+    let (ids, refused) = t.workspace.read_with(cx, |ws, cx| {
+        (
+            ws.dock.read(cx).tab_ids(),
+            ws.action_error().map(str::to_owned),
+        )
+    });
+    assert_eq!(ids, [id], "no new tab");
+    assert_eq!(refused.as_deref(), Some("Shell: alpha is not connected"));
+
+    // A failed log tab whose context is gone from kubeconfig: Reconnect is refused the same way.
+    let core = t.model.read_with(cx, |m, _| m.core().clone());
+    let request = crate::ui::log_view::LogRequest {
+        cluster: "gone".into(),
+        subject: flint_core::LogSubject::Pod(flint_core::LogTarget {
+            namespace: "demo".into(),
+            pod: "web".into(),
+            container: Some("app".into()),
+        }),
+        previous: false,
+    };
+    let server = t.server.clone();
+    let logs = cx
+        .update_window(t.window, |_, window, cx| {
+            let dock = t.workspace.read(cx).dock.clone();
+            dock.update(cx, |dock, cx| {
+                dock.open(
+                    crate::ui::dock::TabKey::Logs(request.clone()),
+                    crate::ui::dock_model::TabCluster::new("gone", Some(&server)),
+                    |window, cx| {
+                        DockTab::Logs(
+                            cx.new(|cx| {
+                                crate::ui::log_view::LogView::new(core, request, window, cx)
+                            }),
+                        )
+                    },
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let ws = workspace.read(cx);
+        ws.dock.read(cx).tab(logs).unwrap().item(cx).can_restart()
+    })
+    .await;
+    t.dispatch(cx, "dock::ReconnectLogs", Value::Null).unwrap();
+    let (count, refused) = t.workspace.read_with(cx, |ws, cx| {
+        (
+            ws.dock.read(cx).tab_count(),
+            ws.action_error().map(str::to_owned),
+        )
+    });
+    assert_eq!(count, 2, "no new tab");
+    assert_eq!(
+        refused.as_deref(),
+        Some("Logs: no kubeconfig context named gone")
+    );
+}
+
+// covers UP-04, UP-42: Cmd-R in a tab whose session runs is not Restart or Reconnect: it falls
+// through to Refresh, which fetches the shown object again.
+#[gpui_kit::test]
+async fn the_refresh_key_reaches_refresh_from_a_running_tab(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    // A log tab whose stream is still starting (`alpha` never answers), focused.
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    let focus = t.workspace.read_with(cx, |ws, cx| {
+        let log = ws.dock.read(cx).active_log().unwrap().read(cx);
+        assert!(!log.can_restart());
+        log.tab_focus()
+    });
+    cx.update_window(t.window, |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    press(cx, &t, "secondary-r");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).detail.as_ref().is_some_and(|d| {
+            d.read(cx)
+                .view_state()
+                .banners
+                .iter()
+                .any(|b| b.id == "detail-refresh-error")
+        })
+    })
+    .await;
+    assert_eq!(
+        t.workspace
+            .read_with(cx, |ws, cx| ws.dock.read(cx).tab_count()),
+        1,
+        "no restart"
+    );
+}
+
 // covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.
 #[gpui_kit::test]
 async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
