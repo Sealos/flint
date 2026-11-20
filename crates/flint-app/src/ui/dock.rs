@@ -18,8 +18,9 @@
 //!    them to the active tab of that kind (see `Workspace::register_actions`, which does it for
 //!    [`Dock::active_log`] and [`Dock::active_terminal`]) and guard them, as for any view.
 
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -40,6 +41,8 @@ pub const DEFAULT_HEIGHT: f32 = 280.;
 pub const MIN_HEIGHT: f32 = 120.;
 /// The dock leaves the main area at least this much (its header and a few rows).
 const MIN_MAIN_HEIGHT: f32 = 160.;
+/// What an empty dock says.
+const EMPTY: &str = "No logs or shells open.";
 /// The tab bar's height.
 const TAB_BAR_HEIGHT: f32 = 28.;
 
@@ -126,6 +129,8 @@ pub struct Dock {
     visible: bool,
     next_id: u64,
     focus: FocusHandle,
+    /// The tab strip's scroll position: the active tab is scrolled into view.
+    strip: ScrollHandle,
 }
 
 impl Dock {
@@ -136,6 +141,7 @@ impl Dock {
             visible: false,
             next_id: 1,
             focus: cx.focus_handle(),
+            strip: ScrollHandle::new(),
         }
     }
 
@@ -163,6 +169,17 @@ impl Dock {
 
     fn active_tab(&self) -> Option<&DockTab> {
         self.tab(self.active?)
+    }
+
+    /// Scrolls the tab strip so the active tab is in view (on the next layout): with many tabs
+    /// a tab just opened or shown would otherwise sit past the strip's edge.
+    fn reveal_active(&self) {
+        if let Some(ix) = self
+            .active
+            .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+        {
+            self.strip.scroll_to_item(ix);
+        }
     }
 
     /// The log tab shown, if the dock is visible and showing one: where log actions go.
@@ -281,6 +298,7 @@ impl Dock {
         if self.active.is_none() {
             self.active = Some(id);
             self.visible = true;
+            self.reveal_active();
         }
         cx.notify();
         id
@@ -310,6 +328,7 @@ impl Dock {
         }
         self.active = Some(id);
         self.visible = true;
+        self.reveal_active();
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -335,6 +354,7 @@ impl Dock {
                 .get(ix)
                 .or_else(|| ix.checked_sub(1).and_then(|i| self.tabs.get(i)))
                 .map(|t| t.id);
+            self.reveal_active();
             if self.active.is_some() {
                 if had_focus {
                     self.focus_active(window, cx);
@@ -515,77 +535,128 @@ pub fn cluster_chip(
         .test_support()
 }
 
+impl Dock {
+    /// The button that lists every tab (title, cluster and status) and shows the one picked:
+    /// how to reach a tab scrolled out of the strip.
+    fn render_tab_list(&self, cx: &App) -> impl IntoElement {
+        let entries: Vec<(u64, String, bool)> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let item = tab.tab.item(cx);
+                let label = dock_model::list_label(
+                    &item.tab_title(),
+                    &tab.cluster.label(),
+                    item.tab_status(),
+                );
+                (tab.id, label, self.active == Some(tab.id))
+            })
+            .collect();
+        Button::new("dock-tab-list")
+            .icon(IconName::ChevronsUpDown)
+            .xsmall()
+            .ghost()
+            .tab_stop(false)
+            .tooltip("All tabs")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                entries.iter().fold(menu, |menu, (id, label, active)| {
+                    menu.item(
+                        PopupMenuItem::new(label.clone())
+                            .checked(*active)
+                            .on_click(registry::on_click(ActivateTab { tab: *id })),
+                    )
+                })
+            })
+    }
+
+    fn render_hide(&self) -> impl IntoElement {
+        Button::new("dock-hide")
+            .icon(IconName::ChevronDown)
+            .xsmall()
+            .ghost()
+            .tab_stop(false)
+            .tooltip(format!(
+                "Hide the dock ({})",
+                registry::key_hint("secondary-j")
+            ))
+            .on_click(registry::on_click(ToggleDock))
+    }
+
+    /// What the dock shows with no tab open: no tab strip, a line on how to open one, and the
+    /// button that hides it.
+    fn render_empty(&self, theme: &Theme) -> AnyElement {
+        v_flex()
+            .id("dock-empty")
+            .flex_1()
+            .relative()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child(div().child(EMPTY).test_text(EMPTY))
+            .child(div().text_xs().child(format!(
+                "Right-click a pod or workload and choose Logs ({}) or Shell ({}).",
+                registry::key_hint("secondary-l"),
+                registry::key_hint("secondary-shift-e")
+            )))
+            .child(div().absolute().top_1().right_1().child(self.render_hide()))
+            .test_support()
+            .into_any_element()
+    }
+}
+
 impl Render for Dock {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let tabs: Vec<AnyElement> = self
-            .tabs
-            .iter()
-            .map(|tab| self.render_tab(tab, &theme, cx))
-            .collect();
-        let content = match self.active_tab() {
-            Some(tab) => div()
-                .flex_1()
-                .min_h_0()
-                .child(tab.view())
-                .into_any_element(),
-            None => v_flex()
-                .id("dock-empty")
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child("No sessions.")
-                .child(div().text_xs().child(format!(
-                    "Right-click a pod or workload for its logs ({}) or a shell ({}).",
-                    registry::key_hint("secondary-l"),
-                    registry::key_hint("secondary-shift-e")
-                )))
-                .test_support()
-                .into_any_element(),
-        };
-        v_flex()
+        let root = v_flex()
             .id("dock")
             .key_context(registry::DOCK)
             .track_focus(&self.focus)
             .map(|el| Self::bind_actions(OnView::new(el, cx)).into_element())
             .size_full()
-            .bg(theme.background)
-            .child(
-                h_flex()
-                    .h(px(TAB_BAR_HEIGHT))
-                    .flex_none()
-                    .bg(theme.tab_bar)
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .id("dock-tabs")
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_x_scroll()
-                            .children(tabs),
-                    )
-                    .child(
-                        div().px_1().flex_none().child(
-                            Button::new("dock-hide")
-                                .icon(IconName::ChevronDown)
-                                .xsmall()
-                                .ghost()
-                                .tab_stop(false)
-                                .tooltip(format!(
-                                    "Hide the dock ({})",
-                                    registry::key_hint("secondary-j")
-                                ))
-                                .on_click(registry::on_click(ToggleDock)),
-                        ),
-                    ),
-            )
-            .child(content)
-            .test_support()
+            .bg(theme.background);
+        let Some(active) = self.active_tab() else {
+            return root.child(self.render_empty(&theme)).test_support();
+        };
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .child(active.view())
+            .into_any_element();
+        let tabs: Vec<AnyElement> = self
+            .tabs
+            .iter()
+            .map(|tab| self.render_tab(tab, &theme, cx))
+            .collect();
+        root.child(
+            h_flex()
+                .h(px(TAB_BAR_HEIGHT))
+                .flex_none()
+                .bg(theme.tab_bar)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    h_flex()
+                        .id("dock-tabs")
+                        .h_full()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.strip)
+                        .children(tabs)
+                        .test_support(),
+                )
+                .child(
+                    h_flex()
+                        .px_1()
+                        .flex_none()
+                        .child(self.render_tab_list(cx))
+                        .child(self.render_hide()),
+                ),
+        )
+        .child(content)
+        .test_support()
     }
 }
 

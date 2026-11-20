@@ -19,6 +19,19 @@ pub enum TabStatus {
     Failed,
 }
 
+impl TabStatus {
+    /// The status in a word, for the tab list.
+    pub fn word(self) -> &'static str {
+        match self {
+            TabStatus::Starting => "starting",
+            TabStatus::Live => "live",
+            TabStatus::Retrying => "reconnecting",
+            TabStatus::Ended => "ended",
+            TabStatus::Failed => "failed",
+        }
+    }
+}
+
 /// The cluster a tab's session runs on: the kubeconfig context and the API server it pointed at
 /// when the tab opened. Like an AI exposure (ADR-0009) and a trusted cluster (ADR-0015), a tab is
 /// pinned to both, so a context re-pointed at another server is another cluster: opening the
@@ -58,6 +71,11 @@ fn normalize_server(server: &str) -> String {
 /// stay readable.
 pub fn shown_title(title: &str) -> String {
     display::middle_truncate(title, TITLE_CHARS)
+}
+
+/// What the tab list says of a tab: its title, its cluster and its status.
+pub fn list_label(title: &str, cluster: &str, status: TabStatus) -> String {
+    format!("{} — {cluster} · {}", shown_title(title), status.word())
 }
 
 /// What a tab's accessible label and full name say: its title and its cluster.
@@ -104,6 +122,10 @@ mod tests {
         assert!(shown.starts_with("Shell: checkout"), "{shown}");
         assert!(shown.ends_with("istio-proxy"), "{shown}");
         assert_eq!(shown_title("web-1 · app"), "web-1 · app");
+        assert_eq!(
+            list_label("Shell: web-1 · app", "kind-dev", TabStatus::Live),
+            "Shell: web-1 · app — kind-dev · live"
+        );
         assert_eq!(
             full_title("api (Deployment)", &TabCluster::new("kind-dev", None)),
             "api (Deployment) on kind-dev"

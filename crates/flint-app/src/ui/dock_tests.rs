@@ -56,10 +56,14 @@ fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
 }
 
 fn shell_request() -> ShellRequest {
+    shell_request_in("web-1")
+}
+
+fn shell_request_in(pod: &str) -> ShellRequest {
     ShellRequest {
         cluster: "test".into(),
         namespace: "demo".into(),
-        pod: "web-1".into(),
+        pod: pod.into(),
         container: Some("app".into()),
     }
 }
@@ -99,11 +103,22 @@ fn open_shell(
     window: AnyWindowHandle,
     dock: &Entity<Dock>,
 ) -> (u64, FakeExec) {
-    let (session, mut fake) = FakeExec::open(shell_request().exec_request(TerminalSize::default()));
+    open_shell_in(cx, window, dock, "web-1")
+}
+
+/// [`open_shell`] in pod `pod`.
+fn open_shell_in(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    dock: &Entity<Dock>,
+    pod: &str,
+) -> (u64, FakeExec) {
+    let (session, mut fake) =
+        FakeExec::open(shell_request_in(pod).exec_request(TerminalSize::default()));
     let id = cx
         .update_window(window, |_, window, cx| {
             dock.update(cx, |dock, cx| {
-                let request = shell_request();
+                let request = shell_request_in(pod);
                 let key = TabKey::Shell(super::terminal_view::ShellKey {
                     request: request.clone(),
                     ended: None,
@@ -301,4 +316,92 @@ async fn a_shell_ends_when_its_context_is_re_pointed(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(found, None, "Shell opens a new tab");
+}
+
+/// Whether tab `id` lies wholly within the tab strip, as drawn.
+fn tab_in_view(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) -> bool {
+    cx.update_window(window, |_, window, _| {
+        let strip = window.find("dock-tabs").bounds();
+        let tab = window.find(("dock-tab", id as usize)).bounds();
+        tab.origin.x >= strip.origin.x - px(0.5)
+            && tab.origin.x + tab.size.width <= strip.origin.x + strip.size.width + px(0.5)
+    })
+    .unwrap()
+}
+
+fn activate(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) {
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch("dock::ActivateTab", json!({ "tab": id }), window, cx)
+    })
+    .unwrap()
+    .unwrap();
+    draw(cx, window);
+    draw(cx, window);
+}
+
+// covers UP-42: with more tabs than fit, the strip scrolls so a tab just opened or shown is in
+// view, and the tab list names every tab (title, cluster, status) and shows the one picked.
+#[gpui_kit::test]
+async fn the_active_tab_stays_in_view(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let mut tabs = Vec::new();
+    let mut fakes = Vec::new();
+    for n in 1..=8 {
+        let (id, fake) = open_shell_in(cx, window, &dock, &format!("web-{n}"));
+        draw(cx, window);
+        tabs.push(id);
+        fakes.push(fake);
+    }
+    let last = *tabs.last().unwrap();
+    assert!(tab_in_view(cx, window, last), "the tab just opened");
+    assert!(!tab_in_view(cx, window, tabs[0]), "more tabs than fit");
+    activate(cx, window, tabs[0]);
+    assert!(tab_in_view(cx, window, tabs[0]));
+    assert!(!tab_in_view(cx, window, last));
+    activate(cx, window, last);
+    assert!(tab_in_view(cx, window, last));
+
+    // The tab list, from its button at the strip's end.
+    cx.update_window(window, |_, window, cx| window.click("dock-tab-list", cx))
+        .unwrap();
+    draw(cx, window);
+    let entries = cx
+        .update_window(window, |_, window, _| {
+            let menu = window.within("popup-menu");
+            (0usize..)
+                .map_while(|ix| menu.try_find(ix))
+                .map(|item| item.label().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(entries.len(), 8, "{entries:?}");
+    assert_eq!(entries[0], "Shell: web-1 · app — test · live");
+    cx.update_window(window, |_, window, cx| {
+        window.within("popup-menu").click(0usize, cx)
+    })
+    .unwrap();
+    draw(cx, window);
+    draw(cx, window);
+    assert_eq!(dock.read_with(cx, |d, _| d.active_id()), Some(tabs[0]));
+    assert!(tab_in_view(cx, window, tabs[0]));
+}
+
+// covers UP-42: an empty dock shows no tab strip, only how to open logs or a shell.
+#[gpui_kit::test]
+async fn an_empty_dock_says_how_to_open_a_tab(cx: &mut TestAppContext) {
+    let (window, _dock) = open_dock(cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("dock-empty").is_some());
+        assert!(window.try_find("dock-tabs").is_none(), "no empty tab strip");
+        assert!(window.try_find("dock-hide").is_some(), "it can still be hidden");
+        let texts: Vec<String> = gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .map(|t| t.text().to_owned())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "No logs or shells open."),
+            "{texts:?}"
+        );
+    })
+    .unwrap();
 }
