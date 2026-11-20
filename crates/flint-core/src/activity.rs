@@ -7,11 +7,15 @@
 //! and a new file starts, so the log keeps at most two files' worth. Each record is written with
 //! one append, so records from several `flint mcp` processes do not interleave. Lines that do not
 //! parse (a newer format, a torn write) are skipped when reading.
+//!
+//! Logging is best-effort: a writer waits at most [`LOCK_WAIT`] for the lock, then skips its
+//! record, so a stalled writer cannot hold up other `flint mcp` processes' replies.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +29,8 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub const LOCK_FILE: &str = "agent-activity.lock";
 /// The longest a text field is recorded: a DNS name's length, plenty for any Kubernetes name.
 pub const MAX_FIELD_BYTES: usize = 253;
+/// The longest a writer waits for [`LOCK_FILE`] before it skips its record.
+pub const LOCK_WAIT: Duration = Duration::from_secs(1);
 /// The most records [`read`] returns, newest kept: more than the two files hold, so this only
 /// bounds a log written with a larger cap.
 pub const MAX_RECORDS: usize = 10_000;
@@ -77,9 +83,56 @@ pub struct ActivityRecord {
     /// by, since `cluster` may be cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_key: Option<String>,
-    /// [`server_key`] of the full `server`, set by [`append`].
+    /// [`server_key`] of the server the cluster is exposed with, as the kubeconfig has it. The
+    /// caller sets it from the unredacted URL; [`append`] (and [`read`], for older lines) falls
+    /// back to the key of the shown `server`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_key: Option<String>,
+    /// The clusters a call read about without naming one: those `list_clusters` probed. Their
+    /// activity tabs list the call too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probed: Vec<Probed>,
+}
+
+/// A cluster a call read about without naming it, by its keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probed {
+    /// [`cluster_key`] of the context.
+    pub cluster_key: String,
+    /// [`server_key`] of the server it is exposed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_key: Option<String>,
+}
+
+impl Probed {
+    /// The keys of `context` at `server`.
+    pub fn new(context: &str, server: Option<&str>) -> Self {
+        Probed {
+            cluster_key: cluster_key(context),
+            server_key: server.map(server_key),
+        }
+    }
+}
+
+impl ActivityRecord {
+    /// Whether the call is about the cluster with key `cluster` at the server with key `server`:
+    /// it named that context, or probed it. A context re-pointed at another server is another
+    /// cluster; a side without a server key (a context not exposed, a tab opened for a context
+    /// with no server) matches any server.
+    pub fn is_about(&self, cluster: &str, server: Option<&str>) -> bool {
+        let at = |cluster_key: Option<&str>, server_key: Option<&str>| {
+            cluster_key == Some(cluster)
+                && match (server_key, server) {
+                    (Some(at), Some(server)) => at == server,
+                    _ => true,
+                }
+        };
+        at(self.cluster_key.as_deref(), self.server_key.as_deref())
+            || self
+                .probed
+                .iter()
+                .any(|p| at(Some(&p.cluster_key), p.server_key.as_deref()))
+    }
 }
 
 /// A stable key for a context name (FNV-1a, 64 bits, in hex): the same in every Flint version.
@@ -87,14 +140,12 @@ pub fn cluster_key(context: &str) -> String {
     fnv1a(context.as_bytes())
 }
 
-/// A stable key for an API server URL, as [`cluster_key`]: without credentials and a trailing
-/// slash, so the server a context points at and the one recorded match.
+/// A stable key for an API server URL, as [`cluster_key`], of the endpoint the cluster pin
+/// compares ([`crate::settings::server_identity`]): two servers have one key only when a pin
+/// would take them for the same. Pass the URL as the kubeconfig has it, not the shown one, which
+/// can hide distinct servers behind one placeholder.
 pub fn server_key(url: &str) -> String {
-    fnv1a(
-        crate::redact::server_url(url)
-            .trim_end_matches('/')
-            .as_bytes(),
-    )
+    fnv1a(crate::settings::server_identity(url).as_bytes())
 }
 
 fn fnv1a(bytes: &[u8]) -> String {
@@ -108,12 +159,13 @@ fn fnv1a(bytes: &[u8]) -> String {
 /// [`MAX_FILE_BYTES`]. Creates the directory if needed. Text fields are cut at
 /// [`MAX_FIELD_BYTES`]: they hold what the agent wrote, and a few huge ones must not flush the
 /// log. Writers take [`LOCK_FILE`] for the whole check, rotation and write, so two of them never
-/// rotate the same file twice.
+/// rotate the same file twice. A writer that cannot take it within [`LOCK_WAIT`] gives up with
+/// [`std::io::ErrorKind::TimedOut`], and the record is not written.
 pub fn append(config_dir: &Path, record: &ActivityRecord) -> std::io::Result<()> {
     let mut line = serde_json::to_vec(&capped(record))?;
     line.push(b'\n');
     std::fs::create_dir_all(config_dir)?;
-    let _lock = Lock::take(&config_dir.join(LOCK_FILE))?;
+    let _lock = Lock::take(&config_dir.join(LOCK_FILE), LOCK_WAIT)?;
     let path = config_dir.join(ACTIVITY_FILE);
     let size = std::fs::metadata(&path).map_or(0, |m| m.len());
     if size > 0 && size + line.len() as u64 > MAX_FILE_BYTES {
@@ -202,27 +254,71 @@ struct Lock {
 }
 
 impl Lock {
-    fn take(path: &Path) -> std::io::Result<Self> {
+    /// Takes the lock on `path` (created owner-only), trying for up to `wait`.
+    fn take(path: &Path, wait: Duration) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(OWNER_ONLY)
             .open(path)?;
-        // SAFETY: flock on a descriptor `file` owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        owner_only(path)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            // SAFETY: flock on a descriptor `file` owns.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Lock { _file: file });
+            }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => {}
+                _ => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "another writer held {LOCK_FILE} for over {} ms",
+                        wait.as_millis()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        Ok(Lock { _file: file })
     }
 }
 
 /// The records in `config_dir`, oldest first, at most [`MAX_RECORDS`] (the newest). A missing
 /// log is empty.
+///
+/// Both files are read from one rotation: if a writer rotated the log between reading the
+/// previous file and the current one (the previous file is then another file), both are read
+/// again, a few times at most. Readers take no lock, so the app never holds up a writer.
 pub fn read(config_dir: &Path) -> Vec<ActivityRecord> {
-    let mut records: Vec<ActivityRecord> = [PREVIOUS_FILE, ACTIVITY_FILE]
+    read_with(config_dir, || {})
+}
+
+/// How many times [`read`] reads the files while writers keep rotating them under it.
+const READ_TRIES: usize = 5;
+
+/// [`read`], calling `between` after reading the previous file (for tests).
+fn read_with(config_dir: &Path, mut between: impl FnMut()) -> Vec<ActivityRecord> {
+    let previous = config_dir.join(PREVIOUS_FILE);
+    let mut files = Vec::new();
+    for _ in 0..READ_TRIES {
+        let (old, id) = read_file(&previous);
+        between();
+        let current = std::fs::read(config_dir.join(ACTIVITY_FILE)).unwrap_or_default();
+        let rotated = file_id(&previous) != id;
+        files = vec![old, current];
+        if !rotated {
+            break;
+        }
+    }
+    let mut records: Vec<ActivityRecord> = files
         .iter()
-        .filter_map(|file| std::fs::read(config_dir.join(file)).ok())
         .flat_map(|bytes| {
             bytes
                 .split(|b| *b == b'\n')
@@ -236,7 +332,30 @@ pub fn read(config_dir: &Path) -> Vec<ActivityRecord> {
     records
 }
 
-/// `record` with its keys, computed from its fields when it has none (an older line).
+/// The file at `path` and its identity, read from one open file; empty and none when missing.
+fn read_file(path: &Path) -> (Vec<u8>, Option<(u64, u64)>) {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (Vec::new(), None);
+    };
+    let id = file.metadata().ok().map(|m| (m.dev(), m.ino()));
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        bytes.clear();
+    }
+    (bytes, id)
+}
+
+/// The device and inode of the file at `path`: a rotation puts another file there.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// `record` with its keys, computed from its fields when it has none (an older line). An older
+/// line's server key is of the shown server (without credentials, query or fragment): the same
+/// as the kubeconfig's for most URLs.
 fn keyed(mut record: ActivityRecord) -> ActivityRecord {
     if record.cluster_key.is_none() {
         record.cluster_key = record.cluster.as_deref().map(cluster_key);
@@ -274,6 +393,7 @@ mod tests {
             outcome: Outcome::Ok,
             cluster_key: Some(cluster_key("prod")),
             server_key: Some(server_key("https://prod:6443")),
+            probed: Vec::new(),
         }
     }
 
@@ -466,6 +586,146 @@ mod tests {
         // FNV-1a's published values: the keys never change between Flint versions.
         assert_eq!(cluster_key(""), "cbf29ce484222325");
         assert_eq!(cluster_key("a"), "af63dc4c8601ec8c");
+    }
+
+    // covers UP-16: two servers a pin tells apart have two keys, though both show as the same
+    // placeholder (an `@` in the path); a trailing slash makes no other server.
+    #[test]
+    fn server_keys_are_of_the_endpoint_the_pin_compares() {
+        let one = "https://proxy.example.com/k8s/@one";
+        let two = "https://proxy.example.com/k8s/@two";
+        assert_eq!(
+            crate::redact::server_url(one),
+            crate::redact::server_url(two)
+        );
+        assert_ne!(server_key(one), server_key(two));
+        assert_eq!(server_key(one), server_key(&format!("{one}/")));
+        let pin = crate::settings::ClusterPin::new("prod", one);
+        assert!(pin.matches("prod", &format!("{one}/")) && !pin.matches("prod", two));
+
+        // Recorded with the shown server and the key of the real one: only that server's tab
+        // finds it.
+        let dir = tempfile::tempdir().unwrap();
+        let at_one = ActivityRecord {
+            server: Some(crate::redact::server_url(one)),
+            server_key: Some(server_key(one)),
+            ..record(1)
+        };
+        append(dir.path(), &at_one).unwrap();
+        let read = read(dir.path());
+        let prod = cluster_key("prod");
+        assert!(read[0].is_about(&prod, Some(&server_key(one))));
+        assert!(!read[0].is_about(&prod, Some(&server_key(two))));
+        assert!(read[0].is_about(&prod, None));
+        assert!(!read[0].is_about(&cluster_key("staging"), None));
+    }
+
+    // covers UP-16: a line written before the keys (or the probed clusters) existed still reads,
+    // with its keys computed from what it shows.
+    #[test]
+    fn older_lines_get_their_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(ACTIVITY_FILE),
+            "{\"at_ms\":1,\"tool\":\"get_resource\",\"cluster\":\"prod\",\"server\":\"https://prod:6443\",\"bytes\":9,\"outcome\":\"ok\"}\n",
+        )
+        .unwrap();
+        let read = read(dir.path());
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].cluster_key, Some(cluster_key("prod")));
+        assert_eq!(read[0].server_key, Some(server_key("https://prod:6443/")));
+        assert!(read[0].probed.is_empty());
+    }
+
+    // covers UP-16: a call that names no cluster but read about some (list_clusters) is about
+    // each cluster it probed, at the server it probed.
+    #[test]
+    fn a_call_is_about_the_clusters_it_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let listed = ActivityRecord {
+            tool: "list_clusters".into(),
+            cluster: None,
+            server: None,
+            cluster_key: None,
+            server_key: None,
+            probed: vec![
+                Probed::new("prod", Some("https://prod:6443")),
+                Probed::new("dev", Some("https://dev:6443")),
+            ],
+            ..record(1)
+        };
+        append(dir.path(), &listed).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(ACTIVITY_FILE)).unwrap();
+        assert!(text.contains(&format!(
+            r#""probed":[{{"cluster_key":"{}","server_key":"{}"}},"#,
+            cluster_key("prod"),
+            server_key("https://prod:6443")
+        )));
+        let read = read(dir.path());
+        assert_eq!(read, [listed]);
+        let about = |context: &str, server: &str| {
+            read[0].is_about(&cluster_key(context), Some(&server_key(server)))
+        };
+        assert!(about("prod", "https://prod:6443/") && about("dev", "https://dev:6443"));
+        assert!(!about("prod", "https://new-prod:6443") && !about("staging", "https://prod:6443"));
+    }
+
+    // covers UP-16: a writer that holds the lock too long costs other writers one record each,
+    // not their reply: they give up after LOCK_WAIT. The lock file is the owner's only.
+    #[test]
+    fn a_held_lock_skips_the_record_after_a_bounded_wait() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &record(1)).unwrap();
+        let lock = dir.path().join(LOCK_FILE);
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let held = Lock::take(&lock, Duration::ZERO).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let config = dir.path().to_owned();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let _ = tx.send((append(&config, &record(2)), started.elapsed()));
+        });
+        let (written, took) = rx
+            .recv_timeout(LOCK_WAIT * 5)
+            .expect("the writer gives up instead of waiting for the lock");
+        assert_eq!(written.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(took >= LOCK_WAIT, "{took:?}");
+        drop(held);
+        assert_eq!(read(dir.path()), [record(1)]);
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        append(dir.path(), &record(3)).unwrap();
+        assert_eq!(read(dir.path()), [record(1), record(3)]);
+    }
+
+    // covers UP-16: a rotation while the log is read does not show expired records or hide the
+    // file just rotated: both files are read again.
+    #[test]
+    fn a_rotation_while_reading_reads_both_files_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = |range: std::ops::Range<u64>| -> String {
+            range
+                .map(|n| serde_json::to_string(&record(n)).unwrap() + "\n")
+                .collect()
+        };
+        let previous = dir.path().join(PREVIOUS_FILE);
+        let current = dir.path().join(ACTIVITY_FILE);
+        std::fs::write(&previous, lines(0..3)).unwrap();
+        std::fs::write(&current, lines(3..6)).unwrap();
+        let mut rotations = 0;
+        let read = read_with(dir.path(), || {
+            if rotations == 0 {
+                std::fs::rename(&current, &previous).unwrap();
+                std::fs::write(&current, lines(6..7)).unwrap();
+            }
+            rotations += 1;
+        });
+        assert_eq!(read, (3..7).map(record).collect::<Vec<_>>());
+        assert_eq!(rotations, 2);
     }
 
     #[test]

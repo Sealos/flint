@@ -29,6 +29,7 @@ fn record(at_ms: i64, cluster: &str, tool: &str) -> ActivityRecord {
         outcome: Outcome::Ok,
         cluster_key: Some(flint_core::activity::cluster_key(cluster)),
         server_key: None,
+        probed: Vec::new(),
     }
 }
 

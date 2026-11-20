@@ -200,10 +200,13 @@ impl FlintMcp {
         };
         // The server `client` found for this call's cluster, from the call's own settings and
         // kubeconfig: none for a call that names no cluster or one not exposed.
-        let server = named
-            .cluster
-            .as_ref()
-            .and_then(|_| CALL.try_with(|c| c.borrow().server.clone()).ok().flatten());
+        let note = CALL
+            .try_with(|c| std::mem::take(&mut *c.borrow_mut()))
+            .unwrap_or_default();
+        let (server, server_key) = match named.cluster {
+            Some(_) => (note.server, note.server_key),
+            None => (None, None),
+        };
         let _ = CALL.try_with(|c| c.borrow_mut().recorded = true);
         self.record(activity::ActivityRecord {
             at_ms: activity::now_ms(),
@@ -219,7 +222,8 @@ impl FlintMcp {
             truncated,
             outcome,
             cluster_key: None,
-            server_key: None,
+            server_key,
+            probed: note.probed,
         })
         .await;
         let content = vec![ContentBlock::text(text)];
@@ -249,6 +253,10 @@ struct CallNote {
     /// The API server of the cluster the call reads, once [`FlintMcp::client`] found it exposed
     /// (without credentials).
     server: Option<String>,
+    /// Its [`activity::server_key`], of the URL as the kubeconfig has it.
+    server_key: Option<String>,
+    /// The clusters `list_clusters` probed.
+    probed: Vec<activity::Probed>,
     /// Its tool recorded it ([`FlintMcp::finish`]).
     recorded: bool,
 }
@@ -551,6 +559,7 @@ impl ServerHandler for FlintMcp {
                 outcome: activity::Outcome::Failed,
                 cluster_key: None,
                 server_key: None,
+                probed: Vec::new(),
             })
             .await;
         }
@@ -599,7 +608,9 @@ impl FlintMcp {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
         // The server this call's settings expose the cluster at: what its record names.
         let _ = CALL.try_with(|c| {
-            c.borrow_mut().server = info.server.as_deref().map(flint_core::redact::server_url);
+            let mut note = c.borrow_mut();
+            note.server = info.server.as_deref().map(flint_core::redact::server_url);
+            note.server_key = info.server.as_deref().map(activity::server_key);
         });
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
@@ -691,6 +702,13 @@ impl FlintMcp {
             .into_iter()
             .cloned()
             .collect();
+        // The clusters this call reads about, for its record.
+        let _ = CALL.try_with(|c| {
+            c.borrow_mut().probed = exposed
+                .iter()
+                .map(|info| activity::Probed::new(&info.name, info.server.as_deref()))
+                .collect();
+        });
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);
         let settings = ctx.settings.clone();
         let kubeconfig_errors: Vec<Value> = ctx

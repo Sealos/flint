@@ -50,8 +50,9 @@ impl ActivityRow {
 }
 
 /// The calls on `cluster` at `server` in `records`, newest first, with times in `tz` and `now`
-/// deciding whether a date is shown. A context re-pointed at another server is another cluster:
-/// its calls there are not shown (a record without a server, from a context not exposed, is).
+/// deciding whether a date is shown: those that named the context, and those that probed it
+/// (`list_clusters`). A context re-pointed at another server is another cluster: its calls there
+/// are not shown (a record without a server, from a context not exposed, is).
 pub fn rows(
     records: &[ActivityRecord],
     cluster: &str,
@@ -66,11 +67,7 @@ pub fn rows(
     let mut mine: Vec<(usize, &ActivityRecord)> = records
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.cluster_key.as_ref() == Some(&cluster))
-        .filter(|(_, r)| match (&r.server_key, &server) {
-            (Some(at), Some(server)) => at == server,
-            _ => true,
-        })
+        .filter(|(_, r)| r.is_about(&cluster, server.as_deref()))
         .collect();
     // Newest first; calls in the same millisecond (several `flint mcp` processes) in the order
     // they were written, last first.
@@ -148,10 +145,11 @@ fn target(r: &ActivityRecord) -> String {
     if text.is_empty() { "—".into() } else { text }
 }
 
+/// How a call ended, with the size of its reply; never a failed call's error text.
 fn result(r: &ActivityRecord) -> String {
     match r.outcome {
-        Outcome::Denied => "denied: outside what agents may read".into(),
-        Outcome::Failed => "failed".into(),
+        Outcome::Denied => format!("denied: outside what agents may read, {}", size(r.bytes)),
+        Outcome::Failed => format!("failed, {}", size(r.bytes)),
         Outcome::Ok => {
             let mut text = match r.items {
                 Some(1) => "1 item".to_owned(),
@@ -439,6 +437,7 @@ mod tests {
             outcome: Outcome::Ok,
             cluster_key: Some(activity::cluster_key(cluster)),
             server_key: Some(activity::server_key("https://prod:6443")),
+            probed: Vec::new(),
         }
     }
 
@@ -456,6 +455,7 @@ mod tests {
             name: None,
             container: None,
             items: None,
+            bytes: 80,
             outcome: Outcome::Denied,
             ..record(today, "prod")
         };
@@ -478,7 +478,8 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "11:59:00 list_resources secrets in web — denied: outside what agents may read",
+                "11:59:00 list_resources secrets in web — denied: outside what agents may read, \
+                 80 B",
                 "2026-11-19 12:00:00 get_pod_logs pods web/web-0, container app — 120 items, 5.0 \
                  KB, cut short",
             ]
@@ -543,6 +544,77 @@ mod tests {
         assert_eq!(count(None), 3);
     }
 
+    // covers UP-16: list_clusters names no cluster but reads about each exposed one: it shows on
+    // the tab of each cluster it probed, at the server it probed.
+    #[test]
+    fn rows_list_the_calls_that_probed_the_cluster() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let listed = ActivityRecord {
+            tool: "list_clusters".into(),
+            cluster: None,
+            server: None,
+            kind: None,
+            namespace: None,
+            name: None,
+            container: None,
+            items: Some(2),
+            bytes: 300,
+            truncated: false,
+            cluster_key: None,
+            server_key: None,
+            probed: vec![
+                activity::Probed::new("prod", Some("https://prod:6443")),
+                activity::Probed::new("dev", Some("https://dev:6443")),
+            ],
+            ..record(now.as_millisecond(), "prod")
+        };
+        let labels = |cluster, server| -> Vec<String> {
+            rows(
+                std::slice::from_ref(&listed),
+                cluster,
+                server,
+                &TimeZone::UTC,
+                now,
+            )
+            .iter()
+            .map(ActivityRow::label)
+            .collect()
+        };
+        assert_eq!(
+            labels("prod", Some("https://prod:6443/")),
+            ["12:00:00 list_clusters — — 2 items, 300 B"]
+        );
+        assert_eq!(labels("dev", None).len(), 1);
+        assert!(labels("prod", Some("https://elsewhere:6443")).is_empty());
+        assert!(labels("staging", None).is_empty());
+    }
+
+    // covers UP-16: two servers that show as the same placeholder are two clusters: a context
+    // re-pointed from one to the other does not show the old server's calls.
+    #[test]
+    fn rows_tell_apart_servers_that_show_alike() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let old = "https://proxy.example.com/k8s/@old";
+        let new = "https://proxy.example.com/k8s/@new";
+        let call = ActivityRecord {
+            server: Some(flint_core::redact::server_url(old)),
+            server_key: Some(activity::server_key(old)),
+            ..record(now.as_millisecond(), "prod")
+        };
+        let count = |server| {
+            rows(
+                std::slice::from_ref(&call),
+                "prod",
+                Some(server),
+                &TimeZone::UTC,
+                now,
+            )
+            .len()
+        };
+        assert_eq!(count(old), 1);
+        assert_eq!(count(new), 0);
+    }
+
     // covers UP-16: newest first by time, calls in the same millisecond last-written first; a
     // context whose name was cut in the log still finds its calls (by key).
     #[test]
@@ -599,11 +671,14 @@ mod tests {
             ..record(0, "prod")
         };
         assert_eq!(result(&one), "1 item, 900 B");
+        // A failed or denied call says how big its reply was, never what it said.
         let failed = ActivityRecord {
             outcome: Outcome::Failed,
+            items: None,
+            bytes: 120,
             ..record(0, "prod")
         };
-        assert_eq!(result(&failed), "failed");
+        assert_eq!(result(&failed), "failed, 120 B");
         assert_eq!(size(3 * 1_048_576), "3.0 MB");
     }
 }
