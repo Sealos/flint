@@ -4,7 +4,11 @@
 # events. Secrets are scrubbed and uids, timestamps and resource versions normalized, so a
 # re-recording of an unchanged cluster gives a small diff.
 #
-#   KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh
+#   KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh [out-dir]
+#
+# With out-dir, the recording goes there instead (the nightly drift check records into a scratch
+# directory and compares it with the committed set: fixture-drift). It must be new or empty:
+# recording replaces the whole directory, and the recorder refuses one with anything in it.
 #
 # Refuses to run unless KUBECONFIG is set explicitly to one file whose current context is
 # kind-flint-dev (scripts/dev-cluster.sh up). Never reads ~/.kube/config.
@@ -39,6 +43,10 @@ fi
 # Neither kubectl nor the recorder reads Flint config; a scratch dir keeps the rule anyway.
 export FLINT_CONFIG_DIR="${FLINT_CONFIG_DIR:-$(mktemp -d)}"
 
+OUT="${1:-$ROOT/crates/flint-e2e/fixtures}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+
 cd "$ROOT"
 # The recorder checks the same things again before it connects.
-cargo run --locked -p flint-e2e --bin record-fixtures -- "$ROOT/crates/flint-e2e/fixtures"
+cargo run --locked -p flint-e2e --bin record-fixtures -- "$OUT"

@@ -2,16 +2,32 @@ name: Cluster e2e
 
 # flint-core and flint-mcp against a real API server: kind on Linux (docs/TESTING.md). macOS
 # runners have no Docker, so this is the only CI job that talks to a cluster. The MCP e2e tests
-# drive the GPUI-free `flint-mcp` binary, the same server as `flint mcp`.
+# drive the GPUI-free `flint-mcp` binary, the same server as `flint mcp`. flint-e2e's UP-09 and
+# UP-10 run here on kind too, so the fake API server's answers are checked against a real one,
+# and nightly the fixtures are re-recorded and compared with the committed set (#128).
 on:
   pull_request:
     paths:
       - crates/flint-core/**
       - crates/flint-mcp/**
+      # The fake API server, the harness and fixtures the kind-run MCP tests and the drift
+      # check use; app-test-only changes stay off kind.
+      - crates/flint-e2e/src/lib.rs
+      - crates/flint-e2e/src/backend.rs
+      - crates/flint-e2e/src/binaries.rs
+      - crates/flint-e2e/src/mcp.rs
+      - crates/flint-e2e/src/scratch.rs
+      - crates/flint-e2e/src/fake_api/**
+      - crates/flint-e2e/src/record/**
+      - crates/flint-e2e/src/bin/**
+      - crates/flint-e2e/tests/mcp.rs
+      - crates/flint-e2e/fixtures/**
+      - crates/flint-e2e/Cargo.toml
       - Cargo.toml
       - Cargo.lock
       - scripts/cluster-fixtures.sh
       - scripts/dev-cluster.sh
+      - scripts/record-fixtures.sh
       - .github/workflows/cluster-e2e.yml
   push:
     branches: [master]
@@ -48,7 +64,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       # Compile before the cluster exists, so a build failure doesn't wait on kind.
       - name: Build tests
-        run: cargo test -p flint-core -p flint-mcp --locked --no-run
+        run: |
+          cargo test -p flint-core -p flint-mcp --locked --no-run
+          cargo test -p flint-e2e --test mcp --locked --no-run
+          cargo build -p flint-mcp --bin flint-mcp --locked
       - name: Pinned kind node image
         id: node
         run: echo "image=$(scripts/dev-cluster.sh node-image)" >> "$GITHUB_OUTPUT"
@@ -69,6 +88,15 @@ jobs:
       - name: flint-mcp e2e
         if: ${{ !cancelled() && steps.kind.outcome == 'success' }}
         run: cargo test -p flint-mcp --locked --no-fail-fast -- --include-ignored
+      # The fake-backed MCP paths, on kind: the same assertions on both backends.
+      - name: flint-e2e MCP on kind (UP-09, UP-10)
+        if: ${{ !cancelled() && steps.kind.outcome == 'success' }}
+        env:
+          FLINT_E2E_BACKEND: kind
+          FLINT_E2E_MCP_BIN: ${{ github.workspace }}/target/debug/flint-mcp
+        run: >-
+          cargo test -p flint-e2e --test mcp --locked --no-fail-fast --
+          --exact up_09_agent_lists_only_exposed_clusters up_10_agent_inspects_a_cluster
       # Tests create their objects in namespaces and a CRD group of their own and delete them.
       - name: Nothing left behind
         if: ${{ !cancelled() && steps.kind.outcome == 'success' }}
@@ -91,3 +119,67 @@ jobs:
           kubectl -n kube-system logs deployment/metrics-server --tail=50 || true
           kubectl -n demo get all || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+
+  # Nightly: the fake API server replays fixtures recorded from kind. Record them again from a
+  # fresh cluster and fail when their structure differs from the committed set (kinds, columns,
+  # discovery fields; never values): then re-record (scripts/record-fixtures.sh) and update the
+  # fake and its tests. The comparison itself is unit tested on every PR (record::shape).
+  fixture-drift:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-cluster-e2e
+          save-if: false
+      - name: Build the recorder and the comparison
+        run: cargo build -p flint-e2e --bin record-fixtures --bin fixture-drift --locked
+      - name: Pinned kind node image
+        id: node
+        run: echo "image=$(scripts/dev-cluster.sh node-image)" >> "$GITHUB_OUTPUT"
+      - name: Create kind cluster (flint-dev)
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          version: v0.33.0
+          node_image: ${{ steps.node.outputs.image }}
+          cluster_name: flint-dev
+          kubeconfig: ${{ env.KUBECONFIG }}
+          wait: 120s
+      - name: Install fixtures
+        run: scripts/cluster-fixtures.sh
+      # What the committed set holds: pod metrics, crash-loop's back-off, and the completed
+      # fixture Job (a finished pod's Table row has conditions). A cluster that is not ready
+      # fails here, not as drift.
+      - name: Wait for metrics, events and the fixture Job
+        run: |
+          kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=3m
+          kubectl -n demo wait --for=condition=complete job/fixture-job --timeout=3m
+          ready=
+          for _ in $(seq 60); do
+            if kubectl top pods -n demo >/dev/null 2>&1 \
+              && kubectl -n demo get events --field-selector reason=BackOff -o name | grep -q .; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::no pod metrics or no BackOff event in demo after 5 minutes"
+            exit 1
+          fi
+      - name: Record into a scratch directory
+        run: scripts/record-fixtures.sh "$RUNNER_TEMP/fixtures"
+      - name: Compare with the committed fixtures
+        run: cargo run -p flint-e2e --bin fixture-drift --locked -- crates/flint-e2e/fixtures "$RUNNER_TEMP/fixtures"
+      - name: Keep the recording
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fixtures-recorded
+          path: ${{ runner.temp }}/fixtures
+          retention-days: 7

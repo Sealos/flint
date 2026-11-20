@@ -269,6 +269,33 @@ fn check_leaks(files: &BTreeMap<PathBuf, String>) -> Result<()> {
     Ok(())
 }
 
+/// Refuses to record into `out` unless it is the committed fixtures directory `fixtures`
+/// (replaced as a whole, as always) or a directory that does not exist yet or is empty:
+/// installing swaps the destination out whole, so anything else in it would be lost.
+pub fn check_destination(out: &Path, fixtures: &Path) -> Result<()> {
+    let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if same(out, fixtures) {
+        return Ok(());
+    }
+    match fs::read_dir(out) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", out.display())),
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                bail!(
+                    "refusing to record into {}: it is not empty, and recording replaces the \
+                     whole directory (give a new or empty one)",
+                    out.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Writes `files` to a new directory next to `out` and swaps it in once complete and loadable,
 /// so a failed run leaves the previous fixtures untouched.
 pub(crate) fn install(files: &BTreeMap<PathBuf, String>, out: &Path) -> Result<Summary> {
@@ -325,6 +352,28 @@ mod tests {
             verbs: vec!["list".into()],
             preferred: true,
         }
+    }
+
+    #[test]
+    fn only_the_fixtures_or_a_new_or_empty_directory_are_recorded_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = dir.path().join("fixtures");
+        fs::create_dir(&fixtures).unwrap();
+        fs::write(fixtures.join("version.json"), "{}").unwrap();
+        // The committed set is replaced, as always.
+        check_destination(&fixtures, &fixtures).unwrap();
+        // Elsewhere: a new directory, or an empty one.
+        check_destination(&dir.path().join("new"), &fixtures).unwrap();
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        check_destination(&empty, &fixtures).unwrap();
+        // Not one with something in it, which would be lost.
+        let used = dir.path().join("used");
+        fs::create_dir(&used).unwrap();
+        fs::write(used.join("notes.txt"), "keep me").unwrap();
+        let error = check_destination(&used, &fixtures).unwrap_err().to_string();
+        assert!(error.contains("not empty"), "{error}");
+        assert!(used.join("notes.txt").exists());
     }
 
     #[test]

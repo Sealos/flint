@@ -6,7 +6,9 @@
 //!
 //! Safety: a Kind backend refuses a kubeconfig whose current context is not served from this
 //! machine (127.0.0.1, localhost or ::1), so a mistyped variable cannot reach a real cluster, and
-//! gives the app a copy holding only that context, never the whole file.
+//! gives the app a copy holding only that context, never the whole file. Before a test writes to
+//! kind, [`TestCluster::verify_local_kind`] also checks that the context is the kind cluster
+//! `kind` itself knows, not just a local URL (a tunnel to another cluster can be one).
 
 use std::path::{Path, PathBuf};
 
@@ -152,10 +154,86 @@ impl TestCluster {
         })
     }
 
+    /// Before a test writes to this cluster: it is a kind cluster on this machine, as `kind`
+    /// knows it. The context is `kind-<name>`, its cluster has no `proxy-url`, and its server is
+    /// the one `kind get kubeconfig --name <name>` gives. Always an error on the fake, which
+    /// tests change through its own API.
+    pub fn verify_local_kind(&self) -> Result<()> {
+        if self.backend != Backend::Kind {
+            bail!("not a kind cluster");
+        }
+        let name = self.context.strip_prefix("kind-").with_context(|| {
+            format!("refusing to write to {}: not a kind context", self.context)
+        })?;
+        let output = std::process::Command::new("kind")
+            .args(["get", "kubeconfig", "--name", name])
+            .output()
+            .context("running `kind get kubeconfig` to check the cluster before writing to it")?;
+        if !output.status.success() {
+            bail!(
+                "refusing to write to {}: kind knows no cluster {name:?} ({})",
+                self.context,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let ours = kube::config::Kubeconfig::read_from(&self.kubeconfig)
+            .with_context(|| format!("reading {}", self.kubeconfig.display()))?;
+        let kinds = kube::config::Kubeconfig::from_yaml(&String::from_utf8_lossy(&output.stdout))
+            .context("parsing `kind get kubeconfig`")?;
+        same_kind_cluster(&ours, &self.context, &kinds)
+    }
+
     /// The fake API server, for scripting watches and faults. `None` on kind.
     pub fn fake_server(&self) -> Option<&FakeApiServer> {
         self.fake.as_ref()
     }
+}
+
+/// Whether `context` in `ours` is the cluster in `kinds` (`kind get kubeconfig`'s output): no
+/// proxy, and the same server.
+fn same_kind_cluster(
+    ours: &kube::config::Kubeconfig,
+    context: &str,
+    kinds: &kube::config::Kubeconfig,
+) -> Result<()> {
+    let cluster_of = |config: &kube::config::Kubeconfig, context: &str| {
+        let name = config
+            .contexts
+            .iter()
+            .find(|c| c.name == context)
+            .and_then(|c| c.context.as_ref())
+            .map(|c| c.cluster.clone())?;
+        config
+            .clusters
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.cluster.clone())
+    };
+    let ours = cluster_of(ours, context)
+        .with_context(|| format!("refusing to write to {context}: it names no cluster"))?;
+    if let Some(proxy) = &ours.proxy_url {
+        bail!("refusing to write to {context}: its cluster goes through a proxy ({proxy})");
+    }
+    let theirs = kinds
+        .contexts
+        .iter()
+        .find_map(|c| cluster_of(kinds, &c.name))
+        .context("`kind get kubeconfig` names no cluster")?;
+    let server = |c: &kube::config::Cluster| {
+        c.server
+            .as_deref()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_owned()
+    };
+    if server(&ours) != server(&theirs) {
+        bail!(
+            "refusing to write to {context}: its server {} is not the kind cluster's {}",
+            server(&ours),
+            server(&theirs)
+        );
+    }
+    Ok(())
 }
 
 /// An `https` server on this machine: the URL's host is exactly 127.0.0.1, localhost or ::1,
@@ -227,6 +305,39 @@ mod tests {
         let loaded = flint_core::kubeconfig::load(std::slice::from_ref(&cluster.kubeconfig));
         let names: Vec<&str> = loaded.contexts.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["kind-dev"]);
+    }
+
+    fn config(context: &str, server: &str, proxy: Option<&str>) -> kube::config::Kubeconfig {
+        let proxy = proxy.map_or(String::new(), |p| format!(", proxy-url: \"{p}\""));
+        kube::config::Kubeconfig::from_yaml(&format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: {context}\nclusters:\n- name: c\n  cluster: {{server: \"{server}\"{proxy}}}\nusers:\n- name: u\n  user: {{}}\ncontexts:\n- name: {context}\n  context: {{cluster: c, user: u}}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_the_cluster_kind_knows_may_be_written_to() {
+        let kinds = config("kind-flint-dev", "https://127.0.0.1:6443", None);
+        let ours = config("kind-flint-dev", "https://127.0.0.1:6443/", None);
+        same_kind_cluster(&ours, "kind-flint-dev", &kinds).unwrap();
+        // A tunnel to another cluster on another local port.
+        let tunnel = config("kind-flint-dev", "https://127.0.0.1:16443", None);
+        let error = same_kind_cluster(&tunnel, "kind-flint-dev", &kinds).unwrap_err();
+        assert!(
+            error.to_string().contains("not the kind cluster's"),
+            "{error}"
+        );
+        // The same URL through a proxy.
+        let proxied = config(
+            "kind-flint-dev",
+            "https://127.0.0.1:6443",
+            Some("socks5://127.0.0.1:1080"),
+        );
+        let error = same_kind_cluster(&proxied, "kind-flint-dev", &kinds).unwrap_err();
+        assert!(error.to_string().contains("proxy"), "{error}");
+        // The fake is never written to this way.
+        let fake = TestCluster::fake(Options::default()).unwrap();
+        assert!(fake.verify_local_kind().is_err());
     }
 
     #[test]
