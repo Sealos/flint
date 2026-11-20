@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, SyncSender};
@@ -58,10 +58,21 @@ pub(crate) fn flush() {
 }
 
 fn flush_queue(queue: &SyncSender<Message>) {
+    let deadline = Instant::now() + FLUSH_WAIT;
     let (done, wait) = mpsc::sync_channel(1);
-    if queue.try_send(Message::Flush(done)).is_ok() {
-        let _ = wait.recv_timeout(FLUSH_WAIT);
+    let mut marker = Message::Flush(done);
+    // A full queue may still drain within the budget: keep offering the marker until then.
+    loop {
+        match queue.try_send(marker) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(back)) if Instant::now() < deadline => {
+                marker = back;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => return,
+        }
     }
+    let _ = wait.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
 fn log_path(macos: bool, home: Option<&Path>, state_home: Option<&Path>) -> Option<PathBuf> {
@@ -213,20 +224,14 @@ impl FileWriter {
         } else {
             bytes
         };
+        // The directory may have been removed and recreated (by this or another process): lock
+        // the lock file that is at the path now, so every writer shares one.
+        if !is_same_file(&self.lock, &self.lock_path)? {
+            fs::create_dir_all(self.path.parent().expect("log path has a parent directory"))?;
+            self.lock = open_private(&self.lock_path)?;
+        }
         let _lock = self.lock()?;
-        let mut file = match open_private(&self.path) {
-            // The directory was removed while running: recreate it. Later events lock the new
-            // lock file; this one is written under the old one.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(self.path.parent().expect("log path has a parent directory"))?;
-                let file = open_private(&self.path)?;
-                let lock = open_private(&self.lock_path)?;
-                drop(_lock);
-                self.lock = lock;
-                file
-            }
-            other => other?,
-        };
+        let mut file = open_private(&self.path)?;
         if file.metadata()?.len() + event.len() as u64 > self.max_bytes {
             self.rotate()?;
             file = open_private(&self.path)?;
@@ -264,6 +269,16 @@ impl FileWriter {
             }
         }
         fs::rename(&self.path, backup(1))
+    }
+}
+
+/// Whether `path` still names the open `file` (false when it is gone or replaced).
+fn is_same_file(file: &File, path: &Path) -> io::Result<bool> {
+    let open = file.metadata()?;
+    match fs::symlink_metadata(path) {
+        Ok(current) => Ok(open.dev() == current.dev() && open.ino() == current.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -393,15 +408,23 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_log_directory_is_recreated() {
+    fn a_removed_log_directory_is_recreated_and_its_lock_shared() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs/flint.log");
-        let mut writer = writer(&path, 1024);
+        let mut first = writer(&path, 1024);
+        let mut second = writer(&path, 1024);
         fs::remove_dir_all(dir.path().join("logs")).unwrap();
-        writer.write(b"after\n").unwrap();
-        writer.write(b"again\n").unwrap();
+        first.write(b"after\n").unwrap();
+        second.write(b"again\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "after\nagain\n");
-        assert!(path.with_extension("log.lock").exists());
+        // Both now lock the recreated lock file: one holding it makes the other wait.
+        let held = first.lock().unwrap();
+        second.lock_wait = Duration::ZERO;
+        assert_eq!(
+            second.write(b"dropped\n").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(held);
     }
 
     #[test]
