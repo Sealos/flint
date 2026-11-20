@@ -398,8 +398,10 @@ enum Acquired {
 impl Terminal {
     /// Flint's controlling terminal, once no other plugin has it and Flint is in its
     /// foreground. A plugin that must prompt (`must_prompt`, `interactiveMode: Always`) waits for
-    /// both as long as its caller does; another waits [`TERMINAL_WAIT`] for the terminal, and
-    /// does not wait for Flint to come to the foreground.
+    /// both as long as its caller does, waiting for the foreground without holding the terminal
+    /// (no other plugin is kept waiting meanwhile); another waits [`TERMINAL_WAIT`] for the
+    /// terminal, and does not wait for Flint to come to the foreground. A terminal that hung up
+    /// (`tcgetpgrp` fails) is no terminal.
     async fn acquire(must_prompt: bool) -> Acquired {
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
@@ -409,30 +411,45 @@ impl Terminal {
             return Acquired::None;
         };
         let fd = OwnedFd::from(file);
-        let lock = TERMINAL.clone().lock_owned();
-        let owner = if must_prompt {
-            lock.await
-        } else {
-            match tokio::time::timeout(TERMINAL_WAIT, lock).await {
-                Ok(owner) => owner,
-                Err(_) => return Acquired::Busy,
-            }
-        };
         // SAFETY: plain calls on a descriptor this function owns.
-        let foreground = || unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() };
-        while !foreground() {
-            if !must_prompt {
-                return Acquired::Background;
+        let foreground = || unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+        // SAFETY: a plain call.
+        let ours = unsafe { libc::getpgrp() };
+        loop {
+            if must_prompt {
+                // Until someone brings Flint to the foreground (`fg`).
+                loop {
+                    match foreground() {
+                        -1 => return Acquired::None,
+                        group if group == ours => break,
+                        _ => tokio::time::sleep(FOREGROUND_POLL).await,
+                    }
+                }
             }
-            // Until someone brings Flint to the foreground (`fg`).
-            tokio::time::sleep(FOREGROUND_POLL).await;
+            let lock = TERMINAL.clone().lock_owned();
+            let owner = if must_prompt {
+                lock.await
+            } else {
+                match tokio::time::timeout(TERMINAL_WAIT, lock).await {
+                    Ok(owner) => owner,
+                    Err(_) => return Acquired::Busy,
+                }
+            };
+            // Checked again with the terminal held: it may have changed while waiting.
+            match foreground() {
+                -1 => return Acquired::None,
+                group if group == ours => {
+                    return Acquired::Terminal(Terminal {
+                        fd,
+                        _owner: owner,
+                        saved: None,
+                        ttou: None,
+                    });
+                }
+                _ if must_prompt => drop(owner),
+                _ => return Acquired::Background,
+            }
         }
-        Acquired::Terminal(Terminal {
-            fd,
-            _owner: owner,
-            saved: None,
-            ttou: None,
-        })
     }
 }
 

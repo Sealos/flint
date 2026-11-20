@@ -895,6 +895,12 @@ async fn in_the_background() {
         always.starts().is_empty(),
         "`Always` waits for the foreground"
     );
+    // It waits without holding the terminal: a plugin that may prompt is not kept waiting for
+    // it, and runs without prompting at once (Flint is in the background).
+    let mut again = super::tests::config(&kubeconfig).await;
+    let started = std::time::Instant::now();
+    resolve(&mut again, "background").await.unwrap();
+    assert!(started.elapsed() < TERMINAL_WAIT, "{:?}", started.elapsed());
     // `fg`.
     // SAFETY: a plain call.
     set_foreground(0, unsafe { libc::getpgrp() });
