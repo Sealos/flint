@@ -55,6 +55,14 @@ pub enum ClusterError {
     /// ([`redact::command_name`]), filled in by [`ClusterError::for_target`].
     #[error("{}", exec_not_found_message(command.as_deref()))]
     ExecPluginNotFound { command: Option<String> },
+    /// An exec auth plugin Flint ran gave no credential for a reason Flint words itself
+    /// ([`PluginProblem`]). `command` is its file name only ([`redact::command_name`]), so the
+    /// app can say which plugin to run again.
+    #[error("{}", plugin_problem_message(command, problem))]
+    ExecPlugin {
+        command: String,
+        problem: PluginProblem,
+    },
     /// The network failed below HTTP: refused, DNS, TLS, reset, dropped ([`Transport`]).
     /// `server` is filled in by [`ClusterError::for_target`].
     #[error("{}", problem.message(server.as_deref()))]
@@ -97,6 +105,42 @@ fn exec_not_found_message(command: Option<&str>) -> String {
     )
 }
 
+/// Why an exec auth plugin Flint ran (`auth_plugin`) gave no credential, other than failing
+/// on its own (an exit status, unreadable output: kube's [`kube::client::AuthError`]s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginProblem {
+    /// A token refresh did not finish within [`CONNECT_TIMEOUT`]: it may wait for a login.
+    TimedOut,
+    /// It timed out before and may prompt, so it is not run again until `until` (local
+    /// `HH:MM`), unless the cluster is selected or retried.
+    Resting { until: String },
+    /// The token refresh's task ended unexpectedly.
+    Stopped,
+    /// It printed more than a credential takes, and was killed.
+    TooLarge,
+}
+
+fn plugin_problem_message(command: &str, problem: &PluginProblem) -> String {
+    let plugin = format!("the exec auth plugin `{command}`");
+    match problem {
+        PluginProblem::TimedOut => format!(
+            "authentication failed: {plugin} did not finish within {}; it may be waiting for a \
+             login. Run it in a terminal (for example, log in again) and retry.",
+            go_duration(CONNECT_TIMEOUT)
+        ),
+        PluginProblem::Resting { until } => format!(
+            "authentication failed: {plugin} timed out, so it is not run again until {until}; \
+             retry to try now"
+        ),
+        PluginProblem::Stopped => format!(
+            "authentication failed: refreshing the token of {plugin} stopped unexpectedly; retry"
+        ),
+        PluginProblem::TooLarge => {
+            format!("authentication failed: {plugin} printed more output than a credential takes")
+        }
+    }
+}
+
 /// A duration as Go (and so kubectl) prints it: `500ms`, `10s`, `1.5s`, `1m0s`.
 pub(crate) fn go_duration(d: Duration) -> String {
     let millis = d.as_millis();
@@ -130,6 +174,11 @@ impl ClusterError {
 
     /// [`ClusterError::kube`] without taking the error, for a caller that still reads it.
     pub(crate) fn kube_ref(err: &kube::Error) -> Self {
+        if let Some(kube::client::AuthError::AuthExec(text)) = find_auth_error(err)
+            && let Some((command, problem)) = crate::auth_plugin::problem(text)
+        {
+            return ClusterError::ExecPlugin { command, problem };
+        }
         match ApiError::from_kube(err) {
             Some(api) => match api.explanation() {
                 Some(message) => ClusterError::Api(message),
@@ -553,9 +602,10 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
         A::AuthExecParse(_) => {
             "authentication failed: the exec auth plugin's output could not be parsed".to_owned()
         }
-        A::AuthExec(text) => crate::auth_plugin::describe(text).unwrap_or_else(|| {
-            "authentication failed: the exec auth plugin reported an error".to_owned()
-        }),
+        A::AuthExec(text) => match crate::auth_plugin::problem(text) {
+            Some((command, problem)) => plugin_problem_message(&command, &problem),
+            None => "authentication failed: the exec auth plugin reported an error".to_owned(),
+        },
         A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => {
             exec_not_found_message(None)
         }

@@ -662,9 +662,10 @@ async fn on_a_terminal() {
 
     let plugin = FakePlugin::new(
         "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
-         tpgid=$(ps -o tpgid= -p $$ | tr -d ' ')\n\
-         pgid=$(ps -o pgid= -p $$ | tr -d ' ')\n\
-         [ \"$tpgid\" = \"$pgid\" ] && echo yes > \"$PLUGIN_DIR/foreground\"\n\
+         fg() { [ \"$(ps -o tpgid= -p $$ | tr -d ' ')\" = \"$(ps -o pgid= -p $$ | tr -d ' ')\" ]; }\n\
+         i=0; while ! fg && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n\
+         fg && echo yes > \"$PLUGIN_DIR/foreground\"\n\
+         stty -echo\n\
          sleep 600 &\n\
          echo $! > \"$PLUGIN_DIR/child.tmp\" && mv \"$PLUGIN_DIR/child.tmp\" \"$PLUGIN_DIR/child\"\n\
          wait\n",
@@ -710,6 +711,12 @@ async fn on_a_terminal() {
     wait_reaped(leader).await;
     wait_dead(child).await;
     assert!(foreground(), "the terminal was not given back");
+    // The plugin turned echo off (a password prompt) and was killed: echo is back on.
+    // SAFETY: an all-zero termios is valid; tcgetattr writes into it.
+    let mut now: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: a plain call on standard input, writing into `now`.
+    assert_eq!(unsafe { libc::tcgetattr(0, &raw mut now) }, 0);
+    assert_ne!(now.c_lflag & libc::ECHO, 0, "echo was left off");
     std::fs::write(done, "ok").unwrap();
 }
 
@@ -743,8 +750,10 @@ async fn a_refresh_that_died_is_replaced() {
         .auth_info
         .exec
         .unwrap();
-    let died = async { false }.boxed().shared();
-    died.clone().await;
+    let died = async { Err(Arc::new(AuthError::ExecPluginFailed)) }
+        .boxed()
+        .shared();
+    let _ = died.clone().await;
     let token = RefreshingToken(Arc::new(TokenShared {
         task: std::sync::Mutex::default(),
         state: Arc::new(tokio::sync::Mutex::new(TokenState {
@@ -753,7 +762,6 @@ async fn a_refresh_that_died_is_replaced() {
             token: SecretString::from("t-old"),
             expires: "2000-01-01T00:00:00Z".parse().unwrap(),
             refreshing: Some(died),
-            failed: None,
             resting: None,
         })),
     }));
@@ -772,7 +780,6 @@ fn a_retry_ends_the_rest_of_its_own_cluster_only() {
         token: SecretString::from("t"),
         expires: Timestamp::now(),
         refreshing: None,
-        failed: None,
         resting: Some((
             Instant::now() + PROMPT_BACK_OFF,
             Timestamp::now() + PROMPT_BACK_OFF,
@@ -788,4 +795,48 @@ fn a_retry_ends_the_rest_of_its_own_cluster_only() {
     assert!(b.rests_until().is_none());
     retry_now("rest-a");
     assert!(a.rests_until().is_none());
+}
+
+// covers UP-03: a refresh's own result is used, even a token that already expires within the
+// refresh margin (as kube does): the margin only decides when to refresh.
+#[tokio::test]
+async fn a_refreshed_token_is_used_even_when_it_expires_soon() {
+    let plugin = FakePlugin::new(
+        "echo run >> \"$PLUGIN_DIR/runs\"\n\
+         n=$(wc -l < \"$PLUGIN_DIR/runs\" | tr -d ' ')\n\
+         printf '{\"status\":{\"token\":\"t-%s\",\"expirationTimestamp\":\"2000-01-01T00:00:00Z\"}}' \"$n\"\n",
+    );
+    let (server, seen) = version_server(1).await;
+    let client = cluster::connect(&plugin.kubeconfig(&server), "ctx")
+        .await
+        .unwrap();
+    cluster::server_version(&client).await.unwrap();
+    assert_eq!(seen.await.unwrap(), ["bearer t-2"]);
+}
+
+// covers UP-04: a plugin's own problems keep its name in what the app shows.
+#[test]
+fn plugin_problems_name_the_plugin_in_the_summary() {
+    let err = kube::Error::Auth(AuthError::AuthExec(format!("{TIMED_OUT}kubelogin")));
+    let error = ClusterError::kube(err);
+    assert!(matches!(
+        &error,
+        ClusterError::ExecPlugin { command, problem: crate::cluster::PluginProblem::TimedOut }
+            if command == "kubelogin"
+    ));
+    assert!(
+        error
+            .summary()
+            .as_str()
+            .contains("`kubelogin` did not finish within 1m0s"),
+        "{}",
+        error.summary().as_str()
+    );
+    let resting = ClusterError::kube(kube::Error::Auth(resting("kubelogin", Timestamp::now())));
+    assert!(
+        resting
+            .summary()
+            .as_str()
+            .contains("`kubelogin` timed out, so it is not run again until ")
+    );
 }

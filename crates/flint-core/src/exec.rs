@@ -232,7 +232,8 @@ impl ExecFailureKind {
             }
             ClusterError::UnknownContext(_)
             | ClusterError::Config { .. }
-            | ClusterError::ExecPluginNotFound { .. } => ExecFailureKind::SignIn,
+            | ClusterError::ExecPluginNotFound { .. }
+            | ClusterError::ExecPlugin { .. } => ExecFailureKind::SignIn,
             ClusterError::Kube(_) => ExecFailureKind::Other,
         }
     }
