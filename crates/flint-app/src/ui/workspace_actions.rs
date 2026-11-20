@@ -42,7 +42,7 @@ use super::{Pane, Workspace, confirm_expose, expose_dialog};
 /// A guard: the view `$view` returns (`log`, `shell`, `detail` or `list_wide`) is open and,
 /// given `$check`, passes it. It expands to a closure that captures nothing, so it is the plain
 /// `fn` the registry's [`Guards`] takes.
-macro_rules! open {
+macro_rules! view_open {
     ($view:ident) => {
         |ws: &Workspace, cx: &App| $view(ws, cx).is_some()
     };
@@ -156,34 +156,34 @@ impl Workspace {
                 |ws, a, cx| ws.nav.read(cx).check_section(a),
             )
             // The list's.
-            .when::<SelectPrev>(open!(list_wide))
-            .when::<SelectNext>(open!(list_wide))
-            .when::<SelectFirst>(open!(list_wide))
-            .when::<SelectLast>(open!(list_wide))
-            .when::<CloseDetail>(open!(list_wide))
-            .when::<FocusFilter>(open!(list_wide))
+            .when::<SelectPrev>(view_open!(list_wide))
+            .when::<SelectNext>(view_open!(list_wide))
+            .when::<SelectFirst>(view_open!(list_wide))
+            .when::<SelectLast>(view_open!(list_wide))
+            .when::<CloseDetail>(view_open!(list_wide))
+            .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
-            .add::<SelectRow>(open!(list_wide), |ws, a, cx| match &ws.list {
+            .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_select_row(a),
                 None => Err(ActionError::unavailable::<SelectRow>()),
             })
-            .add::<SortBy>(open!(list_wide), |ws, a, cx| match &ws.list {
+            .add::<SortBy>(view_open!(list_wide), |ws, a, cx| match &ws.list {
                 Some(l) => l.read(cx).check_sort(a),
                 None => Err(ActionError::unavailable::<SortBy>()),
             })
             // The detail pane's.
-            .when::<Refresh>(open!(detail))
-            .when::<Close>(open!(detail))
-            .when::<ShowOverview>(open!(detail))
-            .when::<ShowYaml>(open!(detail))
-            .when::<ToggleLabels>(open!(detail))
-            .when::<ToggleAnnotations>(open!(detail))
-            .when::<ToggleManagedFields>(open!(detail, DetailView::has_managed_fields))
-            .add::<ToggleSecretValue>(open!(detail, DetailView::is_secret), |ws, a, cx| match &ws
-                .detail
-            {
-                Some(d) => d.read(cx).check_secret_key(a),
-                None => Err(ActionError::unavailable::<ToggleSecretValue>()),
+            .when::<Refresh>(view_open!(detail))
+            .when::<Close>(view_open!(detail))
+            .when::<ShowOverview>(view_open!(detail))
+            .when::<ShowYaml>(view_open!(detail))
+            .when::<ToggleLabels>(view_open!(detail))
+            .when::<ToggleAnnotations>(view_open!(detail))
+            .when::<ToggleManagedFields>(view_open!(detail, DetailView::has_managed_fields))
+            .add::<ToggleSecretValue>(view_open!(detail, DetailView::is_secret), |ws, a, cx| {
+                match detail(ws, cx) {
+                    Some(d) => d.check_secret_key(a),
+                    None => Err(ActionError::unavailable::<ToggleSecretValue>()),
+                }
             })
             // Logs and Shell act on the selected row, which the detail pane shows (UP-47).
             .when::<OpenLogs>(|ws, cx| {
@@ -256,55 +256,60 @@ impl Workspace {
             )
             .add::<SetDockHeight>(|_, _| true, |_, a, _| check_dock_height(a))
             // The active shell tab's.
-            .when::<CopyText>(open!(shell, TerminalView::has_selection))
-            .when::<PasteText>(open!(shell, TerminalView::is_live))
-            .when::<ScrollPageUp>(open!(shell, TerminalView::can_scroll_back))
-            .when::<ScrollToTop>(open!(shell, TerminalView::can_scroll_back))
-            .when::<ScrollPageDown>(open!(shell, TerminalView::is_scrolled_back))
-            .when::<ScrollToBottom>(open!(shell, TerminalView::is_scrolled_back))
-            .add::<SelectText>(open!(shell), |ws, a, cx| match shell(ws, cx) {
+            .when::<CopyText>(view_open!(shell, TerminalView::has_selection))
+            .when::<PasteText>(view_open!(shell, TerminalView::is_live))
+            .when::<ScrollPageUp>(view_open!(shell, TerminalView::can_scroll_back))
+            .when::<ScrollToTop>(view_open!(shell, TerminalView::can_scroll_back))
+            .when::<ScrollPageDown>(view_open!(shell, TerminalView::is_scrolled_back))
+            .when::<ScrollToBottom>(view_open!(shell, TerminalView::is_scrolled_back))
+            .add::<SelectText>(view_open!(shell), |ws, a, cx| match shell(ws, cx) {
                 Some(t) => t.check_cells(a),
                 None => Err(ActionError::unavailable::<SelectText>()),
             })
             // The active log tab's.
-            .when::<TogglePause>(open!(log, LogView::can_pause))
-            .when::<JumpToEnd>(open!(log, LogView::has_lines))
-            .when::<JumpToStart>(open!(log, LogView::has_lines))
-            .when::<ToggleTimestamps>(open!(log))
-            .when::<ToggleWrap>(open!(log))
-            .when::<ToggleSources>(open!(log, LogView::is_workload))
-            .when::<FocusSearch>(open!(log))
-            .when::<NextMatch>(open!(log, LogView::has_matches))
-            .when::<PrevMatch>(open!(log, LogView::has_matches))
-            .when::<SelectPrevLine>(open!(log, LogView::has_lines))
-            .when::<SelectNextLine>(open!(log, LogView::has_lines))
-            .when::<ExtendSelectionUp>(open!(log, LogView::has_lines))
-            .when::<ExtendSelectionDown>(open!(log, LogView::has_lines))
-            .when::<SelectAllLines>(open!(log, LogView::has_lines))
-            .when::<ClearSelection>(open!(log, LogView::has_selection))
-            .when::<LeaveSearch>(open!(log))
-            .when::<CopyLines>(open!(log, LogView::has_selection))
-            .when::<SaveLogs>(open!(log, |l| l.check_save(SaveScope::All).is_ok()))
-            .when::<SaveMatchingLines>(open!(log, |l| l.check_save(SaveScope::Matches).is_ok()))
-            .when::<SaveSelectedLines>(open!(log, |l| l.check_save(SaveScope::Selection).is_ok()))
-            .add::<SaveLines>(open!(log, LogView::has_lines), |ws, a, cx| {
+            .when::<TogglePause>(view_open!(log, LogView::can_pause))
+            .when::<JumpToEnd>(view_open!(log, LogView::has_lines))
+            .when::<JumpToStart>(view_open!(log, LogView::has_lines))
+            .when::<ToggleTimestamps>(view_open!(log))
+            .when::<ToggleWrap>(view_open!(log))
+            .when::<ToggleSources>(view_open!(log, LogView::is_workload))
+            .when::<FocusSearch>(view_open!(log))
+            .when::<NextMatch>(view_open!(log, LogView::has_matches))
+            .when::<PrevMatch>(view_open!(log, LogView::has_matches))
+            .when::<SelectPrevLine>(view_open!(log, LogView::has_lines))
+            .when::<SelectNextLine>(view_open!(log, LogView::has_lines))
+            .when::<ExtendSelectionUp>(view_open!(log, LogView::has_lines))
+            .when::<ExtendSelectionDown>(view_open!(log, LogView::has_lines))
+            .when::<SelectAllLines>(view_open!(log, LogView::has_lines))
+            .when::<ClearSelection>(view_open!(log, LogView::has_selection))
+            .when::<LeaveSearch>(view_open!(log))
+            .when::<CopyLines>(view_open!(log, LogView::has_selection))
+            .when::<SaveLogs>(view_open!(log, |l| l.check_save(SaveScope::All).is_ok()))
+            .when::<SaveMatchingLines>(view_open!(log, |l| l
+                .check_save(SaveScope::Matches)
+                .is_ok()))
+            .when::<SaveSelectedLines>(view_open!(log, |l| l
+                .check_save(SaveScope::Selection)
+                .is_ok()))
+            .add::<SaveLines>(view_open!(log, LogView::has_lines), |ws, a, cx| {
                 match log(ws, cx) {
                     Some(l) => l.check_save(a.lines),
                     None => Err(ActionError::unavailable::<SaveLines>()),
                 }
             })
-            .add::<SelectLine>(open!(log, LogView::has_lines), |ws, a, cx| {
+            .add::<SelectLine>(view_open!(log, LogView::has_lines), |ws, a, cx| {
                 match log(ws, cx) {
                     Some(l) => l.check_line::<SelectLine>(a.line),
                     None => Err(ActionError::unavailable::<SelectLine>()),
                 }
             })
-            .add::<DragSelection>(open!(log, LogView::has_selection), |ws, a, cx| {
-                match log(ws, cx) {
+            .add::<DragSelection>(
+                view_open!(log, LogView::has_selection),
+                |ws, a, cx| match log(ws, cx) {
                     Some(l) => l.check_line::<DragSelection>(a.line),
                     None => Err(ActionError::unavailable::<DragSelection>()),
-                }
-            })
+                },
+            )
     }
 
     /// Gives focus back after it left with a closed view (or a hidden dock): to the open list,
