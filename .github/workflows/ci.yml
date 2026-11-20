@@ -193,6 +193,42 @@ jobs:
                 xargs apt-get install -y -qq --no-install-recommends >/dev/null &&
               scripts/smoke-appimage.sh "flint-v$VERSION-linux-x86_64.AppImage" "$VERSION"'
 
+  # The static musl `flint-mcp` the release ships for Linux, built and checked as release-please
+  # does: in a bare Ubuntu 22.04, `--version`, `initialize` and the MCP e2e tests on the fake API
+  # server. x86_64 only; the release also builds aarch64.
+  mcp-linux:
+    name: mcp-linux (x86_64)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.appimage == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install musl-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-mcp-musl
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build and package
+        # bash -eo pipefail, so a failing build before `| tee` fails the step.
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)" # x-release-please-version$/\1/p' Cargo.toml)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          scripts/package-mcp-linux.sh x86_64 "$VERSION" | tee package.log
+          echo "ARCHIVE=$(basename "$(tail -n 1 package.log)")" >> "$GITHUB_ENV"
+      - name: Smoke test in a clean Ubuntu 22.04
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e ARCHIVE -e VERSION \
+            ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6 \
+            scripts/smoke-mcp-linux.sh "$ARCHIVE" "$VERSION"
+      - name: MCP e2e in a clean Ubuntu 22.04
+        run: scripts/test-mcp-linux.sh x86_64 "$ARCHIVE"
+
   # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
   # and docs (also with the test-only automation channel), and a release build that catches
   # profile-only problems (LTO, strip) before release-please does, and proves the automation

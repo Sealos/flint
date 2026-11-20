@@ -77,7 +77,8 @@ crates/
                 logs, exec, port-forward, metrics, Helm. Depends on tokio and kube. Never on GPUI.
   flint-mcp/    The MCP server (stdio): tool definitions, cluster opt-in checks, output limits. Depends on flint-core.
                 Redaction rules live in `flint_core::redact`, shared with the app.
-                Its `flint-mcp` binary is the same server without GPUI, for Linux CI only; not shipped.
+                Its `flint-mcp` binary is the same server without GPUI: CI's MCP e2e tests run it, and releases
+                ship it for Linux as static musl binaries (ADR-0016).
   flint-app/    The `flint` binary: windows, views, the terminal widget, settings UI, the bridge to core.
                 `flint mcp` runs flint-mcp instead of starting the UI.
   flint-e2e/    Tests only (not published): the fake API server replaying fixtures recorded from kind, and

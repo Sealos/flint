@@ -10,7 +10,8 @@
 #   rust      Rust sources, manifests, the lockfile, toolchain and lint config, the shared GPUI
 #             action: build, test, clippy, docs
 #   app       crates/flint-app: the app's UI lint scripts
-#   appimage  rust, or the AppImage packaging and smoke scripts
+#   appimage  rust, or the Linux release packaging and smoke scripts: the AppImage and the
+#             static flint-mcp
 #   macos     rust, or the release-binary automation check the macOS job runs
 #   deps      manifests, the lockfile and deny.toml: cargo-deny
 #   scripts   scripts/: shellcheck and the scripts' self-tests
@@ -78,7 +79,8 @@ while IFS= read -r path; do
     Cargo.toml | Cargo.lock | crates/*/Cargo.toml | deny.toml) turn_on deps ;;
   esac
   case "$path" in
-    scripts/package-appimage.sh | scripts/smoke-appimage.sh | packaging/linux/*)
+    scripts/package-appimage.sh | scripts/smoke-appimage.sh | packaging/linux/* | \
+      scripts/package-mcp-linux.sh | scripts/smoke-mcp-linux.sh | scripts/test-mcp-linux.sh)
       turn_on appimage
       ;;
   esac

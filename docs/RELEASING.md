@@ -27,13 +27,15 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
 - [ ] It is marked **Latest**, and [/releases/latest](https://github.com/Sealos/flint/releases/latest) opens it. The
   `publish` job only marks a release Latest when no newer one is out, so an older release re-published later is
   correctly not Latest.
-- [ ] It has eight files, four binaries and their `.sha256` checksums, besides GitHub's two Source code archives:
+- [ ] It has twelve files, six binaries and their `.sha256` checksums, besides GitHub's two Source code archives:
   - `flint-vX.Y.Z-macos-universal.dmg` and `.dmg.sha256`
   - `flint-vX.Y.Z-macos-universal.tar.gz` and `.tar.gz.sha256`
   - `flint-vX.Y.Z-linux-x86_64.AppImage` and `.AppImage.sha256`
   - `flint-vX.Y.Z-linux-aarch64.AppImage` and `.AppImage.sha256`
+  - `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and `.tar.gz.sha256`
+  - `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` and `.tar.gz.sha256`
 
-  v0.2.0 and earlier have no DMG.
+  v0.2.0 and earlier have no DMG. v0.2.1 and earlier have no `flint-mcp` archives.
 - [ ] The notes list the changes from `CHANGELOG.md`.
 - [ ] The checksums match. In an empty directory:
 
@@ -42,7 +44,7 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
   shasum -a 256 -c ./*.sha256
   ```
 
-The `publish` job already checks that all eight files are on the draft, non-empty and matching their checksums, and
+The `publish` job already checks that all twelve files are on the draft, non-empty and matching their checksums, and
 that the release ends up published (and Latest when it should be). This step confirms what someone downloading it
 sees.
 
