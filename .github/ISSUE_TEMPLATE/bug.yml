@@ -62,10 +62,10 @@ body:
       description: |
         Flint logs to stderr only for now, so an app opened from Finder or the Dock keeps no log file.
         Start the executable of your install from a terminal with more detail and paste the relevant lines:
-        `FLINT_LOG=warn,flint=debug,flint_app=debug,flint_core=debug flint`
+        `FLINT_LOG=off,flint=debug,flint_app=debug,flint_core=debug flint`
         (DMG: `... /Applications/Flint.app/Contents/MacOS/flint`; AppImage: `... ./flint-vX.Y.Z-linux-x86_64.AppImage`;
         source build: `... cargo run -p flint-app`, with the variable before `cargo`).
-        Do not use a bare `FLINT_LOG=debug`: it turns on debug logging for every library.
+        Keep the leading `off`: other libraries can log raw Kubernetes responses, which Flint has not redacted.
         If you normally open Flint from Finder or the Dock and the problem does not happen when started from a
         terminal (the terminal can pass a different `KUBECONFIG` or `PATH`), say so instead of pasting logs.
       render: text
@@ -76,10 +76,11 @@ body:
       description: |
         Launching the app does not capture `flint mcp`, which your AI client starts itself. In Flint's entry in the
         client's MCP server settings, set the environment variable
-        `FLINT_LOG=warn,flint=info,flint_app=info,flint_core=info,flint_mcp=info` (it overrides any `RUST_LOG` the
+        `FLINT_LOG=off,flint=info,flint_app=info,flint_core=info,flint_mcp=info` (it overrides any `RUST_LOG` the
         client passes on), reproduce the bug, and copy the server's stderr from the client's MCP log (the client's
-        settings or log viewer says where). Keep other libraries at `warn`: the protocol library logs client metadata
-        and notifications at `info`, and full requests and tool results at `debug`, which can include ConfigMap data
-        and pod environment values that Flint does not redact. Paste only the relevant lines, with anything private
-        removed.
+        settings or log viewer says where). Keep the leading `off`: other libraries log client metadata, raw
+        Kubernetes responses and, at `debug`, full requests and tool results, which can include ConfigMap data and pod
+        environment values that Flint does not redact. Paste only the relevant lines, with anything private removed.
+        A tool that fails normally (for example, denied by RBAC) reports the error to the client without logging it:
+        then give the tool name and the error the client showed, with anything private removed.
       render: text

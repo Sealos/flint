@@ -20,6 +20,11 @@ body:
     attributes:
       label: Flint version
       placeholder: "0.2.1"
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version, if it matters here
+      placeholder: "macOS 15.4, Ubuntu 24.04"
   - type: dropdown
     id: auth
     attributes:
