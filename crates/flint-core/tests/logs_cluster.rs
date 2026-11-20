@@ -22,7 +22,9 @@ use serde_json::json;
 
 mod support;
 
-use support::{Core, client, init_logging, test_kubeconfig, two_context_kubeconfig, unique_name};
+use support::{
+    Core, client, init_logging, name_of, test_kubeconfig, two_context_kubeconfig, unique_name,
+};
 
 fn start(kubeconfig: PathBuf, settings: Settings) -> (tempfile::TempDir, Core) {
     init_logging();
@@ -62,6 +64,25 @@ async fn until(
     })
     .await
     .unwrap_or_else(|_| panic!("log condition not reached: {:?}", session.peek().state))
+}
+
+// Tests `support::unique_name`, here so it runs once rather than in every binary using support.
+#[test]
+fn namespace_names_are_unique_and_valid() {
+    let names: BTreeSet<String> = (0..1000).map(|_| unique_name("logs-test")).collect();
+    assert_eq!(names.len(), 1000);
+    let pid = format!("-{}-", std::process::id());
+    assert!(
+        names
+            .iter()
+            .all(|n| n.starts_with("logs-test-") && n.contains(&pid))
+    );
+    // A namespace name is a DNS label: at most 63 characters, even with every part at its
+    // largest.
+    for prefix in ["logs-test", "exec-test"] {
+        let longest = name_of(prefix, u64::MAX, u32::MAX, u32::MAX);
+        assert!(longest.len() <= 63, "{longest}");
+    }
 }
 
 /// Runs `body` in a fresh namespace and deletes the namespace afterwards, also when it panics.

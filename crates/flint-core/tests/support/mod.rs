@@ -52,7 +52,16 @@ pub(super) fn unique_name(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    format!("{prefix}-{secs}-{}-{n}", std::process::id())
+    name_of(prefix, secs, std::process::id(), n)
+}
+
+/// The name [`unique_name`] builds from its parts.
+#[allow(
+    dead_code,
+    reason = "only logs_cluster's test of unique_name calls it directly"
+)]
+pub(super) fn name_of(prefix: &str, secs: u64, pid: u32, n: u32) -> String {
+    format!("{prefix}-{secs}-{pid}-{n}")
 }
 
 pub(super) async fn client(path: &Path) -> Client {
@@ -129,16 +138,4 @@ impl Core {
         })
         .await
     }
-}
-
-#[test]
-fn unique_names_differ_and_keep_their_prefix() {
-    let names: std::collections::BTreeSet<String> = (0..1000).map(|_| unique_name("t")).collect();
-    assert_eq!(names.len(), 1000);
-    let pid = format!("-{}-", std::process::id());
-    assert!(
-        names
-            .iter()
-            .all(|n| n.starts_with("t-") && n.contains(&pid) && n.len() <= 63)
-    );
 }
