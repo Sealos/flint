@@ -142,8 +142,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-16 See what an agent read
 - **When** an agent has called Flint's MCP tools, and I open a cluster's agent activity.
 - **Then** I see each call: when, which tool, what it named, how much came back, and whether it was cut short or
-  denied. No returned content is stored. The view updates while the agent works, even though `flint mcp` is a separate
-  process. The cluster's "AI" badge opens it, with Edit AI Scope there.
+  denied. Listing the clusters counts as a call on each cluster it probed. No returned content is stored. The view
+  updates while the agent works, even though `flint mcp` is a separate process. The cluster's "AI" badge opens it,
+  with Edit AI Scope there.
 - Tests: unit (record format, rotation), core (live reload), mcp, ui.
 
 ### UP-13 Appearance follows macOS

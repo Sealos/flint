@@ -651,7 +651,13 @@ pub fn save_state(dir: &Path, state: &State) -> Result<(), SettingsError> {
 
 /// Server URLs compare equal when they differ only by a trailing slash.
 fn same_server(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
+    server_identity(a) == server_identity(b)
+}
+
+/// The endpoint a cluster pin compares: the API server URL as the kubeconfig has it, without a
+/// trailing slash. It may hold credentials, so it is for comparing (and keying), never showing.
+pub fn server_identity(server: &str) -> &str {
+    server.trim_end_matches('/')
 }
 
 /// Exposes `context` at `server` to AI agents (`Some`), or hides it (`None`), and writes

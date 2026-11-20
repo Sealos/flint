@@ -31,6 +31,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::exec::InputRefused;
 use flint_core::terminal::{Cell, CursorShape, SelectionKind, Side, TermMode, TerminalSize};
 use flint_core::{ExecSession, ExecSnapshot};
 use gpui_kit::base::TestSupportExt as _;
@@ -134,6 +135,8 @@ pub struct TerminalView {
     /// The bell rang a moment ago.
     bell: bool,
     note: Option<Note>,
+    /// The note says the shell is not reading its input ([`TerminalView::input_sent`]).
+    refusal_shown: bool,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
     /// Why Restart Shell cannot run, as the workspace says it: the tab's cluster is protected
@@ -197,6 +200,7 @@ impl TerminalView {
             marked: None,
             bell: false,
             note: None,
+            refusal_shown: false,
             ended: None,
             protected: None,
             chip,
@@ -232,6 +236,9 @@ impl TerminalView {
         }
         if snapshot.state.is_finished() {
             self.marked = None;
+        }
+        if snapshot.input_not_replayed && !self.snapshot.input_not_replayed {
+            self.set_note(Tone::Warning, terminal_model::INPUT_NOT_REPLAYED.to_owned());
         }
         // The terminal drops a selection on its own (the program cleared the screen, switched
         // screens or wrote over it); one scrolled out of view is still there to copy.
@@ -348,8 +355,27 @@ impl TerminalView {
             return;
         }
         self.wheel.reset();
-        self.session.write(bytes);
+        let sent = self.session.write(bytes);
+        self.input_sent(sent, false);
         cx.notify();
+    }
+
+    /// Takes in the core's answer to keystrokes or a paste (`paste`): a refusal says the shell
+    /// is not reading its input, so they were not sent; input taken again clears that note,
+    /// which no longer holds.
+    pub(super) fn input_sent(&mut self, sent: Result<(), InputRefused>, paste: bool) {
+        match sent {
+            Ok(()) => {
+                if self.refusal_shown {
+                    self.note = None;
+                    self.refusal_shown = false;
+                }
+            }
+            Err(refused) => {
+                self.set_note(Tone::Warning, terminal_model::input_refused(refused, paste));
+                self.refusal_shown = true;
+            }
+        }
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -479,7 +505,9 @@ impl TerminalView {
                 (false, false) => b"\x1b[B",
             };
             let bytes = key.repeat(lines.unsigned_abs() as usize);
-            self.session.write(bytes);
+            let sent = self.session.write(bytes);
+            self.input_sent(sent, false);
+            cx.notify();
         } else {
             self.session.scroll(lines);
         }
@@ -704,6 +732,7 @@ impl TerminalView {
 
     pub(super) fn set_note(&mut self, tone: Tone, text: String) {
         self.note = Some(Note { tone, text });
+        self.refusal_shown = false;
     }
 
     /// What the grid paints this frame.

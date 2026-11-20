@@ -60,9 +60,9 @@ pub enum ClusterError {
     /// An exec auth plugin Flint ran gave no credential for a reason Flint words itself
     /// ([`PluginProblem`]). `command` is its file name only ([`redact::command_name`]), so the
     /// app can say which plugin to run again.
-    #[error("{}", plugin_problem_message(command, problem))]
+    #[error("{}", plugin_problem_message(command.as_deref(), problem))]
     ExecPlugin {
-        command: String,
+        command: Option<String>,
         problem: PluginProblem,
     },
     /// The network failed below HTTP: refused, DNS, TLS, reset, dropped ([`Transport`]).
@@ -122,8 +122,11 @@ pub enum PluginProblem {
     TooLarge,
 }
 
-fn plugin_problem_message(command: &str, problem: &PluginProblem) -> String {
-    let plugin = format!("the exec auth plugin `{command}`");
+fn plugin_problem_message(command: Option<&str>, problem: &PluginProblem) -> String {
+    let plugin = match command {
+        Some(command) => format!("the exec auth plugin `{command}`"),
+        None => "the exec auth plugin".to_owned(),
+    };
     match problem {
         PluginProblem::TimedOut => format!(
             "authentication failed: {plugin} did not finish within {}; it may be waiting for a \
@@ -359,7 +362,7 @@ impl Target {
             .and_then(|n| n.auth_info.as_ref())
             .and_then(|a| a.exec.as_ref())
             .and_then(|e| e.command.as_deref())
-            .map(redact::command_name);
+            .and_then(redact::command_name);
         Target {
             server,
             exec_command,
@@ -605,7 +608,7 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
             "authentication failed: the exec auth plugin's output could not be parsed".to_owned()
         }
         A::AuthExec(text) => match crate::auth_plugin::problem(text) {
-            Some((command, problem)) => plugin_problem_message(&command, &problem),
+            Some((command, problem)) => plugin_problem_message(command.as_deref(), &problem),
             None => "authentication failed: the exec auth plugin reported an error".to_owned(),
         },
         A::AuthExecStart(e) if e.kind() == std::io::ErrorKind::NotFound => {

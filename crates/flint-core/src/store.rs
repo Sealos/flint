@@ -171,17 +171,6 @@ pub(crate) struct Store {
     revision: u64,
 }
 
-/// The interned strings a row uses: its namespace, label keys and values, and text cells.
-fn row_strings(row: &Row) -> impl Iterator<Item = &Arc<str>> {
-    row.namespace
-        .iter()
-        .chain(row.labels.iter().flat_map(|(k, v)| [k, v]))
-        .chain(row.cells.iter().filter_map(|cell| match cell {
-            crate::table::Cell::Text(s) => Some(s),
-            _ => None,
-        }))
-}
-
 /// What [`Store::apply`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Applied {
@@ -219,6 +208,7 @@ impl Store {
     pub fn begin_resync(&mut self) {
         self.pending = Some(HashMap::new());
         self.pending_layout = self.layout.clone();
+        self.interner.begin_relist();
     }
 
     /// Replaces the rows with the completed list.
@@ -229,11 +219,10 @@ impl Store {
                 self.layout = self.pending_layout.take();
             }
             // Snapshots published before (the hub's, a view's still on screen) hold the old
-            // rows' strings, so a prune by reference count would keep them. Keep exactly what
-            // the new rows use: the old strings go when their last holder lets go, whenever
+            // rows' strings, so a prune by reference count would keep them. Keep what the
+            // relist asked for: the old strings go when their last holder lets go, whenever
             // that is, with no further events needed.
-            self.interner
-                .keep_only(self.rows.values().flat_map(|row| row_strings(row)));
+            self.interner.keep_relisted();
             self.revise();
         }
     }
@@ -525,6 +514,41 @@ mod tests {
             store.apply(obj(&[(&uid, "demo", &uid, &status)], "4"), true, 0);
         }
         assert!(store.interned() < 100, "{}", store.interned());
+    }
+
+    // covers UP-20, UP-27: a relist of the same rows keeps their strings shared, and drops
+    // only those no relisted row asked for (#295).
+    #[test]
+    fn a_relist_keeps_the_strings_its_rows_use() {
+        let mut store = Store::new(true);
+        for i in 0..100 {
+            let uid = format!("u{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, "Running")], "1"), false, 0);
+        }
+        store.apply(obj(&[("gone", "demo", "gone", "Evicted")], "1"), false, 0);
+        let before = store.interned();
+        store.begin_resync();
+        for i in 0..100 {
+            let uid = format!("u{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, "Running")], "2"), false, 0);
+        }
+        store.finish_resync();
+        // "Evicted", which only the gone row used, is dropped; everything else stays.
+        assert_eq!(store.interned(), before - 1);
+        let snapshot = store.snapshot(KindSnapshot::default());
+        let status = |i: usize| match &snapshot.rows[i].cells[3] {
+            crate::table::Cell::Text(s) => s.clone(),
+            other => panic!("a status cell, not {other:?}"),
+        };
+        // Still one shared string, and still the interner's.
+        assert!(Arc::ptr_eq(&status(0), &status(99)));
+        store.apply(obj(&[("next", "demo", "next", "Running")], "3"), false, 0);
+        let next = store.snapshot(KindSnapshot::default());
+        let running = next.rows.iter().find(|r| &*r.uid == "next").unwrap();
+        match &running.cells[3] {
+            crate::table::Cell::Text(s) => assert!(Arc::ptr_eq(s, &status(0))),
+            other => panic!("a status cell, not {other:?}"),
+        }
     }
 
     // covers UP-27

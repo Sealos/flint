@@ -182,6 +182,7 @@ async fn failures_offer_a_retry(cx: &mut TestAppContext) {
         cx,
         Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: None,
             error: Some("the server could not find the requested resource".into()),
         },

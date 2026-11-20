@@ -514,7 +514,7 @@ impl Workspace {
                 let sections = model
                     .active
                     .as_ref()
-                    .and_then(|c| model.discovery.get(c))
+                    .and_then(|c| model.discovered(c))
                     .and_then(|d| d.discovery.as_ref())
                     .map(|d| d.navigation.sections.as_slice())
                     .unwrap_or_default();
@@ -780,7 +780,7 @@ impl Workspace {
         let discovery_failed = model
             .active
             .as_ref()
-            .and_then(|c| model.discovery.get(c))
+            .and_then(|c| model.discovered(c))
             .is_some_and(|d| d.error.is_some() && d.discovery.is_none());
         failed || discovery_failed
     }
@@ -1123,7 +1123,7 @@ impl Workspace {
     pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
         let model = self.model.read(cx);
         let active = model.active.as_ref()?;
-        let discovery = model.discovery.get(active)?.discovery.as_ref()?;
+        let discovery = model.discovered(active)?.discovery.as_ref()?;
         discovery.nav_entry(kind).ok().cloned()
     }
 

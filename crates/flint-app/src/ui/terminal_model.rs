@@ -3,6 +3,7 @@
 //! splits into runs of text to shape, and the state's wording. No GPUI types, so all of it is
 //! testable without a window; the view (`terminal_view.rs`) draws with them.
 
+use flint_core::exec::InputRefused;
 use flint_core::terminal::{Cell, CellFlags, CursorShape, SelectionKind, Side, TerminalSize};
 use flint_core::{ClusterId, ExecFailure, ExecFailureKind, ExecRequest, ExecState};
 
@@ -194,6 +195,21 @@ pub fn paste_too_large(bytes: usize) -> String {
 }
 
 /// `512 bytes`, `256 KB`, `3.2 MB`.
+/// What a shell tab says when the core refused keystrokes or a paste (`paste`): the shell is
+/// not reading what it was sent before, and the session holds no more.
+pub fn input_refused(refused: InputRefused, paste: bool) -> String {
+    format!(
+        "{}: the shell is not reading its input, and {} already waits for it.",
+        if paste { "Not pasted" } else { "Keys not sent" },
+        byte_size(refused.queued)
+    )
+}
+
+/// What a shell tab says when what was typed while the first shell was tried was too large to
+/// keep for the shell that started ([`flint_core::ExecSnapshot::input_not_replayed`]).
+pub const INPUT_NOT_REPLAYED: &str = "What was typed while the first shell was tried was too \
+    large to keep, so this shell did not get it. Type it again.";
+
 fn byte_size(bytes: usize) -> String {
     const KB: usize = 1024;
     const MB: usize = 1024 * KB;
@@ -517,6 +533,24 @@ mod tests {
             }
         );
         assert_eq!(paste_question(3).0, "Paste 3 lines?");
+        let refused = InputRefused {
+            bytes: 300 * 1024,
+            queued: 1024 * 1024,
+        };
+        assert_eq!(
+            input_refused(refused, true),
+            "Not pasted: the shell is not reading its input, and 1.0 MB already waits for it."
+        );
+        assert_eq!(
+            input_refused(
+                InputRefused {
+                    bytes: 1,
+                    ..refused
+                },
+                false
+            ),
+            "Keys not sent: the shell is not reading its input, and 1.0 MB already waits for it."
+        );
         assert_eq!(
             paste_too_large(3 * 1024 * 1024 + 200 * 1024),
             "Not pasted: the clipboard holds 3.2 MB, more than the 256 KB a shell tab pastes at \
