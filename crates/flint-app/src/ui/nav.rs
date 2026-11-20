@@ -303,7 +303,9 @@ impl NavPanel {
                 el.hover(|el| el.bg(theme.list_hover))
             })
             // The keyboard cursor, while the navigation has focus.
-            .when(cursor, |el| el.border_1().border_color(theme.ring))
+            // Every row has the border, so the ring moving shifts nothing.
+            .border_1()
+            .border_color(super::theme::cursor_ring(theme, cursor))
             .child(
                 div()
                     .flex_1()
@@ -431,7 +433,8 @@ impl Render for NavPanel {
                             .font_semibold()
                             .text_color(theme.muted_foreground)
                             .hover(|el| el.bg(theme.list_hover))
-                            .when(ring, |el| el.border_1().border_color(theme.ring))
+                            .border_1()
+                            .border_color(super::theme::cursor_ring(&theme, ring))
                             .child(
                                 Icon::new(if is_collapsed {
                                     IconName::ChevronRight

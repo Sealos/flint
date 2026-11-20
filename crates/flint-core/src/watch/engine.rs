@@ -307,6 +307,22 @@ impl Engine {
         })
     }
 
+    /// Answers one-off reads of the rows ([`Hub::peek`]) with a snapshot nobody keeps.
+    fn answer_peeks(&self) {
+        if !self.hub.has_peeks() {
+            return;
+        }
+        self.hub.answer_peeks(self.epoch, || {
+            self.store.snapshot(KindSnapshot {
+                cluster: self.cluster.clone(),
+                kind: self.id.clone(),
+                state: self.state.clone(),
+                feed: self.feed,
+                ..Default::default()
+            })
+        });
+    }
+
     fn publish(&mut self) {
         if self.audience() == 0 {
             return;
@@ -334,7 +350,10 @@ impl Engine {
             tokio::select! {
                 biased;
                 _ = sleep_until_opt(deadline) => self.publish(),
-                _ = hub.wake.notified() => self.dirty = true,
+                _ = hub.wake.notified() => {
+                    self.dirty = true;
+                    self.answer_peeks();
+                }
                 out = &mut fut => return out,
             }
         }
@@ -361,6 +380,7 @@ impl Engine {
                 _ = hub.wake.notified() => {
                     self.dirty = true;
                     self.publish();
+                    self.answer_peeks();
                 }
             }
         }
@@ -783,9 +803,19 @@ impl Engine {
             }
             // Rows are merged only for subscribers; status displays need the state alone.
             let listening = self.hub.listeners() > 0;
-            let merged = merge_lanes(&lanes, &reason, self.kind.namespaced, listening);
+            // A one-off read of the rows wants them merged too, without a publish.
+            let peeked = self.hub.has_peeks();
+            let merged = merge_lanes(&lanes, &reason, self.kind.namespaced, listening || peeked);
             self.set_state(merged.state.clone());
             self.set_feed(merged.feed);
+            if peeked {
+                let snapshot = KindSnapshot {
+                    cluster: self.cluster.clone(),
+                    kind: self.id.clone(),
+                    ..merged.clone()
+                };
+                self.hub.answer_peeks(self.epoch, || snapshot);
+            }
             if listening {
                 // At most one snapshot per interval, however many lanes change.
                 if let Some(at) = published {

@@ -157,6 +157,20 @@ enum Row {
     },
 }
 
+/// What the resource switcher opens on, from the workspace.
+pub struct SwitcherScope {
+    /// The active cluster, as the rows name it; `None` with no cluster active.
+    pub cluster: Option<SharedString>,
+    /// The kinds, at first; the objects come through [`CommandPalette::set_index`].
+    pub index: Index,
+    /// The objects are being read from the stores.
+    pub loading: bool,
+    /// The cluster's discovery failed: no kinds are coming.
+    pub discovery_failed: bool,
+    /// The cluster watches only the kinds open in a view.
+    pub on_view: bool,
+}
+
 /// What the resource switcher searches.
 struct Resources {
     /// The active cluster, as the rows name it; `None` with no cluster active.
@@ -164,6 +178,8 @@ struct Resources {
     index: Arc<Index>,
     /// The objects are still being read from the stores.
     loading: bool,
+    discovery_failed: bool,
+    on_view: bool,
     search: Search,
     /// How many items the query matched, listed or not.
     matched: usize,
@@ -236,16 +252,13 @@ impl CommandPalette {
         )
     }
 
-    /// The resource switcher over `index` (the kinds, at first) on `cluster` (its name as
-    /// shown; `None` when no cluster is active). Enter runs Open Kind… or Open Object… from
+    /// The resource switcher over `scope`. Enter runs Open Kind… or Open Object… from
     /// `previous` (or `fallback`), as the palette runs any action. The objects come later,
     /// through [`CommandPalette::set_index`].
     pub fn switcher(
         previous: FocusHandle,
         fallback: FocusHandle,
-        cluster: Option<SharedString>,
-        index: Index,
-        loading: bool,
+        scope: SwitcherScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -260,9 +273,11 @@ impl CommandPalette {
             cx,
         );
         palette.resources = Some(Resources {
-            cluster,
-            index: Arc::new(index),
-            loading,
+            cluster: scope.cluster,
+            index: Arc::new(scope.index),
+            loading: scope.loading,
+            discovery_failed: scope.discovery_failed,
+            on_view: scope.on_view,
             search: Search::default(),
             matched: 0,
         });
@@ -274,15 +289,41 @@ impl CommandPalette {
     /// The switcher's index once the objects in memory are read: the search starts over on
     /// it, with what was typed.
     pub fn set_index(&mut self, index: Arc<Index>, cx: &mut Context<Self>) {
-        if let Some(resources) = &mut self.resources {
-            resources.index = index;
-            resources.loading = false;
-            resources.search = Search::default();
-            let selected = self.selected;
-            self.refilter(cx);
-            // Keep the row the user moved to, when it is still there.
-            self.selected = selected.min(self.rows.len().saturating_sub(1));
-        }
+        // The item the user moved to, by what it is: its row may move as objects arrive.
+        let kept = match (self.rows.get(self.selected), &self.resources) {
+            (Some(Row::Resource { item, .. }), Some(resources)) => {
+                let item = &resources.index.items[*item as usize];
+                Some((
+                    resources.index.kind_of(item).id.clone(),
+                    item.object.clone(),
+                ))
+            }
+            _ => None,
+        };
+        let Some(resources) = &mut self.resources else {
+            return;
+        };
+        resources.index = index;
+        resources.loading = false;
+        resources.search = Search::default();
+        self.refilter(cx);
+        let Some((kind, object)) = kept else {
+            return;
+        };
+        let Some(resources) = &self.resources else {
+            return;
+        };
+        let at = self.rows.iter().position(|row| match row {
+            Row::Resource { item, .. } => {
+                let item = &resources.index.items[*item as usize];
+                resources.index.kind_of(item).id == kind && item.object == object
+            }
+            _ => false,
+        });
+        // Gone from the results: the first row, as after typing.
+        self.selected = at.unwrap_or(0);
+        self.scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
     }
 
     /// What the palette searches.
@@ -853,10 +894,13 @@ impl CommandPalette {
                 RowTexts {
                     label: item.text.to_string().into(),
                     ranges: ranges.clone(),
-                    // An object says its kind; a kind, that it is one.
-                    detail: Some(match item.object {
-                        Some(_) => kind.label.clone().into(),
-                        None => "Kind".into(),
+                    // An object says its kind; a kind, that it is one, and how many of its
+                    // objects are in memory.
+                    detail: Some(match (&item.object, kind.in_memory) {
+                        (Some(_), _) => kind.label.clone().into(),
+                        (None, _) if resources.loading => "Kind".into(),
+                        (None, Some(n)) => format!("Kind · {n} in memory").into(),
+                        (None, None) => "Kind · not loaded".into(),
                     }),
                     shortcut: None,
                     action: None,
@@ -1037,6 +1081,12 @@ impl CommandPalette {
             total: self.rows.len(),
             selected: (!self.rows.is_empty()).then_some(self.selected),
             footer: self.footer().map(|(text, _)| text.to_string()),
+            note: match (&self.step, &self.resources) {
+                (Step::Resources, Some(resources)) => {
+                    resources_note(resources).map(|n| n.to_string())
+                }
+                _ => None,
+            },
             error: self.error.clone(),
         }
     }
@@ -1084,6 +1134,14 @@ struct RowTexts {
 }
 
 /// The switcher's line under the rows: what it searches, or why nothing is listed.
+/// The switcher's second line in On view mode, where most kinds have no objects in memory.
+const ON_VIEW_NOTE: &str = "Only kinds being watched list their objects; open a kind to load them.";
+
+/// The switcher's note under its footer, if any.
+fn resources_note(resources: &Resources) -> Option<SharedString> {
+    (resources.on_view && resources.cluster.is_some()).then(|| ON_VIEW_NOTE.into())
+}
+
 fn resources_footer(resources: &Resources, rows: usize) -> SharedString {
     let index = &resources.index;
     if resources.cluster.is_none() {
@@ -1092,6 +1150,8 @@ fn resources_footer(resources: &Resources, rows: usize) -> SharedString {
     if rows == 0 {
         return if index.items.is_empty() && resources.loading {
             "Reading the objects in memory…".into()
+        } else if index.items.is_empty() && resources.discovery_failed {
+            "No kinds: discovery failed".into()
         } else if index.items.is_empty() {
             "No kinds (discovery has not finished)".into()
         } else {
@@ -1238,6 +1298,10 @@ impl Render for CommandPalette {
             Step::Actions | Step::Resources => None,
         };
         let footer = self.footer();
+        let note = match (&self.step, &self.resources) {
+            (Step::Resources, Some(resources)) => resources_note(resources),
+            _ => None,
+        };
         let root = v_flex()
             .id("command-palette")
             .key_context(registry::PALETTE)
@@ -1312,6 +1376,20 @@ impl Render for CommandPalette {
                             theme.muted_foreground
                         })
                         .child(text)
+                        .test_support(),
+                )
+            })
+            .when_some(note, |el, note| {
+                el.child(
+                    div()
+                        .id("palette-note")
+                        .aria_label(note.clone())
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(note)
                         .test_support(),
                 )
             });

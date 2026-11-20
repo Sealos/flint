@@ -113,7 +113,16 @@ async fn lists_kinds_and_objects_and_filters_them(cx: &mut TestAppContext) {
         ]
     );
     let pods = &switcher.rows[0];
-    assert_eq!(pods.detail.as_deref(), Some("Kind"));
+    assert_eq!(pods.detail.as_deref(), Some("Kind · 2 in memory"));
+    assert_eq!(
+        switcher.rows[2].detail.as_deref(),
+        Some("Kind · not loaded"),
+        "Services: no watch has listed them"
+    );
+    assert_eq!(
+        switcher.note, None,
+        "watch mode All lists every kind's objects"
+    );
     assert_eq!(pods.kind.as_deref(), Some("pods"));
     assert_eq!(pods.cluster.as_deref(), Some("alpha"));
     let web = &switcher.rows[6];
@@ -158,6 +167,50 @@ async fn finds_objects_by_kind_and_name(cx: &mut TestAppContext) {
     assert_eq!(shown(cx, &t).selected, Some(1));
     t.press(cx, "up");
     assert_eq!(shown(cx, &t).selected, Some(0));
+}
+
+// covers UP-31: when the objects arrive (or arrive again), the selection stays on the item the
+// user moved to, wherever its row went; an item no longer listed gives the first row.
+#[gpui_kit::test]
+async fn the_selection_follows_its_item_when_objects_arrive(cx: &mut TestAppContext) {
+    use crate::ui::switcher_model::Index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    let switcher = open_switcher(cx, &t).await;
+    t.type_text(cx, "web");
+    t.press(cx, "down");
+    let switcher_state = shown(cx, &t);
+    assert_eq!(selected(&switcher_state), "demo/web-7d9f");
+    let entries: Vec<flint_core::NavEntry> = standard_sections()
+        .into_iter()
+        .flat_map(|s| s.entries)
+        .collect();
+    let index = |rows: &[(&str, &str, i64)]| {
+        std::sync::Arc::new(Index::new(
+            &entries,
+            &[objects(KindId::pods(), rows, SyncState::Synced, 2)],
+        ))
+    };
+    // Shorter names arrive and rank first: the selection stays on web-7d9f, two rows down.
+    let arrived = index(&[
+        ("demo", "web", 0),
+        ("demo", "web-1", 0),
+        ("demo", "web-7d9f", 0),
+    ]);
+    switcher.update(cx, |p, cx| p.set_index(arrived, cx));
+    let after = shown(cx, &t);
+    assert_eq!(labels(&after), ["demo/web", "demo/web-1", "demo/web-7d9f"]);
+    assert_eq!(after.selected, Some(2));
+    // Gone: the first row.
+    let gone = index(&[("demo", "web", 0)]);
+    switcher.update(cx, |p, cx| p.set_index(gone, cx));
+    assert_eq!(shown(cx, &t).selected, Some(0));
+}
+
+fn selected(state: &PaletteState) -> &str {
+    &state.rows[state.selected.expect("a row is selected")].label
 }
 
 // covers UP-31: Enter on a kind opens its list, with focus, and closes the switcher.
@@ -310,7 +363,7 @@ async fn an_empty_cluster_lists_only_its_kinds(cx: &mut TestAppContext) {
         switcher
             .rows
             .iter()
-            .all(|r| r.detail.as_deref() == Some("Kind"))
+            .all(|r| r.detail.as_deref() == Some("Kind · not loaded"))
     );
     assert_eq!(
         switcher.footer.as_deref(),
@@ -318,6 +371,105 @@ async fn an_empty_cluster_lists_only_its_kinds(cx: &mut TestAppContext) {
     );
     t.type_text(cx, "web");
     assert_eq!(shown(cx, &t).footer.as_deref(), Some("Nothing matches"));
+}
+
+// covers UP-31: a failed discovery is said as such, and in On view mode the switcher says
+// that only the kinds being watched list their objects.
+#[gpui_kit::test]
+async fn says_why_kinds_or_objects_are_missing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.activate(cx, "alpha").await;
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: None,
+            error: Some("the server is unreachable".into()),
+        },
+    );
+    open_switcher(cx, &t).await;
+    assert_eq!(
+        shown(cx, &t).footer.as_deref(),
+        Some("No kinds: discovery failed")
+    );
+    t.press(cx, "escape");
+
+    let _stored = alpha_with_objects(cx, &t).await;
+    t.dispatch(cx, "workspace::WatchOpenViewsOnly", serde_json::Value::Null)
+        .unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.watch_mode_for("alpha") == flint_core::WatchMode::OnView
+    })
+    .await;
+    open_switcher(cx, &t).await;
+    let switcher = shown(cx, &t);
+    assert_eq!(
+        switcher.note.as_deref(),
+        Some("Only kinds being watched list their objects; open a kind to load them.")
+    );
+    assert!(t.find(cx, "palette-note").is_some());
+}
+
+// covers UP-31, UP-33: opening an object that is gone clears the selection shown before, says
+// the object no longer exists once the list is current, and stops waiting: one made later
+// with the name is not selected.
+#[gpui_kit::test]
+async fn opening_a_gone_object_says_so_and_stops_waiting(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        serde_json::json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    assert!(t.detail(cx).is_some());
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        serde_json::json!({"kind": "pods", "namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx), None, "the old selection is cleared at once");
+    assert!(t.detail(cx).is_none());
+    let list_state = |cx: &mut TestAppContext| {
+        let workspace = t.workspace.clone();
+        cx.update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).list.unwrap())
+        })
+        .unwrap()
+    };
+    let banner = list_state(cx)
+        .banners
+        .into_iter()
+        .find(|b| b.id == "list-missing")
+        .expect("the list says the object is gone");
+    assert_eq!(banner.text, "web no longer exists in demo.");
+    // Made again later: not selected out of the blue.
+    t.feed_list(
+        cx,
+        crate::ui::support_tests::pods(&[("demo", "api", 0), ("demo", "web", 0)]),
+    )
+    .await;
+    assert_eq!(t.selected(cx), None);
+    // A selection ends the notice.
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        serde_json::json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    assert!(
+        list_state(cx)
+            .banners
+            .iter()
+            .all(|b| b.id != "list-missing"),
+        "the notice went"
+    );
 }
 
 // covers UP-30, UP-31: Cmd-Shift-P in the switcher shows the actions, and Cmd-P the kinds and

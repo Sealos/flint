@@ -1226,7 +1226,9 @@ impl Workspace {
             })
             .when(!is_active, |el| el.hover(|el| el.bg(theme.list_hover)))
             // The keyboard cursor, while the sidebar has focus.
-            .when(ring, |el| el.border_1().border_color(theme.ring))
+            // Every row has the border, so the ring moving shifts nothing.
+            .border_1()
+            .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
             .on_click(registry::on_click(SelectCluster {
                 cluster: name.clone(),

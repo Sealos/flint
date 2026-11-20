@@ -233,7 +233,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   its kind, its namespace/name and its cluster; results come from memory instantly, even with tens of thousands of
   objects, and searching never makes a request to the cluster. The arrows move the selection; Enter on a kind opens its
   list, and on an object opens its kind's list with the object selected and its details shown; when the namespace
-  filter hides it, the filter is left as it is and the list says the object is filtered out. Esc closes it and puts focus back. Cmd-Shift-P swaps it for the command
+  filter hides it, the filter is left as it is and the list says the object is filtered out; when it no longer
+  exists, the list says so. The exact name comes first ("web" finds the Deployment web before web-cfg). Each kind says
+  how many of its objects are in memory, and in On view mode the switcher says only watched kinds list their
+  objects. Esc closes it and puts focus back. Cmd-Shift-P swaps it for the command
   palette and Cmd-P back. With nothing in memory yet it lists the kinds; with no cluster active it says to select one.
 - Tests: unit (fuzzy matching, 50,000 objects per keystroke, reading the stores without a request), ui.
 

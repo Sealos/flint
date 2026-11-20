@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, oneshot, watch};
 
 use crate::cluster::ClusterId;
 use crate::read::KindId;
@@ -28,6 +28,10 @@ pub(crate) struct Hub {
     /// Told about every publish. Set for the per-namespace hubs a namespace-limited list merges
     /// (see `engine::Engine::run_namespaced`), so the merger never polls.
     on_publish: Option<Arc<Notify>>,
+    /// One-off reads of the rows ([`HubRegistry::stored`]): the watch task answers each with a
+    /// snapshot of its own, kept nowhere else. They are not subscribers, so they neither make
+    /// the task publish, nor jump the list queue, nor keep the hub from being released.
+    peeks: Mutex<Vec<oneshot::Sender<Arc<KindSnapshot>>>>,
 }
 
 /// Snapshot versions come from one counter for the whole process, so a version never repeats
@@ -48,6 +52,7 @@ impl Hub {
             state: Mutex::new(SyncState::Idle),
             feed: Mutex::new(Feed::Watch),
             on_publish: None,
+            peeks: Mutex::new(Vec::new()),
         }
     }
 
@@ -80,6 +85,47 @@ impl Hub {
         }
         self.send(snapshot);
         true
+    }
+
+    /// Asks the watch task for one snapshot of its rows, without subscribing.
+    pub fn peek(&self) -> oneshot::Receiver<Arc<KindSnapshot>> {
+        let (tx, rx) = oneshot::channel();
+        let mut peeks = self.peeks.lock().unwrap_or_else(|e| e.into_inner());
+        // Readers that gave up waiting.
+        peeks.retain(|p| !p.is_closed());
+        peeks.push(tx);
+        drop(peeks);
+        self.wake.notify_one();
+        rx
+    }
+
+    /// Whether a one-off read is waiting for an answer.
+    pub fn has_peeks(&self) -> bool {
+        !self
+            .peeks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Answers the waiting one-off reads with `build()`'s snapshot, if `epoch` still owns the
+    /// hub. Nothing is kept in the hub.
+    pub fn answer_peeks(&self, epoch: u64, build: impl FnOnce() -> KindSnapshot) {
+        let owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        if *owner != epoch {
+            return;
+        }
+        drop(owner);
+        let peeks = std::mem::take(&mut *self.peeks.lock().unwrap_or_else(|e| e.into_inner()));
+        if peeks.iter().all(|p| p.is_closed()) {
+            return;
+        }
+        let mut snapshot = build();
+        snapshot.version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot = Arc::new(snapshot);
+        for peek in peeks {
+            let _ = peek.send(snapshot.clone());
+        }
     }
 
     /// Records the watch task's state if `epoch` still owns the hub. Cheap: no snapshot.
@@ -176,12 +222,13 @@ impl HubRegistry {
     /// (the resource switcher).
     ///
     /// It only reads. It never creates a hub, never tells the manager (so no watch starts, in
-    /// either watch mode) and never reaches the API server: a running watch task builds the
-    /// snapshot from the rows it holds. A watch nobody subscribes to publishes nothing, so it is
-    /// woken with a receiver held for the call, and waited for up to `wait`; a kind that does
-    /// not answer in time gives what it last published.
+    /// either watch mode) and never reaches the API server. A kind someone subscribes to gives
+    /// what it last published; any other is asked for one snapshot ([`Hub::peek`]), which its
+    /// watch task builds from the rows it holds and keeps nowhere: the hub still holds no rows
+    /// afterwards, the task still publishes nothing, its place in the list queue and the hub's
+    /// release do not change. A kind that does not answer within `wait` is left out.
     pub async fn stored(&self, cluster: &str, wait: std::time::Duration) -> Vec<Arc<KindSnapshot>> {
-        let peeked: Vec<(Arc<Hub>, watch::Receiver<Arc<KindSnapshot>>)> = {
+        let hubs: Vec<Arc<Hub>> = {
             let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
             map.iter()
                 .filter(|((c, _), hub)| {
@@ -191,25 +238,25 @@ impl HubRegistry {
                             SyncState::Synced | SyncState::Reconnecting { .. }
                         )
                 })
-                .map(|(_, hub)| (hub.clone(), hub.subscribe()))
+                .map(|(_, hub)| hub.clone())
                 .collect()
         };
         let deadline = tokio::time::Instant::now() + wait;
-        let mut stored = Vec::with_capacity(peeked.len());
+        let mut stored = Vec::with_capacity(hubs.len());
         let mut waiting = Vec::new();
-        for (hub, rx) in peeked {
-            if hub.listeners() > 1 {
-                // Someone else subscribes: what it published is current.
-                stored.push(rx.borrow().clone());
+        for hub in hubs {
+            if hub.listeners() > 0 {
+                // Someone subscribes: what it published is current.
+                stored.push(hub.latest());
             } else {
-                // Woken all at once, so they build their snapshots in parallel.
-                hub.wake.notify_one();
-                waiting.push(rx);
+                // Asked all at once, so they build their snapshots in parallel.
+                waiting.push(hub.peek());
             }
         }
-        for mut rx in waiting {
-            let _ = tokio::time::timeout_at(deadline, rx.changed()).await;
-            stored.push(rx.borrow_and_update().clone());
+        for rx in waiting {
+            if let Ok(Ok(snapshot)) = tokio::time::timeout_at(deadline, rx).await {
+                stored.push(snapshot);
+            }
         }
         stored.sort_by(|a, b| a.kind.cmp(&b.kind));
         stored
@@ -275,35 +322,52 @@ mod tests {
         assert_eq!(registry.states("c1"), [(pods, SyncState::Synced)]);
     }
 
-    // covers UP-31: reading the stores creates no hub and skips kinds that hold no rows.
+    // covers UP-31: reading the stores creates no hub, skips kinds that hold no rows, leaves
+    // nothing in the hubs and does not hold them: a release during the read still happens.
     #[tokio::test(start_paused = true)]
-    async fn stored_reads_listed_kinds_only_and_creates_no_hub() {
+    async fn stored_reads_listed_kinds_only_and_keeps_nothing() {
         let registry = HubRegistry::default();
-        let synced = registry.get_or_create("c1", &KindId::pods());
-        synced.take_over(KindSnapshot::empty(
+        let pods = registry.get_or_create("c1", &KindId::pods());
+        pods.take_over(KindSnapshot::empty(
             "c1".into(),
             KindId::pods(),
             SyncState::Synced,
         ));
-        let loading = registry.get_or_create("c1", &KindId::namespaces());
-        loading.take_over(KindSnapshot::empty(
-            "c1".into(),
-            KindId::namespaces(),
-            SyncState::Loading,
-        ));
+        let read = pods.subscribe();
         registry
-            .get_or_create("c2", &KindId::pods())
+            .get_or_create("c1", &KindId::namespaces())
             .take_over(KindSnapshot::empty(
-                "c2".into(),
-                KindId::pods(),
-                SyncState::Synced,
+                "c1".into(),
+                KindId::namespaces(),
+                SyncState::Loading,
             ));
-        // No task answers here: the call gives up after `wait` with what was published.
+        let unread = registry.get_or_create("c2", &KindId::pods());
+        unread.take_over(KindSnapshot::empty(
+            "c2".into(),
+            KindId::pods(),
+            SyncState::Synced,
+        ));
+        // Subscribed: what it published.
         let stored = registry
             .stored("c1", std::time::Duration::from_millis(50))
             .await;
         let kinds: Vec<&KindId> = stored.iter().map(|s| &s.kind).collect();
         assert_eq!(kinds, [&KindId::pods()]);
+        drop(read);
+        // Not subscribed and no task to answer: left out, and nothing held meanwhile.
+        let reading = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .stored("c2", std::time::Duration::from_millis(50))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(unread.listeners(), 0, "a read is not a subscriber");
+        assert!(unread.has_peeks());
+        registry.release("c2", &KindId::pods());
+        assert!(reading.await.unwrap().is_empty());
         assert!(
             registry
                 .stored("nowhere", Default::default())
@@ -311,10 +375,29 @@ mod tests {
                 .is_empty()
         );
         let map = registry.0.lock().unwrap();
-        assert_eq!(map.len(), 3, "no hub was created");
-        assert!(
-            map.values().all(|h| h.listeners() == 0),
-            "receivers dropped"
+        assert_eq!(
+            map.len(),
+            2,
+            "no hub was created, and the released one went"
         );
+        assert!(map.values().all(|h| h.listeners() == 0));
+    }
+
+    // A peek is answered once, by the owning task only, and leaves the channel as it was.
+    #[test]
+    fn peeks_are_answered_by_the_owner_and_kept_nowhere() {
+        let hub = Hub::new("c".into(), KindId::pods());
+        let epoch = hub.take_over(KindSnapshot::default());
+        let before = hub.latest();
+        let mut rx = hub.peek();
+        hub.answer_peeks(epoch + 1, KindSnapshot::default);
+        assert!(rx.try_recv().is_err(), "a stopped task does not answer");
+        hub.answer_peeks(epoch, || KindSnapshot {
+            state: SyncState::Synced,
+            ..Default::default()
+        });
+        assert_eq!(rx.try_recv().unwrap().state, SyncState::Synced);
+        assert!(!hub.has_peeks());
+        assert!(Arc::ptr_eq(&hub.latest(), &before), "nothing published");
     }
 }

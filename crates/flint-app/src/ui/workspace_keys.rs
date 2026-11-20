@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use flint_core::{KindId, NavEntry, display};
+use flint_core::{KindId, NavEntry, WatchMode, display};
 use gpui_kit::*;
 
 use super::super::focus::release_unfocused_input;
-use super::super::palette::{CommandPalette, Mode};
+use super::super::palette::{CommandPalette, Mode, SwitcherScope};
 use super::super::registry::{
     ActionError, ActivateSelectedCluster, Bind, GoBack, OpenObject, SelectCluster,
     SelectNextCluster, SelectPreviousCluster, ToggleResourceSwitcher,
@@ -50,8 +50,14 @@ impl History {
         self.0.pop()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The places remembered, latest first.
+    pub fn places(&self) -> impl Iterator<Item = &Place> {
+        self.0.iter().rev()
     }
 
     pub fn clear(&mut self) {
@@ -180,8 +186,12 @@ impl Workspace {
     }
 
     /// Whether Go Back has somewhere to go.
-    pub(super) fn can_go_back(&self) -> bool {
-        self.cluster.is_some() && !self.history.is_empty()
+    pub(super) fn can_go_back(&self, cx: &App) -> bool {
+        self.cluster.is_some()
+            && self
+                .history
+                .places()
+                .any(|p| self.nav_entry(p.kind.as_str(), cx).is_some())
     }
 
     /// Go Back: shows the kind and object shown before.
@@ -193,10 +203,13 @@ impl Workspace {
             };
             self.show_kind(&entry, false, window, cx);
             if let Some(list) = &self.list {
+                let focus = list.read(cx).focus_handle().clone();
                 list.update(cx, |list, cx| match place.object {
-                    Some((namespace, name)) => list.select_when_listed(namespace, name, cx),
+                    Some((namespace, name)) => list.select_listed(namespace, name, cx),
                     None => list.clear_selection(cx),
                 });
+                // Also when the kind was open already.
+                window.focus(&focus, cx);
             }
             return;
         }
@@ -250,7 +263,7 @@ impl Workspace {
         self.show_kind(&entry, false, window, cx);
         if let Some(list) = &self.list {
             let focus = list.read(cx).focus_handle().clone();
-            list.update(cx, |list, cx| list.select_when_listed(namespace, name, cx));
+            list.update(cx, |list, cx| list.select_listed(namespace, name, cx));
             window.focus(&focus, cx);
         }
     }
@@ -289,6 +302,15 @@ impl Workspace {
             })
             .unwrap_or_default();
         let core = model.core().clone();
+        let discovery_failed = self
+            .cluster
+            .as_ref()
+            .and_then(|c| model.discovery.get(c))
+            .is_some_and(|d| d.discovery.is_none() && d.error.is_some());
+        let on_view = self
+            .cluster
+            .as_deref()
+            .is_some_and(|c| model.settings.watch_mode_for(c) == WatchMode::OnView);
         let cluster = self.cluster.clone();
         let label = cluster
             .as_deref()
@@ -296,9 +318,14 @@ impl Workspace {
         let index = Index::new(&entries, &[]);
         let loading = cluster.is_some() && !entries.is_empty();
         let fallback = self.focus.clone();
-        let palette = cx.new(|cx| {
-            CommandPalette::switcher(previous, fallback, label, index, loading, window, cx)
-        });
+        let scope = SwitcherScope {
+            cluster: label,
+            index,
+            loading,
+            discovery_failed,
+            on_view,
+        };
+        let palette = cx.new(|cx| CommandPalette::switcher(previous, fallback, scope, window, cx));
         self._switcher = match cluster.filter(|_| loading) {
             Some(cluster) => {
                 let stored = core.stored_snapshots(&cluster);
@@ -337,6 +364,7 @@ mod tests {
         assert!(history.is_empty());
         history.push(place("pods", None));
         history.push(place("pods", Some("web")));
+        assert_eq!(history.places().count(), 2);
         history.push(place("pods", Some("web")));
         history.push(place("services", None));
         assert_eq!(history.pop(), Some(place("services", None)));

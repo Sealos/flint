@@ -249,7 +249,52 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     })
     .await;
     assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert_eq!(focus(cx, &t), Focus::List);
     assert!(!t.available(cx).contains(&"workspace::GoBack"));
+    // Back to the kind already open: the object is selected again, and the list has focus.
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        json!({"kind": "pods", "namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    assert_eq!(t.selected(cx).as_deref(), Some("api"));
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert_eq!(focus(cx, &t), Focus::List);
+    // A place whose kind the cluster no longer serves is no way back.
+    t.dispatch(cx, "workspace::OpenView", json!({"kind": "secrets"}))
+        .unwrap();
+    assert!(t.available(cx).contains(&"workspace::GoBack"));
+    let without_pods: Vec<_> = standard_sections()
+        .into_iter()
+        .map(|mut s| {
+            s.entries.retain(|e| e.id != KindId::pods());
+            s
+        })
+        .collect();
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                without_pods,
+            ))),
+            error: None,
+        },
+    );
+    assert!(!t.available(cx).contains(&"workspace::GoBack"));
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                standard_sections(),
+            ))),
+            error: None,
+        },
+    );
     // Another cluster starts over.
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
         .unwrap();

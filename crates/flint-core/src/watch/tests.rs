@@ -932,6 +932,12 @@ async fn stored_rows_are_read_without_another_request() {
     assert_eq!(fake.list_calls("pods"), lists, "no list");
     assert_eq!(fake.watch_requests("pods").len(), watches, "no watch");
     assert_eq!(hub.listeners(), 0, "the call let go of the hub");
+    // Nothing stays built in the hub: it still holds no rows, as before the read.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        hub.latest().rows.is_empty(),
+        "the rows were left in the hub"
+    );
     task.abort();
 }
 

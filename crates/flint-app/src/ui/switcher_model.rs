@@ -18,6 +18,14 @@ use super::palette_model::{ALT_PENALTY, Matcher};
 
 /// At most this many results are listed; typing more narrows them.
 pub const RESULTS: usize = 200;
+/// Extra points when the query is the whole name (the kind's label, or the object's name
+/// without its namespace), ignoring case: Deployment `demo/web` before ConfigMap
+/// `demo/web-cfg` for "web".
+const EXACT_NAME: i32 = 200;
+/// Extra points when the name starts with the query.
+const NAME_PREFIX: i32 = 100;
+/// Extra points when the query is found in the name alone, not across the namespace.
+const IN_NAME: i32 = 16;
 
 /// A kind the switcher offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +33,9 @@ pub struct Kind {
     pub id: KindId,
     /// As the navigation shows it: Deployments.
     pub label: String,
+    /// How many of its objects are in memory; `None` when its watch has not listed it (not
+    /// watched now, or still loading).
+    pub in_memory: Option<usize>,
 }
 
 /// An object of a kind, as the list finds it.
@@ -49,6 +60,36 @@ pub struct Item {
     pub alt: Box<str>,
     /// Whether `text` is ASCII (names almost always are), known once rather than per keystroke.
     ascii: bool,
+    /// Where the name starts in `text`: after `namespace/`.
+    name_at: u32,
+}
+
+impl Item {
+    /// The name: the kind's label, or the object's name without its namespace.
+    pub fn name(&self) -> &str {
+        &self.text[self.name_at as usize..]
+    }
+}
+
+/// [`EXACT_NAME`] or [`NAME_PREFIX`] for `name` and the lowercase `query`, else 0.
+fn name_bonus(name: &str, query: &str) -> i32 {
+    let (exact, prefix) = if name.is_ascii() && query.is_ascii() {
+        (
+            name.eq_ignore_ascii_case(query),
+            name.len() >= query.len()
+                && name.as_bytes()[..query.len()].eq_ignore_ascii_case(query.as_bytes()),
+        )
+    } else {
+        let name = name.to_lowercase();
+        (name == query, name.starts_with(query))
+    };
+    if exact {
+        EXACT_NAME
+    } else if prefix {
+        NAME_PREFIX
+    } else {
+        0
+    }
 }
 
 /// Everything the switcher searches: the kinds first, in navigation order, then the objects by
@@ -83,10 +124,12 @@ impl Index {
                 text: entry.label.as_str().into(),
                 alt: format!("{} {}", entry.id, entry.kind).into(),
                 ascii: entry.label.is_ascii(),
+                name_at: 0,
             });
             index.kinds.push(Kind {
                 id: entry.id.clone(),
                 label: entry.label.clone(),
+                in_memory: None,
             });
         }
         for snapshot in snapshots {
@@ -108,10 +151,13 @@ impl Index {
                     }),
                     alt: format!("{label} {text}").into(),
                     ascii: text.is_ascii(),
+                    name_at: row.namespace.as_ref().map_or(0, |ns| ns.len() as u32 + 1),
                     text,
                 });
                 index.objects += 1;
             }
+            let kind = &mut index.kinds[kind as usize];
+            kind.in_memory = Some(kind.in_memory.unwrap_or(0) + snapshot.rows.len());
         }
         index
     }
@@ -147,8 +193,10 @@ pub struct Search {
 
 impl Search {
     /// The items matching `query`, best first. With no query: the kinds, then the objects, in
-    /// index order. With one: by score, so a closer match always wins; a match of the text beats
-    /// the same match of the second text; among equal scores, index order (kinds first).
+    /// index order. With one: by score, so a closer match always wins. The name counts most: the
+    /// query being the whole name, then its start, then found in the name alone (not across the
+    /// namespace) earns extra points. A match of the text beats the same match of the second
+    /// text; among equal scores, the shorter text first, then index order (kinds first).
     pub fn run(&mut self, index: &Index, query: &str) -> Found {
         let mut matcher = Matcher::new(query);
         if matcher.is_empty() {
@@ -176,6 +224,11 @@ impl Search {
             .iter()
             .map(|k| matcher.prefix_len(&k.label))
             .collect();
+        let lowered: String = query
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
         let mut matched: Vec<u32> = Vec::new();
         // (points, item, whether the text itself matched)
         let mut scored: Vec<(i32, u32, bool)> = Vec::new();
@@ -183,7 +236,7 @@ impl Search {
         let mut consider = |ix: u32, matcher: &mut Matcher| {
             let item = &index.items[ix as usize];
             let found = match matcher.quick_points_of(&item.text, item.ascii) {
-                Some(points) => Some((points, true)),
+                Some(points) => Some((points + name_bonus(item.name(), &lowered), true)),
                 None => {
                     let alt_possible = item.object.is_none() || {
                         let taken = label_takes[item.kind as usize];
@@ -207,7 +260,8 @@ impl Search {
             None => (0..index.items.len() as u32).for_each(|ix| consider(ix, &mut matcher)),
         }
         let total = scored.len();
-        let order = |a: &(i32, u32, bool)| (std::cmp::Reverse(a.0), a.1);
+        let length = |ix: u32| index.items[ix as usize].text.len();
+        let order = |a: &(i32, u32, bool)| (std::cmp::Reverse(a.0), length(a.1), a.1);
         if scored.len() > RESULTS {
             scored.select_nth_unstable_by_key(RESULTS - 1, order);
             scored.truncate(RESULTS);
@@ -218,9 +272,14 @@ impl Search {
             .map(|(quick, ix, own)| {
                 let item = &index.items[ix as usize];
                 let (points, ranges) = if own {
+                    let in_name = match matcher.points(item.name()) {
+                        Some(_) if item.name_at > 0 => IN_NAME,
+                        _ => 0,
+                    };
+                    let bonus = name_bonus(item.name(), &lowered) + in_name;
                     matcher
                         .score(&item.text)
-                        .map_or((quick, Vec::new()), |s| (s.points, s.ranges))
+                        .map_or((quick, Vec::new()), |s| (s.points + bonus, s.ranges))
                 } else {
                     let points = matcher.points(&item.alt).map_or(quick, |p| p - ALT_PENALTY);
                     (points, Vec::new())
@@ -228,7 +287,9 @@ impl Search {
                 (points, Hit { item: ix, ranges })
             })
             .collect();
-        listed.sort_unstable_by_key(|(points, hit)| (std::cmp::Reverse(*points), hit.item));
+        listed.sort_unstable_by_key(|(points, hit)| {
+            (std::cmp::Reverse(*points), length(hit.item), hit.item)
+        });
         let hits = listed.into_iter().map(|(_, hit)| hit).collect();
         self.last = Some((matcher, matched));
         Found {
@@ -332,6 +393,8 @@ mod tests {
                 "worker-1"
             ]
         );
+        assert_eq!(index.kinds[0].in_memory, Some(2));
+        assert_eq!(index.kinds[2].in_memory, Some(1));
         let web = &index.items[5];
         assert_eq!(index.kind_of(web).label, "Deployments");
         let object = web.object.as_ref().unwrap();
@@ -359,10 +422,10 @@ mod tests {
             texts(&index, &mut search, "coredns"),
             ["kube-system/coredns"]
         );
-        // Equal matches keep the index order.
+        // The whole name first, then the name it starts.
         assert_eq!(
             texts(&index, &mut search, "web"),
-            ["demo/web-1", "demo/web"]
+            ["demo/web", "demo/web-1"]
         );
         assert_eq!(texts(&index, &mut search, "pods web"), ["demo/web-1"]);
         assert_eq!(
@@ -375,6 +438,38 @@ mod tests {
         // The matched bytes of the text, for highlighting.
         let found = search.run(&index, "coredns");
         assert_eq!(found.hits[0].ranges, vec![12..19_usize]);
+    }
+
+    // covers UP-31: the name decides before the namespace and the kind: the Deployment named
+    // web before the ConfigMap web-cfg; equal matches the shorter first.
+    #[test]
+    fn the_exact_name_ranks_first() {
+        let index = Index::new(
+            &[
+                entry("", "configmaps", "ConfigMap", "ConfigMaps"),
+                entry("apps", "deployments", "Deployment", "Deployments"),
+                entry("", "pods", "Pod", "Pods"),
+            ],
+            &[
+                snapshot(
+                    KindId::new("", "configmaps"),
+                    &[(Some("demo"), "web-cfg"), (Some("demo"), "a-web")],
+                ),
+                snapshot(KindId::new("apps", "deployments"), &[(Some("demo"), "web")]),
+                snapshot(
+                    KindId::pods(),
+                    &[(Some("x"), "api-10"), (Some("x"), "api-1")],
+                ),
+            ],
+        );
+        let mut search = Search::default();
+        assert_eq!(
+            texts(&index, &mut search, "web"),
+            ["demo/web", "demo/web-cfg", "demo/a-web"]
+        );
+        assert_eq!(texts(&index, &mut search, "ap1"), ["x/api-1", "x/api-10"]);
+        assert_eq!(index.items[3].name(), "web-cfg");
+        assert_eq!(index.items[0].name(), "ConfigMaps");
     }
 
     // covers UP-31: typing more searches only the earlier matches, with the same results as
@@ -404,9 +499,10 @@ mod tests {
         let found = search.run(&index, "api");
         assert_eq!(found.matched, RESULTS + 51);
         assert_eq!(found.hits.len(), RESULTS);
-        // Equal matches keep the index order; one with a gap ranks after them all.
+        // The exact name first, then the shorter names it starts.
+        assert_eq!(&*index.items[found.hits[0].item as usize].text, "demo/api");
         assert_eq!(
-            &*index.items[found.hits[0].item as usize].text,
+            &*index.items[found.hits[1].item as usize].text,
             "demo/api-0"
         );
         let gapped = search.run(&index, "ap1");

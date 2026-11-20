@@ -133,6 +133,9 @@ pub struct PaletteState {
     pub footer: Option<String>,
     /// Why the last Enter did nothing, if it did nothing.
     pub error: Option<String>,
+    /// A second line under the footer: in the resource switcher in On view mode, that only the
+    /// kinds being watched list their objects.
+    pub note: Option<String>,
 }
 
 /// At most this many palette rows are in the state.

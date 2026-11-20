@@ -123,6 +123,9 @@ impl ResourceList {
     fn banner_states(&self) -> Vec<Banner> {
         let snapshot = &self.shown;
         let mut banners = Vec::new();
+        if let Some(text) = self.missing_text() {
+            banners.push(Banner::new("list-missing", Level::Warning, text));
+        }
         if let Some(text) = self.filtered_out_text() {
             banners.push(Banner::new("list-filtered-out", Level::Info, text));
         }

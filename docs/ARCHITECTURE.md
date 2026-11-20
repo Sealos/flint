@@ -116,9 +116,12 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   events are never forwarded to the UI one by one.
 - Snapshots are shared, read-only data (`Arc`). Views never hold locks on core state.
 - A watch nobody subscribes to builds no snapshots. `CoreHandle::stored_snapshots` reads the rows every watch of a
-  cluster holds without subscribing: it wakes the watches with a receiver held for the call (up to 300 ms), never
-  tells the manager, creates no hub and makes no request, so no watch starts in either mode. The resource switcher
-  uses it.
+  cluster holds without subscribing: a kind someone subscribes to gives what it last published, and any other is
+  asked for one snapshot (`Hub::peek`, a one-shot reply, answered within 300 ms or left out), which its watch task
+  builds from its store and keeps nowhere. A read is not a subscriber: the hub still holds no rows afterwards, the
+  task publishes nothing, the kind keeps its place behind the per-cluster list limit, and the hub can be released
+  meanwhile. It never tells the manager, creates no hub and makes no request, so no watch starts in either mode.
+  The resource switcher uses it.
 
 ## Clusters
 
@@ -919,7 +922,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   over the active cluster's listable kinds and the objects its watches hold in memory, jumping straight to a list or
   a detail view. Rows show the namespace/name (or the kind's label), the kind and the cluster.
   - Never the network: the objects come from `CoreHandle::stored_snapshots` (above), so a kind not watched now (On
-    view mode, or still loading) has no objects listed. Its kind is still listed.
+    view mode, or still loading) has no objects listed. Its kind is still listed, its row saying how many of its
+    objects are in memory or that they are not loaded; in On view mode a note under the footer says that only the
+    kinds being watched list their objects. A failed discovery is said as such.
   - Off the render path: the kinds are listed at once, and the objects arrive a moment later, once the stores are
     read and the index is built on a background thread. Each keystroke runs the search once: when the query only
     grew, over the last query's matches; a subsequence pass rules out most objects, a linear-time score with no
@@ -927,10 +932,16 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     their order and highlights. The rows are a virtual list. A unit test types a name over 50,000 objects within
     50 ms a keystroke in an unoptimized build.
   - "pods web" finds the pod `web`: an object also matches its kind's label followed by its text, with less weight.
+  - The name counts most: the query being the whole name (the object's without its namespace, or the kind's label)
+    earns the most extra points, the name starting with it fewer, and the query found in the name alone a few, so
+    Deployment `demo/web` comes before ConfigMap `demo/web-cfg` for "web". Equal scores list the shorter text
+    first. While the objects arrive, the selection stays on the item the user moved to.
   - Enter on a kind runs Open Kind… (`workspace::OpenView`); on an object, Open Object… (`workspace::OpenObject`,
     hidden from the palette), which opens the kind's list with the object selected, so its details show. The
     namespace filter is never changed for it: when the filter hides the object, its row is not listed, its details
-    still show, and the list says so (`list-filtered-out`). Both go through the registry from where focus
+    still show, and the list says so (`list-filtered-out`). The selection shown before is cleared at once; when the
+    first current list lacks the object, the list says it no longer exists (`list-missing`) and stops waiting, so
+    one made later with the name is not selected. Clearing the selection drops a pick still waited for. Both go through the registry from where focus
     was, as the palette runs any action, and are not recorded as recent actions.
   - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
     in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.
@@ -945,11 +956,14 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     section, Right opens a section and Left closes it, from a kind its own (`navigation::*`). These are bound on the
     pane's own element, so they are available, and listed by the palette, only while it has focus; their keys are in
     `ClusterSidebar && !Input` and `Navigation && !Input`, deeper than the list's arrows in `Workspace && !Input`.
-  - The cursor shows as a 1 px border in the theme's `ring` color while its pane has focus; a click, or a cluster or
-    kind picked any other way, moves it there.
-  - Go Back (Cmd-[, `workspace::GoBack`) returns to the kind and object shown before: opening another kind, or
-    jumping from the switcher, remembers the list and its selected object (at most 50 places). It is per active
-    cluster: switching clusters forgets them. In a text field Cmd-[ is the field's (outdent).
+  - The cursor shows as a 1 px border in the theme's `ring` color while its pane has focus; every row has the
+    border, transparent off the cursor, so the ring moving shifts nothing. A click, or a cluster or kind picked any
+    other way, moves it there.
+  - Go Back (Cmd-[, `workspace::GoBack`) returns to the kind and object shown before, with focus in the list:
+    opening another kind, or jumping from the switcher, remembers the list and its selected object (at most 50
+    places). It is available only while a remembered kind is still served; places of kinds no longer served are
+    skipped. It is per active cluster: switching clusters forgets them. In a text field Cmd-[ is the field's
+    (outdent).
 
 ## Settings and state
 

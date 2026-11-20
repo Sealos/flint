@@ -106,6 +106,12 @@ pub struct ResourceList {
     reveal_selected: bool,
     /// An object to select as soon as it is listed (`FLINT_VIEW`): namespace and name.
     pending_select: Option<(Option<String>, String)>,
+    /// The pending object is waited for only until the first current snapshot (the resource
+    /// switcher, Go Back), not for good (`FLINT_VIEW`).
+    pending_once: bool,
+    /// An object asked for ([`ResourceList::select_listed`]) that the list did not have: what
+    /// the list says about it, until another selection.
+    missing: Option<(Option<String>, String)>,
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
@@ -219,6 +225,8 @@ impl ResourceList {
             selected_gone: false,
             reveal_selected: false,
             pending_select: None,
+            pending_once: false,
+            missing: None,
             computing: false,
             dirty: false,
             remeasure: false,
@@ -312,6 +320,11 @@ impl ResourceList {
         if let Some((namespace, name)) = self.pending_select.take() {
             if find_row(&self.latest, namespace.as_deref(), &name).is_some() {
                 self.select_named(namespace.as_deref(), &name, cx);
+            } else if self.pending_once && self.latest.state.is_current() {
+                // Listed in full and not there: it is gone. Stop waiting, so an object made
+                // later with the name is not selected out of the blue.
+                self.missing = Some((namespace, name));
+                cx.notify();
             } else {
                 self.pending_select = Some((namespace, name));
             }
@@ -336,15 +349,51 @@ impl ResourceList {
         name: String,
         cx: &mut Context<Self>,
     ) {
+        self.pending_once = false;
+        self.missing = None;
         self.pending_select = Some((namespace, name));
         let latest = self.latest.clone();
         self.set_snapshot(latest, cx);
+    }
+
+    /// Selects the object with `name` in `namespace` once the list is current, as a click
+    /// would: the resource switcher and Go Back. The selection shown before is cleared at once;
+    /// if the first current list lacks the object, the list says it no longer exists and stops
+    /// waiting.
+    pub fn select_listed(
+        &mut self,
+        namespace: Option<String>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|s| s.namespace != namespace || s.name != name)
+        {
+            self.clear_selection(cx);
+        }
+        self.missing = None;
+        self.pending_once = true;
+        self.pending_select = Some((namespace, name));
+        let latest = self.latest.clone();
+        self.set_snapshot(latest, cx);
+    }
+
+    /// What the list says about an object asked for that it does not have.
+    pub(in crate::ui) fn missing_text(&self) -> Option<String> {
+        let (namespace, name) = self.missing.as_ref()?;
+        Some(match namespace {
+            Some(ns) => format!("{name} no longer exists in {ns}."),
+            None => format!("{name} no longer exists."),
+        })
     }
 
     fn select_named(&mut self, namespace: Option<&str>, name: &str, cx: &mut Context<Self>) {
         let Some(row) = find_row(&self.latest, namespace, name) else {
             return;
         };
+        self.missing = None;
         let row = &self.latest.rows[row];
         self.selected = Some(Selected {
             uid: row.uid.clone(),
@@ -496,6 +545,7 @@ impl ResourceList {
         window.focus(&self.focus, cx);
         // A user's choice wins over a startup selection still waiting for its object.
         self.pending_select = None;
+        self.missing = None;
         self.selected_ix = Some(ix);
         self.selected_gone = false;
         self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
@@ -514,6 +564,9 @@ impl ResourceList {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        // An object still waited for would be selected later, out of the blue.
+        self.pending_select = None;
+        self.missing = None;
         if self.selected.take().is_some() {
             self.selected_ix = None;
             cx.emit(ListEvent::Selected(None));
@@ -969,8 +1022,6 @@ impl ResourceList {
         }
     }
 
-    /// Banners over the rows: not current (reconnecting, failing), limited to some namespaces
-    /// by permissions, or without server columns.
     /// What the list says when the selected object's namespace is outside the namespace
     /// filter (opened from the resource switcher): its row is hidden, its details show.
     pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
@@ -981,15 +1032,25 @@ impl ResourceList {
             return None;
         }
         Some(format!(
-            "{} is in namespace {namespace}, which the namespace filter hides: its row is not \
-             listed, and its details show.",
+            "{} is in namespace {namespace}, outside the namespace filter, so its row is hidden; \
+             its details are shown.",
             selected.name
         ))
     }
 
+    /// Banners over the rows: an object asked for that is gone, or whose row the namespace
+    /// filter hides; not current (reconnecting, failing), limited to some namespaces by
+    /// permissions, or without server columns.
     fn banners(&self, theme: &Theme) -> Vec<AnyElement> {
         let snapshot = &self.shown;
         let mut banners = Vec::new();
+        if let Some(text) = self.missing_text() {
+            banners.push(
+                notice("list-missing", text, theme.warning)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
         if let Some(text) = self.filtered_out_text() {
             banners.push(
                 notice("list-filtered-out", text, theme.info)

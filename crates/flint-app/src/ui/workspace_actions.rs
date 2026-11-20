@@ -170,7 +170,7 @@ impl Workspace {
                 |ws, _| ws.cluster.is_some(),
                 |ws, a, cx| ws.check_open_object(a, cx),
             )
-            .when::<GoBack>(|ws, _| ws.can_go_back())
+            .when::<GoBack>(|ws, cx| ws.can_go_back(cx))
             .add::<SetNamespaces>(
                 |ws, _| ws.cluster.is_some(),
                 |_, a, _| match a.namespaces.iter().any(|n| n.trim().is_empty()) {

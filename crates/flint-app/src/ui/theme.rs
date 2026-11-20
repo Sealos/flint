@@ -72,6 +72,17 @@ fn apply_accent(colors: &mut ThemeConfigColors, shades: &Shades) {
     colors.chart_1 = c(shades.fill);
 }
 
+/// The border colour of a row the keyboard cursor can be on (the cluster sidebar, the
+/// navigation): the theme's focus ring on the cursor's row, else the same ring fully
+/// transparent. Every such row keeps a 1 px border, so moving the ring shifts nothing.
+pub fn cursor_ring(theme: &Theme, on: bool) -> Hsla {
+    if on {
+        theme.ring
+    } else {
+        theme.ring.opacity(0.)
+    }
+}
+
 /// The accent edge that marks a selected row or item, drawn beside its tint: the tint alone is too
 /// faint to tell selected apart. Put it in a `relative()` element; `inset` keeps it off the
 /// element's top and bottom, so it sits clear of rounded corners.
@@ -189,14 +200,22 @@ pub fn show(mode: ThemeMode, cx: &mut App) {
 pub(super) mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
     use super::{
-        THEMES, chrome, log_current_line, log_current_match, log_match, log_source_colors, resolve,
-        status_dot, themes,
+        THEMES, chrome, cursor_ring, log_current_line, log_current_match, log_match,
+        log_source_colors, resolve, status_dot, themes,
     };
     use crate::ui::accent::{ACCENT, CANDIDATES};
     use flint_core::Appearance;
     use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, try_parse_color};
     use gpui_kit::{Hsla, InteractiveElement as _, Rgba, Styled as _, WindowAppearance, div, hsla};
     use std::rc::Rc;
+
+    // The keyboard cursor's border is the focus ring, and invisible off the cursor (UP-33).
+    #[test]
+    fn the_cursor_ring_is_the_focus_ring_or_nothing() {
+        let theme = Theme::default();
+        assert_eq!(cursor_ring(&theme, true), theme.ring);
+        assert_eq!(cursor_ring(&theme, false).a, 0.);
+    }
 
     // Each status dot draws exactly as the hand-built circle it replaced: the nav's dot and
     // ring, the list's, the log and shell tabs' and the dock tab's state dots, the detail

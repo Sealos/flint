@@ -183,7 +183,9 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     action, detail, shortcut, kind, cluster}], total, selected, footer, error}`. `mode` is `actions` (Cmd-Shift-P) or
     `resources` (the resource switcher, Cmd-P, `palette::ToggleResourceSwitcher`), whose rows have `label` the
     namespace/name or the kind's label, `detail` the object's kind or `Kind`, `kind` the kind's id and `cluster`;
-    its footer says what it searches. `action` is the name of the action whose `argument` it asks
+    its footer says what it searches, and `note` (null otherwise) says, in On view mode, that only watched kinds
+    list their objects. A list's `banners` include `list-missing` (an object opened that no longer exists) and
+    `list-filtered-out` (the selected object's namespace is outside the filter). `action` is the name of the action whose `argument` it asks
     for (`logs::OpenSelectorLogs`), and `step` the heading shown then (its label and the picks so far: `Open Logs by
     Label Selector… · demo`); both are null while it lists actions. A row's `action` is its action's name; `detail`
     is an action's category, a choice's detail, or `typed` for the text typed; at most 200 rows, `total` counting
