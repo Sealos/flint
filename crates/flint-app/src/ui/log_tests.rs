@@ -1876,3 +1876,36 @@ async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppC
         .await;
     assert_eq!(next(cx), Some(4));
 }
+
+// covers UP-44: a copy still being built when the tab closes reaches the clipboard, and of two
+// copies in flight only the later one does.
+#[gpui_kit::test]
+async fn a_copy_lands_after_its_tab_closes(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    cx.run_until_parked();
+    let copy = |cx: &mut TestAppContext, selection| {
+        view.update(cx, |v, _| v.selection = Some(selection));
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_action(Box::new(registry::CopyLines), cx)
+        })
+        .unwrap();
+    };
+    copy(cx, LineSelection::new(0, 1));
+    copy(cx, LineSelection::new(2, 3));
+    cx.run_until_parked();
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied, "line 2\nline 3");
+
+    copy(cx, LineSelection::new(5, 6));
+    let released = view.downgrade();
+    drop(view);
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert!(released.upgrade().is_none(), "the tab is gone");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied, "line 5\nline 6");
+}

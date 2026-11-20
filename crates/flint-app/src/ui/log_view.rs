@@ -160,8 +160,8 @@ pub struct LogView {
     focus: FocusHandle,
     _pump: Task<()>,
     _search: Task<()>,
-    /// Builds a copy's text off the UI thread; replaced by the next copy.
-    _copy: Task<()>,
+    /// Copies asked for so far: only the latest one still being built reaches the clipboard.
+    copies: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -239,7 +239,7 @@ impl LogView {
             focus: cx.focus_handle(),
             _pump: pump,
             _search: Task::ready(()),
-            _copy: Task::ready(()),
+            copies: 0,
             _subscriptions: vec![on_search],
         }
     }

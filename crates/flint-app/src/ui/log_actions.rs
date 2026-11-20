@@ -278,8 +278,8 @@ impl LogView {
     }
 
     /// Copies the selected lines as shown now. The text is built off the UI thread (a million
-    /// lines take a fifth of a second), then put on the clipboard; a newer copy replaces one
-    /// still being built.
+    /// lines take a fifth of a second), then put on the clipboard, also if the tab closed
+    /// meanwhile (as a save finishes); a newer copy replaces one still being built.
     fn copy_lines(&mut self, _: &CopyLines, _: &mut Window, cx: &mut Context<Self>) {
         let Some(selection) = self.selection else {
             cx.propagate();
@@ -288,12 +288,21 @@ impl LogView {
         let lines = self.snapshot.lines.clone();
         let count = selection.present_len(&lines);
         let format = self.format();
-        self._copy = cx.spawn(async move |this, cx| {
+        self.copies += 1;
+        let copy = self.copies;
+        cx.spawn(async move |this, cx| {
             let text = cx
                 .background_spawn(async move { selection.text_as(&lines, format) })
                 .await;
+            // A closed tab copies nothing more: its last copy is the latest.
+            if !this
+                .read_with(cx, |view, _| view.copies == copy)
+                .unwrap_or(true)
+            {
+                return;
+            }
+            cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
             let _ = this.update(cx, |view, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
                 view.set_note(
                     Tone::Muted,
                     format!(
@@ -304,7 +313,8 @@ impl LogView {
                 );
                 cx.notify();
             });
-        });
+        })
+        .detach();
     }
 }
 
