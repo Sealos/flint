@@ -1995,6 +1995,8 @@ dependencies = [
  "async-channel",
  "futures",
  "http",
+ "hyper-timeout",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "libc",
@@ -2009,6 +2011,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 1.2.1+spec-1.1.0",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

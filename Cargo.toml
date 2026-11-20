@@ -44,7 +44,11 @@ alacritty_terminal = { version = "0.26.0", default-features = false }
 
 # The fake API server in flint-e2e. All but rcgen are already in the tree through kube.
 hyper = { version = "1.12.0", features = ["server", "http1"] }
+# Also flint-core's client stack (`cluster::build_client`), which sets TCP keepalive.
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+# Already in the tree through kube; the rest of `cluster::build_client`'s stack, as kube builds it.
+hyper-timeout = "0.5.2"
+tower = { version = "0.5.3", default-features = false, features = ["util", "retry"] }
 http-body-util = "0.1.5"
 bytes = "1.12.2"
 tokio-rustls = { version = "0.26.6", default-features = false }

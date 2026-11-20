@@ -22,6 +22,10 @@ tracing.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 http.workspace = true
+# The client stack with TCP keepalive (`cluster::build_client`); all already in the tree through kube.
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+hyper-timeout.workspace = true
+tower.workspace = true
 # Already in the tree through kube; names TLS handshake failures (`api_error`).
 rustls.workspace = true
 serde-saphyr.workspace = true

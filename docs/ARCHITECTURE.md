@@ -128,6 +128,11 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   plus `/opt/homebrew/bin:/usr/local/bin`. A `path` value in `settings.toml` overrides all of this. Flint sets the
   result as its own process `PATH` before starting the tokio runtime or any threads, because `kube` starts exec
   plugins with Flint's own environment. VS Code does the same.
+- **Dead connections:** API server connections use TCP keepalive as client-go does (first probe after 30 s idle,
+  then every 30 s, 9 probes), so a connection that died silently (the Mac slept, the network or VPN changed) fails
+  and its log stream, watch or shell reconnects or ends instead of waiting forever. There is no read timeout: it would
+  end healthy streams that are only quiet. kube has no hook for this, so `cluster::build_client` builds kube's client
+  stack itself with a keepalive connector.
 - One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view.
 - The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
   with their watches running in the background, so switching to them is instant. The least recently used is made
@@ -244,6 +249,12 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   `[pod/container]` prefix are view toggles, and a workload tab counts its streams in the toolbar. Copy and Save
   (after a confirmation, then the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot
   diff, line text and highlights, state wording, save text) are in `log_model.rs`.
+- **Colors and control characters** are stripped from each line once, on arrival in the core
+  (`logs::strip_controls`), before it is classified, searched or stored: ANSI escape sequences (SGR colors, cursor
+  codes, OSC titles and links, cut-off sequences at the end of a line) and control characters other than tab.
+  Only the text after a line's last carriage return is kept, as a terminal shows a redrawn progress bar. Colors
+  are not interpreted, so lines show, copy and save as plain text, and `\x1b[33mWARN` still reads as a warning.
+  Only a line with something to strip costs an extra allocation.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
   following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
   of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.

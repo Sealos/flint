@@ -56,6 +56,11 @@ const EARLY_OUTPUT: usize = 4096;
 /// How long to wait for the exit status after the output stream ends.
 const STATUS_WAIT: Duration = Duration::from_secs(2);
 
+/// How long output left in the pipe is read after the connection ends. kube ends the stream
+/// after a clean close, so this bound only matters when the connection broke: its message
+/// loop then returns without ending the stream, which would otherwise never reach its end.
+const DRAIN_WAIT: Duration = Duration::from_millis(250);
+
 /// What to run, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
@@ -723,7 +728,7 @@ impl Session {
             mut stdout,
             resize,
             status,
-            finish,
+            mut finish,
         } = process;
         let (remote, rx) = mpsc::unbounded_channel();
         let writer = AbortOnDrop(tokio::spawn(write_remote(stdin, resize, rx)));
@@ -744,9 +749,14 @@ impl Session {
         let mut started = false;
         // The first output, for runtimes that print a missing executable on the TTY.
         let mut early = Vec::new();
+        // How the connection ended, once it has, and until when the output left in the pipe
+        // is still read. kube's message loop can stop on an error without ending the output
+        // stream, so the stream alone cannot tell that the connection is gone.
+        let mut connection: Option<(Result<(), String>, Instant)> = None;
         loop {
             let deadline = self.deadline();
             let sync = self.model.sync_deadline().map(Instant::from_std);
+            let drained = connection.as_ref().map(|(_, until)| *until);
             tokio::select! {
                 read = stdout.read(&mut buf) => match read {
                     // End of output; a read error ends it too, and `finish` says why.
@@ -775,6 +785,12 @@ impl Session {
                         return Outcome::Done(ExecState::Closed);
                     }
                 }
+                result = &mut finish, if connection.is_none() => {
+                    connection = Some((result, Instant::now() + DRAIN_WAIT));
+                }
+                // The connection is gone and the output stream never ended.
+                () = tokio::time::sleep_until(drained.unwrap_or_else(Instant::now)),
+                    if drained.is_some() => break,
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() => self.publish(),
                 // A synchronized update the program never ended (it was interrupted, say).
@@ -798,9 +814,10 @@ impl Session {
                 .await
                 .ok()
                 .flatten();
-            let result = match status {
-                Some(_) => Ok(()),
-                None => tokio::time::timeout(STATUS_WAIT, finish)
+            let result = match (&status, connection) {
+                (Some(_), _) => Ok(()),
+                (None, Some((result, _))) => result,
+                (None, None) => tokio::time::timeout(STATUS_WAIT, finish)
                     .await
                     .unwrap_or(Ok(())),
             };
@@ -1002,9 +1019,11 @@ mod tests {
         /// What the session writes to the command's stdin.
         stdin: DuplexStream,
         /// Where the command's output is written.
-        stdout: Option<DuplexStream>,
+        stdout: Option<Box<dyn AsyncWrite + Send + Unpin>>,
         resizes: futures::channel::mpsc::Receiver<kube::api::TerminalSize>,
         status: Option<oneshot::Sender<Status>>,
+        /// Ends the connection with a result; dropping it ends it cleanly.
+        finish: Option<oneshot::Sender<Result<(), String>>>,
     }
 
     impl Remote {
@@ -1021,6 +1040,15 @@ mod tests {
         fn exit(&mut self, status: Status) {
             let _ = self.status.take().unwrap().send(status);
             self.stdout = None;
+            self.finish = None;
+        }
+
+        /// Breaks the connection as kube 5.1's message loop does when the WebSocket fails: it
+        /// returns the error without sending a status or ending the output stream.
+        fn break_connection(&mut self, error: &str) {
+            self.status = None;
+            self.stdout = None;
+            let _ = self.finish.take().unwrap().send(Err(error.to_owned()));
         }
 
         async fn read_stdin(&mut self, len: usize) -> Vec<u8> {
@@ -1042,23 +1070,40 @@ mod tests {
         }
     }
 
+    /// A fake process whose output stream ends when the remote drops it, as a duplex does.
     fn process() -> (Process, Remote) {
-        let (stdin, remote_stdin) = tokio::io::duplex(IO_BUFFER);
         let (remote_stdout, stdout) = tokio::io::duplex(IO_BUFFER);
+        process_with(Box::pin(stdout), Box::new(remote_stdout))
+    }
+
+    /// A fake process with kube's output pipe: a simplex, whose reader never reaches the end
+    /// when the writer is dropped without being shut down.
+    fn kube_like_process() -> (Process, Remote) {
+        let (stdout, remote_stdout) = tokio::io::simplex(IO_BUFFER);
+        process_with(Box::pin(stdout), Box::new(remote_stdout))
+    }
+
+    fn process_with(
+        stdout: Pin<Box<dyn AsyncRead + Send>>,
+        remote_stdout: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> (Process, Remote) {
+        let (stdin, remote_stdin) = tokio::io::duplex(IO_BUFFER);
         let (resize_tx, resizes) = futures::channel::mpsc::channel(10);
         let (status_tx, status_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
         let process = Process {
             stdin: Box::pin(stdin),
-            stdout: Box::pin(stdout),
+            stdout,
             resize: Some(resize_tx),
             status: status_rx.map(Result::ok).boxed(),
-            finish: async { Ok(()) }.boxed(),
+            finish: finish_rx.map(|r| r.unwrap_or(Ok(()))).boxed(),
         };
         let remote = Remote {
             stdin: remote_stdin,
             stdout: Some(remote_stdout),
             resizes,
             status: Some(status_tx),
+            finish: Some(finish_tx),
         };
         (process, remote)
     }
@@ -1359,6 +1404,53 @@ mod tests {
             .await
             .expect("stdin closed")
             .unwrap();
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn a_broken_connection_fails_the_session_even_if_output_never_ends() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = kube_like_process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        remote.print(b"partial").await;
+        wait_for(&mut session, "output", |s| {
+            s.terminal.row_text(0) == "partial"
+        })
+        .await;
+        remote.print(b" line").await;
+        remote.break_connection(
+            "WebSocket protocol error: Connection reset without closing handshake",
+        );
+        let snap = wait_for(&mut session, "failure", |s| s.state.is_finished()).await;
+        let ExecState::Failed(message) = &snap.state else {
+            panic!("{:?}", snap.state);
+        };
+        assert!(
+            message.starts_with("the exec connection broke: ") && message.contains("reset"),
+            "{message}"
+        );
+        // Output already in the pipe still reaches the screen.
+        assert_eq!(snap.terminal.row_text(0), "partial line");
+    }
+
+    // covers UP-41
+    #[tokio::test]
+    async fn a_clean_close_with_kube_like_output_ends_the_session() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = kube_like_process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        remote.print(b"bye").await;
+        // The server closes the WebSocket without a status; the stream is not shut down.
+        remote.status = None;
+        remote.stdout = None;
+        remote.finish = None;
+        let snap = wait_for(&mut session, "exit", |s| s.state.is_finished()).await;
+        assert_eq!(snap.state, ExecState::Exited { code: None });
+        assert_eq!(snap.terminal.row_text(0), "bye");
     }
 
     // covers UP-41
