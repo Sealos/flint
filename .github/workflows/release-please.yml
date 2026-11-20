@@ -2,8 +2,8 @@ name: Release
 
 # release-please keeps a release PR open with the next version and changelog, built from
 # Conventional Commits on master. Merging that PR tags the release as a draft; the build jobs
-# below attach the macOS binary and the Linux AppImages to it, and `publish` publishes it once all
-# of them have been uploaded.
+# below attach the macOS binary, Flint.app's DMG and the Linux AppImages to it, and `publish`
+# publishes it once all of them have been uploaded.
 on:
   push:
     branches: [master]
@@ -18,6 +18,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+
+# bash -eo pipefail, so a failing command before a pipe (`package-macos-app.sh | tee`) fails its
+# step.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   release-please:
@@ -64,6 +70,9 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: macos-latest
+    # Two release builds (about 15 minutes each on a cold cache) plus packaging; a hung step must
+    # not hold the runner for the default six hours.
+    timeout-minutes: 90
     env:
       TAG: ${{ needs.release-please.outputs.tag_name }}
       VERSION: ${{ needs.release-please.outputs.version }}
@@ -100,10 +109,24 @@ jobs:
           tar -czf "$ARCHIVE" -C dist flint
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+      # The same universal binary as Flint.app (ad-hoc signed until #25) in a drag-to-Applications
+      # DMG, next to the tarball.
+      - name: Package Flint.app and the DMG
+        run: |
+          scripts/package-macos-app.sh dist/flint/flint "$VERSION" dist/app | tee package.log
+          DMG="flint-${TAG}-macos-universal.dmg"
+          # The script prints the DMG's path last; it must be the name `publish` checks for.
+          test "$(basename "$(tail -n 1 package.log)")" = "$DMG"
+          mv "dist/app/$DMG" "$DMG"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+      # Mounts the DMG: bundle ID, signature, --version, mcp, and no automation channel.
+      - name: Smoke test the DMG
+        run: scripts/smoke-macos-app.sh "$DMG" "$VERSION"
       # Releases are immutable once published, so release-please creates a draft (with the tag);
       # the build jobs upload to the draft and `publish` publishes it.
       - name: Upload to the draft release
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" "$DMG" "$DMG.sha256" --clobber
 
   # One AppImage per architecture (ADR-0016), each built natively: linuxdeploy inspects the
   # binary with the host's loader. Both on Ubuntu 24.04, not ubuntu-latest: the binary needs the
@@ -183,6 +206,7 @@ jobs:
           names=$(gh release view "$TAG" --json isDraft,assets --jq 'select(.isDraft == false) | .assets[].name')
           for file in \
             "flint-${TAG}-macos-universal.tar.gz" \
+            "flint-${TAG}-macos-universal.dmg" \
             "flint-${TAG}-linux-x86_64.AppImage" \
             "flint-${TAG}-linux-aarch64.AppImage"; do
             for want in "$file" "$file.sha256"; do

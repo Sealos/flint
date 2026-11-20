@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Flint.app's Info.plist. scripts/package-macos-app.sh replaces @VERSION@ with the release
+  version (X.Y.Z). CFBundleIdentifier is permanent once shipped: Keychain items, notarization,
+  privacy permissions and notification settings hang off it (#175, #25). Flint's own settings do
+  not: they live in the fixed ~/Library/Application Support/Flint.
+  LSMinimumSystemVersion: GPUI documents no floor; 13.0 is the oldest release Flint supports.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleIdentifier</key>
+	<string>se.redstack.flint</string>
+	<key>CFBundleName</key>
+	<string>Flint</string>
+	<key>CFBundleDisplayName</key>
+	<string>Flint</string>
+	<key>CFBundleExecutable</key>
+	<string>flint</string>
+	<key>CFBundleIconFile</key>
+	<string>Flint</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+</dict>
+</plist>

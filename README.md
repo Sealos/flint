@@ -15,23 +15,67 @@ Appearance, or the `appearance` setting, overrides it). Shells open on any clust
 
 ## Install from a release
 
-Each [release](https://github.com/Sealos/flint/releases) has a universal binary for Apple Silicon and Intel Macs.
-It is a command-line binary for now (there is no `.app` bundle until M6): run it from a terminal, and it opens the
-Flint window. Replace `v0.1.1` with the newest tag on the releases page.
+Each [release](https://github.com/Sealos/flint/releases) has `Flint.app` in a disk image,
+`flint-vX.Y.Z-macos-universal.dmg`, for Apple Silicon and Intel Macs on macOS 13 or later. Releases after v0.2.0 have
+it; replace `vX.Y.Z` with the newest tag on the releases page.
+
+1. Download the DMG from the releases page (or with
+   `gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-macos-universal.dmg*'`). To check it, run
+   `shasum -a 256 -c flint-vX.Y.Z-macos-universal.dmg.sha256` next to it.
+2. Open the DMG and drag **Flint** onto **Applications**, then eject the DMG.
+3. Open Flint from Applications, Launchpad or Spotlight.
+
+**First launch.** Until M6 the app is **not signed with a Developer ID or notarized** (it carries an ad-hoc signature
+only), so macOS refuses to open a copy downloaded with a browser the first time. Allow it once per downloaded version,
+either way:
+
+- open Flint once, dismiss the warning (**Done**, not Move to Trash), then open **System Settings > Privacy &
+  Security**, scroll to the message about Flint, click **Open Anyway**, and confirm; or
+- remove the quarantine flag in a terminal: `xattr -dr com.apple.quarantine /Applications/Flint.app`.
+
+On macOS 15 and later, Control-click > Open no longer gets past this check. Until you allow it, macOS also stops
+`Flint.app/Contents/MacOS/flint` run from a terminal, `flint mcp` included. A DMG downloaded with `gh` or `curl` is not
+quarantined and opens directly.
+
+**Environment.** Opened from Finder, the Dock or Spotlight, Flint gets no terminal environment. It runs your login
+shell once at startup to read its `PATH`, so exec credential plugins (`aws`, `gke-gcloud-auth-plugin`, `kubelogin`)
+and `helm` are found as in a terminal. If the shell takes longer than 3 seconds or fails, Flint uses the `PATH` it was
+started with plus `/opt/homebrew/bin` and `/usr/local/bin`. Set `path` in `settings.toml` (below) to skip the shell
+and use your own. Only `PATH` is read: a `KUBECONFIG` exported in your shell is not, so Flint reads `~/.kube/config`
+unless you add files with `kubeconfig_paths`.
+
+**Logs.** Flint logs to stderr only, so an app opened from Finder or the Dock keeps no log. To see one, start it from
+a terminal: `/Applications/Flint.app/Contents/MacOS/flint`.
+
+**The command-line binary.** The app's executable is also the `flint` command, for `flint mcp` (see
+[MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`. Until the Homebrew cask puts it on your
+`PATH`, link it to `/usr/local/bin/flint`, one stable path for your shell and your MCP client configs. `-f` replaces a
+`flint` installed earlier from the command-line archive below:
 
 ```sh
-gh release download v0.1.1 -R Sealos/flint -p 'flint-*-macos-universal.tar.gz*'
-shasum -a 256 -c flint-v0.1.1-macos-universal.tar.gz.sha256
-tar -xzf flint-v0.1.1-macos-universal.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint
+flint --version
+```
+
+### macOS command-line archive
+
+Each release also has the same universal binary without the app bundle, `flint-vX.Y.Z-macos-universal.tar.gz`. Run it
+from a terminal and it opens the Flint window:
+
+```sh
+gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-macos-universal.tar.gz*'
+shasum -a 256 -c flint-vX.Y.Z-macos-universal.tar.gz.sha256
+tar -xzf flint-vX.Y.Z-macos-universal.tar.gz
 sudo install -m 755 flint/flint /usr/local/bin/flint
 flint --version
 flint                                   # opens the window
 ```
 
-Until M6 the binary is **not signed or notarized**. Downloaded with `gh` or `curl`, it runs as is. Downloaded with
-a browser, macOS blocks the first run: remove the quarantine flag with
-`xattr -d com.apple.quarantine /usr/local/bin/flint`, or open **System Settings > Privacy & Security** and choose
-**Open Anyway**. Releases are marked pre-release until 1.0, so the releases page has no "Latest" badge yet.
+Downloaded with `gh` or `curl`, it runs as is. Downloaded with a browser, macOS blocks the first run: remove the
+quarantine flag with `xattr -d com.apple.quarantine /usr/local/bin/flint`, or open **System Settings > Privacy &
+Security** and choose **Open Anyway**. Releases are marked pre-release until 1.0, so the releases page has no "Latest"
+badge yet.
 
 ### Linux (AppImage)
 
@@ -184,6 +228,8 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
   `scripts/package-appimage.sh` and smoke-tests it with `scripts/smoke-appimage.sh`.
 - **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. macOS
   runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
+- **macOS packaging, `macos-app (dmg)`:** on PRs that touch the DMG packaging, packages `Flint.app` and its DMG and
+  runs `scripts/smoke-macos-app.sh` and its self-test (`scripts/smoke-macos-app-test.sh`). Not required.
 - **Cluster e2e (Linux):** a kind cluster set up by `scripts/cluster-fixtures.sh`, then the `flint-core` and
   `flint-mcp` tests with `--include-ignored`, the MCP ones through the GPUI-free `flint-mcp` binary. Runs on PRs that
   touch core or MCP, on master, and nightly (which adds the API-server restart test).
@@ -192,6 +238,7 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
   - `cargo machete` (unused dependencies);
   - `typos`;
   - `actionlint`;
+  - `shellcheck` on `scripts/*.sh`;
   - `scripts/check-module-tests.sh`;
   - `scripts/check-theme-colors.sh` (no hard-coded colors in UI code; see below).
 - **PR title:** must be a Conventional Commit, because PRs are squash-merged and release-please reads the subject.
@@ -216,8 +263,9 @@ Large outputs are cut short. Only Secret values are redacted: everything else an
 `env` values in pod specs, and (until M5.5) pod logs and event messages, is sent as the cluster returns it. Only
 expose clusters whose contents, logs and events you are willing to send to your AI provider.
 
-Register it with Claude Code, using the installed binary (or `"$PWD/target/release/flint"` after
-`cargo build --release`):
+Register it with Claude Code by `/usr/local/bin/flint`: the link into `Flint.app` (see
+[Install from a release](#install-from-a-release)) or the binary from the command-line archive. The path stays the same
+when you update Flint or switch between the two. After `cargo build --release`, use `"$PWD/target/release/flint"`.
 
 ```sh
 claude mcp add flint -- /usr/local/bin/flint mcp
@@ -249,12 +297,15 @@ format, for example `feat(mcp): …` or `fix(core): …`.
 2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release as a draft. Releases are immutable once
    published, so the draft stage is when files can still be attached.
 3. The same workflow then builds `flint` for Apple Silicon and Intel, combines them into a universal binary, and
-   attaches `flint-vX.Y.Z-macos-universal.tar.gz`. In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
+   attaches `flint-vX.Y.Z-macos-universal.tar.gz`. It also packages that binary as an ad-hoc signed `Flint.app` in
+   `flint-vX.Y.Z-macos-universal.dmg` (`scripts/package-macos-app.sh`), mounts the DMG to check it
+   (`scripts/smoke-macos-app.sh`), and attaches it. In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
    runners (`scripts/package-appimage.sh`) and attaches `flint-vX.Y.Z-linux-x86_64.AppImage` and
    `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum.
-4. Once every upload has succeeded, a `publish` job publishes the release and checks that all six files are on it.
+4. Once every upload has succeeded, a `publish` job publishes the release and checks that all eight files are on it.
 
-Until M6, release binaries are **unsigned** and marked as pre-release. macOS will warn when you first run them.
+Until M6, release binaries are **unsigned** (the app only ad-hoc signed) and marked as pre-release. macOS blocks the
+first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)).
 AppImages stay unsigned.
 
 After every published release:
