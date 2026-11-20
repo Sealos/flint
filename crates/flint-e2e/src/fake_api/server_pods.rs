@@ -44,6 +44,16 @@ impl FakeApiServer {
         lock(&self.inner.logs).set(&key, log.previous, text);
     }
 
+    /// Replaces a container's log (its current or previous instance) with the one line the
+    /// kubelet answers when it cannot read it, such as `unable to retrieve container logs for
+    /// containerd://…` (the container was removed): sent as is, without a timestamp, even when
+    /// the request asks for timestamps. Open streams are not told.
+    pub fn set_log_notice(&self, log: &ContainerLog, notice: &str) {
+        let state = lock(&self.inner.state);
+        let key = FakeApiServer::log_key(&state, log);
+        lock(&self.inner.logs).set_notice(&key, log.previous, notice);
+    }
+
     /// Appends the lines of `text` to a container's current log, stamped now (in order, never
     /// two alike), and sends them to its open followed streams. Returns how many streams got
     /// them. Panics for a previous instance: it is not written to any more.
