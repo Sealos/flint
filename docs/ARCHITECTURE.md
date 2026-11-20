@@ -110,7 +110,20 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
 - `flint-core` starts a multi-threaded tokio runtime on background threads when the app launches. GPUI keeps its own
   executor on the main thread ([ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md)).
 - The UI talks to the core only through `CoreHandle`. Commands go in over a channel that works with any runtime.
-  Events come back on another such channel, which a GPUI task drains to update entities.
+  Events come back through a queue (`flint_core::events`, #255) that a GPUI task drains to update entities. It is
+  bounded however slowly it is read: state events (the cluster list, the active cluster, settings, a cluster's
+  discovery, the activity log) keep only their latest form per kind and cluster, a connection its latest attempt
+  starting and where it settled, and errors the last 64 (older ones are dropped, counted and logged). The order of
+  what is left is the order of the last changes, so reading it ends where reading every event would. A reader
+  that skips lists cannot tell from them that a context started over (re-pointed, even and back; removed and added
+  back), so the core numbers its slots: each `ClusterSummary` and each `DiscoveryChanged` carries the slot's
+  generation, and a new slot gets a newer one. The app keeps (and uses) only discovery of a cluster's current
+  generation, holding back one that came ahead of its list; the workspace closes its views when the active cluster's
+  generation moves, as on a switch, and an open resource switcher lists anew. The dock still compares servers: a
+  context that started over at the same server (a namespace edit, a rotated token) keeps its shells, and one
+  re-pointed and put back between reads is ended by the core's `ContextHistory` pin recheck. A list also takes the queued connection and discovery events of contexts it no longer has, so contexts that
+  come and go under new names do not pile up. The reader owns
+  the queue: `CoreHandle::events` hands out readers, and once every reader is dropped the core stops queueing.
 - Watches can change faster than the UI should redraw. The core marks the store as changed and sends at most one
   change event per view per frame budget (about 100 ms). The view then reads the latest snapshot. Individual watch
   events are never forwarded to the UI one by one.
@@ -600,6 +613,17 @@ opens in a tab in the bottom dock.
   log sessions, which are pinned the same way) whether the context changed since, never the server. A change ends it
   with `ExecFailureKind::ContextChanged` and the reason, worded as a log session's (`recheck::reason`). Ending drops
   the exec connection, as closing the session does, so no stream stays open on the old server.
+- **Input budget (#256).** A session holds at most 1 MiB of input (`exec::INPUT_BUDGET`) that the pod has not read:
+  what waits for the session task, what is kept for the next shell while the first may turn out not to exist, and
+  what waits for the pod's stdin. `ExecSession::write` and `paste` reserve their bytes with an atomic update (never
+  blocking the UI) and are refused whole, with `InputRefused`, when they do not fit; the reservation travels with
+  the bytes and is given back once kube's stdin pipe has them, or when they are dropped on any path. The shell tab
+  then says the shell is not reading its input, until input is taken again. The terminal's replies to the program
+  may go 16 KiB past the budget. A copy kept for the next shell counts too; when it does not fit, nothing is kept,
+  input sent for the first shell and still queued is dropped (each input carries the shell attempt it was sent
+  during), and if the next shell starts, its snapshot says so (`input_not_replayed`). Resizes and closing never
+  wait behind input: a resize replaces the size not yet taken in and has its own task to the pod's TTY, and
+  closing is a signal of its own; the session then empties its input queue, giving the bytes back.
 - **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.
@@ -893,13 +917,28 @@ Rules:
   either way). The count and the cut-short flag are read from the reply's own fields, so they are what the agent saw.
   The returned content is never recorded. At 1 MiB the file is renamed to `agent-activity.1.jsonl` (replacing the one
   before) and a new one starts. Writers hold an exclusive `flock` on `agent-activity.lock` while they check, rotate
-  and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice; a write that
-  fails is logged and does not fail the call. The files are the owner's only (0600: they name clusters and objects),
+  and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice. Logging is
+  best-effort: a writer waits at most 1 s for the lock, then skips its record, so a stalled writer cannot hold up
+  other processes' replies; a write that fails is logged and does not fail the call. Readers take no lock: if the
+  log rotated while they read the two files (the previous file is then another one), they read both again. The
+  files, and the lock file, are the owner's only (0600: they name clusters and objects),
   and a line cut off before its newline is ended before the next record, so it costs only itself. Text fields hold
   what the agent wrote, so each is cut at 253 bytes: an agent cannot flush the log with a few huge names. Each record
-  also has stable keys (FNV-1a) of the full context and server, which the app matches by. The server is the one the
-  call's own settings and kubeconfig resolved. A call the router answers without running its tool (an unknown tool,
-  arguments that do not fit) is recorded as failed, with what its arguments name. A context re-pointed at another
+  also has keys of the full context and server, which the app matches by. The server is the one the call's own
+  settings and kubeconfig resolved; it is stored as shown (without credentials), and its key is of the endpoint the
+  cluster pin compares (the kubeconfig's URL without a trailing slash), so two servers that show alike are not taken
+  for one. That URL can hold a password or token, so the server key is an HMAC-SHA256 digest (ring, cut to 128 bits)
+  under a random 32-byte key in `activity.key` beside the log: owner-only, made on first use by whichever process
+  comes first (written to a file of its own, then linked into place without replacing one already there), and read
+  by the core with the log, off the UI thread, for the app to key the tab's own server. Without a usable key file, a record has no server key and its tab matches it
+  by context alone. The context key stays an unkeyed FNV-1a hash: context names are in the record anyway. Server
+  keys from before the keyed digest no longer match, so those calls no longer show in their cluster's tab. A server
+  key is never guessed from the shown server, which can drop a query or be a placeholder.
+  `list_clusters` names no cluster, so its record holds the keys of each cluster it probed (the first 256, and a
+  count of the rest, so one record stays far below the 1 MiB cap), and it shows in each of their tabs. When it
+  probed more than it lists, it also shows in the tab of every cluster it does not list, marked as one that may have
+  probed it, so no tab claims a call never happened. A call the router answers without running its tool (an unknown tool, arguments that do not fit) is
+  recorded as failed, with what its arguments name. A context re-pointed at another
   server is another cluster: its activity tab shows the calls on the server it was opened for, newest first, and
   offers Edit AI Scope only while the context still points there. The core watches both files beside `settings.toml` and sends
   the log to the app (`Event::AgentActivity`) at start and whenever it changes. The cluster's "AI" badge, or Show
@@ -1151,7 +1190,12 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   keeps the output open after the plugin exited gets a second before what the plugin printed is used. A plugin that
   may prompt, with Flint in the foreground of a terminal, is given the terminal once it started (one such plugin at
   a time; the next waits 1.5 s for it, then runs without prompting, as `interactive: false`; one set to
-  `interactiveMode: Always` waits as long as its caller) and Flint takes it back after, with the terminal's settings as they were (echo back on after a killed password prompt). Tokens are cached until a minute before they expire. A
+  `interactiveMode: Always` waits as long as its caller) and Flint takes it back after, with the terminal's settings as they were (echo back on after a killed password prompt). Meanwhile Flint ignores
+  SIGTTOU, so a log line it writes to the terminal with `stty tostop` set does not stop it. When Flint is a
+  background job of its terminal, a plugin that may prompt runs without prompting, and an `Always` one waits until
+  Flint is brought to the foreground. Errors name the plugin by its file name when its command has no whitespace; otherwise they say
+  "the exec auth plugin" and show nothing of the command (it may hold arguments, and telling a spaced path apart would
+  mean reading the disk), so no argument text ever shows. Tokens are cached until a minute before they expire. A
   refresh runs in a task of its own per client, bounded by the connect timeout: requests wait for it, and one that
   gives up (a short request deadline) does not restart a slow login; dropping the client ends it, plugin included. Requests use what the refresh got, even a
   token that expires within the margin, as kube does. A refresh that hangs is a sign-in failure naming the plugin

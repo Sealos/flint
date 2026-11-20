@@ -57,24 +57,26 @@ struct Inner {
     admission: Admission,
 }
 
-/// The longest a call waits for its activity record to be written. Past it the record is
-/// skipped (and logged) rather than holding the reply: the log's file lock is the one wait that
-/// is not this process's own.
+/// The longest a call waits for its activity record to be written, rather than hold its reply.
+/// The write itself gives up on the log's file lock (the one wait that is not this process's
+/// own) after [`activity::LOCK_WAIT`], shorter than this, so a write never outlives its wait by
+/// much.
 const RECORD_WAIT: Duration = Duration::from_secs(2);
+const _: () = assert!(activity::LOCK_WAIT.as_millis() < RECORD_WAIT.as_millis());
 
 impl Inner {
-    /// Writes `record` to the activity log, on the call's own path, waiting at most
-    /// [`RECORD_WAIT`]. A record that could not be written in time, or at all, is logged.
-    async fn record(&self, record: activity::ActivityRecord) {
+    /// Writes `record` to the activity log, keying the servers it `reached`, on the call's own
+    /// path, waiting at most [`RECORD_WAIT`]. A record that could not be written in time, or at
+    /// all, is logged.
+    async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
         let dir = self.config_dir.clone();
-        let write = tokio::task::spawn_blocking(move || activity::append(&dir, &record));
+        let write =
+            tokio::task::spawn_blocking(move || activity::append_call(&dir, &record, &reached));
         match tokio::time::timeout(RECORD_WAIT, write).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => tracing::warn!(error = %e, "cannot write the agent activity log"),
             Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
-            Err(_) => {
-                tracing::warn!("the agent activity log is not writable in time; record skipped")
-            }
+            Err(_) => tracing::warn!("the agent activity log was not written in time"),
         }
     }
 }
@@ -225,10 +227,20 @@ impl FlintMcp {
         };
         // The server `client` found for this call's cluster, from the call's own settings and
         // kubeconfig: none for a call that names no cluster or one not exposed.
-        let server = named
-            .cluster
-            .as_ref()
-            .and_then(|_| CALL.try_with(|c| c.borrow().server.clone()).ok().flatten());
+        let (server, endpoint, probed) = CALL
+            .try_with(|c| {
+                let c = c.borrow();
+                (c.server.clone(), c.endpoint.clone(), c.probed.clone())
+            })
+            .unwrap_or_default();
+        let (server, endpoint) = match named.cluster {
+            Some(_) => (server, endpoint),
+            None => (None, None),
+        };
+        let reached = activity::Reached {
+            server: endpoint,
+            probed,
+        };
         let record = activity::ActivityRecord {
             at_ms: activity::now_ms(),
             tool: tool.to_owned(),
@@ -244,14 +256,16 @@ impl FlintMcp {
             outcome,
             cluster_key: None,
             server_key: None,
+            probed: Vec::new(),
+            probed_more: 0,
         };
         // Within `call_tool`, the record waits for the call's outcome there: a deadline that
         // fires after this still makes it a timeout. Called directly (tests), it is written now.
-        if let Err(record) = CALL
-            .try_with(|c| c.borrow_mut().record = Some(record.clone()))
-            .map_err(|_| record)
+        if let Err((record, reached)) = CALL
+            .try_with(|c| c.borrow_mut().record = Some((record.clone(), reached.clone())))
+            .map_err(|_| (record, reached))
         {
-            self.record(record).await;
+            self.record(record, reached).await;
         }
         let content = vec![ContentBlock::text(text)];
         Ok(if ok {
@@ -261,9 +275,9 @@ impl FlintMcp {
         })
     }
 
-    /// Queues `record` for the activity log ([`Inner::record`]).
-    async fn record(&self, record: activity::ActivityRecord) {
-        self.inner.record(record).await;
+    /// Writes `record` to the activity log, keying the servers it `reached` ([`Inner::record`]).
+    async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
+        self.inner.record(record, reached).await;
     }
 }
 
@@ -273,9 +287,13 @@ struct CallNote {
     /// The API server of the cluster the call reads, once [`FlintMcp::client`] found it exposed
     /// (without credentials).
     server: Option<String>,
-    /// What its tool would record ([`FlintMcp::finish`]), written once the call's outcome is
-    /// settled.
-    record: Option<activity::ActivityRecord>,
+    /// That server as the kubeconfig has it, for its key ([`activity::append_call`]).
+    endpoint: Option<String>,
+    /// The contexts `list_clusters` probed, with their servers as the kubeconfig has them.
+    probed: Vec<(String, Option<String>)>,
+    /// What its tool would record ([`FlintMcp::finish`]), and the servers it reached, written
+    /// once the call's outcome is settled.
+    record: Option<(activity::ActivityRecord, activity::Reached)>,
 }
 
 tokio::task_local! {
@@ -477,22 +495,27 @@ impl FlintMcp {
                     };
                     let named = named_in(arguments.as_ref());
                     inner
-                        .record(activity::ActivityRecord {
-                            at_ms: activity::now_ms(),
-                            tool,
-                            server: None,
-                            cluster: named.cluster,
-                            kind: named.kind,
-                            namespace: named.namespace,
-                            name: named.name,
-                            container: named.container,
-                            items: None,
-                            bytes: 0,
-                            truncated: false,
-                            outcome: activity::Outcome::Failed,
-                            cluster_key: None,
-                            server_key: None,
-                        })
+                        .record(
+                            activity::ActivityRecord {
+                                at_ms: activity::now_ms(),
+                                tool,
+                                server: None,
+                                cluster: named.cluster,
+                                kind: named.kind,
+                                namespace: named.namespace,
+                                name: named.name,
+                                container: named.container,
+                                items: None,
+                                bytes: 0,
+                                truncated: false,
+                                outcome: activity::Outcome::Failed,
+                                cluster_key: None,
+                                server_key: None,
+                                probed: Vec::new(),
+                                probed_more: 0,
+                            },
+                            activity::Reached::default(),
+                        )
                         .await;
                 })
             }));
@@ -616,15 +639,16 @@ impl ServerHandler for FlintMcp {
             () = cancelled.cancelled() => None,
         };
         let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
-        // The reply, and the record its tool left when it is the outcome.
-        let (result, record, server) = match turn {
+        // The reply, the record its tool left when it is the outcome, and the cluster's server.
+        let (result, record, server, endpoint) = match turn {
             // Cancelled while it waited for a turn.
             None => (
                 Err(rmcp::ErrorData::internal_error("cancelled", None)),
                 None,
                 None,
+                None,
             ),
-            Some(Err(busy)) => (failed(&busy.to_string()), None, None),
+            Some(Err(busy)) => (failed(&busy.to_string()), None, None, None),
             Some(Ok(turn)) => {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -645,16 +669,21 @@ impl ServerHandler for FlintMcp {
                         }
                     };
                     drop(turn);
-                    let (record, server) = CALL.with(|c| {
+                    let (record, server, endpoint) = CALL.with(|c| {
                         let mut c = c.borrow_mut();
-                        (c.record.take().filter(|_| finished), c.server.clone())
+                        (
+                            c.record.take().filter(|_| finished),
+                            c.server.clone(),
+                            c.endpoint.clone(),
+                        )
                     });
-                    (result, record, server)
+                    (result, record, server, endpoint)
                 })
                 .await
             }
         };
-        let record = record.unwrap_or_else(|| {
+        let (record, reached) = record.unwrap_or_else(|| {
+            let names_cluster = named.cluster.is_some();
             let bytes = match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(done)) => done
                     .content
@@ -664,10 +693,14 @@ impl ServerHandler for FlintMcp {
                 Ok(_) => 0,
                 Err(error) => error.message.len(),
             };
-            activity::ActivityRecord {
+            let reached = activity::Reached {
+                server: endpoint.filter(|_| names_cluster),
+                probed: Vec::new(),
+            };
+            let record = activity::ActivityRecord {
                 at_ms: activity::now_ms(),
                 tool,
-                server: server.filter(|_| named.cluster.is_some()),
+                server: server.filter(|_| names_cluster),
                 cluster: named.cluster,
                 kind: named.kind,
                 namespace: named.namespace,
@@ -679,9 +712,12 @@ impl ServerHandler for FlintMcp {
                 outcome: activity::Outcome::Failed,
                 cluster_key: None,
                 server_key: None,
-            }
+                probed: Vec::new(),
+                probed_more: 0,
+            };
+            (record, reached)
         });
-        self.record(record).await;
+        self.record(record, reached).await;
         result
     }
 }
@@ -741,7 +777,9 @@ impl FlintMcp {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
         // The server this call's settings expose the cluster at: what its record names.
         let _ = CALL.try_with(|c| {
-            c.borrow_mut().server = info.server.as_deref().map(flint_core::redact::server_url);
+            let mut note = c.borrow_mut();
+            note.server = info.server.as_deref().map(flint_core::redact::server_url);
+            note.endpoint = info.server.clone();
         });
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
@@ -833,6 +871,13 @@ impl FlintMcp {
             .into_iter()
             .cloned()
             .collect();
+        // The clusters this call reads about, for its record.
+        let _ = CALL.try_with(|c| {
+            c.borrow_mut().probed = exposed
+                .iter()
+                .map(|info| (info.name.clone(), info.server.clone()))
+                .collect();
+        });
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);
         let settings = ctx.settings.clone();
         let kubeconfig_errors: Vec<Value> = ctx

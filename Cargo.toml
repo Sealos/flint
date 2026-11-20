@@ -62,6 +62,8 @@ http-body-util = "0.1.5"
 bytes = "1.12.2"
 tokio-rustls = { version = "0.26.6", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+# Already in the tree through rustls; HMAC-SHA256 and the key for the activity log's server keys.
+ring = "0.17.14"
 base64 = "0.22.1"
 # The server side of the fake exec WebSocket: the same tokio-tungstenite kube's client uses.
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
