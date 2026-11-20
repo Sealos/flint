@@ -990,7 +990,7 @@ impl ClusterManager {
     fn activate(&mut self, id: ClusterId) {
         // Someone selected or retried a cluster: a prompting plugin resting after a timed-out
         // refresh may run again now.
-        crate::auth_plugin::retry_now();
+        crate::auth_plugin::retry_now(&id);
         if self.cluster_mut(&id).is_none() {
             self.emit(Event::Error(format!("cluster \"{id}\" no longer exists")));
             return;

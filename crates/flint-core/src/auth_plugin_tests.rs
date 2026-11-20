@@ -271,7 +271,7 @@ async fn a_token_without_expiry_is_used_as_it_is() {
 async fn a_plugin_certificate_becomes_the_client_identity() {
     let plugin = printing(r#"{"clientCertificateData":"CERT","clientKeyData":"KEY"}"#);
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
-    assert!(resolve(&mut config).await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
     let auth = &config.auth_info;
     assert!(auth.exec.is_none(), "kube must not run the plugin again");
     assert_eq!(auth.client_certificate_data.as_deref(), Some("Q0VSVA=="));
@@ -288,7 +288,7 @@ async fn a_kubeconfig_token_wins_over_the_plugin() {
     let mut kubeconfig = plugin.kubeconfig("https://127.0.0.1:1");
     kubeconfig.auth_infos[0].auth_info.as_mut().unwrap().token = Some("t-file".into());
     let mut config = config(&kubeconfig).await;
-    assert!(resolve(&mut config).await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
     assert_eq!(runs(&plugin), 0);
     assert!(config.auth_info.exec.is_some());
 }
@@ -319,7 +319,7 @@ async fn the_plugin_gets_kubes_arguments_and_environment() {
     );
     exec.drop_env = Some(vec!["DROPPED".into()]);
     let mut config = config(&kubeconfig).await;
-    resolve(&mut config).await.unwrap();
+    resolve(&mut config, "ctx").await.unwrap();
     let seen = std::fs::read_to_string(plugin.dir.path().join("seen")).unwrap();
     let (arg, rest) = seen.split_once('|').unwrap();
     let (info, dropped) = rest.rsplit_once('|').unwrap();
@@ -458,7 +458,7 @@ async fn a_helper_holding_the_output_does_not_cost_the_credential() {
     );
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
     let started = std::time::Instant::now();
-    assert!(resolve(&mut config).await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
     assert!(started.elapsed() >= DRAIN_GRACE);
     assert_eq!(config.auth_info.token.unwrap().expose_secret(), "t-held");
     let helper: libc::pid_t = std::fs::read_to_string(plugin.dir.path().join("child"))
@@ -547,7 +547,7 @@ async fn a_hanging_refresh_is_a_sign_in_failure() {
     assert_eq!(plugin.starts().len(), 2);
 
     // A retry runs it again.
-    retry_now();
+    retry_now("ctx");
     tokio::time::resume();
     let request = tokio::spawn(async move { cluster::server_version(&client).await });
     wait_starts(&plugin, 3).await;
@@ -583,7 +583,7 @@ async fn a_chatty_plugin_still_signs_in() {
          printf '{\"status\":{\"token\":\"t-chatty\"}}'\n",
     );
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
-    resolve(&mut config).await.unwrap();
+    resolve(&mut config, "ctx").await.unwrap();
     assert_eq!(config.auth_info.token.unwrap().expose_secret(), "t-chatty");
 }
 
@@ -680,23 +680,112 @@ async fn on_a_terminal() {
         std::fs::read_to_string(plugin.dir.path().join("foreground")).is_ok(),
         "the plugin did not get the terminal"
     );
-    // A second prompting plugin (another cluster) waits for the terminal instead of starting in
-    // the background.
-    let second = FakePlugin::hanging();
+    // A second prompting plugin (another cluster) waits for the terminal briefly instead of
+    // starting in the background; then it runs without prompting, and one that has what it
+    // needs answers at once, not after the first one's login.
+    let second = FakePlugin::new(
+        "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
+         printf '%s' \"$KUBERNETES_EXEC_INFO\" > \"$PLUGIN_DIR/info\"\n\
+         printf '{\"status\":{\"token\":\"t-cached\"}}'\n",
+    );
     let mut other = second.kubeconfig("http://127.0.0.1:1");
     prompting(&mut other);
-    let waiting = tokio::spawn(async move { cluster::connect(&other, "ctx").await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(second.starts().is_empty(), "the second plugin did not wait");
+    let mut config = config(&other).await;
+    let started = std::time::Instant::now();
+    resolve(&mut config, "other").await.unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited >= TERMINAL_WAIT && waited < TERMINAL_WAIT + Duration::from_secs(3),
+        "{waited:?}"
+    );
+    assert_eq!(config.auth_info.token.unwrap().expose_secret(), "t-cached");
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(second.dir.path().join("info")).unwrap())
+            .unwrap();
+    assert_eq!(info["spec"]["interactive"], false, "it may not prompt");
+    assert!(exists(leader), "the first plugin still has the terminal");
+
     attempt.abort();
     assert!(attempt.await.is_err_and(|e| e.is_cancelled()));
     wait_reaped(leader).await;
     wait_dead(child).await;
-    // Then the second gets it.
-    let (second_leader, second_child) = second.wait_started().await;
-    waiting.abort();
-    wait_reaped(second_leader).await;
-    wait_dead(second_child).await;
     assert!(foreground(), "the terminal was not given back");
     std::fs::write(done, "ok").unwrap();
+}
+
+// covers UP-04: a client that is dropped while its token refreshes kills the refresh's plugin
+// (and so gives the terminal back), rather than letting it run on for nobody.
+#[tokio::test]
+async fn dropping_the_client_ends_its_refresh() {
+    let plugin = slow_login();
+    let client = cluster::connect(&plugin.kubeconfig("http://127.0.0.1:1"), "ctx")
+        .await
+        .unwrap();
+    let request = tokio::spawn({
+        let client = client.clone();
+        async move { cluster::server_version(&client).await }
+    });
+    wait_starts(&plugin, 2).await;
+    let login = plugin.starts()[1];
+    request.abort();
+    let _ = request.await;
+    drop(client);
+    wait_reaped(login).await;
+}
+
+// covers UP-04: a refresh that ended without storing anything (its task panicked) does not
+// block the client: the next request starts a new one.
+#[tokio::test]
+async fn a_refresh_that_died_is_replaced() {
+    let plugin = printing(r#"{"token":"t-new","expirationTimestamp":"2999-01-01T00:00:00Z"}"#);
+    let exec = config(&plugin.kubeconfig("https://127.0.0.1:1"))
+        .await
+        .auth_info
+        .exec
+        .unwrap();
+    let died = async { false }.boxed().shared();
+    died.clone().await;
+    let token = RefreshingToken(Arc::new(TokenShared {
+        task: std::sync::Mutex::default(),
+        state: Arc::new(tokio::sync::Mutex::new(TokenState {
+            context: "ctx".into(),
+            exec,
+            token: SecretString::from("t-old"),
+            expires: "2000-01-01T00:00:00Z".parse().unwrap(),
+            refreshing: Some(died),
+            failed: None,
+            resting: None,
+        })),
+    }));
+    let header = token.header().await.unwrap();
+    assert_eq!(header.to_str().unwrap(), "Bearer t-new");
+    assert_eq!(runs(&plugin), 1);
+}
+
+// covers UP-04: retrying one cluster ends its plugin's rest only; another cluster's resting
+// plugin keeps resting.
+#[test]
+fn a_retry_ends_the_rest_of_its_own_cluster_only() {
+    let resting = |context: &str| TokenState {
+        context: context.into(),
+        exec: ExecConfig::default(),
+        token: SecretString::from("t"),
+        expires: Timestamp::now(),
+        refreshing: None,
+        failed: None,
+        resting: Some((
+            Instant::now() + PROMPT_BACK_OFF,
+            Timestamp::now() + PROMPT_BACK_OFF,
+            retry_epoch(context),
+        )),
+    };
+    let (a, b) = (resting("rest-a"), resting("rest-b"));
+    retry_now("rest-b");
+    assert!(
+        a.rests_until().is_some(),
+        "selecting b does not end a's rest"
+    );
+    assert!(b.rests_until().is_none());
+    retry_now("rest-a");
+    assert!(a.rests_until().is_none());
 }

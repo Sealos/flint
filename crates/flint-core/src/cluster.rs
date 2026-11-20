@@ -354,7 +354,7 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
             .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
             .map_err(|e| ClusterError::kube(e).for_target(&target));
     }
-    let token = crate::auth_plugin::resolve(&mut config)
+    let token = crate::auth_plugin::resolve(&mut config, context)
         .await
         .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
     tokio::task::spawn_blocking(move || build_client(config, token))

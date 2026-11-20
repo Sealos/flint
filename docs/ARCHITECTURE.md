@@ -977,11 +977,12 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   group; stdout is capped at 1 MiB (past it the plugin is killed), stderr keeps its first 64 KiB, and a helper that
   keeps the output open after the plugin exited gets a second before what the plugin printed is used. A plugin that
   may prompt, with Flint in the foreground of a terminal, is given the terminal once it started (one such plugin at
-  a time; the next waits) and Flint takes it back after. Tokens are cached until a minute before they expire. A
+  a time; the next waits 1.5 s for it, then runs without prompting, as `interactive: false`) and Flint takes it back
+  after. Tokens are cached until a minute before they expire. A
   refresh runs in a task of its own per client, bounded by the connect timeout: requests wait for it, and one that
-  gives up (a short request deadline) does not restart a slow login. A refresh that hangs is a sign-in failure naming
+  gives up (a short request deadline) does not restart a slow login; dropping the client ends it, plugin included. A refresh that hangs is a sign-in failure naming
   the plugin; a prompting plugin then rests for five minutes (requests say until when) unless someone selects or
-  retries a cluster. A proxy is refused before the plugin runs, as kube's builder did. Connection progress shows in
+  retries that cluster. A proxy is refused before the plugin runs, as kube's builder did. Connection progress shows in
   the UI.
 - **No `helm` installed.** Covered by an install hint. Bundling the binary is a possible follow-up.
 - **AI CLI flags change.** `claude` is young, and its flags can change. Keep the flags in one place, and fail

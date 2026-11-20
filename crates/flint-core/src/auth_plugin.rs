@@ -23,10 +23,10 @@
 //! credentials, a token refreshed a minute before it expires, and kube's error values
 //! ([`AuthError`]), so errors read as before.
 
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -56,6 +56,8 @@ const STDERR_CAP: usize = 64 * 1024;
 pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// How often a running plugin is checked for having exited, while its output is still open.
 const EXIT_POLL: Duration = Duration::from_millis(25);
+/// How long a prompting plugin waits for another one to give the terminal back.
+pub(crate) const TERMINAL_WAIT: Duration = Duration::from_millis(1500);
 /// After a refresh of a plugin that may prompt timed out, refreshes fail at once for this long,
 /// so a browser login nobody completes does not open again every minute.
 const PROMPT_BACK_OFF: Duration = Duration::from_secs(5 * 60);
@@ -65,6 +67,7 @@ const PROMPT_BACK_OFF: Duration = Duration::from_secs(5 * 60);
 const TIMED_OUT: &str = "flint:timed-out:";
 const TOO_LARGE: &str = "flint:too-large:";
 const RESTING: &str = "flint:resting:";
+const STOPPED: &str = "flint:stopped:";
 
 /// What a plugin run returned.
 #[derive(Debug)]
@@ -85,7 +88,10 @@ pub(crate) enum Credential {
 /// Runs the exec plugin of `config`'s user, if kube would, and puts its credential in `config`
 /// in place of the plugin. A token with an expiry comes back as a [`TokenLayer`] for the client
 /// stack, which refreshes it. Cancel-safe: dropping the future kills the plugin.
-pub(crate) async fn resolve(config: &mut kube::Config) -> Result<Option<TokenLayer>, AuthError> {
+pub(crate) async fn resolve(
+    config: &mut kube::Config,
+    context: &str,
+) -> Result<Option<TokenLayer>, AuthError> {
     let auth = &config.auth_info;
     // kube's precedence (`Auth::try_from`): all of these win over an exec plugin.
     let other = auth.auth_provider.is_some()
@@ -120,14 +126,18 @@ pub(crate) async fn resolve(config: &mut kube::Config) -> Result<Option<TokenLay
             token,
             expires: Some(expires),
         } => Some(AsyncFilterLayer::new(RefreshingToken(Arc::new(
-            tokio::sync::Mutex::new(TokenState {
-                exec,
-                token,
-                expires,
-                refreshing: None,
-                failed: None,
-                resting: None,
-            }),
+            TokenShared {
+                task: std::sync::Mutex::default(),
+                state: Arc::new(tokio::sync::Mutex::new(TokenState {
+                    context: context.to_owned(),
+                    exec,
+                    token,
+                    expires,
+                    refreshing: None,
+                    failed: None,
+                    resting: None,
+                })),
+            },
         )))),
         Credential::None => None,
     })
@@ -147,7 +157,23 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
                 .filter_map(|e| Some((e.get("name")?, e.get("value")?))),
         );
     }
-    let interactive = exec.interactive_mode != Some(ExecInteractiveMode::Never);
+    let mut interactive = exec.interactive_mode != Some(ExecInteractiveMode::Never);
+    // Taken before the plugin starts, so a second prompting plugin waits for the first to give
+    // the terminal back instead of starting in the background, where reading it stops it. It
+    // waits [`TERMINAL_WAIT`] at most: then it runs without prompting (it may still have what it
+    // needs cached), rather than spend its whole timeout behind another plugin's login.
+    let terminal = if interactive {
+        match Terminal::acquire().await {
+            Acquired::Terminal(terminal) => Some(terminal),
+            Acquired::Busy => {
+                interactive = false;
+                None
+            }
+            Acquired::None => None,
+        }
+    } else {
+        None
+    };
     if interactive {
         cmd.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
@@ -183,13 +209,6 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     // A group of its own, so a kill also ends what the plugin started (`gcloud` runs Python, a
     // shell wrapper runs the real binary).
     cmd.process_group(0);
-    // Taken before the plugin starts, so a second prompting plugin waits for the first to give
-    // the terminal back instead of starting in the background, where reading it stops it.
-    let terminal = if interactive {
-        Terminal::acquire().await
-    } else {
-        None
-    };
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
     // Closed at once, as `Command::output()` does.
@@ -337,20 +356,38 @@ struct Terminal {
     _owner: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// What [`Terminal::acquire`] got.
+enum Acquired {
+    Terminal(Terminal),
+    /// Another plugin has had the terminal for [`TERMINAL_WAIT`]: this one may not prompt.
+    Busy,
+    /// No terminal Flint is in the foreground of: as before, the plugin inherits Flint's stdin.
+    None,
+}
+
 impl Terminal {
-    /// Flint's controlling terminal, once no other plugin has it, if Flint's group is its
-    /// foreground group (otherwise no one Flint starts may read it anyway).
-    async fn acquire() -> Option<Self> {
-        let file = std::fs::OpenOptions::new()
+    /// Flint's controlling terminal, once no other plugin has it (waiting [`TERMINAL_WAIT`] at
+    /// most), if Flint's group is its foreground group (otherwise no one Flint starts may read
+    /// it anyway).
+    async fn acquire() -> Acquired {
+        let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/tty")
-            .ok()?;
+        else {
+            return Acquired::None;
+        };
         let fd = OwnedFd::from(file);
-        let owner = TERMINAL.clone().lock_owned().await;
+        let Ok(owner) = tokio::time::timeout(TERMINAL_WAIT, TERMINAL.clone().lock_owned()).await
+        else {
+            return Acquired::Busy;
+        };
         // SAFETY: plain calls on a descriptor this function owns.
-        let ours = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() };
-        ours.then_some(Terminal { fd, _owner: owner })
+        if unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() } {
+            Acquired::Terminal(Terminal { fd, _owner: owner })
+        } else {
+            Acquired::None
+        }
     }
 }
 
@@ -490,6 +527,12 @@ pub(crate) fn describe(text: &str) -> Option<String> {
              again until {until}; retry to try now"
         ));
     }
+    if let Some(name) = text.strip_prefix(STOPPED) {
+        return Some(format!(
+            "authentication failed: refreshing the token of the exec auth plugin `{name}` \
+             stopped unexpectedly; retry"
+        ));
+    }
     let name = text.strip_prefix(TOO_LARGE)?;
     Some(format!(
         "authentication failed: the exec auth plugin `{name}` printed more output than a \
@@ -497,14 +540,21 @@ pub(crate) fn describe(text: &str) -> Option<String> {
     ))
 }
 
-/// Bumped by [`retry_now`]: a rest taken before the latest bump is over.
-static RETRY_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Per context, bumped by [`retry_now`]: a rest taken before the latest bump is over.
+static RETRY_EPOCHS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
 
-/// Someone asked to connect now (selected or retried a cluster): plugins resting after a
-/// timed-out refresh ([`PROMPT_BACK_OFF`]) may run again. Requests Flint makes by itself keep
-/// waiting it out.
-pub fn retry_now() {
-    RETRY_EPOCH.fetch_add(1, Ordering::Relaxed);
+fn retry_epoch(context: &str) -> u64 {
+    let epochs = RETRY_EPOCHS.lock().unwrap_or_else(|e| e.into_inner());
+    epochs.get(context).copied().unwrap_or_default()
+}
+
+/// Someone asked to connect to `context` now (selected or retried it): its plugin, if resting
+/// after a timed-out refresh ([`PROMPT_BACK_OFF`]), may run again. Requests Flint makes by itself,
+/// and other contexts, keep waiting it out.
+pub fn retry_now(context: &str) {
+    let mut epochs = RETRY_EPOCHS.lock().unwrap_or_else(|e| e.into_inner());
+    *epochs.entry(context.to_owned()).or_default() += 1;
 }
 
 /// The client stack's layer that sets the plugin's token on each request.
@@ -517,14 +567,34 @@ pub(crate) type TokenLayer = AsyncFilterLayer<RefreshingToken>;
 /// the next. So one client runs at most one plugin at a time, and a slow login is not restarted
 /// by every short request.
 #[derive(Clone)]
-pub(crate) struct RefreshingToken(Arc<tokio::sync::Mutex<TokenState>>);
+pub(crate) struct RefreshingToken(Arc<TokenShared>);
+
+/// What every clone of one client's [`RefreshingToken`] shares.
+struct TokenShared {
+    state: Arc<tokio::sync::Mutex<TokenState>>,
+    /// The refresh task, aborted when the last clone goes (the client is dropped): its plugin is
+    /// killed then, and the terminal given back, instead of running on for nobody.
+    task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl Drop for TokenShared {
+    fn drop(&mut self) {
+        let task = self.task.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
+}
 
 struct TokenState {
+    /// The context the client is for: [`retry_now`] names it.
+    context: String,
     exec: ExecConfig,
     token: SecretString,
     expires: Timestamp,
-    /// The refresh running, which requests wait for.
-    refreshing: Option<Shared<BoxFuture<'static, ()>>>,
+    /// The refresh running, which requests wait for. It resolves to whether the task ended by
+    /// itself: `false` when it panicked or was aborted, so it stored nothing.
+    refreshing: Option<Shared<BoxFuture<'static, bool>>>,
     /// Why the last refresh failed, for the requests that waited for it.
     failed: Option<Arc<AuthError>>,
     /// A prompting plugin whose refresh timed out rests until then (as an instant and as wall
@@ -544,7 +614,7 @@ impl TokenState {
     /// Until when a timed-out prompting plugin rests, if it still does.
     fn rests_until(&self) -> Option<Timestamp> {
         let (until, wall, epoch) = self.resting?;
-        (Instant::now() < until && epoch == RETRY_EPOCH.load(Ordering::Relaxed)).then_some(wall)
+        (Instant::now() < until && epoch == retry_epoch(&self.context)).then_some(wall)
     }
 }
 
@@ -568,25 +638,43 @@ impl std::error::Error for SharedAuthError {
 impl RefreshingToken {
     async fn header(&self) -> Result<HeaderValue, BoxError> {
         let refresh = {
-            let mut state = self.0.lock().await;
+            let mut state = self.0.state.lock().await;
             if state.fresh() {
                 return bearer(&state.token);
             }
             if let Some(until) = state.rests_until() {
                 return Err(resting(&state.name(), until).into());
             }
+            // One that ended without storing anything (it panicked) is no refresh to wait for.
+            if state
+                .refreshing
+                .as_ref()
+                .is_some_and(|r| r.peek() == Some(&false))
+            {
+                state.refreshing = None;
+            }
             match &state.refreshing {
                 Some(refresh) => refresh.clone(),
                 None => {
-                    let refresh = self.start_refresh(state.exec.clone());
+                    let refresh = self.start_refresh(state.exec.clone(), state.context.clone());
                     state.failed = None;
                     state.refreshing = Some(refresh.clone());
                     refresh
                 }
             }
         };
-        refresh.await;
-        let state = self.0.lock().await;
+        if !refresh.clone().await {
+            let mut state = self.0.state.lock().await;
+            if state
+                .refreshing
+                .as_ref()
+                .is_some_and(|r| r.ptr_eq(&refresh))
+            {
+                state.refreshing = None;
+            }
+            return Err(AuthError::AuthExec(format!("{STOPPED}{}", state.name())).into());
+        }
+        let state = self.0.state.lock().await;
         if state.fresh() {
             return bearer(&state.token);
         }
@@ -598,8 +686,8 @@ impl RefreshingToken {
 
     /// Runs the plugin again in a task of its own, which stores the token (or why it failed)
     /// when it ends. The returned future resolves then.
-    fn start_refresh(&self, exec: ExecConfig) -> Shared<BoxFuture<'static, ()>> {
-        let state = self.0.clone();
+    fn start_refresh(&self, exec: ExecConfig, context: String) -> Shared<BoxFuture<'static, bool>> {
+        let state = self.0.state.clone();
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(CONNECT_TIMEOUT, run(&exec)).await;
             let mut state = state.lock().await;
@@ -622,7 +710,7 @@ impl RefreshingToken {
                         state.resting = Some((
                             Instant::now() + PROMPT_BACK_OFF,
                             Timestamp::now() + PROMPT_BACK_OFF,
-                            RETRY_EPOCH.load(Ordering::Relaxed),
+                            retry_epoch(&context),
                         ));
                     }
                     Some(AuthError::AuthExec(format!("{TIMED_OUT}{}", state.name())))
@@ -630,11 +718,9 @@ impl RefreshingToken {
             };
             state.failed = failed.map(Arc::new);
         });
-        async move {
-            let _ = task.await;
-        }
-        .boxed()
-        .shared()
+        let mut slot = self.0.task.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(task.abort_handle());
+        async move { task.await.is_ok() }.boxed().shared()
     }
 }
 
