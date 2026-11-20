@@ -604,7 +604,7 @@ fn a_prompting_plugin_on_a_terminal_is_killed_and_the_terminal_returned() {
         cmd.args(["-qec"])
             .arg(format!(
                 "{} --exact {test} --ignored --test-threads=1",
-                exe.display()
+                shell_quoted(&exe.display().to_string())
             ))
             .arg("/dev/null");
     } else {
@@ -628,6 +628,40 @@ fn a_prompting_plugin_on_a_terminal_is_killed_and_the_terminal_returned() {
         std::fs::read_to_string(&done).is_ok_and(|t| t == "ok"),
         "the terminal run failed:\n{text}"
     );
+    // Plugins without the terminal could not write on it.
+    assert!(
+        !text.contains(TTY_LEAK),
+        "a plugin wrote on the terminal:\n{text}"
+    );
+}
+
+/// `text` as one shell word.
+fn shell_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+#[test]
+fn shell_quoting_keeps_a_path_one_word() {
+    assert_eq!(shell_quoted("/a b/it's"), r"'/a b/it'\''s'");
+}
+
+/// What plugins that may not use the terminal try to write on it.
+const TTY_LEAK: &str = "flint-tty-leak-8471";
+
+/// Shell lines that try to write [`TTY_LEAK`] on the terminal, noting in `$PLUGIN_DIR/tty`
+/// whether `/dev/tty` could not be opened.
+fn try_the_terminal() -> String {
+    format!(
+        "if ( echo {TTY_LEAK} > /dev/tty ) 2>/dev/null; then echo wrote > \"$PLUGIN_DIR/tty\"; \
+         else echo refused > \"$PLUGIN_DIR/tty\"; fi\n"
+    )
+}
+
+fn tty_attempt(plugin: &FakePlugin) -> String {
+    std::fs::read_to_string(plugin.dir.path().join("tty"))
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 #[tokio::test]
@@ -684,11 +718,13 @@ async fn on_a_terminal() {
     // A second prompting plugin (another cluster) waits for the terminal briefly instead of
     // starting in the background; then it runs without prompting, and one that has what it
     // needs answers at once, not after the first one's login.
-    let second = FakePlugin::new(
+    let second = FakePlugin::new(&format!(
         "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
          printf '%s' \"$KUBERNETES_EXEC_INFO\" > \"$PLUGIN_DIR/info\"\n\
-         printf '{\"status\":{\"token\":\"t-cached\"}}'\n",
-    );
+         {}\
+         printf '{{\"status\":{{\"token\":\"t-cached\"}}}}'\n",
+        try_the_terminal()
+    ));
     let mut other = second.kubeconfig("http://127.0.0.1:1");
     prompting(&mut other);
     let mut config = config(&other).await;
@@ -706,10 +742,63 @@ async fn on_a_terminal() {
     assert_eq!(info["spec"]["interactive"], false, "it may not prompt");
     assert!(exists(leader), "the first plugin still has the terminal");
 
+    assert_eq!(
+        tty_attempt(&second),
+        "refused",
+        "without the terminal, no /dev/tty"
+    );
+
+    // A plugin that never prompts has no terminal at all either.
+    let never = FakePlugin::new(&format!(
+        "{}printf '{{\"status\":{{\"token\":\"t-never\"}}}}'\n",
+        try_the_terminal()
+    ));
+    let mut never_config = super::tests::config(&never.kubeconfig("http://127.0.0.1:1")).await;
+    resolve(&mut never_config, "never").await.unwrap();
+    assert_eq!(tty_attempt(&never), "refused");
+
+    // A plugin that must prompt (`Always`) waits for the terminal, past the fallback.
+    let always = FakePlugin::new(
+        "echo $$ >> \"$PLUGIN_DIR/starts\"\n\
+         fg() { [ \"$(ps -o tpgid= -p $$ | tr -d ' ')\" = \"$(ps -o pgid= -p $$ | tr -d ' ')\" ]; }\n\
+         i=0; while ! fg && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n\
+         fg && echo yes > \"$PLUGIN_DIR/foreground\"\n\
+         printf '{\"status\":{\"token\":\"t-always\"}}'\n",
+    );
+    let mut must = always.kubeconfig("http://127.0.0.1:1");
+    must.auth_infos[0]
+        .auth_info
+        .as_mut()
+        .unwrap()
+        .exec
+        .as_mut()
+        .unwrap()
+        .interactive_mode = Some(ExecInteractiveMode::Always);
+    let mut must_config = super::tests::config(&must).await;
+    let waiting = tokio::spawn(async move {
+        resolve(&mut must_config, "always").await.unwrap();
+        must_config
+            .auth_info
+            .token
+            .unwrap()
+            .expose_secret()
+            .to_owned()
+    });
+    tokio::time::sleep(TERMINAL_WAIT + Duration::from_secs(1)).await;
+    assert!(
+        always.starts().is_empty(),
+        "`Always` did not wait for the terminal"
+    );
+
     attempt.abort();
     assert!(attempt.await.is_err_and(|e| e.is_cancelled()));
     wait_reaped(leader).await;
     wait_dead(child).await;
+    assert_eq!(waiting.await.unwrap(), "t-always");
+    assert!(
+        always.dir.path().join("foreground").exists(),
+        "`Always` got the terminal once it was free"
+    );
     assert!(foreground(), "the terminal was not given back");
     // The plugin turned echo off (a password prompt) and was killed: echo is back on.
     // SAFETY: an all-zero termios is valid; tcgetattr writes into it.

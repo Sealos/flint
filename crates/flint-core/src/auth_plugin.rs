@@ -158,11 +158,14 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     }
     let mut interactive = exec.interactive_mode != Some(ExecInteractiveMode::Never);
     // Taken before the plugin starts, so a second prompting plugin waits for the first to give
-    // the terminal back instead of starting in the background, where reading it stops it. It
-    // waits [`TERMINAL_WAIT`] at most: then it runs without prompting (it may still have what it
-    // needs cached), rather than spend its whole timeout behind another plugin's login.
+    // the terminal back instead of starting in the background, where reading it stops it. With
+    // `IfAvailable` it waits [`TERMINAL_WAIT`] at most: then it runs without prompting (it may
+    // still have what it needs cached), rather than spend its whole timeout behind another
+    // plugin's login. `Always` must prompt, so it waits as long as its caller does.
+    let must_prompt = exec.interactive_mode == Some(ExecInteractiveMode::Always);
     let terminal = if interactive {
-        match Terminal::acquire().await {
+        let wait = (!must_prompt).then_some(TERMINAL_WAIT);
+        match Terminal::acquire(wait).await {
             Acquired::Terminal(terminal) => Some(terminal),
             Acquired::Busy => {
                 interactive = false;
@@ -173,6 +176,24 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     } else {
         None
     };
+    // A plugin that may not prompt gets a session of its own, without a controlling terminal:
+    // opening `/dev/tty` fails, so it cannot write into another plugin's prompt or stop on
+    // reading the terminal. Otherwise a group of its own. Either way a kill also ends what the
+    // plugin started (`gcloud` runs Python, a shell wrapper runs the real binary).
+    if interactive {
+        cmd.process_group(0);
+    } else {
+        // SAFETY: the closure runs in the child between fork and exec and only calls setsid,
+        // which is async-signal-safe. The child is no group leader yet, so setsid succeeds.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     if interactive {
         cmd.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
@@ -205,9 +226,6 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     for name in exec.drop_env.iter().flatten() {
         cmd.env_remove(name);
     }
-    // A group of its own, so a kill also ends what the plugin started (`gcloud` runs Python, a
-    // shell wrapper runs the real binary).
-    cmd.process_group(0);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
     // Closed at once, as `Command::output()` does.
@@ -368,10 +386,10 @@ enum Acquired {
 }
 
 impl Terminal {
-    /// Flint's controlling terminal, once no other plugin has it (waiting [`TERMINAL_WAIT`] at
-    /// most), if Flint's group is its foreground group (otherwise no one Flint starts may read
+    /// Flint's controlling terminal, once no other plugin has it (waiting `wait` at most, or as
+    /// long as the caller does), if Flint's group is its foreground group (otherwise no one Flint starts may read
     /// it anyway).
-    async fn acquire() -> Acquired {
+    async fn acquire(wait: Option<Duration>) -> Acquired {
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -380,9 +398,13 @@ impl Terminal {
             return Acquired::None;
         };
         let fd = OwnedFd::from(file);
-        let Ok(owner) = tokio::time::timeout(TERMINAL_WAIT, TERMINAL.clone().lock_owned()).await
-        else {
-            return Acquired::Busy;
+        let lock = TERMINAL.clone().lock_owned();
+        let owner = match wait {
+            Some(wait) => match tokio::time::timeout(wait, lock).await {
+                Ok(owner) => owner,
+                Err(_) => return Acquired::Busy,
+            },
+            None => lock.await,
         };
         // SAFETY: plain calls on a descriptor this function owns.
         if unsafe { libc::tcgetpgrp(fd.as_raw_fd()) == libc::getpgrp() } {
@@ -547,7 +569,7 @@ pub(crate) fn problem(text: &str) -> Option<(String, PluginProblem)> {
 static RETRY_EPOCHS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
     std::sync::LazyLock::new(Default::default);
 
-fn retry_epoch(context: &str) -> u64 {
+pub(crate) fn retry_epoch(context: &str) -> u64 {
     let epochs = RETRY_EPOCHS.lock().unwrap_or_else(|e| e.into_inner());
     epochs.get(context).copied().unwrap_or_default()
 }
