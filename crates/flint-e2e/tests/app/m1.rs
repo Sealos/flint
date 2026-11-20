@@ -168,7 +168,7 @@ fn up_21_filter_and_sort() -> Result<()> {
     );
     connect(&app, TwoClusters::A)?;
     app.wait_for("/header/namespaces", Equals(json!(["demo"])))?;
-    let (scratch, _) = app.quit()?;
+    let scratch = app.quit()?;
     let app = App::launch(AppOptions::new(two.kubeconfig()).reuse(scratch))?;
     connect(&app, TwoClusters::A)?;
     app.wait_for("/header/namespaces", Equals(json!(["demo"])))?;

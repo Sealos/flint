@@ -901,8 +901,8 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     assert_eq!((a.log_requests().len(), b.log_requests().len()), (1, 1));
 
     // The height survives a relaunch on the same config directory.
-    let (scratch, status) = app.quit()?;
-    assert!(status.success(), "{status}");
+    // Quit checks that the app exited cleanly (`App::quit`).
+    let scratch = app.quit()?;
     app = App::launch(AppOptions::new(two.kubeconfig()).reuse(scratch))?;
     let state = app.wait_for("/dock/height", Equals(333.into()))?;
     assert_eq!(state["dock"]["tabs"], json!([]));

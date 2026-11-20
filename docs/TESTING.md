@@ -242,6 +242,26 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   failing tests). Scratch directories record their owner's pid, and the next run removes those of dead processes.
   `App::quit` keeps the scratch directories so `AppOptions::reuse` can relaunch on them. Only one `App` runs at a time
   in a test process; `App::launch` waits for the previous one to be dropped.
+- **Teardown checks** (`flint_e2e::teardown`, #127). When the app goes away, by `App::quit` or by dropping it,
+  every app test checks what must always hold, whatever it did:
+  - UP-91: no fake API server received a request from the app before the test selected a cluster on it, and a server
+    the test never selected received none. Counts start at the launch, per server, for the fake servers the app's
+    kubeconfig names (servers a test adds later count from when it adds them). A kind cluster has no request log and
+    is not checked.
+  - UP-90: every kubeconfig file the app reads (the `KUBECONFIG` list, or the scratch `HOME`'s `.kube/config` when it
+    is unset, and `kubeconfig_paths` in its `settings.toml`, including paths added during the test) is byte-identical
+    at the end, and a missing one is still missing.
+  - The app exited cleanly on Quit (not killed) and removed its automation socket.
+
+  `App::quit` returns the violations as an error; dropping the app panics with them, or only prints them when the test
+  is already panicking or a request timed out or lost the app (the test's own error is the one to read). A launch that
+  fails is not checked. The exceptions are explicit: `App::select_cluster` marks the cluster selected,
+  `App::mark_selected` does so for a selection made another way (the switcher, the palette), a cluster the test
+  exposes to AI, or a request the test sends itself, `App::edit_kubeconfig(|| …)` wraps the test's own kubeconfig changes (UP-06), and
+  `AppOptions::cluster_at_startup` sets `FLINT_CLUSTER` and counts that cluster as selected from the launch
+  (`AppOptions::env` refuses `FLINT_CLUSTER`). Requests are recorded when the fake server answers them, so a request
+  delayed by a fault past the selection counts as after it. `tests/app/harness.rs` breaks UP-90 and UP-91 on purpose in the app
+  and asserts that the test fails; the unit tests in `teardown.rs` also cover a killed app and a socket left behind.
 - **`Mcp`** (`flint_e2e::mcp`): `Mcp::start` runs `flint-mcp`; `Mcp::flint` runs `flint mcp` from the app binary,
   for tests that check the app and the server agree. Both get the given kubeconfig (an empty one is refused), the
   given config directory (with a fixed-`path` `settings.toml` if it has none) and a scratch `HOME`. JSON-RPC over
@@ -593,8 +613,8 @@ milestone T; feature tests are in their feature's milestone.
 
 ### P1: before 1.0
 
-- **Harness (T):** teardown invariants for UP-90 and UP-91
-  (#127); drift guard: MCP tests on both backends in `cluster-e2e` and a nightly fixture diff (#128); fake writes,
+- **Harness (T):** teardown checks for UP-90 and UP-91 run in every app test (#127; its strict `TODO(#98)` wording
+  for UP-04 and UP-27 waits for #98); drift guard: MCP tests on both backends in `cluster-e2e` and a nightly fixture diff (#128); fake writes,
   a remote-looking cluster for protection, metrics, fixture variants, a fake `claude` and clock control (#129); the
   nightly memory soak test (#126).
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the

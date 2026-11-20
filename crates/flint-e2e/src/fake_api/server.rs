@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
@@ -130,6 +130,25 @@ struct Inner {
     shutdown: watch::Receiver<()>,
 }
 
+/// Every fake server running in this process, by URL, so the app harness can read the requests
+/// of the servers a kubeconfig names ([`requests_at`]).
+static RUNNING: Mutex<Vec<(String, Weak<Inner>)>> = Mutex::new(Vec::new());
+
+/// The requests received so far by the fake server at `url` in this process, oldest first, or
+/// `None` when no fake server runs there (another cluster, such as kind, or a closed port).
+pub fn requests_at(url: &str) -> Option<Vec<RequestRecord>> {
+    let url = url.trim_end_matches('/');
+    let running = lock(&RUNNING);
+    // The newest first: a port can be reused while a stopped server's tasks still wind down.
+    let inner = running
+        .iter()
+        .rev()
+        .find(|(u, _)| u == url)
+        .and_then(|(_, inner)| inner.upgrade())?;
+    drop(running);
+    Some(lock(&inner.requests).clone())
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().expect("fake API server lock")
 }
@@ -197,6 +216,11 @@ impl FakeApiServer {
         });
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.clone());
         let accept = tokio::spawn(accept_loop(listener, acceptor, inner.clone()));
+        {
+            let mut running = lock(&RUNNING);
+            running.retain(|(_, inner)| inner.strong_count() > 0);
+            running.push((format!("https://{addr}"), Arc::downgrade(&inner)));
+        }
         Ok(FakeApiServer {
             inner,
             addr,
