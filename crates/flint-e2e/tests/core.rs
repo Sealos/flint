@@ -1363,3 +1363,139 @@ async fn the_app_reads_logs_and_events_as_written() {
         "{events:?}"
     );
 }
+
+/// Events about objects never get an answer: the server accepts the list and stalls.
+fn stall_events(server: &FakeApiServer) {
+    server.inject(
+        Fault::delay(Duration::from_secs(3600))
+            .on(&Gvr::core("events"))
+            .verb(Verb::List),
+    );
+}
+
+/// Waits up to `within` until the fake server is handling exactly `count` requests.
+async fn until_in_flight(server: &FakeApiServer, count: usize, within: Duration, what: &str) {
+    tokio::time::timeout(within, async {
+        while server.requests_in_flight() != count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{what}: requests in flight did not reach {count} within {within:?}")
+    });
+}
+
+/// How many events requests have reached the fake server.
+fn events_requests(server: &FakeApiServer) -> usize {
+    server
+        .arrivals()
+        .iter()
+        .filter(|r| r.is_about(&Gvr::core("events")))
+        .count()
+}
+
+/// Waits until `count` events requests have arrived and the server holds exactly those: the
+/// detail reads got past their object and stalled on the events.
+async fn until_events_stalled(server: &FakeApiServer, count: usize, held: usize, what: &str) {
+    tokio::time::timeout(WAIT, async {
+        while events_requests(server) < count || server.requests_in_flight() != held {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: never stalled on the events"));
+}
+
+/// Far shorter than `read::DETAIL_TIMEOUT`, so a read let go only by its deadline fails here.
+const GIVEN_UP: Duration = Duration::from_secs(5);
+
+// covers UP-23: a closed detail pane stops its read, and with it the object it holds (#258).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_detail_request_cancels_its_read() {
+    let server = FakeApiServer::start().await.unwrap();
+    stall_events(&server);
+    let core = Core::start(&server, None).await;
+    let deployments = KindId::new("apps", "deployments");
+    let fetch = core
+        .handle
+        .fetch_object(CONTEXT, &deployments, Some("demo"), "web");
+    // The object came back; the events request is held.
+    until_events_stalled(&server, 1, 1, "web's detail").await;
+    // The pane closes: nobody waits for the answer any more.
+    drop(fetch);
+    until_in_flight(&server, 0, GIVEN_UP, "the stalled events request given up").await;
+}
+
+// covers UP-23: stepping through many rows on a stalled server leaves no reads behind (#258).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stepping_through_rows_leaves_no_detail_reads_behind() {
+    let server = FakeApiServer::start().await.unwrap();
+    stall_events(&server);
+    let core = Core::start(&server, None).await;
+    let pods = KindId::pods();
+    let names: Vec<String> = server
+        .rows(&Gvr::core("pods"))
+        .into_iter()
+        .filter(|r| r.namespace() == Some("demo"))
+        .map(|r| r.name().to_string())
+        .collect();
+    assert!(names.len() >= 5, "{names:?}");
+    // Each row visited asks for its detail, and the next one replaces it.
+    for round in 0..4 {
+        for name in &names {
+            let asked = events_requests(&server) + 1;
+            let fetch = core.handle.fetch_object(CONTEXT, &pods, Some("demo"), name);
+            until_events_stalled(&server, asked, 1, &format!("round {round}: {name}")).await;
+            drop(fetch);
+            until_in_flight(
+                &server,
+                0,
+                GIVEN_UP,
+                &format!("round {round}: {name} given up"),
+            )
+            .await;
+        }
+    }
+    // Several at once, then all closed.
+    let asked = events_requests(&server) + names.len();
+    let fetches: Vec<_> = names
+        .iter()
+        .map(|name| core.handle.fetch_object(CONTEXT, &pods, Some("demo"), name))
+        .collect();
+    until_events_stalled(&server, asked, names.len(), "every row").await;
+    drop(fetches);
+    until_in_flight(&server, 0, GIVEN_UP, "every read given up").await;
+}
+
+// covers UP-23: events that never come still show the object, with why they are missing (#258).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_events_request_returns_the_object_after_the_deadline() {
+    let server = FakeApiServer::start().await.unwrap();
+    stall_events(&server);
+    let client = server.client().await.unwrap();
+    let kinds = read::discover_kinds(&client).await.unwrap().kinds;
+    let deployments = kinds.iter().find(|k| k.plural() == "deployments").unwrap();
+    let started = std::time::Instant::now();
+    // Bounded here too: without a working deadline the read would wait out the fault's hour.
+    let detail = tokio::time::timeout(
+        Duration::from_secs(10),
+        read::object_detail_within(
+            &client,
+            deployments,
+            Some("demo"),
+            "web",
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("the deadline ends the read")
+    .expect("the object, despite the events");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(detail.object["kind"], "Deployment");
+    assert!(detail.events.is_empty());
+    let error = detail.events_error.expect("why the events are missing");
+    assert!(error.contains("timed out"), "{error}");
+    // Timing out dropped the events request.
+    until_in_flight(&server, 0, GIVEN_UP, "the timed-out events request").await;
+}

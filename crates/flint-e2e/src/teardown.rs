@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-use crate::fake_api::{RequestRecord, arrivals_at};
+use crate::fake_api::{RequestRecord, arrivals_at, connection_mark_at};
 
 /// How many of a server's unexpected requests a violation lists.
 const LISTED: usize = 5;
@@ -27,9 +27,12 @@ const LISTED: usize = 5;
 /// One fake server the app could reach.
 #[derive(Debug)]
 struct Server {
-    /// The requests that had arrived when the app launched (or when the kubeconfig first named
-    /// it). Counted on arrival, so a request a fault delays counts from when it was sent.
-    baseline: usize,
+    /// The server's connection mark when the app launched (or when the kubeconfig first named
+    /// it): only requests on later connections are the app's. A client that came before (the
+    /// app this one relaunches, the test itself) may still have requests on its way on its own
+    /// connections. Requests count on arrival, so one a fault delays counts from when it was
+    /// sent.
+    since: u64,
     selected: bool,
 }
 
@@ -98,12 +101,12 @@ impl Teardown {
                 continue;
             }
             server.selected = true;
-            let requests = arrivals_at(&url).unwrap_or_default();
-            if requests.len() > server.baseline {
+            let requests = since(&url, server.since);
+            if !requests.is_empty() {
                 self.violations.push(unexpected(
                     &format!("before the test selected {context:?}"),
                     &url,
-                    &requests[server.baseline..],
+                    &requests,
                 ));
             }
         }
@@ -118,15 +121,15 @@ impl Teardown {
             if server.selected {
                 continue;
             }
-            let requests = arrivals_at(url).unwrap_or_default();
-            if requests.len() > server.baseline {
+            let requests = since(url, server.since);
+            if !requests.is_empty() {
                 violations.push(unexpected(
                     &format!(
                         "though the test never selected {}",
                         self.contexts_of(url).join(" or ")
                     ),
                     url,
-                    &requests[server.baseline..],
+                    &requests,
                 ));
             }
         }
@@ -187,7 +190,7 @@ impl Teardown {
             let Some(url) = context.server else { continue };
             let url = url.trim_end_matches('/').to_owned();
             if !self.servers.contains_key(&url)
-                && let Some(requests) = arrivals_at(&url)
+                && let Some(mark) = connection_mark_at(&url)
             {
                 let selected = self.contexts.get(&context.name).is_some_and(|urls| {
                     urls.iter()
@@ -196,7 +199,7 @@ impl Teardown {
                 self.servers.insert(
                     url.clone(),
                     Server {
-                        baseline: requests.len(),
+                        since: mark,
                         selected,
                     },
                 );
@@ -212,6 +215,15 @@ impl Teardown {
             .map(|(name, _)| format!("{name:?}"))
             .collect()
     }
+}
+
+/// The requests that have arrived at the fake server at `url` on connections after `mark`.
+fn since(url: &str, mark: u64) -> Vec<RequestRecord> {
+    arrivals_at(url)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.connection > mark)
+        .collect()
 }
 
 /// A UP-91 violation: `requests` reached `url` `when`.
@@ -297,6 +309,32 @@ mod tests {
         two.contact(&two.a);
         let gone = two.dir.path().join("no-socket");
         assert_eq!(teardown.finish(ok(), &gone), Vec::<String>::new());
+    }
+
+    // A client that was there before the launch (the app a test relaunches) may still have a
+    // request on its way on its own connection: it is not the new app's.
+    #[test]
+    fn a_late_request_on_an_older_connection_is_not_the_apps() {
+        let two = Two::start();
+        let client = two.runtime.block_on(two.a.client()).unwrap();
+        two.runtime.block_on(client.apiserver_version()).unwrap();
+        let mut teardown = two.teardown();
+        // On the pooled connection opened before the launch.
+        two.runtime.block_on(client.apiserver_version()).unwrap();
+        let arrivals = two.a.arrivals();
+        assert_eq!(arrivals.len(), 2);
+        assert_eq!(
+            arrivals[0].connection, arrivals[1].connection,
+            "the second request reuses the first one's connection"
+        );
+        // A new client's request after the launch counts.
+        two.contact(&two.b);
+        let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("never selected \"b\""),
+            "{violations:?}"
+        );
     }
 
     #[test]

@@ -506,6 +506,153 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
     Ok(())
 }
 
+// covers UP-10, UP-15
+#[test]
+fn up_10_names_that_are_not_single_path_segments_are_never_sent() -> Result<()> {
+    let two = Two::start()?;
+    two.scratch
+        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    let encoded = "ZmxpbnQtZTJlLXBhdGgtc2VjcmV0";
+    two.a.set_object(
+        &two.a.gvr("secrets"),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "db", "namespace": "demo"},
+            "type": "Opaque",
+            "data": {"password": encoded}
+        }),
+    );
+    let mut mcp = two.mcp()?;
+
+    // Each bad call, with what it answers and the not-found answer it must match: `ns` or
+    // `pod`, with the name it quotes. Made first, on a cold discovery cache.
+    let get = |kind: &str, namespace: Option<&str>, name: &str| json!({"cluster": EXPOSED, "kind": kind, "namespace": namespace, "name": name});
+    let logs = |namespace: &str, pod: &str, container: Option<&str>| json!({"cluster": EXPOSED, "namespace": namespace, "pod": pod, "container": container});
+    let calls = [
+        (
+            "get_resource",
+            get("namespaces", None, "demo/secrets"),
+            "ns",
+            "demo/secrets",
+        ),
+        (
+            "get_resource",
+            get("namespaces", None, "demo%2Fsecrets"),
+            "ns",
+            "demo%2Fsecrets",
+        ),
+        (
+            "get_resource",
+            get("namespaces", None, "demo/secrets?x=1"),
+            "ns",
+            "demo/secrets?x=1",
+        ),
+        ("get_resource", get("namespaces", None, ".."), "ns", ".."),
+        (
+            "get_resource",
+            get("pods", Some("demo"), "x/../db"),
+            "pod",
+            "x/../db",
+        ),
+        (
+            "get_resource",
+            get("pods", Some("demo"), "web#frag"),
+            "pod",
+            "web#frag",
+        ),
+        (
+            "get_resource",
+            get("pods", Some("demo/secrets"), "db"),
+            "pod",
+            "db",
+        ),
+        ("get_resource", get("pods", Some(".."), "db"), "pod", "db"),
+        (
+            "get_pod_logs",
+            logs("demo", "db/../../secrets", None),
+            "pod",
+            "db/../../secrets",
+        ),
+        (
+            "get_pod_logs",
+            logs("demo/secrets", "db", None),
+            "pod",
+            "db",
+        ),
+        (
+            "get_pod_logs",
+            logs("demo", "%2E%2E", None),
+            "pod",
+            "%2E%2E",
+        ),
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": "demo/secrets"}),
+            "ns",
+            "demo/secrets",
+        ),
+        (
+            "get_events",
+            json!({"cluster": EXPOSED, "namespace": "../demo"}),
+            "ns",
+            "../demo",
+        ),
+    ];
+    let mut answers = Vec::new();
+    for (tool, args, _, _) in &calls {
+        let got = mcp.call(tool, args.clone())?;
+        assert!(got.is_error, "{args}: {}", got.text);
+        answers.push(got.text);
+    }
+    let nodes = mcp.call(
+        "get_resource",
+        get("nodes", None, "kind-control-plane/proxy/pods"),
+    )?;
+    assert!(nodes.is_error, "{}", nodes.text);
+    assert!(nodes.text.starts_with("NotFound: nodes "), "{}", nodes.text);
+    let container = mcp.call(
+        "get_pod_logs",
+        logs("demo", "web-69c6f74b8b-qv4xv", Some("web&follow=true")),
+    )?;
+    assert!(container.is_error, "{}", container.text);
+    assert_eq!(
+        container.text,
+        "BadRequest: container \"web&follow=true\" is not valid for pod \"web-69c6f74b8b-qv4xv\""
+    );
+    // Not one request reached the server, not even discovery.
+    assert!(two.a.arrivals().is_empty(), "{:?}", two.a.arrivals());
+
+    // What a missing object looks like, from the server itself.
+    let mut missing = |args: Value| -> Result<String> {
+        let got = mcp.call("get_resource", args)?;
+        assert!(got.is_error, "{}", got.text);
+        Ok(got.text)
+    };
+    let missing_ns = missing(get("namespaces", None, "nope"))?;
+    let missing_pod = missing(get("pods", Some("demo"), "nope"))?;
+    assert_eq!(missing_ns, "NotFound: namespaces \"nope\" not found");
+    assert_eq!(missing_pod, "NotFound: pods \"nope\" not found");
+    for ((tool, args, like, name), answer) in calls.iter().zip(&answers) {
+        let expected = if *like == "ns" {
+            &missing_ns
+        } else {
+            &missing_pod
+        };
+        assert_eq!(
+            answer,
+            &expected.replace("\"nope\"", &format!("{name:?}")),
+            "{tool} {args}"
+        );
+    }
+
+    // The Secret itself is still readable by name, redacted.
+    let secret = mcp.call("get_resource", get("secret", Some("demo"), "db"))?;
+    assert!(!secret.is_error, "{}", secret.text);
+    assert!(!secret.text.contains(encoded), "{}", secret.text);
+    Ok(())
+}
+
 fn names(list: &Value) -> Vec<String> {
     list["rows"]
         .as_array()
@@ -544,6 +691,185 @@ fn up_11_unexposed_repointed_and_unknown_clusters_look_the_same() -> Result<()> 
     // No connection was attempted to either server.
     assert!(two.a.requests().is_empty(), "{:?}", two.a.requests());
     assert!(two.b.requests().is_empty(), "{:?}", two.b.requests());
+    Ok(())
+}
+
+/// Settings exposing `context` at `server`, limited to `namespaces` and `kinds`.
+fn exposing_scoped(context: &str, server: &str, namespaces: &[&str], kinds: &[&str]) -> String {
+    format!(
+        "{}namespaces = {namespaces:?}\nkinds = {kinds:?}\n",
+        exposing(context, server)
+    )
+}
+
+// covers UP-14: a cluster limited to a namespace and kinds shows only those. Every request
+// beyond the scope (another namespace, another kind, a cluster-scoped kind, a missing kind)
+// fails with exactly the error of a cluster that is not exposed, so nothing can be probed.
+// Lists across all namespaces, events and logs stay in the scope.
+#[test]
+fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
+    let two = Two::start()?;
+    write_kubeconfigs(
+        &two.scratch.path().join("kubeconfig"),
+        &[
+            (&two.a, EXPOSED, Some("kube-system")),
+            (&two.b, HIDDEN, None),
+        ],
+    )?;
+    two.a.set_log("demo", "web-69c6f74b8b-qv4xv", "GET / 200\n");
+    two.scratch
+        .write_settings(&exposing_scoped(EXPOSED, &two.a.url(), &["demo"], &[]))?;
+    let mut mcp = two.mcp()?;
+
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    assert_eq!(
+        clusters["clusters"][0]["scope"],
+        json!({"namespaces": ["demo"], "kinds": []}),
+        "{clusters}"
+    );
+    // Names go first, scoped or not: an object name or Kind that could add a field selector of
+    // its own is not found, and nothing is sent.
+    let before = two.a.requests().len();
+    for args in [
+        json!({"cluster": EXPOSED, "object_name": "a,involvedObject.namespace=kube-system"}),
+        json!({"cluster": EXPOSED, "object_kind": "Pod,involvedObject.namespace=kube-system"}),
+        json!({"cluster": EXPOSED, "namespace": "demo/../kube-system"}),
+    ] {
+        let got = mcp.call("get_events", args.clone())?;
+        assert!(
+            got.is_error && got.text.starts_with("NotFound:"),
+            "{args}: {}",
+            got.text
+        );
+    }
+    assert_eq!(two.a.requests().len(), before, "nothing was sent");
+    // The context's default namespace is out of scope: not named.
+    assert_eq!(
+        clusters["clusters"][0]["default_namespace"],
+        Value::Null,
+        "{clusters}"
+    );
+
+    // The not-found every out-of-scope request must match: an unknown cluster's, named alike.
+    let unknown = mcp.call(
+        "list_resources",
+        json!({"cluster": "no-such-cluster", "kind": "pods", "namespace": "demo"}),
+    )?;
+    assert!(unknown.is_error);
+    let expected = unknown.text.replace("no-such-cluster", EXPOSED);
+    let mut refused = |tool: &str, args: Value| -> Result<()> {
+        let got = mcp.call(tool, args.clone())?;
+        assert!(got.is_error, "{tool} {args}: {}", got.text);
+        assert_eq!(got.text, expected, "{tool} {args}");
+        Ok(())
+    };
+    let pods_in = |ns: &str| json!({"cluster": EXPOSED, "kind": "pods", "namespace": ns});
+    refused("list_resources", pods_in("kube-system"))?;
+    refused(
+        "get_resource",
+        json!({"cluster": EXPOSED, "kind": "pods", "namespace": "kube-system", "name": "x"}),
+    )?;
+    // Cluster-scoped kinds are hidden under a namespace scope, as is a kind that does not exist.
+    refused(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "nodes"}),
+    )?;
+    refused(
+        "get_resource",
+        json!({"cluster": EXPOSED, "kind": "namespaces", "name": "kube-system"}),
+    )?;
+    refused(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "gizmos"}),
+    )?;
+    // Events are read through get_events only, which keeps them in scope.
+    refused(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "events", "namespace": "demo"}),
+    )?;
+    refused(
+        "get_events",
+        json!({"cluster": EXPOSED, "namespace": "default"}),
+    )?;
+    refused(
+        "get_events",
+        json!({"cluster": EXPOSED, "object_kind": "Node"}),
+    )?;
+    refused(
+        "get_pod_logs",
+        json!({"cluster": EXPOSED, "namespace": "kube-system", "pod": "x"}),
+    )?;
+
+    let kinds = mcp.call_json("list_resource_kinds", json!({"cluster": EXPOSED}))?;
+    let kinds: Vec<&Value> = kinds["kinds"].as_array().unwrap().iter().collect();
+    assert!(kinds.iter().any(|k| k["kind"] == "Pod"));
+    assert!(kinds.iter().all(|k| k["namespaced"] == true), "{kinds:?}");
+
+    // All namespaces: only the scope's.
+    let pods = mcp.call_json(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "pods"}),
+    )?;
+    let rows = pods["rows"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{pods}");
+    assert!(rows.iter().all(|r| r["namespace"] == "demo"), "{pods}");
+    assert_eq!(pods["continue"], Value::Null);
+    let events = mcp.call_json("get_events", json!({"cluster": EXPOSED}))?;
+    let events = events["events"].as_array().unwrap();
+    assert!(!events.is_empty());
+    assert!(
+        events.iter().all(
+            |e| e["namespace"] == "demo" && !e["object"].as_str().unwrap().starts_with("Node/")
+        ),
+        "{events:?}"
+    );
+    let logs = mcp.call_json(
+        "get_pod_logs",
+        json!({"cluster": EXPOSED, "namespace": "demo", "pod": "web-69c6f74b8b-qv4xv"}),
+    )?;
+    assert_eq!(logs["log"], "GET / 200\n");
+
+    // Kinds named: only those, a cluster-scoped one included because it is named. Logs need pods.
+    two.scratch.write_settings(&exposing_scoped(
+        EXPOSED,
+        &two.a.url(),
+        &["demo"],
+        &["nodes", "configmaps"],
+    ))?;
+    let kinds = mcp.call_json("list_resource_kinds", json!({"cluster": EXPOSED}))?;
+    let mut names: Vec<&str> = kinds["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["plural"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["configmaps", "nodes"]);
+    let nodes = mcp.call_json(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "nodes"}),
+    )?;
+    assert!(!nodes["rows"].as_array().unwrap().is_empty(), "{nodes}");
+    let expected = unknown.text.replace("no-such-cluster", EXPOSED);
+    for (tool, args) in [
+        ("list_resources", pods_in("demo")),
+        (
+            "get_pod_logs",
+            json!({"cluster": EXPOSED, "namespace": "demo", "pod": "web-69c6f74b8b-qv4xv"}),
+        ),
+    ] {
+        let got = mcp.call(tool, args.clone())?;
+        assert!(got.is_error, "{tool}: {}", got.text);
+        assert_eq!(got.text, expected, "{tool} {args}");
+    }
+
+    // Clearing the scope exposes everything again.
+    two.scratch
+        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    assert_eq!(clusters["clusters"][0]["default_namespace"], "kube-system");
+    mcp.call_json("list_resources", pods_in("kube-system"))?;
+    assert!(two.b.requests().is_empty());
     Ok(())
 }
 

@@ -437,11 +437,27 @@ pub(crate) enum EventType {
 // ---------------------------------------------------------------------------------------------
 // Building rows
 
+/// The fewest new strings between two prunes that [`Interner::intern`] triggers.
+const PRUNE_MIN: usize = 4096;
+
 /// Interns repeated strings (statuses, node names, label keys, namespaces) for one kind.
+///
+/// Strings no row uses are dropped once as many new strings came in since the last prune as
+/// that prune kept (and at least [`PRUNE_MIN`]), so a watch that runs for days through steady
+/// churn (rollouts, CronJobs, autoscaling: every new pod brings a unique name, IP and labels)
+/// holds fewer than `2 × kept + PRUNE_MIN` strings, where `kept` is what was still held at the
+/// last prune: by rows, or by the snapshot published last. The bound follows the live count at
+/// that prune, so after a big drop it shrinks only with the next one. Pruning walks the set
+/// once per `max(PRUNE_MIN, kept)` inserts: amortised O(1) per insert.
 #[derive(Debug, Default)]
 pub(crate) struct Interner {
     set: HashSet<Arc<str>>,
+    /// New strings since the last prune.
     inserts: usize,
+    /// How many strings the last prune kept.
+    kept: usize,
+    #[cfg(test)]
+    prunes: usize,
 }
 
 impl Interner {
@@ -452,16 +468,38 @@ impl Interner {
         let fresh: Arc<str> = s.into();
         self.set.insert(fresh.clone());
         self.inserts += 1;
-        if self.inserts >= 4096 && self.inserts >= self.set.len() {
+        if self.inserts >= PRUNE_MIN.max(self.kept) {
             self.prune();
         }
         fresh
     }
 
-    /// Drops strings no row uses any more.
+    /// Drops strings no row uses any more. A string the last published snapshot still holds
+    /// survives until a later prune.
     pub fn prune(&mut self) {
         self.set.retain(|s| Arc::strong_count(s) > 1);
+        self.kept = self.set.len();
         self.inserts = 0;
+        // After a big drop, give the table back too, so later prunes walk what is left.
+        if self.set.capacity() > 4 * self.kept.max(PRUNE_MIN) {
+            self.set.shrink_to_fit();
+        }
+        #[cfg(test)]
+        {
+            self.prunes += 1;
+        }
+    }
+
+    /// Keeps exactly the strings in `used` (after a relist: what the store's rows use), so
+    /// strings only older snapshots hold leave the set at once and are freed with them.
+    pub fn keep_only<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
+        self.set = used.cloned().collect();
+        self.kept = self.set.len();
+        self.inserts = 0;
+        #[cfg(test)]
+        {
+            self.prunes += 1;
+        }
     }
 
     #[cfg(test)]
@@ -1002,6 +1040,56 @@ pub(crate) mod tests {
         assert_eq!(row.cells[5], Cell::Age);
         assert_eq!(row.cell_text(5, 1_767_225_700), "100s");
         assert_eq!(row.cell_text(3, 0), "Running");
+    }
+
+    // covers UP-20: a watch that keeps resuming through churn does not keep dead strings (#257).
+    #[test]
+    fn interned_strings_stay_bounded_through_steady_churn() {
+        let mut interner = Interner::default();
+        // Strings rows still use.
+        let live: Vec<Arc<str>> = (0..10_000)
+            .map(|i| interner.intern(&format!("live-{i}")))
+            .collect();
+        interner.prune();
+        let bound = 2 * live.len() + PRUNE_MIN;
+        // Pods come and go, each with strings of its own, dropped at once.
+        let churn = 200_000;
+        let mut largest = 0;
+        for i in 0..churn {
+            drop(interner.intern(&format!("gone-{i}")));
+            largest = largest.max(interner.len());
+        }
+        assert!(largest < bound, "{largest} strings, bound {bound}");
+        // The live ones are all still there.
+        for s in &live {
+            assert!(Arc::ptr_eq(s, &interner.intern(s)));
+        }
+        // Amortised: one prune per `max(PRUNE_MIN, kept)` new strings, not one per insert. The
+        // count is the automatic prune while the live strings came in, the explicit one, and
+        // one per `max(PRUNE_MIN, kept)` of the churn.
+        assert!(
+            interner.prunes <= 1 + churn / PRUNE_MIN.max(live.len()) + 1,
+            "{} prunes for {churn} inserts",
+            interner.prunes
+        );
+    }
+
+    // covers UP-20
+    #[test]
+    fn a_prune_after_a_drop_gives_the_table_back() {
+        let mut interner = Interner::default();
+        let many: Vec<Arc<str>> = (0..100_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
+        let big = interner.set.capacity();
+        drop(many);
+        interner.prune();
+        assert_eq!(interner.len(), 0);
+        assert!(
+            interner.set.capacity() < big / 4,
+            "{}",
+            interner.set.capacity()
+        );
     }
 
     // covers UP-20

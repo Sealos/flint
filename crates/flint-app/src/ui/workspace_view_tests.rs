@@ -49,10 +49,7 @@ async fn the_cluster_changed_badge_leaves_the_server_its_room(cx: &mut TestAppCo
     let t = open_workspace(cx, dir.path()).await;
     t.model.update(cx, |model, cx| {
         model.settings = Arc::new(Settings {
-            ai_exposed_clusters: vec![AiExposure {
-                context: "alpha".into(),
-                server: "https://10.0.0.1:6443".into(),
-            }],
+            ai_exposed_clusters: vec![AiExposure::new("alpha", "https://10.0.0.1:6443")],
             ..Default::default()
         });
         cx.notify();

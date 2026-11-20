@@ -1,0 +1,397 @@
+//! The AI scope pickers of the Expose to AI and Edit AI Scope dialogs (ADR-0013, UP-14): which
+//! namespaces and kinds agents may read of a cluster. Nothing checked means everything. The
+//! choices come from the cluster's discovery (kinds) and its namespace list, plus whatever the
+//! scope already names, so a scope saved earlier can be read and changed even while the
+//! cluster is not connected.
+//!
+//! Each checkbox performs a registered action (`ai_scope::…`) from the picker's own focus, so
+//! automation and the view tests take the same path as a click.
+
+use std::collections::BTreeSet;
+
+use flint_core::KindInfo;
+use flint_core::settings::AiScope;
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{self, Input, InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::registry::{
+    self, Bind, OnView, ScopeAllKinds, ScopeAllNamespaces, ToggleScopeKind, ToggleScopeNamespace,
+};
+
+/// A kind the pickers offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindChoice {
+    /// The kind id the scope stores (`pods`, `deployments.apps`).
+    pub id: String,
+    /// What the picker shows: the Kind, and the group when it has one.
+    pub label: String,
+    /// Cluster-scoped kinds are hidden under a namespace scope unless checked.
+    pub namespaced: bool,
+}
+
+impl KindChoice {
+    fn of(kind: &KindInfo) -> Self {
+        let label = if kind.group().is_empty() {
+            kind.kind().to_owned()
+        } else {
+            format!("{} ({})", kind.kind(), kind.group())
+        };
+        KindChoice {
+            id: kind.id().as_str().to_owned(),
+            label,
+            namespaced: kind.namespaced,
+        }
+    }
+}
+
+pub struct ScopePicker {
+    namespaces: Vec<String>,
+    kinds: Vec<KindChoice>,
+    selected_namespaces: BTreeSet<String>,
+    selected_kinds: BTreeSet<String>,
+    /// A namespace typed by name: for a cluster whose namespaces are not listed here (not the
+    /// active one, or one whose namespaces cannot be listed).
+    input: Entity<InputState>,
+    /// Why the typed name was not taken (not a namespace name).
+    input_error: Option<String>,
+    focus: FocusHandle,
+    _input: Subscription,
+}
+
+impl ScopePicker {
+    /// Pickers offering `namespaces` and the listable `kinds`, with `scope` checked. What the
+    /// scope names but the cluster does not offer (now) is offered too.
+    pub fn new(
+        namespaces: &[String],
+        kinds: &[KindInfo],
+        scope: &AiScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut offered: BTreeSet<String> = namespaces.iter().cloned().collect();
+        offered.extend(scope.namespaces.iter().cloned());
+        // Events are not offered: agents read them with get_events, which follows the
+        // namespaces and kinds chosen here.
+        let mut choices: Vec<KindChoice> = kinds
+            .iter()
+            .filter(|k| k.is_listable() && !is_event_kind(k))
+            .map(KindChoice::of)
+            .collect();
+        for id in &scope.kinds {
+            if !choices.iter().any(|c| &c.id == id) {
+                choices.push(KindChoice {
+                    id: id.clone(),
+                    label: id.clone(),
+                    namespaced: true,
+                });
+            }
+        }
+        choices.sort_by_key(|c| c.label.to_lowercase());
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Add a namespace by name…"));
+        let on_input = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let _ = this.take_typed(input, window, cx);
+                cx.notify();
+            }
+        });
+        ScopePicker {
+            namespaces: offered.into_iter().collect(),
+            kinds: choices,
+            selected_namespaces: scope.namespaces.iter().cloned().collect(),
+            selected_kinds: scope.kinds.iter().cloned().collect(),
+            input,
+            input_error: None,
+            focus: cx.focus_handle(),
+            _input: on_input,
+        }
+    }
+
+    /// Adds the namespace typed in the field, if any, and clears the field. A name that is not
+    /// a namespace name stays in the field, and the pickers say why.
+    fn take_typed(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ()> {
+        let typed = input.read(cx).value().trim().to_owned();
+        if typed.is_empty() {
+            self.input_error = None;
+            return Ok(());
+        }
+        if !is_namespace_name(&typed) {
+            self.input_error = Some(format!(
+                "\u{201c}{typed}\u{201d} is not a namespace name (lowercase letters, digits and \
+                 -): fix it or clear the field."
+            ));
+            return Err(());
+        }
+        self.input_error = None;
+        self.add_namespace(typed);
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        Ok(())
+    }
+
+    /// The scope to save on confirming: the one checked, with a namespace still typed in the
+    /// field added first. `Err` (the pickers say why) when the typed text is not a namespace
+    /// name: dropping it would leave nothing checked, which means every namespace.
+    pub fn confirmed_scope(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<AiScope, ()> {
+        let input = self.input.clone();
+        let taken = self.take_typed(&input, window, cx);
+        cx.notify();
+        taken.map(|()| self.scope())
+    }
+
+    /// Offers `namespace` and checks it (a name typed in the field).
+    fn add_namespace(&mut self, namespace: String) {
+        if namespace.is_empty() {
+            return;
+        }
+        if let Err(at) = self.namespaces.binary_search(&namespace) {
+            self.namespaces.insert(at, namespace.clone());
+        }
+        self.selected_namespaces.insert(namespace);
+    }
+
+    /// The scope checked now.
+    pub fn scope(&self) -> AiScope {
+        AiScope::new(
+            self.selected_namespaces.iter().cloned().collect(),
+            self.selected_kinds.iter().cloned().collect(),
+        )
+    }
+
+    /// The namespaces and kinds offered.
+    #[cfg(test)]
+    pub fn offered(&self) -> (&[String], &[KindChoice]) {
+        (&self.namespaces, &self.kinds)
+    }
+
+    /// The pickers' actions and their handlers.
+    pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
+        bind.bind::<ScopeAllNamespaces>(|this, _, _, cx| {
+            this.selected_namespaces.clear();
+            cx.notify();
+        })
+        .bind::<ScopeAllKinds>(|this, _, _, cx| {
+            this.selected_kinds.clear();
+            cx.notify();
+        })
+        .bind::<ToggleScopeNamespace>(|this, action, _, cx| {
+            toggle(&mut this.selected_namespaces, action.namespace.trim());
+            cx.notify();
+        })
+        .bind::<ToggleScopeKind>(|this, action, _, cx| {
+            toggle(&mut this.selected_kinds, &action.kind.trim().to_lowercase());
+            cx.notify();
+        })
+    }
+
+    fn section(title: &'static str, cx: &App) -> Div {
+        div()
+            .pt_2()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(title)
+    }
+
+    fn empty(id: &'static str, text: &'static str, cx: &App) -> AnyElement {
+        div()
+            .id(id)
+            .aria_label(text)
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(text)
+            .test_support()
+            .into_any_element()
+    }
+}
+
+/// Core v1 events and `events.k8s.io` events: not offered (agents read events with
+/// `get_events`, which follows the scope).
+fn is_event_kind(kind: &KindInfo) -> bool {
+    kind.plural() == "events" && matches!(kind.group(), "" | "events.k8s.io")
+}
+
+/// A namespace name: a DNS-1123 label (at most 63 lowercase letters, digits and `-`, starting
+/// and ending with a letter or digit).
+fn is_namespace_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && bytes[0] != b'-'
+        && bytes[bytes.len() - 1] != b'-'
+}
+
+/// Adds `name` to `set`, or takes it out if it is there. Empty names are ignored.
+fn toggle(set: &mut BTreeSet<String>, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    if !set.remove(name) {
+        set.insert(name.to_owned());
+    }
+}
+
+/// What a scope lets agents read, in a sentence: for the sidebar's tooltip and the dialogs.
+pub fn summary(scope: &AiScope) -> String {
+    let namespaces = match scope.namespaces.as_slice() {
+        [] => "all namespaces".to_owned(),
+        names => format!("namespaces {}", names.join(", ")),
+    };
+    let kinds = match scope.kinds.as_slice() {
+        [] if scope.namespaces.is_empty() => "all kinds".to_owned(),
+        [] => "all namespaced kinds".to_owned(),
+        names => format!("kinds {}", names.join(", ")),
+    };
+    format!("{namespaces}; {kinds}")
+}
+
+impl Render for ScopePicker {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus.clone();
+        let theme = cx.theme().clone();
+        let namespace_rows = self.namespaces.iter().map(|ns| {
+            Checkbox::new(SharedString::from(format!("scope-ns-{ns}")))
+                .label(ns.clone())
+                .checked(self.selected_namespaces.contains(ns))
+                .on_click(registry::on_click_in(
+                    focus.clone(),
+                    ToggleScopeNamespace {
+                        namespace: ns.clone(),
+                    },
+                ))
+        });
+        let hide_cluster_wide = !self.selected_namespaces.is_empty();
+        let kind_rows = self.kinds.iter().map(|kind| {
+            let label = if kind.namespaced {
+                kind.label.clone()
+            } else {
+                format!("{} · cluster-wide", kind.label)
+            };
+            Checkbox::new(SharedString::from(format!("scope-kind-{}", kind.id)))
+                .label(label)
+                .checked(self.selected_kinds.contains(&kind.id))
+                .on_click(registry::on_click_in(
+                    focus.clone(),
+                    ToggleScopeKind {
+                        kind: kind.id.clone(),
+                    },
+                ))
+        });
+        let namespaces = v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .child(Self::section("Namespaces agents may read", cx))
+            .child(
+                Checkbox::new("scope-ns-all")
+                    .label("All namespaces")
+                    .checked(self.selected_namespaces.is_empty())
+                    .on_click(registry::on_click_in(focus.clone(), ScopeAllNamespaces)),
+            )
+            .child(
+                div()
+                    // A single-line field passes Enter on once it has added the name; the
+                    // dialog would take it as Confirm. Enter in the field only adds.
+                    .on_action(|_: &input::Enter, _, _| {})
+                    .child(Input::new(&self.input).id("scope-ns-add").small()),
+            )
+            .child(
+                v_flex()
+                    .id("scope-ns-list")
+                    .max_h(px(150.))
+                    .overflow_y_scroll()
+                    .gap_1()
+                    .when(self.namespaces.is_empty(), |el| {
+                        el.child(Self::empty(
+                            "scope-ns-empty",
+                            "Type a namespace above, or select the cluster in Flint to list its \
+                             namespaces here.",
+                            cx,
+                        ))
+                    })
+                    .children(namespace_rows),
+            );
+        let kinds = v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .child(Self::section("Kinds agents may read", cx))
+            .child(
+                Checkbox::new("scope-kind-all")
+                    .label("All kinds")
+                    .checked(self.selected_kinds.is_empty())
+                    .on_click(registry::on_click_in(focus.clone(), ScopeAllKinds)),
+            )
+            .child(
+                v_flex()
+                    .id("scope-kind-list")
+                    .max_h(px(150.))
+                    .overflow_y_scroll()
+                    .gap_1()
+                    .when(self.kinds.is_empty(), |el| {
+                        el.child(Self::empty(
+                            "scope-kind-empty",
+                            "Connect to the cluster to list its kinds here.",
+                            cx,
+                        ))
+                    })
+                    .children(kind_rows),
+            );
+        let element = v_flex()
+            .id("ai-scope")
+            .track_focus(&self.focus)
+            .pt_2()
+            .gap_1()
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(namespaces)
+                    .child(div().w_px().self_stretch().bg(theme.border))
+                    .child(kinds),
+            )
+            .when_some(self.input_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .id("scope-ns-error")
+                        .aria_label(error.clone())
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(error)
+                        .test_support(),
+                )
+            })
+            .when(hide_cluster_wide, |el| {
+                el.child(Self::empty(
+                    "scope-cluster-wide-note",
+                    "With namespaces chosen, cluster-wide kinds are hidden unless checked.",
+                    cx,
+                ))
+            })
+            .child(Self::empty(
+                "scope-events-note",
+                "Events follow these choices: agents read the events about objects they may read.",
+                cx,
+            ))
+            .test_support();
+        Self::bind_actions(OnView::new(element, cx)).into_element()
+    }
+}
+
+#[cfg(test)]
+#[path = "scope_picker_tests.rs"]
+mod tests;

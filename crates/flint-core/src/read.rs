@@ -104,6 +104,11 @@ impl std::fmt::Display for KindId {
     }
 }
 
+/// How long one detail read may take: the object, then the events about it. A server that
+/// accepts the request and never answers would otherwise hold the read, and the object it
+/// already fetched, for good (kube sets no read timeout).
+pub const DETAIL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long each discovery request may take. A server that does not answer fails discovery
 /// after this, instead of after kube's 30 s connection timeout.
 pub const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -228,6 +233,50 @@ async fn discover_aggregated(
     ))
 }
 
+/// Whether `name` can be sent as one segment of a request path, as client-go's
+/// `IsValidPathSegmentName` requires: not `.` or `..`, and no `/` or `%`. `?`, `#`, whitespace
+/// and control characters are refused as well, so a name can never end the path or add to it.
+pub fn is_path_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '%' | '?' | '#') || c.is_whitespace() || c.is_control())
+}
+
+/// Lowercase letters, digits and `-`, starting and ending with a letter or digit, of any
+/// non-zero length.
+fn is_dns1123_part(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    bytes.first().is_some_and(alnum)
+        && bytes.last().is_some_and(alnum)
+        && bytes.iter().all(|b| alnum(b) || *b == b'-')
+}
+
+/// A DNS-1123 label: at most 63 lowercase letters, digits and `-`, starting and ending with a
+/// letter or digit.
+pub fn is_dns1123_label(name: &str) -> bool {
+    name.len() <= 63 && is_dns1123_part(name)
+}
+
+/// A DNS-1123 subdomain as Kubernetes checks it: at most 253 characters, parts as in a label
+/// joined by `.`, with no limit on the length of one part.
+pub fn is_dns1123_subdomain(name: &str) -> bool {
+    name.len() <= 253 && name.split('.').all(is_dns1123_part)
+}
+
+/// Whether a discovered group, version and plural can be put into a request path as they are:
+/// a DNS-1123 subdomain group (or the empty core group), a DNS-1123 label version, and a
+/// plural that is one path segment. A server, or an extension API server, that advertises
+/// anything else (`x/../../api/v1/secrets`) has that resource left out.
+fn is_routable(group: &str, version: &str, plural: &str) -> bool {
+    (group.is_empty() || is_dns1123_subdomain(group))
+        && is_dns1123_label(version)
+        && is_path_segment(plural)
+}
+
 /// The kinds of one group at its preferred version, which aggregated discovery lists first.
 fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
     let name = group.metadata.and_then(|m| m.name).unwrap_or_default();
@@ -238,6 +287,7 @@ fn kinds_from_aggregated(group: APIGroupDiscovery) -> Vec<KindInfo> {
     preferred
         .resources
         .into_iter()
+        .filter(|r| is_routable(&name, &version, r.resource.as_deref().unwrap_or_default()))
         .map(|r| KindInfo {
             resource: api_resource(
                 &name,
@@ -307,7 +357,7 @@ fn kinds_from_resource_list(group: &str, version: &str, list: APIResourceList) -
     list.resources
         .into_iter()
         // `pods/log` and the like are subresources, not kinds.
-        .filter(|r| !r.name.contains('/'))
+        .filter(|r| is_routable(group, version, &r.name))
         .map(|r| KindInfo {
             resource: api_resource(group, version, r.kind, r.name),
             namespaced: r.namespaced,
@@ -585,26 +635,44 @@ pub async fn object_detail(
     namespace: Option<&str>,
     name: &str,
 ) -> Result<ObjectDetail, ClusterError> {
+    object_detail_within(client, kind, namespace, name, DETAIL_TIMEOUT).await
+}
+
+/// [`object_detail`] within `deadline` instead of [`DETAIL_TIMEOUT`].
+pub async fn object_detail_within(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+    name: &str,
+    deadline: Duration,
+) -> Result<ObjectDetail, ClusterError> {
     object_detail_at(
         client,
         kind,
         namespace,
         name,
         &crate::cluster::Target::default(),
+        deadline,
     )
     .await
 }
 
-/// [`object_detail`], with `events_error` naming `target`'s server, as safe to show
-/// ([`ClusterError::summary`]).
+/// [`object_detail_within`], with `events_error` naming `target`'s server, as safe to show
+/// ([`ClusterError::summary`]). The object and its events share `deadline`: an object that does
+/// not arrive in time is a timeout error; events that do not are an `events_error`, and the
+/// object is still returned.
 pub(crate) async fn object_detail_at(
     client: &Client,
     kind: &KindInfo,
     namespace: Option<&str>,
     name: &str,
     target: &crate::cluster::Target,
+    deadline: Duration,
 ) -> Result<ObjectDetail, ClusterError> {
-    let object = get(client, kind, namespace, name).await?;
+    let started = tokio::time::Instant::now();
+    let object = tokio::time::timeout(deadline, get(client, kind, namespace, name))
+        .await
+        .map_err(|_| ClusterError::timeout(deadline, None))??;
     let uid = object.metadata.uid.clone();
     let mut value = serde_json::to_value(&object)
         .map_err(|e| ClusterError::Kube(format!("cannot serialize the object: {e}")))?;
@@ -621,18 +689,16 @@ pub(crate) async fn object_detail_at(
     let (events, events_truncated, events_error) = match uid {
         Some(uid) => {
             let selector = format!("involvedObject.uid={uid}");
-            let found = events(
-                client,
-                &EventQuery {
-                    // Events about cluster-scoped objects (nodes) are in some namespace
-                    // ("default" usually), so those are searched in all of them.
-                    namespace: object.metadata.namespace.clone(),
-                    involved: None,
-                    field_selector: Some(selector),
-                    fetch_limit: Some(DETAIL_EVENTS),
-                },
-            )
-            .await;
+            let query = EventQuery {
+                // Events about cluster-scoped objects (nodes) are in some namespace
+                // ("default" usually), so those are searched in all of them.
+                namespace: object.metadata.namespace.clone(),
+                involved: None,
+                field_selector: Some(selector),
+                fetch_limit: Some(DETAIL_EVENTS),
+            };
+            let left = deadline.saturating_sub(started.elapsed());
+            let found = events_within(left, deadline, || events(client, &query)).await;
             match found {
                 Ok((events, truncated)) => (events, truncated, None),
                 // Many roles may read an object but not list events: still show the object.
@@ -653,6 +719,22 @@ pub(crate) async fn object_detail_at(
         events_truncated,
         events_error,
     })
+}
+
+/// The events of a detail read, from `request`, within `left` of its `deadline`. With no time
+/// left, the request is never made: a zero timeout would still poll it once, which can queue
+/// it, before giving up on it.
+async fn events_within<F: Future<Output = Result<(Vec<Event>, bool), ClusterError>>>(
+    left: Duration,
+    deadline: Duration,
+    request: impl FnOnce() -> F,
+) -> Result<(Vec<Event>, bool), ClusterError> {
+    if left.is_zero() {
+        return Err(ClusterError::timeout(deadline, None));
+    }
+    tokio::time::timeout(left, request())
+        .await
+        .unwrap_or_else(|_| Err(ClusterError::timeout(deadline, None)))
 }
 
 /// Removes `metadata.managedFields`, which is noise in every view.
@@ -790,6 +872,34 @@ pub async fn pod_logs(client: &Client, query: &LogQuery) -> Result<String, Clust
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // covers UP-23: a detail read whose object used the whole deadline asks for no events
+    // (#258).
+    #[tokio::test]
+    async fn no_events_are_asked_for_once_the_deadline_is_spent() {
+        let deadline = Duration::from_secs(30);
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let request = || {
+            asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok((Vec::new(), false)))
+        };
+        let error = events_within(Duration::ZERO, deadline, request)
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+        // With time left, it is asked.
+        let request = || {
+            asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok((Vec::new(), false)))
+        };
+        assert!(
+            events_within(Duration::from_secs(1), deadline, request)
+                .await
+                .is_ok()
+        );
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     fn kind(group: &str, version: &str, kind: &str, plural: &str) -> KindInfo {
         KindInfo {
@@ -990,6 +1100,66 @@ mod tests {
         assert_eq!(kinds[0].api_version(), "v1");
         assert_eq!(kinds[0].short_names, ["po"]);
         assert_eq!(kinds[0].singular, "pod");
+    }
+
+    // covers UP-10
+    #[test]
+    fn aggregated_discovery_leaves_out_resources_that_are_not_one_path_segment() {
+        let group = |name: &str, version: &str, plural: &str| -> APIGroupDiscovery {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name},
+                "versions": [{"version": version, "resources": [
+                    {"resource": plural, "responseKind": {"kind": "Widget"}, "verbs": ["get"]},
+                    {"resource": "widgets", "responseKind": {"kind": "Widget"}, "verbs": ["get"]}
+                ]}]
+            }))
+            .unwrap()
+        };
+        let plurals = |g| -> Vec<String> {
+            kinds_from_aggregated(g)
+                .iter()
+                .map(|k| k.plural().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            plurals(group("example.com", "v1", "x/../../api/v1/secrets")),
+            ["widgets"]
+        );
+        for plural in ["..", "a%2Fb", "a?b", ""] {
+            assert_eq!(plurals(group("example.com", "v1", plural)), ["widgets"]);
+        }
+        assert!(plurals(group("example.com/../api", "v1", "gadgets")).is_empty());
+        assert!(plurals(group("example.com", "v1/../../api/v1", "gadgets")).is_empty());
+        assert_eq!(plurals(group("", "v1", "gadgets")), ["gadgets", "widgets"]);
+    }
+
+    // covers UP-10
+    #[test]
+    fn resource_lists_leave_out_resources_that_are_not_one_path_segment() {
+        let list = || -> APIResourceList {
+            serde_json::from_value(serde_json::json!({
+                "groupVersion": "example.com/v1",
+                "resources": [
+                    {"name": "x/../../api/v1/secrets", "singularName": "", "namespaced": true,
+                     "kind": "Secret", "verbs": ["get"]},
+                    {"name": "..", "singularName": "", "namespaced": true, "kind": "X",
+                     "verbs": ["get"]},
+                    {"name": "widgets", "singularName": "widget", "namespaced": true,
+                     "kind": "Widget", "verbs": ["get"]}
+                ]
+            }))
+            .unwrap()
+        };
+        let plurals = |group: &str, version: &str| -> Vec<String> {
+            kinds_from_resource_list(group, version, list())
+                .iter()
+                .map(|k| k.plural().to_owned())
+                .collect()
+        };
+        assert_eq!(plurals("example.com", "v1"), ["widgets"]);
+        assert!(plurals("example.com/../api", "v1").is_empty());
+        assert!(plurals("example.com", "v1/../..").is_empty());
+        assert!(plurals("Example.com", "v1").is_empty());
     }
 
     // covers UP-10

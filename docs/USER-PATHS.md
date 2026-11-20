@@ -98,7 +98,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** the agent lists kinds and resources, gets an object, and reads events and pod logs on an exposed cluster.
 - **Then** results are correct and bounded. Long lists say they were truncated and give a continue token. Secret values
   and copies of them in annotations are redacted. `managedFields` is removed. Errors are readable sentences, not
-  debug dumps.
+  debug dumps. A name, pod, namespace or container that is not a single valid path segment (`a/b`, `..`, `%2F`) is
+  refused before any request, with the same not-found error as a missing object.
 - Kinds are named as `kubectl get` takes them, ignoring case: Kind, plural, singular or short name (`Deployment`,
   `deployments`, `deployment`, `deploy`), optionally with `.group`. A Kind, plural or singular match beats a short
   name; then the core group beats built-in groups (`apps`, `*.k8s.io`), which beat CRDs. A name still matching
@@ -121,7 +122,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** the agent sees only those namespaces and kinds. Asking for anything else returns the same "not found" error
   as an unexposed cluster. Cluster-scoped kinds are hidden unless I named them. Clearing the scope exposes everything
   again.
-- Tests: unit (policy), mcp + cluster, ui.
+- Tests: unit (policy), mcp (fake API server), ui.
 
 ### UP-15 Credentials in logs don't reach the agent
 - **When** an agent reads pod logs or events that contain a token, a password pair (also a passphrase of several words

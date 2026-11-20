@@ -255,9 +255,12 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   every app test checks what must always hold, whatever it did:
   - UP-91: no fake API server received a request from the app before the test selected a cluster on it, and a server
     the test never selected received none. Requests count when they arrive at the server, so one a fault delays past
-    the selection still counts as before it. Counts start at the launch, per server, for the fake servers the app's
-    kubeconfig names (servers a test adds later count from when it adds them). A kind cluster has no request log and
-    is not checked.
+    the selection still counts as before it. Only requests on connections opened after the launch count, per server,
+    for the fake servers the app's kubeconfig names (servers a test adds later count from when it adds them): an app a
+    test quits and relaunches can still have requests on their way on its own connections, and the server may read
+    them after the new app has started. The harness marks the point by opening a connection of its own and waiting
+    until the server has accepted it (`fake_api::connection_mark_at`). A kind cluster has no request log and is not
+    checked.
   - UP-90: every kubeconfig file the app reads (the `KUBECONFIG` list, or the scratch `HOME`'s `.kube/config` when it
     is unset, and `kubeconfig_paths` in its `settings.toml`) is byte-identical at the end, and a missing one is still
     missing. Tests change settings with `App::write_settings`, which takes the bytes of the files the new settings

@@ -22,7 +22,7 @@ use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
-use crate::settings::{self, Settings};
+use crate::settings::{self, AiScope, Settings};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 
@@ -176,27 +176,27 @@ enum Internal {
 }
 
 /// A list of pinned clusters in `settings.toml` ([`crate::settings::ClusterPin`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Pins {
-    /// `ai_exposed_clusters` (ADR-0009).
-    AiExposure,
+    /// `ai_exposed_clusters` (ADR-0009), with what agents may read (ADR-0013).
+    AiExposure(AiScope),
     /// `trusted_clusters` (ADR-0015).
     Trust,
 }
 
 impl Pins {
     /// What the list is, in errors.
-    fn what(self) -> &'static str {
+    fn what(&self) -> &'static str {
         match self {
-            Pins::AiExposure => "exposure",
+            Pins::AiExposure(_) => "exposure",
             Pins::Trust => "trust",
         }
     }
 
     /// What pinning a cluster did, in errors.
-    fn done(self) -> &'static str {
+    fn done(&self) -> &'static str {
         match self {
-            Pins::AiExposure => "exposed",
+            Pins::AiExposure(_) => "exposed",
             Pins::Trust => "trusted",
         }
     }
@@ -317,9 +317,19 @@ impl ClusterManager {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::Activate(id) => self.activate(id),
-            Command::SetAiExposed { cluster, server } => {
-                self.set_pin(Pins::AiExposure, cluster, server).await;
+            Command::SetAiExposed {
+                cluster,
+                server,
+                scope,
+            } => {
+                self.set_pin(Pins::AiExposure(scope), cluster, server).await;
             }
+            Command::SetAiScope {
+                cluster,
+                server,
+                from,
+                scope,
+            } => self.set_ai_scope(cluster, server, from, scope).await,
             Command::SetTrusted {
                 cluster,
                 server,
@@ -467,17 +477,28 @@ impl ClusterManager {
                 };
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 tokio::spawn(async move {
-                    let result = read::object_detail_at(
+                    let mut reply = reply;
+                    let read = read::object_detail_at(
                         &client,
                         &info,
                         namespace.as_deref(),
                         &name,
                         &target,
-                    )
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| e.for_target(&target).summary().to_string());
-                    let _ = reply.send(result);
+                        read::DETAIL_TIMEOUT,
+                    );
+                    // A closed pane drops the receiver: stop the read (and its HTTP requests)
+                    // rather than keep the object alive until the server answers. Checked
+                    // first, so a pane already gone starts no request.
+                    tokio::select! {
+                        biased;
+                        () = reply.closed() => {}
+                        result = read => {
+                            let result = result
+                                .map(Arc::new)
+                                .map_err(|e| e.for_target(&target).summary().to_string());
+                            let _ = reply.send(result);
+                        }
+                    }
                 });
             }
         }
@@ -595,8 +616,6 @@ impl ClusterManager {
         }
     }
 
-    /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
-    /// `settings.toml`.
     /// Trusts `cluster` at `server` (`Some`) or stops trusting it (`None`): request `request`,
     /// numbered when it was made ([`crate::protection::SessionUnlocks`]). A Trust reports how
     /// its write went, which lifts an earlier Stop Trusting only if no request was made since.
@@ -615,7 +634,35 @@ impl ClusterManager {
         }
     }
 
-    /// Returns whether the change was saved.
+    /// Changes what agents may read of `cluster`, exposed at `server`, to `scope`; never
+    /// exposes it ([`settings::set_ai_scope`]).
+    async fn set_ai_scope(
+        &mut self,
+        cluster: ClusterId,
+        server: String,
+        from: AiScope,
+        scope: AiScope,
+    ) {
+        let current = self
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .and_then(|c| c.info.server.as_deref());
+        if current != Some(server.as_str()) {
+            self.emit(Event::Error(format!(
+                "\"{cluster}\" now points to a different server; its AI scope was not changed. \
+                 Review it and try again."
+            )));
+            return;
+        }
+        self.write_settings("the AI scope", move |dir| {
+            settings::set_ai_scope(dir, &cluster, &server, &from, &scope)
+        })
+        .await;
+    }
+
+    /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
+    /// `settings.toml`. Returns whether the change was saved.
     async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
         if let Some(server) = &server {
             // The user confirmed this server. If the context moved since, do not pin the new
@@ -644,7 +691,9 @@ impl ClusterManager {
         }
         let dir = self.config.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || match pins {
-            Pins::AiExposure => settings::set_ai_exposed(&dir, &cluster, server.as_deref()),
+            Pins::AiExposure(scope) => {
+                settings::set_ai_exposed(&dir, &cluster, server.as_deref(), &scope)
+            }
             Pins::Trust => settings::set_trusted(&dir, &cluster, server.as_deref()),
         })
         .await;

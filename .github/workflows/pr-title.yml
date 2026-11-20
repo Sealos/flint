@@ -24,6 +24,7 @@ jobs:
             perf
             refactor
             docs
+            style
             test
             ci
             build
