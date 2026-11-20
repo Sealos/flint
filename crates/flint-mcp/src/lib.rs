@@ -3,9 +3,11 @@
 //! The read functions live in `flint-core`; this crate holds only the tool layer and the policy:
 //! opt-in clusters, redaction, and output bounds. It must never depend on GPUI.
 
+mod limits;
 pub mod policy;
 mod server;
 
+pub use limits::Limits;
 pub use server::FlintMcp;
 
 use std::process::ExitCode;
@@ -13,7 +15,7 @@ use std::process::ExitCode;
 use flint_core::bootstrap::{self, Bootstrap};
 use rmcp::ServiceExt;
 
-/// The whole MCP server process, after argument parsing: bootstrap, logging to stderr, then
+/// The whole MCP server process, after argument parsing: bootstrap, logging setup, then
 /// [`run_stdio`] until the client disconnects. `flint mcp` and the `flint-mcp` binary both run
 /// this, so they behave the same. `program` prefixes a startup error; `verbose` (`--verbose`)
 /// logs info as well as warnings, unless `FLINT_LOG` or `RUST_LOG` says otherwise.
@@ -33,18 +35,44 @@ pub unsafe fn serve_stdio_main(program: &str, verbose: bool) -> ExitCode {
     };
     bootstrap::init_logging(verbose);
     boot.log_summary();
-    match run_stdio(&boot) {
+    let code = match run_stdio(&boot) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("mcp server failed: {e:#}");
+            tracing::error!("mcp server failed: {}", failure_summary(&e));
             ExitCode::FAILURE
         }
+    };
+    bootstrap::flush_logs();
+    code
+}
+
+/// What to log of the server's failure. rmcp's handshake errors Debug-format the client's whole
+/// message, which can carry anything (tool arguments, notification params), so those are
+/// reduced to what went wrong.
+fn failure_summary(e: &anyhow::Error) -> String {
+    use rmcp::service::ServerInitializeError as Init;
+    match e.downcast_ref::<Init>() {
+        Some(Init::ExpectedInitializeRequest(None)) => {
+            "the client closed the connection before initializing".to_owned()
+        }
+        Some(Init::ExpectedInitializeRequest(Some(_))) => {
+            "the client sent another message before initializing".to_owned()
+        }
+        Some(Init::UnexpectedInitializeResponse(_)) => {
+            "the client answered initialize unexpectedly".to_owned()
+        }
+        Some(Init::InitializeFailed(_)) => "initialize failed".to_owned(),
+        Some(Init::ConnectionClosed(_)) => "the connection closed during initialize".to_owned(),
+        Some(Init::TransportError { context, .. }) => {
+            format!("transport error during initialize, when {context}")
+        }
+        _ => format!("{e:#}"),
     }
 }
 
 /// Serves MCP over stdin/stdout until the client disconnects. Starts its own tokio runtime, so
 /// call it after [`flint_core::bootstrap::bootstrap`] and from a plain (non-async) context.
-/// stdout carries only the protocol; log to stderr.
+/// stdout carries only the protocol. Diagnostics go to stderr and the shared log file.
 pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
     // A mostly idle stdio server: two workers are plenty.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -58,7 +86,12 @@ pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
         bootstrap.home.clone(),
     );
     let result = runtime.block_on(async move {
-        let service = server.serve(rmcp::transport::stdio()).await?;
+        let stdio =
+            rmcp::transport::IntoTransport::<rmcp::RoleServer, std::io::Error, _>::into_transport(
+                rmcp::transport::stdio(),
+            );
+        let transport = server.counted(stdio);
+        let service = server.serve(transport).await?;
         service.waiting().await?;
         anyhow::Ok(())
     });

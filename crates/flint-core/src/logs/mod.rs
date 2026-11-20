@@ -9,6 +9,7 @@
 
 mod budget;
 mod buffer;
+mod filter;
 mod line;
 mod pods;
 mod search;
@@ -20,6 +21,7 @@ mod workload;
 
 pub use budget::LogBudget;
 pub use buffer::{BLOCKS_PER_BUDGET, CHUNK_LINES, LogBuffer, LogLines};
+pub use filter::{FilterSpec, LogFilter, MAX_CONTEXT};
 pub use line::{
     LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify, strip_controls,
 };

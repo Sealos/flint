@@ -47,10 +47,11 @@ pub enum ClusterError {
     /// connection timeout inside kube does not say). Build it with [`ClusterError::timeout`] or
     /// [`ClusterError::kube`]; [`ClusterError::for_target`] names the server and the plugin.
     /// Both are already safe to show ([`Target`]).
-    #[error("{}", timeout_message(*after, server.as_deref(), exec_command.as_deref()))]
+    #[error("{}", timeout_message(*after, server.as_deref(), *has_exec_plugin, exec_command.as_deref()))]
     Timeout {
         after: Option<Duration>,
         server: Option<String>,
+        has_exec_plugin: bool,
         exec_command: Option<String>,
     },
     /// The exec auth plugin's program is not on `PATH`. `command` is its file name only
@@ -80,7 +81,12 @@ pub enum ClusterError {
 }
 
 /// `timed out after 10s reaching https://host:6443 (including exec plugin `aws`)`.
-fn timeout_message(after: Option<Duration>, server: Option<&str>, exec: Option<&str>) -> String {
+fn timeout_message(
+    after: Option<Duration>,
+    server: Option<&str>,
+    has_exec_plugin: bool,
+    exec_command: Option<&str>,
+) -> String {
     let mut out = "timed out".to_owned();
     if let Some(after) = after {
         out.push_str(&format!(" after {}", go_duration(after)));
@@ -89,8 +95,10 @@ fn timeout_message(after: Option<Duration>, server: Option<&str>, exec: Option<&
         Some(server) => out.push_str(&format!(" reaching {server}")),
         None => out.push_str(" connecting"),
     }
-    if let Some(exec) = exec {
+    if let Some(exec) = exec_command {
         out.push_str(&format!(" (including exec plugin `{exec}`)"));
+    } else if has_exec_plugin {
+        out.push_str(" (including exec plugin)");
     }
     out
 }
@@ -197,6 +205,7 @@ impl ClusterError {
             None if is_transport_timeout(err) => ClusterError::Timeout {
                 after: None,
                 server: None,
+                has_exec_plugin: false,
                 exec_command: None,
             },
             // An auth provider's failure can hold a refused or reset connection of its own (a
@@ -259,6 +268,7 @@ impl ClusterError {
         ClusterError::Timeout {
             after: Some(after),
             server: server.map(redact::server_url),
+            has_exec_plugin: false,
             exec_command: None,
         }
     }
@@ -275,10 +285,12 @@ impl ClusterError {
             ClusterError::Timeout {
                 after,
                 server,
+                has_exec_plugin,
                 exec_command,
             } => ClusterError::Timeout {
                 after,
                 server: server.or_else(|| target.server.clone()),
+                has_exec_plugin: has_exec_plugin || target.has_exec_plugin,
                 exec_command: exec_command.or_else(|| target.exec_command.clone()),
             },
             ClusterError::ExecPluginNotFound { command: None } => {
@@ -339,6 +351,8 @@ impl std::fmt::Display for SafeErrorText {
 pub struct Target {
     /// The API server URL, through [`redact::server_url`].
     pub server: Option<String>,
+    /// Whether an exec auth plugin is configured, even if its command is hidden.
+    pub has_exec_plugin: bool,
     /// The exec auth plugin's program name, through [`redact::command_name`].
     pub exec_command: Option<String>,
 }
@@ -356,16 +370,17 @@ impl Target {
             .and_then(|n| n.cluster.as_ref())
             .and_then(|c| c.server.as_deref())
             .map(redact::server_url);
-        let exec_command = ctx
+        let exec = ctx
             .and_then(|c| c.user.as_ref())
             .and_then(|u| kubeconfig.auth_infos.iter().find(|n| &n.name == u))
             .and_then(|n| n.auth_info.as_ref())
-            .and_then(|a| a.exec.as_ref())
-            .and_then(|e| e.command.as_deref())
-            .and_then(redact::command_name);
+            .and_then(|a| a.exec.as_ref());
         Target {
             server,
-            exec_command,
+            has_exec_plugin: exec.is_some(),
+            exec_command: exec
+                .and_then(|e| e.command.as_deref())
+                .and_then(redact::command_name),
         }
     }
 }
@@ -898,6 +913,16 @@ mod tests {
         assert_eq!(
             Target::of(&exec_kubeconfig("aws"), "nope"),
             Target::default()
+        );
+    }
+
+    #[test]
+    fn timeouts_keep_the_exec_plugin_hint_when_the_command_is_hidden() {
+        let target = Target::of(&exec_kubeconfig("/opt/private path/plugin"), "ctx");
+        let err = ClusterError::timeout(Duration::from_secs(10), None).for_target(&target);
+        assert_eq!(
+            err.summary().as_str(),
+            "timed out after 10s reaching https://eks.example.com:443/x (including exec plugin)"
         );
     }
 

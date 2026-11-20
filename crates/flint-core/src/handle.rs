@@ -19,8 +19,8 @@ use crate::discovery::ClusterDiscovery;
 use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
-    Freshness, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget, PodSet,
-    WorkloadPod,
+    Freshness, LogFilter, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget,
+    PodSet, WorkloadPod,
 };
 use crate::manager::ClusterManager;
 use crate::protection::{SessionUnlocks, WriteRefusal};
@@ -559,6 +559,23 @@ impl CoreHandle {
             let _ = tx.send(search);
         });
         async move { rx.await.unwrap_or_else(|_| LogSearch::new(query)) }
+    }
+
+    /// Brings `filter` up to date with `lines` on the core's threads (see [`LogFilter`]): for
+    /// the first scan of a new filter over a full buffer. Later updates while following scan
+    /// only new lines. Works on any executor.
+    pub fn filter_logs(
+        &self,
+        mut filter: LogFilter,
+        lines: LogLines,
+    ) -> impl Future<Output = LogFilter> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        let spec = filter.spec().clone();
+        self.runtime.spawn_blocking(move || {
+            filter.update(&lines);
+            let _ = tx.send(filter);
+        });
+        async move { rx.await.unwrap_or_else(|_| LogFilter::new(spec)) }
     }
 
     /// Opens an exec session (a shell in a container, by default) on a connected cluster. The

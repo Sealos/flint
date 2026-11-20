@@ -431,8 +431,14 @@ history is not taken for a quiet pod (#254).
   are not interpreted, so lines show, copy and save as plain text, and `\x1b[33mWARN` still reads as a warning.
   Only a line with something to strip costs an extra allocation.
 - **Severity** is classified once per line on arrival. **Search** (`LogSearch`) remembers how far it scanned, so
-  following with a search open scans only new lines; there is no index. **Selection** (`LineSelection`) is a range
-  of line ids that shrinks when its start is evicted, and is what copy and AI log analysis read.
+  following with a search open scans only new lines; there is no index. A search is plain text, matched in the
+  rows drawn as they are drawn. **Filtering** (`LogFilter`, #264) works the same way: "Matching lines only" (with 0
+  to 100 lines of context, as `grep -C`) and "Errors" (warnings and errors, by the severity rules below) keep the
+  ids of the lines shown, scan only new lines when the tab is drawn, and run their first scan, and any catch-up of
+  more than 20,000 lines, on the core's threads (`CoreHandle::filter_logs`), so a 100k-line buffer filters without
+  holding up a frame. The list then has one item per row shown; copies and saves of a filtered tab write the rows
+  it shows. **Selection** (`LineSelection`) is a range of line ids that shrinks when its start is evicted, and is
+  what copy and AI log analysis read.
 - **Highlighting:** the view colors each line by its severity with the theme's error and warning tokens. The rules
   live in `logs::classify`: case-insensitive whole words; `ERROR`, `FATAL`, `panic`, and any word ending in
   `Exception` or `Error` (such as `NullPointerException`) mark an error; `WARN` and `WARNING` mark a warning; an
@@ -965,14 +971,31 @@ Rules:
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
   and 500 log lines), and lists, objects and logs are also capped at 256 KiB. When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
-- **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
-  `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
-  app).
+- **Bounded work (`flint_mcp::Limits`, #252):** rmcp starts a task per request and per reply and limits neither, so
+  Flint does. At most 16 tool calls run at once and 48 more wait for a turn; past those a call is refused at once with
+  a tool error ("too many tool calls in flight"; retry). A running call holds its turn until it ends: when the client
+  cancels it (`notifications/cancelled`, which drops its Kubernetes requests, a connecting exec plugin included) or
+  after 60 s, with a timeout naming the cluster's server (redacted like every reply). A wrapping transport counts the
+  bytes of replies handed to it and not written yet, and the requests read and not answered: while the replies pass
+  8 MiB it reads nothing more, so a client that stops reading stdout gets nothing more run or answered (refusals and
+  replies to other requests included); a request read while 128 are unanswered is refused there at once, as is one
+  whose id is still in flight; notifications, a cancellation in particular, always pass. A request counts until its
+  reply reaches the transport, or, once cancelled, until nothing works on it (a tool call's handler has ended). When
+  the client closes its end, the stream ends only once every request read is answered. Clusters connect through the
+  per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
+  connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
+  as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
+  written in time is skipped and logged.
+- **stdout is the protocol channel.** Diagnostics go to stderr and Flint's own events also go to the rotating log
+  shared with the app. Both destinations use `FLINT_LOG` (else `RUST_LOG`) if set. Otherwise stderr shows warnings
+  and errors, adding info with `--verbose`, and the file records info (`flint_core::bootstrap::log_filter`). A
+  writer thread owns the file, so logging never blocks the thread that emits an event; when it falls behind, events
+  are dropped from the file but still reach stderr.
 
 The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
 tool layer and the policy (opt-in, limits) live in `flint-mcp`. The redaction rules live in `flint_core::redact`, so
-the app and the MCP server hide the same Secret values; the credential redactor for text is applied by the MCP server
-only.
+the app and the MCP server hide the same Secret values. The MCP server applies the credential redactor to text in
+tool results. The shared tracing subscriber also applies it to process diagnostics.
 
 ## Look and keyboard
 
@@ -1137,9 +1160,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 ## Settings and state
 
-- These files live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
+- Settings and UI state live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
   on macOS and `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux. `state.toml` stays beside
-  `settings.toml` on Linux too, rather than in `$XDG_STATE_HOME`, so one directory and one override hold everything
+  `settings.toml` on Linux too, so the same directory override covers both files
   ([ADR-0016](./adr/0016-linux-appimage.md)).
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`, and `log_total_mib` for all tabs together), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
@@ -1152,6 +1175,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   more" rows of the tree and the old-revisions toggle.
 - `agent-activity.jsonl` and `agent-activity.1.jsonl`: the agent activity log, written by `flint mcp` and rotated at
   1 MiB ([MCP server](#mcp-server)).
+- `flint.log`: process diagnostics from the app and MCP, in `~/Library/Logs/Flint/` on macOS and
+  `$XDG_STATE_HOME/flint/` on Linux (default `~/.local/state/flint/`). The file is owner-only and keeps three
+  backups, rotating by size at 4 MiB. Its events come from Flint targets. If the file is unavailable, diagnostics
+  still go to stderr.
 - `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
   ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.

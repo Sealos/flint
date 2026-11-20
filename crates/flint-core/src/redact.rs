@@ -7,7 +7,8 @@
 //! picks its own marker (the MCP server says `<redacted>`, the app shows dots).
 //!
 //! [`redact_credentials`] hides credential-shaped values in free text (pod logs, event
-//! messages). Only the MCP server uses it: the app shows a cluster's logs and events as they are.
+//! messages). The MCP server applies it to cluster text, and logging applies it to every line
+//! written to stderr or the log file; the app shows a cluster's logs and events as they are.
 
 mod text;
 

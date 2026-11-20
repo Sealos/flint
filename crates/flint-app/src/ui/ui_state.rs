@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use flint_core::redact::safe_error_summary;
 use flint_core::settings::{self, ListSort, PaneWidths, State};
 
 pub struct UiState {
@@ -21,7 +22,10 @@ impl UiState {
         let state = match settings::load_state(&dir) {
             Ok(state) => state,
             Err(e) => {
-                tracing::warn!("using default UI state: {e}");
+                tracing::warn!(
+                    "using default UI state: {}",
+                    safe_error_summary(&e.to_string())
+                );
                 State::default()
             }
         };

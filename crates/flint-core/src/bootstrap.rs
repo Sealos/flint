@@ -8,6 +8,8 @@ use tracing_subscriber::EnvFilter;
 use crate::env_path::{self, PathSource, ResolvedPath};
 use crate::handle::CoreConfig;
 use crate::kubeconfig;
+use crate::logging;
+use crate::redact::safe_error_summary;
 use crate::settings::{self, Settings, SettingsError};
 
 #[derive(Debug, Clone)]
@@ -53,26 +55,30 @@ impl Bootstrap {
         tracing::debug!(path = %self.path.value, "resolved PATH");
         tracing::info!(config_dir = %self.config_dir.display(), "config directory");
         if let Some(e) = &self.settings_error {
-            tracing::warn!("using default settings: {e}");
+            tracing::warn!("using default settings: {}", safe_error_summary(e));
         }
     }
 }
 
-/// Sends logs to stderr, filtered by [`log_filter`] from `FLINT_LOG` and `RUST_LOG`. Never
-/// stdout: in `flint mcp`, stdout carries the protocol. Call it once, after [`bootstrap`].
-/// `verbose` (`--verbose`) raises the default from warnings to info.
+/// Sends diagnostics to stderr and Flint events to a rotating file, filtered by [`log_filter`]
+/// from `FLINT_LOG` and `RUST_LOG`. Stdout is reserved for the MCP protocol. Call it once,
+/// after [`bootstrap`], and call [`flush_logs`] before the process exits.
+/// `verbose` (`--verbose`) raises stderr's default from warnings to info. The file always
+/// defaults to info: a launch from Finder or the Dock can't pass a flag, and the file is what a
+/// bug report attaches. A variable still sets both.
 pub fn init_logging(verbose: bool) {
     let flint_log = std::env::var("FLINT_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter(
-            flint_log.as_deref(),
-            rust_log.as_deref(),
-            verbose,
-        ))
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
+    logging::init(
+        log_filter(flint_log.as_deref(), rust_log.as_deref(), verbose),
+        log_filter(flint_log.as_deref(), rust_log.as_deref(), true),
+    );
+}
+
+/// Waits briefly (at most half a second) for queued events to reach the log file. Call it on
+/// the way out, so the last error before exit isn't lost.
+pub fn flush_logs() {
+    logging::flush();
 }
 
 /// The log filter: `FLINT_LOG` if set, else `RUST_LOG`, else `info` when `verbose` and `warn`
@@ -215,11 +221,14 @@ mod tests {
             .with_writer(move || Writer(writer.clone()))
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, || boot(Vec::new()).log_summary());
+        let mut boot = boot(Vec::new());
+        boot.settings_error = Some("bad\nquoted settings content".into());
+        tracing::subscriber::with_default(subscriber, || boot.log_summary());
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(text.contains("PATH from settings.toml"), "{text}");
         assert!(text.contains("config_dir=/cfg"), "{text}");
         assert!(text.contains("using default settings: bad"), "{text}");
+        assert!(!text.contains("quoted settings content"), "{text}");
     }
 
     struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
