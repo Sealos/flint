@@ -942,6 +942,19 @@ fn short_bearer_tokens() {
 fn a_scheme_is_not_continued_by_the_next_field() {
     for (line, want) in [
         ("token=Bearer user=app", "token=[REDACTED:token] user=app"),
+        // A credential key after the scheme, with any separator the pair rule accepts.
+        (
+            r#"token=Basic password= "example""#,
+            r#"token=[REDACTED:token] password= "[REDACTED:password]""#,
+        ),
+        (
+            "token: Bearer secret : s3cr3t",
+            "token: [REDACTED:token] secret : [REDACTED:secret]",
+        ),
+        (
+            r#"token=Basic api_key:="k-1""#,
+            r#"token=[REDACTED:token] api_key:="[REDACTED:key]""#,
+        ),
         (
             "auth_token=Basic --verbose",
             "auth_token=[REDACTED:token] --verbose",

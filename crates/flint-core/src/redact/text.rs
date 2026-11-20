@@ -906,9 +906,16 @@ fn word_value(line: &str, word: Range<usize>) -> Range<usize> {
     value
 }
 
+/// A credential key and the separator after it, at the start of the text: the start of a
+/// field the pair rule hides, with any separator, spacing and quoting it accepts.
+static CREDENTIAL_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"(?i)^(?:{KEYS}){SEP_NO_LIST}")).expect("field rule builds")
+});
+
 /// Whether the word at `word` starts another field rather than continuing a value: a flag
-/// (`--verbose`), an assignment (`user=app`), or a key whose quoted value follows
-/// (`password="x"`, `user: "a"`). Base64 padding (`Zm9v==`) before a closing quote is not one.
+/// (`--verbose`), an assignment (`user=app`), a credential key with any separator the pair
+/// rule accepts (`password= "x"`, `secret : x`), or a key whose quoted value follows
+/// (`user="x"`, `user: "a"`). Base64 padding (`Zm9v==`) before a closing quote is not one.
 fn is_field(line: &str, word: Range<usize>) -> bool {
     let text = &line[word.clone()];
     let after = &line.as_bytes()[word.end..];
@@ -917,6 +924,7 @@ fn is_field(line: &str, word: Range<usize>) -> bool {
             .get(1)
             .is_some_and(|b| !b.is_ascii_whitespace() && !matches!(b, b',' | b';' | b'}' | b')'));
     text.starts_with('-')
+        || CREDENTIAL_FIELD.is_match(&line[word.start..])
         || text.trim_end_matches('=').contains('=')
         || text.ends_with(':')
         || (text.ends_with('=') && opens_quote)
