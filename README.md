@@ -365,11 +365,12 @@ format, for example `feat(mcp): …` or `fix(core): …`.
 2. Merging the release PR tags `vX.Y.Z` and creates the GitHub release as a draft. Releases are immutable once
    published, so the draft stage is when files can still be attached.
 3. The same workflow then builds `flint` for Apple Silicon and Intel, combines them into a universal binary, and
-   attaches `flint-vX.Y.Z-macos-universal.tar.gz`. It also packages that binary as an ad-hoc signed `Flint.app` in
-   `flint-vX.Y.Z-macos-universal.dmg` (`scripts/package-macos-app.sh`), mounts the DMG to check it
-   (`scripts/smoke-macos-app.sh`), and attaches it. In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
-   runners (`scripts/package-appimage.sh`) and attaches `flint-vX.Y.Z-linux-x86_64.AppImage` and
-   `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum.
+   packages `flint-vX.Y.Z-macos-universal.tar.gz`. It also packages that binary as an ad-hoc signed `Flint.app` in
+   `flint-vX.Y.Z-macos-universal.dmg` (`scripts/package-macos-app.sh`) and mounts the DMG to check it
+   (`scripts/smoke-macos-app.sh`). In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
+   runners (`scripts/package-appimage.sh`): `flint-vX.Y.Z-linux-x86_64.AppImage` and
+   `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum. The build jobs hold a
+   read-only token; a separate `upload` job takes their files and attaches them to the draft.
 4. Once every upload has succeeded, a `publish` job publishes the release and checks that all eight files are on it.
 
 Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed). macOS blocks the
