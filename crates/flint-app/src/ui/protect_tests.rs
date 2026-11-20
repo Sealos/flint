@@ -400,6 +400,41 @@ async fn an_old_trust_on_a_context_without_a_server_can_be_removed(cx: &mut Test
     );
 }
 
+// covers UP-55: when Stop Trusting's write fails, the cluster stays protected while its pin is
+// still in settings.toml, and both removing the pin again and trusting it again (after the
+// confirmation) are offered.
+#[gpui_kit::test]
+async fn a_failed_stop_trusting_can_be_retried(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, _| m.trust_cluster("alpha".into(), server));
+    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+    // As after a Stop Trusting whose write did not land.
+    t.model.update(cx, |m, cx| {
+        m.core().unlocks().revoke_trust("alpha");
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert!(
+        t.model
+            .read_with(cx, |m, _| !m.settings.trusted_clusters.is_empty())
+    );
+    let tip = t.description(cx, "lock-alpha").unwrap_or_default();
+    assert!(tip.contains("remove that trust"), "{tip}");
+    let available = t.available(cx);
+    for action in ["workspace::UntrustCluster", "workspace::TrustCluster"] {
+        assert!(available.contains(&action), "{action}: {available:?}");
+    }
+    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+}
+
 // covers UP-54: an ended shell whose context lost its server, or left kubeconfig, says so on
 // its disabled Restart shell, with no Unlock… (there is nothing to pin an unlock to).
 #[gpui_kit::test]

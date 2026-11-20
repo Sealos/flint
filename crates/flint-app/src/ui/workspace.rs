@@ -1659,10 +1659,74 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
     }
 }
 
+/// An entry of a cluster's lock menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockEntry {
+    Unlock,
+    LockAgain,
+    Trust,
+    /// Remove the context's pin from `settings.toml`: Stop Trusting, or Remove the Old Trust
+    /// when the pin is for another server.
+    Untrust {
+        stale: bool,
+    },
+}
+
+impl LockEntry {
+    fn label(self) -> &'static str {
+        match self {
+            LockEntry::Unlock => "Unlock for This Session…",
+            LockEntry::LockAgain => "Lock Again",
+            LockEntry::Trust => "Trust This Cluster…",
+            LockEntry::Untrust { stale: false } => "Stop Trusting",
+            LockEntry::Untrust { stale: true } => "Remove the Old Trust",
+        }
+    }
+
+    fn action(self, cluster: String) -> Box<dyn Action> {
+        match self {
+            LockEntry::Unlock => Box::new(UnlockCluster { cluster }),
+            LockEntry::LockAgain => Box::new(LockCluster { cluster }),
+            LockEntry::Trust => Box::new(TrustCluster { cluster }),
+            LockEntry::Untrust { .. } => Box::new(UntrustCluster { cluster }),
+        }
+    }
+}
+
+/// What a cluster's lock menu offers. Removing the trust is offered whenever `settings.toml`
+/// holds a pin for the context (`trust` is not `NotTrusted`), whether or not it grants access
+/// now: a pin whose removal failed after Stop Trusting (the cluster is protected meanwhile),
+/// or one for another server. Unlocking and trusting need a server to pin to.
+fn lock_menu(
+    has_server: bool,
+    protection: Protection,
+    trust: &TrustState,
+    settings_ok: bool,
+) -> Vec<LockEntry> {
+    let protected = protection == Protection::Protected && has_server;
+    let unlocked = protection == Protection::Unlocked;
+    let mut entries = Vec::new();
+    if protected {
+        entries.push(LockEntry::Unlock);
+    }
+    if unlocked {
+        entries.push(LockEntry::LockAgain);
+    }
+    if (protected || unlocked) && settings_ok {
+        entries.push(LockEntry::Trust);
+    }
+    if !matches!(trust, TrustState::NotTrusted) && settings_ok {
+        entries.push(LockEntry::Untrust {
+            stale: matches!(trust, TrustState::ServerChanged { .. }),
+        });
+    }
+    entries
+}
+
 /// The lock button of a cluster's row (UP-55): a closed lock while protected, an open one while
-/// unlocked for this session, a shield while trusted, and nothing for a cluster on this machine.
-/// Its menu unlocks, locks again, trusts or stops trusting. It is not a tab stop, so a stray
-/// Space or Enter cannot open it.
+/// unlocked for this session, a shield while trusted, and nothing for a cluster on this machine
+/// (unless an old trust is left to remove). Its menu ([`lock_menu`]) unlocks, locks again,
+/// trusts or stops trusting. It is not a tab stop, so a stray Space or Enter cannot open it.
 fn render_lock_button(
     name: &str,
     has_server: bool,
@@ -1670,19 +1734,18 @@ fn render_lock_button(
     trust: &TrustState,
     settings_ok: bool,
 ) -> Option<AnyElement> {
-    let stale_trust = matches!(trust, TrustState::ServerChanged { .. });
+    let entries = lock_menu(has_server, protection, trust, settings_ok);
     let button = Button::new(SharedString::from(format!("lock-{name}")))
         .xsmall()
         .tab_stop(false);
+    let pinned = !matches!(trust, TrustState::NotTrusted);
     let (button, tip) = match protection {
-        // A stale trust on a local cluster can only be removed, which needs valid settings.
-        Protection::Local if !stale_trust || !settings_ok => return None,
+        Protection::Local if entries.is_empty() => return None,
         Protection::Local => (
             button.ghost().icon(FlintIcon::LockOpen),
             "On this machine: unlocked. Click to remove an old trust.",
         ),
-        // A context with no server cannot be unlocked or trusted; an old trust can still go.
-        Protection::Protected if !has_server && !(stale_trust && settings_ok) => {
+        Protection::Protected if entries.is_empty() => {
             return Some(
                 button
                     .ghost()
@@ -1695,6 +1758,11 @@ fn render_lock_button(
         Protection::Protected if !has_server => (
             button.ghost().icon(FlintIcon::Lock),
             "Protected. This context has no API server now. Click to remove its old trust.",
+        ),
+        Protection::Protected if pinned => (
+            button.ghost().icon(FlintIcon::Lock),
+            "Protected: read-only in Flint, though settings.toml still holds a trust for it. \
+             Click to unlock it, trust it, or remove that trust.",
         ),
         Protection::Protected => (
             button.ghost().icon(FlintIcon::Lock),
@@ -1716,44 +1784,13 @@ fn render_lock_button(
         button
             .tooltip(tip)
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                let cluster = cluster.clone();
-                let protected = protection == Protection::Protected && has_server;
-                let unlocked = protection == Protection::Unlocked;
-                let trusted = protection == Protection::Trusted;
-                menu.when(protected, |menu| {
-                    menu.item(PopupMenuItem::new("Unlock for This Session…").on_click(
-                        registry::on_click(UnlockCluster {
-                            cluster: cluster.clone(),
-                        }),
-                    ))
-                })
-                .when(unlocked, |menu| {
+                entries.iter().fold(menu, |menu, entry| {
                     menu.item(
-                        PopupMenuItem::new("Lock Again").on_click(registry::on_click(
-                            LockCluster {
-                                cluster: cluster.clone(),
-                            },
+                        PopupMenuItem::new(entry.label()).on_click(registry::on_click_or(
+                            entry.action(cluster.clone()),
+                            |_, _, _| {},
                         )),
                     )
-                })
-                .when((protected || unlocked) && settings_ok, |menu| {
-                    menu.item(PopupMenuItem::new("Trust This Cluster…").on_click(
-                        registry::on_click(TrustCluster {
-                            cluster: cluster.clone(),
-                        }),
-                    ))
-                })
-                .when((trusted || stale_trust) && settings_ok, |menu| {
-                    let label = if stale_trust {
-                        "Remove the Old Trust"
-                    } else {
-                        "Stop Trusting"
-                    };
-                    menu.item(PopupMenuItem::new(label).on_click(registry::on_click(
-                        UntrustCluster {
-                            cluster: cluster.clone(),
-                        },
-                    )))
                 })
             });
     Some(
@@ -2256,11 +2293,77 @@ mod view_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, MIN_LIST_WIDTH, layout, mode_name, namespace_summary, no_contexts_text,
-        watch_mode_label,
+        Layout, LockEntry, MIN_LIST_WIDTH, layout, lock_menu, mode_name, namespace_summary,
+        no_contexts_text, watch_mode_label,
     };
-    use flint_core::WatchMode;
-    use flint_core::settings::PaneWidths;
+    use flint_core::settings::{PaneWidths, TrustState};
+    use flint_core::{Protection, WatchMode};
+
+    // covers UP-55: the lock menu offers removing a trust whenever settings.toml holds a pin
+    // for the context, also when it grants nothing now (a Stop Trusting whose write failed, a
+    // pin for another server, a context without a server), so the removal can be retried.
+    #[test]
+    fn the_lock_menu_offers_removal_while_a_pin_is_on_disk() {
+        use LockEntry::*;
+        let stale = TrustState::ServerChanged {
+            trusted_server: "https://old".into(),
+        };
+        let none = TrustState::NotTrusted;
+        let pinned = TrustState::Trusted;
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &none, true),
+            [Unlock, Trust]
+        );
+        assert_eq!(
+            lock_menu(true, Protection::Unlocked, &none, true),
+            [LockAgain, Trust]
+        );
+        assert_eq!(
+            lock_menu(true, Protection::Trusted, &pinned, true),
+            [Untrust { stale: false }]
+        );
+        // Revoked while the pin is still on disk.
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &pinned, true),
+            [Unlock, Trust, Untrust { stale: false }]
+        );
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &stale, true),
+            [Unlock, Trust, Untrust { stale: true }]
+        );
+        assert_eq!(
+            lock_menu(false, Protection::Protected, &stale, true),
+            [Untrust { stale: true }]
+        );
+        assert_eq!(lock_menu(false, Protection::Protected, &none, true), []);
+        assert_eq!(
+            lock_menu(true, Protection::Local, &pinned, true),
+            [Untrust { stale: false }]
+        );
+        assert_eq!(lock_menu(true, Protection::Local, &none, true), []);
+        // An invalid settings.toml cannot be written: nothing that writes it.
+        assert_eq!(
+            lock_menu(true, Protection::Protected, &pinned, false),
+            [Unlock]
+        );
+        assert_eq!(
+            [
+                Unlock,
+                LockAgain,
+                Trust,
+                Untrust { stale: false },
+                Untrust { stale: true }
+            ]
+            .map(LockEntry::label),
+            [
+                "Unlock for This Session…",
+                "Lock Again",
+                "Trust This Cluster…",
+                "Stop Trusting",
+                "Remove the Old Trust"
+            ]
+        );
+    }
 
     fn list_width(widths: Layout, window: f32) -> f32 {
         window - widths.clusters - widths.navigation - widths.detail

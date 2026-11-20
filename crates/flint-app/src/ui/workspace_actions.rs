@@ -655,10 +655,12 @@ impl Workspace {
             ));
         }
         match model.trust(summary) {
-            TrustState::Trusted => Err(ActionError::rejected::<TrustCluster>(
-                "the cluster is trusted already",
-            )),
-            TrustState::NotTrusted => Ok((server, None)),
+            // A pin whose removal failed after Stop Trusting does not count: trusting again
+            // (after the confirmation) is how to make it count.
+            TrustState::Trusted if model.protection(summary) == Protection::Trusted => Err(
+                ActionError::rejected::<TrustCluster>("the cluster is trusted already"),
+            ),
+            TrustState::Trusted | TrustState::NotTrusted => Ok((server, None)),
             TrustState::ServerChanged { trusted_server } => Ok((server, Some(trusted_server))),
         }
     }
