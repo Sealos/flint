@@ -580,7 +580,8 @@ impl TerminalView {
                 },
             )),
             flint_core::ExecState::Failed(reason) => {
-                Some((theme.danger, format!("The shell could not run: {reason}")))
+                let (headline, detail) = terminal_model::failure_words(reason);
+                Some((theme.danger, format!("{headline} Details: {detail}")))
             }
             _ => None,
         };

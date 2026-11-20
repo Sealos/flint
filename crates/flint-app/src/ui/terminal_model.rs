@@ -245,9 +245,37 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
         ExecState::Exited { code: Some(0) } => (Tone::Muted, "Exited (code 0)".to_owned()),
         ExecState::Exited { code: Some(code) } => (Tone::Warning, format!("Exited (code {code})")),
         ExecState::Exited { code: None } => (Tone::Muted, "Exited".to_owned()),
-        ExecState::Failed(reason) => (Tone::Danger, format!("Failed: {reason}")),
+        // Why is said once, in the tab's banner ([`failure_words`]).
+        ExecState::Failed(_) => (Tone::Danger, "Failed".to_owned()),
         ExecState::Closed => (Tone::Muted, "Closed".to_owned()),
     }
+}
+
+/// Why a shell could not run, in plain words, and what the server (or the connection) said, as
+/// the detail: the tab's banner says both, once. Common exec failures get a sentence of their
+/// own; any other keeps the server's text after a plain lead.
+pub fn failure_words(reason: &str) -> (&'static str, String) {
+    let lower = reason.to_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    let headline = if has("executable file not found") || has("no such file or directory") {
+        "Neither bash nor sh is in this container."
+    } else if has("container not found")
+        || has("not running")
+        || has("completed pod")
+        || has("is waiting to start")
+        || has("containercreating")
+    {
+        "The container is not running, so a shell can't start in it."
+    } else if lower.starts_with("forbidden") || has("is forbidden") {
+        "You don't have permission to open a shell in this pod."
+    } else if lower.starts_with("notfound") || has("not found") {
+        "The pod was not found, or the server can't open a shell in it."
+    } else if lower.starts_with("the exec connection broke") {
+        "The connection to the shell broke."
+    } else {
+        "The shell could not start."
+    };
+    (headline, reason.trim().to_owned())
 }
 
 /// A piece of a screen row shaped and drawn as one line of text from column `col`. Every
@@ -501,11 +529,52 @@ mod tests {
             state_text(&ExecState::Exited { code: Some(130) }),
             (Tone::Warning, "Exited (code 130)".into())
         );
+        // Why it failed is said once, in the banner, not again beside the state.
         assert_eq!(
             state_text(&ExecState::Failed("pods \"x\" not found".into())),
-            (Tone::Danger, "Failed: pods \"x\" not found".into())
+            (Tone::Danger, "Failed".into())
         );
         assert_eq!(state_text(&ExecState::Closed).1, "Closed");
+    }
+
+    // covers UP-41: common exec failures read in plain words, the server's text kept as the
+    // detail.
+    #[test]
+    fn exec_failures_read_in_plain_words() {
+        let words = |reason: &str| failure_words(reason).0;
+        assert_eq!(
+            words("Forbidden: pods \"web\" is forbidden: User \"jane\" cannot create pods/exec"),
+            "You don't have permission to open a shell in this pod."
+        );
+        assert_eq!(
+            words("NotFound: subresource exec is not recorded"),
+            "The pod was not found, or the server can't open a shell in it."
+        );
+        assert_eq!(
+            words("unable to upgrade connection: container not found (\"app\")"),
+            "The container is not running, so a shell can't start in it."
+        );
+        assert_eq!(
+            words(
+                "BadRequest: cannot exec into a container in a completed pod; current phase is Succeeded"
+            ),
+            "The container is not running, so a shell can't start in it."
+        );
+        assert_eq!(
+            words("exec: \"/bin/sh\": stat /bin/sh: no such file or directory"),
+            "Neither bash nor sh is in this container."
+        );
+        assert_eq!(
+            words("the exec connection broke: reset"),
+            "The connection to the shell broke."
+        );
+        assert_eq!(
+            failure_words("InternalError: boom"),
+            (
+                "The shell could not start.",
+                "InternalError: boom".to_owned()
+            )
+        );
     }
 
     fn blank(cell: &Cell, _: &u8) -> bool {

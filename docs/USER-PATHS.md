@@ -257,11 +257,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and
   Cmd-V (Ctrl-Shift-C and Ctrl-Shift-V on Linux) copy the mouse selection and paste. The wheel scrolls back through
   the output. Images without `bash` fall back to `sh`. The tab says whether the shell is connecting, running, exited
-  (with its exit code) or failed (and why), and the output stays readable and copyable until I close the tab; Restart
-  shell (Cmd-R; Ctrl+Shift+R on Linux) starts a new shell in a tab beside it. The tab and its toolbar name the
-  cluster the shell runs on, and two clusters never read the same. Pasting several
-  lines into a shell that would run each one as it arrives asks first, and a huge clipboard is refused. If the
-  context is re-pointed at another API server, the shell ends and says why.
+  (with its exit code) or failed (and why, once, in plain words such as "You don't have permission to open a shell
+  in this pod.", with the server's text as the detail), and the output stays readable and copyable until I close
+  the tab; Restart shell (Cmd-R; Ctrl+Shift+R on Linux) starts a new shell in a tab beside it. The tab and its
+  toolbar name the cluster the shell runs on, and two clusters never read the same. Pasting several lines into a
+  shell that would run each one as it arrives asks first, and a huge clipboard is refused. If the context is
+  re-pointed at another API server, the shell ends and says why.
 - Tests: unit (terminal model, session logic, key encoding, colors, grid size), cluster, ui.
 
 ### UP-42 Sessions outlive navigation

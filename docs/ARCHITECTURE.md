@@ -466,8 +466,10 @@ opens in a tab in the bottom dock.
   hidden and inverse are drawn; the cursor is a block, beam or underline (a hollow block, or a faded beam or underline,
   without focus; none once the session ended); the bell flashes the
   screen. The grid size comes from the element's size and the font's advance; a change is sent after 80 ms without
-  further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed
-  (reason); after the end the screen stays scrollable and copyable. Closing the tab drops the session.
+  further change (the first at once). The header says Connecting, Running (command), Exited (code) or Failed;
+  why it failed is said once, in the banner under it, in plain words with the server's text as the detail
+  (`terminal_model::failure_words`: no permission, pod or exec not found, container not running, no shell in the
+  image, a broken connection). After the end the screen stays scrollable and copyable. Closing the tab drops the session.
 - **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,
   Space, the arrows, Home/End, Page Up/Down and Ctrl with a letter or symbol to nothing
   (`registry::TERMINAL_PASSTHROUGH`); it is the deepest context, so those keys skip the app's bindings (focus
