@@ -376,6 +376,52 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   re-pointed, the cluster is protected again.
 - Tests: unit (settings, pinning), ui.
 
+---
+
+### UP-56 See only the kinds in use
+- **Given** watch mode All, and a cluster where Replication Controllers, most of the Network section and two CRD groups
+  have no objects.
+- **When** I connect, wait for the lists to load, and look at the resource tree.
+- **Then** each section lists only its kinds with at least one object anywhere in the cluster, and ends in a dimmed
+  "… N more" row that expands in place. For kinds watched across the whole cluster, changing my namespace filter
+  changes nothing. A collapsed section's count is its kinds in use; a section with none in use shows only its
+  "… N more" row. The two empty CRD groups fold into one "… 2 empty groups" row at the end. Kinds I may not list sit
+  under "N more" with the dimmed "cannot be listed" text and red dot, and hovering says why. No counts appear next to
+  names. Cmd-P still finds every hidden kind, and opening one keeps it visible until I navigate away. The expanded
+  rows are remembered per cluster.
+- Tests: unit (in-use state, folding), ui, e2e (fake API server).
+
+### UP-57 The tree follows the cluster without jumping
+- **When** I connect and the lists are still loading, then create the first Job in a cluster that had none, and later
+  delete the last Gadget while the tree is open.
+- **Then** while a kind's first list is loading or failing (other than forbidden), it stays shown; it folds at most
+  once, after its first list finds nothing, and a watch that reconnects changes nothing. Jobs appears at once.
+  Gadgets stays where it is until I connect again or switch back to the cluster. A kind I may list only in some
+  namespaces is in use when the namespaces my filter names have an object of it. In a cluster set, a kind shows when
+  any member has an object. With watch mode On view, the full tree shows as before, and no extra requests are made.
+- Tests: unit, ui, e2e (fake API server: slow first lists, reconnects, request log).
+
+### UP-58 Read workload health at a glance
+- **When** I open Deployments, StatefulSets, DaemonSets, ReplicaSets or Replication Controllers.
+- **Then** one Ready column shows "ready/desired" with a dot: green when all are ready (also "4/3" during a surge),
+  amber when some are not or when none are yet while it rolls out, red when none are and it is not rolling out, grey
+  and dimmed at 0/0. "· 3 current" shows only when current differs, and hover shows the kind's details (up-to-date
+  and available for Deployments). Sorting by Ready puts red first, then amber, green and grey, each by the share ready
+  (grey by name alone), then by name. During a rollout the cell shows a static ↻ and "rolling out", with no animation; a paused Deployment
+  says "paused"; a Deployment past its progress deadline turns red with the condition's message on hover. Wide adds
+  the server's raw columns next to Ready. Jobs and CronJobs keep their own columns. An agent's `list_resources` still
+  gets the server's columns.
+- Tests: unit (status rules per kind), mcp, ui, e2e (fake API server with full objects and a rollout, #129).
+
+### UP-59 Old ReplicaSet revisions stay out of the way
+- **Given** Deployments that have rolled out many times, one rollout still scaling its old ReplicaSet down, and one
+  orphan ReplicaSet scaled to 0.
+- **When** I open Replica Sets.
+- **Then** the header says how many old revisions are hidden (for example "84 old revisions hidden") with a Show
+  toggle. Only ReplicaSets with pods wanted or still running, and the orphan, are listed. A text filter that matches an
+  old revision shows it dimmed. Show is remembered per cluster.
+- Tests: unit (owner and replica rules), ui.
+
 ## M4: Curated views, metrics and the resource diagram
 
 ### UP-60 Understand a workload at a glance
@@ -404,7 +450,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-64 A large namespace stays readable
 - **Given** a namespace with hundreds of pods, old empty ReplicaSets and many finished Jobs.
 - **Then** empty ReplicaSets and finished Jobs start collapsed, a group of more than about 50 pods shows a count,
-  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI.
+  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI. In the
+  Replica Sets list, old revisions are hidden behind the header's Show toggle (UP-59).
 - Tests: unit (collapsing, limits), cluster (generated load), ui.
 
 ---
@@ -433,6 +480,29 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** a rollout starts or a Warning event fires while the dashboard is open.
 - **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
 - Tests: ui, e2e.
+
+### UP-69 Find the namespace that is broken or full
+- **When** I open Namespaces.
+- **Then** besides Name, Status and Age, each row shows Problems (failing or crash-looping pods, and workloads short of
+  replicas that are not rolling out, counted by the dashboard's rules), Pods, and CPU and Memory as "used / requested".
+  With nothing requested the cell shows usage alone and says "no requests" on hover. Without metrics-server the used
+  part is blank and says so on hover; when I may not read metrics, the hover says that instead. A namespace Flint
+  cannot watch shows "unavailable", not 0. The list is sorted by name; clicking a column sorts by it, and the choice is
+  remembered per cluster (#205). Counts update live.
+- Tests: unit (aggregation, problem rules, effective requests), ui, e2e (fake API server with full pod objects and
+  metrics, #129).
+
+M4 used every number in the 6x block, so its later paths continue at UP-120.
+
+### UP-120 Open a namespace's overview
+- **When** I click the `demo` row in Namespaces.
+- **Then** an overview of `demo` opens in the main view in place of the list, and Back returns to it. It shows problem
+  counts, recent Warning events and rollouts, CPU and memory usage against requests with sparklines, and
+  ResourceQuota use and LimitRange limits when the namespace has them. A count opens its list with a filter for
+  `demo` of that list's own; my namespace filter does not change. The sparklines start when I open the overview or
+  the Namespaces list and fill in from then, up to an hour. Its YAML tab shows the namespace object, and Show YAML in
+  the row's context menu does too.
+- Tests: unit (namespace scope, series start and drop), ui, e2e.
 
 ## M5: Port-forward and Helm
 
@@ -542,6 +612,23 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - **Then** each member has a card with its colour tag, problem counts and usage sparklines, the unhealthiest first,
   under a totals strip. Clicking a count opens the combined list filtered to it.
 - Tests: unit (ordering, totals), ui, e2e.
+
+### UP-86 One row per namespace across a cluster set
+Deferred until cluster sets are scheduled (#199).
+- **Given** a set of three clusters that all have a `payments` namespace, one of them terminating it, and one without
+  metrics-server.
+- **When** I open Namespaces in the set.
+- **Then** `payments` is one row saying "3 clusters", with Problems, Pods, CPU and Memory summed, status Terminating
+  and the oldest age. Usage is marked partial and compared only with the requests of the clusters that report usage.
+  Its chevron shows one child row per cluster with its colour tag and its own values.
+- Tests: unit (merging, worst status, partial usage), ui, e2e (two kind clusters).
+
+### UP-87 Compare one namespace across a cluster set
+Deferred until cluster sets are scheduled (#199).
+- **When** I click the merged `payments` row.
+- **Then** an overview shows a card per cluster for `payments` (problems, usage, sparklines) under a totals strip,
+  and clicking a card opens that cluster's `payments` overview.
+- Tests: unit (totals), ui, e2e.
 
 ## M6: Install
 

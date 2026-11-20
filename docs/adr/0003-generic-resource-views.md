@@ -1,5 +1,8 @@
 # Generic, discovery-driven resource views with curated views for core kinds
 
+**Amended by [ADR-0021](./0021-replica-ready-column.md).** Replica workloads show one Flint-computed Ready column in
+place of the server's replica count columns, which Wide still shows.
+
 Lists for every kind, CRDs included, come from API discovery. Their rows and columns come from the server's Table
 format (`as=Table;g=meta.k8s.io`), the same data `kubectl get` uses. About 10 core kinds (Pod, Deployment,
 StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, Node, Namespace) also get hand-built detail views. This gives

@@ -154,6 +154,12 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   is connected and watched like the active cluster. Rows keep their cluster: details and actions act on the row's
   own cluster. Each cluster may have an optional colour tag, shown in the sidebar, the Cluster column and the detail
   header.
+- **Merged rows (planned, deferred until cluster sets are scheduled, #199):** the Namespaces list will be the one
+  combined list that merges rows. Namespaces with the same name become one row whose columns are summed across
+  members, with a member count, the worst status and the oldest age; usage from members without metrics is marked
+  partial. A chevron shows one child row per member, and clicking the row opens a set-scoped namespace overview with
+  a card per member ([ADR-0020](./adr/0020-namespace-columns-and-overview.md)). The merged row is a view over the
+  members' per-namespace aggregates, keyed by the namespace name; every other list keeps one row per object.
 - **Protection (planned, M3, #81):** every cluster will be protected (read-only in Flint) by default, except clusters on the user's machine
   and clusters marked trusted. A session unlock (one confirmation naming the cluster and server) will last until Flint
   quits ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)). Not built yet: today shells open on any
@@ -183,12 +189,69 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   namespace filter (which accepts typed names when namespaces cannot be listed) is the setting.
 - The table widget is virtualized. Only visible rows are laid out, so a list of 10,000 pods costs about the same to
   draw as a list of 50.
+- **Kinds in use (planned, #194):** in watch mode All, the tree shows only the kinds with at least one object anywhere
+  in the cluster, and folds the rest into a dimmed "… N more" row per section; CRD groups with no objects fold into
+  one "… N empty groups" row ([ADR-0019](./adr/0019-sidebar-shows-kinds-in-use.md)). Each navigation entry gets a
+  state taken from its watch cache at no extra cost: unknown until its first list completes (and shown), in use once
+  its store has an object, and not in use when the first list finds nothing, the list is forbidden, or the kind has
+  no watch. A kind becomes in use as soon as its store gains an object, and leaves that state only when the cluster
+  connects again or becomes active again; a watch that restarts keeps the last state. Forbidden kinds keep today's
+  "cannot be listed" text and red dot. `Navigation` still holds every listable kind, and the tree folds by the state;
+  the open kind and Overview are never folded. A collapsed section's count is its kinds in use. Kinds listed
+  namespace by namespace only know about the namespaces they list. In a cluster set, the state is the union of the
+  members', and the tree folds only when every member is in mode All. In mode On view the tree is not folded and
+  nothing is probed. The resource switcher finds every kind.
+- **Flint-computed columns (planned, #195, #196):** a few columns are computed by Flint and layered on the server's
+  Table. They are synthetic columns, built in `table.rs` beside the synthetic Namespace column (`Column::synthetic`,
+  with their own `ColumnRole`). Each has an identity of its own, apart from its header text, so a Flint column and a
+  server column with the same name (Flint's Ready and the server's Ready with Wide on) stay distinct for sorting, the
+  remembered sort (#205) and a cluster set's union of columns, which today match columns by name
+  (`list_model::resolve_sort`).
+  - **Row data:** Deployments, StatefulSets and DaemonSets are asked for with `includeObject=Object`, and only a few
+    typed fields are kept per row (replica counts, the Progressing condition, `spec.paused`, the update strategy).
+    ReplicaSets and ReplicationControllers need only their Table cells and metadata. Pods stay on
+    `includeObject=Metadata`; their requests are read only while the Namespaces list or a namespace overview is open
+    (see [Namespaces](#namespaces)).
+  - **Wide:** replica workloads get one **Ready** column ("ready/desired", a status dot, a static rollout marker) in
+    place of the server's replica count columns (Desired, Current and Ready, or each kind's equivalents)
+    ([ADR-0021](./adr/0021-replica-ready-column.md)). The replaced server columns are kept in the layout with a
+    priority above 0, so the **Wide** toggle (which shows `priority > 0` columns) puts them back beside Ready.
+  - **MCP** reads lists through the same `table` code but keeps the server's columns and `includeObject=Metadata`, so
+    `list_resources` does not change.
+- **Old ReplicaSet revisions (planned, #197):** ReplicaSets with 0 desired and 0 observed replicas and a Deployment as
+  controller owner are left out of the list by default, with a count and a Show toggle in the header, remembered per
+  cluster in `state.toml`. The text filter still matches them and shows them dimmed.
 
 ### Curated views
 
 About 10 core kinds get hand-built detail views: Pod, Deployment, StatefulSet, DaemonSet, Job, CronJob, Service,
 Ingress, Node, and Namespace. Every other kind uses the generic detail view, which shows metadata, conditions, events,
 and YAML. A curated view is an addition to the generic view, never a replacement: each kind can always show its YAML.
+
+### Namespaces
+
+The Namespaces list's Problems, Pods, CPU and Memory columns, and the namespace overview, are per-namespace
+aggregates ([ADR-0020](./adr/0020-namespace-columns-and-overview.md), #195, #198). The core keeps them per cluster:
+
+- **Problems and Pods** are updated from the Pods store (its Table cells) and the replica workloads' typed status as
+  their snapshots change. The pod and workload problem rules live in one place, shared with the dashboard.
+- **Usage** is summed by namespace from each metrics-server poll.
+- **Requests** come from a second Pods watch with `includeObject=Object`, beside the Metadata one, that runs while
+  the Namespaces list or a namespace overview is open. Each pod's effective request (as the scheduler computes it) is
+  summed by namespace and the object is dropped. Starting it re-lists every pod in full: tens of MB on a cluster with
+  10,000 pods, on each start. It therefore stays alive for 2 minutes after the last of the list and the overviews
+  closes, so moving between the list, an overview and back, or a short detour, does not pay that again. After the
+  grace period it stops and its sums are dropped.
+- **Coverage:** with namespace-limited access, Pods and workloads are watched only in some namespaces. The aggregate
+  records which namespaces its watches cover, and a namespace outside them shows "unavailable", not 0. Metrics that
+  RBAC forbids and a missing metrics-server are told apart.
+- **Sparklines:** a namespace's usage series is a bounded ring buffer like the dashboard's, started when its overview
+  or the Namespaces list opens and dropped when neither is open.
+
+While the list or an overview is open, it counts as an open view of those kinds and of pod metrics, in both watch
+modes. The overview (planned, #198) is the dashboard's components with a namespace scope, plus ResourceQuota use,
+LimitRange limits and a YAML tab. It opens in the main view in place of the list; until it lands, a row opens the
+detail pane.
 
 ### Watch modes
 
@@ -539,7 +602,8 @@ limits against capacity, per node and in total, with a sparkline of the last hou
 events and rollouts). The sparklines come from Flint's own 15-second metrics-server samples, kept in a bounded
 in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
 the dashboard. The dashboard counts as an open view of the kinds it needs. A cluster set's dashboard shows one card per
-member, worst first, under a totals strip. `get_cluster_summary` gives agents the same summary.
+member, worst first, under a totals strip. `get_cluster_summary` gives agents the same summary. The same components,
+scoped to one namespace, make the namespace overview (see [Namespaces](#namespaces)).
 
 ### Metrics
 
@@ -678,7 +742,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   analysis line limit, and a `claude` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, and the dock's height,
   which the user drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
-  filter of each cluster.
+  filter of each cluster. Planned: per cluster, the expanded "… N more" rows of the tree, the old-revisions toggle,
+  and each list's sort.
 - `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
   ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.
