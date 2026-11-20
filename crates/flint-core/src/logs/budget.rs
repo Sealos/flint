@@ -151,20 +151,26 @@ impl LogBudget {
         }
     }
 
-    /// Trims session `id` as planned, if a trim is: `trim` drops its oldest blocks down to the
-    /// bytes given and returns what the buffer holds then, and how much of it is in sealed
-    /// blocks. It runs under the budget's lock, so a tab shown, or resumed, meanwhile either
-    /// withdraws the trim first or comes after it: never shown and then trimmed (UP-42).
+    /// Trims session `id` as planned, if a trim is: `trim` takes its oldest blocks out down to
+    /// the bytes given and returns what the buffer holds then, how much of it is in sealed
+    /// blocks, and what it took out. It runs under the budget's lock, so a tab shown, or
+    /// resumed, meanwhile either withdraws the trim first or comes after it: never shown and
+    /// then trimmed (UP-42). What was taken out is returned, to be freed after the lock is let
+    /// go: freeing many lines is not done while the UI thread may wait on it.
     ///
     /// The result is recorded without planning again: what a session cannot give back would
     /// otherwise have it asked again at once, in a loop. The next change plans again.
-    pub(crate) fn apply_trim(&self, id: u64, trim: impl FnOnce(usize) -> (usize, usize)) {
+    pub(crate) fn apply_trim<R>(
+        &self,
+        id: u64,
+        trim: impl FnOnce(usize) -> ((usize, usize), R),
+    ) -> Option<R> {
         let mut inner = self.lock();
-        if let Some(entry) = inner.sessions.get_mut(&id)
-            && let Some(target) = entry.trim_to.take()
-        {
-            (entry.bytes, entry.trimmable) = trim(target);
-        }
+        let entry = inner.sessions.get_mut(&id)?;
+        let target = entry.trim_to.take()?;
+        let ((bytes, trimmable), released) = trim(target);
+        (entry.bytes, entry.trimmable) = (bytes, trimmable);
+        Some(released)
     }
 
     /// What session `id` should trim its buffer down to, if anything; asked once.
@@ -362,7 +368,6 @@ mod tests {
     // covers UP-42: a trim and showing the tab are never interleaved (#296).
     #[test]
     fn a_trim_applies_before_the_tab_is_shown_or_not_at_all() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         let budget = LogBudget::new(10 * MIB);
         for id in 1..=2 {
             budget.register(id);
@@ -370,27 +375,17 @@ mod tests {
         budget.set_shown(2, true);
         budget.report(1, 6 * MIB, 6 * MIB, false);
         budget.report(2, 6 * MIB, 6 * MIB, false);
-        // Tab 1 starts its trim; it is shown while the trim runs.
-        let (started, wait) = std::sync::mpsc::channel();
-        let done = Arc::new(AtomicBool::new(false));
-        let trimming = std::thread::spawn({
-            let (budget, done) = (budget.clone(), done.clone());
-            move || {
-                budget.apply_trim(1, |target| {
-                    started.send(()).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    done.store(true, Ordering::SeqCst);
-                    (target, target)
-                });
-            }
+        // Tab 1 trims with the budget's lock held, so a tab shown meanwhile waits for it (and
+        // what it took out is handed back, to free after).
+        let released = budget.apply_trim(1, |target| {
+            assert!(
+                budget.inner.try_lock().is_err(),
+                "the budget's lock is held"
+            );
+            ((target, target), "released")
         });
-        wait.recv().unwrap();
-        budget.set_shown(1, true);
-        assert!(
-            done.load(Ordering::SeqCst),
-            "shown only once the trim is done"
-        );
-        trimming.join().unwrap();
+        assert_eq!(released, Some("released"));
+        assert_eq!(budget.apply_trim(1, |t| ((t, t), ())), None, "asked once");
 
         // Shown first: a trim planned while it was hidden is withdrawn, and applying it does
         // nothing.
@@ -406,7 +401,7 @@ mod tests {
         let mut ran = false;
         budget.apply_trim(1, |t| {
             ran = true;
-            (t, t)
+            ((t, t), ())
         });
         assert!(!ran, "the shown tab keeps its lines");
     }

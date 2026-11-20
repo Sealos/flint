@@ -302,26 +302,37 @@ impl Output {
     pub fn append(&mut self, line: LogLine) {
         self.buffer.push(line);
         self.dirty = true;
-        self.trim_frozen();
+        // Not under any lock: freed at once.
+        drop(self.trim_frozen());
     }
 
-    /// Gives memory back to the shared budget: drops the oldest blocks down to `bytes`.
-    fn trim_to(&mut self, bytes: usize) {
-        if self.buffer.trim_to(bytes) {
-            self.trimmed = true;
-            self.dirty = true;
-            self.trim_frozen();
+    /// Gives memory back to the shared budget: takes the oldest blocks out down to `bytes`.
+    /// What it took out (the blocks, and a paused view's old copy) is returned unfreed, for the
+    /// caller to drop once it lets go of the budget's lock.
+    #[must_use = "dropping it frees the lines: do so outside the budget's lock"]
+    fn trim_to(&mut self, bytes: usize) -> Released {
+        let blocks = self.buffer.detach_to(bytes);
+        if blocks.is_empty() {
+            return Released::default();
+        }
+        self.trimmed = true;
+        self.dirty = true;
+        Released {
+            _blocks: blocks,
+            _frozen: self.trim_frozen(),
         }
     }
 
-    /// Keeps a paused view from holding blocks the buffer dropped.
-    fn trim_frozen(&mut self) {
+    /// Keeps a paused view from holding blocks the buffer dropped; returns its old copy.
+    fn trim_frozen(&mut self) -> Option<LogLines> {
         if let Some(frozen) = &mut self.frozen
             && self.frozen_dropped != self.buffer.dropped_blocks()
         {
-            *frozen = frozen.trimmed(self.buffer.first_id());
             self.frozen_dropped = self.buffer.dropped_blocks();
+            let trimmed = frozen.trimmed(self.buffer.first_id());
+            return Some(std::mem::replace(frozen, trimmed));
         }
+        None
     }
 
     pub fn set_state(&mut self, state: &LogState) {
@@ -365,6 +376,13 @@ impl Output {
         }));
         self.dirty = false;
     }
+}
+
+/// Lines a trim took out of a session, freed when this is dropped.
+#[derive(Default)]
+struct Released {
+    _blocks: Vec<Arc<[LogLine]>>,
+    _frozen: Option<LogLines>,
 }
 
 /// A session's place in the shared budget: registered while it runs.
@@ -430,10 +448,13 @@ pub(crate) async fn run(
             }
             () = trim_asked() => {
                 if let Some(b) = &budget {
-                    b.budget.apply_trim(b.id, |bytes| {
-                        out.trim_to(bytes);
-                        (out.buffer.bytes(), out.buffer.trimmable_bytes())
+                    let released = b.budget.apply_trim(b.id, |bytes| {
+                        let released = out.trim_to(bytes);
+                        ((out.buffer.bytes(), out.buffer.trimmable_bytes()), released)
                     });
+                    // Freed here, with the budget's lock let go: a big paused tab can hold
+                    // many lines, and showing a tab waits on that lock.
+                    drop(released);
                 }
             }
             _ = tick.tick(), if out.dirty => {
@@ -601,6 +622,25 @@ mod tests {
 
     fn owned<const N: usize>(lines: [&str; N]) -> Vec<String> {
         lines.map(str::to_owned).into()
+    }
+
+    // covers UP-42: a trim hands back what it took out (blocks, and a paused view's old copy)
+    // instead of freeing it, so the run loop frees it after the budget's lock (#296).
+    #[test]
+    fn a_trim_hands_back_what_it_took_out() {
+        let mut out = Output::new(&config(100_000));
+        for n in 0..3 * crate::logs::CHUNK_LINES {
+            out.append(LogLine::parse(&format!("line {n}"), false));
+        }
+        out.publish(&watch::channel(Arc::new(LogSnapshot::connecting())).0);
+        out.set_paused(true);
+        let released = out.trim_to(0);
+        assert_eq!(released._blocks.len(), 3, "every sealed block");
+        assert!(released._frozen.is_some(), "the paused view's old copy");
+        assert_eq!(out.buffer.trimmable_bytes(), 0);
+        assert!(out.trimmed);
+        let nothing = out.trim_to(0);
+        assert!(nothing._blocks.is_empty() && nothing._frozen.is_none());
     }
 
     // covers UP-42: an ended stream's last block counts as something the budget can take back
