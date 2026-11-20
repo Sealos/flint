@@ -170,6 +170,10 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
                "checked": false, "submenu": []}),
         json!({"label": "Wrap Lines", "enabled": true, "reason": null,
                "checked": false, "submenu": []}),
+        json!({"label": "Errors and Warnings Only", "enabled": true, "reason": null,
+               "checked": false, "submenu": []}),
+        json!({"label": "Matching Lines Only", "enabled": true, "reason": null,
+               "checked": false, "submenu": []}),
     ];
     let s = state(cx, &t);
     assert_eq!(s["focus"], "menu");

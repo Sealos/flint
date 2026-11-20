@@ -342,6 +342,8 @@ impl App {
         command
             .env("FLINT_CONFIG_DIR", &config_dir)
             .env("HOME", scratch.home())
+            // Keeps the log file in the scratch home on Linux too.
+            .env("XDG_STATE_HOME", scratch.home())
             .env("FLINT_LOG", "info")
             .env(EXIT_ON_STDIN_EOF_ENV, "1")
             .envs(options.env.iter().map(|(k, v)| (k, v)))

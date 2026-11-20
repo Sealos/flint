@@ -1960,3 +1960,549 @@ async fn a_copy_lands_after_its_tab_closes(cx: &mut TestAppContext) {
     assert!(released.upgrade().is_none(), "the tab is gone");
     assert_eq!(clipboard(cx).as_deref(), Some("line 5\nline 6"));
 }
+
+/// Runs log action `name` with `args`, as a button or the palette does.
+fn run(cx: &mut TestAppContext, window: AnyWindowHandle, name: &str, args: serde_json::Value) {
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch(name, args, window, cx)
+    })
+    .unwrap()
+    .unwrap();
+}
+
+/// The ids of the rows the tab shows, oldest first.
+fn rows(cx: &mut TestAppContext, view: &Entity<LogView>) -> Vec<u64> {
+    view.read_with(cx, |v, _| {
+        (0..v.row_count()).filter_map(|ix| v.row_id(ix)).collect()
+    })
+}
+
+/// Waits until the tab's filter has scanned and shows `count` rows.
+async fn until_rows(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<LogView>,
+    count: usize,
+) {
+    let view = view.clone();
+    cx.wait_for(window, WAIT, move |_, cx| {
+        let v = view.read(cx);
+        !v.filtering && v.row_count() == count
+    })
+    .await;
+}
+
+// covers UP-48: "Errors" shows only warnings and errors, keeps doing so as lines come, counts
+// them against the buffer, and turning it off shows every line again.
+#[gpui_kit::test]
+async fn errors_only_shows_warnings_and_errors_as_they_come(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 4).await;
+    assert_eq!(rows(cx, &view), [4, 9, 14, 19]);
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(9)).is_some() && window.try_find(line_id(8)).is_none()
+    })
+    .await;
+    let state = view.read_with(cx, |v, _| v.view_state());
+    assert_eq!(state.filter.rows, Some(4));
+    assert!(state.filter.errors_only);
+    assert_eq!(
+        state.last_lines.iter().map(|l| l.id).collect::<Vec<_>>(),
+        [4, 9, 14, 19]
+    );
+    assert_eq!(
+        crate::ui::log_model::shown_count(Some(4), 20),
+        "4 of 20 lines"
+    );
+
+    // Following: new errors join, other lines do not; nothing is scanned twice.
+    feed(cx, &view, lines.push(20, 30).streaming());
+    draw(cx, window);
+    assert_eq!(rows(cx, &view), [4, 9, 14, 19, 24, 29]);
+    view.read_with(cx, |v, _| assert_eq!(v.list.item_count(), 6));
+
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 30).await;
+    assert!(!view.read_with(cx, |v, _| v.is_filtered()));
+}
+
+// covers UP-48: matching lines only, and context around them; a search no line matches says
+// so.
+#[gpui_kit::test]
+async fn matching_lines_only_with_context(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+
+    view.update(cx, |v, cx| v.set_query("error line 1".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 2).await;
+    assert_eq!(rows(cx, &view), [14, 19]);
+
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 1}),
+    );
+    until_rows(cx, window, &view, 5).await;
+    assert_eq!(rows(cx, &view), [13, 14, 15, 18, 19]);
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-context").is_some()
+    })
+    .await;
+
+    // Next Match goes through the matches shown, once the search has scanned too.
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 2
+    })
+    .await;
+    run(cx, window, "logs::NextMatch", serde_json::Value::Null);
+    assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(14));
+
+    // A search no line matches shows nothing, and says so.
+    view.update(cx, |v, cx| v.set_query("line (".into(), cx));
+    until_rows(cx, window, &view, 0).await;
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-filter-empty").is_some()
+    })
+    .await;
+}
+
+// covers UP-48: a full buffer is filtered on the core's threads: the toggle returns at once, the
+// tab says it is filtering, and the rows come when the scan lands.
+#[gpui_kit::test]
+async fn a_full_buffer_filters_off_the_ui_thread(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100_000);
+    feed(cx, &view, lines.push(0, 100_000).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    // Nothing scanned on the UI thread yet: every line stays shown while it filters.
+    view.read_with(cx, |v, _| {
+        assert!(v.filtering);
+        assert!(!v.is_filtered());
+        assert_eq!(v.row_count(), 100_000);
+    });
+    until_rows(cx, window, &view, 20_000).await;
+}
+
+// covers UP-48: a filtered tab far behind (resumed after a long pause) catches up on the core's
+// threads, keeping its rows on screen until then.
+#[gpui_kit::test]
+async fn a_filter_far_behind_catches_up_off_the_ui_thread(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100_000);
+    feed(cx, &view, lines.push(0, 100).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 20).await;
+    // Thirty thousand lines in one snapshot, as after a resume.
+    feed(cx, &view, lines.push(100, 30_100).streaming());
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(v.catching_up, "far behind: caught up off the UI thread");
+        assert_eq!(v.row_count(), 20, "the rows shown stay meanwhile");
+    });
+    until_rows(cx, window, &view, 6_020).await;
+    assert!(!view.read_with(cx, |v, _| v.catching_up));
+}
+
+// covers UP-46, UP-48: a filtered tab saves and copies the rows it shows, not the lines it hides.
+#[gpui_kit::test]
+async fn a_filtered_tab_saves_and_copies_the_rows_it_shows(cx: &mut TestAppContext) {
+    let (core, dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 2).await;
+
+    run(
+        cx,
+        window,
+        "logs::SaveLines",
+        serde_json::json!({"lines": "all", "timestamps": true}),
+    );
+    cx.wait_for(window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    run(cx, window, "ui::Confirm", serde_json::Value::Null);
+    cx.run_until_parked();
+    let path = dir.path().join("errors.log");
+    let chosen = path.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-note").is_some()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "2024-05-01T12:00:00Z ERROR line 4\n2024-05-01T12:00:00Z ERROR line 9\n"
+    );
+
+    // Select all, then copy: the two rows shown, not the eight lines between.
+    let focus = view.read_with(cx, |v, _| v.focus.clone());
+    cx.update_window(window, |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    run(cx, window, "logs::SelectAllLines", serde_json::Value::Null);
+    run(cx, window, "logs::CopyLines", serde_json::Value::Null);
+    cx.run_until_parked();
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    // Newlines between the rows, none after the last, as an unfiltered copy: a pasted row is
+    // not entered.
+    assert_eq!(copied, "ERROR line 4\nERROR line 9");
+}
+
+// covers UP-48: turning a filter on or off keeps the reader's place: the list goes back to the
+// line at its top, or the first row after it, also through a filter that shows nothing.
+#[gpui_kit::test]
+async fn a_filter_change_keeps_the_place(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 1000).streaming());
+    draw(cx, window);
+    view.update(cx, |v, _| {
+        v.list.scroll_to(gpui_kit::ListOffset {
+            item_ix: 500,
+            offset_in_item: px(0.),
+        })
+    });
+    draw(cx, window);
+    let top = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.row_id(v.list.logical_scroll_top().item_ix))
+    };
+    assert_eq!(top(cx), Some(500));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 200).await;
+    assert_eq!(top(cx), Some(504), "the first error after line 500");
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 1000).await;
+    assert_eq!(top(cx), Some(504));
+
+    // Through a filter that shows nothing: the place is held until rows return.
+    view.update(cx, |v, cx| v.set_query("no such line".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 1000).await;
+    assert_eq!(top(cx), Some(504));
+}
+
+// covers UP-48: as lines come and go, the matches among the rows shown are kept up to date
+// from what was found before, the same as finding them again over every match.
+#[gpui_kit::test]
+async fn shown_matches_follow_new_and_evicted_lines(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(40);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+    view.update(cx, |v, cx| v.set_query("line 1".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 1}),
+    );
+    until_rows(cx, window, &view, 11).await;
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    let generations = view.read_with(cx, |v, _| (v.search_generation, v.filter_generation));
+    for to in (27..=202).step_by(7) {
+        let from = view.read_with(cx, |v, _| v.snapshot.lines.end_id());
+        // Found from what was found before.
+        view.read_with(cx, |v, _| v.shown_matches());
+        feed(cx, &view, lines.push(from, to).streaming());
+        draw(cx, window);
+        let (kept, again) = view.read_with(cx, |v, _| {
+            let kept = v.shown_matches();
+            *v.shown_matches.borrow_mut() = None;
+            (kept, v.shown_matches())
+        });
+        assert_eq!(kept, again, "up to line {to}");
+    }
+    let (shown, now) = view.read_with(cx, |v, _| {
+        (
+            v.shown_matches(),
+            (v.search_generation, v.filter_generation),
+        )
+    });
+    assert_eq!(now, generations, "lines only came and went");
+    // Lines 162 to 201 are in the buffer: the errors 164 to 199 and a line either side, of
+    // which those up to 199 say "line 1".
+    assert_eq!(shown.front(), Some(&163));
+    assert_eq!(shown.back(), Some(&199));
+}
+
+// covers UP-48: a refilter on its way is not lost to a long catch-up, and a context change
+// during a first scan restarts it with the new context.
+#[gpui_kit::test]
+async fn refilters_finish_whatever_arrives_meanwhile(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100_000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+    // Context set while the first scan runs: the rows come with it.
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 1}),
+    );
+    until_rows(cx, window, &view, 11).await;
+    assert_eq!(rows(cx, &view), [3, 4, 5, 8, 9, 10, 13, 14, 15, 18, 19]);
+
+    // A refilter, then thirty thousand lines in one snapshot before it lands: it still lands.
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 0}),
+    );
+    feed(cx, &view, lines.push(20, 30_020).streaming());
+    draw(cx, window);
+    until_rows(cx, window, &view, 6_004).await;
+    view.read_with(cx, |v, _| {
+        assert!(!v.filtering && !v.catching_up);
+        assert_eq!(v.list.item_count(), 6_004);
+    });
+}
+
+// covers UP-46, UP-48: with nothing shown, Save, Save Matching Lines and Copy say so rather than
+// write nothing; the match count is of the matches shown.
+#[gpui_kit::test]
+async fn a_filter_that_hides_everything_saves_and_copies_nothing(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 4).streaming());
+    draw(cx, window);
+    // Lines 0 to 3 selected, none an error.
+    view.update(cx, |v, _| v.selection = Some(LineSelection::new(0, 3)));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    view.read_with(cx, |v, _| {
+        assert!(!v.has_lines());
+        assert!(v.check_save(SaveScope::All).is_err());
+        assert!(v.check_save(SaveScope::Selection).is_err());
+        assert_eq!(v.view_state().selection.map(|s| s.lines), Some(0));
+    });
+    run(cx, window, "logs::CopyLines", serde_json::Value::Null);
+    cx.run_until_parked();
+    let note = view.read_with(cx, |v, _| v.note.clone().map(|n| n.text));
+    assert_eq!(
+        note.as_deref(),
+        Some("Nothing copied: no selected line is shown.")
+    );
+
+    // Errors arrive; a search for "line" matches every line, but counts the errors shown.
+    feed(cx, &view, lines.push(4, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("line".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.row_count() == 2
+    })
+    .await;
+    assert_eq!(view.read_with(cx, |v, _| v.shown_match_count()), (2, None));
+    assert_eq!(view.read_with(cx, |v, _| v.view_state().search.matches), 2);
+}
+
+// covers UP-48: a query changed while Matching filters drops the old query's filter at once;
+// the rows shown stay until the new one lands.
+#[gpui_kit::test]
+async fn a_new_query_drops_the_old_filter_on_its_way(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1_000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    view.update(cx, |v, cx| v.set_query("line 1".into(), cx));
+    until_rows(cx, window, &view, 11).await;
+    let generation = view.read_with(cx, |v, _| v.filter_generation);
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    view.read_with(cx, |v, _| {
+        assert!(v.filtering, "the old filter is no longer what is coming");
+        assert!(v.filter_generation > generation);
+        assert_eq!(v.row_count(), 11, "the rows shown stay meanwhile");
+    });
+    until_rows(cx, window, &view, 4).await;
+    assert_eq!(rows(cx, &view), [4, 9, 14, 19]);
+}
+
+// covers UP-48: rows of lines that left the buffer go with the snapshot, before any catch-up,
+// so the first row is always a line shown.
+#[gpui_kit::test]
+async fn evicted_rows_go_with_the_snapshot(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(10);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 2).await;
+    // Lines 0 to 4 leave the buffer; line 9 is the only row left until the tab is drawn.
+    let snapshot = lines.push(10, 15).streaming();
+    view.update(cx, |v, cx| {
+        v.set_snapshot(snapshot, cx);
+        assert_eq!(v.row_count(), 1);
+        assert_eq!(v.row_id(0), Some(9));
+        assert_eq!(v.list.item_count(), 1);
+    });
+    draw(cx, window);
+    assert_eq!(rows(cx, &view), [9, 14]);
+}
+
+// covers UP-48: a filter scanned anew replaces what was found from the old rows, even when the
+// new rows have the same count and ends.
+#[gpui_kit::test]
+async fn new_rows_with_the_same_ends_count_their_own_matches(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    for text in ["ERROR a x", "ERROR b", "info c x", "ERROR d x"] {
+        lines.buffer.push(LogLine::parse(text, false));
+    }
+    feed(cx, &view, lines.streaming());
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 3).await;
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    assert_eq!(view.read_with(cx, |v, _| v.shown_match_count().0), 3);
+    // Rows 0, 2 and 3: the same count and ends, two of them errors.
+    view.update(cx, |v, _| {
+        let spec = flint_core::FilterSpec {
+            query: Some(flint_core::SearchQuery::new("x")),
+            errors_only: false,
+            context: 0,
+        };
+        let mut filter = flint_core::LogFilter::new(spec);
+        filter.update(&v.snapshot.lines);
+        assert_eq!(v.install_filter(filter), 3);
+        assert_eq!(v.shown_match_count().0, 2);
+    });
+}
+
+// covers UP-48: in a filtered tab showing nothing, Jump to Newest still follows the tail, and a
+// selection the filter hides can still be cleared (ending the pause it started).
+#[gpui_kit::test]
+async fn an_empty_filtered_tab_jumps_and_clears_its_selection(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 4).streaming());
+    draw(cx, window);
+    view.update(cx, |v, _| v.selection = Some(LineSelection::new(0, 3)));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    view.read_with(cx, |v, _| {
+        assert!(v.can_jump_to_end());
+        assert!(v.is_selecting());
+        assert!(!v.has_selection());
+    });
+    run(cx, window, "logs::JumpToEnd", serde_json::Value::Null);
+    run(cx, window, "logs::ClearSelection", serde_json::Value::Null);
+    view.read_with(cx, |v, _| assert!(v.selection.is_none()));
+}
