@@ -112,6 +112,26 @@ impl Clock {
         self.now_at_start + i64::try_from(self.started.elapsed().as_secs()).unwrap_or(0)
     }
 
+    /// The server's current time, to the nanosecond (log line timestamps).
+    pub fn now_precise(&self) -> Timestamp {
+        let elapsed = self.started.elapsed();
+        Timestamp::from_second(self.now_at_start)
+            .ok()
+            .and_then(|start| start.checked_add(elapsed).ok())
+            .unwrap_or(Timestamp::UNIX_EPOCH)
+    }
+
+    /// The instant the server started (fixture time [`FIXTURE_NOW`] in the server's time).
+    pub fn start(&self) -> Timestamp {
+        Timestamp::from_second(self.now_at_start).unwrap_or(Timestamp::UNIX_EPOCH)
+    }
+
+    /// The server's current time in fixture time, as objects are stored: new objects take
+    /// timestamps from here, and [`Clock::rebase`] shifts them to "now" on the way out.
+    pub fn fixture_now(&self) -> String {
+        format(self.now() - self.shift, 0)
+    }
+
     /// Shifts every timestamp in a response from fixture time to the server's time, and renders
     /// `Age` cells of a Table from the rows' creation times.
     pub fn rebase(&self, value: &mut Value) {
@@ -194,5 +214,10 @@ mod tests {
         );
         assert_eq!(table["eventTime"], format(1_900_000_000, 6));
         assert!(clock.now() >= 1_900_000_000);
+        assert_eq!(clock.start().as_second(), 1_900_000_000);
+        assert!(clock.now_precise() >= clock.start());
+        // Fixture time runs from FIXTURE_NOW at the start.
+        let (fixture_now, _) = parse(&clock.fixture_now()).unwrap();
+        assert!((FIXTURE_NOW_SECONDS..FIXTURE_NOW_SECONDS + 60).contains(&fixture_now));
     }
 }

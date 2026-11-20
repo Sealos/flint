@@ -1,5 +1,6 @@
 //! flint-core against the fake API server: discovery, Table lists and watches, the relist after
-//! a 410, and 403s. No cluster needed; these run in plain `cargo test`.
+//! a 410, 403s, and log sessions on streaming logs through pod churn. No cluster needed; these
+//! run in plain `cargo test`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -8,9 +9,13 @@ use std::time::Duration;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::read::{self, ListQuery};
 use flint_core::{
-    KindId, KindSnapshot, Settings, Subscription, SyncState, WatchMode, WatchTiming, cluster, table,
+    KindId, KindSnapshot, LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet,
+    Settings, Subscription, SyncState, WatchMode, WatchTiming, WorkloadKind, WorkloadTarget,
+    cluster, table,
 };
-use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Fault, Gvr, Options, Verb, WatchStep};
+use flint_e2e::fake_api::{
+    CONTEXT, ContainerLog, FakeApiServer, FakePod, Fault, Gvr, Options, Verb, WatchStep,
+};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -500,4 +505,174 @@ async fn custom_resources_show_their_printer_columns() {
         .unwrap();
     let gadget = page.rows.iter().find(|r| &*r.name == "gadget-1").unwrap();
     assert_eq!(gadget.cell_text(size, 0), "3");
+}
+
+async fn until_log(
+    session: &mut LogSession,
+    what: &str,
+    pred: impl Fn(&LogSnapshot) -> bool,
+) -> Arc<LogSnapshot> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let snap = session.latest();
+            if pred(&snap) {
+                return snap;
+            }
+            assert!(session.changed().await, "log session stopped");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{what}: never reached, last state {:?}",
+            session.peek().state
+        )
+    })
+}
+
+/// The texts of a snapshot's lines, prefixed with `pod/container` in a workload session.
+fn log_texts(snap: &LogSnapshot) -> Vec<String> {
+    snap.lines
+        .iter()
+        .map(|(_, line)| match &line.source {
+            Some(source) => format!("{} {}", source.label(), line.text),
+            None => line.text.to_string(),
+        })
+        .collect()
+}
+
+// covers UP-40
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_log_streams_resumes_without_repeats_and_ends_with_its_pod() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.add_pod(FakePod::new("demo", "talker", &["app"]).label("app", "talker"));
+    let log = ContainerLog::new("demo", "talker");
+    let target = LogTarget {
+        namespace: "demo".into(),
+        pod: "talker".into(),
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    until_log(&mut session, "streaming", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+    server.append_log(&log, "one\ntwo\n");
+    until_log(&mut session, "two lines", |s| {
+        log_texts(s) == ["one", "two"]
+    })
+    .await;
+
+    // The connection breaks: Flint reconnects from the last timestamp it showed, and the lines
+    // of that second the server sends again are not shown twice.
+    assert_eq!(server.drop_log_streams(&log), 1);
+    until_log(&mut session, "reconnecting", |s| {
+        matches!(s.state, LogState::Reconnecting { .. })
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+    server.append_log(&log, "three\n");
+    until_log(&mut session, "three lines", |s| {
+        log_texts(s) == ["one", "two", "three"]
+    })
+    .await;
+    let requests = server.log_requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    let resume = requests[1].parsed_query();
+    assert!(resume.since_time.is_some() && resume.tail_lines.is_none() && resume.follow);
+    assert!(resume.timestamps);
+
+    // The pod is deleted: its stream ends, and so does the session, saying why.
+    server.delete_pod("demo", "talker");
+    let ended = until_log(&mut session, "ended", |s| {
+        matches!(s.state, LogState::Ended { .. })
+    })
+    .await;
+    assert_eq!(
+        ended.state,
+        LogState::Ended {
+            error: Some("the pod was deleted".into())
+        }
+    );
+    assert_eq!(log_texts(&ended), ["one", "two", "three"]);
+    drop(session);
+    server.wait_for_log_streams(0, WAIT).await.unwrap();
+}
+
+// covers UP-45
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workload_log_follows_its_pods_through_churn() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let (a, b) = ("web-69c6f74b8b-qv4xv", "web-69c6f74b8b-x4gss");
+    server.set_log("demo", a, "a1\n");
+    server.set_log("demo", b, "b1\n");
+    let target = WorkloadTarget {
+        namespace: "demo".into(),
+        pods: PodSet::Workload {
+            kind: WorkloadKind::Deployment,
+            name: "web".into(),
+        },
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    let live = |n: usize| move |s: &LogSnapshot| s.pods.as_ref().is_some_and(|p| p.live() == n);
+    until_log(&mut session, "two pods", live(2)).await;
+    server.wait_for_log_streams(2, WAIT).await.unwrap();
+    let both = until_log(&mut session, "both pods' lines", |s| s.lines.len() == 2).await;
+    let mut texts = log_texts(&both);
+    texts.sort();
+    assert_eq!(texts, [format!("{a}/nginx a1"), format!("{b}/nginx b1")]);
+
+    // Scale up: the new pod is followed without reopening.
+    let new = "web-69c6f74b8b-new01";
+    server.add_pod(server.pod("demo", a).unwrap().sibling(new));
+    until_log(&mut session, "three pods", live(3)).await;
+    server.wait_for_log_streams(3, WAIT).await.unwrap();
+    server.append_log(&ContainerLog::new("demo", new), "n1\n");
+    let line = format!("{new}/nginx n1");
+    until_log(&mut session, "the new pod's line", |s| {
+        log_texts(s).contains(&line)
+    })
+    .await;
+
+    // A rollout replaces b with a pod whose log is refused: that stream fails, the rest go on.
+    let refused = "web-69c6f74b8b-new02";
+    server.inject(
+        Fault::forbidden()
+            .on(&Gvr::core("pods"))
+            .named(refused)
+            .subresource("log"),
+    );
+    server.replace_pod("demo", b, server.pod("demo", a).unwrap().sibling(refused));
+    let snap = until_log(&mut session, "one failed stream", |s| {
+        s.pods
+            .as_ref()
+            .is_some_and(|p| p.failed() == 1 && p.live() == 2 && p.pods == 3)
+    })
+    .await;
+    let pods = snap.pods.as_ref().unwrap();
+    assert!(pods.streams.iter().all(|s| s.source.pod() != b), "{pods:?}");
+
+    // A restarted container is read on from its new instance, without repeats.
+    server.restart_container("demo", a, "nginx");
+    server.wait_for_log_streams(2, WAIT).await.unwrap();
+    server.append_log(&ContainerLog::new("demo", a), "a2\n");
+    let line = format!("{a}/nginx a2");
+    let snap = until_log(&mut session, "the restarted pod's line", |s| {
+        log_texts(s).contains(&line)
+    })
+    .await;
+    let texts = log_texts(&snap);
+    assert_eq!(
+        texts.iter().filter(|t| t.ends_with(" a1")).count(),
+        1,
+        "{texts:?}"
+    );
 }

@@ -26,6 +26,8 @@ pub struct Fault {
     verbs: Vec<Verb>,
     /// `Some(None)`: only requests across all namespaces; `Some(Some(ns))`: only in `ns`.
     namespace: Option<Option<String>>,
+    name: Option<String>,
+    subresource: Option<String>,
     remaining: Option<u32>,
 }
 
@@ -37,6 +39,8 @@ impl Fault {
             resource: None,
             verbs: Vec::new(),
             namespace: None,
+            name: None,
+            subresource: None,
             remaining: None,
         }
     }
@@ -82,6 +86,19 @@ impl Fault {
         self
     }
 
+    /// Only requests about the object of this name (its subresources included).
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = Some(name.to_owned());
+        self
+    }
+
+    /// Only requests for this subresource (`log`), such as one pod's log with
+    /// [`Fault::named`]. Without it, a fault on a resource also matches its subresources.
+    pub fn subresource(mut self, subresource: &str) -> Self {
+        self.subresource = Some(subresource.to_owned());
+        self
+    }
+
     /// Only the next `n` matching requests.
     pub fn times(mut self, n: u32) -> Self {
         self.remaining = Some(n);
@@ -106,6 +123,11 @@ impl Fault {
                 .namespace
                 .as_ref()
                 .is_none_or(|ns| ns.as_deref() == route.namespace())
+            && self.name.as_deref().is_none_or(|n| route.name() == Some(n))
+            && self
+                .subresource
+                .as_deref()
+                .is_none_or(|s| route.subresource() == Some(s))
             && self.remaining != Some(0)
     }
 }
@@ -133,7 +155,8 @@ impl Faults {
     }
 }
 
-/// The message the API server sends when RBAC refuses a request.
+/// The message the API server sends when RBAC refuses a request: `NewForbidden` around
+/// `forbiddenMessage` (`k8s.io/apiserver/pkg/endpoints/handlers/responsewriters/errors.go`).
 pub fn forbidden_message(verb: Verb, route: &Route) -> String {
     let verb = match verb {
         Verb::List => "list",
@@ -148,9 +171,23 @@ pub fn forbidden_message(verb: Verb, route: &Route) -> String {
         Some(ns) => format!("in the namespace \"{ns}\""),
         None => "at the cluster scope".to_owned(),
     };
+    // A schema.GroupResource prints as `resource.group`, or `resource` in the core group.
+    let qualified = if gvr.group.is_empty() {
+        gvr.resource.clone()
+    } else {
+        format!("{}.{}", gvr.resource, gvr.group)
+    };
+    let subject = match route.name() {
+        Some(name) => format!("{qualified} \"{name}\""),
+        None => qualified,
+    };
+    let resource = match route.subresource() {
+        Some(sub) => format!("{}/{sub}", gvr.resource),
+        None => gvr.resource.clone(),
+    };
     format!(
-        "{} is forbidden: User \"flint-e2e\" cannot {verb} resource \"{}\" in API group \"{}\" {scope}",
-        gvr.resource, gvr.resource, gvr.group
+        "{subject} is forbidden: User \"flint-e2e\" cannot {verb} resource \"{resource}\" in API group \"{}\" {scope}",
+        gvr.group
     )
 }
 
@@ -171,6 +208,21 @@ mod tests {
         assert!(!fault.matches(Verb::List, &nodes));
         let in_demo = Fault::status(500).in_namespace("demo");
         assert!(in_demo.matches(Verb::Get, &demo) && !in_demo.matches(Verb::Get, &all));
+        let one_log = Fault::forbidden()
+            .on(&pods)
+            .named("web-1")
+            .subresource("log");
+        let log = Route::parse("/api/v1/namespaces/demo/pods/web-1/log");
+        assert!(one_log.matches(Verb::Get, &log));
+        assert!(!one_log.matches(
+            Verb::Get,
+            &Route::parse("/api/v1/namespaces/demo/pods/web-1")
+        ));
+        assert!(!one_log.matches(
+            Verb::Get,
+            &Route::parse("/api/v1/namespaces/demo/pods/web-2/log")
+        ));
+        assert!(Fault::status(500).on(&pods).matches(Verb::Get, &log));
         assert_eq!(
             Fault::delay(Duration::from_secs(1)).effect(),
             &Effect::Delay(Duration::from_secs(1))
@@ -197,8 +249,17 @@ mod tests {
         let msg = forbidden_message(Verb::List, &Route::parse("/apis/apps/v1/deployments"));
         assert_eq!(
             msg,
-            "deployments is forbidden: User \"flint-e2e\" cannot list resource \"deployments\" \
+            "deployments.apps is forbidden: User \"flint-e2e\" cannot list resource \"deployments\" \
              in API group \"apps\" at the cluster scope"
+        );
+        let msg = forbidden_message(
+            Verb::Get,
+            &Route::parse("/api/v1/namespaces/demo/pods/web-1/log"),
+        );
+        assert_eq!(
+            msg,
+            "pods \"web-1\" is forbidden: User \"flint-e2e\" cannot get resource \"pods/log\" \
+             in API group \"\" in the namespace \"demo\""
         );
         let msg = forbidden_message(Verb::Watch, &Route::parse("/api/v1/namespaces/demo/pods"));
         assert!(msg.ends_with("in the namespace \"demo\""));

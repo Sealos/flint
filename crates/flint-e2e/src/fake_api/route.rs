@@ -83,6 +83,22 @@ impl Route {
         }
     }
 
+    /// The object a request names, if any.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Route::Object { name, .. } | Route::Subresource { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The subresource a request is about (`log`), if any.
+    pub fn subresource(&self) -> Option<&str> {
+        match self {
+            Route::Subresource { subresource, .. } => Some(subresource),
+            _ => None,
+        }
+    }
+
     pub fn verb(&self, method: &http::Method, query: &Query) -> Verb {
         if method != http::Method::GET {
             return Verb::Other;
@@ -151,7 +167,21 @@ pub struct Query {
     pub label_selector: Option<String>,
     pub resource_version_match: Option<String>,
     /// `tailLines` of a log request.
-    pub tail_lines: Option<usize>,
+    pub tail_lines: Option<i64>,
+    /// `container` of a log request.
+    pub container: Option<String>,
+    /// `follow` of a log request.
+    pub follow: bool,
+    /// `previous` of a log request.
+    pub previous: bool,
+    /// `timestamps` of a log request.
+    pub timestamps: bool,
+    /// `sinceSeconds` of a log request.
+    pub since_seconds: Option<i64>,
+    /// `sinceTime` of a log request, as sent.
+    pub since_time: Option<String>,
+    /// `limitBytes` of a log request.
+    pub limit_bytes: Option<i64>,
 }
 
 impl Query {
@@ -173,6 +203,13 @@ impl Query {
                 "labelSelector" => q.label_selector = Some(value).filter(|v| !v.is_empty()),
                 "resourceVersionMatch" => q.resource_version_match = Some(value),
                 "tailLines" => q.tail_lines = value.parse().ok(),
+                "container" => q.container = Some(value).filter(|v| !v.is_empty()),
+                "follow" => q.follow = truthy,
+                "previous" => q.previous = truthy,
+                "timestamps" => q.timestamps = truthy,
+                "sinceSeconds" => q.since_seconds = value.parse().ok(),
+                "sinceTime" => q.since_time = Some(value).filter(|v| !v.is_empty()),
+                "limitBytes" => q.limit_bytes = value.parse().ok(),
                 _ => {}
             }
         }
@@ -261,6 +298,10 @@ mod tests {
             }
         );
         assert_eq!(log.namespace(), Some("demo"));
+        assert_eq!(log.name(), Some("web-1"));
+        assert_eq!(log.subresource(), Some("log"));
+        assert_eq!(Route::parse("/api/v1/pods").name(), None);
+        assert_eq!(Route::parse("/api/v1/nodes/n").subresource(), None);
         assert_eq!(log.gvr(), Some(&Gvr::core("pods")));
         assert_eq!(Route::parse("/apis/apps/v1"), Route::Other);
         assert_eq!(Route::parse("/healthz"), Route::Other);
@@ -300,6 +341,16 @@ mod tests {
         assert_eq!(q.label_selector.as_deref(), Some("app in"));
         assert_eq!(q.resource_version_match.as_deref(), Some("NotOlderThan"));
         assert_eq!(Query::parse(Some("tailLines=5")).tail_lines, Some(5));
+        let log = Query::parse(Some(
+            "container=app&follow=true&previous=true&timestamps=true&tailLines=-1\
+             &sinceSeconds=30&sinceTime=2026-01-01T00%3A00%3A00Z&limitBytes=10",
+        ));
+        assert!(log.follow && log.previous && log.timestamps);
+        assert_eq!(log.container.as_deref(), Some("app"));
+        assert_eq!(log.tail_lines, Some(-1));
+        assert_eq!(log.since_seconds, Some(30));
+        assert_eq!(log.since_time.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(log.limit_bytes, Some(10));
         assert_eq!(Query::parse(None), Query::default());
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");

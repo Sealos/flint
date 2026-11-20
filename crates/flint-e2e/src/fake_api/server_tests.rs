@@ -140,16 +140,11 @@ async fn serves_tables_lists_objects_and_logs() {
         .unwrap();
     assert_eq!(namespace["kind"], "Namespace");
 
-    let pods = server.gvr("pods");
-    let pod = server
-        .rows(&pods)
-        .into_iter()
-        .find(|r| r.namespace() == Some("demo"))
-        .unwrap();
-    let log_path = format!("/api/v1/namespaces/demo/pods/{}/log", pod.name());
+    let pod = "web-69c6f74b8b-qv4xv";
+    let log_path = format!("/api/v1/namespaces/demo/pods/{pod}/log");
     let log = client.request_text(get(&log_path, "*/*")).await.unwrap();
     assert_eq!(log.lines().count(), 3);
-    server.set_log("demo", pod.name(), "one\ntwo\nthree\n");
+    server.set_log("demo", pod, "one\ntwo\nthree\n");
     let tail = client
         .request_text(get(&format!("{log_path}?tailLines=1"), "*/*"))
         .await
@@ -161,6 +156,7 @@ async fn serves_tables_lists_objects_and_logs() {
         ("/apis/nope.example.com/v1/things", 404),
         ("/api/v1/namespaces/demo/nodes", 404),
         ("/api/v1/namespaces/demo/pods/nope/log", 404),
+        ("/api/v1/namespaces/demo/pods/broken-image/log", 400),
         ("/api/v1/namespaces/demo/pods/x/exec", 404),
         ("/apis/metrics.k8s.io/v1beta1/pods?watch=1", 405),
         ("/api/v1/pods?sendInitialEvents=true", 422),

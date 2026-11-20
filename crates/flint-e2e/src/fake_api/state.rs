@@ -1,5 +1,5 @@
-//! The fake server's current objects: the fixtures plus what tests changed, a short log of
-//! changes for watches that resume from an older resource version, and pod logs. Renders lists,
+//! The fake server's current objects: the fixtures plus what tests changed, and a short log of
+//! changes for watches that resume from an older resource version. Renders lists,
 //! objects, Tables and errors the way the API server does. Timestamps stay in fixture time here;
 //! the server rebases responses on the way out.
 
@@ -90,8 +90,6 @@ pub struct State {
     tables: BTreeMap<Gvr, TableData>,
     /// Recorded (or test-provided) full objects.
     objects: BTreeMap<Gvr, BTreeMap<Key, Value>>,
-    /// Pod logs set by tests, by namespace and name.
-    logs: BTreeMap<(String, String), String>,
 }
 
 fn matches(object: &Value, namespace: Option<&str>, query: &Query) -> bool {
@@ -216,7 +214,6 @@ impl State {
             changes: VecDeque::new(),
             tables,
             objects,
-            logs: BTreeMap::new(),
         }
     }
 
@@ -416,9 +413,16 @@ impl State {
         })
     }
 
-    /// Adds or replaces a full object silently; a row is made for it if there is none.
-    pub fn set_object(&mut self, gvr: &Gvr, mut object: Value) -> Result<(), String> {
-        let (namespace, name) = key_of(&object);
+    /// The row of a full object: its current row (or one made with `cells`, the rest at their
+    /// defaults), with the object's metadata. Adds `kind` and `apiVersion` to the object if
+    /// missing.
+    fn row_for_object(
+        &self,
+        gvr: &Gvr,
+        object: &mut Value,
+        cells: &[(&str, &str)],
+    ) -> Result<FakeRow, String> {
+        let (namespace, name) = key_of(object);
         if name.is_empty() {
             return Err("the object has no metadata.name".into());
         }
@@ -428,9 +432,9 @@ impl State {
             object["kind"] = resource.kind.clone().into();
             object["apiVersion"] = gvr.api_version().into();
         }
-        let row = match self.row(gvr, namespace.as_deref(), &name) {
-            Some(row) => row,
-            None => self.new_row(gvr, namespace.as_deref(), &name, &[])?,
+        let row = match (self.row(gvr, namespace.as_deref(), &name), cells) {
+            (Some(row), []) => row,
+            _ => self.new_row(gvr, namespace.as_deref(), &name, cells)?,
         };
         let mut row_json = row.as_json().clone();
         if let (Some(meta), Some(from)) = (
@@ -445,12 +449,43 @@ impl State {
                 }
             }
         }
+        Ok(FakeRow::new(row_json))
+    }
+
+    /// Adds or replaces a full object silently; a row is made for it if there is none.
+    pub fn set_object(&mut self, gvr: &Gvr, mut object: Value) -> Result<(), String> {
+        let row = self.row_for_object(gvr, &mut object, &[])?;
         self.objects
             .entry(gvr.clone())
             .or_default()
-            .insert((namespace, name), object);
-        self.silent_upsert(gvr, FakeRow::new(row_json));
+            .insert(key_of(&object), object);
+        self.silent_upsert(gvr, row);
         Ok(())
+    }
+
+    /// Adds or replaces a full object as a change watches see (`ADDED` or `MODIFIED`), with a
+    /// row made from `cells` (by column name).
+    pub fn apply_object(
+        &mut self,
+        gvr: &Gvr,
+        ty: &'static str,
+        mut object: Value,
+        cells: &[(&str, &str)],
+    ) -> Result<Change, String> {
+        let row = self.row_for_object(gvr, &mut object, cells)?;
+        self.objects
+            .entry(gvr.clone())
+            .or_default()
+            .insert(key_of(&object), object);
+        Ok(self.change(gvr, ty, row))
+    }
+
+    /// The full object held for `namespace`/`name`, if one was recorded or set (not one made
+    /// from a row).
+    pub fn held_object(&self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> Option<&Value> {
+        self.objects
+            .get(gvr)?
+            .get(&(namespace.map(str::to_owned), name.to_owned()))
     }
 
     /// A Table with `rows`, as lists and watch events carry them.
@@ -567,44 +602,6 @@ impl State {
         self.row(gvr, namespace, name)
             .map(|row| self.object_of(gvr, &row))
             .ok_or_else(|| ApiError::not_found(format!("{} \"{name}\" not found", gvr.resource)))
-    }
-
-    pub fn set_log(&mut self, namespace: &str, pod: &str, text: &str) {
-        self.logs
-            .insert((namespace.to_owned(), pod.to_owned()), text.to_owned());
-    }
-
-    /// A pod's log: what a test set, else a few canned lines. `tail` keeps the last lines.
-    pub fn pod_log(
-        &self,
-        namespace: &str,
-        pod: &str,
-        tail: Option<usize>,
-    ) -> Result<String, ApiError> {
-        let pods = Gvr::core("pods");
-        if self.row(&pods, Some(namespace), pod).is_none() {
-            return Err(ApiError::not_found(format!("pods \"{pod}\" not found")));
-        }
-        let text = self
-            .logs
-            .get(&(namespace.to_owned(), pod.to_owned()))
-            .cloned()
-            .unwrap_or_else(|| {
-                (1..=3)
-                    .map(|n| format!("fake log line {n} of {namespace}/{pod}\n"))
-                    .collect()
-            });
-        Ok(match tail {
-            Some(n) => {
-                let lines: Vec<&str> = text.lines().collect();
-                let mut out = lines[lines.len().saturating_sub(n)..].join("\n");
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out
-            }
-            None => text,
-        })
     }
 }
 
@@ -847,14 +844,47 @@ mod tests {
     }
 
     #[test]
-    fn pod_logs_are_canned_or_set() {
+    fn applied_objects_are_changes_with_rows() {
         let mut state = State::new(&fixtures());
-        let pods = state.rows(&Gvr::core("pods"), Some("demo"), &Query::default());
-        let pod = pods[0].name().to_owned();
-        let canned = state.pod_log("demo", &pod, None).unwrap();
-        assert_eq!(canned.lines().count(), 3);
-        state.set_log("demo", &pod, "a\nb\nc\n");
-        assert_eq!(state.pod_log("demo", &pod, Some(2)).unwrap(), "b\nc\n");
-        assert_eq!(state.pod_log("demo", "nope", None).unwrap_err().code, 404);
+        let pods = Gvr::core("pods");
+        let pod = json!({"metadata": {"name": "fresh", "namespace": "demo", "uid": "u-1",
+                         "labels": {"app": "web"}}, "spec": {"containers": [{"name": "app"}]}});
+        let added = state
+            .apply_object(
+                &pods,
+                "ADDED",
+                pod,
+                &[("Ready", "1/1"), ("Status", "Running")],
+            )
+            .unwrap();
+        assert_eq!(added.ty, "ADDED");
+        assert_eq!(added.row.uid(), "u-1");
+        assert_eq!(added.row.metadata()["labels"]["app"], "web");
+        let ready = state
+            .columns(&pods)
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c["name"] == "Ready")
+            .unwrap();
+        assert_eq!(added.row.cells()[ready], "1/1");
+        let held = state.held_object(&pods, Some("demo"), "fresh").unwrap();
+        assert_eq!(held["kind"], "Pod");
+        assert_eq!(
+            held["metadata"]["resourceVersion"],
+            added.resource_version.to_string()
+        );
+        assert_eq!(state.changes_since(&pods, 1000).unwrap().len(), 1);
+        let gone = state.change(&pods, "DELETED", added.row);
+        assert!(state.held_object(&pods, Some("demo"), "fresh").is_none());
+        assert_eq!(gone.ty, "DELETED");
+        assert!(state.apply_object(&pods, "ADDED", json!({}), &[]).is_err());
+        // Rows made from the row only hold no object.
+        let system = state.rows(&pods, Some("kube-system"), &Query::default());
+        assert!(
+            state
+                .held_object(&pods, Some("kube-system"), system[0].name())
+                .is_none()
+        );
     }
 }
