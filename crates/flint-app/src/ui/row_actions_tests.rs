@@ -533,7 +533,10 @@ async fn keys_open_the_default_container_and_the_menu_picks(cx: &mut TestAppCont
     press(cx, &t, "secondary-l");
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-e");
-    assert_eq!(dock_tabs(cx, &t).0, ["web · sidecar", "Shell: web · sidecar"]);
+    assert_eq!(
+        dock_tabs(cx, &t).0,
+        ["web · sidecar", "Shell: web · sidecar"]
+    );
     right_click(cx, &t, "web").await;
     click_entry(cx, &t, 0);
     assert_eq!(submenu(cx, &t), ["app", "sidecar (default)"]);
@@ -1785,7 +1788,7 @@ async fn the_key_refuses_a_default_container_that_is_not_running(cx: &mut TestAp
     click_entry(cx, &t, 3); // After Logs, Previous Logs and its reason.
     assert_eq!(submenu(cx, &t), ["app (default, not running)", "sidecar"]);
     click_submenu(cx, &t, 2);
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web · sidecar"]);
+    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web · sidecar"]);
 }
 
 // covers UP-47: the strip that says why takes a row of its own under the list and the pane,

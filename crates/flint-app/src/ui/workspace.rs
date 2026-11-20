@@ -502,12 +502,12 @@ impl Workspace {
         let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
             return;
         };
-        let what = match &key {
-            TabKey::Logs(_) => "Logs",
-            TabKey::Shell(_) => "Shell",
+        let opening = match &key {
+            TabKey::Logs(_) => Opening::ReconnectLogs,
+            TabKey::Shell(_) => Opening::RestartShell,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
-            self.refuse(format!("{what}: {reason}"), cx);
+            self.refuse(refused(opening, &reason), cx);
             return;
         }
         self.clear_action_error(cx);

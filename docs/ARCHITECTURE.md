@@ -383,9 +383,10 @@ documentation lists the steps.
   active tab's ended or failed session again, on the server its context points at now, in a new tab right after it
   (`Dock::open_beside`), which is shown. The ended tab keeps its lines or scrollback until it is closed, so starting
   again never discards output. A deleted pod's log tab cannot be reconnected (`DockItem::can_restart`). The dock
-  emits `DockEvent::Restart` and the workspace builds the session, refusing, saying why, while the cluster is not
-  connected. On a tab whose session runs, Cmd-R falls through to Refresh. The ended banners of log and shell tabs
-  carry Reconnect and Restart shell buttons.
+  emits `DockEvent::Restart` and the workspace builds the session, refusing while the cluster is not connected with a
+  refusal's sentence ("Can't restart the shell: alpha is not connected.", "Can't reconnect the logs: …";
+  `detail::refused`). On a tab whose session runs, Cmd-R falls through to Refresh. The ended and failed banners of
+  log and shell tabs carry Reconnect and Restart shell buttons.
 - **Many tabs.** The strip scrolls the active tab into view whenever a tab opens, is shown or closes, and on the
   frame after the tab bar changes width (the window or a pane was resized) or a kubeconfig reload changes chips. Show Dock Tabs (`dock::ShowTabList`,
   Shift-Cmd-J, or the button at the strip's end) lists every tab with its cluster and status and shows the one

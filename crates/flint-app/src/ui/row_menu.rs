@@ -323,7 +323,8 @@ pub(in crate::ui) fn refusal(
         let can = match opening {
             Opening::Logs => a.logs,
             Opening::PreviousLogs => a.previous?,
-            Opening::Shell | Opening::LogsAndShell => a.shell,
+            Opening::Shell | Opening::LogsAndShell | Opening::RestartShell => a.shell,
+            Opening::ReconnectLogs => a.logs,
         };
         can.err()
     });

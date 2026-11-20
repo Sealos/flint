@@ -908,7 +908,10 @@ async fn restarting_waits_for_a_connected_cluster(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(ids, [id], "no new tab");
-    assert_eq!(refused.as_deref(), Some("Shell: alpha is not connected"));
+    assert_eq!(
+        refused.as_deref(),
+        Some("Can't restart the shell: alpha is not connected.")
+    );
 
     // A failed log tab whose context is gone from kubeconfig: Reconnect is refused the same way.
     let core = t.model.read_with(cx, |m, _| m.core().clone());
@@ -958,7 +961,7 @@ async fn restarting_waits_for_a_connected_cluster(cx: &mut TestAppContext) {
     assert_eq!(count, 2, "no new tab");
     assert_eq!(
         refused.as_deref(),
-        Some("Logs: no kubeconfig context named gone")
+        Some("Can't reconnect the logs: no kubeconfig context named gone.")
     );
 }
 

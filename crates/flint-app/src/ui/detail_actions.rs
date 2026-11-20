@@ -85,6 +85,10 @@ pub(in crate::ui) enum Opening {
     Shell,
     /// Both Logs and Shell, refused for the same reason (the pane's caption says it once).
     LogsAndShell,
+    /// An ended log tab's Reconnect.
+    ReconnectLogs,
+    /// An ended shell tab's Restart shell.
+    RestartShell,
 }
 
 impl Opening {
@@ -95,6 +99,8 @@ impl Opening {
             Opening::PreviousLogs => "Can't open the previous logs",
             Opening::Shell => "Can't open a shell",
             Opening::LogsAndShell => "Can't open the logs or a shell",
+            Opening::ReconnectLogs => "Can't reconnect the logs",
+            Opening::RestartShell => "Can't restart the shell",
         }
     }
 }

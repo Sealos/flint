@@ -511,6 +511,13 @@ async fn a_failed_shell_says_why_once_in_plain_words(cx: &mut TestAppContext) {
     );
     // Wrapped over more than two lines, not clamped.
     assert!(f32::from(banner.size.height) > 60., "{banner:?}");
+    // A failed shell can be restarted from its banner, as an ended one can.
+    let restart = cx
+        .update_window(shell.window, |_, window, _| {
+            window.try_find("terminal-restart").is_some()
+        })
+        .unwrap();
+    assert!(restart, "Restart shell on the failed banner");
 }
 
 // covers UP-41: the bell flashes the screen for a moment.
