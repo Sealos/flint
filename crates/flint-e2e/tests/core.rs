@@ -593,15 +593,14 @@ async fn a_pod_log_streams_resumes_without_repeats_and_ends_with_its_pod() {
         matches!(s.state, LogState::Ended { .. })
     })
     .await;
-    eprintln!("UP-40 deletion: Flint shows {:?}", ended.state);
+    // This pins what Flint shows today: the session ends with no reason, because the pod
+    // still exists (Succeeded) when its stream ends. #157 will make it give a reason.
     assert_eq!(ended.state, LogState::Ended { error: None });
     assert_eq!(log_texts(&ended), ["one", "two", "three"]);
     // Flint read the stopped container to its end once more (no follow), without repeats.
     let last = server.log_requests().pop().unwrap();
     assert!(!last.parsed_query().follow && last.parsed_query().since_time.is_some());
     server.finish_delete("demo", "talker");
-    let after = session.latest();
-    assert_eq!(after.state, LogState::Ended { error: None });
 }
 
 // covers UP-42

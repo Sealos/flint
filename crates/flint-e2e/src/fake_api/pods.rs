@@ -173,9 +173,14 @@ impl FakePod {
 
     /// The running container exits with `exit_code` at `now` (fixture time): `terminated`,
     /// holding the instance's container id, not ready. The restart count stays until it starts
-    /// again.
+    /// again. Panics if it does not run.
     pub(crate) fn stop(&mut self, container: &str, exit_code: i32, now: &str) {
+        let pod = self.name().to_owned();
         let status = self.status_mut(container);
+        assert!(
+            status.get("state").and_then(|s| s.get("running")).is_some(),
+            "container {container:?} of pod {pod} does not run, so it cannot stop"
+        );
         let id = status.get("containerID").cloned().unwrap_or_default();
         let started = status
             .get("state")
@@ -193,10 +198,11 @@ impl FakePod {
         self.sync();
     }
 
-    /// The container runs from `now` (fixture time). One that terminated starts a new
-    /// instance: the old one moves to `lastState.terminated`, the restart count grows and the
-    /// container id changes; returns true then. One that waited for its first start (Pending)
-    /// or in CrashLoopBackOff just runs. Panics if it already runs.
+    /// The container runs from `now` (fixture time), always as a new instance with an empty
+    /// log. One that terminated moves to `lastState.terminated` (its log becomes the previous
+    /// one: returns true then); one in CrashLoopBackOff already has it there. Either way the
+    /// restart count grows and the container id changes. One that waited for its first start
+    /// (Pending) keeps its id and count. Panics if it already runs.
     pub(crate) fn start(&mut self, container: &str, now: &str) -> bool {
         let identity = format!("fake-pod/{}/{}", self.namespace(), self.uid());
         let pod = self.name().to_owned();
@@ -734,6 +740,13 @@ mod tests {
     #[should_panic(expected = "has no status for container \"nope\"")]
     fn restarting_an_unknown_container_panics() {
         let _ = FakePod::new("demo", "p", &["app"]).restarted("nope");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not run, so it cannot stop")]
+    fn crashing_a_waiting_container_panics() {
+        let mut pod = FakePod::new("demo", "p", &["app"]).waiting("app", "ContainerCreating");
+        pod.stop("app", 1, FIXTURE_NOW);
     }
 
     #[test]

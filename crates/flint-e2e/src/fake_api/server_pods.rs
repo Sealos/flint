@@ -154,20 +154,26 @@ impl FakeApiServer {
     }
 
     /// Starts a container that waits (a Pending pod's, or one in CrashLoopBackOff) or that
-    /// stopped. The pod keeps its uid; pod watches get `MODIFIED`. A container that stopped
-    /// starts a new instance: one more restart, its log becomes the previous one, and a new
-    /// empty log begins. Returns how many pod watches were open. Panics if it already runs.
+    /// stopped. The pod keeps its uid; pod watches get `MODIFIED`. The started instance's log
+    /// begins empty. After a stop or a back-off it is a new instance (one more restart), and the
+    /// last one's log is the previous one. Returns how many pod watches were open. Panics if it
+    /// already runs.
     pub fn start_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
         let mut state = lock(&self.inner.state);
         let mut object = self.held_pod(&state, namespace, pod);
+        let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
+        let mut logs = lock(&self.inner.logs);
         if object.start(container, &self.inner.clock.fixture_now()) {
-            let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
-            lock(&self.inner.logs).rotate(&key);
+            logs.rotate(&key);
+        } else {
+            logs.clear_current(&key);
         }
+        drop(logs);
         self.apply_pod(&mut state, "MODIFIED", object)
     }
 
-    /// The container crashes (exit code 1): its open log streams end cleanly, and pod watches
+    /// The running container crashes (exit code 1; panics if it does not run): its open log
+    /// streams end cleanly, and pod watches
     /// get `MODIFIED` with it terminated. Until it starts again
     /// ([`FakeApiServer::start_container`]), a log request without `previous` reads this
     /// stopped instance, as the kubelet serves it. Returns how many pod watches were open.
@@ -191,7 +197,8 @@ impl FakeApiServer {
     /// `deletionTimestamp` (Terminating); then its containers stop (exit 0), their open log
     /// streams end cleanly, and watches get `MODIFIED` with a terminal phase. The pod can still
     /// be read, and its logs too, until [`FakeApiServer::finish_delete`]. Returns how many pod
-    /// watches were open. Panics if the pod does not exist or is not held in full.
+    /// watches were open. Panics if the pod does not exist, is not held in full, or is already
+    /// being deleted.
     pub fn delete_pod(&self, namespace: &str, name: &str) -> usize {
         let mut state = lock(&self.inner.state);
         self.terminate_pod(&mut state, namespace, name)
@@ -200,6 +207,13 @@ impl FakeApiServer {
     fn terminate_pod(&self, state: &mut State, namespace: &str, name: &str) -> usize {
         let now = self.inner.clock.fixture_now();
         let mut object = self.held_pod(state, namespace, name);
+        assert!(
+            object
+                .as_json()
+                .pointer("/metadata/deletionTimestamp")
+                .is_none(),
+            "pod {namespace}/{name} is already being deleted; call finish_delete"
+        );
         object.mark_deleted(&now, 30);
         self.apply_pod(state, "MODIFIED", object.clone());
         object.stop_all(&now);

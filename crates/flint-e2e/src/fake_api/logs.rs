@@ -590,6 +590,12 @@ impl Logs {
         instances.previous = Some(current);
     }
 
+    /// A new instance starts whose predecessor's log is already the previous one (it backed
+    /// off), or that had none (it never ran): its log starts empty.
+    pub fn clear_current(&mut self, key: &Key) {
+        self.entries(key, false).clear();
+    }
+
     /// The pod's containers stopped: their open streams end; their logs stay readable.
     pub fn end_pod(&mut self, namespace: &str, pod: &str) -> usize {
         self.close(|k| k.0 == namespace && k.1 == pod, None)
@@ -1019,6 +1025,10 @@ mod tests {
             "first run\n"
         );
         assert_eq!(drain(&mut logs.open(&k, running(), &query(""))).0, "");
+        // A fixture container that never logged starts its next instance empty, not canned.
+        let fresh = key("never-written");
+        logs.clear_current(&fresh);
+        assert_eq!(drain(&mut logs.open(&fresh, running(), &query(""))).0, "");
         logs.set(&k, true, "replaced\n");
         assert_eq!(
             drain(&mut logs.open(&k, previous, &query(""))).0,

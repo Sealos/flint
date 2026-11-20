@@ -594,6 +594,57 @@ fn helpers_refuse_an_ambiguous_container() {
     server.append_log(&ContainerLog::new("demo", "multi"), "x\n");
 }
 
+#[tokio::test]
+async fn every_started_instance_begins_with_an_empty_log() {
+    let server = FakeApiServer::start().await.unwrap();
+    let api = pods(&server).await;
+    let previous = LogParams {
+        previous: true,
+        ..LogParams::default()
+    };
+    // CrashLoopBackOff (a fixture whose logs nobody wrote): the started instance is new, and
+    // its predecessor stays the previous log.
+    server.start_container("demo", "crash-loop", "app");
+    let pod = api.get("crash-loop").await.unwrap();
+    assert_eq!(
+        pod.status.unwrap().container_statuses.unwrap()[0].restart_count,
+        6
+    );
+    assert!(
+        read_all(&api, "crash-loop", &LogParams::default())
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        read_all(&api, "crash-loop", &previous).await[0],
+        "fake previous log line 1 of demo/crash-loop"
+    );
+    // A container that never ran (ImagePullBackOff, Pending) starts empty too.
+    server.start_container("demo", "broken-image", "app");
+    let pod = api.get("broken-image").await.unwrap();
+    assert_eq!(pod.status.unwrap().phase.as_deref(), Some("Running"));
+    assert!(
+        read_all(&api, "broken-image", &LogParams::default())
+            .await
+            .is_empty()
+    );
+}
+
+#[test]
+#[should_panic(expected = "is already being deleted; call finish_delete")]
+fn deleting_a_pod_twice_panics() {
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    server.delete_pod("demo", WEB);
+    server.delete_pod("demo", WEB);
+}
+
+#[test]
+#[should_panic(expected = "does not run, so it cannot stop")]
+fn crashing_a_pending_container_panics() {
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    server.crash_container("demo", "broken-image", "app");
+}
+
 #[test]
 #[should_panic(expected = "is not being deleted; call delete_pod first")]
 fn finishing_a_deletion_that_never_started_panics() {
