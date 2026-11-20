@@ -17,6 +17,7 @@ pub mod events;
 pub mod exec;
 pub mod handle;
 pub mod kubeconfig;
+mod logging;
 pub mod logs;
 mod manager;
 pub mod paging;

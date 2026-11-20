@@ -162,11 +162,9 @@ started with plus `/opt/homebrew/bin` and `/usr/local/bin`. Set `path` in `setti
 and use your own. Only `PATH` is read: a `KUBECONFIG` exported in your shell is not, so Flint reads `~/.kube/config`
 unless you add files with `kubeconfig_paths`.
 
-**Logs.** Flint logs to stderr only, so an app opened from Finder or the Dock keeps no log. To see one, start it from
-a terminal: `/Applications/Flint.app/Contents/MacOS/flint`. It prints warnings and errors only; add `--verbose` for
-info, or set `FLINT_LOG` (see [Build and run](#build-and-run)).
-A log file under `~/Library/Logs/Flint/` is not written yet ([#266](https://github.com/Sealos/flint/issues/266)); until it is,
-the bug report form asks for this terminal output.
+**Logs.** Flint writes diagnostics to `~/Library/Logs/Flint/flint.log`, including when opened from Finder or the
+Dock. Use **Go > Go to Folder** in Finder to open `~/Library/Logs/Flint/`. Before attaching a log to a bug report,
+remove cluster names, server URLs and other private details. See [Build and run](#build-and-run) for log levels and rotation.
 
 **The command-line binary.** The app's executable is also the `flint` command, for `flint mcp` (see
 [MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`. `flint --help` lists its commands,
@@ -323,10 +321,15 @@ watch_mode = "all"                # or "on_view"
 
 The app watches `settings.toml` and your kubeconfig files and picks up changes without a restart.
 
-Flint logs to stderr, warnings and errors only by default. `flint --verbose` (or `flint mcp --verbose`) adds info;
-`FLINT_LOG` sets the filter exactly, for example `FLINT_LOG=debug` or `FLINT_LOG=flint_core=debug`, and wins over
-`--verbose`. `RUST_LOG` is read when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists the commands, options
-and environment variables, with the development aids below under their own heading.
+Flint and `flint mcp` log to stderr and share a diagnostic file. On macOS it is `~/Library/Logs/Flint/flint.log`.
+On Linux it is `$XDG_STATE_HOME/flint/flint.log`, defaulting to `~/.local/state/flint/flint.log`. The file stores
+Flint's own diagnostics with credential redaction and rotates at 4 MiB, keeping three older files (`flint.log.1`
+through `flint.log.3`). If the file is unavailable, logging continues on stderr. MCP uses stdout for the protocol.
+
+The default logs warnings and errors. `flint --verbose` (or `flint mcp --verbose`) adds info. `FLINT_LOG` takes
+precedence over `--verbose` and sets the filter for both destinations, for example `FLINT_LOG=debug` or
+`FLINT_LOG=flint_core=debug`. Flint reads `RUST_LOG` when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists
+the commands, options and environment variables, with the development aids below under their own heading.
 
 `FLINT_CLUSTER=<context>` is a development and testing aid, for example for agents that take screenshots: at startup
 Flint activates that context exactly as a click would. It must name a context in the loaded kubeconfig; otherwise Flint

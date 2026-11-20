@@ -190,34 +190,55 @@ fn exposing(context: &str, server: &str) -> String {
     )
 }
 
-/// `serve_stdio_main` logs (here a settings warning and debug lines) to stderr only, and ends
-/// when the client closes stdin. No cluster, no network.
+/// Diagnostics reach stderr and the log file, leaving stdout for the protocol. If the log
+/// directory is blocked, diagnostics still reach stderr. No cluster, no network.
 #[test]
-fn logs_stay_off_stdout_and_eof_ends_the_server() {
+fn logs_stay_off_stdout_even_if_the_log_directory_is_unavailable() {
     let scratch = tempfile::tempdir().unwrap();
     let config_dir = scratch.path().join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("settings.toml"), "path = [\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
-        .env("KUBECONFIG", scratch.path().join("none"))
-        .env("FLINT_CONFIG_DIR", &config_dir)
-        .env("FLINT_LOG", "debug")
-        // Invalid settings carry no `path`; with no usable shell, no login shell runs.
-        .env("SHELL", "/nonexistent")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    // EOF before `initialize` ends the server with an error, which is logged too.
-    assert!(
-        out.stdout.is_empty(),
-        "stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // Exactly the failure code: LeakSanitizer exits with its own code when the server leaks.
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("using default settings"), "{stderr}");
-    assert!(stderr.contains("mcp server failed"), "{stderr}");
+    for blocked in [false, true] {
+        let home = scratch
+            .path()
+            .join(if blocked { "blocked" } else { "home" });
+        if blocked {
+            std::fs::write(&home, "blocks creation of the log directory").unwrap();
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", &home)
+            .env("KUBECONFIG", scratch.path().join("none"))
+            .env("FLINT_CONFIG_DIR", &config_dir)
+            .env("FLINT_LOG", "debug")
+            // Invalid settings carry no `path`; with no usable shell, no login shell runs.
+            .env("SHELL", "/nonexistent")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        // EOF before `initialize` ends the server with an error, which is logged too.
+        assert!(
+            out.stdout.is_empty(),
+            "stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Exactly the failure code: LeakSanitizer exits with its own code when the server leaks.
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("using default settings"), "{stderr}");
+        assert!(stderr.contains("mcp server failed"), "{stderr}");
+        assert_eq!(stderr.contains("could not open Flint's log file"), blocked);
+        if !blocked {
+            let path = if cfg!(target_os = "macos") {
+                home.join("Library/Logs/Flint/flint.log")
+            } else {
+                home.join("flint/flint.log")
+            };
+            let log = std::fs::read_to_string(path).unwrap();
+            assert!(log.contains("using default settings"), "{log}");
+            assert!(log.contains("mcp server failed"), "{log}");
+        }
+    }
 }
 
 /// Without `FLINT_LOG` or `RUST_LOG`, the server logs warnings and errors but no INFO lines;

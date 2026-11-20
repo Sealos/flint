@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use flint_core::bootstrap::{self, Bootstrap};
 use rmcp::ServiceExt;
 
-/// The whole MCP server process, after argument parsing: bootstrap, logging to stderr, then
+/// The whole MCP server process, after argument parsing: bootstrap, logging setup, then
 /// [`run_stdio`] until the client disconnects. `flint mcp` and the `flint-mcp` binary both run
 /// this, so they behave the same. `program` prefixes a startup error; `verbose` (`--verbose`)
 /// logs info as well as warnings, unless `FLINT_LOG` or `RUST_LOG` says otherwise.
@@ -46,7 +46,7 @@ pub unsafe fn serve_stdio_main(program: &str, verbose: bool) -> ExitCode {
 
 /// Serves MCP over stdin/stdout until the client disconnects. Starts its own tokio runtime, so
 /// call it after [`flint_core::bootstrap::bootstrap`] and from a plain (non-async) context.
-/// stdout carries only the protocol; log to stderr.
+/// stdout carries only the protocol. Diagnostics go to stderr and the shared log file.
 pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
     // A mostly idle stdio server: two workers are plenty.
     let runtime = tokio::runtime::Builder::new_multi_thread()

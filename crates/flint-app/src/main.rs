@@ -17,7 +17,7 @@ usage: flint [--verbose]        start the app
        flint --version          print the version
 
 options:
-  --verbose          log info to stderr as well as warnings and errors
+  --verbose          log info as well as warnings and errors
 
 environment:
   KUBECONFIG         kubeconfig files to load, separated by colons (default ~/.kube/config)
@@ -26,6 +26,8 @@ environment:
                      on Linux: $XDG_CONFIG_HOME/flint, else ~/.config/flint
   FLINT_LOG          log filter, for example debug or flint_core=debug; overrides --verbose.
                      RUST_LOG is read when FLINT_LOG is unset, empty or invalid
+  XDG_STATE_HOME     parent of flint/flint.log on Linux (default ~/.local/state).
+                     On macOS the log file is ~/Library/Logs/Flint/flint.log
   SHELL              login shell Flint asks for your PATH, unless settings.toml sets path
   PATH               used, plus the usual tool directories, when that login shell fails
 
@@ -47,9 +49,9 @@ Register `flint mcp` as a stdio MCP server in your AI client, for example:
 
     claude mcp add flint -- {exe} mcp
 
-It only sees the clusters marked Expose to AI in Flint. Logs go to stderr: warnings and errors
-by default, info with --verbose (flint mcp --verbose), or what FLINT_LOG says (for example
-FLINT_LOG=debug)."
+It only sees the clusters marked Expose to AI in Flint. Diagnostics go to stderr and Flint
+events also go to the app's log file (see flint --help). Warnings and errors are logged by
+default. Use --verbose for info, or set FLINT_LOG (for example FLINT_LOG=debug)."
     )
 }
 
@@ -198,6 +200,8 @@ mod tests {
                 "FLINT_CONFIG_DIR",
                 "FLINT_LOG",
                 "RUST_LOG",
+                "XDG_STATE_HOME",
+                "~/Library/Logs/Flint/flint.log",
                 "SHELL",
                 "PATH",
                 "FLINT_CLUSTER",
@@ -218,6 +222,7 @@ mod tests {
                 "KUBECONFIG",
                 "FLINT_CONFIG_DIR",
                 "FLINT_LOG",
+                "XDG_STATE_HOME",
                 "SHELL",
                 "  PATH ",
             ] {
