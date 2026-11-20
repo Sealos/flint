@@ -962,7 +962,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     pane's own element, so they are available, and listed by the palette, only while it has focus; their keys are in
     `ClusterSidebar && !Input` and `Navigation && !Input`, deeper than the list's arrows in `Workspace && !Input`.
   - The cursor shows as a 1 px border in the theme's `ring` color while its pane has focus; every row has the
-    border, transparent off the cursor, so the ring moving shifts nothing. A click, or a cluster or kind picked any
+    border, transparent off the cursor, so the ring moving shifts nothing (nor a row's lock button). The lock
+    button is not a tab stop; from the sidebar, the palette's Unlock Cluster…, Lock Cluster Again…, Trust
+    Cluster… and Stop Trusting Cluster… reach it from the keyboard. A click, or a cluster or kind picked any
     other way, moves it there.
   - Go Back (Cmd-[, `workspace::GoBack`) returns to the kind and object shown before, with focus in the list:
     opening another kind, or jumping from the switcher, remembers the list and its selected object (at most 50

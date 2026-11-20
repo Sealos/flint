@@ -366,3 +366,49 @@ async fn go_back_to_the_open_kind_focuses_the_list(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx), None);
     assert_eq!(focus(cx, &t), Focus::List);
 }
+
+// covers UP-33, UP-55: on a protected cluster the sidebar's cursor ring leaves its lock button
+// where it was, and the lock stays reachable from the keyboard: from the sidebar, the palette
+// unlocks the cluster, asking first.
+#[gpui_kit::test]
+async fn the_lock_stays_reachable_from_the_sidebar(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{alpha_and_beta, open_workspace_with};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "protect_local_clusters = true\n",
+    )
+    .unwrap();
+    let t = open_workspace_with(cx, dir.path(), alpha_and_beta).await;
+    let lock = |cx: &mut TestAppContext| {
+        t.find(cx, "lock-alpha")
+            .expect("alpha's lock button is drawn")
+            .bounds()
+    };
+    t.focus_workspace(cx);
+    let before = lock(cx);
+    t.press(cx, "tab");
+    assert_eq!(focus(cx, &t), Focus::Sidebar);
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(lock(cx), before, "the ring moved the lock button");
+
+    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace
+            .read(cx)
+            .palette_view()
+            .is_some_and(|p| !p.read(cx).view_state().rows.is_empty())
+    })
+    .await;
+    t.type_text(cx, "unlock cluster");
+    t.press(cx, "enter");
+    t.type_text(cx, "alpha");
+    t.press(cx, "enter");
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+    })
+    .await;
+    assert!(t.has_dialog(cx), "Unlock asks first, naming the server");
+}
