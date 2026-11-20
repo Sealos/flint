@@ -653,6 +653,10 @@ impl Workspace {
             // subscription (UP-24).
             self.cluster = active.clone();
             self.close_list(cx);
+            // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
+            // may never come back through `reclaim_focus`, nor a list open here. One that still
+            // has focus goes when the workspace takes focus back.
+            release_unfocused_input(window, cx);
             self.namespaces.clear();
             self.namespaces_state = SyncState::Idle;
             self._namespaces = match &active {
