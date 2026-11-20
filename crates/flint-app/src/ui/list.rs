@@ -512,14 +512,8 @@ impl ResourceList {
         if self.drawn.is_empty() {
             return list_model::visible_columns(columns, self.show_wide);
         }
-        let keys: Vec<String> = self
-            .drawn
-            .iter()
-            .map(|&(col, _)| self.shown.columns[col].key())
-            .collect();
-        (0..columns.len())
-            .filter(|&i| keys.contains(&columns[i].key()))
-            .collect()
+        let drawn: Vec<usize> = self.drawn.iter().map(|&(col, _)| col).collect();
+        list_model::map_drawn(&self.shown.columns, &drawn, columns)
     }
 
     /// The drawn column the sort applies to, if it is drawn.

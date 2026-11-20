@@ -39,6 +39,28 @@ pub fn sort_column(columns: &[Column], spec: Option<&SortSpec>, drawn: &[usize])
         .find(|&i| columns[i].key() == spec.column)
 }
 
+/// The indexes in `new` of the columns `drawn` (indexes into `old`): the same indexes when the
+/// definitions did not change, else each drawn column's match by key, the k-th column with a
+/// key matching the k-th one in `old`, so one drawn column never stands for several (two
+/// columns can share a header, and so a key, one of them wide and hidden).
+pub fn map_drawn(old: &[Column], drawn: &[usize], new: &[Column]) -> Vec<usize> {
+    if old == new {
+        return drawn.to_vec();
+    }
+    drawn
+        .iter()
+        .filter_map(|&col| {
+            let key = old[col].key();
+            let rank = old[..col].iter().filter(|c| c.key() == key).count();
+            new.iter()
+                .enumerate()
+                .filter(|(_, c)| c.key() == key)
+                .nth(rank)
+                .map(|(i, _)| i)
+        })
+        .collect()
+}
+
 /// The sort for `compute_view`: `spec`'s column looked up by key among the `drawn` columns.
 /// `None` when nothing is sorted, or the column no longer exists (a remembered sort on a CRD
 /// column since removed) or is not drawn, which keeps the snapshot order: namespace, then name.
@@ -612,6 +634,33 @@ mod tests {
             labels: Box::new([]),
             cells: Box::new([Cell::Name, Cell::Namespace, Cell::Text(ready.into())]),
         })
+    }
+
+    // covers UP-20, UP-21
+    #[test]
+    fn drawn_columns_map_one_to_one_onto_new_definitions() {
+        // Two server columns headed "Node": the first wide (hidden), the second shown.
+        let mut columns = pod_columns()[..5].to_vec();
+        columns.push(col("Node", 1, ColumnRole::Value, ColumnType::String));
+        columns.push(col("Node", 0, ColumnRole::Value, ColumnType::String));
+        let drawn = vec![0, 1, 2, 3, 4, 6];
+        // Unchanged definitions: the same indexes, never the hidden twin too.
+        assert_eq!(map_drawn(&columns, &drawn, &columns), drawn);
+        let node = SortSpec {
+            column: "server:Node".into(),
+            descending: false,
+        };
+        let mapped = map_drawn(&columns, &drawn, &columns);
+        assert_eq!(sort_column(&columns, Some(&node), &mapped), Some(6));
+        // A column inserted before them: each drawn column maps to its own match.
+        let mut changed = columns.clone();
+        changed.insert(2, col("Phase", 0, ColumnRole::Value, ColumnType::String));
+        let mapped = map_drawn(&columns, &drawn, &changed);
+        assert_eq!(mapped, vec![0, 1, 3, 4, 5, 7]);
+        assert_eq!(sort_column(&changed, Some(&node), &mapped), Some(7));
+        // A drawn column that is gone maps to nothing.
+        changed.truncate(6);
+        assert_eq!(map_drawn(&columns, &drawn, &changed), vec![0, 1, 3, 4, 5]);
     }
 
     #[test]
