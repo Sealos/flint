@@ -54,7 +54,9 @@ impl ActivityRow {
 /// `records`, newest first, with times in `tz` and `now`
 /// deciding whether a date is shown: those that named the context, and those that probed it
 /// (`list_clusters`). A context re-pointed at another server is another cluster: its calls there
-/// are not shown (a record without a server, from a context not exposed, is).
+/// are not shown (a record without a server, from a context not exposed, is). A call that probed
+/// more clusters than its record lists ([`ActivityRecord::probed_more`]) is shown, marked, in the
+/// tab of every cluster it does not list: it may have probed it.
 pub fn rows(
     records: &[ActivityRecord],
     cluster: &str,
@@ -68,7 +70,7 @@ pub fn rows(
     let mut mine: Vec<(usize, &ActivityRecord)> = records
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.is_about(&cluster, server))
+        .filter(|(_, r)| r.is_about(&cluster, server) || maybe_probed(r, &cluster))
         .collect();
     // Newest first; calls in the same millisecond (several `flint mcp` processes) in the order
     // they were written, last first.
@@ -77,11 +79,24 @@ pub fn rows(
         .map(|(_, r)| ActivityRow {
             time: time(r.at_ms, tz, today),
             tool: shown(&r.tool),
-            target: shown(&target(r)),
+            target: if r.is_about(&cluster, server) {
+                target(r)
+            } else {
+                format!(
+                    "{} clusters, maybe this one: not all are listed",
+                    r.probed.len() as u64 + r.probed_more
+                )
+            },
             result: result(r),
             outcome: r.outcome,
         })
         .collect()
+}
+
+/// Whether `r` probed more clusters than it lists and `cluster` is not among those it lists: then
+/// it may have probed `cluster`.
+fn maybe_probed(r: &ActivityRecord, cluster: &str) -> bool {
+    r.probed_more > 0 && !r.probed.iter().any(|p| p.cluster_key == cluster)
 }
 
 fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
@@ -98,18 +113,31 @@ fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
 
 /// `text`, written by an agent, as the view shows it: control characters and the invisible
 /// format characters that reorder or hide text (bidi embeddings, overrides and isolates,
-/// zero-width characters) are shown as escapes (`\n`, `\u{202e}`), so a name cannot break its
+/// zero-width and other default-ignorable characters, line and paragraph separators, blank
+/// fillers) are shown as escapes (`\n`, `\u{202e}`), so a name cannot break its
 /// row or pass itself off as another one. A backslash is doubled, so an escape and the same
 /// characters written by the agent read differently. Everything else is kept.
 fn shown(text: &str) -> String {
     fn hidden(c: char) -> bool {
         matches!(
             c,
-            '\u{061c}'
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
                 | '\u{200b}'..='\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{2069}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
                 | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
         )
     }
     let mut out = String::with_capacity(text.len());
@@ -130,20 +158,21 @@ fn shown(text: &str) -> String {
 /// What a call named: the kind, the object (`namespace/name`, or the namespace alone), and the
 /// container.
 fn target(r: &ActivityRecord) -> String {
-    let object = match (&r.namespace, &r.name) {
+    // Each field escaped on its own, before they are joined: a name cannot pass itself off as
+    // another field (an escaped `, container x` still reads as part of the name it is in).
+    let field = |text: &Option<String>| text.as_deref().map(shown);
+    let object = match (field(&r.namespace), field(&r.name)) {
         (Some(ns), Some(name)) => Some(format!("{ns}/{name}")),
-        (None, Some(name)) => Some(name.clone()),
+        (None, Some(name)) => Some(name),
         (Some(ns), None) => Some(format!("in {ns}")),
         (None, None) => None,
     };
-    let mut text = r
-        .kind
-        .iter()
-        .cloned()
+    let mut text = field(&r.kind)
+        .into_iter()
         .chain(object)
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(container) = &r.container {
+    if let Some(container) = field(&r.container) {
         text.push_str(&format!(", container {container}"));
     }
     if text.is_empty() { "—".into() } else { text }
@@ -185,8 +214,6 @@ pub struct ActivityView {
     cluster: ClusterId,
     /// The server the context pointed at when the tab opened.
     server: Option<String>,
-    /// Its key in the activity log; none without one (then calls match by context alone).
-    server_key: Option<String>,
     /// The log the rows were built from: rebuilt only when it changes.
     shown: Option<Arc<Vec<ActivityRecord>>>,
     model: Entity<ClustersModel>,
@@ -199,13 +226,12 @@ pub struct ActivityView {
 }
 
 impl ActivityView {
-    /// The tab for `cluster` at `server`, matching calls by `keys`: those of the log's config
-    /// directory, so its server key is the one `flint mcp` records.
+    /// The tab for `cluster` at `server`. Calls are matched by the server's key under the log's
+    /// own keys ([`ClustersModel::activity_keys`]), the ones `flint mcp` records with.
     pub fn new(
         model: Entity<ClustersModel>,
         cluster: ClusterId,
         server: Option<String>,
-        keys: &activity::ServerKeys,
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&model, |view, _, cx| {
@@ -214,7 +240,6 @@ impl ActivityView {
         });
         let mut view = ActivityView {
             cluster,
-            server_key: server.as_deref().and_then(|s| keys.server_key(s)),
             server,
             shown: None,
             model,
@@ -229,7 +254,8 @@ impl ActivityView {
     }
 
     fn refresh(&mut self, cx: &App) {
-        let records = self.model.read(cx).agent_activity.clone();
+        let model = self.model.read(cx);
+        let records = model.agent_activity.clone();
         // The model also changes for connections, discovery and settings.
         if self
             .shown
@@ -238,10 +264,15 @@ impl ActivityView {
         {
             return;
         }
+        // None without a key (then calls match by context alone).
+        let server_key = self
+            .server
+            .as_deref()
+            .and_then(|s| model.activity_keys.server_key(s));
         self.rows = rows(
             &records,
             &self.cluster,
-            self.server_key.as_deref(),
+            server_key.as_deref(),
             &self.tz,
             Timestamp::now(),
         );
@@ -552,6 +583,28 @@ mod tests {
         assert_eq!(shown("a\\nb"), "a\\\\nb");
         assert_eq!(shown("a\nb"), "a\\nb");
         assert_ne!(shown("a\\nb"), shown("a\nb"));
+        // Other invisible characters: separators, soft hyphens, joiners, fillers, tags.
+        for c in [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{206a}',
+            '\u{3164}',
+            '\u{e0041}',
+        ] {
+            assert_eq!(
+                shown(&format!("a{c}b")),
+                format!("a{}b", c.escape_unicode())
+            );
+        }
+        // Each field is escaped on its own, before the fields are joined.
+        let spoof = ActivityRecord {
+            name: Some("web-0\u{2028}".into()),
+            container: None,
+            ..record(now.as_millisecond(), "prod")
+        };
+        assert_eq!(target(&spoof), "pods web/web-0\\u{2028}");
     }
 
     // covers UP-16: a context re-pointed at another server shows only the calls on the server its
@@ -622,6 +675,32 @@ mod tests {
         assert_eq!(labels("dev", None).len(), 1);
         assert!(labels("prod", Some("https://elsewhere:6443")).is_empty());
         assert!(labels("staging", None).is_empty());
+
+        // One that probed more than it lists shows, marked, in the tab of every cluster it does
+        // not list: it may have probed it. Not in a listed one's tab at another server.
+        let more = ActivityRecord {
+            probed_more: 300,
+            ..listed
+        };
+        let labels = |cluster| -> Vec<String> {
+            rows(
+                std::slice::from_ref(&more),
+                cluster,
+                Some(&server_key("https://staging:6443")),
+                &TimeZone::UTC,
+                now,
+            )
+            .iter()
+            .map(ActivityRow::label)
+            .collect()
+        };
+        assert_eq!(
+            labels("staging"),
+            [
+                "12:00:00 list_clusters 302 clusters, maybe this one: not all are listed — 2 items, 300 B"
+            ]
+        );
+        assert!(labels("prod").is_empty());
     }
 
     // covers UP-16: two servers that show as the same placeholder are two clusters: a context

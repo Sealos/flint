@@ -945,13 +945,11 @@ impl Workspace {
         let cluster = action.cluster.clone();
         let tab_cluster = self.tab_cluster(&cluster, cx);
         let server = tab_cluster.server.clone();
-        // The log's own key, which `flint mcp` keys servers with.
-        let keys = flint_core::activity::ServerKeys::open(self.ui_state.dir());
         self.open_tab(
             TabKey::Activity(cluster.clone()),
             tab_cluster,
             move |_, cx| {
-                DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, server, &keys, cx)))
+                DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, server, cx)))
             },
             true,
             window,

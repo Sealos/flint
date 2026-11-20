@@ -279,7 +279,7 @@ async fn reports_the_agent_activity_log_as_it_grows() {
     let events = core.events();
     let next = || async {
         loop {
-            if let Event::AgentActivity(records) = events.recv().await.unwrap() {
+            if let Event::AgentActivity(records, _) = events.recv().await.unwrap() {
                 return records;
             }
         }

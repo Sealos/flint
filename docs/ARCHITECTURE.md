@@ -906,12 +906,14 @@ Rules:
   for one. That URL can hold a password or token, so the server key is an HMAC-SHA256 digest (ring, cut to 128 bits)
   under a random 32-byte key in `activity.key` beside the log: owner-only, made on first use by whichever process
   comes first (written to a file of its own, then linked into place without replacing one already there), and read
-  by the app for the tab's own server. Without a usable key file, a record has no server key and its tab matches it
+  by the core with the log, off the UI thread, for the app to key the tab's own server. Without a usable key file, a record has no server key and its tab matches it
   by context alone. The context key stays an unkeyed FNV-1a hash: context names are in the record anyway. Server
-  keys from before the keyed digest no longer match, so those calls no longer show in their cluster's tab; a line
-  with no server key gets one from its shown server, except the placeholder, which matches no tab.
+  keys from before the keyed digest no longer match, so those calls no longer show in their cluster's tab. A server
+  key is never guessed from the shown server, which can drop a query or be a placeholder.
   `list_clusters` names no cluster, so its record holds the keys of each cluster it probed (the first 256, and a
-  count of the rest, so one record stays far below the 1 MiB cap), and it shows in each of their tabs. A call the router answers without running its tool (an unknown tool, arguments that do not fit) is
+  count of the rest, so one record stays far below the 1 MiB cap), and it shows in each of their tabs. When it
+  probed more than it lists, it also shows in the tab of every cluster it does not list, marked as one that may have
+  probed it, so no tab claims a call never happened. A call the router answers without running its tool (an unknown tool, arguments that do not fit) is
   recorded as failed, with what its arguments name. A context re-pointed at another
   server is another cluster: its activity tab shows the calls on the server it was opened for, newest first, and
   offers Edit AI Scope only while the context still points there. The core watches both files beside `settings.toml` and sends

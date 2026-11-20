@@ -169,8 +169,8 @@ pub fn cluster_key(context: &str) -> String {
 }
 
 /// The keyed digest the log keys servers by, with the key in a config directory's [`KEY_FILE`].
-/// Cheap to clone.
-#[derive(Clone)]
+/// Cheap to clone. The default has no key, so no server keys.
+#[derive(Clone, Default)]
 pub struct ServerKeys {
     /// None when the key file could not be read or made: then there are no server keys.
     key: Option<ring::hmac::Key>,
@@ -466,14 +466,13 @@ fn read_with(config_dir: &Path, mut between: impl FnMut()) -> Vec<ActivityRecord
             break;
         }
     }
-    let keys = ServerKeys::open(config_dir);
     let mut records: Vec<ActivityRecord> = files
         .iter()
         .flat_map(|bytes| {
             bytes
                 .split(|b| *b == b'\n')
                 .filter_map(|line| serde_json::from_slice::<ActivityRecord>(line).ok())
-                .map(|record| keyed(record, &keys))
+                .map(keyed)
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -503,26 +502,13 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// A server key no server has: that of a line whose server is not known well enough to match
-/// any tab's.
-pub const UNMATCHED_SERVER: &str = "-";
-
-/// `record` with its keys, computed from its fields when it has none (an older line, or one
-/// written without the key file). Its server key is then of the shown server, which is the
-/// kubeconfig's for URLs without credentials, query or fragment; a server shown as the
-/// placeholder could be any, so it gets [`UNMATCHED_SERVER`].
-fn keyed(mut record: ActivityRecord, keys: &ServerKeys) -> ActivityRecord {
+/// `record` with its cluster key, computed from its context when it has none. Its server key is
+/// never guessed from the shown server, which can drop the query or hide the server behind a
+/// placeholder: a record written without the key file has none, and its tab matches it by
+/// context alone.
+fn keyed(mut record: ActivityRecord) -> ActivityRecord {
     if record.cluster_key.is_none() {
         record.cluster_key = record.cluster.as_deref().map(cluster_key);
-    }
-    if record.server_key.is_none()
-        && let Some(server) = &record.server
-    {
-        record.server_key = if server == crate::redact::HIDDEN_SERVER_URL {
-            Some(UNMATCHED_SERVER.to_owned())
-        } else {
-            keys.server_key(server)
-        };
     }
     record
 }
@@ -792,8 +778,10 @@ mod tests {
         assert!(!read[0].is_about(&cluster_key("staging"), None));
     }
 
-    // covers UP-16: a line written before the keys (or the probed clusters) existed still reads,
-    // with its keys computed from what it shows.
+    // covers UP-16: a line without keys (written before them, or without a usable key file)
+    // still reads, with its cluster key computed from its context. Its server key is never
+    // guessed from the shown server, which can drop the query or be a placeholder: it matches
+    // its tab by context alone.
     #[test]
     fn older_lines_get_their_keys() {
         let dir = tempfile::tempdir().unwrap();
@@ -805,16 +793,13 @@ mod tests {
         .unwrap();
         let read = read(dir.path());
         assert_eq!(read.len(), 2);
-        assert_eq!(read[0].cluster_key, Some(cluster_key("prod")));
-        let keys = ServerKeys::open(dir.path());
-        assert_eq!(read[0].server_key, keys.server_key("https://prod:6443/"));
-        assert!(read[0].probed.is_empty() && read[0].probed_more == 0);
-        // Shown as the placeholder, it could be any server: no tab's.
-        assert_eq!(read[1].server_key.as_deref(), Some(UNMATCHED_SERVER));
-        assert!(!read[1].is_about(
-            &cluster_key("prod"),
-            keys.server_key("https://a").as_deref()
-        ));
+        for line in &read {
+            assert_eq!(line.cluster_key, Some(cluster_key("prod")));
+            assert_eq!(line.server_key, None);
+            assert!(line.probed.is_empty() && line.probed_more == 0);
+            assert!(line.is_about(&cluster_key("prod"), Some(&server_key("https://a"))));
+            assert!(!line.is_about(&cluster_key("dev"), None));
+        }
     }
 
     // covers UP-16: server keys are keyed digests: a credential in a server URL cannot be checked
