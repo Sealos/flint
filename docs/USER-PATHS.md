@@ -60,8 +60,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   hangs.
 - **When** I select it.
 - **Then** within the timeout I see an error stating the cause in plain words, and I can retry. Other clusters and the
-  rest of the UI keep working.
-- Tests: unit (timeouts), cluster (unreachable), ui.
+  rest of the UI keep working. A plugin that hangs is killed at the timeout, with anything it started; retrying while
+  an attempt runs does not start a second plugin.
+- Tests: unit (timeouts, hanging plugin processes), cluster (unreachable), ui.
 
 ### UP-05 Exec-plugin auth when launched from Finder
 - **Given** an EKS, GKE or kubelogin context whose plugin is only on the `PATH` set in my shell rc files.

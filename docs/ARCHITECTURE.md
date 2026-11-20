@@ -970,8 +970,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Table plus watch.** If watch streams in Table format turn out to be unreliable, lists can be built from full
   objects with columns computed on the client (built-in definitions plus CRD printer columns). This costs more code
   but stays within ADR-0003.
-- **Exec plugin latency.** Some auth plugins take seconds to run. Cache tokens until they expire (`kube` does this)
-  and show connection progress in the UI.
+- **Exec plugin latency.** Some auth plugins take seconds to run, and some hang (a browser login that never
+  completes). Flint runs the plugin itself (`flint_core::auth_plugin`) instead of letting kube run it on a blocking
+  thread: the plugin is a child in its own process group, killed with what it started when its connection attempt
+  times out or is dropped. Tokens are cached until a minute before they expire, and connection progress shows in
+  the UI.
 - **No `helm` installed.** Covered by an install hint. Bundling the binary is a possible follow-up.
 - **AI CLI flags change.** `claude` is young, and its flags can change. Keep the flags in one place, and fail
   closed when the CLI rejects them or its `system/init` check fails.

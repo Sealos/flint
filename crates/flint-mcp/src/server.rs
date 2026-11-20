@@ -1016,6 +1016,102 @@ mod tests {
         FlintMcp::new(dir.to_owned(), vec![path], None)
     }
 
+    /// Whether `pid` names a process, zombies included.
+    fn exists(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Waits for `path` to hold a line, then returns its first line.
+    async fn first_line(path: &std::path::Path) -> String {
+        for _ in 0..500 {
+            if let Some(line) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| t.lines().next().map(str::to_owned))
+            {
+                return line;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{} was not written", path.display());
+    }
+
+    // covers UP-04: tool calls on a context whose exec auth plugin never answers (a login that
+    // never comes) share one plugin run, and when they give up the plugin and what it started
+    // are killed, so repeated calls never pile up plugin processes.
+    #[tokio::test]
+    async fn tool_calls_on_a_hanging_plugin_leave_at_most_one_plugin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir(&traces).unwrap();
+        let plugin = dir.path().join("plugin");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\necho $$ >> \"$PLUGIN_DIR/starts\"\nsleep 600 &\n\
+             echo $! > \"$PLUGIN_DIR/child.tmp\" && mv \"$PLUGIN_DIR/child.tmp\" \"$PLUGIN_DIR/child\"\n\
+             wait\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let user = format!(
+            "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      \
+             interactiveMode: Never\n      env:\n      - name: PLUGIN_DIR\n        value: {}\n",
+            plugin.display(),
+            traces.display()
+        );
+        let server = scratch_server(dir.path(), &[("hang", "http://127.0.0.1:1", &user)]);
+        let starts = || {
+            std::fs::read_to_string(traces.join("starts"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+
+        for round in 1..=2 {
+            let _ = std::fs::remove_file(traces.join("child"));
+            let calls: Vec<_> = (0..3)
+                .map(|_| {
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        server
+                            .do_list_kinds(ClusterParams {
+                                cluster: "hang".into(),
+                            })
+                            .await
+                    })
+                })
+                .collect();
+            let child = first_line(&traces.join("child")).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(starts(), round, "one plugin for every call in flight");
+            let leader = std::fs::read_to_string(traces.join("starts"))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
+                .to_owned();
+            assert!(exists(&leader) && exists(&child));
+            // The calls give up, as at their timeout.
+            for call in calls {
+                call.abort();
+            }
+            for pid in [&leader, &child] {
+                for _ in 0..500 {
+                    if !exists(pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(!exists(pid), "plugin process {pid} outlived its calls");
+            }
+        }
+    }
+
     // covers UP-04, UP-10
     #[tokio::test(start_paused = true)]
     async fn tool_errors_name_the_server_and_the_missing_plugin() {

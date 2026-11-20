@@ -5,6 +5,7 @@
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
 pub mod api_error;
+mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;
