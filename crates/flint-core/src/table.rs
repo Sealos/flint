@@ -463,6 +463,9 @@ pub(crate) struct Interner {
     inserts: usize,
     /// How many strings the last prune kept.
     kept: usize,
+    /// The most strings a relist kept since the table was last given back: a small table is
+    /// given back once it keeps half that or less, however gradually it got there.
+    high: usize,
     #[cfg(test)]
     prunes: usize,
 }
@@ -529,13 +532,16 @@ impl Interner {
         self.set.retain(|_, last| *last == relist);
         self.kept = self.set.len();
         // After a big drop (a kind scaled down), give the table back too, as a prune does. Below
-        // PRUNE_MIN strings that rule never fires, so a small table is also given back when the
-        // relist let go of at least as many strings as it kept: steady polling, which keeps
-        // most of them, does not shrink and regrow it.
+        // PRUNE_MIN strings that rule never fires, so a small table is also given back once it
+        // keeps half or less of the most it held since it was last given back, in one relist
+        // or over several: steady polling, which keeps about as many, does not shrink and
+        // regrow it.
+        self.high = self.high.max(before);
         let cap = self.set.capacity();
-        let dropped_half = before - self.kept >= self.kept;
-        if cap > 4 * self.kept.max(PRUNE_MIN) || (dropped_half && cap > 4 * self.kept.max(16)) {
+        let halved = self.kept * 2 <= self.high;
+        if cap > 4 * self.kept.max(PRUNE_MIN) || (halved && cap > 4 * self.kept.max(16)) {
             self.set.shrink_to_fit();
+            self.high = self.kept;
         }
         self.inserts = 0;
         #[cfg(test)]
@@ -1189,28 +1195,28 @@ pub(crate) mod tests {
     }
 
     // covers UP-20: a kind scaled down in steps, each keeping more than half its strings, still
-    // gives the table back once it is well over what is left.
+    // gives the table back once it is well over what is left, below PRUNE_MIN strings too.
     #[test]
     fn a_gradual_scale_down_gives_the_table_back() {
-        let mut interner = Interner::default();
-        let n = 16 * PRUNE_MIN;
-        interner.begin_relist();
-        let rows: Vec<Arc<str>> = (0..n).map(|i| interner.intern(&format!("s-{i}"))).collect();
-        let big = interner.set.capacity();
-        for keep in [n * 6 / 10, n * 4 / 10, n * 3 / 10, n * 2 / 10, n * 3 / 20] {
+        for n in [16 * PRUNE_MIN, 3 * PRUNE_MIN] {
+            let mut interner = Interner::default();
             interner.begin_relist();
-            for s in &rows[..keep] {
-                interner.intern(s);
+            let rows: Vec<Arc<str>> = (0..n).map(|i| interner.intern(&format!("s-{i}"))).collect();
+            let big = interner.set.capacity();
+            // Each relist keeps 60% of the one before.
+            let mut keep = n;
+            while keep > 20 {
+                keep = keep * 6 / 10;
+                interner.begin_relist();
+                for s in &rows[..keep] {
+                    interner.intern(s);
+                }
+                interner.keep_relisted();
+                assert_eq!(interner.len(), keep);
             }
-            interner.keep_relisted();
-            assert_eq!(interner.len(), keep);
+            let cap = interner.set.capacity();
+            assert!(cap <= 4 * keep.max(16), "{n}: {cap} of {big} for {keep}");
         }
-        assert!(
-            interner.set.capacity() <= 4 * interner.len().max(PRUNE_MIN),
-            "{} of {big}",
-            interner.set.capacity()
-        );
-        assert!(interner.set.capacity() < big);
     }
 
     // covers UP-20
