@@ -684,9 +684,13 @@ async fn the_active_tab_stays_in_view_through_resizes_and_closes(cx: &mut TestAp
     draw(cx, window);
     let last = *tabs.last().unwrap();
     assert!(tab_in_view(cx, window, last));
+    // Nothing left to redraw the window (the shells' bell flashes are over).
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    // The resize draws one frame at the new size; the dock asks for the next one itself.
     cx.simulate_window_resize(window, size(px(600.), px(400.)));
-    draw(cx, window);
-    draw(cx, window);
+    cx.run_until_parked();
     assert!(tab_in_view(cx, window, last), "after the window narrowed");
 
     // The second tab shown at the strip's left edge; the first one closes.
@@ -698,4 +702,66 @@ async fn the_active_tab_stays_in_view_through_resizes_and_closes(cx: &mut TestAp
         tab_in_view(cx, window, tabs[1]),
         "after a tab before it closed"
     );
+}
+
+// covers UP-42: a tab whose context left kubeconfig keeps a chip unlike every context still
+// there, marked as gone, while its shell runs on.
+#[gpui_kit::test]
+async fn a_removed_contexts_tab_keeps_its_own_chip(cx: &mut TestAppContext) {
+    const GONE: &str = "gke_acme-prod_eu_core";
+    const KEPT: &str = "gke_acme-dev_eu_core";
+    let (window, dock) = open_dock(cx);
+    dock.update(cx, |d, cx| {
+        d.set_contexts(vec![GONE.into(), KEPT.into()], cx)
+    });
+    let (gone, gone_fake) = open_shell_on(cx, window, &dock, GONE, "web-1");
+    let (kept, _kept_fake) = open_shell_on(cx, window, &dock, KEPT, "web-1");
+    // The context is removed from kubeconfig; its shell keeps running.
+    dock.update(cx, |d, cx| d.set_contexts(vec![KEPT.into()], cx));
+    draw(cx, window);
+    let (gone_label, gone_tooltip, gone_marked) = shell_chip(&dock, gone, cx);
+    let (kept_label, _, kept_marked) = shell_chip(&dock, kept, cx);
+    assert_ne!(gone_label, kept_label);
+    assert!(gone_marked && !kept_marked);
+    assert!(
+        gone_tooltip.ends_with("no longer in kubeconfig."),
+        "{gone_tooltip}"
+    );
+    assert!(
+        dock.read_with(cx, |d, cx| d.list_entry(gone, cx).unwrap())
+            .contains(&gone_label)
+    );
+    drop(gone_fake);
+
+    // A tab opened on a context no chip covers yet is labelled with the others too.
+    let (late, _late_fake) = open_shell_on(cx, window, &dock, "gke_acme-qa_eu_core", "web-1");
+    draw(cx, window);
+    let late_label = shell_chip(&dock, late, cx).0;
+    assert_ne!(late_label, kept_label);
+    assert_ne!(late_label, shell_chip(&dock, gone, cx).0);
+}
+
+// covers UP-42: chips that grow on a kubeconfig reload (a context that now reads like another)
+// do not push the active tab out of view.
+#[gpui_kit::test]
+async fn longer_chips_keep_the_active_tab_in_view(cx: &mut TestAppContext) {
+    const ONE: &str = "gke_p1_z_core";
+    let (window, dock) = open_dock(cx);
+    dock.update(cx, |d, cx| d.set_contexts(vec![ONE.into()], cx));
+    let mut tabs = Vec::new();
+    let mut fakes = Vec::new();
+    for n in 1..=8 {
+        let (id, fake) = open_shell_on(cx, window, &dock, ONE, &format!("web-{n}"));
+        tabs.push(id);
+        fakes.push(fake);
+    }
+    draw(cx, window);
+    let last = *tabs.last().unwrap();
+    assert!(tab_in_view(cx, window, last));
+    dock.update(cx, |d, cx| {
+        d.set_contexts(vec![ONE.into(), "gke_p2_z_core".into()], cx)
+    });
+    draw(cx, window);
+    assert_eq!(shell_chip(&dock, last, cx).0, "core · p1");
+    assert!(tab_in_view(cx, window, last));
 }

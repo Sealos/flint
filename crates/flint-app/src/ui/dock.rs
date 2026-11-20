@@ -49,6 +49,8 @@ pub const DEFAULT_HEIGHT: f32 = 280.;
 pub const MIN_HEIGHT: f32 = 120.;
 /// The dock leaves the main area at least this much (its header and a few rows).
 const MIN_MAIN_HEIGHT: f32 = 160.;
+/// What a tab whose context left kubeconfig says of it.
+const REMOVED: &str = "This context is no longer in kubeconfig.";
 /// What an empty dock says.
 const EMPTY: &str = "No logs or shells open.";
 /// The tab bar's height.
@@ -175,7 +177,8 @@ pub struct Dock {
     /// The open tab list, until it is dismissed.
     tab_menu: Option<(Entity<PopupMenu>, Subscription)>,
     /// Every kubeconfig context, and the chip each one's tabs show ([`chip_labels`]).
-    contexts: Vec<String>,
+    /// `None` until kubeconfig has been read.
+    contexts: Option<Vec<String>>,
     labels: HashMap<String, String>,
 }
 
@@ -191,7 +194,7 @@ impl Dock {
             strip_width: Rc::default(),
             bar: Rc::default(),
             tab_menu: None,
-            contexts: Vec::new(),
+            contexts: None,
             labels: HashMap::new(),
         }
     }
@@ -304,7 +307,7 @@ impl Dock {
                 shown,
             },
         );
-        self.show_cluster(ix + 1, cx);
+        self.tab_added(ix + 1, cx);
         self.activate(new, window, cx);
         Some(new)
     }
@@ -345,17 +348,49 @@ impl Dock {
     }
 
     /// Takes in kubeconfig's contexts, so chips tell apart contexts whose names read alike, and
-    /// updates the shells' toolbars.
+    /// updates the chips. The active tab is scrolled into view again: chips before it may have
+    /// grown.
     pub fn set_contexts(&mut self, contexts: Vec<String>, cx: &mut Context<Self>) {
-        if contexts == self.contexts {
+        if self.contexts.as_ref() == Some(&contexts) {
             return;
         }
-        self.labels = chip_labels(&contexts);
-        self.contexts = contexts;
+        self.contexts = Some(contexts);
+        self.relabel(cx);
+        self.reveal_active();
+    }
+
+    /// Whether `context` has left kubeconfig (its tabs keep running).
+    fn is_removed(&self, context: &str) -> bool {
+        self.contexts
+            .as_ref()
+            .is_some_and(|contexts| !contexts.iter().any(|c| c == context))
+    }
+
+    /// Labels every context in kubeconfig and every one with an open tab, so a tab on a
+    /// context that left kubeconfig never reads like one still there, and tells the shells'
+    /// toolbars.
+    fn relabel(&mut self, cx: &mut Context<Self>) {
+        let mut all = self.contexts.clone().unwrap_or_default();
+        for tab in &self.tabs {
+            if !all.contains(&tab.cluster.context) {
+                all.push(tab.cluster.context.clone());
+            }
+        }
+        self.labels = chip_labels(&all);
         for ix in 0..self.tabs.len() {
             self.show_cluster(ix, cx);
         }
         cx.notify();
+    }
+
+    /// Labels a new tab `ix`: a context no chip covers yet (one that left kubeconfig) is labelled
+    /// with the others, so its chip reads unlike theirs.
+    fn tab_added(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.labels.contains_key(&self.tabs[ix].cluster.context) {
+            self.show_cluster(ix, cx);
+        } else {
+            self.relabel(cx);
+        }
     }
 
     /// Tells tab `ix`'s view (a shell's toolbar) its chip: label, tooltip, and whether its
@@ -364,11 +399,13 @@ impl Dock {
         let tab = &self.tabs[ix];
         if let DockTab::Shell(view) = &tab.tab {
             let label = self.label(&tab.cluster.context);
-            let tooltip = chip_tooltip(&tab.cluster);
-            let repointed = tab.repointed;
-            view.update(cx, |view, cx| {
-                view.set_cluster(label, tooltip, repointed, cx)
-            });
+            let removed = self.is_removed(&tab.cluster.context);
+            let mut tooltip = chip_tooltip(&tab.cluster);
+            if removed {
+                tooltip.push_str(&format!("\n{REMOVED}"));
+            }
+            let stale = tab.repointed || removed;
+            view.update(cx, |view, cx| view.set_cluster(label, tooltip, stale, cx));
         }
     }
 
@@ -454,7 +491,7 @@ impl Dock {
             repointed: false,
             shown,
         });
-        self.show_cluster(self.tabs.len() - 1, cx);
+        self.tab_added(self.tabs.len() - 1, cx);
         if self.active.is_none() {
             self.active = Some(id);
             self.visible = true;
@@ -585,15 +622,35 @@ impl Dock {
                 )
             })
         });
-        menu.focus_handle(cx).focus(window, cx);
-        let dismissed = cx.subscribe_in(&menu, window, |dock, _, _: &DismissEvent, window, cx| {
-            dock.tab_menu = None;
-            // Escape leaves focus nowhere: back to the tab shown.
-            if window.focused(cx).is_none() {
-                dock.focus_active(window, cx);
-            }
-            cx.notify();
-        });
+        // Where focus goes back to when the list closes without anything else taking it
+        // (Escape, a click on nothing focusable). A picked tab, or what a click elsewhere
+        // focused, keeps it.
+        let before = window.focused(cx);
+        let own = menu.focus_handle(cx);
+        own.focus(window, cx);
+        let dismissed = cx.subscribe_in(
+            &menu,
+            window,
+            move |dock, _, _: &DismissEvent, window, cx| {
+                dock.tab_menu = None;
+                cx.notify();
+                // After the click that dismissed it has run, so what it focused is known.
+                let (before, own) = (before.clone(), own.clone());
+                cx.defer_in(window, move |dock, window, cx| {
+                    let stranded = match window.focused(cx) {
+                        None => true,
+                        Some(focused) => focused == own,
+                    };
+                    if !stranded {
+                        return;
+                    }
+                    match before {
+                        Some(before) => window.focus(&before, cx),
+                        None => dock.focus_active(window, cx),
+                    }
+                });
+            },
+        );
         self.tab_menu = Some((menu, dismissed));
         cx.notify();
     }
@@ -646,6 +703,10 @@ impl Dock {
         if tab.repointed {
             tooltip.push_str("\nIts context now points at a different API server.");
         }
+        let removed = self.is_removed(&tab.cluster.context);
+        if removed {
+            tooltip.push_str(&format!("\n{REMOVED}"));
+        }
         let dot = match item.tab_status() {
             TabStatus::Starting | TabStatus::Ended => theme.muted_foreground,
             TabStatus::Live => theme.success,
@@ -693,7 +754,7 @@ impl Dock {
             .child(cluster_chip(
                 ("dock-tab-cluster", id as usize),
                 self.label(&tab.cluster.context),
-                tab.repointed,
+                tab.repointed || removed,
                 None,
                 theme,
             ))
@@ -832,9 +893,6 @@ impl Render for Dock {
             .collect();
         // A strip that changes width (the window or a pane was resized) scrolls the active tab
         // into view again. The width is known only once laid out, so it is checked while
-        // painting and the scroll applies on the frame after.
-        // A strip that changes width (the window or a pane was resized) scrolls the active tab
-        // into view again. The width is known only once laid out, so it is checked while
         // painting, and the next frame scrolls (with the strip's new bounds).
         if self.strip_width.1.take() {
             self.reveal_active();
@@ -842,14 +900,20 @@ impl Render for Dock {
         let watch_width = {
             let watch = self.strip_width.clone();
             let bar = self.bar.clone();
+            let dock = cx.weak_entity();
             canvas(
-                move |bounds, window, _| {
+                move |bounds, _, cx| {
                     bar.set(bounds);
                     let now = f32::from(bounds.size.width);
                     let before = watch.0.replace(now);
                     if before > 0. && (now - before).abs() > 0.5 {
                         watch.1.set(true);
-                        window.refresh();
+                        // Not while drawing (a refresh then is ignored): the dock asks for the
+                        // next frame once this one is done.
+                        let dock = dock.clone();
+                        cx.defer(move |cx| {
+                            let _ = dock.update(cx, |_, cx| cx.notify());
+                        });
                     }
                 },
                 |_, _, _, _| {},

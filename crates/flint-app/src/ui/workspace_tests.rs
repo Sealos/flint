@@ -1000,6 +1000,61 @@ async fn the_refresh_key_reaches_refresh_from_a_running_tab(cx: &mut TestAppCont
     );
 }
 
+// covers UP-42: dismissing the tab list with Escape gives focus back to where it was; a click
+// elsewhere leaves focus where the click put it, never on the closed list.
+#[gpui_kit::test]
+async fn dismissing_the_tab_list_gives_focus_back(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    let menu_open = |cx: &mut TestAppContext| {
+        cx.update_window(t.window, |_, window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .unwrap()
+    };
+    let workspace_focused = |cx: &mut TestAppContext| {
+        cx.update_window(t.window, |_, window, cx| {
+            t.workspace.read(cx).focus.is_focused(window)
+        })
+        .unwrap()
+    };
+    for dismiss in ["escape", "click"] {
+        t.focus_workspace(cx);
+        assert!(workspace_focused(cx));
+        press(cx, &t, "secondary-shift-j");
+        assert!(menu_open(cx), "{dismiss}: the list opened");
+        assert!(!workspace_focused(cx), "the list has focus");
+        if dismiss == "escape" {
+            press(cx, &t, "escape");
+        } else {
+            cx.update_window(t.window, |_, window, cx| {
+                // Plain text in the log tab's toolbar: a click there takes no focus itself.
+                window.click("log-count", cx)
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        assert!(!menu_open(cx), "{dismiss}: the list closed");
+        if dismiss == "escape" {
+            assert!(workspace_focused(cx), "escape: focus is back");
+        } else {
+            // The click went to the log tab, which keeps the focus it took.
+            let log = cx
+                .update_window(t.window, |_, window, cx| {
+                    let ws = t.workspace.read(cx);
+                    let log = ws.dock.read(cx).active_log().unwrap().read(cx).tab_focus();
+                    log.is_focused(window)
+                })
+                .unwrap();
+            assert!(log, "click: focus stays where the click put it");
+        }
+    }
+}
+
 // covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.
 #[gpui_kit::test]
 async fn the_dock_toggles_and_remembers_its_height(cx: &mut TestAppContext) {
