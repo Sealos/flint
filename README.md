@@ -292,8 +292,8 @@ next to a cluster in the sidebar, which asks you to confirm the context and its 
 badge). Nothing is exposed by default. An exposure is tied to the context's API server URL, so a context that is
 re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
 Large outputs are cut short. Only Secret values are redacted: everything else an agent reads, including ConfigMaps,
-`env` values in pod specs, and (until M5.5) pod logs and event messages, is sent as the cluster returns it. Only
-expose clusters whose contents, logs and events you are willing to send to your AI provider.
+`env` values in pod specs, and, until log redaction ships (#68), pod logs and event messages, is sent as the cluster
+returns it. Only expose clusters whose contents, logs and events you are willing to send to your AI provider.
 
 Register it with Claude Code by `/usr/local/bin/flint`: the link into `Flint.app` (see
 [Install from a release](#install-from-a-release)) or the binary from the command-line archive. The path stays the same

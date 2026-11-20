@@ -42,7 +42,8 @@
         <a class="btn" href="https://github.com/Sealos/flint/releases/latest">Latest release</a>
       </div>
       <pre class="code hero-code" role="region" aria-label="Command to register flint mcp with Claude Code" tabindex="0"><code><span class="c"># read-only access to the clusters you expose</span>
-claude mcp add flint -- flint mcp</code></pre>
+claude mcp add flint -- /usr/local/bin/flint mcp</code></pre>
+      <p class="fineprint">With the DMG, first link the app's binary to <code>/usr/local/bin/flint</code> (<a href="https://github.com/Sealos/flint#mcp-server-for-ai-agents">MCP setup</a>).</p>
       <p class="fineprint">Built for macOS first. v0.2.0 ships a universal macOS binary for Apple Silicon and Intel and a best-effort Linux AppImage (x86_64 and arm64); releases after it add Flint.app in a DMG. Until the first signed release the app is not signed with a Developer ID or notarized, so macOS asks you to allow it once (<a href="https://github.com/Sealos/flint#install-from-a-release">install steps</a>).</p>
     </section>
 
@@ -99,9 +100,10 @@ claude mcp add flint -- flint mcp</code></pre>
           </picture>
         </article>
         <article class="card">
-          <h3>A shell in any container</h3>
-          <p>An interactive terminal tab in the same dock, with a container picker for multi-container pods. Tabs
-            keep running while you browse other views.</p>
+          <h3>A shell in a container</h3>
+          <p>An interactive terminal tab in the same dock, for any container that ships <code>bash</code> or
+            <code>/bin/sh</code> (distroless images have neither). A container picker handles multi-container pods,
+            and tabs keep running while you browse other views.</p>
           <picture>
             <source srcset="img/shell-dark.png" media="(prefers-color-scheme: dark)">
             <img src="img/shell-light.png" width="1200" height="738" loading="lazy"
@@ -153,11 +155,15 @@ claude mcp add flint -- flint mcp</code></pre>
           <li>Secret values are always redacted, and large outputs are cut short.</li>
         </ul>
       </div>
-      <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># register it with Claude Code</span>
-claude mcp add flint -- flint mcp
+      <pre class="code" role="region" aria-label="Commands to register flint mcp" tabindex="0"><code><span class="c"># link the app's binary once (DMG install)</span>
+sudo mkdir -p /usr/local/bin
+sudo ln -sf /Applications/Flint.app/Contents/MacOS/flint /usr/local/bin/flint
 
-<span class="c"># with flint on your PATH; other MCP clients take the same command</span>
-flint mcp</code></pre>
+<span class="c"># register it with Claude Code</span>
+claude mcp add flint -- /usr/local/bin/flint mcp
+
+<span class="c"># other MCP clients need the absolute path</span>
+/usr/local/bin/flint mcp</code></pre>
     </section>
 
     <section id="roadmap" class="wrap section">
@@ -166,12 +172,12 @@ flint mcp</code></pre>
         <li class="done"><b>M0</b><span>Cluster sidebar, connect and health check, read-only MCP server</span></li>
         <li class="done"><b>M1</b><span>Every kind with live lists, namespace filter, detail and YAML view</span></li>
         <li class="done"><b>M2</b><span>Streaming pod and workload logs with search, timestamps and save to file; shells in a dock (shipped in v0.2.0)</span></li>
-        <li class="next"><b>M1.5</b><span>Command palette and resource switcher (the Flint Light and Dark themes are in)</span></li>
-        <li><b>M3</b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
-        <li><b>M4</b><span>Curated views for core kinds, CPU and memory from metrics-server, resource diagram</span></li>
-        <li><b>M5</b><span>Port-forward panel with open in browser, Helm releases</span></li>
-        <li><b>M5.5</b><span>Warm clusters for instant switching, AI log analysis through your own Claude Code CLI</span></li>
-        <li><b>M6</b><span>Signed and notarized universal build, Homebrew cask, first public release</span></li>
+        <li class="next"><b>Next</b><span>Command palette and resource switcher (the Flint Light and Dark themes are in)</span></li>
+        <li><b></b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
+        <li><b></b><span>Curated views for core kinds, CPU and memory from metrics-server, resource diagram</span></li>
+        <li><b></b><span>Port-forward panel with open in browser, Helm releases</span></li>
+        <li><b></b><span>Warm clusters for instant switching, AI log analysis through your own Claude Code CLI</span></li>
+        <li><b></b><span>Signed and notarized universal build, Homebrew cask, first signed release</span></li>
       </ol>
     </section>
   </main>
