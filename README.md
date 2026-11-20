@@ -1,10 +1,82 @@
 # Flint
 
-Flint is a native Kubernetes desktop manager for macOS (and, best effort, Linux), in the space of Lens and Freelens. It is written in Rust
-with [GPUI](https://www.gpui.rs/) so it starts fast, stays light on memory, and keeps up with large clusters.
+Flint is a fast, native Kubernetes app for your Mac that lets Claude Code and other AI agents read the clusters you
+choose, and nothing else.
 
-It also ships a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, so AI agents can inspect the
-clusters you choose to expose.
+Its `flint mcp` command is a read-only [MCP](https://modelcontextprotocol.io/) server. The desktop app, in the space of
+Lens and Freelens, is where you choose which clusters agents may read. Flint is written in Rust with
+[GPUI](https://www.gpui.rs/), so it starts fast, stays light on memory, and keeps up with large clusters. It runs on
+macOS and, best effort, Linux.
+
+```sh
+claude mcp add flint -- /usr/local/bin/flint mcp     # after installing Flint and exposing a cluster
+```
+
+See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP clients.
+
+## MCP server for AI agents
+
+`flint mcp` serves the Model Context Protocol over stdio. What an agent gets:
+
+- **Only the clusters you choose.** Nothing is exposed by default. You opt in per cluster with **Expose to AI** (the
+  robot button next to a cluster in the sidebar, which asks you to confirm the context and its server; exposed
+  clusters show an "AI" badge). An exposure is tied to the context's API server URL, so a context that is re-pointed,
+  or has the same name in another `KUBECONFIG`, is not exposed until you expose it again. The list is read again on
+  every call, so a change in the app applies to the next call without restarting the agent. A call naming any other
+  cluster fails as if it did not exist.
+- **Read-only.** The tools list clusters, resource kinds, objects, events, and pod logs, and nothing else: no tool
+  creates, changes, or deletes anything, and there is no exec or port-forward.
+- **Credentials redacted.** Secret values are always redacted. In pod logs, event messages, other message fields
+  (status, conditions, container termination messages, and list columns) and container `args` and `command`, values
+  that look like credentials are replaced with a marker such as `[REDACTED:password]`, and each result says how many
+  were replaced: `Authorization` and bearer tokens, passwords in URLs, AWS, GCP, GitHub, GitLab, Slack, Stripe, OpenAI
+  and Anthropic keys and tokens, Slack webhooks, Azure SAS signatures, JWTs, private key blocks, and the values of
+  `password=`, `secret:`, `token=` and `api_key=` style pairs and flags. Flint's own log viewer and events are
+  unchanged: they show text as written.
+- **Bounded.** Lists, events and logs have default and maximum sizes, and when output is cut short the result says
+  so.
+
+Redaction is pattern matching, so a credential in an unusual format can still get through. Everything else,
+including ConfigMaps and `env` values in pod specs, is sent as the cluster returns it. Only expose clusters whose
+contents, logs and events you are willing to send to your AI provider. The full rules are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#mcp-server).
+
+### Add it to an agent
+
+[Install Flint](#install-from-a-release), link its binary to `/usr/local/bin/flint` (the DMG install shows how, the
+command-line archive installs it there), expose a cluster in the app, then register the server with Claude Code:
+
+```sh
+claude mcp add flint -- /usr/local/bin/flint mcp
+```
+
+The path stays the same when you update Flint or switch between the DMG and the archive. After
+`cargo build --release`, use `"$PWD/target/release/flint"`.
+
+On Linux, register the AppImage the same way; it passes `mcp` through to `flint`:
+
+```sh
+claude mcp add flint -- "$HOME/.local/bin/flint" mcp
+```
+
+Without FUSE, give every `flint mcp` launch its own `TMPDIR` (see [Linux](#linux-appimage)), so it cannot clash with
+the app or another agent's server:
+
+```sh
+claude mcp add flint -- sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTRACT_AND_RUN=1 "$HOME/.local/bin/flint" mcp; s=$?; rm -rf "$d"; exit $s'
+```
+
+Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
+
+### Compared with other Kubernetes MCP servers
+
+As their documentation describes them in November 2026:
+
+| | Flint (`flint mcp`) | [Lens MCP Server](https://docs.lenshq.io/k8slens/mcp-server/) | [kubernetes-mcp-server](https://github.com/containers/kubernetes-mcp-server) |
+|---|---|---|---|
+| Which clusters | Only those you expose, one by one, each tied to its API server URL | Every cluster Lens knows | The contexts in its kubeconfig |
+| Writes | None: no tools for them | Its `kubectl` tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings) | Writes allowed, including delete and pod exec, unless its `read_only` or `disable_destructive` setting is on |
+| Credential redaction in results | Secret values, and credentials in logs, events, messages and container arguments | Not described | Not for tool results (only its own log notifications); Secrets can be denied by configuration |
 
 ## Status
 
@@ -18,19 +90,20 @@ Flint is in early development.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
   containers. Open them from a row's context menu, the detail pane or the keyboard. Shells open on any cluster
   without asking, production included, until protected clusters arrive.
+- A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
 - Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64).
 
 **Coming next:**
 
-- A command palette and a resource switcher.
+- A resource switcher.
 - Log filters (matching lines only, regex, errors only) and time ranges.
 - Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain; protected clusters.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
 - Cluster sets and warm clusters for instant switching, AI log analysis, and a tighter MCP server (scope by
-  namespace and kind, redacted credentials, an activity log).
+  namespace and kind, an activity log).
 - A signed and notarized app with a Homebrew cask.
 
 ## Install from a release
@@ -313,46 +386,6 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
 **Theme tokens only:** views take every color from the theme (`cx.theme()`). Colors live only in
 `crates/flint-app/src/ui/themes/flint.json` (Flint Light and Flint Dark) and `ui/accent.rs` (the orange accent).
 `scripts/check-theme-colors.sh` fails on a color literal anywhere else under `ui/`.
-
-## MCP server for AI agents
-
-`flint mcp` serves the Model Context Protocol over stdio. It is read-only: it can list clusters, resource kinds,
-objects, events, and pod logs, and nothing else. It only sees clusters you mark **Expose to AI** (the robot button
-next to a cluster in the sidebar, which asks you to confirm the context and its server; exposed clusters show an "AI"
-badge). Nothing is exposed by default. An exposure is tied to the context's API server URL, so a context that is
-re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
-Large outputs are cut short. Secret values are redacted. In pod logs, event messages, other message fields
-(status, conditions, container termination messages, and list columns) and container `args` and `command`, values
-that look like credentials are replaced with a marker such as `[REDACTED:password]`, and each result says how many
-were replaced: `Authorization` and bearer tokens, passwords in URLs, AWS, GCP, GitHub, GitLab, Slack, Stripe, OpenAI
-and Anthropic keys and tokens, Slack webhooks, Azure SAS signatures, JWTs, private key blocks, and the values of
-`password=`, `secret:`, `token=` and `api_key=` style pairs and flags.
-This is pattern matching, so a credential in an unusual format can still get through. Everything else, including
-ConfigMaps and `env` values in pod specs, is sent as the cluster returns it. Only expose clusters whose contents,
-logs and events you are willing to send to your AI provider. Flint's own log viewer and events show text as written.
-
-Register it with Claude Code by `/usr/local/bin/flint`: the link into `Flint.app` (see
-[Install from a release](#install-from-a-release)) or the binary from the command-line archive. The path stays the same
-when you update Flint or switch between the two. After `cargo build --release`, use `"$PWD/target/release/flint"`.
-
-```sh
-claude mcp add flint -- /usr/local/bin/flint mcp
-```
-
-On Linux, register the AppImage the same way; it passes `mcp` through to `flint`:
-
-```sh
-claude mcp add flint -- "$HOME/.local/bin/flint" mcp
-```
-
-Without FUSE, give every `flint mcp` launch its own `TMPDIR` (see above), so it cannot clash with the app or another
-agent's server:
-
-```sh
-claude mcp add flint -- sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTRACT_AND_RUN=1 "$HOME/.local/bin/flint" mcp; s=$?; rm -rf "$d"; exit $s'
-```
-
-Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
 
 ## Releases
 
