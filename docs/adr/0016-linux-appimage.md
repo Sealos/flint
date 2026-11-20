@@ -21,6 +21,16 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
 - **Built natively.** The release builds x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`; linuxdeploy
   inspects the binary with the host's loader, so there is no cross-compiling. CI packages and smoke-tests the x86_64
   AppImage on every pull request (`--version` and `mcp`, without FUSE).
+- **The MCP server alone, static.** Agents often run where the AppImage cannot: an older distribution (Ubuntu
+  22.04), or a container without fontconfig and libxcb. Each release therefore also ships `flint-mcp`, the GPUI-free
+  server, as `flint-mcp-vX.Y.Z-<arch>-unknown-linux-musl.tar.gz` for x86_64 and aarch64. It is linked statically
+  against musl, so it needs no library from the host, glibc included; rustls with ring is the only C code in its tree,
+  and the runner's `musl-gcc` (Debian's `musl-tools`) compiles it. It is built natively on the same runners as the
+  AppImages (`scripts/package-mcp-linux.sh`, which fails if the binary asks for a program interpreter or a shared
+  library), then run in a bare `ubuntu:22.04` with no packages added: `--version`, `initialize`, and the MCP e2e
+  tests against the fake API server, built for musl too (`scripts/test-mcp-linux.sh`). Without the app there is no
+  Expose to AI dialog, so clusters are exposed by an `ai_exposed_clusters` entry in `settings.toml`, pinned to context
+  and server like the one the dialog writes (README, "Expose a cluster without the app").
 - **Publishing.** The macOS and Linux build jobs upload to the draft release; a separate `publish` job publishes it
   only after all of them succeeded, and checks every asset is on the published release.
 - **Unsigned.** AppImages are not signed (there is no signing key to manage); the `.sha256` files are the
@@ -45,7 +55,11 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
   desktop are found by users.
 - **glibc floor.** The binary links the glibc of the build runner (Ubuntu 24.04, glibc 2.39), so older
   distributions cannot run it. The runners are pinned to 24.04 rather than `ubuntu-latest`, which would raise the
-  floor silently when GitHub moves it. Building on an older image would lower the floor.
+  floor silently when GitHub moves it. Building on an older image would lower the floor. The static `flint-mcp` has
+  no floor, so agents on older systems run that instead of `flint mcp`.
+- **musl's allocator.** The static `flint-mcp` uses musl's `malloc`, which is slower than glibc's under many
+  threads. The server is mostly waiting on the API server, so this has not mattered; a faster allocator can be
+  linked in if it does.
 - **No menu bar.** GPUI on Linux shows no application menu. Quit and Close Window are on their keys (Ctrl-Q,
   Ctrl-W); every default key uses GPUI's `secondary-` modifier, which is Cmd on macOS and Ctrl on Linux. The View >
   Appearance choice is the `appearance` setting in `settings.toml` until the command palette lands; then every

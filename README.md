@@ -80,6 +80,47 @@ claude mcp add flint -- sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTR
 
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
 
+Where the app cannot run, for example on a Linux server or in a devcontainer, install the
+[static `flint-mcp`](#linux-mcp-server-only-flint-mcp) and register it the same way, without `mcp`:
+
+```sh
+claude mcp add flint -- "$HOME/.local/bin/flint-mcp"
+```
+
+### Expose a cluster without the app
+
+The Expose to AI dialog writes one `ai_exposed_clusters` entry to `settings.toml` per cluster. Without the app, add
+the entry yourself, in the settings file of the machine the server runs on: `$FLINT_CONFIG_DIR/settings.toml` if
+that is set, else `$XDG_CONFIG_HOME/flint/settings.toml` on Linux (default `~/.config/flint/settings.toml`). An entry pins the context name to the API server URL it points to now; print
+that URL with:
+
+```sh
+kubectl config view --minify --context staging -o jsonpath='{.clusters[0].cluster.server}'
+```
+
+```toml
+[[ai_exposed_clusters]]
+context = "staging"
+server = "https://staging.example.com:6443"
+# namespaces = ["shop"]                 # optional: only these namespaces (missing or empty: all)
+# kinds = ["pods", "deployments.apps"]  # optional: only these kinds (missing or empty: all)
+```
+
+An empty list (`namespaces = []`) means no limit, not no access: to keep agents away from a cluster, remove its entry.
+If the file already has `ai_exposed_clusters` as an inline array (`ai_exposed_clusters = [...]`), add the entry to
+that array instead; TOML doesn't allow both forms for one key, and an invalid file turns every exposure off.
+
+- **Pinned.** Both must match: if the context is later re-pointed to another server, or another kubeconfig file has a
+  context of the same name at another server, it is hidden from agents until you update `server`. A trailing slash
+  does not matter.
+- **Checked.** A misspelt key (`namespace` for `namespaces`), or the same context and server listed twice, makes the
+  file invalid. Then nothing is exposed: every call fails and says that `settings.toml` is invalid, and the server
+  logs the reason on stderr when it starts.
+- **Read again on every call**, so an edit applies to the agent's next call without a restart.
+- **Read-only either way.** The entry decides what the server may read, never what it may do: it has no tool that
+  creates, changes or deletes anything. It reads with the kubeconfig's credentials, so a user with read-only RBAC
+  limits it further.
+
 ### Compared with other Kubernetes MCP servers
 
 As their documentation describes them in November 2026:
@@ -215,7 +256,8 @@ host; without them it does not start at all, not even `--version` or `mcp`. Ever
 headless system install them (on Debian and Ubuntu: `libfontconfig1 libxcb1`, listed in
 [`packaging/linux/ubuntu-runtime-packages.txt`](packaging/linux/ubuntu-runtime-packages.txt); CI runs the AppImage in
 a clean `ubuntu:24.04` with only those). The window also needs an X11 or Wayland session and a GPU driver with
-Vulkan or OpenGL ES (Mesa on most systems).
+Vulkan or OpenGL ES (Mesa on most systems). To run only the MCP server on a headless system, an older distribution or
+in a container, use the [static `flint-mcp`](#linux-mcp-server-only-flint-mcp) instead: it needs none of these.
 
 **FUSE.** AppImages mount themselves with FUSE (the `fusermount` or `fusermount3` command). Without it, for example
 in a container, set `APPIMAGE_EXTRACT_AND_RUN=1` to extract to `$TMPDIR` and run from there instead. Give each such
@@ -231,6 +273,32 @@ On Linux there is no menu bar: the command palette (Ctrl-Shift-P) has every menu
 Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the window when the dock shows none; inside a shell tab Ctrl-W goes
 to the shell and Ctrl-Shift-W closes the tab, as in Linux terminals), and every Cmd shortcut is Ctrl. Settings and
 state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
+
+### Linux MCP server only (`flint-mcp`)
+
+Releases after v0.2.1 also have the MCP server on its own, for x86_64 and aarch64:
+`flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`. It is
+the same read-only server as `flint mcp`, without the desktop app. It is a static binary that needs no system
+libraries, not even glibc, so it runs where the AppImage does not: Ubuntu 22.04 and other older distributions, minimal
+containers and devcontainers. CI runs it in a bare `ubuntu:22.04`. A kubeconfig without `certificate-authority-data`
+relies on the system's CA certificates, so a minimal image needs `ca-certificates` installed (or the cluster's CA in
+the kubeconfig). The archive includes musl's license (`LICENSE-MUSL`), since the binary links it statically.
+
+```sh
+gh release download -R Sealos/flint --pattern 'flint-mcp-*-x86_64-unknown-linux-musl.tar.gz*'   # or aarch64
+sha256sum -c flint-mcp-*-x86_64-unknown-linux-musl.tar.gz.sha256 &&
+  tar -xzf flint-mcp-*-x86_64-unknown-linux-musl.tar.gz &&
+  install -D -m 755 flint-mcp/flint-mcp ~/.local/bin/flint-mcp &&
+  "$HOME/.local/bin/flint-mcp" --version
+claude mcp add flint -- "$HOME/.local/bin/flint-mcp"
+```
+
+It reads kubeconfig as `flint` does (`KUBECONFIG`, else `~/.kube/config`, plus `kubeconfig_paths`), and its settings
+from `~/.config/flint/settings.toml` (`$XDG_CONFIG_HOME/flint/`, or `$FLINT_CONFIG_DIR` if set), where it also
+writes its activity log. Like `flint`, it takes `PATH` from your login shell when it starts, so exec auth plugins
+(`aws`, `gke-gcloud-auth-plugin`, `kubelogin`) are found; set `path` in `settings.toml` to skip the shell. It exposes
+nothing until `settings.toml` says so: see [Expose a cluster without the app](#expose-a-cluster-without-the-app).
+The binary is unsigned; the `.sha256` file is the check.
 
 ## Keys
 
@@ -459,17 +527,20 @@ server, is `refactor`, `test` or `chore` (or `fix` when it repairs a bug a user 
    `flint-vX.Y.Z-macos-universal.dmg` (`scripts/package-macos-app.sh`) and mounts the DMG to check it
    (`scripts/smoke-macos-app.sh`). In parallel it builds an AppImage on x86_64 and aarch64 Ubuntu
    runners (`scripts/package-appimage.sh`): `flint-vX.Y.Z-linux-x86_64.AppImage` and
-   `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum. The build jobs hold a
-   read-only token; a separate `upload` job takes their files and attaches them to the draft.
-4. Once every upload has succeeded, a `publish` job publishes the release and checks that all eight files are on it.
+   `flint-vX.Y.Z-linux-aarch64.AppImage`, and the MCP server alone as a static musl binary on the same runners
+   (`scripts/package-mcp-linux.sh`): `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and
+   `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`, each run in a bare `ubuntu:22.04` with the MCP e2e tests.
+   Each file comes with its SHA-256 checksum. The build jobs hold a read-only token; a separate `upload` job takes
+   their files and attaches them to the draft.
+4. Once every upload has succeeded, a `publish` job publishes the release and checks that all twelve files are on it.
 
 Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed). macOS blocks the
 first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)). AppImages
-stay unsigned.
+and the `flint-mcp` archives stay unsigned.
 
 After every published release:
 
-1. **The release checklist** ([`docs/RELEASING.md`](docs/RELEASING.md)): the release page is Latest with all four
+1. **The release checklist** ([`docs/RELEASING.md`](docs/RELEASING.md)): the release page is Latest with all six
    binaries and their checksums, and the DMG installs and opens on a clean Mac (UP-80).
 2. **Reviews of the shipped build:** usability (install and use it as a new user), product development (is the
    roadmap right?) and market fit (against Lens, Freelens, k9s, Headlamp and other tools). Their findings become

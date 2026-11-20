@@ -23,6 +23,8 @@ expect "deps" deny.toml
 expect "rust appimage macos workflows" .github/actions/gpui-linux-deps/action.yml
 expect "appimage scripts" scripts/package-appimage.sh
 expect "appimage" packaging/linux/ubuntu-runtime-packages.txt
+expect "appimage scripts" scripts/package-mcp-linux.sh
+expect "appimage scripts" scripts/smoke-mcp-linux.sh scripts/test-mcp-linux.sh
 expect "appimage macos scripts" scripts/check-no-automation.sh
 expect "scripts" scripts/check-theme-colors.sh
 expect "workflows" .github/workflows/pages.yml

@@ -1,8 +1,11 @@
 //! `flint-mcp`: the read-only MCP server on stdio, without the desktop app.
 //!
 //! It runs the same [`flint_mcp::serve_stdio_main`] as `flint mcp`, but links no GPUI, so it builds
-//! on Linux. CI runs the MCP end-to-end tests against kind with it. It is not shipped: users run
-//! `flint mcp`.
+//! where the app does not. Releases ship it for Linux as static musl binaries
+//! (`scripts/package-mcp-linux.sh`), for agents on hosts the AppImage cannot run on: older glibc,
+//! no fontconfig or libxcb, containers. Without the app's Expose to AI dialog, clusters are exposed
+//! by `ai_exposed_clusters` in `settings.toml` (see the README). CI also runs the MCP end-to-end
+//! tests with it, against the fake API server and kind.
 
 use std::process::ExitCode;
 
@@ -13,7 +16,9 @@ usage: flint-mcp [--verbose]  serve the read-only MCP server on stdio
 --verbose logs info as well as warnings. FLINT_LOG (or RUST_LOG) sets the filter
 exactly, for example FLINT_LOG=debug.
 
-Same server as `flint mcp`, without the desktop app. Not shipped; register `flint mcp` in AI clients.";
+Same server as `flint mcp`, without the desktop app. Where Flint is installed, register `flint mcp`
+in AI clients; elsewhere, this binary. It serves only the clusters that ai_exposed_clusters in
+settings.toml exposes (FLINT_CONFIG_DIR, or ~/.config/flint on Linux).";
 
 /// `Ok(verbose)` to serve; `Err` holds what to print and the exit code. Program name excluded.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<bool, (String, u8)> {
