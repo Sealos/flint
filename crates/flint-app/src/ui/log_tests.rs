@@ -172,6 +172,12 @@ fn feed(cx: &mut TestAppContext, view: &Entity<LogView>, snapshot: Arc<LogSnapsh
     view.update(cx, |view, cx| view.set_snapshot(snapshot, cx));
 }
 
+/// Draws one frame of `window`.
+fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
 fn line_id(id: u64) -> (&'static str, usize) {
     ("log-line", id as usize)
 }
@@ -1530,4 +1536,39 @@ async fn the_state_reports_a_workloads_streams_and_sources(cx: &mut TestAppConte
     );
     press(cx, window, "p");
     assert_eq!(state(cx, &view)["tab"]["sources"], false);
+}
+
+// covers UP-44: the selection hint counts the lines present, also when the selection is cut,
+// and a copy of many lines lands on the clipboard with its note.
+#[gpui_kit::test]
+async fn a_large_selection_is_counted_and_copied(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(30_000);
+    feed(cx, &view, lines.push(0, 30_000).streaming());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-view").is_some()
+    })
+    .await;
+    press(cx, window, "secondary-a");
+    // Lines 0..=29,999 are selected; the next snapshot evicts the first 10,000.
+    feed(
+        cx,
+        &view,
+        lines
+            .push(30_000, 40_000)
+            .snapshot(LogState::Streaming, true, 0),
+    );
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        let selection = v.selection.unwrap();
+        assert_eq!(selection, LineSelection::new(10_000, 29_999));
+        assert_eq!(selection.present_len(&v.snapshot.lines), 20_000);
+    });
+    press(cx, window, "secondary-c");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied.lines().count(), 20_000);
+    assert!(copied.starts_with("line 10000\n"), "{}", &copied[..20]);
+    let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
+    assert_eq!(note, "Copied 20,000 lines as shown, not redacted.");
 }

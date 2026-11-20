@@ -262,23 +262,34 @@ impl LogView {
         }
     }
 
+    /// Copies the selected lines as shown now. The text is built off the UI thread (a million
+    /// lines take a fifth of a second), then put on the clipboard; a newer copy replaces one
+    /// still being built.
     fn copy_lines(&mut self, _: &CopyLines, _: &mut Window, cx: &mut Context<Self>) {
         let Some(selection) = self.selection else {
             cx.propagate();
             return;
         };
-        let count = selection.lines(&self.snapshot.lines).count() as u64;
-        let text = self.selection_text().unwrap_or_default();
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.set_note(
-            Tone::Muted,
-            format!(
-                "Copied {} as shown, not redacted.",
-                log_model::line_count(count)
-            ),
-            cx,
-        );
-        cx.notify();
+        let lines = self.snapshot.lines.clone();
+        let count = selection.present_len(&lines);
+        let format = self.format();
+        self._copy = cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_spawn(async move { selection.text_as(&lines, format) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                view.set_note(
+                    Tone::Muted,
+                    format!(
+                        "Copied {} as shown, not redacted.",
+                        log_model::line_count(count)
+                    ),
+                    cx,
+                );
+                cx.notify();
+            });
+        });
     }
 }
 

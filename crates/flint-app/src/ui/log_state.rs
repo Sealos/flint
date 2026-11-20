@@ -39,7 +39,8 @@ impl LogView {
             selection: self.selection.map(|s| SelectionState {
                 first: s.start(),
                 last: s.end(),
-                lines: s.end() - s.start() + 1,
+                // As the hint counts them: the selected lines still shown.
+                lines: s.present_len(&self.snapshot.lines),
             }),
             streams: self.snapshot.pods.as_deref().map(stream_counts),
             last_lines: last_lines(&self.snapshot.lines, LogTabState::LINE_LIMIT),

@@ -875,7 +875,7 @@ pub fn save_count(
     match scope {
         SaveScope::All => lines.len(),
         SaveScope::Matches => matches.iter().filter(|id| lines.contains(**id)).count(),
-        SaveScope::Selection => selection.map_or(0, |s| s.lines(lines).count()),
+        SaveScope::Selection => selection.map_or(0, |s| s.present_len(lines) as usize),
     }
 }
 

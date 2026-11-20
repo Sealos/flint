@@ -13,9 +13,10 @@
 //! - **Search** runs its first scan on the core's threads ([`CoreHandle::search_logs`]) and then
 //!   keeps up with new lines snapshot by snapshot; matches are highlighted with
 //!   [`flint_core::SearchQuery::match_ranges`].
-//! - **Selection** is a [`LineSelection`] of line ids: copy and save write its lines as shown
-//!   (timestamps only when shown, in full), without redaction. AI log analysis (#56) reads the
-//!   same selection ([`LogView::selection_text`]).
+//! - **Selection** is a [`LineSelection`] of line ids, counted without visiting its lines: copy
+//!   and save write its lines as shown (timestamps only when shown, in full), without
+//!   redaction, and build the text off the UI thread. AI log analysis (#56) reads the same
+//!   selection.
 //! - **Toolbar** is one row at any width ([`log_model::toolbar_fit`]): the status has a slot that
 //!   truncates, and in a narrow tab the toggles and Save move into a "⋯" menu. Under it, one
 //!   strip says the last transient thing (the selection, a copy, a save); a copy or save note
@@ -153,6 +154,8 @@ pub struct LogView {
     focus: FocusHandle,
     _pump: Task<()>,
     _search: Task<()>,
+    /// Builds a copy's text off the UI thread; replaced by the next copy.
+    _copy: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -230,6 +233,7 @@ impl LogView {
             focus: cx.focus_handle(),
             _pump: pump,
             _search: Task::ready(()),
+            _copy: Task::ready(()),
             _subscriptions: vec![on_search],
         }
     }
@@ -483,13 +487,6 @@ impl LogView {
                 offset_in_item: px(0.),
             });
         }
-    }
-
-    /// The selected lines as shown, without redaction: what copy, save and AI log analysis
-    /// (#56) use.
-    pub fn selection_text(&self) -> Option<String> {
-        let selection = self.selection?;
-        Some(selection.text_as(&self.snapshot.lines, self.format()))
     }
 
     /// Where the save dialog opens: Downloads, else the home folder.
@@ -1178,7 +1175,7 @@ impl LogView {
         }
         let selection = self.selection?;
         let lines = &self.snapshot.lines;
-        let count = selection.lines(lines).count() as u64;
+        let count = selection.present_len(lines);
         let mut text = format!(
             "{} selected. {} copies and Save writes them as shown, not redacted. Esc clears.",
             log_model::line_count(count),
