@@ -876,3 +876,49 @@ async fn a_limited_list_proves_an_object_gone_only_when_its_namespace_is_listed_
     .await;
     assert!(missing(cx));
 }
+
+// covers UP-31: the view a cluster had open, restored when its discovery arrives, does not
+// take focus while the switcher is open: the switcher stays, with what was typed.
+#[gpui_kit::test]
+async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    // Pods open on alpha: the view alpha restores.
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.activate(cx, "beta").await;
+    t.activate(cx, "alpha").await;
+    // alpha's discovery is gone for now (it failed, say): nothing to restore yet.
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: None,
+            error: Some("unreachable".into()),
+        },
+    );
+    if t.list(cx).is_some() {
+        // Restored already from the discovery kept before: close it to restore again.
+        t.activate(cx, "beta").await;
+        t.activate(cx, "alpha").await;
+    }
+    open_switcher(cx, &t).await;
+    t.type_text(cx, "web");
+    // Drawn, as the window draws it.
+    assert_eq!(state(cx, &t), (Some(shown(cx, &t)), Focus::Palette));
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                standard_sections(),
+            ))),
+            error: None,
+        },
+    );
+    let list = t.list(cx).expect("alpha's last view is restored");
+    assert_eq!(list.read_with(cx, |l, _| l.kind().clone()), KindId::pods());
+    let (switcher, focus) = state(cx, &t);
+    let switcher = switcher.expect("the switcher stays open");
+    assert_eq!(switcher.query, "web");
+    assert_eq!(focus, Focus::Palette);
+}

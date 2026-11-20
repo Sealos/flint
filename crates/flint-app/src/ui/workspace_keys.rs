@@ -204,7 +204,7 @@ impl Workspace {
             let Some(entry) = self.nav_entry(place.kind.as_str(), cx) else {
                 continue;
             };
-            self.show_kind(&entry, false, window, cx);
+            self.show_kind(&entry, false, true, window, cx);
             if let Some(list) = &self.list {
                 let focus = list.read(cx).focus_handle().clone();
                 list.update(cx, |list, cx| match place.object {
@@ -268,7 +268,7 @@ impl Workspace {
             object: Some((namespace.clone(), name.clone())),
         };
         self.remember_place(&target, cx);
-        self.show_kind(&entry, false, window, cx);
+        self.show_kind(&entry, false, true, window, cx);
         if let Some(list) = &self.list {
             let focus = list.read(cx).focus_handle().clone();
             list.update(cx, |list, cx| list.select_listed(namespace, name, cx));

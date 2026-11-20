@@ -805,7 +805,7 @@ impl Workspace {
                 }
             };
             if let Some(entry) = entry {
-                self.open_kind(&entry, window, cx);
+                self.restore_kind(&entry, window, cx);
                 if let (Some(list), Some(name)) = (&self.list, view.name) {
                     list.update(cx, |list, cx| {
                         list.select_when_listed(view.namespace, name, cx)
@@ -819,7 +819,7 @@ impl Workspace {
             .cloned()
         {
             // The kind last open on this cluster, also after a restart.
-            self.open_kind(&entry, window, cx);
+            self.restore_kind(&entry, window, cx);
         }
     }
 
@@ -862,15 +862,24 @@ impl Workspace {
     }
 
     fn open_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_kind(entry, true, window, cx);
+        self.show_kind(entry, true, true, window, cx);
     }
 
-    /// Opens `entry`'s list (unless it is open), with focus. With `remember`, Go Back can
+    /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
+    /// at the user's asking: it takes focus only if the palette or the switcher is not open,
+    /// so they stay open with what was typed.
+    fn restore_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let take_focus = self.palette.is_none();
+        self.show_kind(entry, true, take_focus, window, cx);
+    }
+
+    /// Opens `entry`'s list (unless it is open), with focus when `take_focus`. With `remember`, Go Back can
     /// return to the list and object shown before.
     fn show_kind(
         &mut self,
         entry: &NavEntry,
         remember: bool,
+        take_focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -884,9 +893,11 @@ impl Workspace {
         {
             // Open already: it takes focus, as a new one would (Enter on it in the
             // navigation).
-            let focus = list.read(cx).focus_handle().clone();
-            window.focus(&focus, cx);
-            release_unfocused_input(window, cx);
+            if take_focus {
+                let focus = list.read(cx).focus_handle().clone();
+                window.focus(&focus, cx);
+                release_unfocused_input(window, cx);
+            }
             return;
         }
         if remember {
@@ -911,8 +922,10 @@ impl Workspace {
             list.update(cx, |list, _| list.set_row_menu(menu));
         }
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
-        let focus = list.read(cx).focus_handle().clone();
-        window.focus(&focus, cx);
+        if take_focus {
+            let focus = list.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        }
         // The closed list's filter, if it had focus.
         release_unfocused_input(window, cx);
         self.list = Some(list);
