@@ -431,10 +431,11 @@ impl ClusterManager {
                 budget,
             } => {
                 let internal = self.internal_tx.clone();
-                // Pinned now: a reconnect must never read logs from another server that the
-                // context was re-pointed to in the meantime (UP-06). To its confirmed server: the
-                // client comes later, and a provisional one is never handed out.
-                let pin = self.contexts.pin_confirmed(&cluster);
+                // Pinned now, to the server shown (the tab's): a reconnect must never read logs
+                // from another server (UP-06). Opened on a fallback, the pin is stale and the
+                // first client lookup ends the session, rather than read from the server the
+                // context's confirmed definition names once its file loads again.
+                let pin = self.session_pin(&cluster);
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
                     let _ = internal.send(Internal::LogClient {
@@ -473,11 +474,7 @@ impl ClusterManager {
             Request::WriteClient { cluster, reply } => {
                 // Read with the client: a shell is pinned to the context its client was built
                 // from (`CheckContext`).
-                let server = self.cluster(&cluster).map(|c| c.info.server.as_deref());
-                let pin = match server {
-                    Some(server) => self.contexts.pin(&cluster, server),
-                    None => self.contexts.pin_confirmed(&cluster),
-                };
+                let pin = self.session_pin(&cluster);
                 let _ = reply.send(self.write_client(&cluster).map(|client| (client, pin)));
             }
             Request::CheckContext {
@@ -1044,6 +1041,15 @@ impl ClusterManager {
             ConnectionState::Connecting | ConnectionState::Connected(_) => {
                 Err(LogError::retry(format!("connecting to \"{cluster}\"")))
             }
+        }
+    }
+
+    /// The pin for a session opened on `cluster` now: to the server its slot shows (what a tab
+    /// is labelled with), stale if that is not the confirmed one ([`ContextHistory::pin`]).
+    fn session_pin(&self, cluster: &str) -> ContextPin {
+        match self.cluster(cluster) {
+            Some(slot) => self.contexts.pin(cluster, slot.info.server.as_deref()),
+            None => self.contexts.pin_confirmed(cluster),
         }
     }
 
@@ -1942,6 +1948,89 @@ mod tests {
 
         rewrite_file(&mut manager, &path, &first).await;
         assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+    }
+
+    // covers UP-06, UP-40: logs opened while `dev` shows the second file's fallback are labelled
+    // with the fallback's server. They never read from another one: the session ends with why,
+    // also after the first file is back, rather than read from the first file's server.
+    #[tokio::test]
+    async fn logs_opened_on_a_fallback_never_switch_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = kubeconfig_with("https://dev");
+        let second = kubeconfig_with("https://prod");
+        let mut manager = manager_reading_two(dir.path(), &first, &second).await;
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, &first[..first.len() / 2]).await;
+        let shown = manager.cluster("dev").and_then(|c| c.info.server.clone());
+        assert_eq!(shown.as_deref(), Some("https://prod"), "the tab's server");
+        // As `Request::OpenLogs` and `Request::WriteClient` pin.
+        let pin = manager.session_pin("dev");
+        assert_eq!(pin.server(), Some("https://prod"));
+        offline(&mut manager);
+        let ended = manager.log_client("dev", &pin).err().expect("no client");
+        assert!(ended.is_cluster(), "{}", ended.message);
+        assert!(ended.message.contains("can't be read"), "{}", ended.message);
+
+        rewrite_file(&mut manager, &path, &first).await;
+        offline(&mut manager);
+        let shown = manager.cluster("dev").and_then(|c| c.info.server.clone());
+        assert_eq!(shown.as_deref(), Some("https://dev"));
+        let ended = manager
+            .log_client("dev", &pin)
+            .err()
+            .expect("never dev's client");
+        assert!(ended.is_cluster(), "{}", ended.message);
+    }
+
+    // covers UP-06, UP-40: the same through `Request::OpenLogs`, with the first file back
+    // before the session asks for its client.
+    #[tokio::test]
+    async fn open_logs_on_a_fallback_ends_instead_of_switching_servers() {
+        use crate::logs::{LogOptions, LogSnapshot, LogState, LogSubject, LogTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let first = kubeconfig_with("https://dev");
+        let second = kubeconfig_with("https://prod");
+        let mut manager = manager_reading_two(dir.path(), &first, &second).await;
+        let mut internal = manager.internal_rx.take().unwrap();
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, &first[..first.len() / 2]).await;
+
+        let (snapshots, mut rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (_paused, paused) = watch::channel(false);
+        let target = LogTarget {
+            namespace: "ns".into(),
+            pod: "picked-on-prod".into(),
+            container: None,
+        };
+        manager.handle_request(Request::OpenLogs {
+            id: 1,
+            cluster: "dev".into(),
+            subject: LogSubject::Pod(target),
+            options: LogOptions::default(),
+            snapshots,
+            paused,
+            budget: crate::logs::Budgeted::new(manager.log_budget(), 1),
+        });
+        rewrite_file(&mut manager, &path, &first).await;
+        offline(&mut manager);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    Some(msg) = internal.recv() => manager.handle_internal(msg).await,
+                    changed = rx.changed() => {
+                        assert!(changed.is_ok(), "session running");
+                        if let LogState::Ended { error, .. } = &rx.borrow().state {
+                            return error.clone();
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the session ends rather than wait for dev");
+        let error = error.expect("with why");
+        assert!(error.contains("can't be read"), "{error}");
     }
 
     // covers UP-04: selecting or reconnecting a cluster while its exec auth plugin still runs

@@ -110,7 +110,8 @@ struct Record {
 ///   confirmed change only if no failed file ranks above the file it now comes from. Otherwise
 ///   the entry may be a fallback, a later file's definition showing only while the first one
 ///   is unreadable: it is provisional, and the confirmed definition stays. A session opened on
-///   a provisional definition is pinned stale, and ends at its next check.
+///   a provisional definition is pinned stale, and its first check ends it
+///   ([`Change::Unconfirmed`]): it never moves to the confirmed server.
 ///
 /// A failed file ranked below a context's file cannot change it, so it masks nothing.
 #[derive(Debug, Default)]
@@ -202,6 +203,9 @@ impl ContextHistory {
     pub fn check(&self, session: Pinned, context: &str, pin: &ContextPin) -> Option<String> {
         let change = match self.records.get(context) {
             Some(r) if r.present && r.generation == pin.generation => return None,
+            // Pinned stale at once: opened on what a load showed but did not confirm (a later
+            // file's fallback, while the first one can't be read).
+            Some(r) if r.present && pin.generation == 0 => Change::Unconfirmed,
             Some(r) if r.present && r.server != pin.server => Change::Repointed,
             // Removed and added back, or re-pointed and put back, since the session opened.
             Some(r) if r.present => Change::Changed,
@@ -220,6 +224,9 @@ pub(crate) enum Change {
     Changed,
     /// A load that no failed file could mask lacks it.
     Removed,
+    /// The session opened on a definition no load confirmed: a later file's, showing while a
+    /// file before it can't be read.
+    Unconfirmed,
 }
 
 /// Why a session on `context` ends, as shown.
@@ -235,6 +242,10 @@ pub(crate) fn reason(session: Pinned, context: &str, change: Change) -> String {
         }
         Change::Changed => format!(
             "\"{context}\" changed in your kubeconfig files since this session opened; {again}"
+        ),
+        Change::Unconfirmed => format!(
+            "\"{context}\" may be defined differently while one of your kubeconfig files can't \
+             be read; {again} once it loads"
         ),
     }
 }
@@ -417,10 +428,8 @@ mod tests {
         assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
         // A shell opened on the fallback meanwhile is stale: its server is not confirmed.
         let on_fallback = h.pin("main", PROD);
-        assert_eq!(
-            h.check(Pinned::Shell, "main", &on_fallback),
-            Some(reason(Pinned::Shell, "main", Change::Repointed))
-        );
+        let unconfirmed = Some(reason(Pinned::Shell, "main", Change::Unconfirmed));
+        assert_eq!(h.check(Pinned::Shell, "main", &on_fallback), unconfirmed);
         h.record(&load(&[("main", STAGING, "a")], &[]));
         assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
 
