@@ -63,7 +63,7 @@ fn key(event: &Event, next_error: &mut u64) -> Key {
         }
         Event::SettingsChanged { .. } => Key::Settings,
         Event::DiscoveryChanged { cluster, .. } => Key::Discovery(cluster.clone()),
-        Event::AgentActivity(_) => Key::Activity,
+        Event::AgentActivity(..) => Key::Activity,
         Event::Error(_) => {
             *next_error += 1;
             Key::Error(*next_error)
