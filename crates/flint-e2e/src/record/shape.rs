@@ -59,49 +59,48 @@ impl Shape {
     }
 
     /// Aggregated discovery (`APIGroupDiscoveryList`): one entry per group, version and
-    /// resource, and the union of the fields of each level.
+    /// resource, each with its own fields, so one resource losing a field is reported even when
+    /// another still has it.
     fn discovery(&mut self, rel: &str, json: &Value) {
-        let mut group_fields = BTreeSet::new();
-        let mut version_fields = BTreeSet::new();
-        let mut resource_fields = BTreeSet::new();
         for group in array(&json["items"]) {
-            group_fields.extend(object_keys(group));
             let name = text_of(&group["metadata"]["name"]);
+            let group_id = if name.is_empty() {
+                "core".to_owned()
+            } else {
+                name
+            };
+            self.insert(format!("group-fields {group_id}"), keys(group));
             for version in array(&group["versions"]) {
-                version_fields.extend(object_keys(version));
-                let v = text_of(&version["version"]);
+                let version_id = format!("{group_id}/{}", text_of(&version["version"]));
+                self.insert(format!("version-fields {version_id}"), keys(version));
                 for resource in array(&version["resources"]) {
-                    resource_fields.extend(object_keys(resource));
-                    let subresources: Vec<String> = array(&resource["subresources"])
-                        .map(|s| text_of(&s["subresource"]))
-                        .collect();
-                    let sorted = |field: &str| {
-                        let mut list: Vec<String> = array(&resource[field]).map(text_of).collect();
-                        list.sort();
-                        list.join(",")
+                    let id = format!("{version_id}/{}", text_of(&resource["resource"]));
+                    let sorted = |list: &Value, field: Option<&str>| {
+                        let mut names: Vec<String> = array(list)
+                            .map(|v| text_of(field.map_or(v, |f| &v[f])))
+                            .collect();
+                        names.sort();
+                        names.join(",")
                     };
                     self.insert(
-                        format!(
-                            "resource {}/{v}/{}",
-                            if name.is_empty() { "core" } else { &name },
-                            text_of(&resource["resource"])
-                        ),
+                        format!("resource {id}"),
                         format!(
                             "kind={} scope={} verbs=[{}] short=[{}] subresources=[{}]",
                             text_of(&resource["responseKind"]["kind"]),
                             text_of(&resource["scope"]),
-                            sorted("verbs"),
-                            sorted("shortNames"),
-                            subresources.join(",")
+                            sorted(&resource["verbs"], None),
+                            sorted(&resource["shortNames"], None),
+                            array(&resource["subresources"])
+                                .map(|sub| text_of(&sub["subresource"]))
+                                .collect::<Vec<_>>()
+                                .join(",")
                         ),
                     );
+                    self.insert(format!("resource-fields {id}"), keys(resource));
                 }
             }
         }
         self.insert(format!("fields {rel}"), keys(json));
-        self.insert(format!("group-fields {rel}"), join(&group_fields));
-        self.insert(format!("version-fields {rel}"), join(&version_fields));
-        self.insert(format!("resource-fields {rel}"), join(&resource_fields));
     }
 
     /// A Table list: its columns, and the fields of the Table and of its rows.
@@ -305,6 +304,30 @@ mod tests {
     }
 
     #[test]
+    fn one_resource_losing_a_field_is_reported() {
+        let dir = copy();
+        edit(dir.path(), "discovery/apis.json", |d| {
+            for group in d["items"].as_array_mut().unwrap() {
+                if group["metadata"]["name"] != "apps" {
+                    continue;
+                }
+                for resource in group["versions"][0]["resources"].as_array_mut().unwrap() {
+                    if resource["resource"] == "deployments" {
+                        resource.as_object_mut().unwrap().remove("singularResource");
+                    }
+                }
+            }
+        });
+        let lines = committed().diff(&Shape::of(dir.path()).unwrap());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("~ resource-fields apps/v1/deployments")
+                && lines[0].contains("recorded:  categories,resource,responseKind,scope,shortNames,subresources,verbs"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn structural_changes_are_reported() {
         let dir = copy();
         edit(dir.path(), "tables/apps/v1/deployments.json", |t| {
@@ -332,7 +355,7 @@ mod tests {
             "~ columns tables/apps/v1/deployments.json",
             "~ row-fields tables/apps/v1/deployments.json",
             "~ resource apiregistration.k8s.io/v1/apiservices",
-            "~ resource-fields discovery/apis.json",
+            "~ resource-fields apiregistration.k8s.io/v1/apiservices",
             "~ fields version.json",
             "- file tables/batch/v1/jobs.json",
             "- columns tables/batch/v1/jobs.json",
