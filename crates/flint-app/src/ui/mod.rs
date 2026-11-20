@@ -6,6 +6,7 @@
 //! ([`theme`]).
 
 mod accent;
+mod activity_view;
 #[cfg(test)]
 mod appearance_tests;
 #[cfg(feature = "automation")]

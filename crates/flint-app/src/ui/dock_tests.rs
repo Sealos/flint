@@ -247,7 +247,7 @@ async fn closing_a_log_tab_searched_before_another_tab_leaks_nothing(cx: &mut Te
     let logs = open_logs(cx, window, &dock, &core);
     let view = match dock.read_with(cx, |d, _| d.tab(logs).unwrap().clone()) {
         DockTab::Logs(view) => view.downgrade(),
-        DockTab::Shell(_) => panic!("a log tab"),
+        DockTab::Shell(_) | DockTab::Activity(_) => panic!("a log tab"),
     };
     let search = focus_search(cx, window);
     let (shell, _fake) = open_shell(cx, window, &dock);
@@ -541,7 +541,7 @@ async fn a_failed_log_tab_reconnects_beside_itself(cx: &mut TestAppContext) {
     assert_eq!(*restarts.borrow(), [id]);
     let old = match dock.read_with(cx, |d, _| d.tab(id).cloned()).unwrap() {
         DockTab::Logs(view) => view.downgrade(),
-        DockTab::Shell(_) => panic!("a log tab"),
+        DockTab::Shell(_) | DockTab::Activity(_) => panic!("a log tab"),
     };
     let (other, _) = open_shell_in(cx, window, &dock, "web-9");
     activate(cx, window, id);
@@ -644,7 +644,7 @@ fn shell_chip(dock: &Entity<Dock>, id: u64, cx: &mut TestAppContext) -> (String,
             let (label, tooltip, repointed) = view.read(cx).chip().clone();
             (label.to_string(), tooltip.to_string(), repointed)
         }
-        DockTab::Logs(_) => panic!("a shell"),
+        DockTab::Logs(_) | DockTab::Activity(_) => panic!("a shell"),
     })
 }
 

@@ -24,8 +24,8 @@ See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP client
   or has the same name in another `KUBECONFIG`, is not exposed until you expose it again. The list is read again on
   every call, so a change in the app applies to the next call without restarting the agent. A call naming any other
   cluster fails as if it did not exist.
-- **Only the namespaces and kinds you choose.** The Expose to AI dialog (and Edit AI Scope, from the "AI" badge or the
-  palette) can limit a cluster to some namespaces and kinds. With namespaces chosen, cluster-wide kinds such as nodes
+- **Only the namespaces and kinds you choose.** The Expose to AI dialog (and Edit AI Scope, from a cluster's agent
+  activity or the palette) can limit a cluster to some namespaces and kinds. With namespaces chosen, cluster-wide kinds such as nodes
   are hidden unless you check them. Lists across all namespaces, events and pod logs stay inside the scope, and a
   request outside it fails exactly as for a cluster that is not exposed, so an agent cannot probe what else exists.
   Text the agent may read can still name things outside the scope (the node a pod runs on), and an older `flint mcp`
@@ -42,6 +42,10 @@ See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP client
   unchanged: they show text as written.
 - **Bounded.** Lists, events and logs have default and maximum sizes, and when output is cut short the result says
   so.
+- **Recorded.** Every call is written to an activity log in Flint's config directory: when, which cluster and tool,
+  what it named (kind, namespace, object, container), how much came back, and whether it was cut short or denied.
+  What came back is never stored. Click a cluster's "AI" badge (or run Show Agent Activity… from the palette) to see its calls; the view
+  updates while the agent works.
 
 Redaction is pattern matching, so a credential in an unusual format can still get through. Everything else,
 including ConfigMaps and `env` values in pod specs, is sent as the cluster returns it. Only expose clusters whose
@@ -110,8 +114,7 @@ Flint is in early development.
 - Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
-- Cluster sets and warm clusters for instant switching, AI log analysis, and a tighter MCP server (scope by
-  namespace and kind, an activity log).
+- Cluster sets and warm clusters for instant switching, and AI log analysis.
 - A signed and notarized app with a Homebrew cask.
 
 ## Install from a release

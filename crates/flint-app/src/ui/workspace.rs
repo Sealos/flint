@@ -27,6 +27,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::activity_view::ActivityView;
 use super::closing;
 use super::clusters::{ClustersModel, Presence, state_label};
 use super::confirm::{self, DialogText};
@@ -42,10 +43,10 @@ use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
 use super::palette::CommandPalette;
 use super::registry::{
-    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditAiScope, ExposeToAi,
-    HideFromAi, LockCluster, RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace,
-    TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds,
-    WatchOpenViewsOnly,
+    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
+    LockCluster, RetryConnection, SelectCluster, ShowAgentActivity, ShowAllNamespaces,
+    ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
+    WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::row_menu;
 use super::scope_picker::{self, ScopePicker};
@@ -525,6 +526,8 @@ impl Workspace {
         let opening = match &key {
             TabKey::Logs(_) => Opening::ReconnectLogs,
             TabKey::Shell(_) => Opening::RestartShell,
+            // Runs no session to start again.
+            TabKey::Activity(_) => return,
         };
         if let Some(reason) = self.sessions_blocked(key.context(), cx) {
             self.refuse(refused(opening, &reason), cx);
@@ -537,6 +540,7 @@ impl Workspace {
         self.clear_action_error(cx);
         let cluster = self.tab_cluster(key.context(), cx);
         let core = self.model.read(cx).core().clone();
+        let model = self.model.clone();
         self.dock.update(cx, |dock, cx| {
             dock.open_beside(
                 id,
@@ -548,6 +552,9 @@ impl Workspace {
                     TabKey::Shell(request) => {
                         let session = core.exec(request.exec_request(Default::default()));
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
+                    }
+                    TabKey::Activity(cluster) => {
+                        DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, cx)))
                     }
                 },
                 window,
@@ -1215,11 +1222,12 @@ impl Workspace {
                     }),
             )
             // Neutral: the toggle next to it already shows the exposure in the accent. "AI·" when
-            // agents may read only part of the cluster; a click edits what they may read.
+            // agents may read only part of the cluster; a click shows what agents asked for
+            // (UP-16), with Edit AI Scope there.
             .when_some(ai_scope.filter(|_| exposure.is_exposed()), |row, scope| {
                 let label = if scope.is_everything() { "AI" } else { "AI·" };
                 let tip = format!(
-                    "AI agents may read {}. Click to change it.",
+                    "AI agents may read {}. Click to see what they asked for.",
                     scope_picker::summary(&scope)
                 );
                 row.child(
@@ -1231,7 +1239,7 @@ impl Workspace {
                         .aria_description(tip.clone())
                         .child(Tag::secondary().outline().xsmall().child(label))
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .on_click(registry::on_click_contained(EditAiScope {
+                        .on_click(registry::on_click_contained(ShowAgentActivity {
                             cluster: name.clone(),
                         }))
                         .test_support(),

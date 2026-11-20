@@ -5,7 +5,9 @@
 use flint_core::LogSubject;
 use gpui_kit::*;
 
-use super::super::view_state::{DockState, Focus, TabClusterState, TabState};
+use super::super::view_state::{
+    ActivityTabState, DockState, Focus, TabClusterState, TabState, TabStatusState,
+};
 use super::{Dock, DockTab, TabKey};
 
 impl Dock {
@@ -27,6 +29,15 @@ impl Dock {
                         let (status, text) = view.status_state();
                         (status, text, None, Some(view.view_state()))
                     }
+                    DockTab::Activity(_) => {
+                        (TabStatusState::Watching, "Live".to_owned(), None, None)
+                    }
+                };
+                let activity = match &tab.tab {
+                    DockTab::Activity(view) => Some(ActivityTabState {
+                        rows: view.read(cx).rows().iter().map(|r| r.label()).collect(),
+                    }),
+                    _ => None,
                 };
                 TabState {
                     id: tab.id,
@@ -49,6 +60,7 @@ impl Dock {
                     status_text,
                     logs,
                     shell,
+                    activity,
                 }
             })
             .collect();
@@ -70,6 +82,7 @@ impl Dock {
         let in_tab = self.tabs.iter().find_map(|tab| match &tab.tab {
             DockTab::Logs(view) => view.read(cx).focus_in(window, cx),
             DockTab::Shell(view) => view.read(cx).focus_in(window, cx),
+            DockTab::Activity(_) => None,
         });
         Some(in_tab.unwrap_or(Focus::Dock))
     }
@@ -84,6 +97,7 @@ pub fn tab_kind(key: &TabKey) -> &'static str {
             LogSubject::Workload(_) => "workload_logs",
         },
         TabKey::Shell(_) => "shell",
+        TabKey::Activity(_) => "agent_activity",
     }
 }
 
