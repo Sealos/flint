@@ -242,6 +242,8 @@ pub struct CommandPalette {
     /// The switcher's item the user moved to, kept across a rescope until the objects arrive
     /// and it is listed again.
     kept: Option<ItemId>,
+    /// See [`CommandPalette::scope_generation`].
+    scope_generation: u64,
     mode: Mode,
     /// The resource switcher's index and search, in [`Mode::Resources`].
     resources: Option<Resources>,
@@ -306,7 +308,13 @@ impl CommandPalette {
 
     /// The switcher's index once the objects in memory are read: the search starts over on
     /// it, with what was typed.
-    pub fn set_index(&mut self, index: Arc<Index>, cx: &mut Context<Self>) {
+    ///
+    /// `scope` is [`CommandPalette::scope_generation`] when the objects were asked for: an
+    /// index read for an earlier scope (another cluster, kinds since renamed) is dropped.
+    pub fn set_index(&mut self, index: Arc<Index>, scope: u64, cx: &mut Context<Self>) {
+        if scope != self.scope_generation {
+            return;
+        }
         // The item the user moved to with the arrows, by what it is: its row may move as
         // objects arrive. A selection nobody moved goes to the best row, which may be new (the
         // rule live refreshes follow).
@@ -337,6 +345,7 @@ impl CommandPalette {
             .or_else(|| self.kept.take())
             .filter(|_| same_cluster);
         self.resources = Some(Resources::of(scope));
+        self.scope_generation += 1;
         self.refilter(cx);
         if let Some(kept) = kept
             && !self.select_item(&kept)
@@ -379,6 +388,12 @@ impl CommandPalette {
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         at.is_some()
+    }
+
+    /// Counts the switcher's scopes ([`CommandPalette::rescope`]), so the objects read for
+    /// one are not shown in another.
+    pub fn scope_generation(&self) -> u64 {
+        self.scope_generation
     }
 
     /// What the palette searches.
@@ -431,6 +446,7 @@ impl CommandPalette {
             selected: 0,
             chosen: false,
             kept: None,
+            scope_generation: 0,
             mode,
             resources: None,
             error: None,

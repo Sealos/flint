@@ -953,7 +953,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     was, as the palette runs any action, and are not recorded as recent actions.
   - An open switcher follows what is active: when another cluster (or API server) becomes active, or the
     active cluster's discovery arrives or fails, or its watch mode changes, it lists anew with what was typed
-    kept. An Enter names the cluster and server its row was listed on, and Open Kind… and Open Object… refuse it
+    kept; objects read for an earlier scope are dropped when they arrive late. An Enter names the cluster and
+    server its row was listed on, and Open Kind… and Open Object… refuse it
     once another is active, so a row of one cluster never opens a same-named object on another.
   - On a namespace-limited list, an object opened is judged gone only once its own namespace was listed anew:
     the merged list says which rows of each namespace it holds (`NamespaceLimit::revisions`, each the

@@ -365,13 +365,14 @@ impl Workspace {
         self._switcher = match cluster {
             Some(cluster) => {
                 let stored = self.model.read(cx).core().stored_snapshots(&cluster);
+                let scope = palette.read(cx).scope_generation();
                 let palette = palette.downgrade();
                 cx.spawn(async move |_, cx| {
                     let snapshots = stored.await;
                     let index = cx
                         .background_spawn(async move { Index::new(&entries, &snapshots) })
                         .await;
-                    let _ = palette.update(cx, |p, cx| p.set_index(Arc::new(index), cx));
+                    let _ = palette.update(cx, |p, cx| p.set_index(Arc::new(index), scope, cx));
                 })
             }
             None => Task::ready(()),

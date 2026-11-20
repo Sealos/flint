@@ -199,13 +199,13 @@ async fn the_selection_follows_its_item_when_objects_arrive(cx: &mut TestAppCont
         ("demo", "web-1", 0),
         ("demo", "web-7d9f", 0),
     ]);
-    switcher.update(cx, |p, cx| p.set_index(arrived, cx));
+    switcher.update(cx, |p, cx| p.set_index(arrived, p.scope_generation(), cx));
     let after = shown(cx, &t);
     assert_eq!(labels(&after), ["demo/web", "demo/web-1", "demo/web-7d9f"]);
     assert_eq!(after.selected, Some(2));
     // Gone: the first row.
     let gone = index(&[("demo", "web", 0)]);
-    switcher.update(cx, |p, cx| p.set_index(gone, cx));
+    switcher.update(cx, |p, cx| p.set_index(gone, p.scope_generation(), cx));
     assert_eq!(shown(cx, &t).selected, Some(0));
 }
 
@@ -234,7 +234,7 @@ async fn an_unmoved_selection_takes_the_best_row_as_objects_arrive(cx: &mut Test
             2,
         )],
     ));
-    switcher.update(cx, |p, cx| p.set_index(index, cx));
+    switcher.update(cx, |p, cx| p.set_index(index, p.scope_generation(), cx));
     let after = shown(cx, &t);
     assert_eq!(labels(&after), ["demo/web-1", "demo/web-7d9f"]);
     assert_eq!(
@@ -632,7 +632,7 @@ async fn a_click_on_replaced_switcher_rows_is_dropped(cx: &mut TestAppContext) {
             2,
         )],
     ));
-    switcher.update(cx, |p, cx| p.set_index(index, cx));
+    switcher.update(cx, |p, cx| p.set_index(index, p.scope_generation(), cx));
     assert_eq!(
         labels(&shown(cx, &t)),
         ["demo/web", "demo/web-1", "demo/web-7d9f"]
@@ -1101,4 +1101,47 @@ async fn the_chosen_item_survives_a_rename(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(t.selected(cx).as_deref(), Some("web-7d9f"));
+}
+
+// covers UP-31: objects read for an earlier scope never land after the switcher listed anew:
+// a late index from before a rename is dropped, so neither the old names nor the first row
+// come back.
+#[gpui_kit::test]
+async fn an_index_read_for_an_earlier_scope_is_dropped(cx: &mut TestAppContext) {
+    use crate::ui::switcher_model::Index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    let switcher = open_switcher(cx, &t).await;
+    let before = switcher.read_with(cx, |p, _| p.scope_generation());
+    t.type_text(cx, "widg");
+    let mut sections = standard_sections();
+    for section in &mut sections {
+        for entry in &mut section.entries {
+            if entry.label == "Widgets" {
+                entry.label = "Widget Gadgets".into();
+            }
+        }
+    }
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                sections,
+            ))),
+            error: None,
+        },
+    );
+    state(cx, &t);
+    assert_eq!(labels(&shown(cx, &t)), ["Widget Gadgets"]);
+    // What the read started before the rename would have built, arriving now.
+    let entries: Vec<flint_core::NavEntry> = standard_sections()
+        .into_iter()
+        .flat_map(|s| s.entries)
+        .collect();
+    let late = std::sync::Arc::new(Index::new(&entries, &[]));
+    switcher.update(cx, |p, cx| p.set_index(late, before, cx));
+    assert_eq!(labels(&shown(cx, &t)), ["Widget Gadgets"]);
 }
