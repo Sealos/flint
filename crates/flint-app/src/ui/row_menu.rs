@@ -6,7 +6,7 @@
 //!
 //! Right-clicking a row selects it, as a click does, so the detail pane shows it; the menu's
 //! entries are then the detail pane's registered actions ([`OpenLogs`], [`OpenPreviousLogs`],
-//! [`OpenShell`], [`OpenContainerShell`]), performed through [`registry::on_click`], so the menu,
+//! [`OpenShell`], [`OpenContainerShell`](super::registry::OpenContainerShell)), performed through [`registry::on_click`], so the menu,
 //! the keys and the palette take one path. What each entry can do comes from [`row_actions`],
 //! which uses the same checks as the actions' guards; an entry that cannot run is disabled,
 //! with the reason under it. An entry chosen before the row's object has loaded waits for it
