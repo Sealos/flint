@@ -295,8 +295,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   (Shift-Cmd-J, or the button at the strip's end) shows every tab with its cluster and status. Opening the same logs
   or shell again shows its tab while it runs; once it ended or failed, a fresh tab opens beside it, and Reconnect
   (logs) or Restart shell starts it again in a new tab beside it, keeping the ended one's output. An empty dock says
-  how to open logs or a shell.
-- Tests: ui.
+  how to open logs or a shell. Log tabs share one memory budget (`log_total_mib`): over it, the tabs I looked at least
+  recently drop their oldest lines first, never the one shown, keep streaming, and say "Older lines dropped to save
+  memory".
+- Tests: unit, ui.
 
 ### UP-43 Spot errors in a log stream
 - **When** I follow a pod's logs and turn timestamps on and off.

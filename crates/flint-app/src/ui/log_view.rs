@@ -328,6 +328,16 @@ impl LogView {
         cx.notify();
     }
 
+    /// Whether this tab is the one shown, for the shared log memory budget (see the dock).
+    pub fn set_shown(&self, shown: bool) {
+        self.session.set_shown(shown);
+    }
+
+    #[cfg(test)]
+    pub fn is_shown(&self) -> bool {
+        self.session.is_shown()
+    }
+
     /// Whether the session reads a workload's pods, whose lines carry a source.
     pub fn is_workload(&self) -> bool {
         matches!(self.request.subject, LogSubject::Workload(_))
@@ -904,9 +914,13 @@ impl LogView {
             .as_ref()
             .map(|p| log_model::streams_text(p));
         // The status's tooltip says everything the slot may cut, and what the toolbar left out.
+        let trimmed = self.snapshot.trimmed;
         let tooltip = {
             let mut parts = vec![status.tooltip.clone().unwrap_or(status.text.clone())];
             parts.extend(pause_text.clone());
+            if trimmed {
+                parts.push(log_model::TRIMMED_TOOLTIP.to_owned());
+            }
             parts.push(count.clone());
             parts.extend(streams.clone());
             if let Some(selector) = self.snapshot.pods.as_ref().and_then(|p| p.selector.clone()) {
@@ -966,6 +980,18 @@ impl LogView {
                                         .truncate()
                                         .text_color(theme.warning)
                                         .child(format!("· {text}"))
+                                        .test_support(),
+                                )
+                            })
+                            .when(trimmed, |el| {
+                                el.child(
+                                    div()
+                                        .id("log-trimmed")
+                                        .flex_shrink(0.5)
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("· {}", log_model::TRIMMED_TEXT))
                                         .test_support(),
                                 )
                             })

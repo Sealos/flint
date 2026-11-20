@@ -432,6 +432,8 @@ pub struct LogTabState {
     pub lines: usize,
     /// Lines that arrived while paused.
     pub held_back: u64,
+    /// Older lines were dropped to keep all log tabs within the shared memory budget.
+    pub trimmed: bool,
     pub paused: bool,
     /// The session follows new lines (not a previous instance).
     pub follows: bool,

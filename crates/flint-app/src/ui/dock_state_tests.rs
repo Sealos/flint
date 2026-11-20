@@ -194,6 +194,7 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
                 held_back: 0,
                 version: 1,
                 pods: None,
+                trimmed: false,
             }),
             cx,
         )

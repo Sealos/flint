@@ -169,6 +169,9 @@ pub(crate) enum Request {
         options: LogOptions,
         snapshots: watch::Sender<Arc<LogSnapshot>>,
         paused: watch::Receiver<bool>,
+        /// Registered when the session was opened, so whether it is shown counts from the
+        /// start; the session keeps it while it runs.
+        budget: crate::logs::Budgeted,
     },
     CloseLogs {
         id: u64,
@@ -257,6 +260,7 @@ pub struct CoreHandle {
     hubs: HubRegistry,
     next_subscription: Arc<AtomicU64>,
     unlocks: SessionUnlocks,
+    log_budget: Arc<crate::logs::LogBudget>,
     runtime: tokio::runtime::Handle,
     _runtime: Arc<RuntimeGuard>,
 }
@@ -274,10 +278,9 @@ impl CoreHandle {
         let (event_tx, event_rx) = async_channel::unbounded();
         let hubs = HubRegistry::default();
         let unlocks = SessionUnlocks::default();
-        runtime.spawn(
-            ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone())
-                .run(cmd_rx, req_rx),
-        );
+        let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
+        let log_budget = manager.log_budget();
+        runtime.spawn(manager.run(cmd_rx, req_rx));
         Ok(Self {
             commands: cmd_tx,
             requests: req_tx,
@@ -285,6 +288,7 @@ impl CoreHandle {
             hubs,
             next_subscription: Arc::new(AtomicU64::new(1)),
             unlocks,
+            log_budget,
             runtime: runtime.handle().clone(),
             _runtime: Arc::new(RuntimeGuard(Some(runtime))),
         })
@@ -422,6 +426,7 @@ impl CoreHandle {
             options: options.clone(),
             snapshots,
             paused: paused_rx,
+            budget: crate::logs::Budgeted::new(self.log_budget.clone(), id),
         });
         LogSession {
             id,
@@ -431,7 +436,13 @@ impl CoreHandle {
             rx,
             paused,
             requests: self.requests.clone(),
+            budget: self.log_budget.clone(),
         }
+    }
+
+    /// The memory budget all log sessions share (`log_total_mib`), for tests and diagnostics.
+    pub fn log_budget(&self) -> &crate::logs::LogBudget {
+        &self.log_budget
     }
 
     /// Brings `search` up to date with `lines` on the core's threads (see [`LogSearch`]). Use it
@@ -655,6 +666,7 @@ pub struct LogSession {
     rx: watch::Receiver<Arc<LogSnapshot>>,
     paused: watch::Sender<bool>,
     requests: async_channel::Sender<Request>,
+    budget: Arc<crate::logs::LogBudget>,
 }
 
 impl LogSession {
@@ -716,6 +728,19 @@ impl LogSession {
 
     pub fn is_paused(&self) -> bool {
         *self.paused.borrow()
+    }
+
+    /// Whether this session's tab is the one shown. The shared log memory budget trims the
+    /// sessions viewed least recently first and never the shown one (see
+    /// [`crate::logs::LogBudget`]).
+    pub fn set_shown(&self, shown: bool) {
+        self.budget.set_shown(self.id, shown);
+    }
+
+    /// Whether [`LogSession::set_shown`] last said this tab is shown (once the core has started
+    /// the session).
+    pub fn is_shown(&self) -> bool {
+        self.budget.is_shown(self.id)
     }
 }
 
