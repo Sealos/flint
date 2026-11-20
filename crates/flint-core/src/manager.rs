@@ -432,6 +432,7 @@ impl ClusterManager {
             Request::OpenLogs {
                 id,
                 cluster,
+                server,
                 subject,
                 options,
                 snapshots,
@@ -443,7 +444,12 @@ impl ClusterManager {
                 // from another server (UP-06). Opened on a fallback, the pin is stale and the
                 // first client lookup ends the session, rather than read from the server the
                 // context's confirmed definition names once its file loads again.
-                let pin = self.session_pin(&cluster);
+                // Given the tab's server, pinned to exactly that: a request taken after the
+                // context moved (its fallback gone, say) is not pinned to where it is now.
+                let pin = match &server {
+                    Some(server) => self.contexts.pin(&cluster, server.as_deref()),
+                    None => self.session_pin(&cluster),
+                };
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
                     let _ = internal.send(Internal::LogClient {
@@ -2034,6 +2040,23 @@ mod tests {
     // before the session asks for its client.
     #[tokio::test]
     async fn open_logs_on_a_fallback_ends_instead_of_switching_servers() {
+        let error = log_error_on_a_fallback(false).await;
+        assert!(error.contains("can't be read"), "{error}");
+    }
+
+    // covers UP-06, UP-40: a log tab opened on the fallback, its request taken only once the
+    // first file is back: pinned to the server the tab shows, not to where the context points
+    // when the core takes it.
+    #[tokio::test]
+    async fn open_logs_taken_after_the_fallback_went_keeps_the_tabs_server() {
+        let error = log_error_on_a_fallback(true).await;
+        assert!(error.contains("may be defined differently"), "{error}");
+    }
+
+    /// Opens logs on `dev` while its first file is half-written (a fallback to prod shows),
+    /// labelled with prod; with `taken_late`, the core takes the request only after the file is
+    /// back. Returns why the session ended.
+    async fn log_error_on_a_fallback(taken_late: bool) -> String {
         use crate::logs::{LogOptions, LogSnapshot, LogState, LogSubject, LogTarget};
         let dir = tempfile::tempdir().unwrap();
         let first = kubeconfig_with("https://dev");
@@ -2050,16 +2073,25 @@ mod tests {
             pod: "picked-on-prod".into(),
             container: None,
         };
-        manager.handle_request(Request::OpenLogs {
+        let shown = manager.cluster("dev").and_then(|c| c.info.server.clone());
+        assert_eq!(shown.as_deref(), Some("https://prod"));
+        let request = Request::OpenLogs {
             id: 1,
             cluster: "dev".into(),
+            server: taken_late.then_some(shown),
             subject: LogSubject::Pod(target),
             options: LogOptions::default(),
             snapshots,
             paused,
             budget: crate::logs::Budgeted::new(manager.log_budget(), 1),
-        });
-        rewrite_file(&mut manager, &path, &first).await;
+        };
+        if taken_late {
+            rewrite_file(&mut manager, &path, &first).await;
+            manager.handle_request(request);
+        } else {
+            manager.handle_request(request);
+            rewrite_file(&mut manager, &path, &first).await;
+        }
         offline(&mut manager);
 
         let error = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2076,9 +2108,8 @@ mod tests {
             }
         })
         .await
-        .expect("the session ends rather than wait for dev");
-        let error = error.expect("with why");
-        assert!(error.contains("can't be read"), "{error}");
+        .expect("the session ends rather than read from dev");
+        error.expect("with why")
     }
 
     // covers UP-04: selecting or reconnecting a cluster while its exec auth plugin still runs

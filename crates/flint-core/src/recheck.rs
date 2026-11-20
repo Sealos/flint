@@ -176,11 +176,11 @@ impl ContextHistory {
                 // A confirmed definition stays until a load confirms a change: a fallback never
                 // replaces it, nor its file.
                 Some(r) if r.present && r.confirmed && provisional => {}
+                // Same server: the file it now comes from is the one whose rank masks its
+                // removal, confirmed or not (an unconfirmed record follows its fallback).
                 Some(r) if r.present && r.server.as_deref() == server => {
-                    if !provisional {
-                        r.source = info.source.clone();
-                        r.confirmed = true;
-                    }
+                    r.source = info.source.clone();
+                    r.confirmed |= !provisional;
                 }
                 Some(r) => {
                     self.last += 1;
@@ -330,7 +330,7 @@ mod tests {
     /// What each file that loaded defines is taken from `contexts` (no shadowed names); see
     /// [`load_shadowing`] for those.
     fn load(contexts: &[(&str, Option<&str>, &str)], failed: &[&str]) -> LoadedKubeconfig {
-        let defines = ["a", "b", "c"]
+        let defines = ["a", "b", "c", "d"]
             .into_iter()
             .filter(|f| !failed.contains(f))
             .map(|f| {
@@ -361,7 +361,7 @@ mod tests {
         LoadedKubeconfig {
             merged: Default::default(),
             contexts,
-            paths: ["a", "b", "c"].map(PathBuf::from).to_vec(),
+            paths: ["a", "b", "c", "d"].map(PathBuf::from).to_vec(),
             errors: failed
                 .iter()
                 .map(|f| (PathBuf::from(f), "did not parse".to_owned()))
@@ -536,6 +536,24 @@ mod tests {
         // fallback's file: the confirmed file is still the one that counts.
         h.record(&load(&[("main", STAGING, "c")], &["a"]));
         h.record(&load(&[], &["a"]));
+        assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
+    }
+
+    // covers UP-06: an unconfirmed context that moves, on the same server, to a later file's
+    // definition while a file between them fails is masked by that file: dropped from the later
+    // file, it may still be in the failed one.
+    #[test]
+    fn an_unconfirmed_context_follows_its_file() {
+        let mut h = ContextHistory::default();
+        // `a` unreadable at startup: `main` from `b` is unconfirmed.
+        h.record(&load(&[("main", STAGING, "b")], &["a"]));
+        let pin = h.pin("main", STAGING);
+        // Now from `d` on the same server, `c` unreadable.
+        h.record(&load(&[("main", STAGING, "d")], &["c"]));
+        assert_eq!(h.records["main"].source, Path::new("d"));
+        assert!(!h.records["main"].confirmed);
+        // `d` drops it while `c` still fails: `c` may define it.
+        h.record(&load(&[], &["c"]));
         assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
     }
 

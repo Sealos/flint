@@ -164,13 +164,37 @@ pub struct LogView {
 }
 
 impl LogView {
+    /// The tab for `request`, on the server its context shows when the core takes it.
+    #[cfg(test)]
     pub fn new(
         core: CoreHandle,
         request: LogRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (session, pump) = Self::open_session(&core, &request, cx);
+        Self::with_session(core, request, None, window, cx)
+    }
+
+    /// The tab for `request` on its context at `server`, as the cluster list shows it now: the
+    /// server the tab is labelled with, which the session is pinned to (UP-06).
+    pub fn at(
+        core: CoreHandle,
+        request: LogRequest,
+        server: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_session(core, request, Some(server), window, cx)
+    }
+
+    fn with_session(
+        core: CoreHandle,
+        request: LogRequest,
+        server: Option<Option<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (session, pump) = Self::open_session(&core, &request, server, cx);
         let list = ListState::new(0, ListAlignment::Top, px(LINE_HEIGHT * 20.));
         list.set_follow_mode(FollowMode::Tail);
         // Redraw the toolbar's Jump button when scrolling starts or stops following.
@@ -245,9 +269,18 @@ impl LogView {
     fn open_session(
         core: &CoreHandle,
         request: &LogRequest,
+        server: Option<Option<String>>,
         cx: &mut Context<Self>,
     ) -> (LogSession, Task<()>) {
-        let session = core.open_logs(&request.cluster, request.subject.clone(), request.options());
+        let session = match server {
+            Some(server) => core.open_logs_at(
+                &request.cluster,
+                server.as_deref(),
+                request.subject.clone(),
+                request.options(),
+            ),
+            None => core.open_logs(&request.cluster, request.subject.clone(), request.options()),
+        };
         let mut updates = session.updates();
         let pump = cx.spawn(async move |this, cx| {
             while updates.changed().await {
