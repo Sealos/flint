@@ -261,6 +261,42 @@ fn generated_inputs() -> Vec<String> {
             out.push(format!("{a} {b}"));
         }
     }
+    for pair in pairs() {
+        let json = json_escaped(&pair);
+        out.extend([
+            pair.clone(),
+            format!("level=info {pair} done"),
+            format!("{{\"msg\":\"{json}\"}}"),
+            format!("'{pair}'"),
+        ]);
+    }
+    out
+}
+
+/// Each credential key with each separator and value style the pair rule accepts, alone and
+/// after a scheme word, as a header value or after a credential key whose value is a scheme
+/// (`token=Basic password= "x"`).
+fn pairs() -> Vec<String> {
+    let keys = ["password", "token", "secret", "api_key", "DB_PASS"];
+    let separators = ["=", "= ", " = ", ":", ": ", "=>", ":="];
+    let values = ["hunter2", "\"hunter2\"", "'hunter2'", "\\\"hunter2\\\""];
+    let schemes = ["Bearer", "Basic", "Digest"];
+    let mut out = Vec::new();
+    for key in keys {
+        for sep in separators {
+            for value in values {
+                let pair = format!("{key}{sep}{value}");
+                out.push(pair.clone());
+                out.push(format!("{pair} user=app"));
+                for scheme in schemes {
+                    out.push(format!("{scheme} {pair}"));
+                    out.push(format!("Authorization: {scheme} {pair}"));
+                    out.push(format!("token={scheme} {pair}"));
+                    out.push(format!("token: {scheme} {pair}"));
+                }
+            }
+        }
+    }
     out
 }
 
