@@ -247,7 +247,7 @@ async fn closing_a_log_tab_searched_before_another_tab_leaks_nothing(cx: &mut Te
     let logs = open_logs(cx, window, &dock, &core);
     let view = match dock.read_with(cx, |d, _| d.tab(logs).unwrap().clone()) {
         DockTab::Logs(view) => view.downgrade(),
-        DockTab::Shell(_) => panic!("a log tab"),
+        DockTab::Shell(_) | DockTab::Activity(_) => panic!("a log tab"),
     };
     let search = focus_search(cx, window);
     let (shell, _fake) = open_shell(cx, window, &dock);
@@ -408,6 +408,42 @@ fn activate(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) {
     draw(cx, window);
 }
 
+// covers UP-42: the log tab shown tells its session, so the shared log memory budget trims
+// the others first (#254).
+#[gpui_kit::test]
+async fn the_shown_log_tab_tells_its_session(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let (core, _dir) = core();
+    let logs = open_logs(cx, window, &dock, &core);
+    let log_view = match dock.read_with(cx, |dock, _| dock.tab(logs).cloned()) {
+        Some(DockTab::Logs(view)) => view,
+        _ => panic!("a log tab"),
+    };
+    let shown = |cx: &mut TestAppContext| log_view.read_with(cx, |v, _| v.is_shown());
+    assert!(shown(cx), "opened and shown");
+    // A shell tab in front: the log tab is not shown any more.
+    let (shell, _fake) = open_shell_in(cx, window, &dock, "web-2");
+    draw(cx, window);
+    assert!(!shown(cx));
+    activate(cx, window, logs);
+    assert!(shown(cx));
+    // Hiding the dock: nothing is shown, though the dock is not drawn any more.
+    let toggle = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            registry::dispatch("dock::ToggleDock", serde_json::Value::Null, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    };
+    toggle(cx);
+    assert!(!shown(cx));
+    toggle(cx);
+    assert!(shown(cx));
+    // Closing the shell leaves the log tab shown.
+    close(cx, window, shell);
+    assert!(shown(cx));
+}
+
 // covers UP-42: with more tabs than fit, the strip scrolls so a tab just opened or shown is in
 // view, and the tab list names every tab (title, cluster, status) and shows the one picked.
 #[gpui_kit::test]
@@ -541,7 +577,7 @@ async fn a_failed_log_tab_reconnects_beside_itself(cx: &mut TestAppContext) {
     assert_eq!(*restarts.borrow(), [id]);
     let old = match dock.read_with(cx, |d, _| d.tab(id).cloned()).unwrap() {
         DockTab::Logs(view) => view.downgrade(),
-        DockTab::Shell(_) => panic!("a log tab"),
+        DockTab::Shell(_) | DockTab::Activity(_) => panic!("a log tab"),
     };
     let (other, _) = open_shell_in(cx, window, &dock, "web-9");
     activate(cx, window, id);
@@ -644,7 +680,7 @@ fn shell_chip(dock: &Entity<Dock>, id: u64, cx: &mut TestAppContext) -> (String,
             let (label, tooltip, repointed) = view.read(cx).chip().clone();
             (label.to_string(), tooltip.to_string(), repointed)
         }
-        DockTab::Logs(_) => panic!("a shell"),
+        DockTab::Logs(_) | DockTab::Activity(_) => panic!("a shell"),
     })
 }
 

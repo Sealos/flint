@@ -142,8 +142,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** an agent has called Flint's MCP tools, and I open a cluster's agent activity.
 - **Then** I see each call: when, which tool, what it named, how much came back, and whether it was cut short or
   denied. No returned content is stored. The view updates while the agent works, even though `flint mcp` is a separate
-  process.
-- Tests: unit (record format, rotation), mcp, ui.
+  process. The cluster's "AI" badge opens it, with Edit AI Scope there.
+- Tests: unit (record format, rotation), core (live reload), mcp, ui.
 
 ### UP-13 Appearance follows macOS
 - **When** macOS switches between light and dark.
@@ -308,8 +308,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   (Shift-Cmd-J, or the button at the strip's end) shows every tab with its cluster and status. Opening the same logs
   or shell again shows its tab while it runs; once it ended or failed, a fresh tab opens beside it, and Reconnect
   (logs) or Restart shell starts it again in a new tab beside it, keeping the ended one's output. An empty dock says
-  how to open logs or a shell.
-- Tests: ui.
+  how to open logs or a shell. Log tabs share one memory budget (`log_total_mib`): over it, the tabs I looked at least
+  recently drop their oldest lines first, never the one shown, keep streaming, and say "Older lines dropped to save
+  memory".
+- Tests: unit, ui.
 
 ### UP-43 Spot errors in a log stream
 - **When** I follow a pod's logs and turn timestamps on and off.

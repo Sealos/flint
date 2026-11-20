@@ -816,7 +816,7 @@ mod tests {
         let (tx, rx) = watch::channel(Arc::new(LogSnapshot::connecting()));
         let (paused, paused_rx) = watch::channel(false);
         let feed = WorkloadFeed::new(logs.clone(), pods.clone(), target, options, config);
-        tokio::spawn(run(Box::new(feed), config, tx, paused_rx));
+        tokio::spawn(run(Box::new(feed), config, tx, paused_rx, None));
         Running {
             rx,
             _paused: paused,
@@ -1210,7 +1210,7 @@ mod tests {
             LogOptions::default(),
             cfg,
         );
-        tokio::spawn(run(Box::new(feed), cfg, tx, paused_rx));
+        tokio::spawn(run(Box::new(feed), cfg, tx, paused_rx, None));
         let s = loop {
             let s = rx.borrow_and_update().clone();
             if matches!(s.state, LogState::Ended { .. }) {

@@ -13,6 +13,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::activity;
 use crate::cluster::{self, CONNECT_TIMEOUT, ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
 use crate::handle::{
@@ -207,6 +208,8 @@ impl Pins {
 struct Changed {
     kubeconfig: bool,
     settings: bool,
+    /// The agent activity log (UP-16).
+    activity: bool,
     /// A missing directory of a watched file was created: watch it now (UP-02: `~/.kube`
     /// created after launch).
     rearm: bool,
@@ -235,6 +238,8 @@ pub(crate) struct ClusterManager {
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
+    /// The memory budget all log sessions share (`log_total_mib`).
+    log_budget: Arc<logs::LogBudget>,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
 }
@@ -246,6 +251,11 @@ struct FileWatcher {
 }
 
 impl ClusterManager {
+    /// The log sessions' shared budget, for [`crate::LogSession::set_shown`].
+    pub(crate) fn log_budget(&self) -> Arc<logs::LogBudget> {
+        self.log_budget.clone()
+    }
+
     pub(crate) fn new(
         config: CoreConfig,
         events: async_channel::Sender<Event>,
@@ -259,6 +269,7 @@ impl ClusterManager {
             config.home.as_deref(),
         );
         let engine_config = Arc::new(EngineConfig::with_timing(&config.watch_timing));
+        let log_budget = logs::LogBudget::new(config.settings.log_total_bytes());
         Self {
             settings: Arc::new(config.settings.clone()),
             settings_error: config.settings_error.clone(),
@@ -276,6 +287,7 @@ impl ClusterManager {
             engine_config,
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
+            log_budget,
             unlocks,
         }
     }
@@ -287,8 +299,11 @@ impl ClusterManager {
     ) {
         let mut internal_rx = self.internal_rx.take().expect("run is called once");
         self.emit_settings();
-        self.reload_kubeconfig().await;
+        // Watching first, so a change after the first reads (an agent's call landing meanwhile)
+        // is noticed.
         self.rebuild_watcher();
+        self.reload_activity().await;
+        self.reload_kubeconfig().await;
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
@@ -409,6 +424,7 @@ impl ClusterManager {
                 options,
                 snapshots,
                 paused,
+                budget,
             } => {
                 let internal = self.internal_tx.clone();
                 // Pinned now: a reconnect must never read logs from another server that the
@@ -441,7 +457,7 @@ impl ClusterManager {
                     Arc::new(KubeLogSource::new(lookup.clone())),
                     Arc::new(KubePodSource::new(lookup)),
                 );
-                let task = tokio::spawn(logs::run(feed, config, snapshots, paused));
+                let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
                 self.log_sessions.insert(id, task);
             }
@@ -756,6 +772,7 @@ impl ClusterManager {
         }
         self.settings = Arc::new(settings);
         self.settings_error = error;
+        self.log_budget.set_limit(self.settings.log_total_bytes());
         // The watch mode may have changed: start and stop the watches first, so a front end
         // that reads the stores when it hears of the change (the resource switcher) finds
         // them as the new settings have them.
@@ -971,6 +988,9 @@ impl ClusterManager {
                 if changed.kubeconfig {
                     self.reload_kubeconfig().await;
                 }
+                if changed.activity {
+                    self.reload_activity().await;
+                }
             }
         }
     }
@@ -1121,6 +1141,14 @@ impl ClusterManager {
         });
     }
 
+    /// Reads the agent activity log and sends it to the front end.
+    async fn reload_activity(&mut self) {
+        let dir = self.config.config_dir.clone();
+        if let Ok(records) = tokio::task::spawn_blocking(move || activity::read(&dir)).await {
+            self.emit(Event::AgentActivity(Arc::new(records)));
+        }
+    }
+
     async fn reload_kubeconfig(&mut self) {
         let paths = self.kubeconfig_paths.clone();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -1233,18 +1261,29 @@ impl ClusterManager {
             .collect();
         let settings_path = self.config.config_dir.join(settings::SETTINGS_FILE);
         let settings_files: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
+        // Beside settings.toml, so it needs no directory of its own.
+        let activity_files: HashSet<PathBuf> = [activity::ACTIVITY_FILE, activity::PREVIOUS_FILE]
+            .iter()
+            .flat_map(|f| watch_names(&self.config.config_dir.join(f)))
+            .collect();
         let (watch_dirs, pending) = watch_plan(kube_files.iter().chain(&settings_files));
 
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
         let (kube_watched, settings_watched) = (kube_files.clone(), settings_files.clone());
+        let watched = Watched {
+            pending,
+            kube: kube_watched,
+            settings: settings_watched,
+            activity: activity_files,
+        };
         let mut watcher =
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else { return };
                 if matches!(event.kind, EventKind::Access(_)) {
                     return;
                 }
-                let changed = classify(&event.paths, &pending, &kube_watched, &settings_watched);
-                if changed.kubeconfig || changed.settings {
+                let changed = classify(&event.paths, &watched);
+                if changed.kubeconfig || changed.settings || changed.activity {
                     let _ = raw_tx.send(changed);
                 }
             }) {
@@ -1307,16 +1346,22 @@ fn watch_plan<'a>(
 /// What an event on `paths` changed. A missing directory that appeared (`pending`) may
 /// already hold kubeconfig files or `settings.toml` (a symlink's target directory restored
 /// with the file in it), so both are read again, besides rebuilding the watcher.
-fn classify(
-    paths: &[PathBuf],
-    pending: &HashSet<PathBuf>,
-    kube: &HashSet<PathBuf>,
-    settings: &HashSet<PathBuf>,
-) -> Changed {
-    let rearm = paths.iter().any(|p| pending.contains(p));
+/// The paths a file watcher reacts to.
+struct Watched {
+    /// Missing directories whose creation means the watcher is rebuilt.
+    pending: HashSet<PathBuf>,
+    kube: HashSet<PathBuf>,
+    settings: HashSet<PathBuf>,
+    activity: HashSet<PathBuf>,
+}
+
+fn classify(paths: &[PathBuf], watched: &Watched) -> Changed {
+    let rearm = paths.iter().any(|p| watched.pending.contains(p));
+    let any = |set: &HashSet<PathBuf>| rearm || paths.iter().any(|p| set.contains(p));
     Changed {
-        kubeconfig: rearm || paths.iter().any(|p| kube.contains(p)),
-        settings: rearm || paths.iter().any(|p| settings.contains(p)),
+        kubeconfig: any(&watched.kube),
+        settings: any(&watched.settings),
+        activity: any(&watched.activity),
         rearm,
     }
 }
@@ -1379,6 +1424,7 @@ async fn debounce(mut raw: mpsc::UnboundedReceiver<Changed>, out: mpsc::Unbounde
         while let Ok(more) = raw.try_recv() {
             changed.kubeconfig |= more.kubeconfig;
             changed.settings |= more.settings;
+            changed.activity |= more.activity;
             changed.rearm |= more.rearm;
         }
         if out.send(Internal::FilesChanged(changed)).is_err() {
@@ -2046,25 +2092,21 @@ mod tests {
     // with settings.toml in it) reloads the settings too, not only kubeconfig.
     #[test]
     fn a_directory_that_appears_reloads_settings_and_kubeconfig() {
-        let pending = HashSet::from([PathBuf::from("/cfg/dotfiles")]);
-        let kube = HashSet::from([PathBuf::from("/k/config")]);
-        let settings = HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]);
-        let changed = classify(
-            &[PathBuf::from("/cfg/dotfiles")],
-            &pending,
-            &kube,
-            &settings,
-        );
-        assert!(changed.rearm && changed.settings && changed.kubeconfig);
-        let changed = classify(&[PathBuf::from("/k/config")], &pending, &kube, &settings);
-        assert!(!changed.rearm && !changed.settings && changed.kubeconfig);
-        let changed = classify(
-            &[PathBuf::from("/cfg/dotfiles/flint.toml")],
-            &pending,
-            &kube,
-            &settings,
-        );
-        assert!(!changed.rearm && changed.settings && !changed.kubeconfig);
+        let watched = Watched {
+            pending: HashSet::from([PathBuf::from("/cfg/dotfiles")]),
+            kube: HashSet::from([PathBuf::from("/k/config")]),
+            settings: HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]),
+            activity: HashSet::from([PathBuf::from("/cfg/agent-activity.jsonl")]),
+        };
+        let changed = classify(&[PathBuf::from("/cfg/dotfiles")], &watched);
+        assert!(changed.rearm && changed.settings && changed.kubeconfig && changed.activity);
+        let changed = classify(&[PathBuf::from("/k/config")], &watched);
+        assert!(!changed.rearm && !changed.settings && changed.kubeconfig && !changed.activity);
+        let changed = classify(&[PathBuf::from("/cfg/dotfiles/flint.toml")], &watched);
+        assert!(!changed.rearm && changed.settings && !changed.kubeconfig && !changed.activity);
+        // covers UP-16: an agent's call reloads only the activity log.
+        let changed = classify(&[PathBuf::from("/cfg/agent-activity.jsonl")], &watched);
+        assert!(!changed.rearm && !changed.settings && !changed.kubeconfig && changed.activity);
     }
 
     // covers UP-12: settings.toml as a symlink to a file that is gone is watched at its

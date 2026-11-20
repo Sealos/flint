@@ -387,7 +387,7 @@ pub struct DockState {
 pub struct TabState {
     /// What `dock::ActivateTab` and `dock::CloseTab` take.
     pub id: u64,
-    /// `pod_logs`, `workload_logs`, `previous_logs` or `shell`.
+    /// `pod_logs`, `workload_logs`, `previous_logs`, `shell` or `agent_activity`.
     pub kind: &'static str,
     /// The title in full (the tab cuts it in the middle).
     pub title: String,
@@ -402,6 +402,15 @@ pub struct TabState {
     pub logs: Option<LogTabState>,
     /// For shell tabs.
     pub shell: Option<ShellTabState>,
+    /// For agent activity tabs.
+    pub activity: Option<ActivityTabState>,
+}
+
+/// An agent activity tab (UP-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActivityTabState {
+    /// Each call in one line, newest first.
+    pub rows: Vec<String>,
 }
 
 /// The cluster a tab's session runs on.
@@ -447,6 +456,8 @@ pub enum TabStatusState {
     Exited { code: Option<i32> },
     /// The shell's session was closed.
     Closed,
+    /// An agent activity tab: it shows the activity log as it grows.
+    Watching,
 }
 
 /// A log tab.
@@ -456,6 +467,8 @@ pub struct LogTabState {
     pub lines: usize,
     /// Lines that arrived while paused.
     pub held_back: u64,
+    /// Older lines were dropped to keep all log tabs within the shared memory budget.
+    pub trimmed: bool,
     pub paused: bool,
     /// The session follows new lines (not a previous instance).
     pub follows: bool,

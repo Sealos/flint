@@ -7,6 +7,7 @@
 //! Sessions do not depend on which cluster is active, so they keep running across cluster
 //! switches until closed.
 
+mod budget;
 mod buffer;
 mod line;
 mod pods;
@@ -17,6 +18,7 @@ mod source;
 mod stream;
 mod workload;
 
+pub use budget::LogBudget;
 pub use buffer::{BLOCKS_PER_BUDGET, CHUNK_LINES, LogBuffer, LogLines};
 pub use line::{
     LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify, strip_controls,
@@ -31,5 +33,5 @@ pub use session::{
 pub use workload::{PodSetStatus, StreamStatus};
 
 pub(crate) use pods::{KubePodSource, list_workload_pods};
-pub(crate) use session::{SessionConfig, feed, run};
+pub(crate) use session::{Budgeted, SessionConfig, feed, run};
 pub(crate) use source::{ClientLookup, KubeLogSource, LogError};

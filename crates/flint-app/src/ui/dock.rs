@@ -1,5 +1,6 @@
 //! The bottom dock (#13): a resizable panel under the main area with one tab per session that
-//! outlives navigation (UP-42): log tabs and shell tabs (#14); AI log analysis (#56) next. Tabs
+//! outlives navigation (UP-42): log tabs, shell tabs (#14) and a cluster's agent activity
+//! (UP-16); AI log analysis (#56) next. Tabs
 //! keep running when the user switches clusters or views, and end only when closed. Each tab
 //! names the cluster its session runs on and is pinned to it: the context and the API server it
 //! pointed at ([`TabCluster`]). The strip scrolls the active tab into view, and a tab list at its
@@ -25,6 +26,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use flint_core::ClusterId;
+
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -33,6 +36,7 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, Theme, h_fle
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::activity_view::ActivityView;
 pub use super::dock_model::TabStatus;
 use super::dock_model::{self, LiveSessions, TabCluster, chip_labels, chip_tooltip};
 use super::focus::release_unfocused_input;
@@ -75,6 +79,8 @@ pub fn dock_height(saved: Option<u32>, window_height: f32) -> f32 {
 pub enum TabKey {
     Logs(LogRequest),
     Shell(ShellRequest),
+    /// A cluster's agent activity: no session, one tab per cluster.
+    Activity(ClusterId),
 }
 
 impl TabKey {
@@ -83,6 +89,7 @@ impl TabKey {
         match self {
             TabKey::Logs(request) => &request.cluster,
             TabKey::Shell(request) => &request.cluster,
+            TabKey::Activity(cluster) => cluster,
         }
     }
 }
@@ -107,6 +114,7 @@ pub trait DockItem {
 pub enum DockTab {
     Logs(Entity<LogView>),
     Shell(Entity<TerminalView>),
+    Activity(Entity<ActivityView>),
 }
 
 impl DockTab {
@@ -114,6 +122,7 @@ impl DockTab {
         match self {
             DockTab::Logs(view) => view.read(cx),
             DockTab::Shell(view) => view.read(cx),
+            DockTab::Activity(view) => view.read(cx),
         }
     }
 
@@ -121,6 +130,7 @@ impl DockTab {
         match self {
             DockTab::Logs(view) => view.clone().into(),
             DockTab::Shell(view) => view.clone().into(),
+            DockTab::Activity(view) => view.clone().into(),
         }
     }
 }
@@ -143,6 +153,7 @@ fn observe(tab: &DockTab, id: u64, cx: &mut Context<Dock>) -> Subscription {
     match tab {
         DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        DockTab::Activity(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
     }
 }
 
@@ -167,6 +178,8 @@ pub struct Dock {
     tabs: Vec<Tab>,
     active: Option<u64>,
     visible: bool,
+    /// The log tab whose session was last told it is shown ([`Dock::sync_shown_log`]).
+    shown_log: Option<u64>,
     next_id: u64,
     focus: FocusHandle,
     /// The tab strip's scroll position: the active tab is scrolled into view.
@@ -190,6 +203,7 @@ impl Dock {
             tabs: Vec::new(),
             active: None,
             visible: false,
+            shown_log: None,
             next_id: 1,
             focus: cx.focus_handle(),
             strip: ScrollHandle::new(),
@@ -242,7 +256,7 @@ impl Dock {
     pub fn active_log(&self) -> Option<&Entity<LogView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) => None,
+            DockTab::Shell(_) | DockTab::Activity(_) => None,
         }
     }
 
@@ -251,14 +265,14 @@ impl Dock {
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) => None,
+            DockTab::Logs(_) | DockTab::Activity(_) => None,
         })
     }
 
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) => None,
+            DockTab::Logs(_) | DockTab::Activity(_) => None,
         }
     }
 
@@ -271,6 +285,8 @@ impl Dock {
             let (reads_to_end, count) = match item.tab_key() {
                 TabKey::Shell(_) => (false, &mut live.shells),
                 TabKey::Logs(request) => (request.previous, &mut live.logs),
+                // Runs no session: closing it ends nothing.
+                TabKey::Activity(_) => continue,
             };
             if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
                 *count += 1;
@@ -524,6 +540,7 @@ impl Dock {
             self.visible = true;
             self.reveal_active();
         }
+        self.sync_shown_log(cx);
         cx.notify();
         id
     }
@@ -545,6 +562,26 @@ impl Dock {
         }
     }
 
+    /// Tells the log sessions which tab is shown, if any: the shared log memory budget trims
+    /// the tabs viewed least recently first, and never the one shown. Run where the shown tab
+    /// or the dock's visibility changes, and on every render for anything else (a hidden dock
+    /// is not drawn, so hiding it cannot rely on the render).
+    fn sync_shown_log(&mut self, cx: &App) {
+        let now = self
+            .active
+            .filter(|_| self.visible)
+            .filter(|id| matches!(self.tab(*id), Some(DockTab::Logs(_))));
+        if now == self.shown_log {
+            return;
+        }
+        for (id, shown) in [(self.shown_log, false), (now, true)] {
+            if let Some(DockTab::Logs(view)) = id.and_then(|id| self.tab(id)) {
+                view.read(cx).set_shown(shown);
+            }
+        }
+        self.shown_log = now;
+    }
+
     /// Shows the dock with tab `id` and focuses it.
     fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab(id).is_none() {
@@ -554,6 +591,7 @@ impl Dock {
         self.visible = true;
         self.reveal_active();
         self.focus_active(window, cx);
+        self.sync_shown_log(cx);
         cx.notify();
     }
 
@@ -595,6 +633,7 @@ impl Dock {
         release_unfocused_input(window, cx);
         // Closing a tab before the active one moves it left, maybe out of view.
         self.reveal_active();
+        self.sync_shown_log(cx);
         cx.notify();
     }
 
@@ -609,6 +648,8 @@ impl Dock {
             self.visible = true;
             self.focus_active(window, cx);
         }
+        // Hidden, the dock is not drawn, so it says so here.
+        self.sync_shown_log(cx);
         cx.notify();
     }
 
@@ -925,6 +966,7 @@ impl Dock {
 
 impl Render for Dock {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_shown_log(cx);
         let theme = cx.theme().clone();
         let root = v_flex()
             .id("dock")

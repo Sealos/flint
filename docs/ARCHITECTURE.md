@@ -350,6 +350,13 @@ ring buffer with two limits, both settings: a line count (`log_buffer_lines`, de
 (`log_buffer_mib`, default 64 MiB). Whichever is hit first evicts the oldest lines, so neither long-running streams
 nor very long lines (up to 64 KiB each) can grow memory without bound. Search runs over the buffer.
 
+All sessions also share one budget (`log_total_mib`, default 512 MiB, never below `log_buffer_mib`;
+`flint_core::logs::LogBudget`), since nothing limits how many log tabs are open. Sessions report the bytes their buffers hold when they publish; when the total is
+over the budget, the tabs viewed least recently drop their oldest blocks first (each only what its sealed blocks can
+give; the open tail block stays), then paused tabs, and never the tab shown (beyond its own `log_buffer_mib`). The dock tells the core which log tab is shown (`LogSession::set_shown`).
+Streams keep running; only history goes, and a trimmed tab says "Older lines dropped to save memory" so a short
+history is not taken for a quiet pod (#254).
+
 - **Sessions** (`flint_core::logs`): `CoreHandle::open_logs` returns a `LogSession`; dropping it stops the stream.
   Sessions belong to no cluster slot, so they keep running across cluster switches. `timestamps=true` is always
   requested, so showing timestamps is a view toggle, and a dropped stream resumes from the last timestamp (with
@@ -867,8 +874,24 @@ Rules:
     messages, annotations and argument lists reach the agent as the cluster returns them.
   - **The app is unchanged:** its log viewer, events and object views show the cluster's text as written, since
     people look at their own cluster there.
-- **Activity log (planned, M5.5, #69):** every call will be recorded (time, cluster, tool, what it named, result
-  size, cut short or denied), never the returned content, and the app will show it per cluster. Not built yet.
+- **Activity log (UP-16, `flint_core::activity`):** every call is recorded as one JSON line in
+  `agent-activity.jsonl` in the config directory: time, tool, cluster and the server it is exposed with, what the call
+  named (kind, namespace, object, container), how many items and bytes came back, whether it was cut short, and
+  whether it ended, failed or was denied (a cluster not exposed, or outside its scope; the agent reads "not found"
+  either way). The count and the cut-short flag are read from the reply's own fields, so they are what the agent saw.
+  The returned content is never recorded. At 1 MiB the file is renamed to `agent-activity.1.jsonl` (replacing the one
+  before) and a new one starts. Writers hold an exclusive `flock` on `agent-activity.lock` while they check, rotate
+  and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice; a write that
+  fails is logged and does not fail the call. The files are the owner's only (0600: they name clusters and objects),
+  and a line cut off before its newline is ended before the next record, so it costs only itself. Text fields hold
+  what the agent wrote, so each is cut at 253 bytes: an agent cannot flush the log with a few huge names. Each record
+  also has stable keys (FNV-1a) of the full context and server, which the app matches by. The server is the one the
+  call's own settings and kubeconfig resolved. A call the router answers without running its tool (an unknown tool,
+  arguments that do not fit) is recorded as failed, with what its arguments name. A context re-pointed at another
+  server is another cluster: its activity tab shows the calls on the server it was opened for, newest first, and
+  offers Edit AI Scope only while the context still points there. The core watches both files beside `settings.toml` and sends
+  the log to the app (`Event::AgentActivity`) at start and whenever it changes. The cluster's "AI" badge, or Show
+  Agent Activity, opens a dock tab with the cluster's calls, newest first, and Edit AI Scope.
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
   and 500 log lines), and lists, objects and logs are also capped at 256 KiB. When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
@@ -1044,11 +1067,11 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 ## Settings and state
 
-- Both files live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
+- These files live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
   on macOS and `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux. `state.toml` stays beside
   `settings.toml` on Linux too, rather than in `$XDG_STATE_HOME`, so one directory and one override hold everything
   ([ADR-0016](./adr/0016-linux-appimage.md)).
-- `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
+- `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`, and `log_total_mib` for all tabs together), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
   analysis line limit, and a `claude` binary override.
@@ -1057,6 +1080,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   filter of each cluster, and each list's sort per cluster and kind (`[list_sorts.<cluster>]`, the column's key and
   direction; a column that is gone falls back to the kind's default order). Planned: per cluster, the expanded "… N
   more" rows of the tree and the old-revisions toggle.
+- `agent-activity.jsonl` and `agent-activity.1.jsonl`: the agent activity log, written by `flint mcp` and rotated at
+  1 MiB ([MCP server](#mcp-server)).
 - `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
   ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.

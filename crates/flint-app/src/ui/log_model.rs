@@ -645,6 +645,13 @@ pub fn toolbar_fit(width: Option<f32>) -> ToolbarFit {
     }
 }
 
+/// What a tab says once the shared log memory budget made it drop lines: so a short history
+/// is not taken for a quiet pod.
+pub const TRIMMED_TEXT: &str = "Older lines dropped to save memory";
+/// The same, in full, in the status's tooltip.
+pub const TRIMMED_TOOLTIP: &str = "Older lines were dropped to keep all log tabs within \
+                                   log_total_mib; the tab shown is trimmed last";
+
 /// What the pause indicator says: why it is paused, and how many lines wait.
 pub fn pause_text(held_back: u64, by_selection: bool) -> String {
     let why = if by_selection {

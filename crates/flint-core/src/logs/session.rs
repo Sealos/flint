@@ -17,6 +17,7 @@ use k8s_openapi::jiff::Timestamp;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
+use super::budget::LogBudget;
 use super::buffer::{LogBuffer, LogLines};
 use super::line::LogLine;
 use super::pods::{PodSource, WorkloadTarget};
@@ -155,6 +156,9 @@ pub struct LogSnapshot {
     /// A workload session's pods and streams: how many are live, failed or capped. `None` for a
     /// pod session (and before a workload session first reports).
     pub pods: Option<Arc<PodSetStatus>>,
+    /// Older lines were dropped to keep all log tabs within the shared memory budget
+    /// (`log_total_mib`, [`super::LogBudget`]), not only by this session's own caps.
+    pub trimmed: bool,
 }
 
 impl LogSnapshot {
@@ -166,6 +170,7 @@ impl LogSnapshot {
             held_back: 0,
             version: 0,
             pods: None,
+            trimmed: false,
         }
     }
 }
@@ -273,6 +278,8 @@ pub(crate) struct Output {
     frozen: Option<LogLines>,
     /// [`LogBuffer::dropped_blocks`] when `frozen` was last trimmed.
     frozen_dropped: u64,
+    /// The shared budget made this session drop lines.
+    trimmed: bool,
     version: u64,
     dirty: bool,
 }
@@ -286,6 +293,7 @@ impl Output {
             published: LogLines::default(),
             frozen: None,
             frozen_dropped: 0,
+            trimmed: false,
             version: 0,
             dirty: true,
         }
@@ -294,6 +302,20 @@ impl Output {
     pub fn append(&mut self, line: LogLine) {
         self.buffer.push(line);
         self.dirty = true;
+        self.trim_frozen();
+    }
+
+    /// Gives memory back to the shared budget: drops the oldest blocks down to `bytes`.
+    fn trim_to(&mut self, bytes: usize) {
+        if self.buffer.trim_to(bytes) {
+            self.trimmed = true;
+            self.dirty = true;
+            self.trim_frozen();
+        }
+    }
+
+    /// Keeps a paused view from holding blocks the buffer dropped.
+    fn trim_frozen(&mut self) {
         if let Some(frozen) = &mut self.frozen
             && self.frozen_dropped != self.buffer.dropped_blocks()
         {
@@ -335,19 +357,52 @@ impl Output {
             paused: self.frozen.is_some(),
             version: self.version,
             pods: self.pods.clone(),
+            trimmed: self.trimmed,
         }));
         self.dirty = false;
     }
 }
 
+/// A session's place in the shared budget: registered while it runs.
+pub(crate) struct Budgeted {
+    budget: Arc<LogBudget>,
+    id: u64,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Budgeted {
+    pub fn new(budget: Arc<LogBudget>, id: u64) -> Self {
+        let wake = budget.register(id);
+        Budgeted { budget, id, wake }
+    }
+}
+
+impl Drop for Budgeted {
+    fn drop(&mut self) {
+        self.budget.unregister(self.id);
+    }
+}
+
 /// Runs a session until every receiver of `tx` is gone. `paused` pauses and resumes delivery.
+/// With `budget`, the session reports its bytes when it publishes and drops its oldest lines
+/// when the shared budget asks.
 pub(crate) async fn run(
     mut feed: Box<dyn Feed>,
     config: SessionConfig,
     tx: watch::Sender<Arc<LogSnapshot>>,
     mut paused: watch::Receiver<bool>,
+    budget: Option<Budgeted>,
 ) {
     let mut out = Output::new(&config);
+    // `notify_one` keeps a permit while nobody waits, so a request made between two turns of
+    // the loop is not lost.
+    let wake = budget.as_ref().map(|b| b.wake.clone());
+    let trim_asked = || async {
+        match &wake {
+            Some(wake) => wake.notified().await,
+            None => std::future::pending().await,
+        }
+    };
     let mut tick = tokio::time::interval(config.publish_every);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pause_open = true;
@@ -363,8 +418,31 @@ pub(crate) async fn run(
                 }
                 let paused = *paused.borrow_and_update();
                 out.set_paused(paused);
+                // Paused tabs are trimmed after idle ones: say so now, not with the next
+                // snapshot.
+                if let Some(b) = &budget {
+                    b.budget.set_paused(b.id, paused);
+                }
             }
-            _ = tick.tick(), if out.dirty => out.publish(&tx),
+            () = trim_asked() => {
+                if let Some(b) = &budget
+                    && let Some(bytes) = b.budget.take_trim(b.id)
+                {
+                    out.trim_to(bytes);
+                    b.budget.trimmed(b.id, out.buffer.bytes(), out.buffer.trimmable_bytes());
+                }
+            }
+            _ = tick.tick(), if out.dirty => {
+                out.publish(&tx);
+                if let Some(b) = &budget {
+                    b.budget.report(
+                        b.id,
+                        out.buffer.bytes(),
+                        out.buffer.trimmable_bytes(),
+                        out.frozen.is_some(),
+                    );
+                }
+            }
             () = std::future::poll_fn(|cx| feed.poll(cx, &mut out)) => {}
         }
     }
@@ -477,7 +555,7 @@ mod tests {
         paused: watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let feed = PodFeed::new(fake, target(), options, &config);
-        tokio::spawn(run(Box::new(feed), config, tx, paused))
+        tokio::spawn(run(Box::new(feed), config, tx, paused, None))
     }
 
     fn start(scripts: Vec<Script>, options: LogOptions, limit: usize) -> Running {
@@ -526,6 +604,110 @@ mod tests {
     }
 
     const T1: &str = "2024-05-01T12:00:01.100Z";
+
+    // covers UP-40, UP-42: open tabs share one memory budget; the least recently viewed gives
+    // lines back first, the shown one keeps its own cap, and streams keep running (#254).
+    #[tokio::test(start_paused = true)]
+    async fn sessions_share_one_budget_least_recently_viewed_first() {
+        const PER_SESSION: usize = 256 * 1024;
+        // Two full tabs, and room for the open tail blocks the least recently viewed tab
+        // cannot give back, so it alone covers the excess.
+        const TOTAL: usize = 2 * PER_SESSION + 2 * (PER_SESSION / crate::logs::BLOCKS_PER_BUDGET);
+        let budget = LogBudget::new(TOTAL);
+        // Three tabs, opened in order; the third is shown.
+        let mut feeds = Vec::new();
+        let mut tabs = Vec::new();
+        for id in 1..=3u64 {
+            let (lines, rx) = futures::channel::mpsc::unbounded();
+            let fake = Arc::new(Fake::default());
+            fake.scripts.lock().unwrap().push_back(Script::Feed(rx));
+            let (tx, snapshots) = watch::channel(Arc::new(LogSnapshot::connecting()));
+            let (_paused, paused_rx) = watch::channel(false);
+            let config = SessionConfig {
+                budget: PER_SESSION,
+                ..config(1_000_000)
+            };
+            let feed = PodFeed::new(fake, target(), LogOptions::default(), &config);
+            let budgeted = Budgeted::new(budget.clone(), id);
+            tokio::spawn(run(Box::new(feed), config, tx, paused_rx, Some(budgeted)));
+            feeds.push(lines);
+            tabs.push((snapshots, _paused));
+        }
+        // Tab 1 was viewed before tab 2; tab 3 is shown now.
+        for id in [1, 2] {
+            budget.set_shown(id, true);
+            budget.set_shown(id, false);
+        }
+        budget.set_shown(3, true);
+
+        // Each tab fills to its own cap in turn, the shown one last: 3 × 256 KiB of lines
+        // against about 512 KiB for all, so only the last one's growth goes over.
+        let line = "x".repeat(200);
+        for feed in &feeds {
+            for n in 0..3_000 {
+                feed.unbounded_send(format!("{n} {line}")).unwrap();
+                if n % 100 == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        let latest = |tab: &mut (watch::Receiver<Arc<LogSnapshot>>, watch::Sender<bool>)| {
+            tab.0.borrow_and_update().clone()
+        };
+        let snaps: Vec<Arc<LogSnapshot>> = tabs.iter_mut().map(latest).collect();
+        // What the tabs really hold, from their lines: within the budget, give or take an open
+        // tail block per tab. A full tab sits a few blocks under its own cap, which evicts whole
+        // blocks.
+        let held = |s: &LogSnapshot| -> usize { s.lines.iter().map(|(_, l)| l.heap_bytes()).sum() };
+        let block = PER_SESSION / crate::logs::BLOCKS_PER_BUDGET;
+        let total: usize = snaps.iter().map(|s| held(s)).sum();
+        assert!(
+            total <= TOTAL + 3 * block,
+            "{total} bytes held, budget {TOTAL}"
+        );
+        assert!(
+            snaps[0].trimmed,
+            "the least recently viewed tab gave lines back"
+        );
+        // Tab 1 gave back what was needed; tab 2, viewed more recently, nothing.
+        assert!(!snaps[1].trimmed, "tab 2 was not needed");
+        assert!(
+            held(&snaps[1]) + 4 * block >= PER_SESSION,
+            "tab 2 holds {} of {PER_SESSION}",
+            held(&snaps[1])
+        );
+        assert!(!snaps[2].trimmed, "the shown tab keeps its own cap");
+        assert!(
+            held(&snaps[2]) + 4 * block >= PER_SESSION,
+            "the shown tab is full: {} of {PER_SESSION}",
+            held(&snaps[2])
+        );
+        assert!(
+            snaps[0].lines.len() < snaps[1].lines.len(),
+            "tab 1 ({}) was trimmed before tab 2 ({})",
+            snaps[0].lines.len(),
+            snaps[1].lines.len()
+        );
+        assert!(snaps[2].lines.len() >= snaps[1].lines.len());
+
+        // A trimmed tab still streams.
+        feeds[0]
+            .unbounded_send("after the trim".to_owned())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let tab1 = latest(&mut tabs[0]);
+        assert_eq!(
+            tab1.lines
+                .iter()
+                .last()
+                .map(|(_, l)| l.text.to_string())
+                .as_deref(),
+            Some("after the trim")
+        );
+        assert!(tab1.trimmed);
+    }
 
     // covers UP-40
     #[tokio::test(start_paused = true)]

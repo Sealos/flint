@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use flint_core::activity::ActivityRecord;
 use flint_core::settings::{AiExposureState, AiScope, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
@@ -31,6 +32,8 @@ pub struct ClustersModel {
     pub last_error: Option<String>,
     /// The latest discovery result per cluster, and why the last discovery failed, if it did.
     pub discovery: HashMap<ClusterId, Discovered>,
+    /// The agent activity log, every cluster's, oldest first (UP-16).
+    pub agent_activity: Arc<Vec<ActivityRecord>>,
     /// The cluster to activate once kubeconfig is loaded (`FLINT_CLUSTER`). Taken on first load.
     startup_cluster: Option<String>,
     _events: Task<()>,
@@ -64,6 +67,7 @@ impl ClustersModel {
             settings_error: None,
             last_error: None,
             discovery: HashMap::new(),
+            agent_activity: Arc::default(),
             startup_cluster,
             _events: task,
         }
@@ -108,6 +112,7 @@ impl ClustersModel {
                 self.discovery
                     .insert(cluster, Discovered { discovery, error });
             }
+            Event::AgentActivity(records) => self.agent_activity = records,
             Event::Error(message) => {
                 tracing::warn!("{message}");
                 self.last_error = Some(message);

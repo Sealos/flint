@@ -495,7 +495,7 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
         let dock = ws.dock.read(cx);
         match dock.tab(dock.tab_ids()[0]).unwrap() {
             DockTab::Logs(view) => view.downgrade(),
-            DockTab::Shell(_) => panic!("a log tab"),
+            DockTab::Shell(_) | DockTab::Activity(_) => panic!("a log tab"),
         }
     });
 
