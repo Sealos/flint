@@ -523,11 +523,12 @@ fn up_41_sh_fallback_container_picker_and_paste() -> Result<()> {
         app.press_key("secondary-shift-e")?;
         Ok(())
     })?;
-    let state = app.wait_for(&at(i, "status/state"), Equals("running".into()))?;
-    assert_eq!(
-        tab_at(&state, i)["status"],
-        json!({"state": "running", "command": "/bin/sh"})
-    );
+    // The tab reads "running bash" from the moment bash's exec connects until the container
+    // says bash is missing; wait for sh rather than for the first "running".
+    let state = app.wait_for(
+        &at(i, "status"),
+        Equals(json!({"state": "running", "command": "/bin/sh"})),
+    )?;
     assert_eq!(
         tab_at(&state, i)["title"],
         format!("Shell: {PODINFO} · podinfo")
@@ -614,14 +615,14 @@ fn up_41_sh_fallback_container_picker_and_paste() -> Result<()> {
         )?;
         Ok(())
     })?;
-    let state = app.wait_for(&at(j, "status/state"), Equals("running".into()))?;
+    // As above: bash runs briefly before the container says it is missing.
+    let state = app.wait_for(
+        &at(j, "status"),
+        Equals(json!({"state": "running", "command": "/bin/sh"})),
+    )?;
     assert_eq!(
         tab_at(&state, j)["title"],
         format!("Shell: {MULTI} · sidecar")
-    );
-    assert_eq!(
-        tab_at(&state, j)["status"],
-        json!({"state": "running", "command": "/bin/sh"})
     );
     wait_for_row(&app, j, "/ #")?;
     let requests = fake.exec_requests();
