@@ -72,6 +72,17 @@ impl LineSelection {
         (self.start()..=self.end()).contains(&id)
     }
 
+    /// How many selected lines are in `lines`, without visiting them: what the selection hint
+    /// and the copy note count, every frame if need be.
+    pub fn present_len(&self, lines: &LogLines) -> u64 {
+        let Some(last) = lines.end_id().checked_sub(1).filter(|_| !lines.is_empty()) else {
+            return 0;
+        };
+        let start = self.start().max(lines.first_id());
+        let end = self.end().min(last);
+        if start > end { 0 } else { end - start + 1 }
+    }
+
     /// Whether some selected lines are no longer (or not yet) in `lines`.
     pub fn is_cut(&self, lines: &LogLines) -> bool {
         !(lines.contains(self.start()) && lines.contains(self.end()))
@@ -183,13 +194,44 @@ mod tests {
         assert!(sel.is_cut(&view));
         assert_eq!(sel.clamp(&view), Some(LineSelection::new(3, 2)));
         assert_eq!(sel.text(&view, false), "line 2\nline 3");
+        assert_eq!(sel.present_len(&view), 2);
 
         for n in 6..10 {
             buf.push(LogLine::parse(&format!("line {n}"), false));
         }
         assert_eq!(sel.clamp(&buf.view()), None);
         assert_eq!(sel.text(&buf.view(), false), "");
+        assert_eq!(sel.present_len(&buf.view()), 0);
         assert_eq!(LineSelection::line(0).clamp(&LogLines::default()), None);
+    }
+
+    // covers UP-40: the count matches the lines visited, cut at either end or not.
+    #[test]
+    fn present_len_counts_without_visiting_the_lines() {
+        let mut buf = buffer(6, 6);
+        for n in 6..9 {
+            buf.push(LogLine::parse(&format!("line {n}"), false));
+        }
+        // Lines 3..=8 are present.
+        let view = buf.view();
+        for (a, h) in [
+            (0, 2),
+            (0, 4),
+            (4, 6),
+            (5, 12),
+            (9, 12),
+            (3, 8),
+            (0, 20),
+            (7, 7),
+        ] {
+            let sel = LineSelection::new(h, a);
+            assert_eq!(
+                sel.present_len(&view),
+                sel.lines(&view).count() as u64,
+                "{a}..={h}"
+            );
+        }
+        assert_eq!(LineSelection::line(0).present_len(&LogLines::default()), 0);
     }
 
     // covers UP-45

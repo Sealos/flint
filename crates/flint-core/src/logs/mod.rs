@@ -22,7 +22,7 @@ pub use line::{
     LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify, strip_controls,
 };
 pub use pods::{Freshness, PodSet, WorkloadKind, WorkloadPod, WorkloadTarget};
-pub use search::{LogSearch, SearchQuery};
+pub use search::{LogSearch, SearchMatcher, SearchQuery};
 pub use selection::LineSelection;
 pub use session::{
     LogOptions, LogSince, LogSnapshot, LogState, LogSubject, LogTarget, MAX_STREAMS,

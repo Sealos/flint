@@ -415,7 +415,8 @@ pub struct SearchState {
     pub matches: usize,
     /// The current match's position among them, from 1.
     pub current: Option<usize>,
-    /// The first scan of the buffer is still running.
+    /// A scan runs on the core's threads (the first of the query, or a long catch-up): the
+    /// matches are not known yet, and `matches` is 0.
     pub searching: bool,
 }
 

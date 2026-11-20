@@ -29,20 +29,34 @@ impl LogView {
             wrap: self.wrap,
             search: SearchState {
                 query: self.query.text.clone(),
-                matches: self.search.count(),
-                current: self
-                    .current_match
-                    .and_then(|id| self.search.matches().binary_search(&id).ok())
-                    .map(|ix| ix + 1),
+                matches: self.match_count(),
+                // Among the matches of the lines shown: evicted ones lead the list until the
+                // next scan drops them.
+                current: self.current_match.and_then(|id| {
+                    let matches = self.search.matches();
+                    let evicted = matches.partition_point(|m| *m < self.snapshot.lines.first_id());
+                    matches.binary_search(&id).ok().map(|ix| ix - evicted + 1)
+                }),
                 searching: self.searching,
             },
             selection: self.selection.map(|s| SelectionState {
                 first: s.start(),
                 last: s.end(),
-                lines: s.end() - s.start() + 1,
+                // As the hint counts them: the selected lines still shown.
+                lines: s.present_len(&self.snapshot.lines),
             }),
             streams: self.snapshot.pods.as_deref().map(stream_counts),
             last_lines: last_lines(&self.snapshot.lines, LogTabState::LINE_LIMIT),
+        }
+    }
+
+    /// How many lines shown match, as [`LogView::has_matches`] sees them. 0 while a scan runs
+    /// on the core's threads.
+    fn match_count(&self) -> usize {
+        if self.searching {
+            0
+        } else {
+            self.search.count_in(&self.snapshot.lines)
         }
     }
 

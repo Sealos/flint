@@ -135,8 +135,11 @@ impl LogView {
         self.selection.is_some()
     }
 
-    pub(in crate::ui) fn match_count(&self) -> usize {
-        self.search.count()
+    /// Whether a line shown matches the search, counting lines that arrived since the last
+    /// scan and not evicted ones: what Next and Previous Match, and Save Matching Lines, need.
+    /// `false` while a scan runs on the core's threads, whose matches are not known yet.
+    pub(in crate::ui) fn has_matches(&self) -> bool {
+        !self.searching && self.search.has_match_in(&self.snapshot.lines)
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
@@ -155,7 +158,8 @@ impl LogView {
         let reason = match scope {
             _ if !self.has_lines() => Some("no lines are shown"),
             SaveScope::All => None,
-            SaveScope::Matches if self.search.count() == 0 => Some("no lines match the search"),
+            SaveScope::Matches if self.searching => Some("still searching…"),
+            SaveScope::Matches if !self.has_matches() => Some("no lines match the search"),
             SaveScope::Matches => None,
             SaveScope::Selection if self.selection.is_none() => Some("no lines are selected"),
             SaveScope::Selection => None,
@@ -195,7 +199,13 @@ impl LogView {
         cx.notify();
     }
 
+    /// Goes to the next match, wrapping around. Nothing while a scan runs on the core's threads
+    /// (the guard refuses it then).
     pub(super) fn next_match(&mut self, _: &NextMatch, _: &mut Window, cx: &mut Context<Self>) {
+        if self.searching {
+            return;
+        }
+        self.catch_up_now();
         let next = self
             .search
             .next_after(self.current_match)
@@ -203,7 +213,12 @@ impl LogView {
         self.go_to_match(next, cx);
     }
 
+    /// Goes to the previous match, wrapping around; see [`LogView::next_match`].
     pub(super) fn prev_match(&mut self, _: &PrevMatch, _: &mut Window, cx: &mut Context<Self>) {
+        if self.searching {
+            return;
+        }
+        self.catch_up_now();
         let prev = self
             .search
             .prev_before(self.current_match)
@@ -262,29 +277,87 @@ impl LogView {
         }
     }
 
+    /// Copies the selected lines as shown now. The text is built off the UI thread (a million
+    /// lines take a fifth of a second), then put on the clipboard, also if the tab closed
+    /// meanwhile (as a save finishes). Only the app's latest copy lands ([`LatestCopy`]): an
+    /// older one still being built, in this tab or another, never replaces it.
     fn copy_lines(&mut self, _: &CopyLines, _: &mut Window, cx: &mut Context<Self>) {
         let Some(selection) = self.selection else {
             cx.propagate();
             return;
         };
-        let count = selection.lines(&self.snapshot.lines).count() as u64;
-        let text = self.selection_text().unwrap_or_default();
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.set_note(
-            Tone::Muted,
-            format!(
-                "Copied {} as shown, not redacted.",
-                log_model::line_count(count)
-            ),
-            cx,
-        );
-        cx.notify();
+        let lines = self.snapshot.lines.clone();
+        let count = selection.present_len(&lines);
+        let format = self.format();
+        let copy = LatestCopy::start(cx);
+        cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_spawn(async move { selection.text_as(&lines, format) })
+                .await;
+            if !cx.update(|cx| LatestCopy::land(copy, text, cx)) {
+                return;
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.set_note(
+                    Tone::Muted,
+                    format!(
+                        "Copied {} as shown, not redacted.",
+                        log_model::line_count(count)
+                    ),
+                    cx,
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+/// The app's latest copy of log lines, by number: copies are built off the UI thread, and
+/// one asked for later (in any tab) must not be replaced by an older one that took longer.
+#[derive(Default)]
+pub(in crate::ui) struct LatestCopy(u64);
+
+impl Global for LatestCopy {}
+
+impl LatestCopy {
+    /// A new copy, now the latest: its number.
+    pub(in crate::ui) fn start(cx: &mut App) -> u64 {
+        let latest = cx.default_global::<LatestCopy>();
+        latest.0 += 1;
+        latest.0
+    }
+
+    /// Puts copy `copy`'s `text` on the clipboard if no copy was asked for since. Whether it
+    /// did.
+    pub(in crate::ui) fn land(copy: u64, text: String, cx: &mut App) -> bool {
+        let latest = cx.try_global::<LatestCopy>().is_some_and(|l| l.0 == copy);
+        if latest {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        latest
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::ui::registry::{Scope, tests::assert_binds_scope};
+
+    // covers UP-44: of copies in flight, the latest asked for wins, whichever lands last.
+    #[gpui_kit::test]
+    fn only_the_latest_copy_lands(cx: &mut gpui_kit::TestAppContext) {
+        use super::LatestCopy;
+        let clipboard =
+            |cx: &mut gpui_kit::TestAppContext| cx.read_from_clipboard().and_then(|c| c.text());
+        let (slow, fast) = cx.update(|cx| (LatestCopy::start(cx), LatestCopy::start(cx)));
+        assert!(cx.update(|cx| LatestCopy::land(fast, "fast".into(), cx)));
+        assert!(!cx.update(|cx| LatestCopy::land(slow, "slow".into(), cx)));
+        assert_eq!(clipboard(cx).as_deref(), Some("fast"));
+        // In order, each lands.
+        let next = cx.update(LatestCopy::start);
+        assert!(cx.update(|cx| LatestCopy::land(next, "next".into(), cx)));
+        assert_eq!(clipboard(cx).as_deref(), Some("next"));
+    }
 
     // The handlers run through a window in `log_tests.rs`.
     #[test]

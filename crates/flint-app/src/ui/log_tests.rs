@@ -172,6 +172,12 @@ fn feed(cx: &mut TestAppContext, view: &Entity<LogView>, snapshot: Arc<LogSnapsh
     view.update(cx, |view, cx| view.set_snapshot(snapshot, cx));
 }
 
+/// Draws one frame of `window`.
+fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
 fn line_id(id: u64) -> (&'static str, usize) {
     ("log-line", id as usize)
 }
@@ -403,9 +409,13 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
         "2 of 4"
     );
 
-    // Following keeps matching new lines, without a new scan.
+    // Following keeps matching new lines, without a new scan, by the time they are drawn.
     feed(cx, &view, lines.push(20, 30).streaming());
-    assert_eq!(view.read_with(cx, |v, _| v.search.count()), 6);
+    draw(cx, window);
+    assert_eq!(
+        view.read_with(cx, |v, _| (v.searching, v.search.count())),
+        (false, 6)
+    );
     // Wrapping around: next from the last match is the first.
     view.update(cx, |v, _| v.current_match = Some(29));
     press(cx, window, "secondary-g");
@@ -1530,4 +1540,383 @@ async fn the_state_reports_a_workloads_streams_and_sources(cx: &mut TestAppConte
     );
     press(cx, window, "p");
     assert_eq!(state(cx, &view)["tab"]["sources"], false);
+}
+
+/// Draws `frames` frames of `window` and returns the time one took.
+fn frame_cost(cx: &mut TestAppContext, window: AnyWindowHandle, frames: u32) -> Duration {
+    let started = std::time::Instant::now();
+    for _ in 0..frames {
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    started.elapsed() / frames
+}
+
+/// A quick measure of what a log tab costs on the UI thread (in the headless test window): a
+/// frame with a large selection, a copy of it, and the snapshots a hidden tab with a search takes
+/// in. Ignored: run it in release mode with `--ignored --nocapture` to compare changes.
+#[gpui_kit::test]
+#[ignore = "measurement: run with --release --ignored --nocapture"]
+async fn measure_log_tab_costs(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+
+    // A frame and a copy with every one of 1M lines selected.
+    let (window, view) = open(cx, core.clone());
+    let mut lines = Feed::new(1_000_000);
+    feed(cx, &view, lines.push(0, 1_000_000).streaming());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-view").is_some()
+    })
+    .await;
+    view.update(cx, |v, _| {
+        v.selection = Some(LineSelection::new(0, 999_999))
+    });
+    let per_frame = frame_cost(cx, window, 50);
+    eprintln!("1M lines selected: {per_frame:?} per frame");
+    let started = std::time::Instant::now();
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(Box::new(registry::CopyLines), cx)
+    })
+    .unwrap();
+    let copy = started.elapsed();
+    cx.run_until_parked();
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied.lines().count(), 1_000_000);
+    eprintln!("copy of 1M lines: {copy:?} on the UI thread");
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+
+    // A tab of 100k lines that follows a fast pod: 100 snapshots of 1,600 new lines each,
+    // which evict as many. The tab is hidden (not drawn), so this is what a snapshot costs.
+    let (window, shelf, view) = open_on_shelf(cx, core);
+    let mut lines = Feed::new(100_000);
+    feed(cx, &view, lines.push(0, 100_000).streaming());
+    cx.run_until_parked();
+    let show = |cx: &mut TestAppContext, shown| {
+        shelf.update(cx, |s, cx| {
+            s.shown = shown;
+            cx.notify();
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    };
+    show(cx, false);
+    let snapshots: Vec<_> = (0..100u64)
+        .map(|i| {
+            let from = 100_000 + i * 1_600;
+            lines.push(from, from + 1_600).streaming()
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    for snapshot in &snapshots[..50] {
+        feed(cx, &view, snapshot.clone());
+    }
+    let plain = started.elapsed() / 50;
+    eprintln!("hidden tab, snapshot of 1.6k new lines in 100k, no search: {plain:?}");
+
+    // The same with a search.
+    view.update(cx, |v, cx| v.set_query("error line 9".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    let started = std::time::Instant::now();
+    for snapshot in &snapshots[50..] {
+        feed(cx, &view, snapshot.clone());
+    }
+    let searched = started.elapsed() / 50;
+    eprintln!("hidden tab, snapshot of 1.6k new lines in 100k, with a search: {searched:?}");
+    let started = std::time::Instant::now();
+    show(cx, true);
+    eprintln!(
+        "first frame once shown (80k lines behind): {:?}",
+        started.elapsed()
+    );
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    show(cx, true);
+    let expected = lines
+        .buffer
+        .view()
+        .range(lines.buffer.first_id(), lines.buffer.last_id().unwrap() + 1)
+        .filter(|(_, l)| l.text.contains("ERROR line 9"))
+        .count();
+    assert_eq!(view.read_with(cx, |v, _| v.search.count()), expected);
+}
+
+/// A log tab in a host that draws it only while `shown`, as the dock draws only the tab shown.
+struct Shelf {
+    log: Entity<LogView>,
+    shown: bool,
+}
+
+impl Render for Shelf {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .children(self.shown.then(|| self.log.clone()))
+    }
+}
+
+/// A log tab on a [`Shelf`], shown, reading snapshots only from the test.
+fn open_on_shelf(
+    cx: &mut TestAppContext,
+    core: CoreHandle,
+) -> (AnyWindowHandle, Entity<Shelf>, Entity<LogView>) {
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        registry::init(cx);
+    });
+    cx.update(|cx| {
+        let (window, shelf) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(1000.), px(400.)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| {
+                    let log = cx.new(|cx| {
+                        let mut view = LogView::new(core, request(), window, cx);
+                        view.stop_streaming();
+                        view
+                    });
+                    Shelf { log, shown: true }
+                })
+            },
+        )
+        .unwrap();
+        let log = shelf.read(cx).log.clone();
+        (window, shelf, log)
+    })
+}
+
+// covers UP-43: a tab that is not drawn (hidden behind another tab, or with the dock hidden)
+// scans nothing as lines arrive; once drawn, its search has every match of the lines shown,
+// without those evicted meanwhile. Far behind, it catches up on the core's threads.
+#[gpui_kit::test]
+async fn a_hidden_tab_catches_up_its_search_when_shown(cx: &mut TestAppContext) {
+    use super::CATCH_UP_ON_UI;
+
+    let (core, _dir) = core();
+    let (window, shelf, view) = open_on_shelf(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 4
+    })
+    .await;
+
+    // Hidden: snapshots leave the search behind (2,000 lines, 1,000 of them evicted).
+    shelf.update(cx, |s, cx| {
+        s.shown = false;
+        cx.notify();
+    });
+    draw(cx, window);
+    for from in (20..2020).step_by(100) {
+        feed(cx, &view, lines.push(from, from + 100).streaming());
+    }
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.search.count(), 4, "nothing scanned while hidden");
+        assert_eq!(v.search.pending(&v.snapshot.lines), 1000);
+    });
+    let show = |cx: &mut TestAppContext, shown| {
+        shelf.update(cx, |s, cx| {
+            s.shown = shown;
+            cx.notify();
+        });
+        draw(cx, window);
+    };
+    show(cx, true);
+    let expected: Vec<u64> = (1020..2020).filter(|n| n % 5 == 4).collect();
+    view.read_with(cx, |v, _| {
+        assert!(!v.searching);
+        assert_eq!(
+            v.search.matches().iter().copied().collect::<Vec<_>>(),
+            expected
+        );
+    });
+
+    // Far behind: the catch-up runs off the UI thread, and lands with the same result.
+    let mut lines = Feed::new(CATCH_UP_ON_UI as usize * 2);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("ERROR".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    show(cx, false);
+    let end = 10 + CATCH_UP_ON_UI + 1;
+    feed(cx, &view, lines.push(10, end).streaming());
+    assert_eq!(view.read_with(cx, |v, _| v.search.count()), 2);
+    show(cx, true);
+    assert!(view.read_with(cx, |v, _| v.searching), "scans on the core");
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.pending(&v.snapshot.lines) == 0
+    })
+    .await;
+    let expected = (0..end).filter(|n| n % 5 == 4).count();
+    assert_eq!(view.read_with(cx, |v, _| v.search.count()), expected);
+}
+
+// covers UP-44: the selection hint counts the lines present, also when the selection is cut,
+// and a copy of many lines lands on the clipboard with its note.
+#[gpui_kit::test]
+async fn a_large_selection_is_counted_and_copied(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(30_000);
+    feed(cx, &view, lines.push(0, 30_000).streaming());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-view").is_some()
+    })
+    .await;
+    press(cx, window, "secondary-a");
+    // Lines 0..=29,999 are selected; the next snapshot evicts the first 10,000.
+    feed(
+        cx,
+        &view,
+        lines
+            .push(30_000, 40_000)
+            .snapshot(LogState::Streaming, true, 0),
+    );
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        let selection = v.selection.unwrap();
+        assert_eq!(selection, LineSelection::new(10_000, 29_999));
+        assert_eq!(selection.present_len(&v.snapshot.lines), 20_000);
+    });
+    press(cx, window, "secondary-c");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied.lines().count(), 20_000);
+    assert!(copied.starts_with("line 10000\n"), "{}", &copied[..20]);
+    let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
+    assert_eq!(note, "Copied 20,000 lines as shown, not redacted.");
+}
+
+// covers UP-43: between a snapshot and the next frame (here, a tab not drawn), Next Match and
+// Save Matching Lines see the lines shown: not matches evicted meanwhile, and new ones. While
+// a catch-up runs on the core's threads, they are refused.
+#[gpui_kit::test]
+async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppContext) {
+    use super::CATCH_UP_ON_UI;
+    use crate::ui::registry::NextMatch;
+
+    let (core, _dir) = core();
+    let (window, shelf, view) = open_on_shelf(cx, core);
+    let mut lines = Feed::new(4);
+    // Lines 6..10 are kept: the error at 9 matches.
+    feed(cx, &view, lines.push(0, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 1
+    })
+    .await;
+    shelf.update(cx, |s, cx| {
+        s.shown = false;
+        cx.notify();
+    });
+    draw(cx, window);
+
+    // Lines 10..14 evict the match and hold none.
+    feed(cx, &view, lines.push(10, 14).streaming());
+    view.read_with(cx, |v, _| {
+        assert!(!v.has_matches(), "the evicted matches do not count");
+        assert!(v.check_save(SaveScope::Matches).is_err());
+    });
+    // Line 14 matches, not scanned yet.
+    feed(cx, &view, lines.push(14, 15).streaming());
+    view.read_with(cx, |v, _| {
+        assert!(v.has_matches());
+        assert!(v.check_save(SaveScope::Matches).is_ok());
+        let search = v.view_state().search;
+        assert_eq!((search.matches, search.searching), (1, false));
+    });
+    let next = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.next_match(&NextMatch, window, cx))
+        })
+        .unwrap();
+        view.read_with(cx, |v, _| v.current_match)
+    };
+    assert_eq!(next(cx), Some(14));
+
+    // Far behind: shown, it scans on the core's threads, and the actions wait for it.
+    let mut lines = Feed::new(CATCH_UP_ON_UI as usize * 2);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("ERROR".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    feed(
+        cx,
+        &view,
+        lines.push(10, 10 + CATCH_UP_ON_UI + 1).streaming(),
+    );
+    shelf.update(cx, |s, cx| {
+        s.shown = true;
+        cx.notify();
+    });
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(v.searching);
+        assert!(!v.has_matches());
+        let search = v.view_state().search;
+        assert_eq!((search.matches, search.searching), (0, true));
+        let refused = v.check_save(SaveScope::Matches).unwrap_err();
+        assert!(refused.to_string().contains("still searching"), "{refused}");
+    });
+    assert_eq!(next(cx), None, "nothing moves while searching");
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    assert_eq!(next(cx), Some(4));
+}
+
+// covers UP-44: a copy still being built when the tab closes reaches the clipboard; of copies
+// in flight, the latest asked for wins, whichever lands last: a slow copy of many lines then a
+// fast one with the tab closed in between, and copies from two tabs. Several iterations, so
+// the copies finish in different orders.
+#[gpui_kit::test(iterations = 20)]
+async fn a_copy_lands_after_its_tab_closes(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core.clone());
+    let (other_window, other) = open(cx, core);
+    let mut lines = Feed::new(50_000);
+    let snapshot = lines.push(0, 50_000).streaming();
+    feed(cx, &view, snapshot.clone());
+    feed(cx, &other, snapshot);
+    cx.run_until_parked();
+    let copy =
+        |cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<LogView>, selection| {
+            view.update(cx, |v, _| v.selection = Some(selection));
+            cx.update_window(window, |_, window, cx| {
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                window.dispatch_action(Box::new(registry::CopyLines), cx)
+            })
+            .unwrap();
+        };
+    let clipboard = |cx: &mut TestAppContext| cx.read_from_clipboard().and_then(|c| c.text());
+
+    // Two tabs: the slow copy in one, then a fast one in the other.
+    copy(cx, window, &view, LineSelection::new(0, 49_999));
+    copy(cx, other_window, &other, LineSelection::new(2, 3));
+    cx.run_until_parked();
+    assert_eq!(clipboard(cx).as_deref(), Some("line 2\nline 3"));
+
+    // One tab: a slow copy, then a fast one, and the tab closes before either lands.
+    copy(cx, window, &view, LineSelection::new(0, 49_999));
+    copy(cx, window, &view, LineSelection::new(5, 6));
+    let released = view.downgrade();
+    drop(view);
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert!(released.upgrade().is_none(), "the tab is gone");
+    assert_eq!(clipboard(cx).as_deref(), Some("line 5\nline 6"));
 }
