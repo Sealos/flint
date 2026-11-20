@@ -25,9 +25,13 @@ pub struct SocketFile {
 }
 
 impl SocketFile {
-    /// Removes the socket, unless something else has replaced it since.
+    /// Removes the socket, unless something else has replaced it since. The device and inode
+    /// identify it exactly while the listener is open (the app keeps it open until it quits). The
+    /// file type is checked as well, for the case where the listener has been dropped and a new
+    /// file at the path was given the freed inode number (Linux reuses them at once).
     pub fn remove(&self) {
         if let Ok(meta) = fs::symlink_metadata(&self.path)
+            && meta.file_type().is_socket()
             && meta.dev() == self.dev
             && meta.ino() == self.ino
         {
@@ -257,6 +261,23 @@ mod tests {
         assert_eq!(fs::read_to_string(&other).unwrap(), "not a socket");
     }
 
+    // A file that took over the socket's device and inode (Linux reuses a freed inode number
+    // at once) is not the socket: built from the file's own identity, so this needs no luck.
+    #[test]
+    fn a_file_with_the_sockets_identity_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automation.sock");
+        fs::write(&path, "theirs").unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let file = SocketFile {
+            path: path.clone(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        file.remove();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+    }
+
     #[test]
     fn removes_only_its_own_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -266,12 +287,13 @@ mod tests {
         file.remove();
         assert!(!path.exists());
 
-        // Replaced by someone else since: left alone.
+        // Replaced by someone else since: left alone. The listener stays open, as it does in the
+        // app until it quits, so the socket's inode stays allocated and cannot be reused.
         let (listener, file) = bind(&path).unwrap();
-        drop(listener);
         fs::remove_file(&path).unwrap();
         fs::write(&path, "theirs").unwrap();
         file.remove();
         assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        drop(listener);
     }
 }
