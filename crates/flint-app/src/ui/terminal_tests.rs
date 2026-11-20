@@ -758,3 +758,61 @@ async fn the_state_reports_the_screen_and_the_exit(cx: &mut TestAppContext) {
     // As the toolbar says it.
     assert_eq!(s["status_text"], "Ended: the context changed");
 }
+
+// covers UP-41 (#256): while the shell is not reading its input, a paste or a key the session
+// has no room for is not sent, and the tab says so; once the shell reads again, both go.
+#[gpui_kit::test]
+async fn input_the_shell_is_not_reading_is_refused_saying_so(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    let note = |shell: &Shell, cx: &mut TestAppContext| {
+        shell
+            .view
+            .read_with(cx, |v, _| v.note.as_ref().map(|n| n.text.clone()))
+    };
+    // The fake takes nothing in until pumped: as a shell that stopped reading.
+    cx.write_to_clipboard(ClipboardItem::new_string("x".repeat(MAX_PASTE_BYTES)));
+    for _ in 0..3 {
+        shell.press(cx, TERMINAL_PASTE[0]);
+        assert_eq!(note(&shell, cx), None);
+    }
+    shell.press(cx, TERMINAL_PASTE[0]);
+    let refused = note(&shell, cx).expect("a note");
+    assert!(
+        refused.starts_with("Not pasted: the shell is not reading its input"),
+        "{refused}"
+    );
+    // A key that does not fit either.
+    let room =
+        flint_core::exec::INPUT_BUDGET - shell.view.read_with(cx, |v, _| v.session.queued_input());
+    shell.view.update(cx, |v, cx| v.send(vec![b'y'; room], cx));
+    shell.input(cx, "z");
+    let refused = note(&shell, cx).expect("a note");
+    assert!(refused.starts_with("Keys not sent:"), "{refused}");
+    let sent = shell.sent(cx);
+    assert_eq!(
+        sent.len(),
+        3 * MAX_PASTE_BYTES + room,
+        "nothing refused was sent"
+    );
+    assert!(!sent.ends_with(b"z"));
+    // The shell read it all: typing goes again, and the note, no longer true, is gone.
+    shell.input(cx, "z");
+    assert_eq!(shell.sent(cx), b"z");
+    assert_eq!(note(&shell, cx), None);
+}
+
+// covers UP-41 (#256): when what was typed while bash was tried was not kept for /bin/sh, the
+// tab says so.
+#[gpui_kit::test]
+async fn input_not_replayed_to_the_next_shell_is_said(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    shell.fake.input_not_replayed();
+    shell.settle(cx);
+    let note = shell
+        .view
+        .read_with(cx, |v, _| v.note.as_ref().map(|n| n.text.clone()));
+    assert_eq!(
+        note.as_deref(),
+        Some(crate::ui::terminal_model::INPUT_NOT_REPLAYED)
+    );
+}

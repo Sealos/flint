@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use flint_core::ClusterId;
 use flint_core::activity::{self, ActivityRecord, Outcome};
+use flint_core::settings::server_identity;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tooltip::Tooltip;
@@ -49,9 +50,13 @@ impl ActivityRow {
     }
 }
 
-/// The calls on `cluster` at `server` in `records`, newest first, with times in `tz` and `now`
-/// deciding whether a date is shown. A context re-pointed at another server is another cluster:
-/// its calls there are not shown (a record without a server, from a context not exposed, is).
+/// The calls on `cluster` at the server with key `server` ([`activity::ServerKeys`]) in
+/// `records`, newest first, with times in `tz` and `now`
+/// deciding whether a date is shown: those that named the context, and those that probed it
+/// (`list_clusters`). A context re-pointed at another server is another cluster: its calls there
+/// are not shown (a record without a server, from a context not exposed, is). A call that probed
+/// more clusters than its record lists ([`ActivityRecord::probed_more`]) is shown, marked, in the
+/// tab of every cluster it does not list: it may have probed it.
 pub fn rows(
     records: &[ActivityRecord],
     cluster: &str,
@@ -62,15 +67,10 @@ pub fn rows(
     let today = now.to_zoned(tz.clone()).date();
     // By key: the names in a record may be cut.
     let cluster = activity::cluster_key(cluster);
-    let server = server.map(activity::server_key);
     let mut mine: Vec<(usize, &ActivityRecord)> = records
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.cluster_key.as_ref() == Some(&cluster))
-        .filter(|(_, r)| match (&r.server_key, &server) {
-            (Some(at), Some(server)) => at == server,
-            _ => true,
-        })
+        .filter(|(_, r)| r.is_about(&cluster, server) || maybe_probed(r, &cluster))
         .collect();
     // Newest first; calls in the same millisecond (several `flint mcp` processes) in the order
     // they were written, last first.
@@ -78,12 +78,25 @@ pub fn rows(
     mine.into_iter()
         .map(|(_, r)| ActivityRow {
             time: time(r.at_ms, tz, today),
-            tool: r.tool.clone(),
-            target: target(r),
+            tool: shown(&r.tool),
+            target: if r.is_about(&cluster, server) {
+                target(r)
+            } else {
+                format!(
+                    "{} clusters, maybe this one: not all are listed",
+                    r.probed.len() as u64 + r.probed_more
+                )
+            },
             result: result(r),
             outcome: r.outcome,
         })
         .collect()
+}
+
+/// Whether `r` probed more clusters than it lists and `cluster` is not among those it lists: then
+/// it may have probed `cluster`.
+fn maybe_probed(r: &ActivityRecord, cluster: &str) -> bool {
+    r.probed_more > 0 && !r.probed.iter().any(|p| p.cluster_key == cluster)
 }
 
 fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
@@ -98,32 +111,78 @@ fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
     }
 }
 
+/// `text`, written by an agent, as the view shows it: control characters and the invisible
+/// format characters that reorder or hide text (bidi embeddings, overrides and isolates,
+/// zero-width and other default-ignorable characters, line and paragraph separators, blank
+/// fillers) are shown as escapes (`\n`, `\u{202e}`), so a name cannot break its
+/// row or pass itself off as another one. A backslash is doubled, so an escape and the same
+/// characters written by the agent read differently. Everything else is kept.
+fn shown(text: &str) -> String {
+    fn hidden(c: char) -> bool {
+        matches!(
+            c,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
+        )
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_control() {
+            out.extend(c.escape_default());
+        } else if hidden(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// What a call named: the kind, the object (`namespace/name`, or the namespace alone), and the
 /// container.
 fn target(r: &ActivityRecord) -> String {
-    let object = match (&r.namespace, &r.name) {
+    // Each field escaped on its own, before they are joined: a name cannot pass itself off as
+    // another field (an escaped `, container x` still reads as part of the name it is in).
+    let field = |text: &Option<String>| text.as_deref().map(shown);
+    let object = match (field(&r.namespace), field(&r.name)) {
         (Some(ns), Some(name)) => Some(format!("{ns}/{name}")),
-        (None, Some(name)) => Some(name.clone()),
+        (None, Some(name)) => Some(name),
         (Some(ns), None) => Some(format!("in {ns}")),
         (None, None) => None,
     };
-    let mut text = r
-        .kind
-        .iter()
-        .cloned()
+    let mut text = field(&r.kind)
+        .into_iter()
         .chain(object)
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(container) = &r.container {
+    if let Some(container) = field(&r.container) {
         text.push_str(&format!(", container {container}"));
     }
     if text.is_empty() { "—".into() } else { text }
 }
 
+/// How a call ended, with the size of its reply; never a failed call's error text.
 fn result(r: &ActivityRecord) -> String {
     match r.outcome {
-        Outcome::Denied => "denied: outside what agents may read".into(),
-        Outcome::Failed => "failed".into(),
+        Outcome::Denied => format!("denied: outside what agents may read, {}", size(r.bytes)),
+        Outcome::Failed => format!("failed, {}", size(r.bytes)),
         Outcome::Ok => {
             let mut text = match r.items {
                 Some(1) => "1 item".to_owned(),
@@ -167,6 +226,8 @@ pub struct ActivityView {
 }
 
 impl ActivityView {
+    /// The tab for `cluster` at `server`. Calls are matched by the server's key under the log's
+    /// own keys ([`ClustersModel::activity_keys`]), the ones `flint mcp` records with.
     pub fn new(
         model: Entity<ClustersModel>,
         cluster: ClusterId,
@@ -193,7 +254,8 @@ impl ActivityView {
     }
 
     fn refresh(&mut self, cx: &App) {
-        let records = self.model.read(cx).agent_activity.clone();
+        let model = self.model.read(cx);
+        let records = model.agent_activity.clone();
         // The model also changes for connections, discovery and settings.
         if self
             .shown
@@ -202,10 +264,15 @@ impl ActivityView {
         {
             return;
         }
+        // None without a key (then calls match by context alone).
+        let server_key = self
+            .server
+            .as_deref()
+            .and_then(|s| model.activity_keys.server_key(s));
         self.rows = rows(
             &records,
             &self.cluster,
-            self.server.as_deref(),
+            server_key.as_deref(),
             &self.tz,
             Timestamp::now(),
         );
@@ -325,8 +392,8 @@ impl Render for ActivityView {
                 .iter()
                 .find(|c| c.info.name == self.cluster)
                 .filter(|c| {
-                    c.info.server.as_deref().map(activity::server_key)
-                        == self.server.as_deref().map(activity::server_key)
+                    c.info.server.as_deref().map(server_identity)
+                        == self.server.as_deref().map(server_identity)
                 })
                 .and_then(|c| model.ai_scope(c))
                 .is_some()
@@ -393,7 +460,16 @@ mod tests {
     use jiff::Timestamp;
     use jiff::tz::TimeZone;
 
-    use super::{ActivityRow, result, rows, size, target};
+    use super::{ActivityRow, result, rows, shown, size, target};
+
+    /// Server keys under a fixed key.
+    fn keys() -> activity::ServerKeys {
+        activity::ServerKeys::with_secret(&[7; 32])
+    }
+
+    fn server_key(url: &str) -> String {
+        keys().server_key(url).unwrap()
+    }
 
     fn record(at_ms: i64, cluster: &str) -> ActivityRecord {
         ActivityRecord {
@@ -410,7 +486,9 @@ mod tests {
             truncated: true,
             outcome: Outcome::Ok,
             cluster_key: Some(activity::cluster_key(cluster)),
-            server_key: Some(activity::server_key("https://prod:6443")),
+            server_key: Some(server_key("https://prod:6443")),
+            probed: Vec::new(),
+            probed_more: 0,
         }
     }
 
@@ -428,6 +506,7 @@ mod tests {
             name: None,
             container: None,
             items: None,
+            bytes: 80,
             outcome: Outcome::Denied,
             ..record(today, "prod")
         };
@@ -443,18 +522,89 @@ mod tests {
             clusters,
             denied,
         ];
-        let labels: Vec<String> = rows(&records, "prod", Some("https://prod:6443/"), &tz, now)
-            .iter()
-            .map(ActivityRow::label)
-            .collect();
+        let labels: Vec<String> = rows(
+            &records,
+            "prod",
+            Some(&server_key("https://prod:6443/")),
+            &tz,
+            now,
+        )
+        .iter()
+        .map(ActivityRow::label)
+        .collect();
         assert_eq!(
             labels,
             [
-                "11:59:00 list_resources secrets in web — denied: outside what agents may read",
+                "11:59:00 list_resources secrets in web — denied: outside what agents may read, \
+                 80 B",
                 "2026-11-19 12:00:00 get_pod_logs pods web/web-0, container app — 120 items, 5.0 \
                  KB, cut short",
             ]
         );
+    }
+
+    // covers UP-16: what an agent wrote cannot break its row or pass itself off as another
+    // target: control characters and the invisible characters that reorder or hide text are
+    // shown as escapes, in the cell and its tooltip (which show the same text).
+    #[test]
+    fn agent_text_is_shown_with_control_characters_escaped() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let sneaky = ActivityRecord {
+            tool: "get_\u{1b}[2Jresource".into(),
+            namespace: Some("web\u{202e}metsys-ebuk".into()),
+            name: Some("web-0\nkube-system/vault-0".into()),
+            container: Some("app\u{2066}\u{200b}\t".into()),
+            ..record(now.as_millisecond(), "prod")
+        };
+        let row = rows(&[sneaky], "prod", None, &TimeZone::UTC, now)
+            .pop()
+            .expect("the call is listed");
+        assert_eq!(row.tool, "get_\\u{1b}[2Jresource");
+        assert_eq!(
+            row.target,
+            "pods web\\u{202e}metsys-ebuk/web-0\\nkube-system/vault-0, container \
+             app\\u{2066}\\u{200b}\\t"
+        );
+        for text in [&row.tool, &row.target] {
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| c.is_control() || ('\u{2000}'..='\u{2fff}').contains(&c)),
+                "{text:?}"
+            );
+        }
+        // Everything else is kept as written: other scripts, emoji, punctuation.
+        assert_eq!(
+            shown("pods ns/naïve-日本-🚀 \"q\""),
+            "pods ns/naïve-日本-🚀 \"q\""
+        );
+        // A backslash is doubled: the two characters `\n` written by the agent do not read as an
+        // escaped newline.
+        assert_eq!(shown("a\\nb"), "a\\\\nb");
+        assert_eq!(shown("a\nb"), "a\\nb");
+        assert_ne!(shown("a\\nb"), shown("a\nb"));
+        // Other invisible characters: separators, soft hyphens, joiners, fillers, tags.
+        for c in [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{206a}',
+            '\u{3164}',
+            '\u{e0041}',
+        ] {
+            assert_eq!(
+                shown(&format!("a{c}b")),
+                format!("a{}b", c.escape_unicode())
+            );
+        }
+        // Each field is escaped on its own, before the fields are joined.
+        let spoof = ActivityRecord {
+            name: Some("web-0\u{2028}".into()),
+            container: None,
+            ..record(now.as_millisecond(), "prod")
+        };
+        assert_eq!(target(&spoof), "pods web/web-0\\u{2028}");
     }
 
     // covers UP-16: a context re-pointed at another server shows only the calls on the server its
@@ -464,7 +614,7 @@ mod tests {
         let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
         let at = |server: Option<&str>| ActivityRecord {
             server: server.map(str::to_owned),
-            server_key: server.map(activity::server_key),
+            server_key: server.map(server_key),
             ..record(now.as_millisecond(), "prod")
         };
         let records = [
@@ -472,10 +622,111 @@ mod tests {
             at(Some("https://prod:6443")),
             at(None),
         ];
-        let count = |server| rows(&records, "prod", server, &TimeZone::UTC, now).len();
+        let count = |server: Option<&str>| {
+            let key = server.map(server_key);
+            rows(&records, "prod", key.as_deref(), &TimeZone::UTC, now).len()
+        };
         assert_eq!(count(Some("https://prod:6443")), 2);
         assert_eq!(count(Some("https://old:6443/")), 2);
         assert_eq!(count(None), 3);
+    }
+
+    // covers UP-16: list_clusters names no cluster but reads about each exposed one: it shows on
+    // the tab of each cluster it probed, at the server it probed.
+    #[test]
+    fn rows_list_the_calls_that_probed_the_cluster() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let listed = ActivityRecord {
+            tool: "list_clusters".into(),
+            cluster: None,
+            server: None,
+            kind: None,
+            namespace: None,
+            name: None,
+            container: None,
+            items: Some(2),
+            bytes: 300,
+            truncated: false,
+            cluster_key: None,
+            server_key: None,
+            probed: vec![
+                activity::Probed::new(&keys(), "prod", Some("https://prod:6443")),
+                activity::Probed::new(&keys(), "dev", Some("https://dev:6443")),
+            ],
+            ..record(now.as_millisecond(), "prod")
+        };
+        let labels = |cluster, server: Option<&str>| -> Vec<String> {
+            let key = server.map(server_key);
+            rows(
+                std::slice::from_ref(&listed),
+                cluster,
+                key.as_deref(),
+                &TimeZone::UTC,
+                now,
+            )
+            .iter()
+            .map(ActivityRow::label)
+            .collect()
+        };
+        assert_eq!(
+            labels("prod", Some("https://prod:6443/")),
+            ["12:00:00 list_clusters — — 2 items, 300 B"]
+        );
+        assert_eq!(labels("dev", None).len(), 1);
+        assert!(labels("prod", Some("https://elsewhere:6443")).is_empty());
+        assert!(labels("staging", None).is_empty());
+
+        // One that probed more than it lists shows, marked, in the tab of every cluster it does
+        // not list: it may have probed it. Not in a listed one's tab at another server.
+        let more = ActivityRecord {
+            probed_more: 300,
+            ..listed
+        };
+        let labels = |cluster| -> Vec<String> {
+            rows(
+                std::slice::from_ref(&more),
+                cluster,
+                Some(&server_key("https://staging:6443")),
+                &TimeZone::UTC,
+                now,
+            )
+            .iter()
+            .map(ActivityRow::label)
+            .collect()
+        };
+        assert_eq!(
+            labels("staging"),
+            [
+                "12:00:00 list_clusters 302 clusters, maybe this one: not all are listed — 2 items, 300 B"
+            ]
+        );
+        assert!(labels("prod").is_empty());
+    }
+
+    // covers UP-16: two servers that show as the same placeholder are two clusters: a context
+    // re-pointed from one to the other does not show the old server's calls.
+    #[test]
+    fn rows_tell_apart_servers_that_show_alike() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let old = "https://proxy.example.com/k8s/@old";
+        let new = "https://proxy.example.com/k8s/@new";
+        let call = ActivityRecord {
+            server: Some(flint_core::redact::server_url(old)),
+            server_key: Some(server_key(old)),
+            ..record(now.as_millisecond(), "prod")
+        };
+        let count = |server| {
+            rows(
+                std::slice::from_ref(&call),
+                "prod",
+                Some(&server_key(server)),
+                &TimeZone::UTC,
+                now,
+            )
+            .len()
+        };
+        assert_eq!(count(old), 1);
+        assert_eq!(count(new), 0);
     }
 
     // covers UP-16: newest first by time, calls in the same millisecond last-written first; a
@@ -534,11 +785,14 @@ mod tests {
             ..record(0, "prod")
         };
         assert_eq!(result(&one), "1 item, 900 B");
+        // A failed or denied call says how big its reply was, never what it said.
         let failed = ActivityRecord {
             outcome: Outcome::Failed,
+            items: None,
+            bytes: 120,
             ..record(0, "prod")
         };
-        assert_eq!(result(&failed), "failed");
+        assert_eq!(result(&failed), "failed, 120 B");
         assert_eq!(size(3 * 1_048_576), "3.0 MB");
     }
 }

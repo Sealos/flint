@@ -13,6 +13,7 @@ pub mod cluster;
 pub mod discovery;
 pub mod display;
 pub mod env_path;
+pub mod events;
 pub mod exec;
 pub mod handle;
 pub mod kubeconfig;

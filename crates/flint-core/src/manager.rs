@@ -50,6 +50,10 @@ pub(crate) struct Cluster {
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
+    /// The slot's generation, from the manager-wide counter: a new slot (a new context, one
+    /// re-pointed or otherwise changed, one back after being removed) has a new one. Front ends
+    /// tell a cluster that started over by it, whatever lists they skipped (#255).
+    generation: u64,
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
@@ -99,6 +103,7 @@ impl Cluster {
             state: ConnectionState::Disconnected,
             client: None,
             attempt: 0,
+            generation: 0,
             discovery: None,
             discovering: false,
             rediscover: false,
@@ -135,6 +140,7 @@ impl Cluster {
         ClusterSummary {
             info: self.info.clone(),
             state: self.state.clone(),
+            generation: self.generation,
         }
     }
 }
@@ -218,10 +224,12 @@ struct Changed {
 
 pub(crate) struct ClusterManager {
     config: CoreConfig,
-    events: async_channel::Sender<Event>,
+    events: crate::events::EventSender,
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: Option<mpsc::UnboundedReceiver<Internal>>,
     kubeconfig: Arc<LoadedKubeconfig>,
+    /// The last slot generation handed out ([`Cluster::generation`]).
+    generation: u64,
     /// Every context's history across kubeconfig loads, which sessions are pinned to.
     contexts: ContextHistory,
     /// The kubeconfig files for the current settings: the base files plus `kubeconfig_paths`.
@@ -261,7 +269,7 @@ impl ClusterManager {
 
     pub(crate) fn new(
         config: CoreConfig,
-        events: async_channel::Sender<Event>,
+        events: crate::events::EventSender,
         hubs: HubRegistry,
         unlocks: SessionUnlocks,
     ) -> Self {
@@ -281,6 +289,7 @@ impl ClusterManager {
             internal_tx,
             internal_rx: Some(internal_rx),
             kubeconfig: Arc::default(),
+            generation: 0,
             contexts: ContextHistory::default(),
             kubeconfig_paths,
             clusters: Vec::new(),
@@ -322,8 +331,7 @@ impl ClusterManager {
     }
 
     fn emit(&self, event: Event) {
-        // An unbounded channel only fails when the receiver is gone, i.e. the front end quit.
-        let _ = self.events.try_send(event);
+        self.events.send(event);
     }
 
     fn emit_settings(&self) {
@@ -911,8 +919,10 @@ impl ClusterManager {
                     None
                 };
                 let discovery = slot.discovery.clone();
+                let generation = slot.generation;
                 self.emit(Event::DiscoveryChanged {
                     cluster: cluster.clone(),
+                    generation,
                     discovery,
                     error,
                 });
@@ -1171,9 +1181,18 @@ impl ClusterManager {
     /// Reads the agent activity log and sends it to the front end.
     async fn reload_activity(&mut self) {
         let dir = self.config.config_dir.clone();
-        if let Ok(records) = tokio::task::spawn_blocking(move || activity::read(&dir)).await {
-            self.emit(Event::AgentActivity(Arc::new(records)));
+        let read = tokio::task::spawn_blocking(move || {
+            (activity::read(&dir), activity::ServerKeys::open(&dir))
+        });
+        if let Ok((records, keys)) = read.await {
+            self.emit(Event::AgentActivity(Arc::new(records), keys));
         }
+    }
+
+    /// A new slot generation.
+    fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
     }
 
     async fn reload_kubeconfig(&mut self) {
@@ -1235,9 +1254,15 @@ impl ClusterManager {
                         Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
+                    fresh.generation = self.next_generation();
                     fresh
                 }
-                None => Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config),
+                None => {
+                    let mut fresh =
+                        Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
+                    fresh.generation = self.next_generation();
+                    fresh
+                }
             };
             self.clusters.push(slot);
         }
@@ -1708,7 +1733,7 @@ mod tests {
     async fn manager_reading(dir: &Path, yaml: &str) -> ClusterManager {
         let path = dir.join("kubeconfig");
         std::fs::write(&path, yaml).unwrap();
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
@@ -2069,7 +2094,7 @@ mod tests {
             plugin.user_yaml()
         );
         std::fs::write(&path, yaml).unwrap();
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
@@ -2105,7 +2130,7 @@ mod tests {
     // protected, follows unlocks and trust, and is pinned to the server.
     #[tokio::test]
     async fn the_write_gate_refuses_protected_clusters() {
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
@@ -2386,7 +2411,7 @@ mod tests {
         ];
         for (name, steps) in cases {
             let dir = tempfile::tempdir().unwrap();
-            let (events, _rx) = async_channel::unbounded();
+            let (events, _rx) = crate::events::channel();
             let config = CoreConfig {
                 config_dir: dir.path().to_owned(),
                 settings: Settings::default(),

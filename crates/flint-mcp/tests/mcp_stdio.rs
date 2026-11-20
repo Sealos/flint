@@ -267,7 +267,8 @@ fn closed_port() -> u16 {
 fn every_call_is_recorded_in_the_activity_log() {
     let scratch = tempfile::tempdir().unwrap();
     let kubeconfig = scratch.path().join("kubeconfig");
-    let refusing = format!("https://127.0.0.1:{}", closed_port());
+    // An `@` in the path: the server shows as a placeholder, which other servers share.
+    let refusing = format!("https://127.0.0.1:{}/k8s/@dev", closed_port());
     std::fs::write(
         &kubeconfig,
         format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {refusing}\nusers:\n- name: u\n  user:\n    token: SECRETTOKEN\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n- name: other\n  context:\n    cluster: c\n    user: u\n"),
@@ -371,9 +372,26 @@ fn every_call_is_recorded_in_the_activity_log() {
     );
     assert_eq!(records[0].items, Some(1));
     assert!(records.iter().all(|r| r.bytes > 0 && !r.truncated));
-    // The server a cluster is exposed with; none for one that is not exposed.
-    assert_eq!(records[2].server.as_deref(), Some(refusing.as_str()));
-    assert_eq!(records[1].server, None);
+    // The server a cluster is exposed with, as shown; none for one that is not exposed. Its key
+    // is of the server itself, not of the placeholder it shows as.
+    use flint_core::activity::{KEY_FILE, Probed, ServerKeys};
+    // Keyed with the config directory's own key, which the first call made.
+    assert!(config_dir.join(KEY_FILE).exists());
+    let keys = ServerKeys::open(&config_dir);
+    let server_key = |url: &str| keys.server_key(url);
+    let shown = flint_core::redact::server_url(&refusing);
+    assert_eq!(shown, flint_core::redact::HIDDEN_SERVER_URL);
+    assert_eq!(records[2].server.as_deref(), Some(shown.as_str()));
+    assert!(server_key(&refusing).is_some());
+    assert_eq!(records[2].server_key, server_key(&refusing));
+    assert_ne!(server_key(&refusing), server_key(&shown));
+    assert_eq!((&records[1].server, &records[1].server_key), (&None, &None));
+    // list_clusters names no cluster but is about the one it probed, at its server.
+    assert_eq!(
+        records[0].probed,
+        [Probed::new(&keys, "dev", Some(&refusing))]
+    );
+    assert!(records[1..].iter().all(|r| r.probed.is_empty()));
     // What came back is never stored.
     let log =
         std::fs::read_to_string(config_dir.join(flint_core::activity::ACTIVITY_FILE)).unwrap();

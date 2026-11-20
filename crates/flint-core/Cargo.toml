@@ -37,6 +37,8 @@ secrecy.workspace = true
 jiff.workspace = true
 # Already in the tree through kube; names TLS handshake failures (`api_error`).
 rustls.workspace = true
+# Already in the tree through rustls; keys the activity log's server URLs (`activity::ServerKeys`).
+ring.workspace = true
 serde-saphyr.workspace = true
 # `bootstrap::init_logging`, shared by the app and the MCP server.
 tracing-subscriber.workspace = true
