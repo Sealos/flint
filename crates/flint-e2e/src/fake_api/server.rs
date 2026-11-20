@@ -133,7 +133,7 @@ struct Inner {
 }
 
 /// Every fake server running in this process, by URL, so the app harness can read the requests
-/// of the servers a kubeconfig names ([`requests_at`]).
+/// of the servers a kubeconfig names ([`arrivals_at`]).
 static RUNNING: Mutex<Vec<(String, Weak<Inner>)>> = Mutex::new(Vec::new());
 
 /// The requests that have reached the fake server at `url` in this process so far, as they
