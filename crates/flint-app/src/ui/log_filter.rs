@@ -107,6 +107,8 @@ impl LogView {
             if self.filter.is_some() {
                 let anchor = self.scroll_anchor();
                 self.filter = None;
+                // Only a filtered tab uses it.
+                *self.shown_matches.borrow_mut() = None;
                 self.rows_generation += 1;
                 self.list.reset(self.snapshot.lines.len());
                 self.scroll_back_to(anchor);
@@ -227,6 +229,8 @@ impl LogView {
             }
         }
         if appended > 0 {
+            // Rows came: the place is theirs now.
+            self.held_anchor = None;
             let end = self.list.item_count();
             self.list.splice(end..end, appended);
         }
@@ -235,6 +239,10 @@ impl LogView {
     /// The line at the top of the list, unless it follows the tail: where the list goes back
     /// to when its rows are replaced ([`LogView::scroll_back_to`]).
     fn scroll_anchor(&self) -> Option<LineId> {
+        // A filter that showed nothing kept the place from before it.
+        if self.row_count() == 0 {
+            return self.held_anchor;
+        }
         if self.list.is_following_tail() {
             return None;
         }
@@ -242,13 +250,16 @@ impl LogView {
     }
 
     /// Scrolls the list, its rows just replaced, back to `anchor`, or the first row after it
-    /// (the last row when none is), so changing a filter keeps the reader's place.
+    /// (the last row when none is), so changing a filter keeps the reader's place. With no rows,
+    /// the place is held for the next rows.
     fn scroll_back_to(&mut self, anchor: Option<LineId>) {
+        self.held_anchor = None;
         let Some(id) = anchor else {
             return;
         };
         let count = self.row_count();
         if count == 0 {
+            self.held_anchor = Some(id);
             return;
         }
         let ix = match self.filter_rows() {

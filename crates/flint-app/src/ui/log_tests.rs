@@ -2196,7 +2196,7 @@ async fn a_filtered_tab_saves_and_copies_the_rows_it_shows(cx: &mut TestAppConte
 }
 
 // covers UP-48: turning a filter on or off keeps the reader's place: the list goes back to the
-// line at its top, or the first row after it.
+// line at its top, or the first row after it, also through a filter that shows nothing.
 #[gpui_kit::test]
 async fn a_filter_change_keeps_the_place(cx: &mut TestAppContext) {
     let (core, _dir) = core();
@@ -2227,6 +2227,24 @@ async fn a_filter_change_keeps_the_place(cx: &mut TestAppContext) {
         cx,
         window,
         "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 1000).await;
+    assert_eq!(top(cx), Some(504));
+
+    // Through a filter that shows nothing: the place is held until rows return.
+    view.update(cx, |v, cx| v.set_query("no such line".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
         serde_json::Value::Null,
     );
     until_rows(cx, window, &view, 1000).await;

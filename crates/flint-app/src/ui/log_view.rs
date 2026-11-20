@@ -171,6 +171,9 @@ pub struct LogView {
     /// Bumped whenever `filter` is replaced (a scan or catch-up landing, the filter turned
     /// off), so what was found from the old rows is found again ([`LogView::shown_matches`]).
     rows_generation: u64,
+    /// Where the list was when a filter left it with no rows: where it goes back to when rows
+    /// return, unless the tail is followed meanwhile.
+    held_anchor: Option<LineId>,
     _filter: Task<()>,
     search_input: Entity<InputState>,
     note: Option<Note>,
@@ -267,6 +270,7 @@ impl LogView {
             _catch_up: Task::ready(()),
             filter_generation: 0,
             rows_generation: 0,
+            held_anchor: None,
             _filter: Task::ready(()),
             search_input,
             note: None,

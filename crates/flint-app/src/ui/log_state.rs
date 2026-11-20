@@ -41,7 +41,8 @@ impl LogView {
                 errors_only: self.errors_only,
                 context: self.context,
                 rows: self.is_filtered().then(|| self.row_count()),
-                filtering: self.filtering,
+                // A catch-up on the core's threads too: the rows shown are not up to date.
+                filtering: self.filtering || self.catching_up,
             },
             selection: self.selection.map(|s| SelectionState {
                 first: s.start(),

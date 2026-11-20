@@ -18,6 +18,11 @@ use super::super::registry::{
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
 
+/// How many times longer than the other the rows or the matches must be for
+/// [`LogView::shown_matches`] to look the shorter's ids up rather than walk both: about the cost
+/// of a lookup in a million.
+const SPARSE_RATIO: usize = 20;
+
 /// What [`LogView::shown_matches`] was found from: when any of it changes, it is found again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ui) struct ShownMatchesKey {
@@ -42,6 +47,7 @@ impl LogView {
                     view.sync_pause();
                 }
                 view.list.set_follow_mode(FollowMode::Tail);
+                view.held_anchor = None;
                 cx.notify();
             })
             .bind::<JumpToStart>(|view, _, _, cx| {
@@ -246,19 +252,29 @@ impl LogView {
         let matches = matches.range(matches.partition_point(|id| *id < from)..);
         let lines = &self.snapshot.lines;
         let kept = Arc::make_mut(&mut shown);
-        // Walks the shorter of the two (both sorted), looking each id up in the other: a tab
-        // showing few rows, or few matches, does little work however many the other has.
-        if rows.len() <= matches.len() {
-            kept.extend(
-                rows.copied()
-                    .filter(|id| all_matches.binary_search(id).is_ok() && lines.contains(*id)),
-            );
+        // Both are sorted. One much shorter than the other (few rows shown, or few matches):
+        // each of its ids is looked up in the other, so the work follows the shorter. Else one
+        // walk over both.
+        let (short, long) = (rows.len().min(matches.len()), rows.len().max(matches.len()));
+        if short.saturating_mul(SPARSE_RATIO) < long {
+            if rows.len() <= matches.len() {
+                kept.extend(
+                    rows.copied()
+                        .filter(|id| all_matches.binary_search(id).is_ok() && lines.contains(*id)),
+                );
+            } else {
+                kept.extend(
+                    matches
+                        .copied()
+                        .filter(|id| all_rows.binary_search(id).is_ok() && lines.contains(*id)),
+                );
+            }
         } else {
-            kept.extend(
-                matches
-                    .copied()
-                    .filter(|id| all_rows.binary_search(id).is_ok() && lines.contains(*id)),
-            );
+            let mut rows = rows.peekable();
+            kept.extend(matches.copied().filter(|id| {
+                while rows.next_if(|row| **row < *id).is_some() {}
+                rows.peek().is_some_and(|row| **row == *id) && lines.contains(*id)
+            }));
         }
         *cache = Some((key, shown.clone()));
         shown
