@@ -971,9 +971,32 @@ impl ResourceList {
 
     /// Banners over the rows: not current (reconnecting, failing), limited to some namespaces
     /// by permissions, or without server columns.
+    /// What the list says when the selected object's namespace is outside the namespace
+    /// filter (opened from the resource switcher): its row is hidden, its details show.
+    pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
+        let selected = self.selected.as_ref()?;
+        let namespace = selected.namespace.as_deref()?;
+        let filter = &self.query.namespaces;
+        if !self.namespaced || filter.is_empty() || filter.iter().any(|n| n == namespace) {
+            return None;
+        }
+        Some(format!(
+            "{} is in namespace {namespace}, which the namespace filter hides: its row is not \
+             listed, and its details show.",
+            selected.name
+        ))
+    }
+
     fn banners(&self, theme: &Theme) -> Vec<AnyElement> {
         let snapshot = &self.shown;
         let mut banners = Vec::new();
+        if let Some(text) = self.filtered_out_text() {
+            banners.push(
+                notice("list-filtered-out", text, theme.info)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
         if let Some(limit) = &snapshot.limited_to
             && !limit.listed.is_empty()
         {

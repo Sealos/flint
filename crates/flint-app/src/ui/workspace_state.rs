@@ -38,6 +38,7 @@ impl Workspace {
             .dock
             .read(cx)
             .view_state(self.dock_height(window_height), window, cx);
+        let cursor = self.sidebar_cursor(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
 
@@ -63,6 +64,7 @@ impl Workspace {
                         AiExposureState::ServerChanged { .. } => "server_changed",
                     },
                     protection: model.protection(cluster).name(),
+                    cursor: cursor.as_deref() == Some(cluster.info.name.as_str()),
                 }
             })
             .collect();
@@ -195,6 +197,12 @@ impl Workspace {
         if self.focus.is_focused(window) {
             return Focus::Workspace;
         }
+        if self.sidebar_focus.is_focused(window) {
+            return Focus::Sidebar;
+        }
+        if self.nav.read(cx).focus_handle().is_focused(window) {
+            return Focus::Navigation;
+        }
         if self
             .palette
             .as_ref()
@@ -215,6 +223,13 @@ impl Workspace {
             .is_some_and(|d| d.read(cx).yaml_focused(window, cx))
         {
             return Focus::DetailYaml;
+        }
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.read(cx).focus_handle().is_focused(window))
+        {
+            return Focus::Detail;
         }
         if self.namespace_input.focus_handle(cx).is_focused(window) {
             return Focus::NamespaceInput;

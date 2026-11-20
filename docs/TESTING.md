@@ -70,12 +70,14 @@ The tests sit next to the view they test, as child modules, so they can read its
 | Cmd-W, Close Window and Quit with dock sessions | `ui/closing_tests.rs` | UP-42 |
 | Appearance | `ui/appearance_tests.rs` | UP-32 |
 | Command palette, About Flint, the Edit actions | `ui/palette_tests.rs`, `ui/palette_model.rs` | UP-30, UP-45 |
+| Resource switcher | `ui/switcher_tests.rs`, `ui/switcher_model.rs` | UP-31 |
+| Panes, sidebar and navigation keys, Go Back | `ui/keyboard_tests.rs`, `ui/workspace_keys.rs` | UP-33 |
 
 Together they cover the UI parts of UP-01, 02, 07, 08, 20, 21, 23, 24, 25 and 27, and part of UP-22: a CRD appears
 under its API group and opens. The rest needs a real API server, so it stays in the cluster tests: UP-22's printer
 columns, UP-24's "the old cluster's watches stop", and UP-27's recovery itself (the view tests check what the list
-shows while reconnecting). UP-33 is covered only in part: the list's arrows, Home and End are tested, but there are no
-arrow keys for the cluster sidebar yet.
+shows while reconnecting). UP-33's keys are covered in the view tests; quitting with
+Cmd-Q is not.
 
 The list and the detail pane each have a test that closes them and checks nothing they made is left alive
 (`a_closed_list_is_released`, `a_closed_detail_pane_is_released`).
@@ -134,14 +136,16 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     then draws twice, since a context menu is built a frame after the click. A row's id is in `list.rows[].id`
     (`row-<uid>`); right-clicking it selects the row and opens its menu, which `state.menu` then lists. `rejected`
     when no element, or more than one, is drawn with that id, or it is out of view (rows are virtualized).
-  - `state`: the visible view tree: `focus` (`workspace`, `list`, `list_filter`, `namespace_input`, `detail_yaml`,
+  - `state`: the visible view tree: `focus` (`workspace`, `sidebar`, `navigation`, `list`, `list_filter`,
+    `namespace_input`, `detail`, `detail_yaml`,
     `dock`, `log`, `log_search`, `shell`, `dialog`, `menu`, `palette`, `other` or `none`), `dialog` (`{title, text,
     buttons}` while one is open: Expose to AI, Save logs, a multi-line paste, About Flint with only `OK`), `appearance`,
     `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`, `connection`, and `presence`: `live`
-    only for the watched cluster, `idle` for one connected but not watched), sidebar `banners`, `active_cluster`,
+    only for the watched cluster, `idle` for one connected but not watched, and `cursor` on the one under the
+    sidebar's keyboard cursor), sidebar `banners`, `active_cluster`,
     `main` (`no_contexts` when no kubeconfig file had a context), `header` (`namespace_button` and `watch_mode` are
     null while hidden, as on a failed cluster; `watch_mode_source`: `default` or `cluster`), `nav` (sections, and the
-    entries of open ones), `list` (`count` as the toolbar shows it, columns as drawn and up to 500 rows in display
+    entries of open ones, `cursor` on the section or entry under its keyboard cursor), `list` (`count` as the toolbar shows it, columns as drawn and up to 500 rows in display
     order, each with its element `id`, `cells` and `cells_by_column`, Secret cells masked, with its `banners` and
     `placeholder`), `detail` (which object, tab, fetch state, and its sections with entry counts; never values),
     `dock`, `menu` and `palette` (below). Errors in it are sanitized summaries. The JSON is stable: fields are added, never
@@ -175,8 +179,11 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     - Any other menu lists its drawn entries with `owner` null: a separator is left out, but a note cannot be told
       from an entry, and `enabled` is false only where the drawing says the entry is disabled.
     - Focus is `menu` while one is open, also when it is drawn inside a dock tab.
-  - `state.palette`: the open command palette, or null: `{query, action, step, argument, rows: [{label, action,
-    detail, shortcut}], total, selected, footer, error}`. `action` is the name of the action whose `argument` it asks
+  - `state.palette`: the open command palette, or null: `{mode, query, action, step, argument, rows: [{label,
+    action, detail, shortcut, kind, cluster}], total, selected, footer, error}`. `mode` is `actions` (Cmd-Shift-P) or
+    `resources` (the resource switcher, Cmd-P, `palette::ToggleResourceSwitcher`), whose rows have `label` the
+    namespace/name or the kind's label, `detail` the object's kind or `Kind`, `kind` the kind's id and `cluster`;
+    its footer says what it searches. `action` is the name of the action whose `argument` it asks
     for (`logs::OpenSelectorLogs`), and `step` the heading shown then (its label and the picks so far: `Open Logs by
     Label Selector… · demo`); both are null while it lists actions. A row's `action` is its action's name; `detail`
     is an action's category, a choice's detail, or `typed` for the text typed; at most 200 rows, `total` counting

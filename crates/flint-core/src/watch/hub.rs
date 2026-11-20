@@ -171,6 +171,50 @@ impl HubRegistry {
         states
     }
 
+    /// What the in-memory stores of `cluster` hold now: one snapshot per kind whose watch has
+    /// listed (synced, or reconnecting with its last rows), for a search over every object
+    /// (the resource switcher).
+    ///
+    /// It only reads. It never creates a hub, never tells the manager (so no watch starts, in
+    /// either watch mode) and never reaches the API server: a running watch task builds the
+    /// snapshot from the rows it holds. A watch nobody subscribes to publishes nothing, so it is
+    /// woken with a receiver held for the call, and waited for up to `wait`; a kind that does
+    /// not answer in time gives what it last published.
+    pub async fn stored(&self, cluster: &str, wait: std::time::Duration) -> Vec<Arc<KindSnapshot>> {
+        let peeked: Vec<(Arc<Hub>, watch::Receiver<Arc<KindSnapshot>>)> = {
+            let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .filter(|((c, _), hub)| {
+                    c == cluster
+                        && matches!(
+                            hub.state(),
+                            SyncState::Synced | SyncState::Reconnecting { .. }
+                        )
+                })
+                .map(|(_, hub)| (hub.clone(), hub.subscribe()))
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut stored = Vec::with_capacity(peeked.len());
+        let mut waiting = Vec::new();
+        for (hub, rx) in peeked {
+            if hub.listeners() > 1 {
+                // Someone else subscribes: what it published is current.
+                stored.push(rx.borrow().clone());
+            } else {
+                // Woken all at once, so they build their snapshots in parallel.
+                hub.wake.notify_one();
+                waiting.push(rx);
+            }
+        }
+        for mut rx in waiting {
+            let _ = tokio::time::timeout_at(deadline, rx.changed()).await;
+            stored.push(rx.borrow_and_update().clone());
+        }
+        stored.sort_by(|a, b| a.kind.cmp(&b.kind));
+        stored
+    }
+
     /// Forgets a hub nobody reads. Only call it for kinds no task is running for.
     pub fn release(&self, cluster: &str, kind: &KindId) {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -229,5 +273,48 @@ mod tests {
         assert_eq!(registry.states("c1"), [(pods.clone(), SyncState::Idle)]);
         hub.set_state(next, &SyncState::Synced);
         assert_eq!(registry.states("c1"), [(pods, SyncState::Synced)]);
+    }
+
+    // covers UP-31: reading the stores creates no hub and skips kinds that hold no rows.
+    #[tokio::test(start_paused = true)]
+    async fn stored_reads_listed_kinds_only_and_creates_no_hub() {
+        let registry = HubRegistry::default();
+        let synced = registry.get_or_create("c1", &KindId::pods());
+        synced.take_over(KindSnapshot::empty(
+            "c1".into(),
+            KindId::pods(),
+            SyncState::Synced,
+        ));
+        let loading = registry.get_or_create("c1", &KindId::namespaces());
+        loading.take_over(KindSnapshot::empty(
+            "c1".into(),
+            KindId::namespaces(),
+            SyncState::Loading,
+        ));
+        registry
+            .get_or_create("c2", &KindId::pods())
+            .take_over(KindSnapshot::empty(
+                "c2".into(),
+                KindId::pods(),
+                SyncState::Synced,
+            ));
+        // No task answers here: the call gives up after `wait` with what was published.
+        let stored = registry
+            .stored("c1", std::time::Duration::from_millis(50))
+            .await;
+        let kinds: Vec<&KindId> = stored.iter().map(|s| &s.kind).collect();
+        assert_eq!(kinds, [&KindId::pods()]);
+        assert!(
+            registry
+                .stored("nowhere", Default::default())
+                .await
+                .is_empty()
+        );
+        let map = registry.0.lock().unwrap();
+        assert_eq!(map.len(), 3, "no hub was created");
+        assert!(
+            map.values().all(|h| h.listeners() == 0),
+            "receivers dropped"
+        );
     }
 }

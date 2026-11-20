@@ -887,6 +887,54 @@ async fn nothing_is_built_while_nobody_listens() {
     task.abort();
 }
 
+// covers UP-31: the resource switcher reads a watch's rows from memory. The watch nobody
+// subscribes to builds them from its store when woken; nothing is listed or watched again.
+#[tokio::test(start_paused = true)]
+async fn stored_rows_are_read_without_another_request() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(
+            &[
+                ("u1", "demo", "a", "Running"),
+                ("u2", "demo", "b", "Running"),
+            ],
+            true,
+            "10",
+        ),
+    );
+    let registry = HubRegistry::default();
+    let hub = registry.get_or_create("c", &pods().id());
+    let epoch = hub.take_over(KindSnapshot::default());
+    let engine = engine::Engine::new(
+        "c".into(),
+        pods(),
+        fake.clone(),
+        hub.clone(),
+        epoch,
+        config(),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    );
+    let task = tokio::spawn(engine.run(Feed::Watch));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while registry.states("c") != [(pods().id(), SyncState::Synced)] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watch lists");
+    assert_eq!(hub.latest().rows.len(), 0, "nothing published while unread");
+    let (lists, watches) = (fake.list_calls("pods"), fake.watch_requests("pods").len());
+
+    let stored = registry.stored("c", Duration::from_secs(1)).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(names(&stored[0]), ["a", "b"]);
+    assert_eq!(fake.list_calls("pods"), lists, "no list");
+    assert_eq!(fake.watch_requests("pods").len(), watches, "no watch");
+    assert_eq!(hub.listeners(), 0, "the call let go of the hub");
+    task.abort();
+}
+
 // ---- watch manager ----------------------------------------------------------------------
 
 fn kinds() -> Vec<KindInfo> {

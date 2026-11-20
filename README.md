@@ -226,12 +226,19 @@ state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
 
 Cmd-Shift-P opens the command palette: type part of any action's name and press Enter. It lists only what can run
 now, with each action's shortcut, and asks for what an action needs (a cluster, a namespace, a kind, a column, a
-label selector). These are the default keys on macOS; on Linux, Cmd is Ctrl.
+label selector). Cmd-P opens the resource switcher: type part of a kind or object name ("pods web" works too) and
+press Enter to open the kind's list, or the object selected with its details; it searches only what Flint already
+holds in memory, so it never asks the cluster. These are the default keys on macOS; on Linux, Cmd is Ctrl.
 
 | Key | Action | Where |
 |---|---|---|
 | ⇧⌘P | Show Command Palette (again to close it) | anywhere |
-| ↑ ↓ or ⌃P ⌃N, ⏎, ⎋ | Move, run the selected action, close (or go back a step) | in the palette |
+| ⌘P | Go to Resource: a kind, or an object in memory (again to close it) | anywhere |
+| ↑ ↓ or ⌃P ⌃N, ⏎, ⎋ | Move, run the selected action or open the kind or object, close (or go back a step) | in the palette or the switcher |
+| ⇥, ⇧⇥ | Focus Next Pane, Focus Previous Pane: clusters, navigation, list, detail, dock | outside text fields and shells |
+| ↑ ↓, ⏎ | Move between clusters, connect to the selected one | the cluster sidebar |
+| ↑ ↓, ⏎, → ← | Move, open the kind (or open or close the section), open the section, close it | the navigation |
+| ⌘[ | Go Back to the kind and object shown before | outside text fields |
 | ⌘F | Focus Filter | a list |
 | ↑ ↓, Home, End | Select the previous, next, first, last row | a list |
 | ⎋ | Close Detail | the detail pane |

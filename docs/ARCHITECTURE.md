@@ -115,6 +115,10 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   change event per view per frame budget (about 100 ms). The view then reads the latest snapshot. Individual watch
   events are never forwarded to the UI one by one.
 - Snapshots are shared, read-only data (`Arc`). Views never hold locks on core state.
+- A watch nobody subscribes to builds no snapshots. `CoreHandle::stored_snapshots` reads the rows every watch of a
+  cluster holds without subscribing: it wakes the watches with a receiver held for the call (up to 300 ms), never
+  tells the manager, creates no hub and makes no request, so no watch starts in either mode. The resource switcher
+  uses it.
 
 ## Clusters
 
@@ -842,7 +846,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   Flint, Hide Flint (Cmd-H), Hide Others (Option-Cmd-H), Show All and Quit; Edit has Cut, Copy, Paste and Select All,
   which the focused text field handles (the list filter, the namespace field, the log search, the palette), and
   Copy and Paste also a shell tab; View has
-  Show Command Palette and Appearance; Window has Close Dock Tab and Close Window. The Edit actions are bound only in
+  Show Command Palette, Go to Resource, Go Back and Appearance; Window has Close Dock Tab and Close Window. The Edit actions are bound only in
   a text field's key context (`Input`), so a shell tab keeps Cmd-C and Cmd-V for itself (and Linux shells keep Ctrl-C,
   Ctrl-V, Ctrl-X and Ctrl-A, which are in `TERMINAL_PASSTHROUGH`). Hide has no key on Linux, where Ctrl-H is a
   shell's backspace.
@@ -911,8 +915,41 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     bound in `CommandPalette > Input` so they win over the search field's arrows, Enter and Esc, and hidden from it.
   - A new control is not done until it is in the registry; a unit test per view checks that it binds every action
     of its scope.
-- **Resource switcher (Cmd-P):** fuzzy search over the kinds and objects of the active cluster, jumping straight to
-  a list or a detail view. It searches the in-memory stores, so it never makes network calls.
+- **Resource switcher (Cmd-P, Ctrl-P on Linux; a mode of the palette view, `switcher_model.rs`):** a fuzzy search
+  over the active cluster's listable kinds and the objects its watches hold in memory, jumping straight to a list or
+  a detail view. Rows show the namespace/name (or the kind's label), the kind and the cluster.
+  - Never the network: the objects come from `CoreHandle::stored_snapshots` (above), so a kind not watched now (On
+    view mode, or still loading) has no objects listed. Its kind is still listed.
+  - Off the render path: the kinds are listed at once, and the objects arrive a moment later, once the stores are
+    read and the index is built on a background thread. Each keystroke runs the search once: when the query only
+    grew, over the last query's matches; a subsequence pass rules out most objects, a linear-time score with no
+    allocation (`Matcher::quick_points`) ranks the rest, and only the best 200 get the palette's full scoring for
+    their order and highlights. The rows are a virtual list. A unit test types a name over 50,000 objects within
+    50 ms a keystroke in an unoptimized build.
+  - "pods web" finds the pod `web`: an object also matches its kind's label followed by its text, with less weight.
+  - Enter on a kind runs Open Kind… (`workspace::OpenView`); on an object, Open Object… (`workspace::OpenObject`,
+    hidden from the palette), which opens the kind's list with the object selected, so its details show. The
+    namespace filter is never changed for it: when the filter hides the object, its row is not listed, its details
+    still show, and the list says so (`list-filtered-out`). Both go through the registry from where focus
+    was, as the palette runs any action, and are not recorded as recent actions.
+  - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
+    in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.
+- **Panes and Go Back (UP-33, `workspace_keys.rs`):** the cluster sidebar (key context `ClusterSidebar`) and the
+  navigation (`Navigation`) take focus, by Tab or a click. Tab and Shift-Tab (`workspace::FocusNextPane`,
+  `FocusPreviousPane`, bound in `Workspace && !Input`) move focus through the panes shown: sidebar, navigation, list,
+  detail pane, the dock's shown tab, and around. A text field keeps Tab for moving between controls, and a shell tab
+  passes it to the shell.
+  - In the sidebar, the arrows move a cursor over the clusters (it starts on the active one) and Enter connects to the
+    one under it (`sidebar::*`). In the navigation, the arrows move over the section headers and the listable kinds
+    of open sections (starting on the open kind), Enter opens a kind (its list takes focus) or opens and closes a
+    section, Right opens a section and Left closes it, from a kind its own (`navigation::*`). These are bound on the
+    pane's own element, so they are available, and listed by the palette, only while it has focus; their keys are in
+    `ClusterSidebar && !Input` and `Navigation && !Input`, deeper than the list's arrows in `Workspace && !Input`.
+  - The cursor shows as a 1 px border in the theme's `ring` color while its pane has focus; a click, or a cluster or
+    kind picked any other way, moves it there.
+  - Go Back (Cmd-[, `workspace::GoBack`) returns to the kind and object shown before: opening another kind, or
+    jumping from the switcher, remembers the list and its selected object (at most 50 places). It is per active
+    cluster: switching clusters forgets them. In a text field Cmd-[ is the field's (outdent).
 
 ## Settings and state
 

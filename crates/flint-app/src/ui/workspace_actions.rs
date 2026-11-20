@@ -24,23 +24,23 @@ use super::super::focus::release_unfocused_input;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
-use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, PaletteEvent};
+use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, Mode, PaletteEvent};
 use super::super::registry::{
     About, ActionError, ActionSpec, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection,
     Close, CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
     DefaultWatchOpenViewsOnly, DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp,
-    FocusFilter, FocusSearch, Forward, ForwardCurrent, Guards, Hide, HideFromAi, HideOthers,
-    JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
-    OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenSelectorLogs, OpenShell, OpenView,
-    PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, RestartShell, RetryConnection,
-    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown,
-    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
-    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
-    SelectText, SetDockHeight, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces,
-    ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette,
-    ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause,
-    ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
-    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    FocusFilter, FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack,
+    Guards, Hide, HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab,
+    OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs,
+    OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
+    Refresh, RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope,
+    SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
+    SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
+    SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth, ShowAll,
+    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
+    ToggleCommandPalette, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
+    TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
+    ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{LockCluster, TrustCluster, UnlockCluster, UntrustCluster};
 use super::super::terminal_view::TerminalView;
@@ -62,47 +62,52 @@ macro_rules! view_open {
 impl Workspace {
     /// Every workspace action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
-        bind.bind::<ToggleCommandPalette>(Self::toggle_palette)
-            .bind::<About>(Self::about)
-            .bind::<SelectCluster>(Self::select_cluster)
-            .bind::<ExposeToAi>(Self::expose_to_ai)
-            .bind::<HideFromAi>(Self::hide_from_ai)
-            .bind::<UnlockCluster>(Self::unlock_cluster)
-            .bind::<LockCluster>(Self::lock_cluster)
-            .bind::<TrustCluster>(Self::trust_cluster)
-            .bind::<UntrustCluster>(Self::untrust_cluster)
-            .bind::<RetryConnection>(Self::retry_connection)
-            .bind::<WatchAllKinds>(|this, _, _, cx| {
-                this.set_watch_mode(true, Some(WatchMode::All), cx)
-            })
-            .bind::<WatchOpenViewsOnly>(|this, _, _, cx| {
-                this.set_watch_mode(true, Some(WatchMode::OnView), cx)
-            })
-            .bind::<UseDefaultWatchMode>(|this, _, _, cx| this.set_watch_mode(true, None, cx))
-            .bind::<DefaultWatchAllKinds>(|this, _, _, cx| {
-                this.set_watch_mode(false, Some(WatchMode::All), cx)
-            })
-            .bind::<DefaultWatchOpenViewsOnly>(|this, _, _, cx| {
-                this.set_watch_mode(false, Some(WatchMode::OnView), cx)
-            })
-            .bind::<OpenView>(Self::open_view)
-            .bind::<SetNamespaces>(Self::set_namespaces)
-            .bind::<ToggleNamespace>(Self::toggle_namespace)
-            .bind::<AddNamespace>(Self::add_namespace)
-            .bind::<ShowAllNamespaces>(|this, _, _, cx| {
-                if this.cluster.is_some() {
-                    this.set_namespace_filter(Vec::new(), cx)
-                }
-            })
-            .bind::<SetPaneWidth>(Self::set_pane_width)
-            .bind::<OpenSelectorLogs>(Self::open_selector_logs)
-            .bind::<SetDockHeight>(|this, action, window, cx| match check_dock_height(action) {
-                Ok(()) => {
-                    let height = f32::from(window.viewport_size().height);
-                    this.resize_dock(action.height, height, cx);
-                }
-                Err(e) => tracing::warn!("{e}"),
-            })
+        bind.bind::<ToggleCommandPalette>(|this, _, window, cx| {
+            this.toggle_palette_in(Mode::Actions, window, cx)
+        })
+        .bind::<ToggleResourceSwitcher>(Self::toggle_switcher)
+        .bind::<OpenObject>(Self::open_object)
+        .bind::<GoBack>(Self::go_back)
+        .bind::<FocusNextPane>(|this, _, window, cx| this.focus_pane(1, window, cx))
+        .bind::<FocusPreviousPane>(|this, _, window, cx| this.focus_pane(-1, window, cx))
+        .bind::<About>(Self::about)
+        .bind::<SelectCluster>(Self::select_cluster)
+        .bind::<ExposeToAi>(Self::expose_to_ai)
+        .bind::<HideFromAi>(Self::hide_from_ai)
+        .bind::<UnlockCluster>(Self::unlock_cluster)
+        .bind::<LockCluster>(Self::lock_cluster)
+        .bind::<TrustCluster>(Self::trust_cluster)
+        .bind::<UntrustCluster>(Self::untrust_cluster)
+        .bind::<RetryConnection>(Self::retry_connection)
+        .bind::<WatchAllKinds>(|this, _, _, cx| this.set_watch_mode(true, Some(WatchMode::All), cx))
+        .bind::<WatchOpenViewsOnly>(|this, _, _, cx| {
+            this.set_watch_mode(true, Some(WatchMode::OnView), cx)
+        })
+        .bind::<UseDefaultWatchMode>(|this, _, _, cx| this.set_watch_mode(true, None, cx))
+        .bind::<DefaultWatchAllKinds>(|this, _, _, cx| {
+            this.set_watch_mode(false, Some(WatchMode::All), cx)
+        })
+        .bind::<DefaultWatchOpenViewsOnly>(|this, _, _, cx| {
+            this.set_watch_mode(false, Some(WatchMode::OnView), cx)
+        })
+        .bind::<OpenView>(Self::open_view)
+        .bind::<SetNamespaces>(Self::set_namespaces)
+        .bind::<ToggleNamespace>(Self::toggle_namespace)
+        .bind::<AddNamespace>(Self::add_namespace)
+        .bind::<ShowAllNamespaces>(|this, _, _, cx| {
+            if this.cluster.is_some() {
+                this.set_namespace_filter(Vec::new(), cx)
+            }
+        })
+        .bind::<SetPaneWidth>(Self::set_pane_width)
+        .bind::<OpenSelectorLogs>(Self::open_selector_logs)
+        .bind::<SetDockHeight>(|this, action, window, cx| match check_dock_height(action) {
+            Ok(()) => {
+                let height = f32::from(window.viewport_size().height);
+                this.resize_dock(action.height, height, cx);
+            }
+            Err(e) => tracing::warn!("{e}"),
+        })
     }
 
     /// Registers the workspace's actions on its root element, and forwards the open views'.
@@ -161,6 +166,11 @@ impl Workspace {
                 |ws, _| ws.cluster.is_some(),
                 |ws, a, cx| ws.check_open_view(a, cx),
             )
+            .add::<OpenObject>(
+                |ws, _| ws.cluster.is_some(),
+                |ws, a, cx| ws.check_open_object(a, cx),
+            )
+            .when::<GoBack>(|ws, _| ws.can_go_back())
             .add::<SetNamespaces>(
                 |ws, _| ws.cluster.is_some(),
                 |_, a, _| match a.namespaces.iter().any(|n| n.trim().is_empty()) {
@@ -345,63 +355,86 @@ impl Workspace {
             )
     }
 
-    /// Opens the command palette over the actions available where focus is, or closes it.
-    fn toggle_palette(
+    /// Opens the command palette in `mode` (the actions available where focus is, or the
+    /// resource switcher), or closes it when it is open in that mode. Open in the other mode,
+    /// it switches, keeping where it came from.
+    pub(super) fn toggle_palette_in(
         &mut self,
-        _: &ToggleCommandPalette,
+        mode: Mode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((palette, _)) = self.palette.take() {
-            let previous = palette.read(cx).origin(window);
-            window.focus(&previous, cx);
-            release_unfocused_input(window, cx);
-            cx.notify();
-            return;
-        }
-        // An open context menu, drop-down or popover (the namespace filter) is drawn over the
-        // palette and could take a click meant for it: dismiss it first, as Esc would. One that
-        // knows where focus was gives it back, and the palette runs its actions from there; else
-        // (focus still on the closed menu) from the workspace.
-        let mut previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
-        let mut contexts = window.context_stack();
-        if contexts
-            .iter()
-            .any(|c| c.contains(POPUP_MENU) || c.contains(POPOVER_CONTENT))
-        {
-            previous.dispatch_action(&Cancel, window, cx);
-            match window.focused(cx) {
-                Some(back) if back != previous => {
-                    previous = back;
-                    contexts = window.context_stack();
+        let (previous, contexts) = match self.palette.take() {
+            Some((palette, _)) => {
+                let (origin, same) = {
+                    let palette = palette.read(cx);
+                    (palette.origin(window), palette.mode() == mode)
+                };
+                self._switcher = Task::ready(());
+                window.focus(&origin, cx);
+                release_unfocused_input(window, cx);
+                if same {
+                    cx.notify();
+                    return;
                 }
-                _ => {
-                    previous = self.focus.clone();
-                    let end = contexts
-                        .iter()
-                        .position(|c| c.contains(super::super::registry::WORKSPACE))
-                        .map_or(0, |i| i + 1);
-                    contexts.truncate(end);
-                }
+                // Switching modes: no menu was open over the palette.
+                (origin, None)
             }
-        }
+            None => {
+                // An open context menu, drop-down or popover (the namespace filter) is drawn
+                // over the palette and could take a click meant for it: dismiss it first, as
+                // Esc would. One that knows where focus was gives it back, and the palette runs
+                // its actions from there; else (focus still on the closed menu) from the
+                // workspace.
+                let mut previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+                let mut contexts = window.context_stack();
+                if contexts
+                    .iter()
+                    .any(|c| c.contains(POPUP_MENU) || c.contains(POPOVER_CONTENT))
+                {
+                    previous.dispatch_action(&Cancel, window, cx);
+                    match window.focused(cx) {
+                        Some(back) if back != previous => {
+                            previous = back;
+                            contexts = window.context_stack();
+                        }
+                        _ => {
+                            previous = self.focus.clone();
+                            let end = contexts
+                                .iter()
+                                .position(|c| c.contains(super::super::registry::WORKSPACE))
+                                .map_or(0, |i| i + 1);
+                            contexts.truncate(end);
+                        }
+                    }
+                }
+                (previous, Some(contexts))
+            }
+        };
         // A popover open while focus is elsewhere (the namespace filter's, after Focus Filter)
         // closes by its open state.
         self.namespace_popover_open = false;
-        let this = cx.weak_entity();
-        let choices: ChoiceSource = Rc::new(move |spec, arg, cx| match this.upgrade() {
-            Some(ws) => ws.read(cx).palette_choices(spec, arg, cx),
-            None => ArgInput::Text,
-        });
-        let palette = cx.new(|cx| {
-            CommandPalette::new(previous, self.focus.clone(), contexts, choices, window, cx)
-        });
+        let palette = match mode {
+            Mode::Actions => {
+                // Read while `previous` still has focus: the palette takes it next.
+                let contexts = contexts.unwrap_or_else(|| window.context_stack());
+                let this = cx.weak_entity();
+                let choices: ChoiceSource = Rc::new(move |spec, arg, cx| match this.upgrade() {
+                    Some(ws) => ws.read(cx).palette_choices(spec, arg, cx),
+                    None => ArgInput::Text,
+                });
+                let fallback = self.focus.clone();
+                cx.new(|cx| CommandPalette::new(previous, fallback, contexts, choices, window, cx))
+            }
+            Mode::Resources => self.new_switcher(previous, window, cx),
+        };
         let dismissed = cx.subscribe_in(
             &palette,
             window,
             |this, _, event: &PaletteEvent, window, cx| match event {
                 PaletteEvent::Dismissed => {
                     this.palette = None;
+                    this._switcher = Task::ready(());
                     // Focus went back (or elsewhere): the palette's field must not stay the
                     // window's focused one.
                     release_unfocused_input(window, cx);
@@ -422,10 +455,12 @@ impl Workspace {
             }
         });
         self.palette = Some((palette.clone(), dismissed));
-        // Listing reads the guards, which read this workspace: once this update is done.
-        window.defer(cx, move |window, cx| {
-            palette.update(cx, |palette, cx| palette.load(window, cx))
-        });
+        if mode == Mode::Actions {
+            // Listing reads the guards, which read this workspace: once this update is done.
+            window.defer(cx, move |window, cx| {
+                palette.update(cx, |palette, cx| palette.load(window, cx))
+            });
+        }
         cx.notify();
     }
 
@@ -810,10 +845,17 @@ impl Workspace {
         self.open_logs(request, true, window, cx);
     }
 
-    fn select_cluster(&mut self, action: &SelectCluster, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_cluster(
+        &mut self,
+        action: &SelectCluster,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match self.check_cluster::<SelectCluster>(&action.cluster, cx) {
             Ok(()) => {
                 let cluster = action.cluster.clone();
+                // The sidebar's cursor follows the cluster picked, however it was picked.
+                self.sidebar_cursor = Some(cluster.clone());
                 self.model.update(cx, |m, _| m.activate(cluster));
             }
             Err(e) => tracing::warn!("{e}"),
@@ -919,7 +961,12 @@ impl Workspace {
     }
 
     /// Opens a kind as clicking it in the navigation does.
-    fn open_view(&mut self, action: &OpenView, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_view(
+        &mut self,
+        action: &OpenView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match self.nav_entry(&action.kind, cx) {
             Some(entry) => self.open_kind(&entry, window, cx),
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),
@@ -1108,6 +1155,7 @@ mod tests {
     #[test]
     fn every_workspace_action_is_bound() {
         assert_binds_scope(Scope::Workspace, super::Workspace::bind_actions);
+        assert_binds_scope(Scope::Sidebar, super::Workspace::bind_sidebar_actions);
     }
 
     #[test]
