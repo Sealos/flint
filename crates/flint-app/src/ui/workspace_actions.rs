@@ -204,19 +204,19 @@ impl Workspace {
                     None => Err(ActionError::unavailable::<OpenContainerLogs>()),
                 },
             )
+            // A pod or a workload's pods not known yet: Shell waits for them.
             .when::<OpenShell>(|ws, cx| {
                 ws.sessions_open_here(cx)
-                    && detail(ws, cx).is_some_and(|d| d.shell_plan::<OpenShell>(None).is_ok())
+                    && detail(ws, cx).is_some_and(|d| d.shell_check::<OpenShell>(None).is_ok())
             })
             .add::<OpenContainerShell>(
                 |ws, cx| {
                     ws.sessions_open_here(cx)
-                        && detail(ws, cx).is_some_and(|d| d.shell_pod().is_some())
+                        && detail(ws, cx)
+                            .is_some_and(|d| d.shell_check::<OpenContainerShell>(None).is_ok())
                 },
                 |ws, a, cx| match detail(ws, cx) {
-                    Some(d) => d
-                        .shell_plan::<OpenContainerShell>(Some(&a.container))
-                        .map(|_| ()),
+                    Some(d) => d.shell_check::<OpenContainerShell>(Some(&a.container)),
                     None => Err(ActionError::unavailable::<OpenContainerShell>()),
                 },
             )
@@ -436,6 +436,7 @@ impl Workspace {
     pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
         match self.cluster_summary(cluster, cx).map(|c| &c.state) {
             Some(ConnectionState::Connected(_) | ConnectionState::Connecting) => None,
+            // Already a short, safe summary (`ClusterError::summary`).
             Some(ConnectionState::Failed(error)) => {
                 Some(format!("{cluster} is not connected: {error}"))
             }
@@ -461,11 +462,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Err(e) = check_selector(action) {
-            tracing::warn!("{e}");
+            self.refuse(format!("Logs: {}", super::super::detail::reason(&e)), cx);
             return;
         }
         let Some(cluster) = self.cluster.clone() else {
-            tracing::warn!("OpenSelectorLogs: no active cluster");
+            self.refuse("Logs: no cluster is selected".to_owned(), cx);
             return;
         };
         let request = LogRequest {
@@ -477,7 +478,7 @@ impl Workspace {
             }),
             previous: false,
         };
-        self.open_logs(request, window, cx);
+        self.open_logs(request, true, window, cx);
     }
 
     fn select_cluster(&mut self, action: &SelectCluster, _: &mut Window, cx: &mut Context<Self>) {

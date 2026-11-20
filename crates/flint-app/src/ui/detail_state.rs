@@ -17,6 +17,9 @@ impl DetailView {
         if self.gone {
             banners.push(Banner::new("detail-gone", Level::Warning, "Deleted"));
         }
+        if let Some(waiting) = self.waiting() {
+            banners.push(Banner::new("detail-pending", Level::Info, waiting));
+        }
         if let Some(error) = &self.refresh_error {
             banners.push(Banner::new(
                 "detail-refresh-error",
@@ -59,6 +62,8 @@ impl DetailView {
             sections,
             revealed,
             banners,
+            // Filled in by the workspace, which knows the cluster's state.
+            actions: Vec::new(),
         }
     }
 }

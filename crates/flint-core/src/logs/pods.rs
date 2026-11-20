@@ -62,6 +62,24 @@ pub enum PodSet {
     Selector(String),
 }
 
+impl PodSet {
+    /// The pods of workload `name`, read from its `spec.selector` in `object` (the workload as
+    /// fetched) when it has a usable one, which saves fetching the workload again; otherwise
+    /// [`PodSet::Workload`], which fetches it.
+    pub fn of_workload(kind: WorkloadKind, name: &str, object: &serde_json::Value) -> PodSet {
+        let selector = object
+            .pointer("/spec/selector")
+            .and_then(|s| serde_json::from_value::<LabelSelector>(s.clone()).ok());
+        match selector.map(|s| selector_string(kind, name, Some(s))) {
+            Some(Ok(text)) => PodSet::Selector(text),
+            _ => PodSet::Workload {
+                kind,
+                name: name.to_owned(),
+            },
+        }
+    }
+}
+
 /// The pods of a workload in one namespace, merged into one session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkloadTarget {
@@ -361,11 +379,23 @@ impl WorkloadPod {
     }
 }
 
-/// Lists the pods of a workload (or a label selector) in `namespace` once, sorted by name.
+/// How current a pod list must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// What the API server's cache holds (`resourceVersion=0`): cheap, possibly a little behind.
+    /// For showing which pod a shell would open in.
+    Cached,
+    /// A quorum read: for acting on a pod now.
+    Current,
+}
+
+/// Lists the pods of a workload (or a label selector) in `namespace` once, sorted by name. An
+/// empty selector is refused: it would select every pod in the namespace.
 pub(crate) async fn list_workload_pods(
     client: kube::Client,
     namespace: &str,
     pods: &PodSet,
+    freshness: Freshness,
 ) -> Result<Vec<WorkloadPod>, LogError> {
     let selector = match pods {
         PodSet::Workload { kind, name } => {
@@ -380,13 +410,18 @@ pub(crate) async fn list_workload_pods(
                 .selector(namespace, *kind, name)
                 .await?
         }
+        PodSet::Selector(selector) if selector.trim().is_empty() => {
+            return Err(LogError::fatal("empty label selector"));
+        }
         PodSet::Selector(selector) => selector.clone(),
     };
     let api: Api<Pod> = Api::namespaced(client, namespace);
-    let list = api
-        .list(&kube::api::ListParams::default().labels(&selector))
-        .await
-        .map_err(LogError::from_kube)?;
+    let params = kube::api::ListParams::default().labels(&selector);
+    let params = match freshness {
+        Freshness::Cached => params.match_any(),
+        Freshness::Current => params,
+    };
+    let list = api.list(&params).await.map_err(LogError::from_kube)?;
     let mut pods: Vec<WorkloadPod> = list.items.iter().map(WorkloadPod::from_pod).collect();
     pods.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(pods)
@@ -553,6 +588,51 @@ mod tests {
         let annotated = WorkloadPod::from_pod(&annotated);
         assert_eq!(annotated.default_container.as_deref(), Some("proxy"));
         assert!(!annotated.ready, "no Ready condition yet");
+    }
+
+    // covers UP-47: an empty selector would list every pod in the namespace, so it is refused
+    // before any request (the client points nowhere).
+    #[tokio::test]
+    async fn listing_by_an_empty_selector_is_refused() {
+        let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+        for selector in ["", "  "] {
+            let err = list_workload_pods(
+                client.clone(),
+                "ns",
+                &PodSet::Selector(selector.into()),
+                Freshness::Current,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.message, "empty label selector");
+        }
+    }
+
+    // covers UP-47: the selector of a workload already fetched is reused; without a usable one
+    // the workload is fetched again.
+    #[test]
+    fn a_fetched_workloads_selector_is_reused() {
+        let deployment = json!({"spec": {"selector": {"matchLabels": {"app": "web"}}}});
+        assert_eq!(
+            PodSet::of_workload(WorkloadKind::Deployment, "web", &deployment),
+            PodSet::Selector("app=web".into())
+        );
+        let workload = PodSet::Workload {
+            kind: WorkloadKind::Deployment,
+            name: "web".into(),
+        };
+        for object in [
+            json!({"spec": {}}),
+            json!({"spec": {"selector": {}}}),
+            json!({"spec": {"selector": "nonsense"}}),
+        ] {
+            assert_eq!(
+                PodSet::of_workload(WorkloadKind::Deployment, "web", &object),
+                workload,
+                "{object}"
+            );
+        }
     }
 
     #[test]

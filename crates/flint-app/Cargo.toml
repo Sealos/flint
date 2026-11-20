@@ -35,6 +35,8 @@ libc = { workspace = true, optional = true }
 automation = ["dep:async-channel", "dep:image", "dep:libc", "gpui-kit/test-support"]
 
 [dev-dependencies]
+# Pod lists answered by hand in the row action tests.
+async-channel.workspace = true
 # `exec::fake`: shell tab tests drive a session without a pod.
 flint-core = { workspace = true, features = ["test-support"] }
 # Headless GPUI windows for view tests (`#[gpui_kit::test]`).

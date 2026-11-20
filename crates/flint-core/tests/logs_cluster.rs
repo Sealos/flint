@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flint_core::handle::{Command, ConnectionState, Event};
 use flint_core::{
-    LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogSubject, LogTarget, PodSet,
-    SearchQuery, Settings, Severity, WorkloadKind, WorkloadPod, WorkloadTarget,
+    Freshness, LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogSubject, LogTarget,
+    PodSet, SearchQuery, Settings, Severity, WorkloadKind, WorkloadPod, WorkloadTarget,
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -408,6 +408,7 @@ async fn follows_a_deployments_pods_as_they_scale_and_get_replaced() {
                             kind: WorkloadKind::Deployment,
                             name: "printer".into(),
                         },
+                        Freshness::Current,
                     )
                     .await
                     .unwrap();
@@ -431,12 +432,18 @@ async fn follows_a_deployments_pods_as_they_scale_and_get_replaced() {
                     kind: WorkloadKind::Deployment,
                     name: "nope".into(),
                 },
+                Freshness::Current,
             )
             .await;
         assert!(missing.is_err(), "{missing:?}");
         let by_selector = core
             .handle
-            .workload_pods(&name, &ns, PodSet::Selector("app=printer".into()))
+            .workload_pods(
+                &name,
+                &ns,
+                PodSet::Selector("app=printer".into()),
+                Freshness::Cached,
+            )
             .await
             .unwrap();
         assert_eq!(by_selector.len(), 2);

@@ -836,9 +836,11 @@ impl Session {
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// A spawned task that is aborted when this is dropped, so the work stops with whoever waits
+/// for it.
+pub(crate) struct AbortOnDrop<T>(pub tokio::task::JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }

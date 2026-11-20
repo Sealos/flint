@@ -312,16 +312,32 @@ the module documentation lists the steps.
 
 **From rows** (UP-47): Logs (`detail::OpenLogs`, ⌘L), Previous Logs (`detail::OpenPreviousLogs`, ⇧⌘L) and Shell
 (`detail::OpenShell`, ⇧⌘E) act on the selected row, which the detail pane shows, so the keys, the palette, the pane's
-buttons and a row's context menu (`ui/row_menu.rs`) are one set of actions with one set of guards. A right-click
-selects the row first. For a pod they open its default container (a picker when it has several app containers); for
-a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs opens the workload session (all pods, prefixed) and
-Shell opens in its first ready pod by name, which the detail pane lists with `CoreHandle::workload_pods` each time it
-fetches the workload. Asked for before the pod (or the pods) has loaded, an action waits and runs once it has; the menu
-is rebuilt then too. Shell also waits while a changed workload's pods are listed again, so it never opens in a pod
-listed before, and a deleted pod or workload has none. The workspace forwards these actions to the detail pane
-showing when they arrive (`registry::ForwardCurrent`), not the one last drawn, so a key right after moving to another
-row acts on that row. While the row's cluster is not connected the actions are disabled and the menu says why.
-`logs::OpenSelectorLogs` (palette) opens a label selector's pods on the active cluster.
+buttons and a row's context menu (`ui/row_menu.rs`) are one set of actions. `row_menu::row_actions` says what each can
+do now and why not, with the same checks as the guards; the menu, the pane's buttons and the automation `state` show
+it (a disabled entry carries its reason). A right-click selects the row first. For a pod they open its default
+container (a picker when it has several app containers); for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job,
+Logs opens the workload session (all pods, prefixed) and Shell opens in its first ready pod by name.
+
+- **Workload pods** (`ui/detail_pods.rs`, `CoreHandle::workload_pods`): never listed on each update of the workload.
+  A cached list (`resourceVersion=0`) shows which pod a shell would open in: a moment after the row is selected (so
+  key repeat through a list starts no request per row), and when its menu opens if the list is missing, failed or
+  older than the workload. Shell itself always runs a quorum list and opens in a pod of that list; a list that fails
+  then refuses Shell with its error, never falling back on an older list. One list runs at a time per pane (asking
+  again joins it). The selector comes from the fetched workload when it has one. Dropping the pane drops the request,
+  and dropping the core's future aborts its task.
+- **Waiting.** Asked for before the pod (or the pods) has loaded, an action waits, shown in the pane, for 30 seconds
+  at most, then gives up saying so. A tab opened late takes focus only if focus has not moved since the ask. The open
+  menu is rebuilt whenever what it shows changes.
+- **Refusals.** An action refused, at once or after waiting, says why in a strip over the dock (`action-error`),
+  cleared by the next tab opened or another row selected. Shell is refused for a deleted pod or workload and for a pod
+  that finished (`Succeeded`, `Failed`) or is being deleted. While the row's cluster is not connected every entry is
+  disabled and the menu says why with core's summary of the error (`ClusterError::summary`); an action's
+  own reason (a refused pod list, say) is cut to one short line.
+- The workspace forwards these actions to the detail pane showing when they arrive (`registry::ForwardCurrent`), not
+  the one last drawn, so a key right after moving to another row acts on that row.
+
+`logs::OpenSelectorLogs` (palette) opens a label selector's pods on the active cluster; core refuses an empty
+selector.
 
 ### Exec terminal
 

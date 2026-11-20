@@ -1,24 +1,29 @@
 //! View tests for Logs, Previous Logs and Shell on pod and workload rows (UP-47): from a row's
 //! context menu, from the keys and through the registry, over the whole window
 //! (`support_tests`). The test servers never answer, so the tests hand the detail pane its
-//! object and a workload's pods, and feed log tabs their lines.
+//! object and feed log tabs their lines; a workload's pods are listed through [`FakePods`],
+//! which the tests answer by hand, so the pane's own list requests run.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use flint_core::logs::LogBuffer;
 use flint_core::{
-    Cell, Column, ColumnRole, ColumnType, ConnectionState, KindId, KindSnapshot, LineSource,
-    LogLine, LogSnapshot, LogState, NavEntry, ObjectDetail, PodSetStatus, Row, SafeErrorText,
-    StreamStatus, SyncState, WorkloadPod,
+    Cell, Column, ColumnRole, ColumnType, ConnectionState, Freshness, KindId, KindSnapshot,
+    LineSource, LogLine, LogSnapshot, LogState, NavEntry, ObjectDetail, PodSet, PodSetStatus, Row,
+    SafeErrorText, StreamStatus, SyncState, WorkloadPod,
 };
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, SharedString, TestAppContext};
 use serde_json::{Value, json};
 
+use crate::ui::detail::{PENDING_TIMEOUT, TestPodLister};
 use crate::ui::dock::DockTab;
 use crate::ui::list::{ListEvent, Selected};
 use crate::ui::registry::{self, ActionError};
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
+use crate::ui::view_state::{ActionAvailability, AppState, Focus};
 
 async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
     dispatch(
@@ -194,13 +199,138 @@ fn show_loading(cx: &mut TestAppContext, t: &TestWorkspace) {
     draw(cx, t);
 }
 
-/// Hands the detail pane a workload's pods, as if listed.
-fn show_pods(cx: &mut TestAppContext, t: &TestWorkspace, pods: Vec<WorkloadPod>) {
-    let detail = t
-        .workspace
-        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
-    detail.update(cx, |d, cx| d.show_pods(Ok(pods.into()), cx));
+type Listed = Result<Vec<WorkloadPod>, String>;
+
+/// Pod lists the detail pane asks for, answered by hand.
+#[derive(Clone, Default)]
+struct FakePods(Rc<RefCell<Vec<Asked>>>);
+
+struct Asked {
+    pods: PodSet,
+    freshness: Freshness,
+    /// `None` once answered.
+    reply: Option<async_channel::Sender<Listed>>,
+}
+
+impl Asked {
+    fn waits(&self) -> bool {
+        self.reply.as_ref().is_some_and(|r| r.receiver_count() > 0)
+    }
+}
+
+impl FakePods {
+    /// Answers the pane's pod lists from now on.
+    fn install(cx: &mut TestAppContext) -> Self {
+        let fake = FakePods::default();
+        let asked = fake.0.clone();
+        cx.update(|cx| {
+            cx.set_global(TestPodLister(Rc::new(move |_, _, pods, freshness| {
+                let (reply, answer) = async_channel::bounded(1);
+                asked.borrow_mut().push(Asked {
+                    pods,
+                    freshness,
+                    reply: Some(reply),
+                });
+                Box::pin(async move {
+                    answer
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err("not answered".into()))
+                })
+            })))
+        });
+        fake
+    }
+
+    /// The lists asked for and not answered yet, oldest first, whose asker still waits.
+    fn waiting(&self) -> Vec<Freshness> {
+        self.0
+            .borrow()
+            .iter()
+            .filter(|a| a.waits())
+            .map(|a| a.freshness)
+            .collect()
+    }
+
+    /// How many lists were asked for in all.
+    fn asked(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// What the last list asked for selected.
+    fn last_pods(&self) -> PodSet {
+        self.0.borrow().last().unwrap().pods.clone()
+    }
+
+    /// Answers the oldest list still waiting, and draws.
+    fn answer(&self, cx: &mut TestAppContext, t: &TestWorkspace, listed: Listed) {
+        let ix = self
+            .0
+            .borrow()
+            .iter()
+            .position(Asked::waits)
+            .expect("a list is waiting");
+        let reply = self.0.borrow_mut()[ix].reply.take().unwrap();
+        reply.try_send(listed).unwrap();
+        draw(cx, t);
+    }
+}
+
+/// Lets the delay pass after which a selected workload's pods are listed for showing.
+fn let_pods_list(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.executor()
+        .advance_clock(crate::ui::detail::SHOW_PODS_DELAY);
     draw(cx, t);
+}
+
+/// The window's state, as the automation channel reports it.
+fn app_state(cx: &mut TestAppContext, t: &TestWorkspace) -> AppState {
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.view_state(window, cx))
+    })
+    .unwrap()
+}
+
+/// The detail pane's Logs, Previous Logs and Shell, as the state reports them.
+fn actions(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<ActionAvailability> {
+    app_state(cx, t).detail.unwrap().actions
+}
+
+fn available(action: &'static str) -> ActionAvailability {
+    ActionAvailability {
+        action,
+        enabled: true,
+        reason: None,
+    }
+}
+
+fn unavailable(action: &'static str, reason: &str) -> ActionAvailability {
+    ActionAvailability {
+        action,
+        enabled: false,
+        reason: Some(reason.into()),
+    }
+}
+
+/// Why the last Logs or Shell did not open, as shown over the dock.
+fn refusal(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    app_state(cx, t)
+        .banners
+        .into_iter()
+        .find(|b| b.id == "action-error")
+        .map(|b| b.text)
+}
+
+/// Whether the detail pane's Shell button is drawn disabled (`None`: not drawn).
+fn shell_button_disabled(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<bool> {
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .try_find("detail-shell")
+            .map(|b| b.disabled() == Some(true))
+    })
+    .unwrap()
 }
 
 fn workload_pod(name: &str, ready: bool, containers: &[&str]) -> WorkloadPod {
@@ -223,8 +353,9 @@ async fn right_click(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
     .await;
 }
 
-/// The open menu's entries' labels. (Whether one is disabled is not exposed; the tests click
-/// it and check nothing opened.)
+/// The open menu's rows: its entries and the labels under disabled ones that say why. (A
+/// menu row does not report whether it is disabled: the tests click a disabled entry and
+/// check that nothing opened and nothing was refused, and read the state's `actions`.)
 fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| {
@@ -235,6 +366,12 @@ fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
             .collect()
     })
     .unwrap()
+}
+
+/// Opens the context menu of `name`'s row and returns its rows.
+async fn open_menu(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) -> Vec<String> {
+    right_click(cx, t, name).await;
+    menu(cx, t)
 }
 
 /// Clicks the open menu's entry `ix`.
@@ -340,7 +477,8 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
     draw(cx, &t);
     assert_eq!(dock_tabs(cx, &t).0[2], "$ web · sidecar");
 
-    // Logs again (the menu, then Cmd-L from the list) shows the open tab, not a second one.
+    // Logs again from the menu shows the open tab, not a second one; so does Previous Logs
+    // (Shift-Cmd-L) from the list.
     right_click(cx, &t, "web").await;
     click_entry(cx, &t, 0);
     assert_eq!(dock_tabs(cx, &t).1, Some(0));
@@ -377,12 +515,30 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     focus_list(cx, &t);
     press(cx, &t, "down");
     show_loading(cx, &t);
-    // It never restarted: Previous Logs in its menu does nothing.
+    // It never restarted: Previous Logs in its menu is disabled, saying why.
     right_click(cx, &t, "api").await;
     show_fetched(cx, &t, api());
-    assert_eq!(menu(cx, &t), ["Logs", "Previous Logs", "Shell"]);
+    let why = "container app has not restarted, so it has no previous logs";
+    assert_eq!(
+        menu(cx, &t),
+        [
+            "Logs".to_owned(),
+            "Previous Logs".to_owned(),
+            why.to_owned(),
+            "Shell".to_owned()
+        ]
+    );
+    assert_eq!(
+        actions(cx, &t),
+        [
+            available("Logs"),
+            unavailable("Previous Logs", why),
+            available("Shell")
+        ]
+    );
     click_entry(cx, &t, 1);
     assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
+    assert_eq!(refusal(cx, &t), None, "a disabled entry does not run");
     press(cx, &t, "escape");
     // Cmd-L before the pod has loaded opens its logs once it has.
     show_loading(cx, &t);
@@ -399,6 +555,12 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     focus_list(cx, &t);
     press(cx, &t, "secondary-shift-e");
     assert_eq!(dock_tabs(cx, &t).0, ["api · app", "$ api · app"]);
+    // Keys reach the action even when it cannot run: it says why.
+    assert_eq!(refusal(cx, &t), None);
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-l");
+    assert_eq!(refusal(cx, &t).as_deref(), Some(why));
+    assert_eq!(dock_tabs(cx, &t).0.len(), 2);
 }
 
 // covers UP-45, UP-47: Logs on a Deployment row opens one tab for every pod, titled with the
@@ -408,10 +570,18 @@ async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
 async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
+    let _pods = FakePods::install(cx);
     activate(cx, &t, "alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
-    right_click(cx, &t, "web").await;
-    assert_eq!(menu(cx, &t), ["Logs of All Pods", "Shell"]);
+    // One wording for Logs, on pods and workloads alike: the menu, the pane and the palette.
+    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell"]);
+    let button = cx
+        .update_window(t.window, |_, window, _| {
+            window.find("detail-logs").label().map(str::to_owned)
+        })
+        .unwrap();
+    assert_eq!(button.as_deref(), Some("Logs"));
+    assert_eq!(registry::label::<registry::OpenLogs>(), "Open Logs");
     click_entry(cx, &t, 0);
     assert_eq!(
         dock_tabs(cx, &t),
@@ -485,51 +655,80 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
     );
 }
 
-// covers UP-47, UP-41: Shell on a workload opens in its first ready pod (by name), in the
-// default container or the one picked; with no ready pod it is disabled and says why.
+// covers UP-47, UP-41: Shell on a workload opens in the first ready pod (by name) of a list
+// it asks for when chosen, never of the one shown; with no ready pod it is disabled, saying
+// why, in the menu, the state and the pane. A menu opened before the pods are listed lists
+// them and is rebuilt once they are, naming the pod.
 #[gpui_kit::test]
 async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
     activate(cx, &t, "alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
-    dispatch(
-        cx,
-        &t,
-        "resource_list::SelectRow",
-        json!({"namespace": "demo", "name": "web"}),
-    )
-    .unwrap();
-    draw(cx, &t);
-    show_pods(cx, &t, vec![workload_pod("web-a", false, &["app"])]);
+    select_row(cx, &t, "web");
+    let_pods_list(cx, &t);
+    assert_eq!(pods.waiting(), [Freshness::Cached]);
+    pods.answer(cx, &t, Ok(vec![workload_pod("web-a", false, &["app"])]));
+    let why = "no pod of Deployment web is ready";
     assert_eq!(
         dispatch(cx, &t, "detail::OpenShell", Value::Null),
         Err(ActionError::NotAvailable("detail::OpenShell".into())),
-        "no pod is ready"
     );
-    right_click(cx, &t, "web").await;
-    assert_eq!(menu(cx, &t), ["Logs of All Pods", "Shell"]);
+    assert_eq!(
+        actions(cx, &t),
+        [available("Logs"), unavailable("Shell", why)]
+    );
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell", why]);
+    assert_eq!(pods.asked(), 1, "the pods listed still hold");
     click_entry(cx, &t, 1);
-    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new(), "disabled");
+    assert_eq!(refusal(cx, &t), None, "a disabled entry does not run");
+    assert_eq!(pods.waiting(), Vec::<Freshness>::new());
     press(cx, &t, "escape");
 
-    // A menu opened while the pods are listed is rebuilt once they are: it names the pod.
-    show_loading(cx, &t);
-    right_click(cx, &t, "web").await;
-    assert_eq!(menu(cx, &t), ["Logs of All Pods", "Shell"]);
-
-    show_pods(
+    // The Deployment changed: the pods are listed again once its menu opens, and the menu is
+    // rebuilt when they are.
+    let list = t.workspace.read_with(cx, |ws, _| ws.list.clone().unwrap());
+    let mut changed = (*deployments(&["web"])).clone();
+    let mut row = (*changed.rows[0]).clone();
+    row.resource_version = "2".into();
+    changed.rows = vec![Arc::new(row)];
+    list.update(cx, |list, cx| list.set_snapshot(Arc::new(changed), cx));
+    draw(cx, &t);
+    assert_eq!(
+        pods.waiting(),
+        Vec::<Freshness>::new(),
+        "not on every change"
+    );
+    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell", why]);
+    assert_eq!(pods.waiting(), [Freshness::Cached]);
+    pods.answer(
         cx,
         &t,
-        vec![
+        Ok(vec![
             workload_pod("web-a", false, &["app"]),
             workload_pod("web-c", true, &["app"]),
             workload_pod("web-b", true, &["app"]),
-        ],
+        ]),
     );
-    assert_eq!(menu(cx, &t), ["Logs of All Pods", "Shell in web-b"]);
+    assert_eq!(menu(cx, &t), ["Logs", "Shell in web-b"]);
+    assert_eq!(shell_button_disabled(cx, &t), Some(false));
+
+    // Chosen, Shell lists the pods once more, as they are now: web-b went meanwhile.
     click_entry(cx, &t, 1);
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web-b · app"]);
+    assert_eq!(pods.waiting(), [Freshness::Current]);
+    assert_eq!(
+        dock_tabs(cx, &t).0,
+        Vec::<String>::new(),
+        "waits for the list"
+    );
+    pods.answer(
+        cx,
+        &t,
+        Ok(vec![workload_pod("web-c", true, &["app", "proxy"])]),
+    );
+    assert_eq!(dock_tabs(cx, &t).0, ["$ web-c · app"]);
     let request = t.workspace.read_with(cx, |ws, cx| {
         ws.dock
             .read(cx)
@@ -541,11 +740,10 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
     });
     assert_eq!(
         (request.namespace.as_str(), request.pod.as_str()),
-        ("demo", "web-b")
+        ("demo", "web-c")
     );
 
-    // Several containers: the picker, through the registry here.
-    show_pods(cx, &t, vec![workload_pod("web-b", true, &["app", "proxy"])]);
+    // A container, through the registry: it waits for the list too.
     dispatch(
         cx,
         &t,
@@ -553,17 +751,342 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
         json!({"container": "proxy"}),
     )
     .unwrap();
-    draw(cx, &t);
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web-b · app", "$ web-b · proxy"]);
-    assert!(matches!(
+    assert_eq!(pods.waiting(), [Freshness::Current]);
+    pods.answer(
+        cx,
+        &t,
+        Ok(vec![workload_pod("web-c", true, &["app", "proxy"])]),
+    );
+    assert_eq!(dock_tabs(cx, &t).0, ["$ web-c · app", "$ web-c · proxy"]);
+    // One the pod lacks is refused at once.
+    assert_eq!(
         dispatch(
             cx,
             &t,
             "detail::OpenContainerShell",
             json!({"container": "nope"})
         ),
-        Err(ActionError::Rejected { .. })
-    ));
+        Err(ActionError::Rejected {
+            action: "detail::OpenContainerShell".into(),
+            reason: "pod web-c has no app container nope".into()
+        })
+    );
+    // One gone by the time the pods are listed again is refused then, saying why.
+    dispatch(
+        cx,
+        &t,
+        "detail::OpenContainerShell",
+        json!({"container": "proxy"}),
+    )
+    .unwrap();
+    pods.answer(cx, &t, Ok(vec![workload_pod("web-c", true, &["app"])]));
+    assert_eq!(dock_tabs(cx, &t).0.len(), 2);
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some("pod web-c has no app container proxy")
+    );
+}
+
+// covers UP-47: a workload's pods are listed lazily and once at a time: not when it is
+// selected in passing, not on each change, one list joining another, and a list nobody waits
+// for any more is dropped (which aborts its request). The selector comes from the fetched
+// workload when there is one.
+#[gpui_kit::test]
+async fn pod_lists_are_lazy_joined_and_dropped(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
+    activate(cx, &t, "alpha").await;
+    open_list(
+        cx,
+        &t,
+        deployments_entry(),
+        deployments(&["api", "db", "web"]),
+        "api",
+    )
+    .await;
+    // Moving through the rows (key repeat) lists nothing for the rows passed over.
+    for name in ["api", "db", "web"] {
+        select_row(cx, &t, name);
+    }
+    assert_eq!(pods.asked(), 0);
+    let_pods_list(cx, &t);
+    assert_eq!(pods.waiting(), [Freshness::Cached]);
+    assert_eq!(
+        pods.last_pods(),
+        PodSet::Workload {
+            kind: flint_core::WorkloadKind::Deployment,
+            name: "web".into()
+        },
+        "not fetched yet: the workload is read for its selector"
+    );
+    // The menu and Shell join the list running; Shell's current list starts after it.
+    right_click(cx, &t, "web").await;
+    press(cx, &t, "escape");
+    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    assert_eq!(pods.waiting(), [Freshness::Cached]);
+    pods.answer(cx, &t, Ok(vec![workload_pod("web-a", true, &["app"])]));
+    assert_eq!(pods.waiting(), [Freshness::Current]);
+    // Another row: the list for web is dropped.
+    select_row(cx, &t, "db");
+    assert_eq!(pods.waiting(), Vec::<Freshness>::new());
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
+
+    // Fetched, the workload's own selector is used.
+    show_fetched(
+        cx,
+        &t,
+        detail(json!({
+            "kind": "Deployment",
+            "metadata": {"name": "db", "namespace": "demo"},
+            "spec": {"selector": {"matchLabels": {"app": "db"}}}
+        })),
+    );
+    let_pods_list(cx, &t);
+    assert_eq!(pods.last_pods(), PodSet::Selector("app=db".into()));
+}
+
+// covers UP-47, UP-41: a list that fails when Shell asks for it refuses Shell with its error;
+// Shell never falls back on the pods listed before. A failed list shows Shell disabled with
+// the error.
+#[gpui_kit::test]
+async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let pods = FakePods::install(cx);
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
+    select_row(cx, &t, "web");
+    let_pods_list(cx, &t);
+    pods.answer(cx, &t, Ok(vec![workload_pod("web-a", true, &["app"])]));
+    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    pods.answer(cx, &t, Err("pods is forbidden".into()));
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new(), "not into web-a");
+    let why = "the pods of Deployment web could not be listed: pods is forbidden";
+    assert_eq!(refusal(cx, &t).as_deref(), Some(why));
+    assert_eq!(
+        actions(cx, &t),
+        [available("Logs"), unavailable("Shell", why)]
+    );
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
+}
+
+// covers UP-47, UP-41: a container shell asked for before the pod has loaded waits for it, as
+// Shell does; the guard and the handler agree on a deleted pod.
+#[gpui_kit::test]
+async fn a_container_shell_waits_for_the_pod(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_loading(cx, &t);
+    dispatch(
+        cx,
+        &t,
+        "detail::OpenContainerShell",
+        json!({"container": "sidecar"}),
+    )
+    .unwrap();
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(dock_tabs(cx, &t).0, ["$ web · sidecar"]);
+
+    let list = t.workspace.read_with(cx, |ws, _| ws.list.clone().unwrap());
+    list.update(cx, |list, cx| list.set_snapshot(pods(&[]), cx));
+    draw(cx, &t);
+    assert_eq!(
+        dispatch(
+            cx,
+            &t,
+            "detail::OpenContainerShell",
+            json!({"container": "app"})
+        ),
+        Err(ActionError::NotAvailable(
+            "detail::OpenContainerShell".into()
+        ))
+    );
+}
+
+// covers UP-47, UP-41: a pod that finished, or is being deleted, takes no shell: Shell is
+// disabled, saying why.
+#[gpui_kit::test]
+async fn a_finished_pod_has_no_shell(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "job-1", 0)]), "job-1").await;
+    select_row(cx, &t, "job-1");
+    let pod = |extra: Value| {
+        let mut object = json!({
+            "kind": "Pod",
+            "metadata": {"name": "job-1", "namespace": "demo"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"containerStatuses": [{"name": "app", "restartCount": 0}]}
+        });
+        for (path, value) in extra.as_object().unwrap() {
+            let (section, field) = path.split_once('.').unwrap();
+            object[section][field] = value.clone();
+        }
+        detail(object)
+    };
+    for (extra, why) in [
+        (
+            json!({"status.phase": "Succeeded"}),
+            "pod job-1 has finished (Succeeded)",
+        ),
+        (
+            json!({"status.phase": "Failed"}),
+            "pod job-1 has finished (Failed)",
+        ),
+        (
+            json!({"metadata.deletionTimestamp": "2024-05-01T12:00:00Z"}),
+            "pod job-1 is being deleted",
+        ),
+    ] {
+        show_fetched(cx, &t, pod(extra));
+        assert_eq!(
+            dispatch(cx, &t, "detail::OpenShell", Value::Null),
+            Err(ActionError::NotAvailable("detail::OpenShell".into()))
+        );
+        assert_eq!(actions(cx, &t)[2], unavailable("Shell", why));
+        assert_eq!(shell_button_disabled(cx, &t), Some(true));
+    }
+    show_fetched(cx, &t, pod(json!({"status.phase": "Running"})));
+    assert_eq!(actions(cx, &t)[2], available("Shell"));
+}
+
+// covers UP-47: an open menu follows what it shows: built again whenever the row's object
+// changes, not only once after loading.
+#[gpui_kit::test]
+async fn an_open_menu_follows_its_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(
+        open_menu(cx, &t, "web").await,
+        ["Logs", "Previous Logs", "Shell"]
+    );
+    // The pod finished while the menu was open.
+    let mut finished = pod_detail("web");
+    finished.object["status"]["phase"] = json!("Succeeded");
+    show_fetched(cx, &t, finished);
+    assert_eq!(
+        menu(cx, &t),
+        [
+            "Logs",
+            "Previous Logs",
+            "Shell",
+            "pod web has finished (Succeeded)"
+        ]
+    );
+}
+
+// covers UP-47: right-clicking a row other than the selected one selects it, and the menu acts
+// on it.
+#[gpui_kit::test]
+async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(
+        cx,
+        &t,
+        pods_entry(),
+        pods(&[("demo", "api", 0), ("demo", "web", 1)]),
+        "api",
+    )
+    .await;
+    select_row(cx, &t, "api");
+    show_fetched(cx, &t, pod_detail("api"));
+    right_click(cx, &t, "web").await;
+    let selected = t.workspace.read_with(cx, |ws, cx| {
+        ws.list.as_ref().unwrap().read(cx).selected_name()
+    });
+    assert_eq!(selected.as_deref(), Some("web"));
+    show_fetched(cx, &t, pod_detail("web"));
+    click_entry(cx, &t, 0);
+    assert_eq!(dock_tabs(cx, &t).0, ["web · app"]);
+}
+
+// covers UP-47, UP-40: an action that waited does not take focus from where the user went
+// meanwhile (its tab still opens); one whose focus stayed put takes it. It shows that it waits,
+// and gives up, saying so, if its object never loads.
+#[gpui_kit::test]
+async fn a_late_action_keeps_focus_and_gives_up_in_time(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_loading(cx, &t);
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-l");
+    let waiting = app_state(cx, &t)
+        .detail
+        .unwrap()
+        .banners
+        .into_iter()
+        .find(|b| b.id == "detail-pending")
+        .map(|b| b.text);
+    assert_eq!(waiting.as_deref(), Some("Logs opens once web has loaded"));
+    // The user moves to the filter meanwhile.
+    dispatch(cx, &t, "resource_list::FocusFilter", Value::Null).unwrap();
+    draw(cx, &t);
+    assert_eq!(app_state(cx, &t).focus, Focus::ListFilter);
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(dock_tabs(cx, &t), (vec!["web · app".to_owned()], Some(0)));
+    assert_eq!(app_state(cx, &t).focus, Focus::ListFilter, "focus stayed");
+
+    // Focus left where it was: the tab takes it.
+    show_loading(cx, &t);
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-l");
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(dock_tabs(cx, &t).1, Some(1));
+    assert_ne!(app_state(cx, &t).focus, Focus::List, "the tab took focus");
+
+    // Never loaded: it gives up, saying so.
+    show_loading(cx, &t);
+    focus_list(cx, &t);
+    press(cx, &t, "secondary-shift-e");
+    cx.executor().advance_clock(PENDING_TIMEOUT);
+    draw(cx, &t);
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some("Shell: gave up waiting for web to load (30 s)")
+    );
+    let state = app_state(cx, &t).detail.unwrap();
+    assert!(state.banners.iter().all(|b| b.id != "detail-pending"));
+    show_fetched(cx, &t, pod_detail("web"));
+    assert_eq!(dock_tabs(cx, &t).0.len(), 2, "no shell once given up");
+}
+
+// covers UP-47: a pending action whose object fails to load says why.
+#[gpui_kit::test]
+async fn a_pending_action_on_a_failed_fetch_says_why(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    activate(cx, &t, "alpha").await;
+    open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
+    select_row(cx, &t, "web");
+    show_loading(cx, &t);
+    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
+    let detail_view = t
+        .workspace
+        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
+    detail_view.update(cx, |d, cx| {
+        d.show_failed("the server is unavailable".into(), cx)
+    });
+    draw(cx, &t);
+    assert_eq!(
+        refusal(cx, &t).as_deref(),
+        Some("the pod could not be fetched: the server is unavailable")
+    );
 }
 
 // covers UP-47, UP-45: the selector logs action opens one tab for the pods a label selector
@@ -653,6 +1176,45 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
         Some("alpha is not connected: connection refused")
     );
     assert_eq!(dock_tabs(cx, &t).0, ["$ web · app"]);
+    // Every entry is unavailable, saying why.
+    let why = "alpha is not connected: connection refused";
+    assert_eq!(
+        actions(cx, &t),
+        [
+            unavailable("Logs", why),
+            unavailable("Previous Logs", why),
+            unavailable("Shell", why)
+        ]
+    );
+    // A long error shows as core's summary of it: one line, quoted values hidden.
+    let long = format!("connection refused by \"{}\"\nsecond line", "x".repeat(300));
+    let summary = SafeErrorText::reduced(&long);
+    t.model.update(cx, |model, cx| {
+        for cluster in &mut model.clusters {
+            cluster.state = ConnectionState::Failed(summary.clone());
+        }
+        cx.notify();
+    });
+    let shown = actions(cx, &t)[0].reason.clone().unwrap();
+    assert_eq!(shown, format!("alpha is not connected: {summary}"));
+    assert!(!shown.contains('\n') && !shown.contains("xxx"), "{shown}");
+    // A session asked for anyway (a pending action that loads late) is refused, saying why.
+    let request = t.workspace.read_with(cx, |ws, cx| {
+        ws.dock
+            .read(cx)
+            .active_terminal()
+            .unwrap()
+            .read(cx)
+            .request()
+            .clone()
+    });
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| ws.open_shell(request, true, window, cx))
+    })
+    .unwrap();
+    let why = refusal(cx, &t).unwrap();
+    assert!(why.starts_with("Shell: alpha is not connected"), "{why}");
 }
 
 // covers UP-42, UP-47: a log tab opened from a row's menu frees everything once the tab closes
@@ -661,6 +1223,7 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
 async fn a_tab_opened_from_a_row_leaks_nothing_once_closed(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
+    let _pods = FakePods::install(cx);
     activate(cx, &t, "alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     dispatch(
@@ -759,50 +1322,19 @@ async fn an_action_right_after_moving_rows_acts_on_the_new_row(cx: &mut TestAppC
     assert_eq!(dock_tabs(cx, &t).0, ["web · app"]);
 }
 
-// covers UP-47, UP-41: once a workload changed, its pods are listed again, and Shell waits for
-// that list instead of opening in a pod listed before, which may be gone or no longer ready.
-#[gpui_kit::test]
-async fn a_workload_shell_waits_for_its_pods_listed_again(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
-    open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
-    select_row(cx, &t, "web");
-    show_pods(cx, &t, vec![workload_pod("web-a", true, &["app"])]);
-
-    let detail = t
-        .workspace
-        .read_with(cx, |ws, _| ws.detail.clone().unwrap());
-    detail.update(cx, |d, cx| d.show_relisting(cx));
-    draw(cx, &t);
-    dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
-    draw(cx, &t);
-    assert_eq!(
-        dock_tabs(cx, &t).0,
-        Vec::<String>::new(),
-        "waits for the list"
-    );
-    // web-a was replaced by web-b.
-    show_pods(cx, &t, vec![workload_pod("web-b", true, &["app"])]);
-    assert_eq!(dock_tabs(cx, &t).0, ["$ web-b · app"]);
-}
-
 // covers UP-47, UP-41: a deleted workload or pod has no shell: Shell is disabled and says why,
 // though the pods listed before still show.
 #[gpui_kit::test]
 async fn a_deleted_object_has_no_shell(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
+    let pods_listed = FakePods::install(cx);
     activate(cx, &t, "alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     select_row(cx, &t, "web");
-    show_pods(cx, &t, vec![workload_pod("web-a", true, &["app"])]);
-    assert_eq!(
-        dispatch(cx, &t, "detail::OpenShell", Value::Null),
-        Ok(()),
-        "before"
-    );
-    let shells = dock_tabs(cx, &t).0.len();
+    let_pods_list(cx, &t);
+    pods_listed.answer(cx, &t, Ok(vec![workload_pod("web-a", true, &["app"])]));
+    assert_eq!(actions(cx, &t)[1], available("Shell"));
 
     let list = t.workspace.read_with(cx, |ws, _| ws.list.clone().unwrap());
     list.update(cx, |list, cx| list.set_snapshot(deployments(&[]), cx));
@@ -811,17 +1343,8 @@ async fn a_deleted_object_has_no_shell(cx: &mut TestAppContext) {
         dispatch(cx, &t, "detail::OpenShell", Value::Null),
         Err(ActionError::NotAvailable("detail::OpenShell".into()))
     );
-    let reason = t.workspace.read_with(cx, |ws, cx| {
-        ws.detail
-            .as_ref()
-            .unwrap()
-            .read(cx)
-            .shell_plan::<crate::ui::registry::OpenShell>(None)
-    });
-    assert!(
-        matches!(&reason, Err(ActionError::Rejected { reason, .. }) if reason == "web was deleted"),
-        "{reason:?}"
-    );
+    assert_eq!(actions(cx, &t)[1], unavailable("Shell", "web was deleted"));
+    assert_eq!(shell_button_disabled(cx, &t), Some(true));
 
     // The same for a pod.
     open_list(cx, &t, pods_entry(), pods(&[("demo", "api", 0)]), "api").await;
@@ -834,5 +1357,5 @@ async fn a_deleted_object_has_no_shell(cx: &mut TestAppContext) {
         dispatch(cx, &t, "detail::OpenShell", Value::Null),
         Err(ActionError::NotAvailable("detail::OpenShell".into()))
     );
-    assert_eq!(dock_tabs(cx, &t).0.len(), shells);
+    assert_eq!(dock_tabs(cx, &t).0, Vec::<String>::new());
 }

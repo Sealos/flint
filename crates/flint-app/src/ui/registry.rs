@@ -598,6 +598,10 @@ impl ActionSpec {
 
     /// Whether the action is enabled now, whatever its arguments: its guard, if the workspace
     /// installed one (a list action with no list open is not).
+    #[cfg_attr(
+        not(any(test, feature = "automation")),
+        expect(dead_code, reason = "used by the command palette (#29) and automation")
+    )]
     pub fn is_enabled(&self, cx: &App) -> bool {
         guard(self.type_id, cx).is_none_or(|g| (g.enabled)(cx))
     }
@@ -692,11 +696,6 @@ pub fn find(name: &str) -> Option<&'static ActionSpec> {
 /// The label of action `A`, for a menu item.
 pub fn label<A: Action>() -> &'static str {
     find(A::name_for_type()).map_or(A::name_for_type(), |spec| spec.label)
-}
-
-/// Whether action `A` is enabled now (its guard), for a menu item drawn disabled.
-pub fn enabled<A: Action>(cx: &App) -> bool {
-    find(A::name_for_type()).is_some_and(|spec| spec.is_enabled(cx))
 }
 
 /// The spec of `action`'s type.
@@ -808,6 +807,20 @@ pub fn on_click<E: ?Sized, A: Action>(action: A) -> impl Fn(&E, &mut Window, &mu
     move |_, window, cx| {
         if let Err(e) = perform(&action, window, cx) {
             tracing::warn!("{e}");
+        }
+    }
+}
+
+/// [`on_click`] that also hands a refusal to `refused`, for a control drawn from state that may
+/// be older than the click (a menu left open), so the user learns why nothing happened.
+pub fn on_click_or<E: ?Sized>(
+    action: Box<dyn Action>,
+    refused: impl Fn(&ActionError, &mut App) + 'static,
+) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if let Err(e) = perform(&*action, window, cx) {
+            tracing::warn!("{e}");
+            refused(&e, cx);
         }
     }
 }

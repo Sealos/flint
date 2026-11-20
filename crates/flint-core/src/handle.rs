@@ -18,7 +18,8 @@ use crate::discovery::ClusterDiscovery;
 use crate::exec::{ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
-    LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget, PodSet, WorkloadPod,
+    Freshness, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget, PodSet,
+    WorkloadPod,
 };
 use crate::manager::ClusterManager;
 use crate::read::{KindId, ObjectDetail};
@@ -438,38 +439,41 @@ impl CoreHandle {
 
     /// Lists the pods of a workload (or a label selector) in `namespace` on a connected
     /// cluster, once and sorted by name, so a front end can open a shell in one of them
-    /// ([`WorkloadPod::first_ready`]). Never blocks; the future works on any executor and fails
-    /// if the cluster is not connected, the workload is missing or the list is refused.
+    /// ([`WorkloadPod::first_ready`]). [`Freshness::Cached`] reads the API server's cache, for
+    /// showing; [`Freshness::Current`] is a quorum read, for acting. Never blocks; the future
+    /// works on any executor and fails if the cluster is not connected, the workload is missing,
+    /// the selector is empty or the list is refused. Dropping the future stops the request.
     pub fn workload_pods(
         &self,
         cluster: &str,
         namespace: &str,
         pods: PodSet,
+        freshness: Freshness,
     ) -> impl Future<Output = Result<Vec<WorkloadPod>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::Client {
             cluster: cluster.to_owned(),
             reply,
         });
-        let (tx, result) = oneshot::channel();
         let (cluster, namespace) = (cluster.to_owned(), namespace.to_owned());
-        self.runtime.spawn(async move {
-            let listed = match sent {
+        let listed = spawn_aborting(&self.runtime, async move {
+            match sent {
                 Ok(()) => match rx.await {
-                    Ok(Some(client)) => crate::logs::list_workload_pods(client, &namespace, &pods)
-                        .await
-                        .map_err(|e| e.message),
+                    Ok(Some(client)) => {
+                        crate::logs::list_workload_pods(client, &namespace, &pods, freshness)
+                            .await
+                            .map_err(|e| e.message)
+                    }
                     Ok(None) => Err(format!("\"{cluster}\" is not connected")),
                     Err(_) => Err("the core stopped before answering".to_owned()),
                 },
                 Err(_) => Err("the core is not running".to_owned()),
-            };
-            let _ = tx.send(listed);
+            }
         });
         async move {
-            result
+            listed
                 .await
-                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+                .unwrap_or_else(|| Err("the core stopped before answering".to_owned()))
         }
     }
 
@@ -674,6 +678,17 @@ impl Drop for RuntimeGuard {
     }
 }
 
+/// Runs `task` on `runtime`. The returned future yields its output (`None` if the runtime
+/// dropped it), and dropping that future aborts the task, so an answer nobody waits for any
+/// more is not worked on.
+fn spawn_aborting<T: Send + 'static>(
+    runtime: &tokio::runtime::Handle,
+    task: impl Future<Output = T> + Send + 'static,
+) -> impl Future<Output = Option<T>> + Send + 'static {
+    let mut task = crate::exec::AbortOnDrop(runtime.spawn(task));
+    async move { (&mut task.0).await.ok() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +740,49 @@ mod tests {
         assert!(err.contains("not connected"), "{err}");
         assert!(core.discovery("nowhere").await.is_none());
         assert!(core.watched_kinds("nowhere").await.is_empty());
+    }
+
+    // covers UP-47: a pod list nobody waits for any more stops: dropping the future aborts
+    // the task doing the request.
+    #[tokio::test]
+    async fn dropping_a_spawned_request_aborts_it() {
+        struct Flag(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (dropped, aborted) = tokio::sync::oneshot::channel();
+        let flag = Flag(Some(dropped));
+        let waiting = spawn_aborting(&tokio::runtime::Handle::current(), async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        // Not even polled once.
+        drop(waiting);
+        tokio::time::timeout(Duration::from_secs(5), aborted)
+            .await
+            .expect("the task was aborted, dropping what it held")
+            .unwrap();
+
+        let answered = spawn_aborting(&tokio::runtime::Handle::current(), async { 7 });
+        assert_eq!(answered.await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn workload_pods_on_an_unknown_cluster_answer_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let err = core
+            .workload_pods(
+                "nowhere",
+                "ns",
+                PodSet::Selector("app=web".into()),
+                Freshness::Current,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("not connected"), "{err}");
     }
 
     // covers UP-40

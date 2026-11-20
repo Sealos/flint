@@ -27,11 +27,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::clusters::{ClustersModel, Presence, state_label};
-use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef};
+use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, TakeFocus};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
+use super::notice::notice;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
     RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
@@ -192,6 +193,9 @@ pub struct Workspace {
     startup_yaml: bool,
     /// Open the next detail view's pod logs (`FLINT_VIEW=…#logs`).
     startup_logs: bool,
+    /// Why the last Logs or Shell did not open, shown over the dock until the next one does,
+    /// or another row is selected.
+    action_error: Option<String>,
     /// The last write of `state.toml`; the next one waits for it, so writes land in order.
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
@@ -301,6 +305,7 @@ impl Workspace {
             namespace_input,
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
+            action_error: None,
             startup_view,
             saving: None,
             _save_panes: Task::ready(()),
@@ -428,19 +433,22 @@ impl Workspace {
         self.save_panes_later(cx);
     }
 
-    /// Opens (or shows) the log tab for `request` in the dock, and focuses it. Refused while
-    /// its cluster is not connected.
+    /// Opens (or shows) the log tab for `request` in the dock, focusing it if `focus`.
+    /// Refused, saying why, while its cluster is not connected.
     pub(in crate::ui) fn open_logs(
         &mut self,
         request: LogRequest,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(reason) = self.sessions_blocked(&request.cluster, cx) {
-            tracing::warn!("logs: {reason}");
+            self.refuse(format!("Logs: {reason}"), cx);
             return;
         }
+        self.action_error = None;
         let core = self.model.read(cx).core().clone();
+        let kept = (!focus).then(|| window.focused(cx)).flatten();
         self.dock.update(cx, |dock, cx| {
             dock.open(
                 TabKey::Logs(request.clone()),
@@ -449,22 +457,41 @@ impl Workspace {
                 cx,
             )
         });
+        if let Some(kept) = kept {
+            window.focus(&kept, cx);
+        }
         cx.notify();
     }
 
-    /// Opens (or shows) the shell tab for `request` in the dock, and focuses it. The session
-    /// starts at the classic 80 by 24; the tab sends its real size once laid out. Refused while
-    /// its cluster is not connected.
+    /// Says why Logs or Shell did not open, over the dock.
+    pub(in crate::ui) fn refuse(&mut self, why: String, cx: &mut Context<Self>) {
+        tracing::warn!("{why}");
+        self.action_error = Some(why);
+        cx.notify();
+    }
+
+    /// Why the last Logs or Shell did not open, while it is shown.
+    #[cfg(any(test, feature = "automation"))]
+    pub(in crate::ui) fn action_error(&self) -> Option<&str> {
+        self.action_error.as_deref()
+    }
+
+    /// Opens (or shows) the shell tab for `request` in the dock, focusing it if `focus`. The
+    /// session starts at the classic 80 by 24; the tab sends its real size once laid out.
+    /// Refused, saying why, while its cluster is not connected.
     pub(in crate::ui) fn open_shell(
         &mut self,
         request: ShellRequest,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(reason) = self.sessions_blocked(&request.cluster, cx) {
-            tracing::warn!("shell: {reason}");
+            self.refuse(format!("Shell: {reason}"), cx);
             return;
         }
+        self.action_error = None;
+        let kept = (!focus).then(|| window.focused(cx)).flatten();
         let core = self.model.read(cx).core().clone();
         let key = TabKey::Shell(ShellKey {
             request: request.clone(),
@@ -481,6 +508,9 @@ impl Workspace {
                 cx,
             )
         });
+        if let Some(kept) = kept {
+            window.focus(&kept, cx);
+        }
         cx.notify();
     }
 
@@ -680,12 +710,14 @@ impl Workspace {
                         .as_ref()
                         .map_or(DetailTab::Overview, |d| d.read(cx).tab())
                 };
+                // A reason given for the row left no longer applies.
+                self.action_error = None;
                 let core = self.model.read(cx).core().clone();
                 let startup_logs = std::mem::take(&mut self.startup_logs);
                 let detail = cx.new(|cx| {
                     let mut detail = DetailView::new(core, object, tab, window, cx);
                     if startup_logs {
-                        detail.open_logs_when_loaded();
+                        detail.open_logs_when_loaded(cx);
                     }
                     detail
                 });
@@ -699,12 +731,15 @@ impl Workspace {
                                         list.update(cx, |list, cx| list.clear_selection(cx));
                                     }
                                 }
-                                DetailEvent::OpenLogs(request) => {
-                                    this.open_logs(request.clone(), window, cx)
+                                DetailEvent::OpenLogs(request, focus) => {
+                                    let focus = takes_focus(focus, window, cx);
+                                    this.open_logs(request.clone(), focus, window, cx)
                                 }
-                                DetailEvent::OpenShell(request) => {
-                                    this.open_shell(request.clone(), window, cx)
+                                DetailEvent::OpenShell(request, focus) => {
+                                    let focus = takes_focus(focus, window, cx);
+                                    this.open_shell(request.clone(), focus, window, cx)
                                 }
+                                DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
                             }
                         }),
                     ];
@@ -1724,6 +1759,9 @@ impl Render for Workspace {
                         theme,
                         cx,
                     )))
+                    .when_some(self.action_error.clone(), |el, why| {
+                        el.child(notice("action-error", why, theme.danger))
+                    })
                     .when(self.dock.read(cx).is_visible(), |el| {
                         el.child(
                             div()
@@ -1753,6 +1791,14 @@ impl Render for Workspace {
                         )
                     }),
             )
+    }
+}
+
+/// Whether a tab opened for a detail action takes focus (see [`TakeFocus`]).
+fn takes_focus(focus: &TakeFocus, window: &Window, cx: &App) -> bool {
+    match focus {
+        TakeFocus::Yes => true,
+        TakeFocus::IfStill(then) => window.focused(cx) == *then,
     }
 }
 
