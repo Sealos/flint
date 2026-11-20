@@ -1877,35 +1877,46 @@ async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppC
     assert_eq!(next(cx), Some(4));
 }
 
-// covers UP-44: a copy still being built when the tab closes reaches the clipboard, and of two
-// copies in flight only the later one does.
-#[gpui_kit::test]
+// covers UP-44: a copy still being built when the tab closes reaches the clipboard; of copies
+// in flight, the latest asked for wins, whichever lands last: a slow copy of many lines then a
+// fast one with the tab closed in between, and copies from two tabs. Several iterations, so
+// the copies finish in different orders.
+#[gpui_kit::test(iterations = 20)]
 async fn a_copy_lands_after_its_tab_closes(cx: &mut TestAppContext) {
     let (core, _dir) = core();
-    let (window, view) = open(cx, core);
-    let mut lines = Feed::new(100);
-    feed(cx, &view, lines.push(0, 10).streaming());
+    let (window, view) = open(cx, core.clone());
+    let (other_window, other) = open(cx, core);
+    let mut lines = Feed::new(50_000);
+    let snapshot = lines.push(0, 50_000).streaming();
+    feed(cx, &view, snapshot.clone());
+    feed(cx, &other, snapshot);
     cx.run_until_parked();
-    let copy = |cx: &mut TestAppContext, selection| {
-        view.update(cx, |v, _| v.selection = Some(selection));
-        cx.update_window(window, |_, window, cx| {
-            window.dispatch_action(Box::new(registry::CopyLines), cx)
-        })
-        .unwrap();
-    };
-    copy(cx, LineSelection::new(0, 1));
-    copy(cx, LineSelection::new(2, 3));
-    cx.run_until_parked();
-    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
-    assert_eq!(copied, "line 2\nline 3");
+    let copy =
+        |cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<LogView>, selection| {
+            view.update(cx, |v, _| v.selection = Some(selection));
+            cx.update_window(window, |_, window, cx| {
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                window.dispatch_action(Box::new(registry::CopyLines), cx)
+            })
+            .unwrap();
+        };
+    let clipboard = |cx: &mut TestAppContext| cx.read_from_clipboard().and_then(|c| c.text());
 
-    copy(cx, LineSelection::new(5, 6));
+    // Two tabs: the slow copy in one, then a fast one in the other.
+    copy(cx, window, &view, LineSelection::new(0, 49_999));
+    copy(cx, other_window, &other, LineSelection::new(2, 3));
+    cx.run_until_parked();
+    assert_eq!(clipboard(cx).as_deref(), Some("line 2\nline 3"));
+
+    // One tab: a slow copy, then a fast one, and the tab closes before either lands.
+    copy(cx, window, &view, LineSelection::new(0, 49_999));
+    copy(cx, window, &view, LineSelection::new(5, 6));
     let released = view.downgrade();
     drop(view);
     cx.update_window(window, |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
     assert!(released.upgrade().is_none(), "the tab is gone");
-    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
-    assert_eq!(copied, "line 5\nline 6");
+    assert_eq!(clipboard(cx).as_deref(), Some("line 5\nline 6"));
 }

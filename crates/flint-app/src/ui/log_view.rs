@@ -160,8 +160,6 @@ pub struct LogView {
     focus: FocusHandle,
     _pump: Task<()>,
     _search: Task<()>,
-    /// Copies asked for so far: only the latest one still being built reaches the clipboard.
-    copies: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -239,7 +237,6 @@ impl LogView {
             focus: cx.focus_handle(),
             _pump: pump,
             _search: Task::ready(()),
-            copies: 0,
             _subscriptions: vec![on_search],
         }
     }
