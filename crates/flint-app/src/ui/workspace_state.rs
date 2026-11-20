@@ -3,7 +3,7 @@
 // module-tests: workspace_actions.rs
 
 use flint_core::settings::AiExposureState;
-use flint_core::{Appearance, ConnectionState, WatchMode, display};
+use flint_core::{Appearance, ConnectionState, display};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestQueryExt as _;
 use gpui_kit::*;
@@ -17,7 +17,7 @@ use super::super::view_state::{
     KubeconfigPath, KubeconfigState, Level, Main, MenuEntryState, MenuState, connection_error_text,
     error_text,
 };
-use super::{Workspace, header_controls, namespace_summary};
+use super::{Workspace, header_controls, namespace_summary, watch_mode_label};
 
 impl Workspace {
     /// What the window shows now, as data.
@@ -118,13 +118,9 @@ impl Workspace {
                 breadcrumb,
                 namespace_button: controls.namespaces.then(|| namespace_summary(&filter)),
                 namespaces: filter,
-                watch_mode: controls.watch_mode.then(|| {
-                    match model.settings.watch_mode_for(name) {
-                        WatchMode::All => "Live: all kinds",
-                        WatchMode::OnView => "Live: open views only",
-                    }
-                    .to_owned()
-                }),
+                watch_mode: controls
+                    .watch_mode
+                    .then(|| watch_mode_label(model.settings.watch_mode_for(name)).to_owned()),
                 watch_mode_source: if model.settings.cluster_watch_mode.contains_key(name) {
                     "cluster"
                 } else {
