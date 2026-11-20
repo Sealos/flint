@@ -376,6 +376,44 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   re-pointed, the cluster is protected again.
 - Tests: unit (settings, pinning), ui.
 
+---
+
+### UP-56 See only the kinds in use
+- **Given** watch mode All, and a cluster where Replication Controllers, most of the Network section and two CRD groups
+  have no objects.
+- **When** I connect and look at the resource tree.
+- **Then** each section lists only its kinds with at least one object anywhere in the cluster, whatever my namespace
+  filter, and ends in a dimmed "… N more" row that expands in place. The two empty CRD groups fold into one
+  "… 2 empty groups" row at the end. Kinds I may not list sit under "N more" with a lock, and hovering says why. No
+  counts appear next to names. Cmd-P still finds every hidden kind, and opening one keeps it visible until I navigate
+  away. The expanded rows are remembered per cluster.
+- Tests: unit (in-use set, folding), ui, e2e (fake API server).
+
+### UP-57 The tree follows the cluster without jumping
+- **When** I create the first Job in a cluster that had none, and later delete the last Gadget while the tree is
+  open.
+- **Then** Jobs appears at once. Gadgets stays where it is until I connect again or switch back to the
+  cluster. In a cluster set, a kind shows when any member has an object. With watch mode On view, the full tree
+  shows as before, and no extra requests are made.
+- Tests: unit, ui, e2e (fake API server, request log).
+
+### UP-58 Read workload health at a glance
+- **When** I open Deployments, StatefulSets, DaemonSets, ReplicaSets or Replication Controllers.
+- **Then** one Ready column shows "ready/desired" with a dot: green when all are ready, amber when some are not, red
+  when none are but some are wanted, grey and dimmed at 0/0. "· 3 current" shows only when current differs, and hover
+  shows the kind's details (up-to-date and available for Deployments). The column sorts by health. During a rollout
+  the cell shows a spinner and "2/3 · rolling out"; a Deployment past its progress deadline turns red with the
+  condition's message on hover. Wide adds the server's raw columns next to Ready. Jobs and CronJobs keep their own
+  columns.
+- Tests: unit (status rules per kind), ui, e2e (fake API server with a rollout).
+
+### UP-59 Old ReplicaSet revisions stay out of the way
+- **Given** Deployments that have rolled out many times, and one orphan ReplicaSet scaled to 0.
+- **When** I open Replica Sets.
+- **Then** the header says "84 old revisions hidden" with a Show toggle, and only the live ReplicaSets and the orphan
+  are listed. A text filter that matches an old revision shows it dimmed. Show is remembered per cluster.
+- Tests: unit (owner and replica rules), ui.
+
 ## M4: Curated views, metrics and the resource diagram
 
 ### UP-60 Understand a workload at a glance
@@ -404,7 +442,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-64 A large namespace stays readable
 - **Given** a namespace with hundreds of pods, old empty ReplicaSets and many finished Jobs.
 - **Then** empty ReplicaSets and finished Jobs start collapsed, a group of more than about 50 pods shows a count,
-  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI.
+  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI. In the
+  Replica Sets list, old revisions are hidden behind the header's Show toggle (UP-59).
 - Tests: unit (collapsing, limits), cluster (generated load), ui.
 
 ---
@@ -433,6 +472,24 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** a rollout starts or a Warning event fires while the dashboard is open.
 - **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
 - Tests: ui, e2e.
+
+### UP-69 Find the namespace that is broken or full
+- **When** I open Namespaces.
+- **Then** besides Name, Status and Age, each row shows Problems (failing or crash-looping pods and workloads short
+  of replicas, counted as the dashboard counts them), Pods, and CPU and Memory as "used / requested". Without
+  metrics-server the used part is blank and the requests still show. The list is sorted by name; clicking a column
+  sorts by it, and the choice is remembered. Counts update live.
+- Tests: unit (aggregation, problem rules), ui, e2e (fake API server).
+
+M4 used every number in the 6x block, so its later paths continue at UP-120.
+
+### UP-120 Open a namespace's overview
+- **When** I click the `demo` row in Namespaces.
+- **Then** an overview of `demo` opens: problem counts that open the matching lists filtered to `demo`, CPU and
+  memory usage against requests with sparklines of the last hour, recent Warning events and rollouts, and
+  ResourceQuota and LimitRange use when the namespace has them. Its YAML tab shows the namespace object, and Show
+  YAML in the row's context menu does too.
+- Tests: unit (namespace scope), ui, e2e.
 
 ## M5: Port-forward and Helm
 
@@ -542,6 +599,19 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - **Then** each member has a card with its colour tag, problem counts and usage sparklines, the unhealthiest first,
   under a totals strip. Clicking a count opens the combined list filtered to it.
 - Tests: unit (ordering, totals), ui, e2e.
+
+### UP-86 One row per namespace across a cluster set
+- **Given** a set of three clusters that all have a `payments` namespace, one of them terminating it.
+- **When** I open Namespaces in the set.
+- **Then** `payments` is one row saying "3 clusters", with Problems, Pods, CPU and Memory summed, status Terminating
+  and the oldest age. Its chevron shows one child row per cluster with its colour tag and its own values.
+- Tests: unit (merging, worst status), ui, e2e (two kind clusters).
+
+### UP-87 Compare one namespace across a cluster set
+- **When** I click the merged `payments` row.
+- **Then** an overview shows a card per cluster for `payments` (problems, usage, sparklines) under a totals strip,
+  and clicking a card opens that cluster's `payments` overview.
+- Tests: unit (totals), ui, e2e.
 
 ## M6: Install
 

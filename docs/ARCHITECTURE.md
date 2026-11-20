@@ -154,6 +154,11 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   is connected and watched like the active cluster. Rows keep their cluster: details and actions act on the row's
   own cluster. Each cluster may have an optional colour tag, shown in the sidebar, the Cluster column and the detail
   header.
+- **Merged rows (planned, M5.5):** the Namespaces list is the one combined list that merges rows. Namespaces with the
+  same name become one row whose columns are summed across members, with a member count, the worst status and the
+  oldest age; a chevron shows one child row per member, and clicking the row opens a set-scoped namespace overview
+  with a card per member ([ADR-0020](./adr/0020-namespace-columns-and-overview.md)). The merged row is a view over the
+  members' per-namespace aggregates; every other list keeps one row per object.
 - **Protection (planned, M3, #81):** every cluster will be protected (read-only in Flint) by default, except clusters on the user's machine
   and clusters marked trusted. A session unlock (one confirmation naming the cluster and server) will last until Flint
   quits ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)). Not built yet: today shells open on any
@@ -183,12 +188,42 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   namespace filter (which accepts typed names when namespaces cannot be listed) is the setting.
 - The table widget is virtualized. Only visible rows are laid out, so a list of 10,000 pods costs about the same to
   draw as a list of 50.
+- **Kinds in use (planned, M3):** in watch mode All, the tree shows only the kinds with at least one object anywhere
+  in the cluster, and folds the rest into a dimmed "… N more" row per section; CRD groups with no objects fold into
+  one "… N empty groups" row ([ADR-0019](./adr/0019-sidebar-shows-kinds-in-use.md)). The in-use set comes from the
+  watch caches at no extra cost: a kind joins it when its store gains a first object, and leaves it only when the
+  cluster connects again or becomes active again, so rows never vanish under the cursor. Forbidden kinds and kinds
+  without a watch are not in it; forbidden ones show a lock. `Navigation` still holds every listable kind, and each
+  entry gains an in-use flag that the tree folds by; the open kind is never folded. In a cluster set, the set is the
+  union of the members'. In mode On view the tree is not folded and nothing is probed. Search and the palette find
+  every kind.
+- **Flint-computed columns (planned, M3 and M4):** a few columns are computed by Flint and layered on the server's
+  Table. They are synthetic columns, built in `table.rs` beside Namespace and Age (`Column::synthetic`, with their own
+  `ColumnRole`), and filled from a few typed fields Flint keeps per row (replica status, pod phase and requests, the
+  controller owner uid), never the whole object. Replica workloads get one **Ready** column ("ready/desired", a
+  status dot, a rollout marker) in place of the server's Desired, Current and Ready
+  ([ADR-0021](./adr/0021-replica-ready-column.md)): the replaced server columns are kept in the layout with a
+  priority above 0, so the **Wide** toggle (which shows `priority > 0` columns) puts them back beside Ready. The
+  Namespaces list gets Problems, Pods, CPU and Memory ([ADR-0020](./adr/0020-namespace-columns-and-overview.md)).
+- **Old ReplicaSet revisions (planned, M3):** ReplicaSets with 0 desired and a Deployment as controller owner are
+  left out of the list by default, with a count and a Show toggle in the header, remembered per cluster in
+  `state.toml`. The text filter still matches them and shows them dimmed.
 
 ### Curated views
 
 About 10 core kinds get hand-built detail views: Pod, Deployment, StatefulSet, DaemonSet, Job, CronJob, Service,
 Ingress, Node, and Namespace. Every other kind uses the generic detail view, which shows metadata, conditions, events,
 and YAML. A curated view is an addition to the generic view, never a replacement: each kind can always show its YAML.
+
+### Namespaces
+
+The Namespaces list's Problems, Pods, CPU and Memory columns, and the namespace overview, are per-namespace
+aggregates ([ADR-0020](./adr/0020-namespace-columns-and-overview.md)). The core keeps them per cluster, updated
+from the Pods and replica workload stores as their snapshots change (problem rules shared with the dashboard), and
+from each metrics-server poll (usage summed by namespace). Requests are summed from each pod's typed requests.
+While the list or an overview is open it counts as an open view of those kinds and of pod metrics, in both watch
+modes. The overview (planned, M4) is the dashboard's components with a namespace scope, plus ResourceQuota and
+LimitRange use and a YAML tab; until it lands, a row opens the detail pane.
 
 ### Watch modes
 
@@ -539,7 +574,8 @@ limits against capacity, per node and in total, with a sparkline of the last hou
 events and rollouts). The sparklines come from Flint's own 15-second metrics-server samples, kept in a bounded
 in-memory buffer while the cluster is connected. Thresholds are typed settings with per-cluster overrides, edited from
 the dashboard. The dashboard counts as an open view of the kinds it needs. A cluster set's dashboard shows one card per
-member, worst first, under a totals strip. `get_cluster_summary` gives agents the same summary.
+member, worst first, under a totals strip. `get_cluster_summary` gives agents the same summary. The same components,
+scoped to one namespace, make the namespace overview (see [Namespaces](#namespaces)).
 
 ### Metrics
 
@@ -678,7 +714,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   analysis line limit, and a `claude` binary override.
 - `state.toml`: window layout (the widths of the cluster column, navigation and detail pane, and the dock's height,
   which the user drags), cluster order and pins in the sidebar, the last view open in each cluster, and the namespace
-  filter of each cluster.
+  filter of each cluster. Planned: per cluster, the expanded "… N more" rows of the tree, the old-revisions toggle,
+  and each list's sort.
 - `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
   ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.
@@ -692,10 +729,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | T | Test foundation: unit tests for every module, headless view tests, automation channel (test builds only), `flint-e2e` harness, recorded fake API server, Linux kind e2e, e2e screenshots ([TESTING.md](./TESTING.md)) |
 | M1.5 | Look and keyboard: Flint Light and Flint Dark themes with orange accents that follow macOS, command palette, resource switcher |
 | M2 | Log viewer with streaming, search, timestamps and error highlighting; exec terminal |
-| M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain, clusters protected by default |
-| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram, cluster dashboard with thresholds and `get_cluster_summary` |
+| M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain, clusters protected by default; list polish: a resource tree of the kinds in use, a Ready column for replica workloads, old ReplicaSet revisions hidden |
+| M4 | Curated views for core kinds, metrics-server columns and node/pod usage, Namespaces list health and usage columns, resource diagram, cluster dashboard with thresholds and `get_cluster_summary`, namespace overview |
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
-| M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets, colour tags and a set dashboard, AI log analysis through the user's Claude Code CLI |
+| M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets, colour tags, a set dashboard and merged namespace rows, AI log analysis through the user's Claude Code CLI |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
 | M7 | Fleet actions on a cluster set: rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
 | M8 | Recordings: background capture of a workload's logs, events and metrics into SQLite, automatic recording on trouble, a timeline view, MCP access and export |
