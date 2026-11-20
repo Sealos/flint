@@ -8,6 +8,14 @@ release page that looks wrong, and the first launch of the app on a Mac that has
 Work through it for every published release, top to bottom, and note the result on the release PR. A failed step
 becomes an issue before anything else.
 
+## 0. Before merging the release PR
+
+Once the release PR is merged, the tag already holds `CHANGELOG.md`, so this check comes first.
+
+- [ ] Every entry under Features and Bug Fixes in the release PR is something a user can see. If internal work
+  slipped in, edit both `CHANGELOG.md` on the release branch and the release notes in the PR description, and
+  note the commit so its type is right next time (see [Releases](../README.md#releases)).
+
 ## 1. The release page
 
 Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases), or run
@@ -25,8 +33,6 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
 
   v0.2.0 and earlier have no DMG.
 - [ ] The notes list the changes from `CHANGELOG.md`.
-- [ ] Every entry under Features and Bug Fixes is something a user can see. If internal work slipped in, edit the
-  release notes, and note the commit so its type is right next time (see [Releases](../README.md#releases)).
 - [ ] The checksums match. In an empty directory:
 
   ```sh
