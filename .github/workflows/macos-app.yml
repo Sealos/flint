@@ -1,0 +1,59 @@
+name: macOS app
+
+# Flint.app in its DMG, packaged and smoke tested as release-please.yml's build-macos does, so a
+# broken packaging script or Info.plist shows on its PR rather than when a release is cut (#175).
+# macOS runners cost about ten times as much as Linux ones, so this runs only on PRs that touch
+# the packaging inputs, and by hand. Not a required check.
+on:
+  pull_request:
+    paths:
+      - scripts/package-macos-app.sh
+      - scripts/smoke-macos-app.sh
+      - scripts/check-no-automation.sh
+      - packaging/macos/**
+      - assets/brand/Flint.icns
+      - .github/workflows/macos-app.yml
+      - .github/workflows/release-please.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # rust-cache puts every RUST*/CARGO* variable in its key: these must match ci.yml's macos job
+  # (its workflow env plus its job env), or the shared cache below never restores.
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+# bash -eo pipefail, so a failing script before a pipe fails its step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # One architecture (the runner's arm64) instead of the release's universal binary: the
+  # packaging does not depend on the slices, and a second target would double the build.
+  dmg:
+    name: macos-app (dmg)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # ci.yml's macOS job saves this cache on master, with its release build; only read it here.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos
+          save-if: false
+      - name: Release build
+        run: cargo build --release --locked -p flint-app
+      - name: Package Flint.app and the DMG
+        run: |
+          VERSION=$(./target/release/flint --version | cut -d' ' -f2)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          scripts/package-macos-app.sh target/release/flint "$VERSION" dist | tee package.log
+          DMG=$(tail -n 1 package.log)
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+      - name: Smoke test the DMG
+        run: scripts/smoke-macos-app.sh "$DMG" "$VERSION"

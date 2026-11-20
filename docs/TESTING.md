@@ -87,8 +87,9 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
   refuses both together). CI's `linux (flint-app)` and `macos (flint-app)` jobs run flint-app's clippy and tests with
   the feature, and `scripts/check-no-automation.sh <binary>` checks that a release binary has none of the channel's
   strings (release binaries are stripped, so there are no symbols to look for). Every job that builds a release
-  binary runs it on the executable, before an AppImage or archive compresses it: `macos (flint-app)`,
-  `appimage (x86_64)` and both release builds. It fails closed (on an empty, compressed or non-Flint file too), and
+  binary runs it on the executable, before an AppImage, DMG or archive compresses it: `macos (flint-app)`,
+  `appimage (x86_64)` and both release builds. `scripts/smoke-macos-app.sh` also runs it on the executable inside
+  the mounted DMG's `Flint.app`, in `macos-app (dmg)` and the macOS release build. It fails closed (on an empty, compressed or non-Flint file too), and
   the `no-automation-check` lint job tests that (`scripts/check-no-automation-test.sh`). The channel builds on Linux
   too (peer credentials through `SO_PEERCRED`, a 107-byte socket path), where screenshots answer `not_available`:
   GPUI's Linux backend cannot render offscreen.
@@ -505,7 +506,8 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `linux (flint-app)` | Linux | The app's clippy (with and without `--features automation`) and view tests (with the feature) on GPUI's Linux backend (headless test platform, no display) |
 | `appimage (x86_64)` | Linux | A release build packaged with `scripts/package-appimage.sh`, then `scripts/smoke-appimage.sh`: `--version` and `mcp` answering `initialize` through the AppImage, without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`). No display, so the window is not opened |
 | `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
-| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job that needs macOS |
+| `macos-app (dmg)` | macOS | `macos-app.yml`, only on PRs that touch the macOS packaging (`scripts/package-macos-app.sh`, `scripts/smoke-macos-app.sh`, `scripts/check-no-automation.sh`, `packaging/macos/`, `assets/brand/Flint.icns`, `macos-app.yml`, `release-please.yml`) and by hand. A release build (the runner's arm64 only) packaged as `Flint.app` in a DMG with `scripts/package-macos-app.sh`, then `scripts/smoke-macos-app.sh`: mounts the DMG read-only, checks the bundle identifier and version (PlistBuddy), the ad-hoc signature (`codesign --verify --deep --strict`), `--version` and `mcp` answering `initialize` through `Flint.app/Contents/MacOS/flint`, and that the bundled binary has no automation channel. The release's `build-macos` runs the same two scripts on the universal binary before it uploads the DMG. Not required |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job on every PR that needs macOS |
 | `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`) and MCP e2e |
 

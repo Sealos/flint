@@ -548,7 +548,10 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 ### UP-80 Install from the DMG
 - **When** I install from the DMG on a clean Mac.
 - **Then** the app opens without Gatekeeper warnings, on both Apple Silicon and Intel.
-- Tests: manual.
+- Tests: manual, plus a CI smoke test of the DMG (`scripts/smoke-macos-app.sh`).
+- Before M6, releases already ship the DMG with an ad-hoc signed `Flint.app` (#175). It installs the same way, but the
+  first launch of a browser download needs Open Anyway in Privacy & Security, or removing the quarantine flag (README).
+  Signing and notarization, which make the warning go away, stay in #25.
 
 ### UP-81 Install with Homebrew
 - **When** I run `brew install --cask flint`.
