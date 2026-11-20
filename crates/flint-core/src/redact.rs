@@ -163,38 +163,20 @@ pub fn server_url(url: &str) -> String {
 
 /// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
 /// its directory (which can name the user's home), arguments or environment. kubeconfig's
-/// `command` is one program path, which may hold spaces (`/opt/Cloud Tools/kubelogin`); it may
-/// also have been written with arguments after it (`/opt/bin/aws eks get-token`), whose text
-/// must not show, slashes and all. So, in this order:
-///
-/// 1. the whole command, if it names a file: its file name;
-/// 2. else the longest part of it that ends before a space and names a file: its file name;
-/// 3. else the first word's file name. A spaced path whose file is missing may then show a
-///    piece of its directory (`/opt/Cloud Tools/kubelogin` as `Cloud`), never an argument.
-pub fn command_name(command: &str) -> String {
-    command_name_with(command, |path| path.is_file())
-}
-
-fn command_name_with(command: &str, is_file: impl Fn(&std::path::Path) -> bool) -> String {
+/// `command` is one program path, but it may have been written with arguments after it, and a
+/// path may hold spaces: with whitespace in it, nothing can tell which is which without looking
+/// at the disk (which a stalled mount can hang), so nothing of it is shown (`None`: say "the exec
+/// auth plugin"). A spaced path like `/opt/Cloud Tools/kubelogin` is therefore not named, which
+/// is the price of never showing an argument.
+pub fn command_name(command: &str) -> Option<String> {
     let command = command.trim();
-    let file_name = |program: &str| {
-        let path = std::path::Path::new(program);
-        path.file_name()
-            .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
-    };
-    if is_file(std::path::Path::new(command)) {
-        return file_name(command);
+    if command.is_empty() || command.contains(char::is_whitespace) {
+        return None;
     }
-    let longest = command
-        .char_indices()
-        .rev()
-        .filter(|(_, c)| c.is_whitespace())
-        .map(|(at, _)| command[..at].trim_end())
-        .find(|prefix| !prefix.is_empty() && is_file(std::path::Path::new(prefix)));
-    if let Some(program) = longest {
-        return file_name(program);
-    }
-    file_name(command.split_whitespace().next().unwrap_or_default())
+    let name = std::path::Path::new(command)
+        .file_name()
+        .map_or_else(|| command.to_owned(), |n| n.to_string_lossy().into_owned());
+    Some(name)
 }
 
 #[cfg(test)]
@@ -282,53 +264,27 @@ mod tests {
     }
 
     #[test]
-    fn command_names_drop_the_directory_and_arguments() {
-        assert_eq!(command_name("aws"), "aws");
+    fn command_names_show_a_plain_program_by_its_file_name() {
+        assert_eq!(command_name("kubelogin").as_deref(), Some("kubelogin"));
         assert_eq!(
-            command_name("/Users/someone/bin/gke-gcloud-auth-plugin"),
-            "gke-gcloud-auth-plugin"
+            command_name("/usr/local/bin/kubelogin").as_deref(),
+            Some("kubelogin")
         );
         assert_eq!(
-            command_name(" /opt/bin/aws eks get-token --secret x"),
-            "aws"
+            command_name("/Users/someone/bin/gke-gcloud-auth-plugin").as_deref(),
+            Some("gke-gcloud-auth-plugin")
         );
-        assert_eq!(command_name(""), "");
-        // An argument's slashes do not make it the name.
-        assert_eq!(command_name("aws --token=abc/def"), "aws");
+        assert_eq!(command_name(""), None);
     }
 
-    // A plugin path with spaces is named by its file name when the file is there: a spaced
-    // directory, absolute or relative, or a spaced file name; with arguments after it too.
+    // With whitespace in the command, none of it is shown: an argument (slashes and all) never
+    // is, and so a spaced path is not named either. Nothing reads the disk.
     #[test]
-    fn command_names_find_a_spaced_path_that_exists() {
-        let files = [
-            "/opt/Cloud Tools/kubelogin",
-            "Cloud Tools/kubelogin",
-            "/opt/bin/kube login",
-        ];
-        let is_file =
-            |path: &std::path::Path| files.iter().any(|f| path == std::path::Path::new(f));
-        let name = |command| command_name_with(command, is_file);
-        assert_eq!(name("/opt/Cloud Tools/kubelogin"), "kubelogin");
-        assert_eq!(name("Cloud Tools/kubelogin"), "kubelogin");
-        assert_eq!(name("/opt/bin/kube login"), "kube login");
-        assert_eq!(
-            name("/opt/Cloud Tools/kubelogin get-token --x=a/b"),
-            "kubelogin"
-        );
-    }
-
-    // An absolute command written with an argument holding slashes never shows the argument:
-    // without a file to go by, the first word is the program.
-    #[test]
-    fn command_names_never_show_an_argument() {
-        let nothing = |_: &std::path::Path| false;
+    fn command_names_show_nothing_of_a_command_with_whitespace() {
         let token = format!("{}{}", "abc", "/def-secret");
-        let name = |command: &str| command_name_with(command, nothing);
-        assert_eq!(name(&format!("/opt/bin/aws --token={token}")), "aws");
-        assert_eq!(name(&format!("aws --token={token}")), "aws");
-        assert_eq!(name(&format!("/usr/local/bin/plugin {token}")), "plugin");
-        // Missing and spaced: ambiguous, but still no argument.
-        assert_eq!(name("/opt/Cloud Tools/kubelogin"), "Cloud");
+        assert_eq!(command_name(&format!("/opt/bin/aws --token={token}")), None);
+        assert_eq!(command_name(&format!("aws --token={token}")), None);
+        assert_eq!(command_name(" /opt/bin/aws eks get-token --secret x"), None);
+        assert_eq!(command_name("/opt/Cloud Tools/kubelogin"), None);
     }
 }

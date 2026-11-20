@@ -1015,7 +1015,7 @@ fn plugin_problems_name_the_plugin_in_the_summary() {
     assert!(matches!(
         &error,
         ClusterError::ExecPlugin { command, problem: crate::cluster::PluginProblem::TimedOut }
-            if command == "kubelogin"
+            if command.as_deref() == Some("kubelogin")
     ));
     assert!(
         error
@@ -1024,6 +1024,16 @@ fn plugin_problems_name_the_plugin_in_the_summary() {
             .contains("`kubelogin` did not finish within 1m0s"),
         "{}",
         error.summary().as_str()
+    );
+    // A command with whitespace is not named, so no argument shows: the generic words.
+    let unnamed = ClusterError::kube(kube::Error::Auth(AuthError::AuthExec(TIMED_OUT.to_owned())));
+    assert!(
+        unnamed
+            .summary()
+            .as_str()
+            .starts_with("authentication failed: the exec auth plugin did not finish within"),
+        "{}",
+        unnamed.summary().as_str()
     );
     let resting = ClusterError::kube(kube::Error::Auth(resting("kubelogin", Timestamp::now())));
     assert!(

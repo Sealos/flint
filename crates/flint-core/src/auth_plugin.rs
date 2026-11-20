@@ -280,7 +280,7 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     if too_large {
         return Err(AuthError::AuthExec(format!(
             "{TOO_LARGE}{}",
-            redact::command_name(program)
+            redact::command_name(program).unwrap_or_default()
         )));
     }
     let out = std::process::Output {
@@ -291,7 +291,7 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     if !out.status.success() {
         // kube puts the command's `Debug` form here, environment included; only the name is kept.
         return Err(AuthError::AuthExecRun {
-            cmd: redact::command_name(program),
+            cmd: redact::command_name(program).unwrap_or_default(),
             out: Box::new(out),
         });
     }
@@ -596,22 +596,23 @@ fn parse(stdout: &[u8]) -> Result<Credential, AuthError> {
 
 /// What an [`AuthError::AuthExec`] of Flint's own says: the plugin's program name and the
 /// problem, or `None` for kube's (whose text may quote the plugin's output, so it is not shown).
-pub(crate) fn problem(text: &str) -> Option<(String, PluginProblem)> {
+pub(crate) fn problem(text: &str) -> Option<(Option<String>, PluginProblem)> {
+    let named = |name: &str| (!name.is_empty()).then(|| name.to_owned());
     if let Some(name) = text.strip_prefix(TIMED_OUT) {
-        return Some((name.to_owned(), PluginProblem::TimedOut));
+        return Some((named(name), PluginProblem::TimedOut));
     }
     if let Some((until, name)) = text
         .strip_prefix(RESTING)
         .and_then(|rest| rest.split_once('|'))
     {
         let until = until.to_owned();
-        return Some((name.to_owned(), PluginProblem::Resting { until }));
+        return Some((named(name), PluginProblem::Resting { until }));
     }
     if let Some(name) = text.strip_prefix(STOPPED) {
-        return Some((name.to_owned(), PluginProblem::Stopped));
+        return Some((named(name), PluginProblem::Stopped));
     }
     let name = text.strip_prefix(TOO_LARGE)?;
-    Some((name.to_owned(), PluginProblem::TooLarge))
+    Some((named(name), PluginProblem::TooLarge))
 }
 
 /// Per context, bumped by [`retry_now`]: a rest taken before the latest bump is over.
@@ -680,7 +681,7 @@ impl TokenState {
     }
 
     fn name(&self) -> String {
-        redact::command_name(self.exec.command.as_deref().unwrap_or_default())
+        redact::command_name(self.exec.command.as_deref().unwrap_or_default()).unwrap_or_default()
     }
 
     /// Until when a timed-out prompting plugin rests, if it still does.
@@ -753,7 +754,8 @@ impl RefreshingToken {
         context: String,
     ) -> Shared<BoxFuture<'static, Refreshed>> {
         let state = self.0.state.clone();
-        let name = redact::command_name(exec.command.as_deref().unwrap_or_default());
+        let name =
+            redact::command_name(exec.command.as_deref().unwrap_or_default()).unwrap_or_default();
         let stopped = AuthError::AuthExec(format!("{STOPPED}{name}"));
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(CONNECT_TIMEOUT, run(&exec)).await;

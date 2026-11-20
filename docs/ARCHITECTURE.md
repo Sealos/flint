@@ -1053,8 +1053,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   `interactiveMode: Always` waits as long as its caller) and Flint takes it back after, with the terminal's settings as they were (echo back on after a killed password prompt). Meanwhile Flint ignores
   SIGTTOU, so a log line it writes to the terminal with `stty tostop` set does not stop it. When Flint is a
   background job of its terminal, a plugin that may prompt runs without prompting, and an `Always` one waits until
-  Flint is brought to the foreground. Errors name the plugin by its file name: the whole command or its longest part that names a file (so
-  a path with spaces), else its first word, so text after it never shows. Tokens are cached until a minute before they expire. A
+  Flint is brought to the foreground. Errors name the plugin by its file name when its command has no whitespace; otherwise they say
+  "the exec auth plugin" and show nothing of the command (it may hold arguments, and telling a spaced path apart would
+  mean reading the disk), so no argument text ever shows. Tokens are cached until a minute before they expire. A
   refresh runs in a task of its own per client, bounded by the connect timeout: requests wait for it, and one that
   gives up (a short request deadline) does not restart a slow login; dropping the client ends it, plugin included. Requests use what the refresh got, even a
   token that expires within the margin, as kube does. A refresh that hangs is a sign-in failure naming the plugin
