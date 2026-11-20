@@ -57,8 +57,61 @@ struct Inner {
     discovery: SlotMap<Kinds>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
     admission: Admission,
-    /// Connections being made, by cluster and fingerprint ([`FlintMcp::connecting`]).
-    connecting: Mutex<HashMap<(String, u64), Connecting>>,
+    /// Connections being made, by cluster and fingerprint, with the number of the attempt
+    /// ([`FlintMcp::connecting`]).
+    connecting: Mutex<HashMap<(String, u64), (u64, Connecting)>>,
+    next_connect: std::sync::atomic::AtomicU64,
+    /// Connect tasks running at once: a cancelled call leaves its connection running for the
+    /// next ones, so calls on many clusters must not leave one each.
+    connect_turns: Arc<tokio::sync::Semaphore>,
+    /// Writes activity records in order, off every reply's path ([`Inner::record`]).
+    activity: Mutex<Option<ActivityWriter>>,
+}
+
+/// Connect tasks that run at once.
+const CONNECTS_AT_ONCE: usize = 4;
+/// Activity records waiting to be written; past that one is dropped (and logged).
+const RECORDS_QUEUED: usize = 256;
+
+/// The task that writes activity records, and its queue.
+struct ActivityWriter {
+    queue: tokio::sync::mpsc::Sender<activity::ActivityRecord>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Inner {
+    /// Queues `record` for the activity log, written in order by a task of its own: no reply
+    /// waits for the file. A queue that is full (the disk stalls) drops the record, logged.
+    fn record(&self, record: activity::ActivityRecord) {
+        let mut writer = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+        if writer.is_none() {
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                tracing::warn!("no runtime to write the agent activity log; record dropped");
+                return;
+            };
+            let (queue, mut records) = tokio::sync::mpsc::channel(RECORDS_QUEUED);
+            let dir = self.config_dir.clone();
+            let task = runtime.spawn(async move {
+                while let Some(record) = records.recv().await {
+                    let dir = dir.clone();
+                    let written =
+                        tokio::task::spawn_blocking(move || activity::append(&dir, &record)).await;
+                    match written {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "cannot write the agent activity log")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+                    }
+                }
+            });
+            *writer = Some(ActivityWriter { queue, task });
+        }
+        let queue = &writer.as_ref().expect("started").queue;
+        if queue.try_send(record).is_err() {
+            tracing::warn!("the agent activity log is behind; a record was dropped");
+        }
+    }
 }
 
 /// A connection being made, shared by the calls that wait for it ([`FlintMcp::connecting`]); its
@@ -237,7 +290,7 @@ impl FlintMcp {
             .try_with(|c| c.borrow_mut().record = Some(record.clone()))
             .map_err(|_| record)
         {
-            self.record(record).await;
+            self.record(record);
         }
         let content = vec![ContentBlock::text(text)];
         Ok(if ok {
@@ -247,15 +300,22 @@ impl FlintMcp {
         })
     }
 
-    /// Appends `record` to the activity log. A failure to write is logged and does not fail the
-    /// call.
-    async fn record(&self, record: activity::ActivityRecord) {
-        let dir = self.inner.config_dir.clone();
-        let written = tokio::task::spawn_blocking(move || activity::append(&dir, &record)).await;
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
-            Err(e) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+    /// Queues `record` for the activity log ([`Inner::record`]).
+    fn record(&self, record: activity::ActivityRecord) {
+        self.inner.record(record);
+    }
+
+    /// Writes the activity records still queued, waiting up to 5 seconds: when the server stops.
+    pub async fn flush_activity(&self) {
+        let writer = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(ActivityWriter { queue, task }) = writer {
+            drop(queue);
+            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }
     }
 }
@@ -443,6 +503,9 @@ impl FlintMcp {
                 discovery: Mutex::default(),
                 admission: Admission::new(limits),
                 connecting: Mutex::default(),
+                next_connect: std::sync::atomic::AtomicU64::new(0),
+                connect_turns: Arc::new(tokio::sync::Semaphore::new(CONNECTS_AT_ONCE)),
+                activity: Mutex::default(),
             }),
             tool_router: Self::tool_router(),
         }
@@ -458,6 +521,33 @@ impl FlintMcp {
         T: rmcp::transport::Transport<rmcp::RoleServer> + 'static,
     {
         let admission = &self.inner.admission;
+        // A call the client cancels while it waits at the transport never reaches `call_tool`:
+        // recorded from there.
+        let inner = Arc::downgrade(&self.inner);
+        admission
+            .replies()
+            .on_dropped_call(Box::new(move |tool, arguments| {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let named = named_in(arguments.as_ref());
+                inner.record(activity::ActivityRecord {
+                    at_ms: activity::now_ms(),
+                    tool,
+                    server: None,
+                    cluster: named.cluster,
+                    kind: named.kind,
+                    namespace: named.namespace,
+                    name: named.name,
+                    container: named.container,
+                    items: None,
+                    bytes: 0,
+                    truncated: false,
+                    outcome: activity::Outcome::Failed,
+                    cluster_key: None,
+                    server_key: None,
+                });
+            }));
         Counted::new(transport, admission.replies(), &admission.limits())
     }
 
@@ -643,7 +733,7 @@ impl ServerHandler for FlintMcp {
                 server_key: None,
             }
         });
-        self.record(record).await;
+        self.record(record);
         result
     }
 }
@@ -656,7 +746,9 @@ struct HandlerEnded {
 
 impl Drop for HandlerEnded {
     fn drop(&mut self) {
-        self.replies.handler_ended(&self.id);
+        // A handler that panicked sends no reply: nothing else would let its request go.
+        self.replies
+            .handler_ended(&self.id, std::thread::panicking());
     }
 }
 
@@ -713,7 +805,14 @@ impl FlintMcp {
         let client = slot
             .cell
             .get_or_try_init(|| {
-                self.connecting(name, fingerprint, &ctx.kubeconfig, &info.name, &target)
+                self.connecting(
+                    name,
+                    fingerprint,
+                    &ctx.kubeconfig,
+                    &info.name,
+                    &target,
+                    slot.clone(),
+                )
             })
             .await
             .map_err(|e| ToolError::new(e.as_str()))?
@@ -738,6 +837,7 @@ impl FlintMcp {
         kubeconfig: &Arc<LoadedKubeconfig>,
         context: &str,
         target: &Target,
+        cached: Arc<flint_core::cache::Slot<Client>>,
     ) -> Connecting {
         let mut connecting = self
             .inner
@@ -745,23 +845,41 @@ impl FlintMcp {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let key = (name.to_owned(), fingerprint);
-        // A connection that failed is no connection to wait for.
-        if let Some(shared) = connecting.get(&key)
-            && !matches!(shared.peek(), Some(Err(_)))
-        {
+        if let Some((_, shared)) = connecting.get(&key) {
             return shared.clone();
         }
-        connecting.retain(|_, shared| shared.peek().is_none());
+        let attempt = self
+            .inner
+            .next_connect
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (kubeconfig, context, target) =
             (kubeconfig.clone(), context.to_owned(), target.clone());
+        let (turns, inner, entry) = (
+            self.inner.connect_turns.clone(),
+            Arc::downgrade(&self.inner),
+            key.clone(),
+        );
         let task = tokio::spawn(async move {
-            tokio::time::timeout(
+            // Held until this task ends, plugin included.
+            let _turn = turns.acquire_owned().await;
+            let result = tokio::time::timeout(
                 TOOL_CONNECT_TIMEOUT,
                 cluster::connect(&kubeconfig.merged, &context),
             )
             .await
             .unwrap_or_else(|_| Err(ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None)))
-            .map_err(|e| Arc::new(e.for_target(&target).for_agent()))
+            .map_err(|e| Arc::new(e.for_target(&target).for_agent()));
+            // Kept for the next call even if every call waiting for it gave up.
+            if let Ok(client) = &result {
+                let _ = cached.cell.set(client.clone());
+            }
+            if let Some(inner) = inner.upgrade() {
+                let mut connecting = inner.connecting.lock().unwrap_or_else(|e| e.into_inner());
+                if connecting.get(&entry).is_some_and(|(n, _)| *n == attempt) {
+                    connecting.remove(&entry);
+                }
+            }
+            result
         });
         let shared = async move {
             task.await
@@ -769,7 +887,7 @@ impl FlintMcp {
         }
         .boxed()
         .shared();
-        connecting.insert(key, shared.clone());
+        connecting.insert(key, (attempt, shared.clone()));
         shared
     }
 

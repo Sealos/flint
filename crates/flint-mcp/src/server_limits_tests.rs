@@ -355,8 +355,12 @@ async fn refusals_to_a_stalled_client_stay_within_the_budget() {
             .expect("replies keep coming")
             .unwrap();
         let reply: Value = serde_json::from_str(&line).unwrap();
+        // Refused by the admission, or at the transport when too many wait there.
+        let at_door = reply["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("too many requests waiting"));
         assert!(
-            text(&reply).starts_with("too many tool calls in flight"),
+            at_door || text(&reply).starts_with("too many tool calls in flight"),
             "{reply}"
         );
         refused += 1;
@@ -403,7 +407,7 @@ async fn a_cancellation_gets_through_at_the_request_limit() {
     let server = server(dir.path(), Some(&url), limits);
     let admission = || &server.inner.admission;
     let mut client = Client::start(&server, 64 * 1024).await;
-    for id in 1..=3 {
+    for id in 1..=4 {
         client
             .call(id, "list_resource_kinds", json!({"cluster": "silent"}))
             .await;
@@ -411,18 +415,139 @@ async fn a_cancellation_gets_through_at_the_request_limit() {
     wait_for("two calls running", || admission().running() == 2).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
-        admission().admitted(),
+        admission().entered(),
         2,
-        "the third waits at the transport"
+        "the third and fourth wait at the transport"
     );
+    // The fourth is cancelled while it waits there: it never runs, and is recorded.
+    client.cancel(4).await;
     client.cancel(1).await;
-    // The third takes the cancelled one's place: three handlers ran, two at a time.
-    wait_for("the third runs", || {
-        admission().admitted() == 2 && admission().running() == 2
+    // The third takes the cancelled first one's place.
+    wait_for("the third reached a turn", || admission().entered() == 3).await;
+    wait_for("two calls running", || admission().running() == 2).await;
+    let records = || flint_core::activity::read(dir.path());
+    wait_for("both cancelled calls are recorded", || records().len() == 2).await;
+    assert!(
+        records()
+            .iter()
+            .all(|r| r.outcome == flint_core::activity::Outcome::Failed)
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(admission().entered(), 3, "the fourth never ran");
+    assert_eq!(admission().replies().unanswered_count(), 2);
+}
+
+// covers UP-08: when the client closes its end with calls still waiting at the transport, they
+// still run and are answered, then the stream ends.
+#[tokio::test]
+async fn calls_waiting_when_the_client_closes_still_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        unanswered: 2,
+        deadline: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let client = Client::start(&server, 64 * 1024).await;
+    let Client {
+        mut write,
+        mut read,
+    } = client;
+    for id in 1..=3u64 {
+        let line = format!(
+            "{}\n",
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "list_resource_kinds", "arguments": {"cluster": "silent"}}})
+        );
+        write.write_all(line.as_bytes()).await.unwrap();
+    }
+    write.shutdown().await.unwrap();
+    let mut ids = Vec::new();
+    let mut line = String::new();
+    for _ in 0..3 {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(10), read.read_line(&mut line))
+            .await
+            .expect("each call is answered")
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert!(text(&reply).starts_with("timed out after 300ms"), "{reply}");
+        ids.push(reply["id"].as_u64().unwrap());
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2, 3]);
+}
+
+// covers UP-08: connections are made by at most a few tasks at once, however many clusters are
+// called, and a finished one leaves no entry behind (its client stays cached).
+#[tokio::test]
+async fn connections_are_made_a_few_at_a_time() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let traces = dir.path().join("traces");
+    std::fs::create_dir(&traces).unwrap();
+    let plugin = dir.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\necho $$ >> \"$PLUGIN_DIR/starts\"\nexec sleep 600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let names: Vec<String> = (0..6).map(|n| format!("c{n}")).collect();
+    let mut kubeconfig = String::from("apiVersion: v1\nkind: Config\nclusters:\n");
+    let mut settings = String::new();
+    for name in &names {
+        kubeconfig += &format!("- name: {name}\n  cluster:\n    server: http://127.0.0.1:1\n");
+        settings += &format!(
+            "[[ai_exposed_clusters]]\ncontext = \"{name}\"\nserver = \"http://127.0.0.1:1\"\n"
+        );
+    }
+    kubeconfig += &format!(
+        "users:\n- name: u\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      \
+         command: {}\n      interactiveMode: Never\n      env:\n      - name: PLUGIN_DIR\n        \
+         value: {}\ncontexts:\n",
+        plugin.display(),
+        traces.display()
+    );
+    for name in &names {
+        kubeconfig += &format!("- name: {name}\n  context:\n    cluster: {name}\n    user: u\n");
+    }
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig).unwrap();
+    std::fs::write(dir.path().join("settings.toml"), settings).unwrap();
+    let server = FlintMcp::with_limits(
+        dir.path().to_owned(),
+        vec![dir.path().join("kubeconfig")],
+        None,
+        Limits::default(),
+    );
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for (id, name) in (1..).zip(&names) {
+        client
+            .call(id, "list_resource_kinds", json!({"cluster": name}))
+            .await;
+    }
+    let starts = || {
+        std::fs::read_to_string(traces.join("starts"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    wait_for("connections start", || starts() >= super::CONNECTS_AT_ONCE).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(starts(), super::CONNECTS_AT_ONCE, "a few at a time");
+
+    // A connection that finishes takes its entry away, and keeps its client.
+    let quick = tempfile::tempdir().unwrap();
+    // A server that refuses: the connection (the client) is made at once, the call then fails.
+    let fast = self::server(quick.path(), Some("http://127.0.0.1:1"), Limits::default());
+    let mut fast_client = Client::start(&fast, 64 * 1024).await;
+    fast_client
+        .call(1, "list_resource_kinds", json!({"cluster": "silent"}))
+        .await;
+    let _ = fast_client.next().await;
+    wait_for("no connection left in flight", || {
+        fast.inner.connecting.lock().unwrap().is_empty()
     })
     .await;
-    let records = || flint_core::activity::read(dir.path());
-    wait_for("the cancelled call is recorded", || records().len() == 1).await;
-    assert_eq!(records()[0].outcome, flint_core::activity::Outcome::Failed);
-    assert_eq!(admission().replies().unanswered_count(), 2);
 }

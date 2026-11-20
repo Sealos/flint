@@ -114,20 +114,39 @@ async fn reply_bytes_count_until_written() {
     assert_eq!(replies.outstanding(), 0);
 }
 
-// covers UP-08: a cancelled tool call is counted until its handler ends (it may still write
-// its activity record); a cancelled other request is done with at once.
+// covers UP-08: a request counts until its reply reaches the transport (where its bytes count
+// from then on), however its handler ended; a cancelled one (no reply comes) until nothing
+// works on it any more: a tool call once its handler ended, anything else at once.
 #[test]
-fn cancelled_tool_calls_count_until_their_handler_ends() {
+fn requests_count_until_answered_or_done_with() {
     let replies = ReplyBytes::default();
-    let (tool, other) = (
-        rmcp::model::NumberOrString::Number(1),
-        rmcp::model::NumberOrString::Number(2),
+    let id = |n| rmcp::model::NumberOrString::Number(n);
+    let tool = Work {
+        tool: true,
+        ..Work::default()
+    };
+    for n in 1..=4 {
+        replies.unanswered().insert(id(n), tool);
+    }
+    replies.unanswered().insert(id(5), Work::default());
+
+    // 1: answered after its handler ended.
+    replies.handler_ended(&id(1), false);
+    assert!(
+        replies.unanswered().contains_key(&id(1)),
+        "the reply is on its way"
     );
-    replies.unanswered().insert(tool.clone(), Work::Tool);
-    replies.unanswered().insert(other.clone(), Work::Other);
-    replies.cancelled(&tool);
-    replies.cancelled(&other);
-    assert_eq!(replies.unanswered_count(), 1, "the tool call still counts");
-    replies.handler_ended(&tool);
+    replies.answered(&id(1));
+    // 2: cancelled while running, then its handler ends.
+    replies.cancelled(&id(2));
+    assert!(replies.unanswered().contains_key(&id(2)), "still running");
+    replies.handler_ended(&id(2), false);
+    // 3: cancelled after its handler ended (rmcp drops the reply).
+    replies.handler_ended(&id(3), false);
+    replies.cancelled(&id(3));
+    // 4: its handler panicked: no reply comes.
+    replies.handler_ended(&id(4), true);
+    // 5: anything else, cancelled.
+    replies.cancelled(&id(5));
     assert_eq!(replies.unanswered_count(), 0);
 }

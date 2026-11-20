@@ -915,12 +915,16 @@ Rules:
   also tracks requests read and not answered; while the replies pass 8 MiB, or 128 requests are unanswered, it reads
   no more requests and no admitted call starts its work. A client that stops reading stdout therefore holds about
   that budget plus those replies, however many calls it keeps sending (refusals and replies to other requests
-  included). A request read at that limit waits at the transport (up to as many again) while reading goes on, so a
-  cancellation still gets through; a tool call counts until its handler ends, even once cancelled. A request whose id
-  is still in flight is refused at the transport. A cluster's connection (and its exec auth plugin) is made in a task
-  of its own that later calls join, so a cancelled call does not make the next one start another. Each call writes one
-  activity record once its outcome is settled: refused, cancelled and timed-out calls as failed. The timeout reply is
-  redacted like every other.
+  included). A request read at that limit waits at the transport (up to as many again; past that it is refused
+  there) while reading goes on, so a cancellation always gets through; when the client closes its end, what waits
+  still runs. A request counts until its reply reaches the transport (where its bytes count), or, once cancelled,
+  until nothing works on it (a tool call's handler has ended). A request whose id is still in flight is refused at
+  the transport. A cluster's connection (and its exec auth plugin) is made in a task of its own that later calls
+  join; at most 4 run at once, each holding its turn until it ends, and a finished one keeps its client cached and
+  leaves nothing behind. Each call writes one activity record once its outcome is settled (refused, cancelled,
+  timed-out and cancelled-while-waiting calls as failed), through one writer task with a bounded queue, so no reply
+  waits for the file; the server flushes it when the client disconnects. The timeout reply is redacted like every
+  other.
 - **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
   `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
   app).

@@ -61,6 +61,8 @@ pub(crate) struct Admission {
     /// Calls admitted: running or waiting.
     admitted: Arc<AtomicUsize>,
     replies: Arc<ReplyBytes>,
+    #[cfg(test)]
+    entered: AtomicUsize,
 }
 
 /// A call refused because [`Limits::running`] plus [`Limits::waiting`] calls are admitted.
@@ -102,6 +104,8 @@ impl Admission {
             turns: Arc::new(Semaphore::new(limits.running)),
             admitted: Arc::default(),
             replies: Arc::new(ReplyBytes::default()),
+            #[cfg(test)]
+            entered: AtomicUsize::new(0),
         }
     }
 
@@ -112,6 +116,12 @@ impl Admission {
     /// The reply byte count the transport keeps ([`Counted`]).
     pub(crate) fn replies(&self) -> Arc<ReplyBytes> {
         self.replies.clone()
+    }
+
+    /// Calls admitted since the start.
+    #[cfg(test)]
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(Ordering::Acquire)
     }
 
     /// Calls running or waiting now.
@@ -136,6 +146,8 @@ impl Admission {
             self.admitted.fetch_sub(1, Ordering::AcqRel);
             return Err(Busy { admitted: before });
         }
+        #[cfg(test)]
+        self.entered.fetch_add(1, Ordering::AcqRel);
         // Counted until the turn ends, or until this future is dropped while it waits.
         let admitted = Admitted(self.admitted.clone());
         let permit = self
@@ -158,23 +170,52 @@ impl Admission {
 /// answered yet.
 #[derive(Default)]
 pub(crate) struct ReplyBytes {
+    /// Told of a tool call the client cancelled while it waited at the transport (it never
+    /// reaches a handler): its tool and arguments.
+    dropped_call: std::sync::OnceLock<DroppedCall>,
     outstanding: AtomicUsize,
     /// Requests read and not done with yet, and whether each is a tool call.
     unanswered: std::sync::Mutex<HashMap<RequestId, Work>>,
     released: Notify,
 }
 
-/// What a request read is, for when it counts as done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Work {
-    /// A tool call: done when its handler has ended (`ServerHandler::call_tool`), which a
-    /// cancellation does not do at once (it may still write its activity record).
-    Tool,
-    /// Anything else: done when answered, or when cancelled (rmcp then sends nothing).
-    Other,
+/// A request read and not done with yet. It is done when its reply reaches the transport
+/// ([`Counted`]'s `send`, which counts the reply's bytes from then on), or, once cancelled (rmcp
+/// then sends no reply), when nothing works on it any more: at once for most requests, when its
+/// handler has ended for a tool call (`ServerHandler::call_tool`), which may still be writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Work {
+    tool: bool,
+    /// The tool call's handler has ended (its reply may still be on its way to the transport).
+    ended: bool,
+    cancelled: bool,
 }
 
+impl Work {
+    /// Whether nothing will hold anything for it any more.
+    fn done(self) -> bool {
+        self.cancelled && (!self.tool || self.ended)
+    }
+}
+
+/// What [`ReplyBytes`] tells of a dropped tool call.
+pub(crate) type DroppedCall =
+    Box<dyn Fn(String, Option<serde_json::Map<String, serde_json::Value>>) + Send + Sync>;
+
 impl ReplyBytes {
+    /// Sets what is told of a dropped tool call; only the first one set counts.
+    pub(crate) fn on_dropped_call(&self, tell: DroppedCall) {
+        let _ = self.dropped_call.set(tell);
+    }
+
+    fn dropped(&self, message: &RxJsonRpcMessage<RoleServer>) {
+        if let (JsonRpcMessage::Request(request), Some(tell)) = (message, self.dropped_call.get())
+            && let ClientRequest::CallToolRequest(call) = &request.request
+        {
+            tell(call.params.name.to_string(), call.params.arguments.clone());
+        }
+    }
+
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
     }
@@ -214,12 +255,15 @@ impl ReplyBytes {
         self.unanswered().len()
     }
 
-    fn done(&self, id: &RequestId, only: Option<Work>) {
+    /// Updates request `id` with `change`, and lets it go once it is done ([`Work`]).
+    fn update(&self, id: &RequestId, change: impl FnOnce(&mut Work), answered: bool) {
         let mut unanswered = self.unanswered();
-        let removed = match (unanswered.get(id), only) {
-            (Some(work), Some(only)) if *work != only => false,
-            (Some(_), _) => unanswered.remove(id).is_some(),
-            (None, _) => false,
+        let removed = match unanswered.get_mut(id) {
+            Some(work) => {
+                change(work);
+                (answered || work.done()) && unanswered.remove(id).is_some()
+            }
+            None => false,
         };
         drop(unanswered);
         if removed {
@@ -227,19 +271,27 @@ impl ReplyBytes {
         }
     }
 
-    /// Request `id` is answered.
+    /// The reply to request `id` reached the transport: its bytes are counted from now on.
     fn answered(&self, id: &RequestId) {
-        self.done(id, None);
+        self.update(id, |_| {}, true);
     }
 
-    /// The client cancelled request `id`: done with unless it is a tool call still running.
+    /// The client cancelled request `id`: rmcp will send no reply.
     fn cancelled(&self, id: &RequestId) {
-        self.done(id, Some(Work::Other));
+        self.update(id, |work| work.cancelled = true, false);
     }
 
-    /// The handler of tool call `id` ended: it holds nothing any more.
-    pub(crate) fn handler_ended(&self, id: &RequestId) {
-        self.done(id, None);
+    /// The handler of tool call `id` ended. Its reply, if it is not cancelled, is still on its way
+    /// to the transport and counts until it arrives; `failed` (it panicked) sends none.
+    pub(crate) fn handler_ended(&self, id: &RequestId, failed: bool) {
+        self.update(
+            id,
+            |work| {
+                work.ended = true;
+                work.cancelled |= failed;
+            },
+            false,
+        );
     }
 }
 
@@ -264,9 +316,11 @@ pub(crate) struct Counted<T> {
     inner: T,
     replies: Arc<ReplyBytes>,
     /// Requests read while [`Limits::unanswered`] were not done with: passed on in order as
-    /// those are. Reading goes on meanwhile (a cancellation must get through), up to as many
-    /// again.
+    /// those are. Reading goes on meanwhile (a cancellation must get through); past as many
+    /// again waiting, a request is refused.
     deferred: VecDeque<RxJsonRpcMessage<RoleServer>>,
+    /// The client closed its end: what is deferred still goes out, then the stream ends.
+    eof: bool,
     /// Past this many reply bytes not written ([`Limits::reply_budget`]), or this many
     /// requests not answered ([`Limits::unanswered`]), no more requests are read.
     budget: usize,
@@ -279,6 +333,7 @@ impl<T> Counted<T> {
             inner,
             replies,
             deferred: VecDeque::new(),
+            eof: false,
             budget: limits.reply_budget,
             unanswered: limits.unanswered,
         }
@@ -303,23 +358,26 @@ fn request_id(message: &RxJsonRpcMessage<RoleServer>) -> Option<&RequestId> {
 }
 
 fn work(request: &rmcp::model::JsonRpcRequest<ClientRequest>) -> Work {
-    match request.request {
-        ClientRequest::CallToolRequest(_) => Work::Tool,
-        _ => Work::Other,
+    Work {
+        tool: matches!(request.request, ClientRequest::CallToolRequest(_)),
+        ..Work::default()
     }
 }
 
-/// Answers a request whose id is still in flight with an error, without passing it to rmcp
-/// (which would start a second handler). The reply is counted until written.
-fn refuse_duplicate<T: Transport<RoleServer>>(
+/// Why a request is refused at the transport.
+const DUPLICATE: &str = "a request with this id is still in flight; use a new id";
+const BUSY: &str = "too many requests waiting; retry when some have been answered";
+
+/// Answers a request with an error, without passing it to rmcp: one whose id is still in
+/// flight (rmcp would start a second handler), or one past what may wait. The reply is counted
+/// until written.
+fn refuse<T: Transport<RoleServer>>(
     inner: &mut T,
     replies: &Arc<ReplyBytes>,
     id: RequestId,
+    why: &'static str,
 ) {
-    let error = rmcp::ErrorData::invalid_request(
-        "a request with this id is still in flight; use a new id",
-        None,
-    );
+    let error = rmcp::ErrorData::invalid_request(why, None);
     let reply: TxJsonRpcMessage<RoleServer> = JsonRpcMessage::error(error, Some(id));
     let bytes = serde_json::to_vec(&reply).map_or(0, |line| line.len() + 1);
     let held = replies.hold(bytes);
@@ -370,10 +428,13 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
     /// refused here, its reply counted like any other.
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
         let (replies, budget, most) = (self.replies.clone(), self.budget, self.unanswered);
-        let (inner, deferred) = (&mut self.inner, &mut self.deferred);
+        let (inner, deferred, eof) = (&mut self.inner, &mut self.deferred, &mut self.eof);
         async move {
             loop {
                 let free = || replies.unanswered_count() < most;
+                if *eof && deferred.is_empty() {
+                    return None;
+                }
                 if free()
                     && let Some(request) = deferred.pop_front()
                 {
@@ -383,12 +444,19 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                     return Some(request);
                 }
                 let within = || replies.outstanding() <= budget;
-                let reading = within() && deferred.len() < most;
+                // Reading goes on while bytes allow, so a cancellation always gets through.
+                let reading = !*eof && within();
                 let message = tokio::select! {
-                    message = inner.receive(), if reading => message?,
+                    message = inner.receive(), if reading => match message {
+                        Some(message) => message,
+                        None => {
+                            *eof = true;
+                            continue;
+                        }
+                    },
                     () = replies.until(|| free() && !deferred.is_empty()),
                         if !deferred.is_empty() => continue,
-                    () = replies.until(|| within() && deferred.len() < most), if !reading => continue,
+                    () = replies.until(within), if !reading && !*eof => continue,
                 };
                 match &message {
                     JsonRpcMessage::Request(request) => {
@@ -396,7 +464,10 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                         let in_flight = replies.unanswered().contains_key(id)
                             || deferred.iter().any(|d| request_id(d) == Some(id));
                         if in_flight {
-                            refuse_duplicate(inner, &replies, id.clone());
+                            refuse(inner, &replies, id.clone(), DUPLICATE);
+                        } else if !free() && deferred.len() >= most {
+                            // As many wait here already: refused, its reply counted.
+                            refuse(inner, &replies, id.clone(), BUSY);
                         } else if free() {
                             replies.unanswered().insert(id.clone(), work(request));
                             return Some(message);
@@ -406,8 +477,14 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                     }
                     _ => {
                         if let Some(id) = cancels(&message) {
-                            // One still waiting here never reaches rmcp.
-                            deferred.retain(|d| request_id(d) != Some(&id));
+                            // One still waiting here never reaches rmcp: told of here.
+                            deferred.retain(|d| {
+                                let ours = request_id(d) == Some(&id);
+                                if ours {
+                                    replies.dropped(d);
+                                }
+                                !ours
+                            });
                             replies.cancelled(&id);
                         }
                         return Some(message);
