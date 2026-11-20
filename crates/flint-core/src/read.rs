@@ -698,9 +698,7 @@ pub(crate) async fn object_detail_at(
                 fetch_limit: Some(DETAIL_EVENTS),
             };
             let left = deadline.saturating_sub(started.elapsed());
-            let found = tokio::time::timeout(left, events(client, &query))
-                .await
-                .unwrap_or_else(|_| Err(ClusterError::timeout(deadline, None)));
+            let found = events_within(left, deadline, || events(client, &query)).await;
             match found {
                 Ok((events, truncated)) => (events, truncated, None),
                 // Many roles may read an object but not list events: still show the object.
@@ -721,6 +719,22 @@ pub(crate) async fn object_detail_at(
         events_truncated,
         events_error,
     })
+}
+
+/// The events of a detail read, from `request`, within `left` of its `deadline`. With no time
+/// left, the request is never made: a zero timeout would still poll it once, which can queue
+/// it, before giving up on it.
+async fn events_within<F: Future<Output = Result<(Vec<Event>, bool), ClusterError>>>(
+    left: Duration,
+    deadline: Duration,
+    request: impl FnOnce() -> F,
+) -> Result<(Vec<Event>, bool), ClusterError> {
+    if left.is_zero() {
+        return Err(ClusterError::timeout(deadline, None));
+    }
+    tokio::time::timeout(left, request())
+        .await
+        .unwrap_or_else(|_| Err(ClusterError::timeout(deadline, None)))
 }
 
 /// Removes `metadata.managedFields`, which is noise in every view.
@@ -858,6 +872,34 @@ pub async fn pod_logs(client: &Client, query: &LogQuery) -> Result<String, Clust
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // covers UP-23: a detail read whose object used the whole deadline asks for no events
+    // (#258).
+    #[tokio::test]
+    async fn no_events_are_asked_for_once_the_deadline_is_spent() {
+        let deadline = Duration::from_secs(30);
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let request = || {
+            asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok((Vec::new(), false)))
+        };
+        let error = events_within(Duration::ZERO, deadline, request)
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+        // With time left, it is asked.
+        let request = || {
+            asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok((Vec::new(), false)))
+        };
+        assert!(
+            events_within(Duration::from_secs(1), deadline, request)
+                .await
+                .is_ok()
+        );
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     fn kind(group: &str, version: &str, kind: &str, plural: &str) -> KindInfo {
         KindInfo {
