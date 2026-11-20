@@ -961,14 +961,16 @@ Rules:
   connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
   as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
   written in time is skipped and logged.
-- **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
-  `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
-  app).
+- **stdout is the protocol channel.** Diagnostics go to stderr and Flint's own events also go to the rotating log
+  shared with the app. Both destinations use `FLINT_LOG` (else `RUST_LOG`) if set. Otherwise stderr shows warnings
+  and errors, adding info with `--verbose`, and the file records info (`flint_core::bootstrap::log_filter`). A
+  writer thread owns the file, so logging never blocks the thread that emits an event; when it falls behind, events
+  are dropped from the file but still reach stderr.
 
 The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
 tool layer and the policy (opt-in, limits) live in `flint-mcp`. The redaction rules live in `flint_core::redact`, so
-the app and the MCP server hide the same Secret values; the credential redactor for text is applied by the MCP server
-only.
+the app and the MCP server hide the same Secret values. The MCP server applies the credential redactor to text in
+tool results. The shared tracing subscriber also applies it to process diagnostics.
 
 ## Look and keyboard
 
@@ -1133,9 +1135,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 
 ## Settings and state
 
-- These files live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
+- Settings and UI state live in Flint's config directory: `FLINT_CONFIG_DIR` if set, else `~/Library/Application Support/Flint/`
   on macOS and `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux. `state.toml` stays beside
-  `settings.toml` on Linux too, rather than in `$XDG_STATE_HOME`, so one directory and one override hold everything
+  `settings.toml` on Linux too, so the same directory override covers both files
   ([ADR-0016](./adr/0016-linux-appimage.md)).
 - `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`, and `log_total_mib` for all tabs together), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
@@ -1148,6 +1150,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   more" rows of the tree and the old-revisions toggle.
 - `agent-activity.jsonl` and `agent-activity.1.jsonl`: the agent activity log, written by `flint mcp` and rotated at
   1 MiB ([MCP server](#mcp-server)).
+- `flint.log`: process diagnostics from the app and MCP, in `~/Library/Logs/Flint/` on macOS and
+  `$XDG_STATE_HOME/flint/` on Linux (default `~/.local/state/flint/`). The file is owner-only and keeps three
+  backups, rotating by size at 4 MiB. Its events come from Flint targets. If the file is unavailable, diagnostics
+  still go to stderr.
 - `recordings.sqlite` (after 1.0): recordings, their log lines, events and metric samples, in typed tables
   ([ADR-0018](./adr/0018-recordings.md)). Retention settings and per-cluster auto-record live in `settings.toml`.
 - Flint never writes to kubeconfig files.
