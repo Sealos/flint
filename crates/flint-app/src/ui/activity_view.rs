@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use flint_core::ClusterId;
 use flint_core::activity::{self, ActivityRecord, Outcome};
+use flint_core::settings::server_identity;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tooltip::Tooltip;
@@ -49,7 +50,8 @@ impl ActivityRow {
     }
 }
 
-/// The calls on `cluster` at `server` in `records`, newest first, with times in `tz` and `now`
+/// The calls on `cluster` at the server with key `server` ([`activity::ServerKeys`]) in
+/// `records`, newest first, with times in `tz` and `now`
 /// deciding whether a date is shown: those that named the context, and those that probed it
 /// (`list_clusters`). A context re-pointed at another server is another cluster: its calls there
 /// are not shown (a record without a server, from a context not exposed, is).
@@ -63,11 +65,10 @@ pub fn rows(
     let today = now.to_zoned(tz.clone()).date();
     // By key: the names in a record may be cut.
     let cluster = activity::cluster_key(cluster);
-    let server = server.map(activity::server_key);
     let mut mine: Vec<(usize, &ActivityRecord)> = records
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.is_about(&cluster, server.as_deref()))
+        .filter(|(_, r)| r.is_about(&cluster, server))
         .collect();
     // Newest first; calls in the same millisecond (several `flint mcp` processes) in the order
     // they were written, last first.
@@ -98,7 +99,8 @@ fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
 /// `text`, written by an agent, as the view shows it: control characters and the invisible
 /// format characters that reorder or hide text (bidi embeddings, overrides and isolates,
 /// zero-width characters) are shown as escapes (`\n`, `\u{202e}`), so a name cannot break its
-/// row or pass itself off as another one. Everything else is kept.
+/// row or pass itself off as another one. A backslash is doubled, so an escape and the same
+/// characters written by the agent read differently. Everything else is kept.
 fn shown(text: &str) -> String {
     fn hidden(c: char) -> bool {
         matches!(
@@ -112,7 +114,9 @@ fn shown(text: &str) -> String {
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_control() {
             out.extend(c.escape_default());
         } else if hidden(c) {
             out.extend(c.escape_unicode());
@@ -181,6 +185,8 @@ pub struct ActivityView {
     cluster: ClusterId,
     /// The server the context pointed at when the tab opened.
     server: Option<String>,
+    /// Its key in the activity log; none without one (then calls match by context alone).
+    server_key: Option<String>,
     /// The log the rows were built from: rebuilt only when it changes.
     shown: Option<Arc<Vec<ActivityRecord>>>,
     model: Entity<ClustersModel>,
@@ -193,10 +199,13 @@ pub struct ActivityView {
 }
 
 impl ActivityView {
+    /// The tab for `cluster` at `server`, matching calls by `keys`: those of the log's config
+    /// directory, so its server key is the one `flint mcp` records.
     pub fn new(
         model: Entity<ClustersModel>,
         cluster: ClusterId,
         server: Option<String>,
+        keys: &activity::ServerKeys,
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&model, |view, _, cx| {
@@ -205,6 +214,7 @@ impl ActivityView {
         });
         let mut view = ActivityView {
             cluster,
+            server_key: server.as_deref().and_then(|s| keys.server_key(s)),
             server,
             shown: None,
             model,
@@ -231,7 +241,7 @@ impl ActivityView {
         self.rows = rows(
             &records,
             &self.cluster,
-            self.server.as_deref(),
+            self.server_key.as_deref(),
             &self.tz,
             Timestamp::now(),
         );
@@ -351,8 +361,8 @@ impl Render for ActivityView {
                 .iter()
                 .find(|c| c.info.name == self.cluster)
                 .filter(|c| {
-                    c.info.server.as_deref().map(activity::server_key)
-                        == self.server.as_deref().map(activity::server_key)
+                    c.info.server.as_deref().map(server_identity)
+                        == self.server.as_deref().map(server_identity)
                 })
                 .and_then(|c| model.ai_scope(c))
                 .is_some()
@@ -421,6 +431,15 @@ mod tests {
 
     use super::{ActivityRow, result, rows, shown, size, target};
 
+    /// Server keys under a fixed key.
+    fn keys() -> activity::ServerKeys {
+        activity::ServerKeys::with_secret(&[7; 32])
+    }
+
+    fn server_key(url: &str) -> String {
+        keys().server_key(url).unwrap()
+    }
+
     fn record(at_ms: i64, cluster: &str) -> ActivityRecord {
         ActivityRecord {
             at_ms,
@@ -436,7 +455,7 @@ mod tests {
             truncated: true,
             outcome: Outcome::Ok,
             cluster_key: Some(activity::cluster_key(cluster)),
-            server_key: Some(activity::server_key("https://prod:6443")),
+            server_key: Some(server_key("https://prod:6443")),
             probed: Vec::new(),
         }
     }
@@ -471,10 +490,16 @@ mod tests {
             clusters,
             denied,
         ];
-        let labels: Vec<String> = rows(&records, "prod", Some("https://prod:6443/"), &tz, now)
-            .iter()
-            .map(ActivityRow::label)
-            .collect();
+        let labels: Vec<String> = rows(
+            &records,
+            "prod",
+            Some(&server_key("https://prod:6443/")),
+            &tz,
+            now,
+        )
+        .iter()
+        .map(ActivityRow::label)
+        .collect();
         assert_eq!(
             labels,
             [
@@ -518,9 +543,14 @@ mod tests {
         }
         // Everything else is kept as written: other scripts, emoji, punctuation.
         assert_eq!(
-            shown("pods ns/naïve-日本-🚀 \"q\" \\x"),
-            "pods ns/naïve-日本-🚀 \"q\" \\x"
+            shown("pods ns/naïve-日本-🚀 \"q\""),
+            "pods ns/naïve-日本-🚀 \"q\""
         );
+        // A backslash is doubled: the two characters `\n` written by the agent do not read as an
+        // escaped newline.
+        assert_eq!(shown("a\\nb"), "a\\\\nb");
+        assert_eq!(shown("a\nb"), "a\\nb");
+        assert_ne!(shown("a\\nb"), shown("a\nb"));
     }
 
     // covers UP-16: a context re-pointed at another server shows only the calls on the server its
@@ -530,7 +560,7 @@ mod tests {
         let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
         let at = |server: Option<&str>| ActivityRecord {
             server: server.map(str::to_owned),
-            server_key: server.map(activity::server_key),
+            server_key: server.map(server_key),
             ..record(now.as_millisecond(), "prod")
         };
         let records = [
@@ -538,7 +568,10 @@ mod tests {
             at(Some("https://prod:6443")),
             at(None),
         ];
-        let count = |server| rows(&records, "prod", server, &TimeZone::UTC, now).len();
+        let count = |server: Option<&str>| {
+            let key = server.map(server_key);
+            rows(&records, "prod", key.as_deref(), &TimeZone::UTC, now).len()
+        };
         assert_eq!(count(Some("https://prod:6443")), 2);
         assert_eq!(count(Some("https://old:6443/")), 2);
         assert_eq!(count(None), 3);
@@ -563,16 +596,17 @@ mod tests {
             cluster_key: None,
             server_key: None,
             probed: vec![
-                activity::Probed::new("prod", Some("https://prod:6443")),
-                activity::Probed::new("dev", Some("https://dev:6443")),
+                activity::Probed::new(&keys(), "prod", Some("https://prod:6443")),
+                activity::Probed::new(&keys(), "dev", Some("https://dev:6443")),
             ],
             ..record(now.as_millisecond(), "prod")
         };
-        let labels = |cluster, server| -> Vec<String> {
+        let labels = |cluster, server: Option<&str>| -> Vec<String> {
+            let key = server.map(server_key);
             rows(
                 std::slice::from_ref(&listed),
                 cluster,
-                server,
+                key.as_deref(),
                 &TimeZone::UTC,
                 now,
             )
@@ -598,14 +632,14 @@ mod tests {
         let new = "https://proxy.example.com/k8s/@new";
         let call = ActivityRecord {
             server: Some(flint_core::redact::server_url(old)),
-            server_key: Some(activity::server_key(old)),
+            server_key: Some(server_key(old)),
             ..record(now.as_millisecond(), "prod")
         };
         let count = |server| {
             rows(
                 std::slice::from_ref(&call),
                 "prod",
-                Some(server),
+                Some(&server_key(server)),
                 &TimeZone::UTC,
                 now,
             )

@@ -203,12 +203,16 @@ impl FlintMcp {
         let note = CALL
             .try_with(|c| std::mem::take(&mut *c.borrow_mut()))
             .unwrap_or_default();
-        let (server, server_key) = match named.cluster {
-            Some(_) => (note.server, note.server_key),
+        let (server, endpoint) = match named.cluster {
+            Some(_) => (note.server, note.endpoint),
             None => (None, None),
         };
+        let reached = activity::Reached {
+            server: endpoint,
+            probed: note.probed,
+        };
         let _ = CALL.try_with(|c| c.borrow_mut().recorded = true);
-        self.record(activity::ActivityRecord {
+        let record = activity::ActivityRecord {
             at_ms: activity::now_ms(),
             tool: tool.to_owned(),
             server,
@@ -222,10 +226,11 @@ impl FlintMcp {
             truncated,
             outcome,
             cluster_key: None,
-            server_key,
-            probed: note.probed,
-        })
-        .await;
+            server_key: None,
+            probed: Vec::new(),
+            probed_more: 0,
+        };
+        self.record(record, reached).await;
         let content = vec![ContentBlock::text(text)];
         Ok(if ok {
             CallToolResult::success(content)
@@ -234,11 +239,13 @@ impl FlintMcp {
         })
     }
 
-    /// Appends `record` to the activity log. A failure to write is logged and does not fail the
-    /// call.
-    async fn record(&self, record: activity::ActivityRecord) {
+    /// Appends `record` to the activity log, keying the servers it `reached`. A failure to write
+    /// is logged and does not fail the call.
+    async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
         let dir = self.inner.config_dir.clone();
-        let written = tokio::task::spawn_blocking(move || activity::append(&dir, &record)).await;
+        let written =
+            tokio::task::spawn_blocking(move || activity::append_call(&dir, &record, &reached))
+                .await;
         match written {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
@@ -253,10 +260,10 @@ struct CallNote {
     /// The API server of the cluster the call reads, once [`FlintMcp::client`] found it exposed
     /// (without credentials).
     server: Option<String>,
-    /// Its [`activity::server_key`], of the URL as the kubeconfig has it.
-    server_key: Option<String>,
-    /// The clusters `list_clusters` probed.
-    probed: Vec<activity::Probed>,
+    /// That server as the kubeconfig has it, for its key ([`activity::append_call`]).
+    endpoint: Option<String>,
+    /// The contexts `list_clusters` probed, with their servers as the kubeconfig has them.
+    probed: Vec<(String, Option<String>)>,
     /// Its tool recorded it ([`FlintMcp::finish`]).
     recorded: bool,
 }
@@ -544,7 +551,7 @@ impl ServerHandler for FlintMcp {
                 Ok(_) => 0,
                 Err(error) => error.message.len(),
             };
-            self.record(activity::ActivityRecord {
+            let record = activity::ActivityRecord {
                 at_ms: activity::now_ms(),
                 tool,
                 server: None,
@@ -560,8 +567,9 @@ impl ServerHandler for FlintMcp {
                 cluster_key: None,
                 server_key: None,
                 probed: Vec::new(),
-            })
-            .await;
+                probed_more: 0,
+            };
+            self.record(record, activity::Reached::default()).await;
         }
         result
     }
@@ -610,7 +618,7 @@ impl FlintMcp {
         let _ = CALL.try_with(|c| {
             let mut note = c.borrow_mut();
             note.server = info.server.as_deref().map(flint_core::redact::server_url);
-            note.server_key = info.server.as_deref().map(activity::server_key);
+            note.endpoint = info.server.clone();
         });
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
@@ -706,7 +714,7 @@ impl FlintMcp {
         let _ = CALL.try_with(|c| {
             c.borrow_mut().probed = exposed
                 .iter()
-                .map(|info| activity::Probed::new(&info.name, info.server.as_deref()))
+                .map(|info| (info.name.clone(), info.server.clone()))
                 .collect();
         });
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);

@@ -5,7 +5,7 @@
 //! The file is read once at startup and written whole after each change, off the UI thread.
 //! The app is its only writer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flint_core::settings::{self, ListSort, PaneWidths, State};
 
@@ -26,6 +26,11 @@ impl UiState {
             }
         };
         UiState { dir, state }
+    }
+
+    /// Flint's config directory, where `state.toml` is.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The namespaces `cluster` is filtered to. Empty means all namespaces.

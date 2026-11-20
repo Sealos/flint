@@ -270,8 +270,9 @@ async fn reports_the_agent_activity_log_as_it_grows() {
         truncated: false,
         outcome: Outcome::Ok,
         cluster_key: Some(activity::cluster_key("one")),
-        server_key: Some(activity::server_key(SERVER)),
+        server_key: activity::ServerKeys::with_secret(&[7; 32]).server_key(SERVER),
         probed: Vec::new(),
+        probed_more: 0,
     };
     activity::append(&config, &record(1)).unwrap();
     let core = start(dir.path(), true);

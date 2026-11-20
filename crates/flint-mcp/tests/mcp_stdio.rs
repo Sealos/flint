@@ -374,15 +374,23 @@ fn every_call_is_recorded_in_the_activity_log() {
     assert!(records.iter().all(|r| r.bytes > 0 && !r.truncated));
     // The server a cluster is exposed with, as shown; none for one that is not exposed. Its key
     // is of the server itself, not of the placeholder it shows as.
-    use flint_core::activity::{Probed, server_key};
+    use flint_core::activity::{KEY_FILE, Probed, ServerKeys};
+    // Keyed with the config directory's own key, which the first call made.
+    assert!(config_dir.join(KEY_FILE).exists());
+    let keys = ServerKeys::open(&config_dir);
+    let server_key = |url: &str| keys.server_key(url);
     let shown = flint_core::redact::server_url(&refusing);
     assert_eq!(shown, flint_core::redact::HIDDEN_SERVER_URL);
     assert_eq!(records[2].server.as_deref(), Some(shown.as_str()));
-    assert_eq!(records[2].server_key, Some(server_key(&refusing)));
+    assert!(server_key(&refusing).is_some());
+    assert_eq!(records[2].server_key, server_key(&refusing));
     assert_ne!(server_key(&refusing), server_key(&shown));
     assert_eq!((&records[1].server, &records[1].server_key), (&None, &None));
     // list_clusters names no cluster but is about the one it probed, at its server.
-    assert_eq!(records[0].probed, [Probed::new("dev", Some(&refusing))]);
+    assert_eq!(
+        records[0].probed,
+        [Probed::new(&keys, "dev", Some(&refusing))]
+    );
     assert!(records[1..].iter().all(|r| r.probed.is_empty()));
     // What came back is never stored.
     let log =
