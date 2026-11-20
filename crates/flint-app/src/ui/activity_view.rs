@@ -78,8 +78,8 @@ pub fn rows(
     mine.into_iter()
         .map(|(_, r)| ActivityRow {
             time: time(r.at_ms, tz, today),
-            tool: r.tool.clone(),
-            target: target(r),
+            tool: shown(&r.tool),
+            target: shown(&target(r)),
             result: result(r),
             outcome: r.outcome,
         })
@@ -96,6 +96,34 @@ fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
     } else {
         at.strftime("%Y-%m-%d %H:%M:%S").to_string()
     }
+}
+
+/// `text`, written by an agent, as the view shows it: control characters and the invisible
+/// format characters that reorder or hide text (bidi embeddings, overrides and isolates,
+/// zero-width characters) are shown as escapes (`\n`, `\u{202e}`), so a name cannot break its
+/// row or pass itself off as another one. Everything else is kept.
+fn shown(text: &str) -> String {
+    fn hidden(c: char) -> bool {
+        matches!(
+            c,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else if hidden(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// What a call named: the kind, the object (`namespace/name`, or the namespace alone), and the
@@ -393,7 +421,7 @@ mod tests {
     use jiff::Timestamp;
     use jiff::tz::TimeZone;
 
-    use super::{ActivityRow, result, rows, size, target};
+    use super::{ActivityRow, result, rows, shown, size, target};
 
     fn record(at_ms: i64, cluster: &str) -> ActivityRecord {
         ActivityRecord {
@@ -454,6 +482,43 @@ mod tests {
                 "2026-11-19 12:00:00 get_pod_logs pods web/web-0, container app — 120 items, 5.0 \
                  KB, cut short",
             ]
+        );
+    }
+
+    // covers UP-16: what an agent wrote cannot break its row or pass itself off as another
+    // target: control characters and the invisible characters that reorder or hide text are
+    // shown as escapes, in the cell and its tooltip (which show the same text).
+    #[test]
+    fn agent_text_is_shown_with_control_characters_escaped() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let sneaky = ActivityRecord {
+            tool: "get_\u{1b}[2Jresource".into(),
+            namespace: Some("web\u{202e}metsys-ebuk".into()),
+            name: Some("web-0\nkube-system/vault-0".into()),
+            container: Some("app\u{2066}\u{200b}\t".into()),
+            ..record(now.as_millisecond(), "prod")
+        };
+        let row = rows(&[sneaky], "prod", None, &TimeZone::UTC, now)
+            .pop()
+            .expect("the call is listed");
+        assert_eq!(row.tool, "get_\\u{1b}[2Jresource");
+        assert_eq!(
+            row.target,
+            "pods web\\u{202e}metsys-ebuk/web-0\\nkube-system/vault-0, container \
+             app\\u{2066}\\u{200b}\\t"
+        );
+        for text in [&row.tool, &row.target] {
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| c.is_control() || ('\u{2000}'..='\u{2fff}').contains(&c)),
+                "{text:?}"
+            );
+        }
+        // Everything else is kept as written: other scripts, emoji, punctuation.
+        assert_eq!(
+            shown("pods ns/naïve-日本-🚀 \"q\" \\x"),
+            "pods ns/naïve-日本-🚀 \"q\" \\x"
         );
     }
 
