@@ -174,6 +174,10 @@ pub struct SwitcherScope {
     pub on_view: bool,
 }
 
+/// A switcher item by what it is, not by its row: its kind, and the object (`None` for the
+/// kind itself).
+type ItemId = (flint_core::KindId, Option<super::switcher_model::Object>);
+
 /// What the resource switcher searches.
 struct Resources {
     /// The active cluster, as the rows name it; `None` with no cluster active.
@@ -235,6 +239,9 @@ pub struct CommandPalette {
     /// The selection was moved with the arrows, so a refreshed list keeps it; else the best
     /// row (row 0) is selected again.
     chosen: bool,
+    /// The switcher's item the user moved to, kept across a rescope until the objects arrive
+    /// and it is listed again.
+    kept: Option<ItemId>,
     mode: Mode,
     /// The resource switcher's index and search, in [`Mode::Resources`].
     resources: Option<Resources>,
@@ -303,17 +310,7 @@ impl CommandPalette {
         // The item the user moved to with the arrows, by what it is: its row may move as
         // objects arrive. A selection nobody moved goes to the best row, which may be new (the
         // rule live refreshes follow).
-        let selected = self.rows.get(self.selected).filter(|_| self.chosen);
-        let kept = match (selected, &self.resources) {
-            (Some(Row::Resource { item, .. }), Some(resources)) => {
-                let item = &resources.index.items[*item as usize];
-                Some((
-                    resources.index.kind_of(item).id.clone(),
-                    item.object.clone(),
-                ))
-            }
-            _ => None,
-        };
+        let kept = self.chosen_item().or_else(|| self.kept.take());
         let Some(resources) = &mut self.resources else {
             return;
         };
@@ -321,34 +318,67 @@ impl CommandPalette {
         resources.loading = false;
         resources.search = Search::default();
         self.refilter(cx);
-        let Some((kind, object)) = kept else {
-            return;
-        };
+        // The objects are in: an item not listed now is gone, or filtered out.
+        if let Some(kept) = kept {
+            self.select_item(&kept);
+        }
+    }
+
+    /// The switcher over another scope (another cluster became active, or its discovery
+    /// arrived): what it lists starts over, with what was typed kept. On the same cluster, the
+    /// item the user moved to stays selected, once listed again (the objects come later).
+    pub fn rescope(&mut self, scope: SwitcherScope, cx: &mut Context<Self>) {
         let Some(resources) = &self.resources else {
             return;
+        };
+        let same_cluster = resources.cluster_id == scope.cluster_id;
+        let kept = self
+            .chosen_item()
+            .or_else(|| self.kept.take())
+            .filter(|_| same_cluster);
+        self.resources = Some(Resources::of(scope));
+        self.refilter(cx);
+        if let Some(kept) = kept
+            && !self.select_item(&kept)
+        {
+            // Not listed until the objects arrive (`set_index`).
+            self.kept = Some(kept);
+        }
+    }
+
+    /// What the selected row is, when the user moved to it.
+    fn chosen_item(&self) -> Option<ItemId> {
+        let (Some(Row::Resource { item, .. }), Some(resources)) = (
+            self.rows.get(self.selected).filter(|_| self.chosen),
+            &self.resources,
+        ) else {
+            return None;
+        };
+        let item = &resources.index.items[*item as usize];
+        Some((
+            resources.index.kind_of(item).id.clone(),
+            item.object.clone(),
+        ))
+    }
+
+    /// Selects the row of `item`, as the user chose it, if it is listed; otherwise the first
+    /// row stays selected. Whether it was listed.
+    fn select_item(&mut self, (kind, object): &ItemId) -> bool {
+        let Some(resources) = &self.resources else {
+            return false;
         };
         let at = self.rows.iter().position(|row| match row {
             Row::Resource { item, .. } => {
                 let item = &resources.index.items[*item as usize];
-                resources.index.kind_of(item).id == kind && item.object == object
+                resources.index.kind_of(item).id == *kind && item.object == *object
             }
             _ => false,
         });
-        // Gone from the results: the first row, as after typing.
         self.selected = at.unwrap_or(0);
         self.chosen = at.is_some();
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
-    }
-
-    /// The switcher over another scope (another cluster became active, or its discovery
-    /// arrived): what it lists starts over, with what was typed kept.
-    pub fn rescope(&mut self, scope: SwitcherScope, cx: &mut Context<Self>) {
-        if self.resources.is_none() {
-            return;
-        }
-        self.resources = Some(Resources::of(scope));
-        self.refilter(cx);
+        at.is_some()
     }
 
     /// What the palette searches.
@@ -368,6 +398,8 @@ impl CommandPalette {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH));
         let on_query = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
+                // Typing chooses anew.
+                this.kept = None;
                 this.refilter(cx);
             }
         });
@@ -398,6 +430,7 @@ impl CommandPalette {
             rows_version: 0,
             selected: 0,
             chosen: false,
+            kept: None,
             mode,
             resources: None,
             error: None,
@@ -639,6 +672,7 @@ impl CommandPalette {
     fn move_by(&mut self, step: isize, cx: &mut Context<Self>) {
         self.selected = palette_model::step(self.selected, self.rows.len(), step);
         self.chosen = true;
+        self.kept = None;
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         cx.notify();

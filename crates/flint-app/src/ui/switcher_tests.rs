@@ -1050,3 +1050,55 @@ async fn going_back_to_an_object_deleted_meanwhile_says_so(cx: &mut TestAppConte
     .await;
     assert_eq!(t.selected(cx), None);
 }
+
+// covers UP-31: discovery renaming a kind lists anew, and the item the user moved to stays
+// selected once listed again: Enter opens it, not the first row.
+#[gpui_kit::test]
+async fn the_chosen_item_survives_a_rename(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    open_switcher(cx, &t).await;
+    t.type_text(cx, "web");
+    t.press(cx, "down");
+    assert_eq!(selected(&shown(cx, &t)), "demo/web-7d9f");
+    let mut sections = standard_sections();
+    for section in &mut sections {
+        for entry in &mut section.entries {
+            if entry.label == "Widgets" {
+                entry.label = "Widget Gadgets".into();
+            }
+        }
+    }
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                sections,
+            ))),
+            error: None,
+        },
+    );
+    // Listed anew, the objects read again.
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).palette_view().is_some_and(|p| {
+            let p = p.read(cx);
+            p.resources.as_ref().is_some_and(|r| {
+                !r.loading && r.index.kinds.iter().any(|k| k.label == "Widget Gadgets")
+            })
+        })
+    })
+    .await;
+    let after = shown(cx, &t);
+    assert_eq!(labels(&after), ["demo/web", "demo/web-7d9f"]);
+    assert_eq!(selected(&after), "demo/web-7d9f");
+    t.press(cx, "enter");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).detail_view().is_some()
+    })
+    .await;
+    assert_eq!(t.selected(cx).as_deref(), Some("web-7d9f"));
+}

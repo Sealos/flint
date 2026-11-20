@@ -939,7 +939,8 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     for a kind or a cluster-scoped object, whose text is the name; while ranking every object it is judged from
     where the quick match starts, and the best 200 check the name itself), so
     Deployment `demo/web` comes before ConfigMap `demo/web-cfg` for "web". Equal scores list the shorter text
-    first. While the objects arrive, the selection stays on the item the user moved to, and a click drawn on the
+    first. While the objects arrive, and when the switcher lists anew on the same cluster (a kind renamed),
+    the selection stays on the item the user moved to once it is listed again, and a click drawn on the
     rows before (`PalettePick`'s rows version, as in the palette) is dropped, so it cannot open the object now in
     its row.
   - Enter on a kind runs Open Kind… (`workspace::OpenView`); on an object, Open Object… (`workspace::OpenObject`,
