@@ -26,6 +26,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -280,14 +281,14 @@ pub struct ExecSnapshot {
     pub input_not_replayed: bool,
 }
 
-/// What a front end asks of a running session. Keystrokes and pastes carry the [`Charge`]
-/// reserved for them. [`Input::Resize`] and [`Input::Close`] never wait in the queue:
-/// `Session::recv` makes them from the size slot and the close signal.
+/// What a front end asks of a running session. Keystrokes and pastes carry what [`Sent`]
+/// says. [`Input::Resize`] and [`Input::Close`] never wait in the queue: `Session::recv` makes
+/// them from the size slot and the close signal.
 pub(crate) enum Input {
-    Write(Vec<u8>, Charge),
-    Paste(String, Charge),
+    Write(Vec<u8>, Sent),
+    Paste(String, Sent),
     /// Paste only if the program has bracketed paste on; the reply says whether it did.
-    PasteIfBracketed(String, Charge, oneshot::Sender<bool>),
+    PasteIfBracketed(String, Sent, oneshot::Sender<bool>),
     Resize(TerminalSize),
     Scroll(i32),
     ScrollToBottom,
@@ -307,6 +308,13 @@ pub(crate) enum Input {
     Close,
 }
 
+/// What a keystroke or a paste carries besides itself: the share of the input budget reserved
+/// for it, and the shell attempt it was sent during (see `Session::forget_queued_input`).
+pub(crate) struct Sent {
+    charge: Charge,
+    attempt: u64,
+}
+
 /// A front end's handle to one exec session, from [`crate::CoreHandle::exec`].
 ///
 /// Every method returns at once and works on any executor. Dropping the session closes it.
@@ -318,6 +326,8 @@ pub struct ExecSession {
     /// Set by [`ExecSession::close`]; dropping it closes the session too.
     close: watch::Sender<bool>,
     budget: Arc<InputBudget>,
+    /// The shell attempt input sent now belongs to, as the session task numbers them.
+    attempt: Arc<AtomicU64>,
     rx: watch::Receiver<Arc<ExecSnapshot>>,
 }
 
@@ -327,6 +337,7 @@ pub(crate) struct SessionChannels {
     size: watch::Receiver<TerminalSize>,
     close: watch::Receiver<bool>,
     budget: Arc<InputBudget>,
+    attempt: Arc<AtomicU64>,
     out: watch::Sender<Arc<ExecSnapshot>>,
     model: TerminalModel,
 }
@@ -347,6 +358,7 @@ impl ExecSession {
         let (size_tx, size) = watch::channel(request.size);
         let (close_tx, close) = watch::channel(false);
         let budget = InputBudget::new(INPUT_BUDGET);
+        let attempt = Arc::new(AtomicU64::new(0));
         (
             Self {
                 request,
@@ -354,6 +366,7 @@ impl ExecSession {
                 size: size_tx,
                 close: close_tx,
                 budget: budget.clone(),
+                attempt: attempt.clone(),
                 rx,
             },
             SessionChannels {
@@ -361,6 +374,7 @@ impl ExecSession {
                 size,
                 close,
                 budget,
+                attempt,
                 out,
                 model,
             },
@@ -378,6 +392,14 @@ impl ExecSession {
         let _ = self.inputs.try_send(input);
     }
 
+    /// Reserves `bytes` of the input budget for input sent now.
+    fn reserve(&self, bytes: usize) -> Result<Sent, InputRefused> {
+        Ok(Sent {
+            charge: budget::reserve(&self.budget, bytes)?,
+            attempt: self.attempt.load(Ordering::Acquire),
+        })
+    }
+
     /// Sends keystrokes (already encoded for the terminal) to the command, and scrolls the view
     /// back to the bottom. Ignored once the command has finished. Refused, and nothing sent,
     /// when they do not fit in what the session holds for a command that is not reading its
@@ -387,8 +409,8 @@ impl ExecSession {
         if bytes.is_empty() {
             return Ok(());
         }
-        let charge = budget::reserve(&self.budget, bytes.len())?;
-        self.send(Input::Write(bytes, charge));
+        let sent = self.reserve(bytes.len())?;
+        self.send(Input::Write(bytes, sent));
         Ok(())
     }
 
@@ -396,8 +418,8 @@ impl ExecSession {
     /// [`TerminalModel::paste_bytes`]). Refused whole, as [`ExecSession::write`] is.
     pub fn paste(&self, text: impl Into<String>) -> Result<(), InputRefused> {
         let text = text.into();
-        let charge = budget::reserve(&self.budget, text.len() + PASTE_MARKERS)?;
-        self.send(Input::Paste(text, charge));
+        let sent = self.reserve(text.len() + PASTE_MARKERS)?;
+        self.send(Input::Paste(text, sent));
         Ok(())
     }
 
@@ -411,9 +433,9 @@ impl ExecSession {
         text: impl Into<String>,
     ) -> Result<impl Future<Output = bool> + Send + 'static, InputRefused> {
         let text = text.into();
-        let charge = budget::reserve(&self.budget, text.len() + PASTE_MARKERS)?;
+        let sent = self.reserve(text.len() + PASTE_MARKERS)?;
         let (reply, rx) = oneshot::channel();
-        self.send(Input::PasteIfBracketed(text, charge, reply));
+        self.send(Input::PasteIfBracketed(text, sent, reply));
         Ok(async move { rx.await.unwrap_or(false) })
     }
 
@@ -767,6 +789,7 @@ pub(crate) async fn run(
                 tracing::debug!(?command, "command not in the container; trying the next");
                 if std::mem::take(&mut pending.dropped) {
                     session.input_not_replayed = true;
+                    session.forget_queued_input();
                 }
                 // Some runtimes print the error on the TTY: start the next shell on a clean
                 // screen.
@@ -890,6 +913,9 @@ struct Session {
     sizing: bool,
     close: watch::Receiver<bool>,
     budget: Arc<InputBudget>,
+    attempt: Arc<AtomicU64>,
+    /// Input sent during an attempt before this one is dropped when it arrives.
+    current_attempt: u64,
     out: watch::Sender<Arc<ExecSnapshot>>,
     last_publish: Option<Instant>,
     /// Output arrived since the last snapshot.
@@ -908,6 +934,8 @@ impl Session {
             sizing: true,
             close: channels.close,
             budget: channels.budget,
+            attempt: channels.attempt,
+            current_attempt: 0,
             out: channels.out,
             last_publish: None,
             dirty: false,
@@ -945,6 +973,22 @@ impl Session {
     fn deadline(&self) -> Option<Instant> {
         self.dirty
             .then(|| self.last_publish.map_or_else(Instant::now, |at| at + FRAME))
+    }
+
+    /// Starts the next shell without anything sent for the ones tried before: input still
+    /// queued from then is dropped when it arrives, so no tail of what was typed for a shell
+    /// whose replay was dropped reaches the next one. Input sent from now on is kept.
+    fn forget_queued_input(&mut self) {
+        self.current_attempt = self.attempt.fetch_add(1, Ordering::AcqRel) + 1;
+    }
+
+    /// Whether `input` was sent for a shell tried before the current one.
+    fn is_stale(&self, input: &Result<Input, async_channel::RecvError>) -> bool {
+        matches!(
+            input,
+            Ok(Input::Write(_, sent) | Input::Paste(_, sent) | Input::PasteIfBracketed(_, sent, _))
+                if sent.attempt < self.current_attempt
+        )
     }
 
     /// What the front end asks next: closing first, then a new size, then queued input, so
@@ -985,17 +1029,21 @@ impl Session {
         input: Result<Input, async_channel::RecvError>,
         pending: Option<&mut Replay>,
     ) -> Flow {
+        if self.is_stale(&input) {
+            // Dropping it gives its bytes back, and answers a bracketed paste with no.
+            return Flow::Continue;
+        }
         let Ok(input) = input else {
             // The session handle is gone.
             return Flow::Close;
         };
         match input {
-            Input::Write(bytes, charge) => {
+            Input::Write(bytes, sent) => {
                 if let Some(pending) = pending {
-                    pending.take_in(bytes, charge);
+                    pending.take_in(bytes, sent.charge);
                 }
             }
-            Input::Paste(text, mut charge) => {
+            Input::Paste(text, Sent { mut charge, .. }) => {
                 if let Some(pending) = pending {
                     let bytes = self.model.paste_bytes(&text);
                     charge.set(bytes.len());
@@ -1051,20 +1099,27 @@ impl Session {
         to_pod: &ToPod,
         unconfirmed: Option<&mut Replay>,
     ) -> Flow {
+        if self.is_stale(&input) {
+            return Flow::Continue;
+        }
         let (bytes, mut charge) = match input {
-            Ok(Input::Write(bytes, charge)) => (bytes, charge),
-            Ok(Input::Paste(text, charge)) => (self.model.paste_bytes(&text), charge),
-            Ok(Input::PasteIfBracketed(text, charge, reply)) => {
+            Ok(Input::Write(bytes, sent)) => (bytes, sent.charge),
+            Ok(Input::Paste(text, sent)) => (self.model.paste_bytes(&text), sent.charge),
+            Ok(Input::PasteIfBracketed(text, sent, reply)) => {
                 let bracketed = self.model.bracketed_paste();
                 let _ = reply.send(bracketed);
                 if !bracketed {
                     return Flow::Continue;
                 }
-                (self.model.paste_bytes(&text), charge)
+                (self.model.paste_bytes(&text), sent.charge)
             }
             other => return self.handle_live_control(other, to_pod),
         };
         charge.set(bytes.len());
+        if bytes.is_empty() {
+            // An empty paste without bracketed paste: nothing to send.
+            return Flow::Continue;
+        }
         self.follow_output();
         if let Some(unconfirmed) = unconfirmed {
             unconfirmed.keep(&bytes, &self.budget);
@@ -1276,6 +1331,16 @@ impl Session {
                 return;
             }
         }
+    }
+}
+
+impl Drop for Session {
+    /// Closes the input queue and empties it without sending anything: the handle keeps its
+    /// sender, so what waits there would otherwise stay, holding its bytes of the budget and
+    /// leaving a bracketed paste unanswered (dropping its reply answers no).
+    fn drop(&mut self) {
+        self.inputs.close();
+        while self.inputs.try_recv().is_ok() {}
     }
 }
 
@@ -2468,6 +2533,93 @@ mod tests {
         sh_remote.next_resize().await;
         session.write(b"q".to_vec()).unwrap();
         assert_eq!(sh_remote.read_stdin(1).await, b"q");
+    }
+
+    /// A session's task side, driven by the test, with somewhere for live input to go.
+    fn session_parts() -> (ExecSession, Session, ToPod, mpsc::UnboundedReceiver<Chunk>) {
+        let (session, channels) = ExecSession::new(request());
+        let core = Session::new(channels);
+        let (stdin, rx) = mpsc::unbounded_channel();
+        let to_pod = ToPod {
+            stdin,
+            size: watch::channel(core.model.size()).0,
+        };
+        (session, core, to_pod, rx)
+    }
+
+    // covers UP-41 (#256): when what was typed for bash was too large to keep for /bin/sh,
+    // input sent for bash and still queued is dropped, not sent to /bin/sh without its
+    // beginning; input sent once /bin/sh is tried still goes to it.
+    #[tokio::test]
+    async fn input_queued_for_a_shell_whose_replay_was_dropped_never_reaches_the_next() {
+        let (session, mut core, to_pod, mut stdin) = session_parts();
+        // Sent while bash was tried; the session task has not taken them in yet.
+        session.write(b" /tmp/a\r".to_vec()).unwrap();
+        let pasted = session.paste_if_bracketed("y").unwrap();
+        session.write(b"z".to_vec()).unwrap();
+        core.forget_queued_input();
+        // Sent once /bin/sh is tried.
+        session.write(b"ls\r".to_vec()).unwrap();
+        session.write(b"pwd\r".to_vec()).unwrap();
+
+        let mut pending = Replay::default();
+        for _ in 0..2 {
+            let input = core.recv().await;
+            assert_eq!(
+                core.handle_offline(input, Some(&mut pending)),
+                Flow::Continue
+            );
+        }
+        assert!(pending.is_empty(), "nothing from bash's attempt is kept");
+        assert!(!pasted.await, "a stale paste is answered no");
+        let input = core.recv().await;
+        core.handle_live(input, &to_pod, None);
+        assert!(stdin.try_recv().is_err(), "nor sent to a running shell");
+        for _ in 0..2 {
+            let input = core.recv().await;
+            core.handle_offline(input, Some(&mut pending));
+        }
+        assert_eq!(pending.bytes, b"ls\rpwd\r");
+        assert_eq!(
+            session.queued_input(),
+            7,
+            "the dropped input's bytes came back"
+        );
+    }
+
+    // covers UP-41 (#256): closing a session while input still waits in its queue gives that
+    // input's bytes back and answers a waiting bracketed paste.
+    #[tokio::test]
+    async fn closing_with_input_queued_gives_it_back_and_answers_pastes() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let mut session = open(&launcher, request());
+        remote.next_resize().await;
+        wait_for(&mut session, "running", |s| {
+            matches!(s.state, ExecState::Running { .. })
+        })
+        .await;
+        // All sent before the session task runs again: closing goes first, so these are
+        // still queued when it ends.
+        let pasted = session.paste_if_bracketed("a\nb").unwrap();
+        session.paste("x".repeat(PASTE)).unwrap();
+        session.close();
+        let answered = tokio::time::timeout(Duration::from_secs(1), pasted).await;
+        assert!(!answered.expect("the paste is answered"));
+        queued(&session, 0).await;
+        wait_for(&mut session, "closed", |s| s.state == ExecState::Closed).await;
+    }
+
+    // covers UP-41 (#256): an empty paste without bracketed paste queues nothing for the pod.
+    #[tokio::test]
+    async fn an_empty_paste_sends_nothing() {
+        let (session, mut core, to_pod, mut stdin) = session_parts();
+        session.paste("").unwrap();
+        let input = core.recv().await;
+        assert_eq!(core.handle_live(input, &to_pod, None), Flow::Continue);
+        assert!(stdin.try_recv().is_err(), "no empty chunk");
+        assert_eq!(session.queued_input(), 0);
     }
 
     #[test]

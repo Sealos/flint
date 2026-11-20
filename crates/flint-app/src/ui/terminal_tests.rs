@@ -795,9 +795,10 @@ async fn input_the_shell_is_not_reading_is_refused_saying_so(cx: &mut TestAppCon
         "nothing refused was sent"
     );
     assert!(!sent.ends_with(b"z"));
-    // The shell read it all: typing goes again.
+    // The shell read it all: typing goes again, and the note, no longer true, is gone.
     shell.input(cx, "z");
     assert_eq!(shell.sent(cx), b"z");
+    assert_eq!(note(&shell, cx), None);
 }
 
 // covers UP-41 (#256): when what was typed while bash was tried was not kept for /bin/sh, the

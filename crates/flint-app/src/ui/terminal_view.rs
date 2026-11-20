@@ -135,6 +135,8 @@ pub struct TerminalView {
     /// The bell rang a moment ago.
     bell: bool,
     note: Option<Note>,
+    /// The note says the shell is not reading its input ([`TerminalView::input_sent`]).
+    refusal_shown: bool,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
     /// Why Restart Shell cannot run, as the workspace says it: the tab's cluster is protected
@@ -198,6 +200,7 @@ impl TerminalView {
             marked: None,
             bell: false,
             note: None,
+            refusal_shown: false,
             ended: None,
             protected: None,
             chip,
@@ -352,15 +355,27 @@ impl TerminalView {
             return;
         }
         self.wheel.reset();
-        if let Err(refused) = self.session.write(bytes) {
-            self.input_refused(refused, false);
-        }
+        let sent = self.session.write(bytes);
+        self.input_sent(sent, false);
         cx.notify();
     }
 
-    /// Says that the shell is not reading its input, so what was typed or pasted was not sent.
-    pub(super) fn input_refused(&mut self, refused: InputRefused, paste: bool) {
-        self.set_note(Tone::Warning, terminal_model::input_refused(refused, paste));
+    /// Takes in the core's answer to keystrokes or a paste (`paste`): a refusal says the shell
+    /// is not reading its input, so they were not sent; input taken again clears that note,
+    /// which no longer holds.
+    pub(super) fn input_sent(&mut self, sent: Result<(), InputRefused>, paste: bool) {
+        match sent {
+            Ok(()) => {
+                if self.refusal_shown {
+                    self.note = None;
+                    self.refusal_shown = false;
+                }
+            }
+            Err(refused) => {
+                self.set_note(Tone::Warning, terminal_model::input_refused(refused, paste));
+                self.refusal_shown = true;
+            }
+        }
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -490,10 +505,9 @@ impl TerminalView {
                 (false, false) => b"\x1b[B",
             };
             let bytes = key.repeat(lines.unsigned_abs() as usize);
-            if let Err(refused) = self.session.write(bytes) {
-                self.input_refused(refused, false);
-                cx.notify();
-            }
+            let sent = self.session.write(bytes);
+            self.input_sent(sent, false);
+            cx.notify();
         } else {
             self.session.scroll(lines);
         }
@@ -718,6 +732,7 @@ impl TerminalView {
 
     pub(super) fn set_note(&mut self, tone: Tone, text: String) {
         self.note = Some(Note { tone, text });
+        self.refusal_shown = false;
     }
 
     /// What the grid paints this frame.

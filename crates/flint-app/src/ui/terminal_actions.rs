@@ -51,9 +51,8 @@ impl TerminalView {
     fn paste(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         match terminal_model::paste_check(&text) {
             PasteCheck::Paste => {
-                if let Err(refused) = self.session.paste(text) {
-                    self.input_refused(refused, true);
-                }
+                let sent = self.session.paste(text);
+                self.input_sent(sent, true);
                 cx.notify();
             }
             PasteCheck::TooLarge { bytes } => {
@@ -62,9 +61,12 @@ impl TerminalView {
             }
             PasteCheck::Lines { lines } => {
                 let pasted = match self.session.paste_if_bracketed(text.clone()) {
-                    Ok(pasted) => pasted,
+                    Ok(pasted) => {
+                        self.input_sent(Ok(()), true);
+                        pasted
+                    }
                     Err(refused) => {
-                        self.input_refused(refused, true);
+                        self.input_sent(Err(refused), true);
                         cx.notify();
                         return;
                     }
@@ -108,9 +110,8 @@ impl TerminalView {
             let _ = view.update(cx, |view, cx| {
                 // The shell may have ended while the question was open.
                 if view.is_live() {
-                    if let Err(refused) = view.session.paste(text) {
-                        view.input_refused(refused, true);
-                    }
+                    let sent = view.session.paste(text);
+                    view.input_sent(sent, true);
                     cx.notify();
                 }
             });
