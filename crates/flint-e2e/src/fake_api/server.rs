@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -133,6 +133,10 @@ struct Inner {
     requests: Mutex<Vec<RequestRecord>>,
     /// Every request as it arrived, before faults or answers: what the app sent, and when.
     arrivals: Mutex<Vec<RequestRecord>>,
+    /// Requests whose handler is running: answered or not yet, before their response (a
+    /// stream's body is not counted). A client that gives up on a request closes its connection,
+    /// which ends the handler ([`FakeApiServer::requests_in_flight`]).
+    in_flight: AtomicUsize,
     /// How many connections have been accepted: the number of the last one.
     connections: AtomicU64,
     /// Each accepted connection's number by its client's address, until
@@ -196,6 +200,23 @@ pub fn connection_mark_at(url: &str) -> Option<u64> {
             return Some(inner.connections.load(Ordering::SeqCst));
         }
         std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Counts a request in [`Inner::in_flight`] until its handler ends, answered or dropped with its
+/// connection.
+struct InFlight(Arc<Inner>);
+
+impl InFlight {
+    fn enter(inner: &Arc<Inner>) -> InFlight {
+        inner.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlight(inner.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -263,6 +284,7 @@ impl FakeApiServer {
             watchers: Mutex::default(),
             requests: Mutex::default(),
             arrivals: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
             connections: AtomicU64::new(0),
             accepted: Mutex::default(),
             shutdown,
@@ -533,6 +555,13 @@ impl FakeApiServer {
         lock(&self.inner.requests).clone()
     }
 
+    /// How many requests the server is handling now: arrived and not yet answered (a fault may
+    /// be delaying them), until the client gives up on them and closes the connection. A
+    /// stream's body, once its headers are sent, does not count.
+    pub fn requests_in_flight(&self) -> usize {
+        self.inner.in_flight.load(Ordering::SeqCst)
+    }
+
     /// Every request that has arrived so far, oldest first, including those still delayed by a
     /// fault or not yet answered (their `status` is `None`).
     pub fn arrivals(&self) -> Vec<RequestRecord> {
@@ -676,6 +705,7 @@ async fn handle(
         connection,
     };
     lock(&inner.arrivals).push(record.clone());
+    let _in_flight = InFlight::enter(&inner);
     let upgrade = remote::is_websocket_upgrade(req.headers());
     let effect = lock(&inner.faults).take(verb, &route, upgrade);
     let response = match effect {
