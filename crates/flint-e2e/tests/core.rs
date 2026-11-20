@@ -1477,14 +1477,19 @@ async fn a_stalled_events_request_returns_the_object_after_the_deadline() {
     let kinds = read::discover_kinds(&client).await.unwrap().kinds;
     let deployments = kinds.iter().find(|k| k.plural() == "deployments").unwrap();
     let started = std::time::Instant::now();
-    let detail = read::object_detail_within(
-        &client,
-        deployments,
-        Some("demo"),
-        "web",
-        Duration::from_secs(1),
+    // Bounded here too: without a working deadline the read would wait out the fault's hour.
+    let detail = tokio::time::timeout(
+        Duration::from_secs(10),
+        read::object_detail_within(
+            &client,
+            deployments,
+            Some("demo"),
+            "web",
+            Duration::from_secs(1),
+        ),
     )
     .await
+    .expect("the deadline ends the read")
     .expect("the object, despite the events");
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(detail.object["kind"], "Deployment");

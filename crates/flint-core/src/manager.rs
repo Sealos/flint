@@ -477,15 +477,17 @@ impl ClusterManager {
                         read::DETAIL_TIMEOUT,
                     );
                     // A closed pane drops the receiver: stop the read (and its HTTP requests)
-                    // rather than keep the object alive until the server answers.
+                    // rather than keep the object alive until the server answers. Checked
+                    // first, so a pane already gone starts no request.
                     tokio::select! {
+                        biased;
+                        () = reply.closed() => {}
                         result = read => {
                             let result = result
                                 .map(Arc::new)
                                 .map_err(|e| e.for_target(&target).summary().to_string());
                             let _ = reply.send(result);
                         }
-                        () = reply.closed() => {}
                     }
                 });
             }
