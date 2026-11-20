@@ -135,64 +135,88 @@ impl SearchMatcher {
 
     /// Whether `text` contains the query.
     pub fn is_match(&self, text: &str) -> bool {
-        self.next_match(text, 0).is_some()
-    }
-
-    /// Byte ranges of every non-overlapping match in `text`.
-    pub fn match_ranges(&self, text: &str) -> Vec<Range<usize>> {
-        let mut out = Vec::new();
-        let mut at = 0;
-        while let Some(found) = self.next_match(text, at) {
-            // Every pattern is at least one byte long, so this moves forward.
-            at = found.end;
-            out.push(found);
-        }
-        out
-    }
-
-    /// The first match in `text` starting at byte `from` (a char boundary) or later.
-    fn next_match(&self, text: &str, from: usize) -> Option<Range<usize>> {
-        let rest = text.get(from..)?;
         match &self.find {
-            Find::Nothing => None,
-            Find::Exact(finder) => finder
-                .find(rest.as_bytes())
-                .map(|at| from + at..from + at + finder.needle().len()),
-            Find::AsciiFolded(finder) => {
-                let mut lower = self.scratch.borrow_mut();
-                lower.clear();
-                lower.extend(rest.bytes().map(|b| b.to_ascii_lowercase()));
-                finder
-                    .find(&lower)
-                    .map(|at| from + at..from + at + finder.needle().len())
-            }
-            Find::Folded { lower, chars } => {
-                {
-                    let mut text_lower = self.scratch.borrow_mut();
-                    text_lower.clear();
-                    let (bytes, mut i, mut utf8) = (rest.as_bytes(), 0, [0; 4]);
-                    while let Some(&b) = bytes.get(i) {
-                        // Log text is mostly ASCII: only other chars are decoded.
-                        if b.is_ascii() {
-                            text_lower.push(b.to_ascii_lowercase());
-                            i += 1;
-                            continue;
-                        }
-                        let c = rest[i..].chars().next().unwrap_or_default();
-                        for lc in c.to_lowercase() {
-                            text_lower.extend_from_slice(lc.encode_utf8(&mut utf8).as_bytes());
-                        }
-                        i += c.len_utf8();
-                    }
-                    // A match at a char boundary is also one in the lowercased text.
-                    lower.find(&text_lower)?;
-                }
-                rest.char_indices().find_map(|(at, _)| {
-                    folded_prefix_len(&rest[at..], chars).map(|len| from + at..from + at + len)
-                })
+            Find::Nothing => false,
+            Find::Exact(finder) => finder.find(text.as_bytes()).is_some(),
+            Find::AsciiFolded(finder) => finder.find(&self.lowered(text)).is_some(),
+            Find::Folded { chars, .. } => {
+                self.might_fold_match(text) && folded_matches(text, chars).next().is_some()
             }
         }
     }
+
+    /// Byte ranges of every non-overlapping match in `text`. The text is lowercased once,
+    /// however many matches it has: a long wrapped line is highlighted in every frame.
+    pub fn match_ranges(&self, text: &str) -> Vec<Range<usize>> {
+        let ranges = |finder: &memmem::Finder<'_>, hay: &[u8]| {
+            let len = finder.needle().len();
+            finder.find_iter(hay).map(|at| at..at + len).collect()
+        };
+        match &self.find {
+            Find::Nothing => Vec::new(),
+            Find::Exact(finder) => ranges(finder, text.as_bytes()),
+            // Lowercasing ASCII keeps byte offsets, so ranges map back onto `text`.
+            Find::AsciiFolded(finder) => ranges(finder, &self.lowered(text)),
+            Find::Folded { chars, .. } => {
+                if !self.might_fold_match(text) {
+                    return Vec::new();
+                }
+                folded_matches(text, chars).collect()
+            }
+        }
+    }
+
+    /// `text` with its ASCII lowercased, in the buffer kept from line to line.
+    fn lowered(&self, text: &str) -> std::cell::RefMut<'_, Vec<u8>> {
+        let mut lower = self.scratch.borrow_mut();
+        lower.clear();
+        lower.extend(text.bytes().map(|b| b.to_ascii_lowercase()));
+        lower
+    }
+
+    /// Whether `text`, lowercased char by char, holds the lowercased pattern: a match at a
+    /// char boundary is also one there, so `false` rules a line out without comparing chars.
+    fn might_fold_match(&self, text: &str) -> bool {
+        let Find::Folded { lower, .. } = &self.find else {
+            return true;
+        };
+        let mut text_lower = self.scratch.borrow_mut();
+        text_lower.clear();
+        let (bytes, mut i, mut utf8) = (text.as_bytes(), 0, [0; 4]);
+        while let Some(&b) = bytes.get(i) {
+            // Log text is mostly ASCII: only other chars are decoded.
+            if b.is_ascii() {
+                text_lower.push(b.to_ascii_lowercase());
+                i += 1;
+                continue;
+            }
+            let c = text[i..].chars().next().unwrap_or_default();
+            for lc in c.to_lowercase() {
+                text_lower.extend_from_slice(lc.encode_utf8(&mut utf8).as_bytes());
+            }
+            i += c.len_utf8();
+        }
+        lower.find(&text_lower).is_some()
+    }
+}
+
+/// The non-overlapping matches of `pat` (lowercased chars) in `text`, comparing chars with
+/// simple lowercase folding at each char boundary, as byte ranges of `text`.
+fn folded_matches<'a>(text: &'a str, pat: &'a [char]) -> impl Iterator<Item = Range<usize>> + 'a {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at < text.len() {
+            let rest = &text[at..];
+            if let Some(len) = folded_prefix_len(rest, pat) {
+                let found = at..at + len;
+                // A pattern is never empty, so a match moves on by at least one char.
+                at += len.max(rest.chars().next().map_or(1, char::len_utf8));
+                return Some(found);
+            }
+            at += rest.chars().next().map_or(1, char::len_utf8);
+        }
+        None
+    })
 }
 
 /// How many bytes at the start of `text` match `pat` (already lowercased), if they all do.
@@ -458,6 +482,151 @@ mod tests {
         let mut sensitive = SearchQuery::new("a");
         sensitive.case_sensitive = true;
         assert_eq!(sensitive.match_ranges("aAa"), [0..1, 2..3]);
+    }
+
+    /// The ranges `match_ranges` gave before [`SearchMatcher`]: the reference the matcher
+    /// must agree with.
+    fn reference_ranges(query: &SearchQuery, text: &str) -> Vec<Range<usize>> {
+        let needle = query.text.as_str();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        if query.case_sensitive {
+            return text
+                .match_indices(needle)
+                .map(|(at, m)| at..at + m.len())
+                .collect();
+        }
+        if needle.is_ascii() {
+            let mut out = Vec::new();
+            let (hay, pat) = (text.as_bytes(), needle.as_bytes());
+            let mut at = 0;
+            while at + pat.len() <= hay.len() {
+                if hay[at..at + pat.len()].eq_ignore_ascii_case(pat) {
+                    out.push(at..at + pat.len());
+                    at += pat.len();
+                } else {
+                    at += 1;
+                }
+            }
+            return out;
+        }
+        let pat: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let mut p = 0;
+            let mut used = 0;
+            let mut ok = true;
+            for (_, c) in &chars[i..] {
+                if p == pat.len() {
+                    break;
+                }
+                for lc in c.to_lowercase() {
+                    if pat.get(p) != Some(&lc) {
+                        ok = false;
+                        break;
+                    }
+                    p += 1;
+                }
+                if !ok {
+                    break;
+                }
+                used += 1;
+            }
+            if ok && p == pat.len() {
+                let start = chars[i].0;
+                let end = chars.get(i + used).map_or(text.len(), |(at, _)| *at);
+                out.push(start..end);
+                i += used.max(1);
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn match_ranges_agree_with_the_reference_on_many_texts() {
+        // Texts from a small alphabet, so matches are dense, overlap and sit next to each
+        // other; with chars that fold to two (İ), that change byte length (K, the Kelvin
+        // sign) and that are not letters.
+        let alphabet: Vec<char> = "aAbB \u{e4}\u{c4}\u{df}\u{130}i\u{307}\u{212a}k=5"
+            .chars()
+            .collect();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let needles = [
+            "a", "ab", "aa", "AbA", "=5", "5", "\u{e4}", "\u{e4}a", "\u{df}", "i\u{307}", "k",
+            "\u{212a}", "a \u{c4}", "bb",
+        ];
+        for _ in 0..400 {
+            let len = (next() % 40) as usize;
+            let text: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            for needle in needles {
+                for case_sensitive in [false, true] {
+                    let query = SearchQuery {
+                        case_sensitive,
+                        ..SearchQuery::new(needle)
+                    };
+                    let expected = reference_ranges(&query, &text);
+                    assert_eq!(
+                        query.match_ranges(&text),
+                        expected,
+                        "{needle:?} in {text:?} (case-sensitive: {case_sensitive})"
+                    );
+                    assert_eq!(
+                        query.is_match(&text),
+                        !expected.is_empty(),
+                        "{needle:?} in {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A quick measure of highlighting a long, wrapped line: 64 KiB with a match every dozen
+    /// bytes, as `render_line` asks for every visible row in every frame. Ignored: run it in
+    /// release mode with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: run with --release --ignored --nocapture"]
+    fn measure_match_ranges_on_a_dense_64k_line() {
+        let text = "id=1 ERROR; ".repeat(64 * 1024 / 12);
+        for (name, query) in [
+            ("ASCII", SearchQuery::new("error")),
+            ("non-ASCII", SearchQuery::new("err\u{f6}r")),
+        ] {
+            let text = if name == "ASCII" {
+                text.clone()
+            } else {
+                text.replace("ERROR", "ERR\u{d6}R")
+            };
+            let rounds = 50;
+            let started = std::time::Instant::now();
+            let mut count = 0;
+            for _ in 0..rounds {
+                count = query.match_ranges(&text).len();
+            }
+            let now = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                assert_eq!(reference_ranges(&query, &text).len(), count);
+            }
+            let reference = started.elapsed() / rounds;
+            eprintln!(
+                "match_ranges on a {} KiB line, {count} {name} matches: {now:?} \
+                 (the reference algorithm: {reference:?})",
+                text.len() / 1024
+            );
+        }
     }
 
     /// A quick measure of a search's scan: 100k lines of about 100 bytes, for an ASCII query,
