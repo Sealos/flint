@@ -90,10 +90,7 @@ impl Shape {
                             text_of(&resource["scope"]),
                             sorted(&resource["verbs"], None),
                             sorted(&resource["shortNames"], None),
-                            array(&resource["subresources"])
-                                .map(|sub| text_of(&sub["subresource"]))
-                                .collect::<Vec<_>>()
-                                .join(",")
+                            sorted(&resource["subresources"], Some("subresource"))
                         ),
                     );
                     self.insert(format!("resource-fields {id}"), keys(resource));
@@ -297,6 +294,35 @@ mod tests {
         edit(dir.path(), "objects/apps/v1/deployments.json", |o| {
             o["items"].as_array_mut().unwrap().clear();
         });
+        assert_eq!(
+            committed().diff(&Shape::of(dir.path()).unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn subresources_in_another_order_are_the_same() {
+        let dir = copy();
+        edit(dir.path(), "discovery/apis.json", |d| {
+            for group in d["items"].as_array_mut().unwrap() {
+                for version in group["versions"].as_array_mut().unwrap() {
+                    for resource in version["resources"].as_array_mut().unwrap() {
+                        // `get_mut`: indexing would add the field where it is missing.
+                        if let Some(subs) = resource
+                            .get_mut("subresources")
+                            .and_then(Value::as_array_mut)
+                        {
+                            subs.reverse();
+                        }
+                    }
+                }
+            }
+        });
+        let deployments = &Shape::of(dir.path()).unwrap().0["resource apps/v1/deployments"];
+        assert!(
+            deployments.ends_with("subresources=[scale,status]"),
+            "{deployments}"
+        );
         assert_eq!(
             committed().diff(&Shape::of(dir.path()).unwrap()),
             Vec::<String>::new()
