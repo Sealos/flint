@@ -3,7 +3,7 @@
 Which tests cover each path in [`USER-PATHS.md`](./USER-PATHS.md) today, at which layer, and what is missing. The plan
 that closes the gaps is in [`TESTING.md`](./TESTING.md#e2e-coverage-plan). Update a row when a test for its path lands.
 
-Audited on master at 057b773 (after #100, #106, #94 and #118), and rechecked for M2 at 194a79c by the M2 release
+Audited on master at 057b773 (after #100, #106, #94 and #118), and rechecked for M2 at 34e83db by the M2 release
 review (#15). "#116" marks view tests that have since merged (aa59738). The app e2e tests are `#[ignore]`d in plain
 `cargo test`; CI runs them in the `macos (flint-app)` job (#117).
 
@@ -53,7 +53,7 @@ review (#15). "#116" marks view tests that have since merged (aa59738). The app 
 | 42 | ui | `ui/workspace_tests.rs::the_dock_toggles_and_remembers_its_height`, `logs_open_in_the_dock_and_outlive_a_cluster_switch` (V); `ui/dock_tests.rs` leak tests (V) | stream closed on tab close, height across a relaunch | #124 |
 | 43 | U, K, ui | `logs/line.rs::severity_follows_the_whole_word_rules` (U); `logs_cluster.rs::follows_a_chatty_pod…` (K, asserts severity and timestamps, untagged); `ui/log_tests.rs::timestamps_and_wrap_toggle_without_reloading` (V) | "without reloading" unchecked at the HTTP level | #122 |
 | 44 | ui | `ui/log_tests.rs::selecting_pauses_and_copies_the_lines_as_shown` (V) | — (view layer is right) | — |
-| 45 | U, K, ui | 33 tagged in `logs/` (U); `logs_cluster.rs::follows_a_deployments_pods_as_they_scale_and_get_replaced` (K); `e2e/core.rs::a_workload_log_follows_its_pods_through_churn` (F); `ui/log_tests.rs::a_workload_tab_shows_sources_and_stream_counts` (V) | no app test with pod churn | #125 |
+| 45 | U, K, F, ui | 33 tagged in `logs/` (U); `logs_cluster.rs::follows_a_deployments_pods_as_they_scale_and_get_replaced` (K); `e2e/core.rs::a_workload_log_follows_its_pods_through_churn` (F); `ui/log_tests.rs::a_workload_tab_shows_sources_and_stream_counts` (V) | no app test with pod churn | #125 |
 | 46 | U, ui | `ui/log_tests.rs::save_writes_matches_as_shown_to_the_chosen_file`, `a_narrow_toolbar_keeps_save_reachable` (V) | — (the native save panel can't be automated; view layer is right) | — |
 
 ## M3 and later

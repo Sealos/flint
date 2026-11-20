@@ -11,7 +11,7 @@ and browses every kind it serves, CRDs included: live lists with the `kubectl ge
 filter, and a detail view with metadata, conditions, events and read-only YAML. A bottom dock holds pod and workload
 logs (follow, search, timestamps, previous logs, save to a file) and shells into containers; open them from a row's
 context menu, the detail pane or the keyboard. It has a light and a dark theme that follow the system (View >
-Appearance, or the `appearance` setting, overrides it). Shells are not gated yet: protected clusters arrive in M3.
+Appearance, or the `appearance` setting, overrides it). Shells open on any cluster without asking, production included; protected clusters arrive in M3.
 
 ## Install from a release
 
@@ -212,8 +212,9 @@ objects, events, and pod logs, and nothing else. It only sees clusters you mark 
 next to a cluster in the sidebar, which asks you to confirm the context and its server; exposed clusters show an "AI"
 badge). Nothing is exposed by default. An exposure is tied to the context's API server URL, so a context that is
 re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
-Secret values are always redacted, and large outputs are cut short. Pod logs and event messages are **not** redacted
-yet (planned for M5.5), so only expose clusters whose logs you are willing to send to your AI provider.
+Large outputs are cut short. Only Secret values are redacted: everything else an agent reads, including ConfigMaps,
+`env` values in pod specs, and (until M5.5) pod logs and event messages, is sent as the cluster returns it. Only
+expose clusters whose contents, logs and events you are willing to send to your AI provider.
 
 Register it with Claude Code, using the installed binary (or `"$PWD/target/release/flint"` after
 `cargo build --release`):
