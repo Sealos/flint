@@ -62,6 +62,24 @@ pub enum PodSet {
     Selector(String),
 }
 
+impl PodSet {
+    /// The pods of workload `name`, read from its `spec.selector` in `object` (the workload as
+    /// fetched) when it has a usable one, which saves fetching the workload again; otherwise
+    /// [`PodSet::Workload`], which fetches it.
+    pub fn of_workload(kind: WorkloadKind, name: &str, object: &serde_json::Value) -> PodSet {
+        let selector = object
+            .pointer("/spec/selector")
+            .and_then(|s| serde_json::from_value::<LabelSelector>(s.clone()).ok());
+        match selector.map(|s| selector_string(kind, name, Some(s))) {
+            Some(Ok(text)) => PodSet::Selector(text),
+            _ => PodSet::Workload {
+                kind,
+                name: name.to_owned(),
+            },
+        }
+    }
+}
+
 /// The pods of a workload in one namespace, merged into one session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkloadTarget {
@@ -311,6 +329,104 @@ impl PodSource for KubePodSource {
     }
 }
 
+/// A pod of a workload, as a shell into the workload needs it (UP-41, UP-47).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadPod {
+    pub name: String,
+    /// Its `Ready` condition is true and it is not being deleted.
+    pub ready: bool,
+    /// Its app containers (not init containers or sidecars), in spec order.
+    pub containers: Vec<String>,
+    /// The container `kubectl exec` picks: the one the `kubectl.kubernetes.io/default-container`
+    /// annotation names, if it is an app container, else the first.
+    pub default_container: Option<String>,
+}
+
+impl WorkloadPod {
+    pub fn from_pod(pod: &Pod) -> Self {
+        let containers: Vec<String> = pod
+            .spec
+            .iter()
+            .flat_map(|s| s.containers.iter().map(|c| c.name.clone()))
+            .collect();
+        let annotated = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("kubectl.kubernetes.io/default-container"))
+            .filter(|name| containers.contains(name))
+            .cloned();
+        let ready = pod.metadata.deletion_timestamp.is_none()
+            && pod
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"));
+        WorkloadPod {
+            name: pod.metadata.name.clone().unwrap_or_default(),
+            ready,
+            default_container: annotated.or_else(|| containers.first().cloned()),
+            containers,
+        }
+    }
+
+    /// The pod a shell into a workload opens in: the first ready one with a container, by name,
+    /// so asking again picks the same pod while it stays ready.
+    pub fn first_ready(pods: &[WorkloadPod]) -> Option<&WorkloadPod> {
+        pods.iter()
+            .filter(|p| p.ready && p.default_container.is_some())
+            .min_by(|a, b| a.name.cmp(&b.name))
+    }
+}
+
+/// How current a pod list must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// What the API server's cache holds (`resourceVersion=0`): cheap, possibly a little behind.
+    /// For showing which pod a shell would open in.
+    Cached,
+    /// A quorum read: for acting on a pod now.
+    Current,
+}
+
+/// Lists the pods of a workload (or a label selector) in `namespace` once, sorted by name. An
+/// empty selector is refused: it would select every pod in the namespace.
+pub(crate) async fn list_workload_pods(
+    client: kube::Client,
+    namespace: &str,
+    pods: &PodSet,
+    freshness: Freshness,
+) -> Result<Vec<WorkloadPod>, LogError> {
+    let selector = match pods {
+        PodSet::Workload { kind, name } => {
+            let lookup: ClientLookup = {
+                let client = client.clone();
+                std::sync::Arc::new(move || {
+                    let client = client.clone();
+                    async move { Ok(client) }.boxed()
+                })
+            };
+            KubePodSource::new(lookup)
+                .selector(namespace, *kind, name)
+                .await?
+        }
+        PodSet::Selector(selector) if selector.trim().is_empty() => {
+            return Err(LogError::fatal("empty label selector"));
+        }
+        PodSet::Selector(selector) => selector.clone(),
+    };
+    let api: Api<Pod> = Api::namespaced(client, namespace);
+    let params = kube::api::ListParams::default().labels(&selector);
+    let params = match freshness {
+        Freshness::Cached => params.match_any(),
+        Freshness::Current => params,
+    };
+    let list = api.list(&params).await.map_err(LogError::from_kube)?;
+    let mut pods: Vec<WorkloadPod> = list.items.iter().map(WorkloadPod::from_pod).collect();
+    pods.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(pods)
+}
+
 fn pod_event(event: watcher::Event<Pod>) -> PodEvent {
     match event {
         watcher::Event::Init => PodEvent::Init,
@@ -432,6 +548,91 @@ mod tests {
         assert!(empty.is_fatal());
         assert_eq!(empty.message, "Job \"j\" has no pod selector");
         assert!(selector_string(WorkloadKind::Job, "j", None).is_err());
+    }
+
+    // covers UP-47: a shell into a workload opens in its first ready pod, in the container
+    // kubectl would pick.
+    #[test]
+    fn a_workload_shell_picks_the_first_ready_pod() {
+        let ready = |name: &str, ready: &str| {
+            pod(json!({
+                "metadata": {"name": name},
+                "spec": {"initContainers": [{"name": "init"}],
+                         "containers": [{"name": "app"}, {"name": "proxy"}]},
+                "status": {"conditions": [{"type": "Ready", "status": ready}]}
+            }))
+        };
+        let web_b = WorkloadPod::from_pod(&ready("web-b", "True"));
+        assert_eq!(web_b.containers, ["app", "proxy"]);
+        assert_eq!(web_b.default_container.as_deref(), Some("app"));
+        assert!(web_b.ready);
+        let web_a = WorkloadPod::from_pod(&ready("web-a", "False"));
+        assert!(!web_a.ready);
+        let web_c = WorkloadPod::from_pod(&ready("web-c", "True"));
+        let pods = [web_c.clone(), web_a.clone(), web_b.clone()];
+        assert_eq!(WorkloadPod::first_ready(&pods), Some(&web_b));
+        assert_eq!(WorkloadPod::first_ready(&[web_a]), None);
+
+        // A pod being deleted is not ready; the annotation names the default container.
+        let leaving = pod(json!({
+            "metadata": {"name": "web-0", "deletionTimestamp": "2024-05-01T12:00:00Z"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }));
+        assert!(!WorkloadPod::from_pod(&leaving).ready);
+        let annotated = pod(json!({
+            "metadata": {"name": "a", "annotations": {
+                "kubectl.kubernetes.io/default-container": "proxy"}},
+            "spec": {"containers": [{"name": "app"}, {"name": "proxy"}]}
+        }));
+        let annotated = WorkloadPod::from_pod(&annotated);
+        assert_eq!(annotated.default_container.as_deref(), Some("proxy"));
+        assert!(!annotated.ready, "no Ready condition yet");
+    }
+
+    // covers UP-47: an empty selector would list every pod in the namespace, so it is refused
+    // before any request (the client points nowhere).
+    #[tokio::test]
+    async fn listing_by_an_empty_selector_is_refused() {
+        let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+        for selector in ["", "  "] {
+            let err = list_workload_pods(
+                client.clone(),
+                "ns",
+                &PodSet::Selector(selector.into()),
+                Freshness::Current,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.message, "empty label selector");
+        }
+    }
+
+    // covers UP-47: the selector of a workload already fetched is reused; without a usable one
+    // the workload is fetched again.
+    #[test]
+    fn a_fetched_workloads_selector_is_reused() {
+        let deployment = json!({"spec": {"selector": {"matchLabels": {"app": "web"}}}});
+        assert_eq!(
+            PodSet::of_workload(WorkloadKind::Deployment, "web", &deployment),
+            PodSet::Selector("app=web".into())
+        );
+        let workload = PodSet::Workload {
+            kind: WorkloadKind::Deployment,
+            name: "web".into(),
+        };
+        for object in [
+            json!({"spec": {}}),
+            json!({"spec": {"selector": {}}}),
+            json!({"spec": {"selector": "nonsense"}}),
+        ] {
+            assert_eq!(
+                PodSet::of_workload(WorkloadKind::Deployment, "web", &object),
+                workload,
+                "{object}"
+            );
+        }
     }
 
     #[test]

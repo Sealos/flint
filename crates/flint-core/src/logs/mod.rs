@@ -19,7 +19,7 @@ mod workload;
 
 pub use buffer::{BLOCKS_PER_BUDGET, CHUNK_LINES, LogBuffer, LogLines};
 pub use line::{LineFormat, LineId, LineSource, LogLine, MAX_LINE_BYTES, Severity, classify};
-pub use pods::{PodSet, WorkloadKind, WorkloadTarget};
+pub use pods::{Freshness, PodSet, WorkloadKind, WorkloadPod, WorkloadTarget};
 pub use search::{LogSearch, SearchQuery};
 pub use selection::LineSelection;
 pub use session::{
@@ -27,6 +27,6 @@ pub use session::{
 };
 pub use workload::{PodSetStatus, StreamStatus};
 
-pub(crate) use pods::KubePodSource;
+pub(crate) use pods::{KubePodSource, list_workload_pods};
 pub(crate) use session::{SessionConfig, feed, run};
 pub(crate) use source::{ClientLookup, KubeLogSource, LogError};

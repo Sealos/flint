@@ -233,7 +233,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ## M2: Logs and exec
 
 ### UP-40 Read pod logs
-- **When** I open logs for a pod (Logs in its detail pane, or Cmd-L).
+- **When** I open logs for a pod (Logs in its detail pane or its row's context menu, or Cmd-L; UP-47).
 - **Then** a tab opens in the bottom dock (or the open one for that container is shown). I can pick a container, follow
   new lines, see the previous container's logs, search with highlighted matches and move between them, and pause
   following, with the number of lines held back shown. Scrolling up stops following; scrolling back to the bottom (or
@@ -242,7 +242,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: cluster, ui.
 
 ### UP-41 Shell into a container
-- **When** I open a shell on a pod (Shell in its detail pane, or Shift-Cmd-E; a container picker when it has several).
+- **When** I open a shell on a pod (Shell in its detail pane or its row's context menu, or Shift-Cmd-E; a container
+  picker when it has several), or on a workload (in its first ready pod; UP-47).
 - **Then** a tab opens in the bottom dock with an interactive terminal that resizes with the dock and the window.
   Colors, bold, italic, underline, inverse and wide characters show as in other terminals, in both themes, and
   full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and
@@ -273,8 +274,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: ui.
 
 ### UP-45 Follow a workload's logs
-- **When** I open logs for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, or for a label selector.
-- **Then** one tab shows the lines of every pod and container merged in arrival order, each prefixed with its pod and
+- **When** I open logs for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job (Logs on its row or in its detail
+  pane, or Cmd-L), or for a label selector (Open Logs by Label Selector in the palette).
+- **Then** one tab, titled with the kind and name, shows the lines of every pod and container merged in arrival order, each prefixed with its pod and
   container (the prefix can be hidden). Pods that start, restart or replace deleted ones are followed without
   reopening the tab. A pod whose stream fails does not stop the others, and the tab shows how many streams are
   live, failed or over the limit. Search, severity, timestamps and selection work as for one pod.
@@ -287,6 +289,21 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   save dialog writes them as shown, with timestamps only if they are shown, and the tab says how many lines went
   where.
 - Tests: unit, ui.
+
+### UP-47 Logs and a shell from any pod or workload row
+- **When** I right-click a pod or workload row (Deployment, StatefulSet, DaemonSet, ReplicaSet, Job), or select it
+  and press Cmd-L, Shift-Cmd-L or Shift-Cmd-E (also from the palette).
+- **Then** the row is selected and its menu offers Logs, Previous Logs (pods) and Shell: a pod's logs and shell, a
+  workload's logs of all pods (UP-45) and a shell in its first ready pod, with a container picker when the pod has
+  several. Each opens its dock tab, or shows the one already open. A workload's shell opens in a pod listed when I
+  ask, never in one listed earlier. Chosen before the row's pod has loaded, an entry waits for it, says so, and gives
+  up after 30 seconds; a tab that opens late does not take focus from where I went meanwhile, nor hide the dock tab I
+  am typing in. What does not apply is disabled, with the reason under it in the menu and on the pane's button: a pod
+  that never restarted (Previous Logs), a workload with no ready pod (as last listed, until it changes), a pod that
+  finished or is being deleted, a pod or workload that was deleted (Shell), or a cluster that is not connected. An
+  action that cannot run anyway (a key, or a wait that ended badly) says why over the dock, until the next one opens,
+  I select something else, or ten seconds pass.
+- Tests: unit, cluster, ui.
 
 ---
 

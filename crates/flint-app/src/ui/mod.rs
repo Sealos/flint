@@ -23,6 +23,7 @@ mod nav;
 mod notice;
 mod object;
 mod registry;
+mod row_menu;
 mod startup;
 #[cfg(test)]
 mod support_tests;

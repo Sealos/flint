@@ -8,9 +8,10 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 use super::super::clusters::Presence;
+use super::super::row_menu;
 use super::super::view_state::{
-    AppState, Banner, ClusterState, DialogState, Focus, HeaderState, KubeconfigPath,
-    KubeconfigState, Level, Main, connection_error_text, error_text,
+    ActionAvailability, AppState, Banner, ClusterState, DialogState, Focus, HeaderState,
+    KubeconfigPath, KubeconfigState, Level, Main, connection_error_text, error_text,
 };
 use super::{Workspace, header_controls, namespace_summary};
 
@@ -77,6 +78,13 @@ impl Workspace {
         }
         if let Some(error) = &model.last_error {
             banners.push(Banner::new("last-error", Level::Danger, error_text(error)));
+        }
+        if let Some(error) = self.action_error() {
+            banners.push(Banner::new(
+                "action-error",
+                Level::Danger,
+                error_text(error),
+            ));
         }
 
         let list = self.list.as_ref().map(|l| l.read(cx));
@@ -155,7 +163,11 @@ impl Workspace {
             header,
             nav: self.nav.read(cx).view_state(),
             list: list.map(|l| l.view_state()),
-            detail: detail.map(|d| d.view_state()),
+            detail: detail.map(|d| {
+                let mut state = d.view_state();
+                state.actions = row_action_states(self, cx);
+                state
+            }),
         }
     }
 
@@ -197,4 +209,22 @@ impl Workspace {
         }
         Focus::Other
     }
+}
+
+/// Logs, Previous Logs and Shell for the selected row, as its menu shows them.
+fn row_action_states(ws: &Workspace, cx: &App) -> Vec<ActionAvailability> {
+    let Some(a) = row_menu::row_actions(ws, cx) else {
+        return Vec::new();
+    };
+    let state = |action, can: &row_menu::Availability| ActionAvailability {
+        action,
+        enabled: can.is_ok(),
+        reason: can.as_ref().err().cloned(),
+    };
+    let mut states = vec![state("Logs", &a.logs)];
+    if let Some(previous) = &a.previous {
+        states.push(state("Previous Logs", previous));
+    }
+    states.push(state("Shell", &a.shell));
+    states
 }

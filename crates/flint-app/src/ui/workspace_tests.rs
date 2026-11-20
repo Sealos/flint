@@ -9,7 +9,7 @@ use gpui_kit::{AppContext as _, Entity, FocusHandle, TestAppContext};
 use serde_json::{Value, json};
 
 use super::Workspace;
-use crate::ui::detail::{DetailTab, DetailView};
+use crate::ui::detail::DetailTab;
 use crate::ui::dock::{DockItem as _, DockTab, TabStatus};
 use crate::ui::list::ResourceList;
 use crate::ui::nav::NavPanel;
@@ -27,10 +27,6 @@ impl Workspace {
 
     pub(in crate::ui) fn list_view(&self) -> Option<Entity<ResourceList>> {
         self.list.clone()
-    }
-
-    pub(in crate::ui) fn detail_view(&self) -> Option<Entity<DetailView>> {
-        self.detail.clone()
     }
 
     pub(in crate::ui) fn nav_view(&self) -> Entity<NavPanel> {

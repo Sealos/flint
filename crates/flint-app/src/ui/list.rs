@@ -17,6 +17,7 @@ use flint_core::{
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -31,6 +32,7 @@ use flint_core::redact::is_safe_secret_column;
 
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
+use super::row_menu::RowMenu;
 
 use super::registry::{
     self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy,
@@ -123,6 +125,8 @@ pub struct ResourceList {
     laid_out_width: Option<f32>,
     focus: FocusHandle,
     filter: Entity<InputState>,
+    /// A row's context menu, for kinds that have one (pods and workloads: UP-47).
+    row_menu: Option<RowMenu>,
     _watch: Task<()>,
     _compute: Task<()>,
     _tick: Task<()>,
@@ -209,6 +213,7 @@ impl ResourceList {
             laid_out_width: None,
             focus: cx.focus_handle(),
             filter,
+            row_menu: None,
             _watch: watch,
             _compute: Task::ready(()),
             _tick: tick,
@@ -237,6 +242,11 @@ impl ResourceList {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    /// Gives each row a context menu built by `menu`; right-clicking a row selects it first.
+    pub fn set_row_menu(&mut self, menu: RowMenu) {
+        self.row_menu = Some(menu);
     }
 
     /// The snapshot being drawn and how many of its rows pass the filters, for tests.
@@ -524,6 +534,10 @@ impl ResourceList {
             };
             let row = &self.shown.rows[row_ix as usize];
             let is_selected = selected_uid == Some(&*row.uid);
+            let select = SelectRow {
+                namespace: row.namespace.as_deref().map(str::to_owned),
+                name: row.name.to_string(),
+            };
             let mut el = h_flex()
                 .id(SharedString::from(format!("row-{}", row.uid)))
                 .h(px(ROW_HEIGHT))
@@ -543,10 +557,7 @@ impl ResourceList {
                 .when(stale, |el| el.text_color(theme.muted_foreground))
                 // By name, not position: rows may have been reordered by the time the click
                 // is handled.
-                .on_click(registry::on_click(SelectRow {
-                    namespace: row.namespace.as_deref().map(str::to_owned),
-                    name: row.name.to_string(),
-                }));
+                .on_click(registry::on_click(select.clone()));
             let finished = health
                 && list_model::row_finished(&self.shown.columns, |i| {
                     cell_text(row, i, now).to_string()
@@ -605,7 +616,22 @@ impl ResourceList {
                     });
                 el = el.child(cell);
             }
-            elements.push(el.child(div().flex_1()).test_support().into_any_element());
+            let el = el.child(div().flex_1()).test_support();
+            elements.push(match &self.row_menu {
+                // A right-click selects the row (a mouse down, before the menu opens on it), so
+                // the menu acts on it.
+                Some(menu) => {
+                    let menu = menu.clone();
+                    div()
+                        .id(SharedString::from(format!("row-menu-{}", row.uid)))
+                        .w_full()
+                        .on_mouse_down(MouseButton::Right, registry::on_click_passing(select))
+                        .child(el)
+                        .context_menu(move |m, window, cx| menu(m, window, cx))
+                        .into_any_element()
+                }
+                None => el.into_any_element(),
+            });
         }
         elements
     }

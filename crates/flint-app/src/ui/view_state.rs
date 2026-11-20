@@ -259,6 +259,18 @@ pub struct DetailState {
     /// Secret keys whose value is revealed (never the values).
     pub revealed: Vec<String>,
     pub banners: Vec<Banner>,
+    /// For pods and workloads: Logs, Previous Logs and Shell, and whether each can run now
+    /// (what the row menu shows, disabled entries with their reason).
+    pub actions: Vec<ActionAvailability>,
+}
+
+/// Whether an action can run now, and if not, why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActionAvailability {
+    /// As the menu names it: `Logs`, `Previous Logs`, `Shell`.
+    pub action: &'static str,
+    pub enabled: bool,
+    pub reason: Option<String>,
 }
 
 /// A detail-pane section and how many entries it has.

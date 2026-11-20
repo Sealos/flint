@@ -36,9 +36,9 @@ pub use handle::{
     LogSession, LogUpdates, Subscription, WatchTiming,
 };
 pub use logs::{
-    LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogOptions, LogSearch,
-    LogSince, LogSnapshot, LogState, LogSubject, LogTarget, PodSet, PodSetStatus, SearchQuery,
-    Severity, StreamStatus, WorkloadKind, WorkloadTarget,
+    Freshness, LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogOptions,
+    LogSearch, LogSince, LogSnapshot, LogState, LogSubject, LogTarget, PodSet, PodSetStatus,
+    SearchQuery, Severity, StreamStatus, WorkloadKind, WorkloadPod, WorkloadTarget,
 };
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};

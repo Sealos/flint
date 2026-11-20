@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flint_core::handle::{Command, ConnectionState, Event};
 use flint_core::{
-    LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogSubject, LogTarget, PodSet,
-    SearchQuery, Settings, Severity, WorkloadKind, WorkloadTarget,
+    Freshness, LogOptions, LogSearch, LogSession, LogSnapshot, LogState, LogSubject, LogTarget,
+    PodSet, SearchQuery, Settings, Severity, WorkloadKind, WorkloadPod, WorkloadTarget,
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -394,6 +394,59 @@ async fn follows_a_deployments_pods_as_they_scale_and_get_replaced() {
                     .starts_with(&format!("[{}] ", source.label()))
             );
         }
+
+        // A shell into the workload finds its pods (UP-47): both ready, the same one picked
+        // each time.
+        let listed = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let pods = core
+                    .handle
+                    .workload_pods(
+                        &name,
+                        &ns,
+                        PodSet::Workload {
+                            kind: WorkloadKind::Deployment,
+                            name: "printer".into(),
+                        },
+                        Freshness::Current,
+                    )
+                    .await
+                    .unwrap();
+                if pods.len() == 2 && pods.iter().all(|p| p.ready) {
+                    return pods;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("both pods get ready");
+        assert!(listed.iter().all(|p| p.containers == ["app"]));
+        let first = WorkloadPod::first_ready(&listed).unwrap();
+        assert_eq!(first.name, listed[0].name, "sorted by name");
+        let missing = core
+            .handle
+            .workload_pods(
+                &name,
+                &ns,
+                PodSet::Workload {
+                    kind: WorkloadKind::Deployment,
+                    name: "nope".into(),
+                },
+                Freshness::Current,
+            )
+            .await;
+        assert!(missing.is_err(), "{missing:?}");
+        let by_selector = core
+            .handle
+            .workload_pods(
+                &name,
+                &ns,
+                PodSet::Selector("app=printer".into()),
+                Freshness::Cached,
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_selector.len(), 2);
 
         // Scale to 3: the third pod's lines appear in the same session.
         deployments
