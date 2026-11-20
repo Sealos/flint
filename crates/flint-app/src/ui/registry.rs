@@ -104,16 +104,18 @@ actions!(
 actions!(
     detail,
     [
-        /// Open the shown pod's logs (its default container) in the dock.
+        /// Open the logs of the selected pod (its default container) or workload (every pod,
+        /// merged) in the dock.
         OpenLogs,
-        /// Open the logs of the previous instance of the shown pod's default container.
+        /// Open the logs of the previous instance of the selected pod's default container.
         OpenPreviousLogs
     ]
 );
 actions!(
     detail,
     [
-        /// Open a shell in the shown pod's default container, in the dock.
+        /// Open a shell in the default container of the selected pod, or of the selected
+        /// workload's first ready pod, in the dock.
         OpenShell
     ]
 );
@@ -317,6 +319,15 @@ pub struct OpenContainerLogs {
 #[serde(deny_unknown_fields)]
 pub struct OpenContainerShell {
     pub container: String,
+}
+
+/// Open the merged logs of the pods matching a label selector, on the active cluster.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = logs, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct OpenSelectorLogs {
+    pub namespace: String,
+    pub selector: String,
 }
 
 /// Select the text of a shell tab's screen from one cell to another (inclusive), as dragging
@@ -587,10 +598,6 @@ impl ActionSpec {
 
     /// Whether the action is enabled now, whatever its arguments: its guard, if the workspace
     /// installed one (a list action with no list open is not).
-    #[cfg_attr(
-        not(any(test, feature = "automation")),
-        expect(dead_code, reason = "used by the command palette (#29) and automation")
-    )]
     pub fn is_enabled(&self, cx: &App) -> bool {
         guard(self.type_id, cx).is_none_or(|g| (g.enabled)(cx))
     }
@@ -685,6 +692,11 @@ pub fn find(name: &str) -> Option<&'static ActionSpec> {
 /// The label of action `A`, for a menu item.
 pub fn label<A: Action>() -> &'static str {
     find(A::name_for_type()).map_or(A::name_for_type(), |spec| spec.label)
+}
+
+/// Whether action `A` is enabled now (its guard), for a menu item drawn disabled.
+pub fn enabled<A: Action>(cx: &App) -> bool {
+    find(A::name_for_type()).is_some_and(|spec| spec.is_enabled(cx))
 }
 
 /// The spec of `action`'s type.
@@ -809,6 +821,19 @@ pub fn on_click_contained<E: ?Sized, A: Action>(
     move |event, window, cx| {
         cx.stop_propagation();
         perform(event, window, cx);
+    }
+}
+
+/// [`on_click`] for a press that something around the control also handles (a row's right-click,
+/// which selects the row and then opens its context menu): the press goes on. Dispatching an
+/// action marks the event handled, which would stop it here.
+pub fn on_click_passing<E: ?Sized, A: Action>(
+    action: A,
+) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    let perform = on_click(action);
+    move |event, window, cx| {
+        perform(event, window, cx);
+        cx.propagate();
     }
 }
 
@@ -1016,6 +1041,61 @@ impl<E: InteractiveElement, V: 'static> Bind<V> for Forward<E, V> {
     }
 }
 
+/// [`Forward`] to the view `current` finds on `owner` when an action comes, rather than the
+/// one drawn: an action that follows a change of view before the next frame (a key, or an
+/// automation step, right after selecting another row) reaches the new view. Without a view
+/// when drawn, the actions are not handled here.
+pub struct ForwardCurrent<E, W: 'static, V: 'static> {
+    element: E,
+    owner: WeakEntity<W>,
+    current: fn(&W) -> Option<&Entity<V>>,
+    shown: bool,
+}
+
+impl<E: InteractiveElement, W: 'static, V: 'static> ForwardCurrent<E, W, V> {
+    pub fn new(
+        element: E,
+        owner: &W,
+        cx: &Context<W>,
+        current: fn(&W) -> Option<&Entity<V>>,
+    ) -> Self {
+        let shown = current(owner).is_some();
+        Self {
+            element,
+            owner: cx.weak_entity(),
+            current,
+            shown,
+        }
+    }
+
+    pub fn into_element(self) -> E {
+        self.element
+    }
+}
+
+impl<E: InteractiveElement, W: 'static, V: 'static> Bind<V> for ForwardCurrent<E, W, V> {
+    fn bind<A: Action>(self, handler: Handler<V, A>) -> Self {
+        if !self.shown {
+            return self;
+        }
+        let owner = self.owner.clone();
+        let current = self.current;
+        let element =
+            self.element
+                .on_action(move |action: &A, window: &mut Window, cx: &mut App| {
+                    let Some(owner) = owner.upgrade() else {
+                        return;
+                    };
+                    // The view closed since this frame was drawn: nothing to do.
+                    let Some(view) = current(owner.read(cx)).cloned() else {
+                        return;
+                    };
+                    view.update(cx, |view, cx| handler(view, action, window, cx));
+                });
+        Self { element, ..self }
+    }
+}
+
 /// The workspace's key context.
 pub const WORKSPACE: &str = "Workspace";
 /// Plain keys (arrows, Esc) work in the window, but not while typing in a field.
@@ -1182,6 +1262,14 @@ const CONTAINER: &[Arg] = &[
         required: false,
         kind: ArgKind::Bool,
     },
+];
+const SELECTOR: &[Arg] = &[
+    arg("namespace", "namespace name", ArgKind::Namespace),
+    arg(
+        "selector",
+        "label selector, as kubectl -l takes it: app=web,tier!=db",
+        ArgKind::Text,
+    ),
 ];
 const SHELL_CONTAINER: &[Arg] = &[arg("container", "container name", ArgKind::Text)];
 const CELLS: &[Arg] = &[
@@ -1408,12 +1496,15 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Detail, S::Detail)
         .hidden(),
-        Spec::unit::<OpenLogs>("Open Logs", "Open the shown pod's logs in the dock.")
+        Spec::unit::<OpenLogs>(
+            "Open Logs",
+            "Open the selected pod's logs, or every pod of the selected workload merged, in the dock.",
+        )
             .of(C::Logs, S::Detail)
             .keys(&["secondary-l"], Some(WORKSPACE)),
         Spec::unit::<OpenPreviousLogs>(
             "Open Previous Logs",
-            "Open the logs of the previous instance of the shown pod's container.",
+            "Open the logs of the previous instance of the selected pod's container.",
         )
         .of(C::Logs, S::Detail)
         .keys(&["secondary-shift-l"], Some(WORKSPACE)),
@@ -1425,7 +1516,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Logs, S::Detail),
         Spec::unit::<OpenShell>(
             "Open Shell",
-            "Open a shell (bash, else sh) in the shown pod's default container, in the dock.",
+            "Open a shell (bash, else sh) in the selected pod, or the selected workload's first ready pod, in the dock.",
         )
         .of(C::Terminal, S::Detail)
         .keys(&["secondary-shift-e"], Some(WORKSPACE)),
@@ -1435,6 +1526,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             SHELL_CONTAINER,
         )
         .of(C::Terminal, S::Detail),
+        Spec::with_args::<OpenSelectorLogs>(
+            "Open Logs by Label Selector…",
+            "Open the merged logs of every pod matching a label selector on the active cluster, in the dock.",
+            SELECTOR,
+        )
+        .of(C::Logs, S::Workspace),
         // The dock.
         Spec::unit::<ToggleDock>("Toggle Dock", "Show or hide the bottom dock.")
             .of(C::View, S::Dock)

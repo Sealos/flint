@@ -438,7 +438,7 @@ impl Render for Dock {
                 .text_color(theme.muted_foreground)
                 .child("No sessions.")
                 .child(div().text_xs().child(format!(
-                    "Open a pod's logs (Logs, {}) or a shell (Shell, {}) from its detail pane.",
+                    "Right-click a pod or workload for its logs ({}) or a shell ({}).",
                     registry::key_hint("secondary-l"),
                     registry::key_hint("secondary-shift-e")
                 )))

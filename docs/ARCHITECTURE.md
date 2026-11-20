@@ -310,6 +310,19 @@ already has a tab shows that tab. Cmd-J shows and hides the dock; Cmd-W closes t
 dock (elsewhere it closes the window). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant;
 the module documentation lists the steps.
 
+**From rows** (UP-47): Logs (`detail::OpenLogs`, ⌘L), Previous Logs (`detail::OpenPreviousLogs`, ⇧⌘L) and Shell
+(`detail::OpenShell`, ⇧⌘E) act on the selected row, which the detail pane shows, so the keys, the palette, the pane's
+buttons and a row's context menu (`ui/row_menu.rs`) are one set of actions with one set of guards. A right-click
+selects the row first. For a pod they open its default container (a picker when it has several app containers); for
+a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job, Logs opens the workload session (all pods, prefixed) and
+Shell opens in its first ready pod by name, which the detail pane lists with `CoreHandle::workload_pods` each time it
+fetches the workload. Asked for before the pod (or the pods) has loaded, an action waits and runs once it has; the menu
+is rebuilt then too. Shell also waits while a changed workload's pods are listed again, so it never opens in a pod
+listed before, and a deleted pod or workload has none. The workspace forwards these actions to the detail pane
+showing when they arrive (`registry::ForwardCurrent`), not the one last drawn, so a key right after moving to another
+row acts on that row. While the row's cluster is not connected the actions are disabled and the menu says why.
+`logs::OpenSelectorLogs` (palette) opens a label selector's pods on the active cluster.
+
 ### Exec terminal
 
 `Api::<Pod>::exec` with a TTY, over the `ws` feature. Bytes go to `alacritty_terminal`, and a GPUI terminal view
@@ -325,8 +338,9 @@ opens in a tab in the bottom dock.
 - **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.
-- **Shell tab** (`flint-app/src/ui/terminal_view.rs`): opened by Shell in a pod's detail pane (`detail::OpenShell`,
-  ⇧⌘E; a container picker when the pod has several app containers, `detail::OpenContainerShell`). While its command
+- **Shell tab** (`flint-app/src/ui/terminal_view.rs`): opened by Shell on a pod or workload, in its detail pane or
+  its row's menu (`detail::OpenShell`, ⇧⌘E; a container picker when the pod has several app containers,
+  `detail::OpenContainerShell`; see "From rows" above). While its command
   runs, Shell on the same container shows the tab; once it ended, Shell opens a new one beside it. The grid is painted
   from each snapshot with the theme's mono font: one quad per run of equal background, then each row's text shaped
   with every glyph forced to the cell width (wide characters and combining marks shaped on their own), so columns

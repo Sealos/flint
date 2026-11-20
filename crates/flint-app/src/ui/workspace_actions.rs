@@ -8,28 +8,30 @@
 //! are checked wherever focus is.
 
 use flint_core::settings::AiExposureState;
-use flint_core::{ClusterSummary, ConnectionState, NavEntry, WatchMode};
+use flint_core::{
+    ClusterSummary, ConnectionState, LogSubject, NavEntry, PodSet, WatchMode, WorkloadTarget,
+};
 use gpui_kit::*;
 
 use super::super::detail::DetailView;
 use super::super::dock::Dock;
 use super::super::list::ResourceList;
-use super::super::log_view::LogView;
+use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
 use super::super::registry::{
     ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
     CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
     DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
-    Forward, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab, OnView,
-    OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell, OpenView,
-    PaneName, PasteText, PrevMatch, PrevTab, Refresh, RetryConnection, SaveLines, SaveLogs,
-    SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom,
-    ScrollToTop, SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext,
-    SelectNextLine, SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight,
-    SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview, ShowYaml, SortBy,
-    ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
-    TogglePause, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
-    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    Forward, ForwardCurrent, Guards, HideFromAi, JumpToEnd, JumpToStart, NextMatch, NextTab,
+    OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenSelectorLogs,
+    OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, Refresh, RetryConnection,
+    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown,
+    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
+    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
+    SelectText, SetDockHeight, SetNamespaces, SetPaneWidth, ShowAllNamespaces, ShowOverview,
+    ShowYaml, SortBy, ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleNamespace,
+    ToggleNavSection, TogglePause, ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide,
+    ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
@@ -65,6 +67,7 @@ impl Workspace {
                 }
             })
             .bind::<SetPaneWidth>(Self::set_pane_width)
+            .bind::<OpenSelectorLogs>(Self::open_selector_logs)
             .bind::<SetDockHeight>(|this, action, window, cx| match check_dock_height(action) {
                 Ok(()) => {
                     let height = f32::from(window.viewport_size().height);
@@ -83,8 +86,9 @@ impl Workspace {
         let element = Self::bind_actions(OnView::new(element, cx)).into_element();
         let element =
             ResourceList::bind_actions(Forward::new(element, self.list.as_ref())).into_element();
-        let element =
-            DetailView::bind_actions(Forward::new(element, self.detail.as_ref())).into_element();
+        // The detail pane follows the selected row, which may change between frames.
+        let detail = ForwardCurrent::new(element, self, cx, |ws| ws.detail.as_ref());
+        let element = DetailView::bind_actions(detail).into_element();
         let element = Dock::bind_actions(Forward::new(element, Some(&self.dock))).into_element();
         let log = self.dock.read(cx).active_log().cloned();
         let element = LogView::bind_actions(Forward::new(element, log.as_ref())).into_element();
@@ -178,33 +182,47 @@ impl Workspace {
                     None => Err(ActionError::unavailable::<ToggleSecretValue>()),
                 },
             )
+            // Logs and Shell act on the selected row, which the detail pane shows (UP-47).
             .when::<OpenLogs>(|ws, cx| {
-                detail(ws, cx).is_some_and(|d| d.log_request::<OpenLogs>(None, false).is_ok())
+                ws.sessions_open_here(cx)
+                    && detail(ws, cx).is_some_and(|d| d.log_plan::<OpenLogs>(None, false).is_ok())
             })
             .when::<OpenPreviousLogs>(|ws, cx| {
-                detail(ws, cx)
-                    .is_some_and(|d| d.log_request::<OpenPreviousLogs>(None, true).is_ok())
+                ws.sessions_open_here(cx)
+                    && detail(ws, cx)
+                        .is_some_and(|d| d.log_plan::<OpenPreviousLogs>(None, true).is_ok())
             })
             .add::<OpenContainerLogs>(
-                |ws, cx| detail(ws, cx).is_some_and(|d| !d.log_containers().is_empty()),
+                |ws, cx| {
+                    ws.sessions_open_here(cx)
+                        && detail(ws, cx).is_some_and(|d| !d.log_containers().is_empty())
+                },
                 |ws, a, cx| match detail(ws, cx) {
                     Some(d) => d
-                        .log_request::<OpenContainerLogs>(Some(&a.container), a.previous)
+                        .log_plan::<OpenContainerLogs>(Some(&a.container), a.previous)
                         .map(|_| ()),
                     None => Err(ActionError::unavailable::<OpenContainerLogs>()),
                 },
             )
             .when::<OpenShell>(|ws, cx| {
-                detail(ws, cx).is_some_and(|d| d.shell_request::<OpenShell>(None).is_ok())
+                ws.sessions_open_here(cx)
+                    && detail(ws, cx).is_some_and(|d| d.shell_plan::<OpenShell>(None).is_ok())
             })
             .add::<OpenContainerShell>(
-                |ws, cx| detail(ws, cx).is_some_and(|d| d.shell_containers().next().is_some()),
+                |ws, cx| {
+                    ws.sessions_open_here(cx)
+                        && detail(ws, cx).is_some_and(|d| d.shell_pod().is_some())
+                },
                 |ws, a, cx| match detail(ws, cx) {
                     Some(d) => d
-                        .shell_request::<OpenContainerShell>(Some(&a.container))
+                        .shell_plan::<OpenContainerShell>(Some(&a.container))
                         .map(|_| ()),
                     None => Err(ActionError::unavailable::<OpenContainerShell>()),
                 },
+            )
+            .add::<OpenSelectorLogs>(
+                |ws, cx| ws.cluster.is_some() && ws.sessions_open_here(cx),
+                |_, a, _| check_selector(a),
             )
             // The dock's.
             .when::<CloseActiveTab>(|ws, cx| {
@@ -413,6 +431,55 @@ impl Workspace {
         Ok(())
     }
 
+    /// Why log and shell sessions cannot open on `cluster` now (it is not connected), if so.
+    /// A cluster still connecting may: the object to act on is loading too.
+    pub(in crate::ui) fn sessions_blocked(&self, cluster: &str, cx: &App) -> Option<String> {
+        match self.cluster_summary(cluster, cx).map(|c| &c.state) {
+            Some(ConnectionState::Connected(_) | ConnectionState::Connecting) => None,
+            Some(ConnectionState::Failed(error)) => {
+                Some(format!("{cluster} is not connected: {error}"))
+            }
+            Some(ConnectionState::Disconnected) => Some(format!("{cluster} is not connected")),
+            None => Some(format!("no kubeconfig context named {cluster}")),
+        }
+    }
+
+    /// Whether sessions can open on the cluster of the object shown, or else the active one.
+    fn sessions_open_here(&self, cx: &App) -> bool {
+        let cluster = match &self.detail {
+            Some(d) => Some(d.read(cx).object().cluster.clone()),
+            None => self.cluster.clone(),
+        };
+        cluster.is_some_and(|c| self.sessions_blocked(&c, cx).is_none())
+    }
+
+    /// Opens the merged logs of the pods matching a label selector on the active cluster.
+    fn open_selector_logs(
+        &mut self,
+        action: &OpenSelectorLogs,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = check_selector(action) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let Some(cluster) = self.cluster.clone() else {
+            tracing::warn!("OpenSelectorLogs: no active cluster");
+            return;
+        };
+        let request = LogRequest {
+            cluster,
+            subject: LogSubject::Workload(WorkloadTarget {
+                namespace: action.namespace.trim().to_owned(),
+                pods: PodSet::Selector(action.selector.trim().to_owned()),
+                container: None,
+            }),
+            previous: false,
+        };
+        self.open_logs(request, window, cx);
+    }
+
     fn select_cluster(&mut self, action: &SelectCluster, _: &mut Window, cx: &mut Context<Self>) {
         match self.check_cluster::<SelectCluster>(&action.cluster, cx) {
             Ok(()) => {
@@ -573,6 +640,22 @@ fn log<'a>(ws: &Workspace, cx: &'a App) -> Option<&'a LogView> {
     ws.dock.read(cx).active_log().map(|l| l.read(cx))
 }
 
+/// [`OpenSelectorLogs`] takes a namespace and a selector that selects something: an empty
+/// one would follow every pod in the namespace.
+fn check_selector(action: &OpenSelectorLogs) -> Result<(), ActionError> {
+    if action.namespace.trim().is_empty() {
+        return Err(ActionError::rejected::<OpenSelectorLogs>(
+            "empty namespace name",
+        ));
+    }
+    if action.selector.trim().is_empty() {
+        return Err(ActionError::rejected::<OpenSelectorLogs>(
+            "empty label selector",
+        ));
+    }
+    Ok(())
+}
+
 /// [`SetDockHeight`] takes a positive height.
 fn check_dock_height(action: &SetDockHeight) -> Result<(), ActionError> {
     if action.height.is_finite() && action.height > 0. {
@@ -655,3 +738,7 @@ mod header_tests;
 #[cfg(test)]
 #[path = "expose_tests.rs"]
 mod expose_tests;
+
+#[cfg(test)]
+#[path = "row_actions_tests.rs"]
+mod row_actions_tests;

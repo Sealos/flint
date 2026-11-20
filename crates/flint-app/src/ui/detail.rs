@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use flint_core::read::event_time;
 use flint_core::table::{human_duration, unix_now};
-use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail};
+use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, PodSet, WorkloadKind, WorkloadPod};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
@@ -18,7 +18,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, Theme, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -28,8 +29,9 @@ use super::log_view::LogRequest;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
-    self, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenShell, Refresh, ShowOverview,
-    ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields, ToggleSecretValue,
+    self, ActionError, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenShell, Refresh,
+    ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
+    ToggleSecretValue,
 };
 use super::terminal_model::ShellRequest;
 
@@ -85,10 +87,35 @@ impl Prepared {
 
 pub enum DetailEvent {
     Close,
-    /// Open (or show) a log tab for one of the pod's containers.
+    /// Open (or show) a log tab for one of the pod's containers, or for a workload's pods.
     OpenLogs(LogRequest),
-    /// Open (or show) a shell tab in one of the pod's containers.
+    /// Open (or show) a shell tab in a container of the pod, or of a workload's ready pod.
     OpenShell(ShellRequest),
+}
+
+/// What Logs and Shell act on: a pod, a workload's pods, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) enum Subject {
+    Pod,
+    Workload(WorkloadKind),
+    Other,
+}
+
+impl Subject {
+    pub(in crate::ui) fn of(kind: &KindId) -> Self {
+        if *kind == KindId::pods() {
+            Subject::Pod
+        } else {
+            WorkloadKind::from_kind(kind).map_or(Subject::Other, Subject::Workload)
+        }
+    }
+}
+
+/// An action asked for before what it needs had loaded, run once it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) enum Pending {
+    Logs { previous: bool },
+    Shell,
 }
 
 impl EventEmitter<DetailEvent> for DetailView {}
@@ -97,6 +124,7 @@ pub struct DetailView {
     core: CoreHandle,
     object: ObjectRef,
     is_secret: bool,
+    subject: Subject,
     tab: DetailTab,
     fetch: Fetch,
     /// A fetch is running.
@@ -114,9 +142,15 @@ pub struct DetailView {
     yaml_text: String,
     /// Show `metadata.managedFields` in the YAML (hidden by default).
     show_managed_fields: bool,
-    /// Open the pod's logs once it is fetched (`FLINT_VIEW=…#logs`).
-    open_logs_when_loaded: bool,
+    /// A workload's pods, listed with each fetch, for Shell (`None` until listed).
+    pods: Option<Result<Arc<[WorkloadPod]>, String>>,
+    /// A relist of the workload's pods is running: the workload changed, so the pods listed
+    /// before may be gone or no longer ready, and Shell waits for the new list.
+    listing_pods: bool,
+    /// Logs or Shell asked for while loading (`FLINT_VIEW=…#logs`, a row just selected).
+    pending: Option<Pending>,
     _fetch: Task<()>,
+    _pods: Task<()>,
     _yaml: Task<()>,
 }
 
@@ -135,10 +169,12 @@ impl DetailView {
                 .soft_wrap(false)
         });
         let is_secret = object.kind.as_str() == "secrets";
+        let subject = Subject::of(&object.kind);
         let mut view = DetailView {
             core,
             object,
             is_secret,
+            subject,
             tab,
             fetch: Fetch::Loading,
             fetching: false,
@@ -151,8 +187,11 @@ impl DetailView {
             yaml,
             yaml_text: String::new(),
             show_managed_fields: false,
-            open_logs_when_loaded: false,
+            pods: None,
+            listing_pods: false,
+            pending: None,
             _fetch: Task::ready(()),
+            _pods: Task::ready(()),
             _yaml: Task::ready(()),
         };
         view.refresh(window, cx);
@@ -167,9 +206,58 @@ impl DetailView {
         self.tab
     }
 
-    /// Opens the pod's logs as soon as it is fetched, as Logs would (`FLINT_VIEW=…#logs`).
+    /// Opens the logs once the object is fetched, as Logs would (`FLINT_VIEW=…#logs`).
     pub fn open_logs_when_loaded(&mut self) {
-        self.open_logs_when_loaded = true;
+        self.pending = Some(Pending::Logs { previous: false });
+    }
+
+    /// What Logs and Shell act on.
+    pub(in crate::ui) fn subject(&self) -> Subject {
+        self.subject
+    }
+
+    /// The object (or, for a workload, its pods) is still loading, so Logs and Shell may wait.
+    pub(in crate::ui) fn is_loading(&self) -> bool {
+        match self.subject {
+            Subject::Pod => matches!(self.fetch, Fetch::Loading),
+            Subject::Workload(_) => self.pods.is_none() || self.listing_pods,
+            Subject::Other => false,
+        }
+    }
+
+    /// Lists a workload's pods again, for Shell. Each call replaces the one running.
+    fn list_pods(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Subject::Workload(kind) = self.subject else {
+            return;
+        };
+        let o = &self.object;
+        let pods = PodSet::Workload {
+            kind,
+            name: o.name.clone(),
+        };
+        let listed =
+            self.core
+                .workload_pods(&o.cluster, o.namespace.as_deref().unwrap_or_default(), pods);
+        self.listing_pods = true;
+        self._pods = cx.spawn_in(window, async move |this, cx| {
+            let listed = listed.await.map(Arc::from);
+            let _ = this.update(cx, |view, cx| view.show_pods(listed, cx));
+        });
+    }
+
+    /// Takes a workload's pods in, as listed (tests call it: their servers never answer).
+    pub(in crate::ui) fn show_pods(
+        &mut self,
+        pods: Result<Arc<[WorkloadPod]>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.listing_pods = false;
+        // A failed relist keeps the pods listed before.
+        if pods.is_ok() || !matches!(self.pods, Some(Ok(_))) {
+            self.pods = Some(pods);
+        }
+        self.run_pending(cx);
+        cx.notify();
     }
 
     /// Fetches the object again. Calls while a fetch runs coalesce into one more fetch.
@@ -180,6 +268,7 @@ impl DetailView {
         }
         self.fetching = true;
         self.refetch = false;
+        self.list_pods(window, cx);
         let o = &self.object;
         let fetch = self
             .core
@@ -201,7 +290,10 @@ impl DetailView {
                     Ok(prepared) => view.loaded(prepared, window, cx),
                     Err(error) => match view.fetch {
                         Fetch::Loaded { .. } => view.refresh_error = Some(error),
-                        _ => view.fetch = Fetch::Failed(error),
+                        _ => {
+                            view.fetch = Fetch::Failed(error);
+                            view.run_pending(cx);
+                        }
                     },
                 }
                 if view.refetch {
@@ -224,9 +316,7 @@ impl DetailView {
         // A re-render of the previous copy must not land after this one.
         self._yaml = Task::ready(());
         self.fetch = Fetch::Loaded { detail, overview };
-        if std::mem::take(&mut self.open_logs_when_loaded) {
-            self.open_logs::<OpenLogs>(None, false, cx);
-        }
+        self.run_pending(cx);
         if self.show_managed_fields == managed {
             self.set_yaml(yaml, window, cx);
         } else {
@@ -272,6 +362,29 @@ impl DetailView {
     /// The object was deleted: keep showing the last copy, marked as gone.
     pub fn mark_gone(&mut self, cx: &mut Context<Self>) {
         self.gone = true;
+        cx.notify();
+    }
+
+    /// Shows the object as still loading, as on a slow server (the test servers fail at once).
+    #[cfg(test)]
+    pub fn show_loading(&mut self, cx: &mut Context<Self>) {
+        self._fetch = Task::ready(());
+        self._pods = Task::ready(());
+        self.fetching = false;
+        self.fetch = Fetch::Loading;
+        self.listing_pods = false;
+        if let Subject::Workload(_) = self.subject {
+            self.pods = None;
+        }
+        cx.notify();
+    }
+
+    /// Shows a workload's pods as being listed again, the list before still at hand, as after
+    /// the workload changed on a slow server.
+    #[cfg(test)]
+    pub fn show_relisting(&mut self, cx: &mut Context<Self>) {
+        self._pods = Task::ready(());
+        self.listing_pods = true;
         cx.notify();
     }
 
@@ -377,8 +490,22 @@ impl DetailView {
     }
 
     /// For pods: Logs, with a container picker when the pod has several containers or a
-    /// previous instance to read.
+    /// previous instance to read. For workloads: Logs of every pod (UP-45).
     fn render_logs_button(&self) -> Option<AnyElement> {
+        if let Subject::Workload(_) = self.subject {
+            return Some(
+                Button::new("detail-logs")
+                    .xsmall()
+                    .ghost()
+                    .label("Logs")
+                    .tooltip(format!(
+                        "Open the logs of every pod in the dock ({})",
+                        registry::key_hint("secondary-l")
+                    ))
+                    .on_click(registry::on_click(OpenLogs))
+                    .into_any_element(),
+            );
+        }
         let containers: Vec<PodContainer> = self.log_containers().to_vec();
         let button = Button::new("detail-logs")
             .xsmall()
@@ -430,17 +557,33 @@ impl DetailView {
         }
     }
 
-    /// For pods: Shell, with a container picker when the pod has several app containers.
+    /// For pods and workloads: Shell (in a workload's first ready pod), with a container picker
+    /// when the pod has several app containers. A workload with no ready pod, or an object that
+    /// was deleted, shows it disabled, saying why.
     fn render_shell_button(&self) -> Option<AnyElement> {
-        let containers: Vec<String> = self.shell_containers().map(|c| c.name.clone()).collect();
-        let button = Button::new("detail-shell")
-            .xsmall()
-            .ghost()
-            .label("Shell")
-            .tooltip(format!(
-                "Open a shell in the dock ({})",
-                registry::key_hint("secondary-shift-e")
-            ));
+        let button = Button::new("detail-shell").xsmall().ghost().label("Shell");
+        let shell = self.shell_pod();
+        let refused = match self.shell_plan::<OpenShell>(None) {
+            Err(ActionError::Rejected { reason, .. }) => Some(reason),
+            _ => None,
+        };
+        let workload_listed = matches!(
+            (self.subject, &self.pods),
+            (Subject::Workload(_), Some(Ok(_)))
+        );
+        if let Some(reason) = refused.filter(|_| self.gone || workload_listed) {
+            return Some(button.disabled(true).tooltip(reason).into_any_element());
+        }
+        let shell = shell?;
+        let keys = registry::key_hint("secondary-shift-e");
+        let button = match self.subject {
+            Subject::Workload(_) => button.tooltip(format!(
+                "Open a shell in {} in the dock ({keys})",
+                shell.pod
+            )),
+            _ => button.tooltip(format!("Open a shell in the dock ({keys})")),
+        };
+        let containers = shell.containers;
         match containers.as_slice() {
             [] => None,
             [_] => Some(

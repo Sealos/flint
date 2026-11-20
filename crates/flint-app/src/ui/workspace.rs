@@ -37,6 +37,7 @@ use super::registry::{
     RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, UseDefaultWatchMode,
     WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::row_menu;
 use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
 use super::terminal_view::{ShellKey, TerminalView};
@@ -404,6 +405,11 @@ impl Workspace {
         });
     }
 
+    /// The detail pane, showing the selected row, if one is open.
+    pub(in crate::ui) fn detail_view(&self) -> Option<Entity<DetailView>> {
+        self.detail.clone()
+    }
+
     /// The dock's height as shown in a window `window_height` tall.
     pub(in crate::ui) fn dock_height(&self, window_height: f32) -> f32 {
         dock::dock_height(self.panes.dock, window_height)
@@ -422,13 +428,18 @@ impl Workspace {
         self.save_panes_later(cx);
     }
 
-    /// Opens (or shows) the log tab for `request` in the dock, and focuses it.
+    /// Opens (or shows) the log tab for `request` in the dock, and focuses it. Refused while
+    /// its cluster is not connected.
     pub(in crate::ui) fn open_logs(
         &mut self,
         request: LogRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(reason) = self.sessions_blocked(&request.cluster, cx) {
+            tracing::warn!("logs: {reason}");
+            return;
+        }
         let core = self.model.read(cx).core().clone();
         self.dock.update(cx, |dock, cx| {
             dock.open(
@@ -442,13 +453,18 @@ impl Workspace {
     }
 
     /// Opens (or shows) the shell tab for `request` in the dock, and focuses it. The session
-    /// starts at the classic 80 by 24; the tab sends its real size once laid out.
+    /// starts at the classic 80 by 24; the tab sends its real size once laid out. Refused while
+    /// its cluster is not connected.
     pub(in crate::ui) fn open_shell(
         &mut self,
         request: ShellRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(reason) = self.sessions_blocked(&request.cluster, cx) {
+            tracing::warn!("shell: {reason}");
+            return;
+        }
         let core = self.model.read(cx).core().clone();
         let key = TabKey::Shell(ShellKey {
             request: request.clone(),
@@ -609,6 +625,10 @@ impl Workspace {
         let namespaces = self.ui_state.namespace_filter(&cluster).to_vec();
         let list =
             cx.new(|cx| ResourceList::new(core, cluster.clone(), entry, namespaces, window, cx));
+        if row_menu::has_row_actions(&entry.id) {
+            let menu = row_menu::row_menu(cx.weak_entity());
+            list.update(cx, |list, _| list.set_row_menu(menu));
+        }
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
         let focus = list.read(cx).focus_handle().clone();
         window.focus(&focus, cx);

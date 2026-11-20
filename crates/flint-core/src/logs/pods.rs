@@ -311,6 +311,87 @@ impl PodSource for KubePodSource {
     }
 }
 
+/// A pod of a workload, as a shell into the workload needs it (UP-41, UP-47).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadPod {
+    pub name: String,
+    /// Its `Ready` condition is true and it is not being deleted.
+    pub ready: bool,
+    /// Its app containers (not init containers or sidecars), in spec order.
+    pub containers: Vec<String>,
+    /// The container `kubectl exec` picks: the one the `kubectl.kubernetes.io/default-container`
+    /// annotation names, if it is an app container, else the first.
+    pub default_container: Option<String>,
+}
+
+impl WorkloadPod {
+    pub fn from_pod(pod: &Pod) -> Self {
+        let containers: Vec<String> = pod
+            .spec
+            .iter()
+            .flat_map(|s| s.containers.iter().map(|c| c.name.clone()))
+            .collect();
+        let annotated = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("kubectl.kubernetes.io/default-container"))
+            .filter(|name| containers.contains(name))
+            .cloned();
+        let ready = pod.metadata.deletion_timestamp.is_none()
+            && pod
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"));
+        WorkloadPod {
+            name: pod.metadata.name.clone().unwrap_or_default(),
+            ready,
+            default_container: annotated.or_else(|| containers.first().cloned()),
+            containers,
+        }
+    }
+
+    /// The pod a shell into a workload opens in: the first ready one with a container, by name,
+    /// so asking again picks the same pod while it stays ready.
+    pub fn first_ready(pods: &[WorkloadPod]) -> Option<&WorkloadPod> {
+        pods.iter()
+            .filter(|p| p.ready && p.default_container.is_some())
+            .min_by(|a, b| a.name.cmp(&b.name))
+    }
+}
+
+/// Lists the pods of a workload (or a label selector) in `namespace` once, sorted by name.
+pub(crate) async fn list_workload_pods(
+    client: kube::Client,
+    namespace: &str,
+    pods: &PodSet,
+) -> Result<Vec<WorkloadPod>, LogError> {
+    let selector = match pods {
+        PodSet::Workload { kind, name } => {
+            let lookup: ClientLookup = {
+                let client = client.clone();
+                std::sync::Arc::new(move || {
+                    let client = client.clone();
+                    async move { Ok(client) }.boxed()
+                })
+            };
+            KubePodSource::new(lookup)
+                .selector(namespace, *kind, name)
+                .await?
+        }
+        PodSet::Selector(selector) => selector.clone(),
+    };
+    let api: Api<Pod> = Api::namespaced(client, namespace);
+    let list = api
+        .list(&kube::api::ListParams::default().labels(&selector))
+        .await
+        .map_err(LogError::from_kube)?;
+    let mut pods: Vec<WorkloadPod> = list.items.iter().map(WorkloadPod::from_pod).collect();
+    pods.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(pods)
+}
+
 fn pod_event(event: watcher::Event<Pod>) -> PodEvent {
     match event {
         watcher::Event::Init => PodEvent::Init,
@@ -432,6 +513,46 @@ mod tests {
         assert!(empty.is_fatal());
         assert_eq!(empty.message, "Job \"j\" has no pod selector");
         assert!(selector_string(WorkloadKind::Job, "j", None).is_err());
+    }
+
+    // covers UP-47: a shell into a workload opens in its first ready pod, in the container
+    // kubectl would pick.
+    #[test]
+    fn a_workload_shell_picks_the_first_ready_pod() {
+        let ready = |name: &str, ready: &str| {
+            pod(json!({
+                "metadata": {"name": name},
+                "spec": {"initContainers": [{"name": "init"}],
+                         "containers": [{"name": "app"}, {"name": "proxy"}]},
+                "status": {"conditions": [{"type": "Ready", "status": ready}]}
+            }))
+        };
+        let web_b = WorkloadPod::from_pod(&ready("web-b", "True"));
+        assert_eq!(web_b.containers, ["app", "proxy"]);
+        assert_eq!(web_b.default_container.as_deref(), Some("app"));
+        assert!(web_b.ready);
+        let web_a = WorkloadPod::from_pod(&ready("web-a", "False"));
+        assert!(!web_a.ready);
+        let web_c = WorkloadPod::from_pod(&ready("web-c", "True"));
+        let pods = [web_c.clone(), web_a.clone(), web_b.clone()];
+        assert_eq!(WorkloadPod::first_ready(&pods), Some(&web_b));
+        assert_eq!(WorkloadPod::first_ready(&[web_a]), None);
+
+        // A pod being deleted is not ready; the annotation names the default container.
+        let leaving = pod(json!({
+            "metadata": {"name": "web-0", "deletionTimestamp": "2024-05-01T12:00:00Z"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }));
+        assert!(!WorkloadPod::from_pod(&leaving).ready);
+        let annotated = pod(json!({
+            "metadata": {"name": "a", "annotations": {
+                "kubectl.kubernetes.io/default-container": "proxy"}},
+            "spec": {"containers": [{"name": "app"}, {"name": "proxy"}]}
+        }));
+        let annotated = WorkloadPod::from_pod(&annotated);
+        assert_eq!(annotated.default_container.as_deref(), Some("proxy"));
+        assert!(!annotated.ready, "no Ready condition yet");
     }
 
     #[test]

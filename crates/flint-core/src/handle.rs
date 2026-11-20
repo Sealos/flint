@@ -17,7 +17,9 @@ use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
 use crate::exec::{ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
-use crate::logs::{LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget};
+use crate::logs::{
+    LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget, PodSet, WorkloadPod,
+};
 use crate::manager::ClusterManager;
 use crate::read::{KindId, ObjectDetail};
 use crate::settings::{Appearance, Settings, WatchMode};
@@ -432,6 +434,43 @@ impl CoreHandle {
             crate::exec::start(client, request, channels).await;
         });
         session
+    }
+
+    /// Lists the pods of a workload (or a label selector) in `namespace` on a connected
+    /// cluster, once and sorted by name, so a front end can open a shell in one of them
+    /// ([`WorkloadPod::first_ready`]). Never blocks; the future works on any executor and fails
+    /// if the cluster is not connected, the workload is missing or the list is refused.
+    pub fn workload_pods(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        pods: PodSet,
+    ) -> impl Future<Output = Result<Vec<WorkloadPod>, String>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::Client {
+            cluster: cluster.to_owned(),
+            reply,
+        });
+        let (tx, result) = oneshot::channel();
+        let (cluster, namespace) = (cluster.to_owned(), namespace.to_owned());
+        self.runtime.spawn(async move {
+            let listed = match sent {
+                Ok(()) => match rx.await {
+                    Ok(Some(client)) => crate::logs::list_workload_pods(client, &namespace, &pods)
+                        .await
+                        .map_err(|e| e.message),
+                    Ok(None) => Err(format!("\"{cluster}\" is not connected")),
+                    Err(_) => Err("the core stopped before answering".to_owned()),
+                },
+                Err(_) => Err("the core is not running".to_owned()),
+            };
+            let _ = tx.send(listed);
+        });
+        async move {
+            result
+                .await
+                .unwrap_or_else(|_| Err("the core stopped before answering".to_owned()))
+        }
     }
 
     /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
