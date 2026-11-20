@@ -81,8 +81,9 @@ itself, and a row opens a dashboard scoped to that namespace.
   moving between the list and an overview from paying that again.
   The kwok measurements that would size this are still planned, and #27 proposes deferring the nightly memory soak
   (#126).
-- Workload problems use the typed replica status of [ADR-0021](./0021-replica-ready-column.md). The dashboard's
-  "short of replicas" count leaves out rolling-out workloads too, so a healthy rollout is never a problem.
+- Workload problems use the typed replica status of [ADR-0021](./0021-replica-ready-column.md), so a healthy rollout
+  is never a problem here. Proposed, pending the owner's decision: the dashboard's "short of replicas" count would
+  leave out rolling-out workloads too (see #101).
 - The effective request follows Kubernetes: pod-level requests when the pod sets them; otherwise the app containers
   plus the restartable init (sidecar) containers, or the largest init container plus the sidecars started before it
   when that is larger; plus pod overhead.
