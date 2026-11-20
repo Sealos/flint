@@ -331,7 +331,8 @@ documentation lists the steps.
   context's cluster, else the context, cut in the middle past 16 characters. No two contexts in kubeconfig share a
   chip: where two would read alike, the chip adds what tells them apart (the differing part of the account or
   region for EKS, of the project or location for GKE, else of the context names), and anything still alike is
-  numbered. A shell's toolbar shows the same chip, with the full context and server in its tooltip; both mark a
+  numbered. Contexts with an open tab count too, so a tab whose context left kubeconfig keeps a distinct chip,
+  marked, with a tooltip saying so. A shell's toolbar shows the same chip, with the full context and server in its tooltip; both mark a
   re-pointed context alike. With the longest chip and title, about two and a half tabs fit in 860 points.
 - **Identity.** A tab is its `TabKey` (what it reads or runs) on a `TabCluster`: the context name and the API server
   URL it pointed at when the tab opened, as AI exposure (ADR-0009) and trusted clusters (ADR-0015) pin a cluster.
@@ -349,7 +350,7 @@ documentation lists the steps.
   connected. On a tab whose session runs, Cmd-R falls through to Refresh. The ended banners of log and shell tabs
   carry Reconnect and Restart shell buttons.
 - **Many tabs.** The strip scrolls the active tab into view whenever a tab opens, is shown or closes, and on the
-  frame after the tab bar changes width (the window or a pane was resized). Show Dock Tabs (`dock::ShowTabList`,
+  frame after the tab bar changes width (the window or a pane was resized) or a kubeconfig reload changes chips. Show Dock Tabs (`dock::ShowTabList`,
   Shift-Cmd-J, or the button at the strip's end) lists every tab with its cluster and status and shows the one
   picked (`dock::ActivateTab`). With no tab, the strip is hidden and the dock says how to open logs or a shell.
 
