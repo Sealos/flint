@@ -278,6 +278,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 without_pods,
             ))),
@@ -289,6 +290,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
             ))),

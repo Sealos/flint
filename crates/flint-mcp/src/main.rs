@@ -13,7 +13,7 @@ const USAGE: &str = "\
 usage: flint-mcp [--verbose]  serve the read-only MCP server on stdio
        flint-mcp --version    print the version
 
---verbose logs info to stderr as well as warnings. FLINT_LOG (or RUST_LOG) sets the filter
+--verbose logs info as well as warnings. FLINT_LOG (or RUST_LOG) sets the filter
 exactly, for example FLINT_LOG=debug.
 
 Same server as `flint mcp`, without the desktop app. Where Flint is installed, register `flint mcp`

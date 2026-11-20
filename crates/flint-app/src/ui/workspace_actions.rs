@@ -326,7 +326,7 @@ impl Workspace {
             })
             // The active log tab's.
             .when::<TogglePause>(view_open!(log, LogView::can_pause))
-            .when::<JumpToEnd>(view_open!(log, LogView::has_lines))
+            .when::<JumpToEnd>(view_open!(log, LogView::can_jump_to_end))
             .when::<JumpToStart>(view_open!(log, LogView::has_lines))
             .when::<ToggleTimestamps>(view_open!(log))
             .when::<ToggleWrap>(view_open!(log))
@@ -339,7 +339,7 @@ impl Workspace {
             .when::<ExtendSelectionUp>(view_open!(log, LogView::has_lines))
             .when::<ExtendSelectionDown>(view_open!(log, LogView::has_lines))
             .when::<SelectAllLines>(view_open!(log, LogView::has_lines))
-            .when::<ClearSelection>(view_open!(log, LogView::has_selection))
+            .when::<ClearSelection>(view_open!(log, LogView::is_selecting))
             .when::<LeaveSearch>(view_open!(log))
             .when::<CopyLines>(view_open!(log, LogView::has_selection))
             .when::<SaveLogs>(view_open!(log, |l| l.check_save(SaveScope::All).is_ok()))
@@ -514,7 +514,7 @@ impl Workspace {
                 let sections = model
                     .active
                     .as_ref()
-                    .and_then(|c| model.discovery.get(c))
+                    .and_then(|c| model.discovered(c))
                     .and_then(|d| d.discovery.as_ref())
                     .map(|d| d.navigation.sections.as_slice())
                     .unwrap_or_default();
@@ -780,7 +780,7 @@ impl Workspace {
         let discovery_failed = model
             .active
             .as_ref()
-            .and_then(|c| model.discovery.get(c))
+            .and_then(|c| model.discovered(c))
             .is_some_and(|d| d.error.is_some() && d.discovery.is_none());
         failed || discovery_failed
     }
@@ -1123,7 +1123,7 @@ impl Workspace {
     pub(in crate::ui) fn nav_entry(&self, kind: &str, cx: &App) -> Option<NavEntry> {
         let model = self.model.read(cx);
         let active = model.active.as_ref()?;
-        let discovery = model.discovery.get(active)?.discovery.as_ref()?;
+        let discovery = model.discovered(active)?.discovery.as_ref()?;
         discovery.nav_entry(kind).ok().cloned()
     }
 

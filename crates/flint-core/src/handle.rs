@@ -1,8 +1,9 @@
 //! The bridge between a UI (or any other front end) and the core (ADR-0002).
 //!
-//! The core runs on its own multi-thread tokio runtime. Front ends send [`Command`]s and receive
-//! [`Event`]s over `async_channel` channels, which work with any executor, so a GPUI task can
-//! await them directly. Nothing here blocks the caller.
+//! The core runs on its own multi-thread tokio runtime. Front ends send [`Command`]s over
+//! `async_channel` channels and read [`Event`]s from a bounded queue ([`crate::events`]) that
+//! keeps the latest state of each kind; both work with any executor, so a GPUI task can await
+//! them directly. Nothing here blocks the caller.
 
 use std::future::Future;
 use std::io;
@@ -18,8 +19,8 @@ use crate::discovery::ClusterDiscovery;
 use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
-    Freshness, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget, PodSet,
-    WorkloadPod,
+    Freshness, LogFilter, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget,
+    PodSet, WorkloadPod,
 };
 use crate::manager::ClusterManager;
 use crate::protection::{SessionUnlocks, WriteRefusal};
@@ -216,6 +217,11 @@ pub enum ConnectionState {
 pub struct ClusterSummary {
     pub info: ContextInfo,
     pub state: ConnectionState,
+    /// The core's slot for the context: a new one (re-pointed or otherwise changed, back after
+    /// being removed) has a higher generation. What came from an older one (its discovery, a
+    /// session opened on it) belongs to a cluster that is gone, whatever lists a front end skipped
+    /// (#255).
+    pub generation: u64,
 }
 
 /// The full cluster list. Sent whole whenever kubeconfig is (re)loaded.
@@ -249,12 +255,19 @@ pub enum Event {
     /// `error` is set and `discovery` holds the previous result, if any.
     DiscoveryChanged {
         cluster: ClusterId,
+        /// The generation of the slot it was discovered for ([`ClusterSummary::generation`]):
+        /// one for an older slot is stale.
+        generation: u64,
         discovery: Option<Arc<ClusterDiscovery>>,
         error: Option<String>,
     },
     /// The agent activity log ([`crate::activity`]), at start and whenever `flint mcp` adds to
-    /// it: every record kept, oldest first, for all clusters.
-    AgentActivity(Arc<Vec<crate::activity::ActivityRecord>>),
+    /// it: every record kept, oldest first, for all clusters, with the keys its servers are keyed
+    /// by (read with it, off the UI thread).
+    AgentActivity(
+        Arc<Vec<crate::activity::ActivityRecord>>,
+        crate::activity::ServerKeys,
+    ),
     /// A problem worth showing that is not tied to one cluster's connection.
     Error(String),
 }
@@ -279,7 +292,7 @@ const CORE_WORKER_THREADS: usize = 4;
 pub struct CoreHandle {
     commands: async_channel::Sender<Command>,
     requests: async_channel::Sender<Request>,
-    events: async_channel::Receiver<Event>,
+    events: crate::events::EventSource,
     hubs: HubRegistry,
     next_subscription: Arc<AtomicU64>,
     unlocks: SessionUnlocks,
@@ -298,7 +311,7 @@ impl CoreHandle {
             .build()?;
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (req_tx, req_rx) = async_channel::unbounded();
-        let (event_tx, event_rx) = async_channel::unbounded();
+        let (event_tx, event_rx) = crate::events::queue();
         let hubs = HubRegistry::default();
         let unlocks = SessionUnlocks::default();
         let manager = ClusterManager::new(config, event_tx, hubs.clone(), unlocks.clone());
@@ -513,6 +526,23 @@ impl CoreHandle {
         async move { rx.await.unwrap_or_else(|_| LogSearch::new(query)) }
     }
 
+    /// Brings `filter` up to date with `lines` on the core's threads (see [`LogFilter`]): for
+    /// the first scan of a new filter over a full buffer. Later updates while following scan
+    /// only new lines. Works on any executor.
+    pub fn filter_logs(
+        &self,
+        mut filter: LogFilter,
+        lines: LogLines,
+    ) -> impl Future<Output = LogFilter> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        let spec = filter.spec().clone();
+        self.runtime.spawn_blocking(move || {
+            filter.update(&lines);
+            let _ = tx.send(filter);
+        });
+        async move { rx.await.unwrap_or_else(|_| LogFilter::new(spec)) }
+    }
+
     /// Opens an exec session (a shell in a container, by default) on a connected cluster. The
     /// session runs on its own task: it keeps running when the active cluster changes, and ends
     /// when it is closed or dropped. When the cluster is not connected, it fails at once. Never
@@ -646,9 +676,11 @@ impl CoreHandle {
         }
     }
 
-    /// The event stream. There should be one consumer: each event goes to one receiver only.
-    pub fn events(&self) -> async_channel::Receiver<Event> {
-        self.events.clone()
+    /// The event stream ([`crate::events`]): latest state per kind and cluster, and recent
+    /// errors. Each event goes to one reader. The handle does not keep the stream open: once
+    /// every reader is dropped, the core stops queueing events.
+    pub fn events(&self) -> crate::events::Events {
+        self.events.events()
     }
 }
 

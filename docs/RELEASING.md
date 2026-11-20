@@ -15,6 +15,9 @@ Once the release PR is merged, the tag already holds `CHANGELOG.md`, so this che
 - [ ] Every entry in every public section of the release PR (Features, Bug Fixes, Performance) is something a user
   can see. If internal work slipped in, edit both `CHANGELOG.md` on the release branch and the release notes in the
   PR description, and note the commit so its type is right next time (see [Releases](../README.md#releases)).
+- [ ] The `macos (flint-app)` job passed on the `master` commit the release PR is based on (`gh run list -R
+  Sealos/flint -w CI -b master -L 3`). PRs skip it unless labelled `run-macos`, and the release workflow does not wait
+  for it, so this is the only macOS app test and e2e run before the release publishes.
 - [ ] Repeat the check after any new commit lands on `master`: release-please regenerates `CHANGELOG.md` and the PR
   description and overwrites manual edits. Check the version of the release PR that you actually merge.
 

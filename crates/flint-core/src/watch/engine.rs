@@ -586,7 +586,8 @@ impl Engine {
                     // Only a rejection of the streaming parameters turns them off for the
                     // cluster; another 400 (one API's quirk) only skips them this time.
                     if is_streaming_rejection(&m) {
-                        tracing::info!(cluster = %self.cluster, kind = %self.id, error = %m,
+                        tracing::info!(cluster = %self.cluster, kind = %self.id,
+                            error = %crate::redact::safe_error_summary(&m),
                             "streaming lists rejected; using list and watch");
                         self.source.disable_streaming_lists();
                     }
