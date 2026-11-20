@@ -73,12 +73,12 @@ impl PodSetStatus {
 
     /// Streams that ended on an error.
     pub fn failed(&self) -> usize {
-        self.count(|s| matches!(s, LogState::Ended { error: Some(_) }))
+        self.count(|s| matches!(s, LogState::Ended { error: Some(_), .. }))
     }
 
     /// Streams that ended without one (the container finished, or everything was read).
     pub fn ended(&self) -> usize {
-        self.count(|s| matches!(s, LogState::Ended { error: None }))
+        self.count(|s| matches!(s, LogState::Ended { error: None, .. }))
     }
 
     fn count(&self, pred: impl Fn(&LogState) -> bool) -> usize {
@@ -280,7 +280,10 @@ impl WorkloadFeed {
     /// Ends the session: an error retrying cannot fix (the workload does not exist, access is
     /// denied, the context now points elsewhere). Every stream stops; the lines stay.
     fn fail(&mut self, error: String) {
-        self.state = LogState::Ended { error: Some(error) };
+        self.state = LogState::Ended {
+            error: Some(error),
+            pod_deleted: false,
+        };
         self.watch = Watch::Done;
         self.streams.clear();
         self.queue.clear();
@@ -466,7 +469,10 @@ impl WorkloadFeed {
             && self.streams.iter().all(|e| e.stream.is_done())
             && !matches!(self.state, LogState::Ended { .. })
         {
-            self.state = LogState::Ended { error: None };
+            self.state = LogState::Ended {
+                error: None,
+                pod_deleted: false,
+            };
             self.status_dirty = true;
         }
     }
@@ -587,7 +593,7 @@ impl Feed for WorkloadFeed {
                 changed = stream.handle(step, &mut |line| out.append(line));
             }
             let cluster_error = match stream.state() {
-                LogState::Ended { error } if stream.ended_on_cluster_error() => error.clone(),
+                LogState::Ended { error, .. } if stream.ended_on_cluster_error() => error.clone(),
                 _ => None,
             };
             let done = stream.is_done();
@@ -1016,7 +1022,8 @@ mod tests {
         assert_eq!(
             status.streams[1].state,
             LogState::Ended {
-                error: Some("Forbidden: pods \"web-b\" is forbidden".into())
+                error: Some("Forbidden: pods \"web-b\" is forbidden".into()),
+                pod_deleted: false,
             }
         );
         run.logs.send("web-a/app", "still here");
@@ -1098,7 +1105,8 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
-                error: Some("NotFound: deployments.apps \"web\" not found".into())
+                error: Some("NotFound: deployments.apps \"web\" not found".into()),
+                pod_deleted: false,
             }
         );
 
@@ -1111,7 +1119,7 @@ mod tests {
         let s = run
             .until(|s| matches!(s.state, LogState::Ended { .. }))
             .await;
-        assert!(matches!(&s.state, LogState::Ended { error: Some(e) } if e.contains("empty")));
+        assert!(matches!(&s.state, LogState::Ended { error: Some(e), .. } if e.contains("empty")));
         assert!(run.pods.selectors.lock().unwrap().is_empty());
     }
 
@@ -1146,7 +1154,8 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
-                error: Some("\"dev\" now points to a different API server".into())
+                error: Some("\"dev\" now points to a different API server".into()),
+                pod_deleted: false,
             }
         );
         assert!(pods_of(&s).streams.is_empty());
@@ -1170,7 +1179,8 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
-                error: Some("\"dev\" now points to a different API server".into())
+                error: Some("\"dev\" now points to a different API server".into()),
+                pod_deleted: false,
             }
         );
         assert_eq!(pods_of(&s).streams.len(), 0, "every stream stopped");
@@ -1202,7 +1212,13 @@ mod tests {
         let s = run
             .until(|s| matches!(s.state, LogState::Ended { .. }))
             .await;
-        assert_eq!(s.state, LogState::Ended { error: None });
+        assert_eq!(
+            s.state,
+            LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         let mut lines = texts(&s);
         lines.sort();
         assert_eq!(lines, ["[web-a/app] a", "[web-b/app] b"]);

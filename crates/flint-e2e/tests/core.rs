@@ -587,20 +587,182 @@ async fn a_pod_log_streams_resumes_without_repeats_and_ends_with_its_pod() {
     assert!(resume.timestamps);
 
     // The pod is deleted as kubectl deletes it: it turns Terminating, its container stops and
-    // the stream ends while the pod still exists (Succeeded), then it goes.
+    // the stream ends while the pod still exists (Succeeded), then it goes. The container's
+    // last line reaches the log after the followed stream ended, while Flint looks the pod up
+    // (held back here): only the last read (no follow) can catch it.
+    server.inject(
+        Fault::delay(Duration::from_millis(300))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Get)
+            .named("talker")
+            .times(1),
+    );
     server.delete_pod("demo", "talker");
+    assert_eq!(server.append_log(&log, "four\n"), 0, "no stream follows it");
     let ended = until_log(&mut session, "ended", |s| {
         matches!(s.state, LogState::Ended { .. })
     })
     .await;
-    // This pins what Flint shows today: the session ends with no reason, because the pod
-    // still exists (Succeeded) when its stream ends. #157 will make it give a reason.
-    assert_eq!(ended.state, LogState::Ended { error: None });
-    assert_eq!(log_texts(&ended), ["one", "two", "three"]);
+    // The pod still exists when its stream ends, but it is being deleted: the session says so,
+    // as an ordinary end rather than an error.
+    assert_eq!(
+        ended.state,
+        LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        }
+    );
+    assert_eq!(log_texts(&ended), ["one", "two", "three", "four"]);
     // Flint read the stopped container to its end once more (no follow), without repeats.
     let last = server.log_requests().pop().unwrap();
     assert!(!last.parsed_query().follow && last.parsed_query().since_time.is_some());
     server.finish_delete("demo", "talker");
+}
+
+// covers UP-40
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminating_pod_keeps_its_log_until_its_container_stops() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.add_pod(FakePod::new("demo", "slow", &["app"]).label("app", "slow"));
+    let log = ContainerLog::new("demo", "slow");
+    let target = LogTarget {
+        namespace: "demo".into(),
+        pod: "slow".into(),
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    until_log(&mut session, "streaming", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+
+    // Terminating, with a long grace period: the container still runs and logs its shutdown.
+    server.begin_delete_pod("demo", "slow");
+    server.append_log(&log, "draining\n");
+    until_log(&mut session, "the first shutdown line", |s| {
+        log_texts(s) == ["draining"]
+    })
+    .await;
+    // The followed stream ends cleanly while the container still runs (an API server restart,
+    // a proxy's idle timeout): Flint reconnects instead of ending the session.
+    assert_eq!(server.end_log_streams(&log), 1);
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+    server.append_log(&log, "closing connections\n");
+    until_log(&mut session, "a shutdown line after the reconnect", |s| {
+        log_texts(s) == ["draining", "closing connections"]
+    })
+    .await;
+
+    // The container stops: now the session ends, saying why.
+    server.finish_shutdown("demo", "slow");
+    let ended = until_log(&mut session, "ended", |s| {
+        matches!(s.state, LogState::Ended { .. })
+    })
+    .await;
+    assert_eq!(
+        ended.state,
+        LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        }
+    );
+    assert_eq!(log_texts(&ended), ["draining", "closing connections"]);
+    server.finish_delete("demo", "slow");
+}
+
+// covers UP-40
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_gone_before_its_status_caught_up_ends_as_deleted() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.add_pod(FakePod::new("demo", "lagging", &["app"]).label("app", "lagging"));
+    let log = ContainerLog::new("demo", "lagging");
+    let target = LogTarget {
+        namespace: "demo".into(),
+        pod: "lagging".into(),
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    until_log(&mut session, "streaming", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+    server.append_log(&log, "bye\n");
+    until_log(&mut session, "the line", |s| log_texts(s) == ["bye"]).await;
+
+    // The kubelet ends the stream before the pod's status shows the container stopped: Flint
+    // looks, finds it Terminating but running, and waits to reconnect. Meanwhile the pod goes.
+    server.begin_delete_pod("demo", "lagging");
+    assert_eq!(server.end_log_streams(&log), 1);
+    server
+        .wait_for_request(WAIT, |r| {
+            r.path == "/api/v1/namespaces/demo/pods/lagging" && r.status == Some(200)
+        })
+        .await
+        .unwrap();
+    server.finish_delete("demo", "lagging");
+
+    // The reopen finds no pod: it was deleted, which is no error.
+    let ended = until_log(&mut session, "ended", |s| {
+        matches!(s.state, LogState::Ended { .. })
+    })
+    .await;
+    assert_eq!(
+        ended.state,
+        LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        }
+    );
+    assert_eq!(log_texts(&ended), ["bye"]);
+}
+
+// covers UP-45
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workload_log_outlives_a_deleted_pod() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    let (a, b) = ("web-69c6f74b8b-qv4xv", "web-69c6f74b8b-x4gss");
+    let target = WorkloadTarget {
+        namespace: "demo".into(),
+        pods: PodSet::Workload {
+            kind: WorkloadKind::Deployment,
+            name: "web".into(),
+        },
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    until_log(&mut session, "two pods", |s| {
+        s.pods.as_ref().is_some_and(|p| p.live() == 2)
+    })
+    .await;
+    server.wait_for_log_streams(2, WAIT).await.unwrap();
+
+    // One pod is deleted gracefully: its stream ends quietly, the session reads on.
+    server.delete_pod("demo", b);
+    server.finish_delete("demo", b);
+    until_log(&mut session, "one pod left", |s| {
+        s.pods
+            .as_ref()
+            .is_some_and(|p| p.pods == 1 && p.live() == 1 && p.failed() == 0)
+    })
+    .await;
+    server.append_log(&ContainerLog::new("demo", a), "still here\n");
+    let line = format!("{a}/nginx still here");
+    let snap = until_log(&mut session, "the other pod's line", |s| {
+        log_texts(s).contains(&line)
+    })
+    .await;
+    assert_eq!(snap.state, LogState::Streaming);
 }
 
 // covers UP-42

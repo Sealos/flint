@@ -860,7 +860,10 @@ impl LogView {
                     .into_any_element(),
             );
         }
-        if let LogState::Ended { error: Some(error) } = &self.snapshot.state
+        // A failure only: a deleted pod's end shows in the status ("Ended · pod deleted").
+        if let LogState::Ended {
+            error: Some(error), ..
+        } = &self.snapshot.state
             && !self.snapshot.lines.is_empty()
         {
             notes.push(
@@ -908,15 +911,22 @@ impl LogView {
                         None => format!("Attempt {attempt}"),
                     }),
                 ),
-                LogState::Ended { error: None } => {
-                    (false, theme.muted_foreground, "No log lines.", None)
-                }
-                LogState::Ended { error: Some(e) } => (
+                LogState::Ended { error: Some(e), .. } => (
                     false,
                     theme.danger,
                     "Could not read the logs.",
                     Some(e.clone()),
                 ),
+                // The log was read; the pod just logged nothing before it was deleted.
+                LogState::Ended {
+                    pod_deleted: true, ..
+                } => (
+                    false,
+                    theme.muted_foreground,
+                    "No log lines.",
+                    Some("The pod was deleted.".to_owned()),
+                ),
+                LogState::Ended { .. } => (false, theme.muted_foreground, "No log lines.", None),
             };
         v_flex()
             .id("log-empty")
@@ -984,8 +994,8 @@ impl DockItem for LogView {
             LogState::Connecting => TabStatus::Starting,
             LogState::Streaming => TabStatus::Live,
             LogState::Reconnecting { .. } => TabStatus::Retrying,
-            LogState::Ended { error: None } => TabStatus::Ended,
-            LogState::Ended { error: Some(_) } => TabStatus::Failed,
+            LogState::Ended { error: Some(_), .. } => TabStatus::Failed,
+            LogState::Ended { .. } => TabStatus::Ended,
         }
     }
 

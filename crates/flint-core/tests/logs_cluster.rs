@@ -224,7 +224,7 @@ async fn follows_a_chatty_pod_within_the_buffer_and_across_cluster_switches() {
         };
         let mut short = core.handle.open_logs(&first, target, tail);
         let done = until(&mut short, 30, |s| matches!(s.state, LogState::Ended { .. })).await;
-        assert_eq!(done.state, LogState::Ended { error: None });
+        assert_eq!(done.state, LogState::Ended { error: None, pod_deleted: false });
         assert_eq!(done.lines.len(), 5);
         assert!(done.lines.iter().all(|(_, l)| l.text.contains("tick")));
     })
@@ -282,7 +282,13 @@ async fn picks_a_container_and_reads_the_previous_instance() {
         };
         let mut session = core.handle.open_logs(&name, target(Some("app")), previous);
         let done = until(&mut session, 30, ended).await;
-        assert_eq!(done.state, LogState::Ended { error: None });
+        assert_eq!(
+            done.state,
+            LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         assert_eq!(done.lines.len(), 1);
         assert!(
             done.lines
@@ -304,7 +310,10 @@ async fn picks_a_container_and_reads_the_previous_instance() {
         // Two containers and none picked: the server's reason, and no retrying.
         let mut unpicked = core.handle.open_logs(&name, target(None), once);
         let done = until(&mut unpicked, 30, ended).await;
-        let LogState::Ended { error: Some(error) } = &done.state else {
+        let LogState::Ended {
+            error: Some(error), ..
+        } = &done.state
+        else {
             panic!("expected an error, got {:?}", done.state);
         };
         assert!(error.contains("container"), "{error}");

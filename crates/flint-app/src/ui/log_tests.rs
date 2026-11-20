@@ -238,6 +238,7 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
         lines.snapshot(
             LogState::Ended {
                 error: Some("container not found".into()),
+                pod_deleted: false,
             },
             false,
             0,
@@ -246,6 +247,26 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
     assert_eq!(status(cx), TabStatus::Failed);
     cx.wait_for(window, WAIT, |window, _| {
         window.try_find("log-ended").is_some()
+    })
+    .await;
+    assert_eq!(view.read_with(cx, |v, _| v.list.item_count()), 50);
+
+    // A pod deleted after its log was read is an ordinary end: no failure, no error notice.
+    feed(
+        cx,
+        &view,
+        lines.snapshot(
+            LogState::Ended {
+                error: None,
+                pod_deleted: true,
+            },
+            false,
+            0,
+        ),
+    );
+    assert_eq!(status(cx), TabStatus::Ended);
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-ended").is_none()
     })
     .await;
     assert_eq!(view.read_with(cx, |v, _| v.list.item_count()), 50);

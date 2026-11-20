@@ -113,6 +113,14 @@ pub(crate) struct Stream {
     draining: bool,
     /// The pod was deleted: finish the current read, then end instead of reconnecting.
     gone: bool,
+    /// The pod is being deleted (single-pod sessions): the last catch-up read ends the stream
+    /// with `pod_deleted`.
+    deleted: bool,
+    /// The pod was seen being deleted while its container still ran (single-pod sessions): if
+    /// it is gone (404) by the next open, it was deleted.
+    terminating: bool,
+    /// An open succeeded once: the pod existed, so a later 404 means it was deleted.
+    opened: bool,
     deadline: Option<Pin<Box<Sleep>>>,
     /// The stream ended on an error about the cluster rather than this container.
     cluster_error: bool,
@@ -153,6 +161,9 @@ impl Stream {
             resume: None,
             draining: false,
             gone: false,
+            deleted: false,
+            terminating: false,
+            opened: false,
             deadline: None,
             cluster_error: false,
         };
@@ -236,6 +247,7 @@ impl Stream {
                 return false;
             }
             Step::Opened(Ok(lines)) => {
+                self.opened = true;
                 self.set_state(LogState::Streaming);
                 Phase::Read(lines)
             }
@@ -258,30 +270,45 @@ impl Stream {
                 self.end(None)
             }
             Step::Expired => return false,
+            // A pod that was read before, or seen being deleted, and is now not found was
+            // deleted: an ordinary end. A 404 on the very first open stays an error (a wrong
+            // name, or a pod deleted before the session began).
+            Step::Opened(Err(e))
+                if e.kind == ErrorKind::NotFound
+                    && self.member.is_none()
+                    && (self.opened || self.terminating || self.deleted) =>
+            {
+                self.end_deleted()
+            }
             // The last catch-up of a finished container: what was read is all there is.
-            Step::Opened(Err(e)) if e.is_fatal() && self.draining => self.end(None),
+            Step::Opened(Err(e)) if e.is_fatal() && self.draining => self.drained(),
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => {
                 self.end(Some(e.message))
             }
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
                 self.retry(Some(e))
             }
-            Step::Eof if !self.options.follow || self.options.previous || self.draining => {
-                self.end(None)
-            }
+            Step::Eof if self.draining => self.drained(),
+            Step::Eof if !self.options.follow || self.options.previous => self.end(None),
             Step::Eof => {
                 let uid = self.member.as_ref().map(|m| m.uid.as_str());
                 Phase::CheckEnd(self.source.after_end(&self.target, uid))
             }
             Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(None),
-            Step::AfterEnd(Ok(AfterEnd::Finished)) => {
+            Step::AfterEnd(Ok(AfterEnd::Terminating)) => {
+                self.terminating = self.member.is_none();
+                self.retry(None)
+            }
+            Step::AfterEnd(Ok(end @ (AfterEnd::Finished | AfterEnd::Deleting))) => {
+                // Pods of a workload come and go; a deleted one ends its stream quietly.
+                self.deleted = end == AfterEnd::Deleting && self.member.is_none();
                 self.draining = true;
                 let request = self.resume_request();
                 Phase::Connect(self.source.open(&request))
             }
             // Pods of a workload come and go; that is no error.
             Step::AfterEnd(Ok(AfterEnd::Gone)) if self.member.is_some() => self.end(None),
-            Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end(Some("the pod was deleted".to_owned())),
+            Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end_deleted(),
             Step::Retry => {
                 let request = self.resume_request();
                 Phase::Connect(self.source.open(&request))
@@ -306,6 +333,7 @@ impl Stream {
             return;
         }
         self.draining = false;
+        self.deleted = false;
         self.attempts = 0;
         self.set_state(LogState::Connecting);
         let request = self.resume_request();
@@ -412,11 +440,36 @@ impl Stream {
         Phase::Wait(Box::pin(tokio::time::sleep(delay)))
     }
 
+    /// Ends after the last catch-up read: quietly for a container that finished, with
+    /// `pod_deleted` for a single-pod stream whose pod is being deleted.
+    fn drained(&mut self) -> Phase {
+        if self.deleted {
+            self.end_deleted()
+        } else {
+            self.end(None)
+        }
+    }
+
     fn end(&mut self, error: Option<String>) -> Phase {
+        self.finish(LogState::Ended {
+            error,
+            pod_deleted: false,
+        })
+    }
+
+    /// Ends a single-pod stream because its pod was deleted: an expected end, not an error.
+    fn end_deleted(&mut self) -> Phase {
+        self.finish(LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        })
+    }
+
+    fn finish(&mut self, state: LogState) -> Phase {
         self.deadline = None;
         // Lines held for a resume are not kept past the end.
         self.resume = None;
-        self.set_state(LogState::Ended { error });
+        self.set_state(state);
         Phase::Done
     }
 }
@@ -550,7 +603,13 @@ mod tests {
         tokio::time::advance(GONE_GRACE + Duration::from_millis(1)).await;
         drain(&mut s).await;
         assert!(s.is_done());
-        assert_eq!(s.state(), &LogState::Ended { error: None });
+        assert_eq!(
+            s.state(),
+            &LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         assert!(!s.ended_on_cluster_error());
     }
 
@@ -586,7 +645,14 @@ mod tests {
         // The pod lookup is by uid: a pod of the same name is another pod, so this one is gone.
         assert_eq!(*source.uids.lock().unwrap(), [Some("u1".to_owned())]);
         assert!(s.is_done());
-        assert_eq!(s.state(), &LogState::Ended { error: None }, "no error");
+        assert_eq!(
+            s.state(),
+            &LogState::Ended {
+                error: None,
+                pod_deleted: false
+            },
+            "no error"
+        );
 
         // Restarted after all: it reads on from where it stopped, without repeating lines.
         s.revive();
@@ -601,10 +667,88 @@ mod tests {
         assert_eq!(
             single.state(),
             &LogState::Ended {
-                error: Some("the pod was deleted".into())
+                error: None,
+                pod_deleted: true,
             }
         );
         assert_eq!(*plain.uids.lock().unwrap(), [None]);
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_being_deleted_ends_its_session_with_a_reason_after_a_last_read() {
+        let mut s = stream(&[], None);
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Deleting)), &mut |_| {});
+        // The stopped container is read to its end once more before the session ends.
+        assert!(!s.is_done() && matches!(s.phase, Phase::Connect(_)));
+        s.handle(Step::Eof, &mut |_| {});
+        let deleted = LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        };
+        assert_eq!(s.state(), &deleted);
+
+        // The pod went before that last read: the reason stays.
+        let mut early = stream(&[], None);
+        early.handle(Step::AfterEnd(Ok(AfterEnd::Deleting)), &mut |_| {});
+        early.handle(Step::Opened(Err(LogError::fatal("not found"))), &mut |_| {});
+        assert_eq!(early.state(), &deleted);
+
+        // A workload's pod comes and goes: its stream ends quietly.
+        let tag = Arc::new(LineSource::new("web-1", "app"));
+        let mut member = stream(&[], Some(tag));
+        member.handle(Step::AfterEnd(Ok(AfterEnd::Deleting)), &mut |_| {});
+        member.handle(Step::Eof, &mut |_| {});
+        assert_eq!(
+            member.state(),
+            &LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
+    }
+
+    // covers UP-40
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_gone_before_a_reopen_was_deleted_not_missing() {
+        let not_found = || {
+            Step::Opened(Err(LogError {
+                message: "NotFound: pods \"p\" not found".into(),
+                kind: ErrorKind::NotFound,
+            }))
+        };
+        let deleted = LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        };
+        // Seen terminating while its container still ran, then gone by the reopen: the kubelet
+        // ended the stream before the pod's status showed the container stopped.
+        let mut s = stream(&[], None);
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Terminating)), &mut |_| {});
+        assert!(matches!(s.state(), LogState::Reconnecting { .. }));
+        s.handle(not_found(), &mut |_| {});
+        assert_eq!(s.state(), &deleted);
+
+        // Read once, then gone (deleted at once, between two reads).
+        let mut read = stream(&[], None);
+        read.handle(
+            Step::Opened(Ok(futures::stream::pending().boxed())),
+            &mut |_| {},
+        );
+        read.handle(Step::Line(Err(LogError::retry("EOF"))), &mut |_| {});
+        read.handle(not_found(), &mut |_| {});
+        assert_eq!(read.state(), &deleted);
+
+        // Never found: the error stays.
+        let mut never = stream(&[], None);
+        never.handle(not_found(), &mut |_| {});
+        assert!(matches!(
+            never.state(),
+            LogState::Ended {
+                error: Some(_),
+                pod_deleted: false
+            }
+        ));
     }
 
     // covers UP-45
@@ -622,7 +766,13 @@ mod tests {
         let mut d = stream(&[], None);
         d.handle(Step::AfterEnd(Ok(AfterEnd::Finished)), &mut |_| {});
         d.handle(Step::Opened(Err(LogError::fatal("gone"))), &mut |_| {});
-        assert_eq!(d.state(), &LogState::Ended { error: None });
+        assert_eq!(
+            d.state(),
+            &LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
         assert!(!d.ended_on_cluster_error());
     }
 
@@ -642,7 +792,13 @@ mod tests {
             &mut |_| {},
         );
         assert!(changed && s.is_done());
-        assert_eq!(s.state(), &LogState::Ended { error: None });
+        assert_eq!(
+            s.state(),
+            &LogState::Ended {
+                error: None,
+                pod_deleted: false
+            }
+        );
     }
 
     // covers UP-45
@@ -672,7 +828,8 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
-                error: Some("re-pointed".into())
+                error: Some("re-pointed".into()),
+                pod_deleted: false,
             }
         );
     }

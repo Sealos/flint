@@ -407,6 +407,43 @@ async fn a_deleted_pod_terminates_stays_readable_then_goes() {
     assert!(api.get_opt(other).await.unwrap().is_none());
 }
 
+#[tokio::test]
+async fn a_pod_being_deleted_keeps_logging_until_its_containers_stop() {
+    let server = FakeApiServer::start().await.unwrap();
+    let api = pods(&server).await;
+    server.set_log("demo", WEB, "serving\n");
+    let mut lines = open(&api, WEB, &follow()).await.unwrap();
+    next(&mut lines).await.unwrap().unwrap();
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+
+    server.begin_delete_pod("demo", WEB);
+    // Terminating, but still running: the stream stays open and gets the shutdown lines.
+    let pod = api.get(WEB).await.unwrap();
+    assert!(pod.metadata.deletion_timestamp.is_some());
+    assert_eq!(pod.status.unwrap().phase.as_deref(), Some("Running"));
+    assert_eq!(
+        server.append_log(&ContainerLog::new("demo", WEB), "draining\n"),
+        1
+    );
+    assert_eq!(
+        texts(&[next(&mut lines).await.unwrap().unwrap()]),
+        ["draining"]
+    );
+
+    server.finish_shutdown("demo", WEB);
+    assert!(next(&mut lines).await.is_none());
+    let pod = api.get(WEB).await.unwrap();
+    assert_eq!(pod.status.unwrap().phase.as_deref(), Some("Succeeded"));
+    server.finish_delete("demo", WEB);
+}
+
+#[test]
+#[should_panic(expected = "is not being deleted; call begin_delete_pod first")]
+fn finishing_a_shutdown_that_never_started_panics() {
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    server.finish_shutdown("demo", WEB);
+}
+
 /// Reads plain watch events (as kube's watcher gets them) until `count` arrived.
 async fn events(lines: &mut Lines, count: usize) -> Vec<Value> {
     let mut out = Vec::new();
