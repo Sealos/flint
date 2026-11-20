@@ -472,8 +472,10 @@ async fn opening_a_gone_object_says_so_and_stops_waiting(cx: &mut TestAppContext
     );
 }
 
-// covers UP-30, UP-31: Cmd-Shift-P in the switcher shows the actions, and Cmd-P the kinds and
-// objects again; the same key again closes it.
+// covers UP-30, UP-31: Show Command Palette in the switcher shows the actions, and Go to
+// Resource the kinds and objects again; Go to Resource again closes it. Run through the
+// registry, as the View menu does: the switcher's key is not the same on every system in the
+// palette's field (see the next test).
 #[gpui_kit::test]
 async fn the_palette_and_the_switcher_swap(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -481,7 +483,8 @@ async fn the_palette_and_the_switcher_swap(cx: &mut TestAppContext) {
     let _stored = alpha_with_objects(cx, &t).await;
     t.focus_workspace(cx);
     open_switcher(cx, &t).await;
-    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    t.dispatch(cx, "palette::ToggleCommandPalette", serde_json::Value::Null)
+        .unwrap();
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         workspace.read(cx).palette_view().is_some_and(|p| {
@@ -494,11 +497,53 @@ async fn the_palette_and_the_switcher_swap(cx: &mut TestAppContext) {
     assert_eq!(actions.mode, "actions");
     // Listed from where focus was before the switcher opened.
     assert!(labels(&actions).contains(&"Go to Resource"), "{actions:?}");
-    open_switcher(cx, &t).await;
+    t.dispatch(
+        cx,
+        "palette::ToggleResourceSwitcher",
+        serde_json::Value::Null,
+    )
+    .unwrap();
     assert_eq!(shown(cx, &t).mode, "resources");
-    t.press_key_of(cx, "palette::ToggleResourceSwitcher");
+    t.dispatch(
+        cx,
+        "palette::ToggleResourceSwitcher",
+        serde_json::Value::Null,
+    )
+    .unwrap();
     assert!(palette(cx, &t).is_none());
     assert_eq!(state(cx, &t).1, Focus::Workspace);
+}
+
+// covers UP-30, UP-31: the switcher's key in the palette's field. On macOS, Cmd-P switches to
+// the switcher. Elsewhere the key is Ctrl-P, which the palette's field takes first: it moves
+// the selection up, as Ctrl-N moves it down, and the palette stays as it is.
+#[gpui_kit::test]
+async fn the_switcher_key_in_the_palette_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    t.focus_workspace(cx);
+    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace
+            .read(cx)
+            .palette_view()
+            .is_some_and(|p| !p.read(cx).rows.is_empty())
+    })
+    .await;
+    t.press(cx, "down");
+    t.press(cx, "down");
+    assert_eq!(shown(cx, &t).selected, Some(2));
+    // `secondary-p`: Cmd-P on macOS, Ctrl-P elsewhere.
+    t.press_key_of(cx, "palette::ToggleResourceSwitcher");
+    let after = shown(cx, &t);
+    if cfg!(target_os = "macos") {
+        assert_eq!(after.mode, "resources");
+    } else {
+        assert_eq!(after.mode, "actions");
+        assert_eq!(after.selected, Some(1), "Ctrl-P moved the selection up");
+    }
 }
 
 // The switcher is released once closed, its field and index included.
