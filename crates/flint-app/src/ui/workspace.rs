@@ -1058,18 +1058,17 @@ impl Workspace {
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
         // Filled while live (or failing, or connecting); a ring while idle: connected, but not
         // watched.
-        let dot = div()
+        let (color, filled) = match presence {
+            Presence::NotConnected => (theme.muted_foreground.opacity(0.4), true),
+            Presence::Connecting => (theme.warning, true),
+            Presence::Live => (theme.success, true),
+            Presence::Idle => (theme.success, false),
+            Presence::Failed => (theme.danger, true),
+        };
+        let dot = super::theme::status_dot(color, filled)
             .id(SharedString::from(format!("cluster-dot-{name}")))
             .size_2()
             .flex_none()
-            .rounded_full()
-            .map(|el| match presence {
-                Presence::NotConnected => el.bg(theme.muted_foreground.opacity(0.4)),
-                Presence::Connecting => el.bg(theme.warning),
-                Presence::Live => el.bg(theme.success),
-                Presence::Idle => el.border_1().border_color(theme.success),
-                Presence::Failed => el.bg(theme.danger),
-            })
             .test_support();
 
         let tooltip = hover_text.clone();

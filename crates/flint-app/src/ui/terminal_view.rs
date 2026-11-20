@@ -496,7 +496,7 @@ impl TerminalView {
                     .min_w(px(60.))
                     .max_w(px(360.))
                     .text_color(color)
-                    .child(div().size_1p5().flex_none().rounded_full().bg(color))
+                    .child(super::theme::status_dot(color, true).flex_none())
                     .child(div().min_w_0().truncate().child(state))
                     .tooltip(move |window, cx| Tooltip::new(full_state.clone()).build(window, cx))
                     .test_support(),

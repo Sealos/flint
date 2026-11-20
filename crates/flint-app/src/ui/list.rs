@@ -972,7 +972,7 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         .flex_none()
         .text_xs()
         .text_color(color)
-        .child(div().size_1p5().rounded_full().bg(color))
+        .child(super::theme::status_dot(color, true))
         .child(text)
         .when_some(detail, |el, detail| {
             el.tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
