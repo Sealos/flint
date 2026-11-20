@@ -1154,6 +1154,45 @@ mod tests {
         assert_eq!(waits, [500, 1000], "the backoff grew again from the start");
     }
 
+    // covers UP-45: a pod watch that simply ends, with no error, is reopened after the backoff
+    // like a broken one, and says no error while it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_watch_that_ends_reconnects_after_the_backoff() {
+        let mut run = start(32);
+        let (second, events) = mpsc::unbounded();
+        run.pods.watches.lock().unwrap().push_back(events);
+        run.list(vec![pod("web-a", "a", &[("app", true)])]);
+        run.opened("web-a/app").await;
+        run.until(|s| s.state == LogState::Streaming).await;
+        let ended = tokio::time::Instant::now();
+        run.watch.close_channel();
+        let s = run
+            .until(|s| matches!(s.state, LogState::Reconnecting { .. }))
+            .await;
+        assert_eq!(
+            s.state,
+            LogState::Reconnecting {
+                back_off: false,
+                error: None,
+                attempt: 1
+            }
+        );
+
+        second.unbounded_send(Ok(PodEvent::Init)).unwrap();
+        second
+            .unbounded_send(Ok(PodEvent::InitApply(pod("web-a", "a", &[("app", true)]))))
+            .unwrap();
+        second.unbounded_send(Ok(PodEvent::InitDone)).unwrap();
+        run.until(|s| s.state == LogState::Streaming).await;
+        let opens = run.pods.opens.lock().unwrap().clone();
+        assert_eq!(opens.len(), 2);
+        assert_eq!(
+            (opens[1] - ended).as_millis(),
+            500,
+            "waited the first backoff"
+        );
+    }
+
     // covers UP-45
     #[tokio::test(start_paused = true)]
     async fn errors_retrying_cannot_fix_end_the_session() {

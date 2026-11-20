@@ -1054,10 +1054,69 @@ mod tests {
     }
 
     fn attempt(s: &Stream) -> u32 {
-        match s.state() {
-            LogState::Reconnecting { attempt, .. } => *attempt,
-            other => panic!("not reconnecting: {other:?}"),
+        attempt_of(s.state())
+    }
+
+    // covers UP-40: the kubelet's "cannot read the log" answer is not progress, so a container
+    // that keeps answering it is retried less and less often, like any other failure.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_kubelet_answers_keep_backing_off() {
+        let notice = "unable to retrieve container logs for containerd://c54f232e5b";
+        let mut s = Stream::new(
+            Arc::new(Fated {
+                lines: vec![notice.to_owned()],
+                fate: AfterEnd::Restarts,
+            }),
+            LogTarget {
+                namespace: "ns".into(),
+                pod: "p".into(),
+                container: Some("c".into()),
+            },
+            LogOptions::default(),
+            10,
+            Backoff {
+                first: Duration::from_secs(1),
+                max: Duration::from_secs(30),
+            },
+            None,
+        );
+        drain(&mut s).await;
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (1, 1));
+        for expected in [(2, 2), (3, 4)] {
+            s.handle(Step::Retry, &mut |_| {});
+            s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+            let mut out = Vec::new();
+            s.handle(
+                Step::Line(Ok(RawLine {
+                    text: notice.into(),
+                    truncated: false,
+                })),
+                &mut |l| out.push(l),
+            );
+            assert!(out.is_empty(), "the answer is not shown as a line");
+            s.handle(Step::AfterEnd(Ok(AfterEnd::Restarts)), &mut |_| {});
+            assert_eq!((attempt(&s), wait_left(&s).as_secs()), expected);
+            assert!(matches!(
+                s.state(),
+                LogState::Reconnecting { error: Some(e), .. } if e == notice
+            ));
         }
+    }
+
+    // covers UP-45: a nudge skips the wait but keeps the count, so a container that fails again
+    // right after restarting waits longer, not from the start.
+    #[tokio::test(start_paused = true)]
+    async fn a_nudge_keeps_the_attempt_count() {
+        let mut s = stream(&[], None);
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (2, 2));
+        s.nudge();
+        assert_eq!(wait_left(&s), Duration::ZERO, "no wait left");
+        s.handle(Step::Retry, &mut |_| {});
+        s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+        s.handle(Step::Line(Err(LogError::retry("reset"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (3, 4));
     }
 
     // covers UP-45: failures in a row wait longer and longer; only a new line resets the count.
