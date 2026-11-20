@@ -213,7 +213,8 @@ jobs:
         env:
           FLINT_E2E_APP_BIN: ${{ github.workspace }}/target/debug/flint
           FLINT_AUTOMATION_SCREENSHOTS: ${{ runner.temp }}/e2e-shots
-        run: cargo test -p flint-e2e --test app --locked -- --ignored
+        # The kind test returns early without FLINT_TEST_KUBECONFIG; skip it so it never shows as passed.
+        run: cargo test -p flint-e2e --test app --locked -- --ignored --skip up_41_shell_on_kind
       - name: Upload app e2e screenshots
         id: screenshots
         if: always() && steps.e2e.outcome != 'skipped'

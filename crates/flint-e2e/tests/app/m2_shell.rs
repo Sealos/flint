@@ -15,10 +15,15 @@
 //! - **A context re-pointed at another API server** (UP-41): `ui/dock_tests.rs`.
 //! - **Close Window** (UP-42: Cmd-W away from the dock closes the window): it closes
 //!   `cx.active_window()`, and the app under test runs in the background, so it has no active
-//!   window and the action does nothing. `ui/workspace_tests.rs` covers its routing.
+//!   window and the action does nothing. `ui/workspace_tests.rs` covers its routing; #174
+//!   tracks the app test, with an exit observed apart from `App::quit`.
+//! - **Saving the dock's height on quit** (UP-42): the height is saved when it changes, so the
+//!   relaunch in `up_42_sessions_outlive_navigation` proves it is read back, not that quitting
+//!   saves it.
 //!
 //! The paste test goes through the system clipboard, as a user's copy and paste does (the app's
-//! own Copy, then Paste). It puts back the text the clipboard held before.
+//! own Copy, then Paste). It puts back the plain text the clipboard held before; anything else it
+//! held (an image, rich text) is lost.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -85,6 +90,11 @@ fn wait_for_row(app: &App, index: usize, row: &str) -> Result<Value> {
     Ok(app.wait_for(&at(index, "shell/screen"), Contains(row.into()))?)
 }
 
+/// [`wait_for_row`] with its own timeout.
+fn wait_for_row_within(app: &App, index: usize, row: &str, within: Duration) -> Result<Value> {
+    Ok(app.wait_for_within(&at(index, "shell/screen"), Contains(row.into()), within)?)
+}
+
 /// Waits until the newest exec session's stdin holds `bytes`.
 fn wait_for_stdin(exec: &FakeExec, bytes: &[u8]) -> Result<Vec<u8>> {
     until(
@@ -102,6 +112,16 @@ fn exec_number(fake: &FakeApiServer, count: usize) -> Result<FakeExec> {
         |s| s.len() >= count,
     )?;
     Ok(sessions[count - 1].clone())
+}
+
+/// Waits until the session got a resize to `size`.
+fn wait_for_resize(exec: &FakeExec, size: TtySize) -> Result<()> {
+    until(
+        &format!("a resize to {size:?}"),
+        || exec.resizes(),
+        |r| r.contains(&size),
+    )?;
+    Ok(())
 }
 
 /// The commands of every exec request so far.
@@ -170,7 +190,8 @@ fn new_tab(app: &App, before: &[u64], open: impl FnOnce() -> Result<()>) -> Resu
     Ok((id, tab_index(&state, id)?))
 }
 
-/// The system clipboard's text, put back when dropped: the paste tests copy and paste through
+/// The system clipboard's plain text, put back when dropped (anything else it held, such as an
+/// image, is not restored): the paste tests copy and paste through
 /// it, as a user does.
 struct Clipboard(Vec<u8>);
 
@@ -285,8 +306,8 @@ fn up_41_shell_into_a_container() -> Result<()> {
     assert_eq!(tab["shell"]["live"], true);
     assert_eq!(state["dock"]["visible"], true);
     let prompt = format!("root@{WEB}:/#");
-    let state = wait_for_row(&app, i, &prompt)?;
-    assert_eq!(state["focus"], "shell");
+    wait_for_row(&app, i, &prompt)?;
+    app.wait_for("/focus", Equals("shell".into()))?;
     let exec = fake.last_exec().context("an exec session")?;
     assert_eq!(exec.command(), ["bash"]);
     assert_eq!(exec.container(), "nginx");
@@ -314,6 +335,8 @@ fn up_41_shell_into_a_container() -> Result<()> {
     let state = app.wait_for(&at(i, "shell/rows"), Test::at_least(first.height + 1))?;
     let taller = size(&state, i);
     assert_eq!(taller.width, first.width, "only the rows change");
+    // kube sends stdin and resizes on separate channels: type only once the resize is in.
+    wait_for_resize(&exec, taller)?;
     run(&app, "stty size")?;
     wait_for_row(&app, i, &format!("{} {}", taller.height, taller.width))?;
     assert_eq!(exec.resizes(), [first, taller]);
@@ -327,6 +350,7 @@ fn up_41_shell_into_a_container() -> Result<()> {
     let state = app.wait_for(&at(i, "shell/cols"), Test::at_least(taller.width + 1))?;
     let wider = size(&state, i);
     assert_eq!(wider.height, taller.height, "only the columns change");
+    wait_for_resize(&exec, wider)?;
     run(&app, "stty size")?;
     wait_for_row(&app, i, &format!("{} {}", wider.height, wider.width))?;
     assert_eq!(exec.resizes(), [first, taller, wider]);
@@ -405,14 +429,22 @@ fn up_41_shell_into_a_container() -> Result<()> {
     );
     let second = exec_number(fake, 2)?;
     assert_eq!(second.command(), ["bash"]);
-    // The text typed into the ended tab went nowhere: the app handled it before the restart.
-    assert!(
-        !String::from_utf8_lossy(&exec.stdin()).contains("late"),
-        "{:?}",
-        String::from_utf8_lossy(&exec.stdin())
-    );
-    assert!(!screen(&state, i).iter().any(|r| r.contains("late")));
+    // The ended tab keeps its output beside the new one.
+    let rows = screen(&state, i);
+    for kept in ["130", "bye", &format!("{prompt} exit 3"), "exit"] {
+        assert!(rows.iter().any(|r| r == kept), "{kept} kept: {rows:?}");
+    }
+    assert!(!rows.iter().any(|r| r.contains("late")), "{rows:?}");
+    // The text typed into the ended tab went nowhere: the app handled the keys before the
+    // restart (commands are handled in order). The ended session was already closed, so the
+    // check that can fail is that the restarted shell never got them either.
     wait_for_row(&app, j, &prompt)?;
+    assert!(
+        !String::from_utf8_lossy(&second.stdin()).contains("late"),
+        "{:?}",
+        String::from_utf8_lossy(&second.stdin())
+    );
+    assert!(!String::from_utf8_lossy(&exec.stdin()).contains("late"));
 
     // Closing the tabs ends their sessions.
     for id in [restarted, shell, logs] {
@@ -747,7 +779,8 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     assert!(exec.print("\r\nprinted after the view change\r\n"));
     wait_for_row(&app, s, "printed after the view change")?;
 
-    // Cmd-J hides the dock and shows it again with its tabs and sessions intact.
+    // Toggle Dock (the action Cmd-J performs) hides the dock and shows it again, with its tabs
+    // and sessions intact.
     app.dispatch("dock::ToggleDock", Value::Null)?;
     let state = app.wait_for("/dock/visible", Equals(false.into()))?;
     assert_eq!(tab_ids(&state), [logs, shell]);
@@ -831,7 +864,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     Ok(())
 }
 
-/// A namespace with two pods on the kind dev cluster, deleted when dropped: `shell-bash`
+/// A labelled namespace with two pods on the kind dev cluster, deleted when dropped: `shell-bash`
 /// (nginx, which has bash) and `shell-sh` (busybox, only sh).
 struct KindPods {
     runtime: tokio::runtime::Runtime,
@@ -839,10 +872,14 @@ struct KindPods {
     namespace: String,
 }
 
+/// The label on the kind test's namespaces, so a run that was killed before deleting its
+/// namespace leaves nothing behind for long: the next run deletes it.
+const KIND_LABEL: (&str, &str) = ("flint-e2e", "shell");
+
 impl KindPods {
     fn create(kubeconfig: &std::path::Path) -> Result<KindPods> {
         use k8s_openapi::api::core::v1::{Namespace, Pod};
-        use kube::api::{Api, PostParams};
+        use kube::api::{Api, DeleteParams, ListParams, PostParams};
         use kube::runtime::wait::{await_condition, conditions::is_pod_running};
 
         let runtime = tokio::runtime::Runtime::new()?;
@@ -855,15 +892,34 @@ impl KindPods {
             .await?;
             anyhow::Ok(kube::Client::try_from(config)?)
         })?;
+        let namespaces: Api<Namespace> = Api::all(client.clone());
+        let label = format!("{}={}", KIND_LABEL.0, KIND_LABEL.1);
+        runtime.block_on(async {
+            // Leftovers of runs that were killed.
+            for stale in namespaces
+                .list(&ListParams::default().labels(&label))
+                .await?
+            {
+                let Some(name) = stale.metadata.name else {
+                    continue;
+                };
+                eprintln!("deleting namespace {name}, left by an earlier run");
+                namespaces.delete(&name, &DeleteParams::default()).await?;
+            }
+            let ns = serde_json::from_value(json!({"metadata": {
+                "name": namespace,
+                "labels": {KIND_LABEL.0: KIND_LABEL.1},
+            }}))?;
+            namespaces.create(&PostParams::default(), &ns).await?;
+            anyhow::Ok(())
+        })?;
+        // The namespace exists: from here on, dropping the guard deletes it.
         let pods = KindPods {
             runtime,
             client: client.clone(),
             namespace: namespace.clone(),
         };
         pods.runtime.block_on(async {
-            let namespaces: Api<Namespace> = Api::all(client.clone());
-            let ns = serde_json::from_value(json!({"metadata": {"name": namespace}}))?;
-            namespaces.create(&PostParams::default(), &ns).await?;
             let api: Api<Pod> = Api::namespaced(client, &namespace);
             for (name, image, command) in [
                 ("shell-bash", "nginx:1.27", None),
@@ -950,8 +1006,23 @@ fn up_41_shell_on_kind() -> Result<()> {
     run(&app, "echo hi-from-kind")?;
     let state = wait_for_row(&app, i, "hi-from-kind")?;
     let size = size(&state, i);
-    run(&app, "stty size")?;
-    wait_for_row(&app, i, &format!("{} {}", size.height, size.width))?;
+    // kube sends the first resize and stdin on separate channels, and kind has no fake to say
+    // when the resize arrived: ask again until the TTY has the tab's size.
+    let expected = format!("{} {}", size.height, size.width);
+    let mut sized = false;
+    for _ in 0..5 {
+        run(&app, "stty size")?;
+        if wait_for_row_within(&app, i, &expected, Duration::from_secs(2)).is_ok() {
+            sized = true;
+            break;
+        }
+    }
+    if !sized {
+        bail!(
+            "stty size never said {expected}: {:?}",
+            screen(&app.state()?, i)
+        );
+    }
     app.screenshot_themes("up41-shell-kind")?;
     run(&app, "exit 3")?;
     let state = app.wait_for(&at(i, "status/state"), Equals("exited".into()))?;
