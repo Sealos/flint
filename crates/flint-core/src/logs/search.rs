@@ -287,6 +287,30 @@ impl LogSearch {
             .saturating_sub(self.scanned_to.max(lines.first_id()))
     }
 
+    /// Whether a line of `lines` matches, counting lines not scanned yet (tested here, without
+    /// keeping the result): what an action's guard asks between two updates, which must
+    /// neither count evicted matches nor miss new ones.
+    pub fn has_match_in(&self, lines: &LogLines) -> bool {
+        let (first, end) = (lines.first_id(), lines.end_id());
+        let present = self.matches.partition_point(|id| *id < first);
+        self.matches.get(present).is_some_and(|id| *id < end)
+            || lines
+                .range(self.scanned_to.max(first), end)
+                .any(|(_, line)| self.matcher.matches_line(line))
+    }
+
+    /// How many lines of `lines` match, counting lines not scanned yet and not evicted matches,
+    /// as [`LogSearch::has_match_in`] sees them.
+    pub fn count_in(&self, lines: &LogLines) -> usize {
+        let (first, end) = (lines.first_id(), lines.end_id());
+        let present = self.matches.partition_point(|id| *id < first);
+        self.matches.len() - present
+            + lines
+                .range(self.scanned_to.max(first), end)
+                .filter(|(_, line)| self.matcher.matches_line(line))
+                .count()
+    }
+
     /// Matching line ids, oldest first.
     pub fn matches(&self) -> &VecDeque<LineId> {
         &self.matches
@@ -429,6 +453,36 @@ mod tests {
         assert_eq!(search.pending(&buffer.view()), 5);
         search.update(&buffer.view());
         assert_eq!(search.matches(), &[23, 24, 25, 26, 27]);
+    }
+
+    // covers UP-43: between updates, whether a line matches counts neither evicted matches
+    // nor misses new ones.
+    #[test]
+    fn has_match_in_sees_new_lines_and_forgets_evicted_ones() {
+        let mut buffer = LogBuffer::new(3);
+        push(&mut buffer, "error a");
+        let mut search = LogSearch::new(SearchQuery::new("error"));
+        search.update(&buffer.view());
+        assert!(search.has_match_in(&buffer.view()));
+        for t in ["ok", "ok", "ok"] {
+            push(&mut buffer, t);
+        }
+        assert_eq!(search.count(), 1, "not updated");
+        assert!(
+            !search.has_match_in(&buffer.view()),
+            "the match was evicted"
+        );
+        push(&mut buffer, "ERROR b");
+        assert!(
+            search.has_match_in(&buffer.view()),
+            "a line not scanned yet matches"
+        );
+        assert_eq!(search.count_in(&buffer.view()), 1);
+        push(&mut buffer, "error c");
+        assert_eq!(search.count_in(&buffer.view()), 2);
+        search.update(&buffer.view());
+        assert_eq!(search.count_in(&buffer.view()), search.count());
+        assert!(!LogSearch::default().has_match_in(&buffer.view()));
     }
 
     #[test]

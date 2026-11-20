@@ -399,8 +399,8 @@ impl LogView {
         });
     }
 
-    /// Brings the search up to the lines shown: before the tab is drawn, and before a match is
-    /// used. Snapshots do not scan, so a hidden tab scans nothing until it is shown again; then
+    /// Brings the search up to the lines shown before the tab is drawn (actions that use its
+    /// matches catch up at once: [`LogView::catch_up_now`]). Snapshots do not scan, so a hidden tab scans nothing until it is shown again; then
     /// it catches up at once, or on the core's threads when it is more than
     /// [`CATCH_UP_ON_UI`] lines behind. Nothing to do while a scan runs: it catches up when it
     /// lands.
@@ -413,6 +413,16 @@ impl LogView {
             self.scan(self.search.clone(), None, cx);
         } else {
             self.search.update(lines);
+        }
+    }
+
+    /// Brings the search up to the lines shown at once, before an action uses its matches, if
+    /// no scan runs on the core's threads (those actions are refused meanwhile:
+    /// [`LogView::has_matches`]). A tab on screen is at most a frame behind, so this scans few
+    /// lines.
+    fn catch_up_now(&mut self) {
+        if !self.searching {
+            self.search.update(&self.snapshot.lines);
         }
     }
 
@@ -448,7 +458,7 @@ impl LogView {
             sources: self.sources,
             wrap: self.wrap,
             has_lines: !self.snapshot.lines.is_empty(),
-            has_matches: self.search.count() > 0,
+            has_matches: self.has_matches(),
             has_selection: self.selection.is_some(),
         }
     }
@@ -539,7 +549,7 @@ impl LogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.catch_up_search(cx);
+        self.catch_up_now();
         let save = PendingSave {
             scope,
             format: LineFormat {
@@ -884,7 +894,7 @@ impl LogView {
         });
         let following = self.list.is_following_tail();
         let has_query = !self.query.text.is_empty();
-        let has_matches = self.search.count() > 0;
+        let has_matches = self.has_matches();
         let timestamps = self.timestamps;
         let workload = self.is_workload();
         let sources = self.sources;

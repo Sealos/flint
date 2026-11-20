@@ -135,8 +135,11 @@ impl LogView {
         self.selection.is_some()
     }
 
-    pub(in crate::ui) fn match_count(&self) -> usize {
-        self.search.count()
+    /// Whether a line shown matches the search, counting lines that arrived since the last
+    /// scan and not evicted ones: what Next and Previous Match, and Save Matching Lines, need.
+    /// `false` while a scan runs on the core's threads, whose matches are not known yet.
+    pub(in crate::ui) fn has_matches(&self) -> bool {
+        !self.searching && self.search.has_match_in(&self.snapshot.lines)
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
@@ -155,7 +158,8 @@ impl LogView {
         let reason = match scope {
             _ if !self.has_lines() => Some("no lines are shown"),
             SaveScope::All => None,
-            SaveScope::Matches if self.search.count() == 0 => Some("no lines match the search"),
+            SaveScope::Matches if self.searching => Some("still searching…"),
+            SaveScope::Matches if !self.has_matches() => Some("no lines match the search"),
             SaveScope::Matches => None,
             SaveScope::Selection if self.selection.is_none() => Some("no lines are selected"),
             SaveScope::Selection => None,
@@ -195,8 +199,13 @@ impl LogView {
         cx.notify();
     }
 
+    /// Goes to the next match, wrapping around. Nothing while a scan runs on the core's threads
+    /// (the guard refuses it then).
     pub(super) fn next_match(&mut self, _: &NextMatch, _: &mut Window, cx: &mut Context<Self>) {
-        self.catch_up_search(cx);
+        if self.searching {
+            return;
+        }
+        self.catch_up_now();
         let next = self
             .search
             .next_after(self.current_match)
@@ -204,8 +213,12 @@ impl LogView {
         self.go_to_match(next, cx);
     }
 
+    /// Goes to the previous match, wrapping around; see [`LogView::next_match`].
     pub(super) fn prev_match(&mut self, _: &PrevMatch, _: &mut Window, cx: &mut Context<Self>) {
-        self.catch_up_search(cx);
+        if self.searching {
+            return;
+        }
+        self.catch_up_now();
         let prev = self
             .search
             .prev_before(self.current_match)

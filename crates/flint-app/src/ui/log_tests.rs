@@ -1798,3 +1798,81 @@ async fn a_large_selection_is_counted_and_copied(cx: &mut TestAppContext) {
     let note = view.read_with(cx, |v, _| v.note.clone().unwrap().text);
     assert_eq!(note, "Copied 20,000 lines as shown, not redacted.");
 }
+
+// covers UP-43: between a snapshot and the next frame (here, a tab not drawn), Next Match and
+// Save Matching Lines see the lines shown: not matches evicted meanwhile, and new ones. While
+// a catch-up runs on the core's threads, they are refused.
+#[gpui_kit::test]
+async fn match_actions_see_the_lines_shown_and_wait_for_a_scan(cx: &mut TestAppContext) {
+    use super::CATCH_UP_ON_UI;
+    use crate::ui::registry::NextMatch;
+
+    let (core, _dir) = core();
+    let (window, shelf, view) = open_on_shelf(cx, core);
+    let mut lines = Feed::new(4);
+    // Lines 6..10 are kept: the error at 9 matches.
+    feed(cx, &view, lines.push(0, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 1
+    })
+    .await;
+    shelf.update(cx, |s, cx| {
+        s.shown = false;
+        cx.notify();
+    });
+    draw(cx, window);
+
+    // Lines 10..14 evict the match and hold none.
+    feed(cx, &view, lines.push(10, 14).streaming());
+    view.read_with(cx, |v, _| {
+        assert!(!v.has_matches(), "the evicted matches do not count");
+        assert!(v.check_save(SaveScope::Matches).is_err());
+    });
+    // Line 14 matches, not scanned yet.
+    feed(cx, &view, lines.push(14, 15).streaming());
+    view.read_with(cx, |v, _| {
+        assert!(v.has_matches());
+        assert!(v.check_save(SaveScope::Matches).is_ok());
+        let search = v.view_state().search;
+        assert_eq!((search.matches, search.searching), (1, false));
+    });
+    let next = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.next_match(&NextMatch, window, cx))
+        })
+        .unwrap();
+        view.read_with(cx, |v, _| v.current_match)
+    };
+    assert_eq!(next(cx), Some(14));
+
+    // Far behind: shown, it scans on the core's threads, and the actions wait for it.
+    let mut lines = Feed::new(CATCH_UP_ON_UI as usize * 2);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    view.update(cx, |v, cx| v.set_query("ERROR".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    feed(
+        cx,
+        &view,
+        lines.push(10, 10 + CATCH_UP_ON_UI + 1).streaming(),
+    );
+    shelf.update(cx, |s, cx| {
+        s.shown = true;
+        cx.notify();
+    });
+    draw(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(v.searching);
+        assert!(!v.has_matches());
+        let search = v.view_state().search;
+        assert_eq!((search.matches, search.searching), (0, true));
+        let refused = v.check_save(SaveScope::Matches).unwrap_err();
+        assert!(refused.to_string().contains("still searching"), "{refused}");
+    });
+    assert_eq!(next(cx), None, "nothing moves while searching");
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    assert_eq!(next(cx), Some(4));
+}
