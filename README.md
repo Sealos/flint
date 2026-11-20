@@ -285,7 +285,7 @@ gh release download -R Sealos/flint --pattern 'flint-mcp-*-x86_64-unknown-linux-
 sha256sum -c flint-mcp-*-x86_64-unknown-linux-musl.tar.gz.sha256
 tar -xzf flint-mcp-*-x86_64-unknown-linux-musl.tar.gz
 install -D -m 755 flint-mcp/flint-mcp ~/.local/bin/flint-mcp
-flint-mcp --version
+"$HOME/.local/bin/flint-mcp" --version
 claude mcp add flint -- "$HOME/.local/bin/flint-mcp"
 ```
 

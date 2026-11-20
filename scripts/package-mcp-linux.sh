@@ -39,9 +39,11 @@ out=$PWD
 # cc-rs looks for a cross compiler named <arch>-linux-musl-gcc for aarch64; the native musl-gcc
 # is the one to use on both architectures.
 export "CC_${target//-/_}=${CC_MUSL:-musl-gcc}"
-(cd "$repo" && cargo build --release --locked -p flint-mcp --bin flint-mcp --target "$target")
-# Cargo resolves a relative CARGO_TARGET_DIR against the repo, where it ran; so does this.
+# An explicit target directory, so the binary packaged is the one just built whatever Cargo's
+# configuration says. A relative CARGO_TARGET_DIR counts from the repo, as Cargo would.
 target_dir=$(cd "$repo" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)
+(cd "$repo" && cargo build --release --locked -p flint-mcp --bin flint-mcp --target "$target" \
+  --target-dir "$target_dir")
 binary=$target_dir/$target/release/flint-mcp
 
 # No program interpreter and no shared libraries: what makes it run without the host's libc.
@@ -50,9 +52,10 @@ if grep -q 'Requesting program interpreter' <<<"$headers"; then
   echo "error: $binary asks for a program interpreter; it is not static" >&2
   exit 1
 fi
-if readelf -dW "$binary" | grep -q '(NEEDED)'; then
+dynamic=$(readelf -dW "$binary")
+if grep -q '(NEEDED)' <<<"$dynamic"; then
   echo "error: $binary links shared libraries:" >&2
-  readelf -dW "$binary" | grep '(NEEDED)' >&2
+  grep '(NEEDED)' <<<"$dynamic" >&2
   exit 1
 fi
 echo "static: no interpreter, no shared libraries"
