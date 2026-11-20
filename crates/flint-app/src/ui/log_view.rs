@@ -1014,6 +1014,8 @@ impl LogView {
         };
         let facts = self.menu_facts();
         let has_lines = !lines.is_empty();
+        // Save writes the rows shown: none when a filter hides every line.
+        let can_save = facts.has_lines;
         h_flex()
             .id("log-toolbar")
             .h(px(super::workspace::HEADER_HEIGHT))
@@ -1294,7 +1296,7 @@ impl LogView {
                                     .xsmall()
                                     .ghost()
                                     .tooltip("Save to a file")
-                                    .disabled(!has_lines)
+                                    .disabled(!can_save)
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
                                         move |menu, _, cx| {

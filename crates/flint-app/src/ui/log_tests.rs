@@ -2190,7 +2190,61 @@ async fn a_filtered_tab_saves_and_copies_the_rows_it_shows(cx: &mut TestAppConte
     run(cx, window, "logs::CopyLines", serde_json::Value::Null);
     cx.run_until_parked();
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
-    assert_eq!(copied, "ERROR line 4\nERROR line 9\n");
+    // Newlines between the rows, none after the last, as an unfiltered copy: a pasted row is
+    // not entered.
+    assert_eq!(copied, "ERROR line 4\nERROR line 9");
+}
+
+// covers UP-48: as lines come and go, the matches among the rows shown are kept up to date
+// from what was found before, the same as finding them again over every match.
+#[gpui_kit::test]
+async fn shown_matches_follow_new_and_evicted_lines(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(40);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+    view.update(cx, |v, cx| v.set_query("line 1".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    run(
+        cx,
+        window,
+        "logs::SetLogContext",
+        serde_json::json!({"lines": 1}),
+    );
+    until_rows(cx, window, &view, 11).await;
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    let generations = view.read_with(cx, |v, _| (v.search_generation, v.filter_generation));
+    for to in (27..=202).step_by(7) {
+        let from = view.read_with(cx, |v, _| v.snapshot.lines.end_id());
+        // Found from what was found before.
+        view.read_with(cx, |v, _| v.shown_matches());
+        feed(cx, &view, lines.push(from, to).streaming());
+        draw(cx, window);
+        let (kept, again) = view.read_with(cx, |v, _| {
+            let kept = v.shown_matches();
+            *v.shown_matches.borrow_mut() = None;
+            (kept, v.shown_matches())
+        });
+        assert_eq!(kept, again, "up to line {to}");
+    }
+    let (shown, now) = view.read_with(cx, |v, _| {
+        (
+            v.shown_matches(),
+            (v.search_generation, v.filter_generation),
+        )
+    });
+    assert_eq!(now, generations, "lines only came and went");
+    // Lines 162 to 201 are in the buffer: the errors 164 to 199 and a line either side, of
+    // which those up to 199 say "line 1".
+    assert_eq!(shown.first(), Some(&163));
+    assert_eq!(shown.last(), Some(&199));
 }
 
 // covers UP-48: a refilter on its way is not lost to a long catch-up, and a context change

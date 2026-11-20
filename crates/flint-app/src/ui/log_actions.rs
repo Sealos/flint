@@ -192,7 +192,8 @@ impl LogView {
 
     /// The matches among the rows shown in a filtered tab, oldest first. Found again only when
     /// the search's matches or the rows changed, in one walk over both (they are sorted), so a
-    /// redraw does not go over every match.
+    /// redraw does not go over every match. While lines only come and go (same search, filter
+    /// and rows), only the end is walked again: see [`LogView::shown_matches_from`].
     pub(in crate::ui) fn shown_matches(&self) -> Arc<[LineId]> {
         let rows = self.filter_rows();
         let matches = self.search.matches();
@@ -210,7 +211,8 @@ impl LogView {
             }),
             first: self.snapshot.lines.first_id(),
         };
-        if let Some((cached, shown)) = &*self.shown_matches.borrow()
+        let mut cache = self.shown_matches.borrow_mut();
+        if let Some((cached, shown)) = &*cache
             && *cached == key
         {
             return shown.clone();
@@ -218,20 +220,47 @@ impl LogView {
         let shown: Arc<[LineId]> = match rows {
             None => Arc::from([]),
             Some(rows) => {
-                let mut rows = rows.iter().peekable();
-                matches
-                    .iter()
+                let (kept, from) = match &*cache {
+                    Some((old, shown))
+                        if old.search == key.search
+                            && old.filter == key.filter
+                            && old.rows_generation == key.rows_generation =>
+                    {
+                        let from = self.shown_matches_from(old);
+                        let first = key.first;
+                        let start = shown.partition_point(|id| *id < first);
+                        let end = shown.partition_point(|id| *id < from);
+                        (&shown[start..end.max(start)], from)
+                    }
+                    _ => (&[][..], 0),
+                };
+                let mut rows = rows
+                    .range(rows.partition_point(|id| *id < from)..)
+                    .peekable();
+                let found = matches
+                    .range(matches.partition_point(|id| *id < from)..)
                     .copied()
                     .filter(|id| {
                         while rows.next_if(|row| **row < *id).is_some() {}
                         rows.peek().is_some_and(|row| **row == *id)
                             && self.snapshot.lines.contains(*id)
-                    })
-                    .collect()
+                    });
+                kept.iter().copied().chain(found).collect()
             }
         };
-        *self.shown_matches.borrow_mut() = Some((key, shown.clone()));
+        *cache = Some((key, shown.clone()));
         shown
+    }
+
+    /// From which line [`LogView::shown_matches`] found from `old` can change while only lines
+    /// come and go: line ids only grow, a new match comes after the last one scanned, and a new
+    /// row at most `context` lines before the last row (the context before a new match). Before
+    /// that, only evicted lines drop out.
+    fn shown_matches_from(&self, old: &ShownMatchesKey) -> LineId {
+        let context = self.filter.as_ref().map_or(0, |f| f.spec().context) as LineId;
+        let rows = old.rows.2.map_or(0, |back| back.saturating_sub(context));
+        let matches = old.matches.2.map_or(0, |back| back + 1);
+        rows.min(matches)
     }
 
     /// Whether a line shown matches the search, counting lines that arrived since the last
@@ -486,8 +515,15 @@ impl LogView {
                 .background_spawn(async move {
                     match rows {
                         Some(rows) => {
+                            // As `text_as` copies: newlines between lines, none after the last,
+                            // so a pasted line is not sent as typed and entered.
                             log_model::save_text(&lines, SaveScope::Matches, &rows, None, format)
-                                .map(|(text, _)| text)
+                                .map(|(mut text, _)| {
+                                    if text.ends_with('\n') {
+                                        text.pop();
+                                    }
+                                    text
+                                })
                                 .unwrap_or_default()
                         }
                         None => selection.text_as(&lines, format),
