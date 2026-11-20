@@ -35,6 +35,7 @@ use gpui_kit::*;
 
 pub use super::dock_model::TabStatus;
 use super::dock_model::{self, TabCluster, chip_labels, chip_tooltip};
+use super::focus::release_unfocused_input;
 use super::log_view::{LogRequest, LogView};
 use super::menu_record;
 use super::registry::{
@@ -559,10 +560,14 @@ impl Dock {
             } else {
                 self.visible = false;
                 if had_focus {
+                    // Not left on the closed tab: the dock holds it until its owner takes it.
+                    window.focus(&self.focus, cx);
                     cx.emit(DockEvent::Blurred);
                 }
             }
         }
+        // The closed tab's search field, focused now or when another tab was shown.
+        release_unfocused_input(window, cx);
         // Closing a tab before the active one moves it left, maybe out of view.
         self.reveal_active();
         cx.notify();

@@ -6,6 +6,7 @@
 //! that failure, then show an object as a finished fetch would ([`show_fetched`]).
 
 use flint_core::{KindId, ObjectDetail, SyncState};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
 use serde_json::{Value, json};
@@ -391,6 +392,57 @@ async fn the_refresh_key_refetches_or_retries(cx: &mut TestAppContext) {
     t.focus_workspace(cx);
     t.press_key_of(cx, "workspace::RetryConnection");
     t.wait_for_attempts(cx, "beta", attempts + 1).await;
+}
+
+// A detail pane closed while its YAML has focus (clicked into, to select and copy) is freed with
+// its editor. The window keeps the focused text field registered (gpui-component's
+// `WindowState`, a strong handle) until asked after focus moved on.
+#[gpui_kit::test]
+async fn a_detail_pane_closed_from_its_yaml_is_released(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.open_kind(
+        cx,
+        "pods",
+        objects(KindId::pods(), &[("demo", "api", 0)], SyncState::Synced, 1),
+    )
+    .await;
+
+    let snapshot = cx.update(|cx| cx.leak_detector_snapshot());
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    t.dispatch(cx, "detail::ShowYaml", Value::Null).unwrap();
+    cx.run_until_parked();
+    let pane = view(cx, &t);
+    let yaml = pane.read_with(cx, |d, _| d.yaml.clone());
+    cx.update_window(t.window, |_, window, cx| {
+        let focus = gpui_kit::Focusable::focus_handle(yaml.read(cx), cx);
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let registered = cx
+        .update_window(t.window, |_, window, cx| window.has_focused_input(cx))
+        .unwrap();
+    assert!(registered, "the YAML is the window's focused text field");
+    let (pane, yaml) = {
+        let weak = (pane.downgrade(), yaml.downgrade());
+        drop((pane, yaml));
+        weak
+    };
+    t.dispatch(cx, "detail::Close", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert!(t.detail(cx).is_none());
+    pane.assert_released();
+    yaml.assert_released();
+    cx.update(|cx| cx.assert_no_new_leaks(&snapshot));
 }
 
 // A closed detail pane is freed, with its YAML editor and fetch task.

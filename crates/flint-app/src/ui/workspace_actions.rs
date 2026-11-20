@@ -15,6 +15,7 @@ use gpui_kit::*;
 
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::Dock;
+use super::super::focus::release_unfocused_input;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
@@ -329,6 +330,8 @@ impl Workspace {
             None => self.focus.clone(),
         };
         window.focus(&focus, cx);
+        // A text field that had focus in the closed view (a list's filter, a log tab's search).
+        release_unfocused_input(window, cx);
     }
 
     fn settings_ok(&self, cx: &App) -> bool {

@@ -855,3 +855,57 @@ async fn a_closed_list_is_released(cx: &mut TestAppContext) {
     services_list.assert_released();
     services_filter.assert_released();
 }
+
+// A list closed while its filter has focus is freed with it: replaced by another kind (focus
+// moves to the new list) and closed by a cluster switch (the workspace takes focus back). The
+// window keeps the focused text input registered (gpui-component's `WindowState`, a strong
+// handle) until asked after focus moved on.
+#[gpui_kit::test]
+async fn a_list_closed_while_filtering_is_released(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{open_workspace, pods, standard_sections};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let filtering = |cx: &mut TestAppContext| {
+        t.press_key_of(cx, "resource_list::FocusFilter");
+        cx.run_until_parked();
+        let list = t.list(cx).unwrap();
+        let filter = list.read_with(cx, |l, _| l.filter.clone());
+        let focused = cx
+            .update_window(t.window, |_, window, cx| {
+                gpui_kit::Focusable::focus_handle(filter.read(cx), cx).is_focused(window)
+            })
+            .unwrap();
+        assert!(focused, "the filter has focus");
+        let registered = cx
+            .update_window(t.window, |_, window, cx| {
+                use gpui_kit::component::WindowExt as _;
+                window.has_focused_input(cx)
+            })
+            .unwrap();
+        assert!(registered, "the filter is the window's focused text field");
+        (list.downgrade(), filter.downgrade())
+    };
+
+    // Replaced by another kind.
+    t.open_kind(cx, "pods", pods(&[("demo", "api", 0)])).await;
+    let (pods_list, pods_filter) = filtering(cx);
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "services"}),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    pods_list.assert_released();
+    pods_filter.assert_released();
+
+    // Closed by a cluster switch.
+    let (services_list, services_filter) = filtering(cx);
+    t.activate(cx, "beta").await;
+    cx.run_until_parked();
+    assert!(t.list(cx).is_none());
+    services_list.assert_released();
+    services_filter.assert_released();
+}

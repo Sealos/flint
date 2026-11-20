@@ -32,6 +32,7 @@ use super::confirm::{self, DialogText};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, refused};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
 use super::dock_model::TabCluster;
+use super::focus::release_unfocused_input;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
@@ -783,6 +784,8 @@ impl Workspace {
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
         let focus = list.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
+        // The closed list's filter, if it had focus.
+        release_unfocused_input(window, cx);
         self.list = Some(list);
         let save = self.ui_state.set_last_view(&cluster, entry.id.as_str());
         self.persist(save, cx);
@@ -806,6 +809,8 @@ impl Workspace {
                 self._detail_subscriptions.clear();
                 let focus = list.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
+                // The closed pane's YAML, if it had focus.
+                release_unfocused_input(window, cx);
             }
             ListEvent::Selected(Some(selected)) => {
                 let list = list.read(cx);
@@ -866,6 +871,8 @@ impl Workspace {
                         }),
                     ];
                 self.detail = Some(detail);
+                // The replaced pane's YAML, if it had focus and focus has moved on.
+                release_unfocused_input(window, cx);
                 self.tell_detail_sessions_blocked(cx);
             }
             ListEvent::SelectedChanged => {
