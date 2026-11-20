@@ -598,13 +598,18 @@ opens in a tab in the bottom dock.
   another server, or lacks it. A change undone by a later reload still counts.
   - **What a load confirms.** The loader reads the kubeconfig files in order, and the first file that defines a name
     wins. A file that fails to load (caught half-written) is skipped, and what it defines is unknown. A context
-    missing from a load is removed only if no failed file ranks at or above the file that defined it. A context
-    with another server is a confirmed change only if no failed file ranks above the file it now comes from;
-    otherwise it may be a later file's fallback, showing while the first file is unreadable, and it stays
-    provisional. A failed file ranked after a context's file masks no change to it.
-  - **Provisional entries.** Sessions on the confirmed definition go on. A log session is never handed the
-    fallback's client: it waits for the file. A shell opened on a fallback is pinned stale, and ends at its next
-    check.
+    missing from a load is removed only if no failed file ranks at or above the file that defined it, and no
+    failed file defined it too (a shadowed definition) when it last loaded. A failure in a file never known to
+    define the context masks nothing. A context with another server is a confirmed change only if no failed file
+    ranks above the file it now comes from; otherwise it may be a later file's fallback, showing while the first
+    file is unreadable, and it stays provisional.
+  - **Provisional entries.** What a load cannot confirm never replaces confirmed history, its file included, even
+    on the same server. A context first seen that way (a file before it already unreadable at startup) is recorded
+    as unconfirmed; a load that confirms it on the same server keeps its sessions. Sessions on the confirmed
+    definition go on while a fallback shows. A session opened on the fallback (a shell, or a log tab, labelled with
+    the fallback's server) is pinned to that server, stale: its first check ends it with why, so it never moves to
+    the confirmed server once the first file loads again. A log session is never handed a client for another
+    server than its pin.
   - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
     A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
