@@ -245,6 +245,8 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
         ExecState::Exited { code: Some(0) } => (Tone::Muted, "Exited (code 0)".to_owned()),
         ExecState::Exited { code: Some(code) } => (Tone::Warning, format!("Exited (code {code})")),
         ExecState::Exited { code: None } => (Tone::Muted, "Exited".to_owned()),
+        // Core ended it as the tab does ([`toolbar_state`]).
+        ExecState::Failed(f) if f.kind == ExecFailureKind::ContextChanged => context_changed(),
         // Why is said once, in the tab's banner ([`failure_words`]).
         ExecState::Failed(_) => (Tone::Danger, "Failed".to_owned()),
         ExecState::Closed => (Tone::Muted, "Closed".to_owned()),
@@ -255,10 +257,14 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
 /// re-pointed), else the session's state ([`state_text`]).
 pub fn toolbar_state(state: &ExecState, ended_by_tab: bool) -> (Tone, String) {
     if ended_by_tab {
-        (Tone::Warning, "Ended: the context changed".to_owned())
+        context_changed()
     } else {
         state_text(state)
     }
+}
+
+fn context_changed() -> (Tone, String) {
+    (Tone::Warning, "Ended: the context changed".to_owned())
 }
 
 /// Why a shell could not run, in plain words, and what was said (by the server, the
@@ -278,6 +284,9 @@ pub fn failure_words(failure: &ExecFailure) -> (&'static str, String) {
         ExecFailureKind::Upgrade => {
             "The connection to the cluster can't carry a shell (a proxy may be blocking \
              WebSocket upgrades)."
+        }
+        ExecFailureKind::ContextChanged => {
+            "The shell ended: its context now points to another cluster, or is gone."
         }
         ExecFailureKind::Other => "The shell could not start.",
         ExecFailureKind::Server => server_words(&failure.message),
@@ -567,6 +576,14 @@ mod tests {
             (Tone::Danger, "Failed".into())
         );
         assert_eq!(state_text(&ExecState::Closed).1, "Closed");
+        // covers UP-06: core ended it because its context changed, as the tab would.
+        assert_eq!(
+            state_text(&ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::ContextChanged,
+                "\"main\" now points to a different API server"
+            ))),
+            (Tone::Warning, "Ended: the context changed".into())
+        );
     }
 
     // covers UP-41: common exec failures read in plain words, the server's text kept as the
@@ -648,6 +665,14 @@ mod tests {
                 "the exec connection broke: reset"
             ),
             "The connection to the shell broke."
+        );
+        // covers UP-06
+        assert_eq!(
+            words(
+                ExecFailureKind::ContextChanged,
+                "\"main\" is no longer in your kubeconfig files"
+            ),
+            "The shell ended: its context now points to another cluster, or is gone."
         );
         assert_eq!(
             failure_words(&ExecFailure::new(ExecFailureKind::Server, " boom ")).1,

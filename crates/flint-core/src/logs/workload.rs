@@ -30,6 +30,7 @@ use super::pods::{ContainerInfo, PodEvent, PodEvents, PodInfo, PodSet, PodSource
 use super::session::{Feed, LogOptions, LogState, LogTarget, Output, SessionConfig};
 use super::source::{LogError, LogSource};
 use super::stream::{Member, Retry, Stream};
+use crate::recheck::{RECHECK_EVERY, Recheck};
 
 /// What a workload session reads: its pods and the state of each stream. Rebuilt only when
 /// something in it changes, not for every line.
@@ -130,10 +131,6 @@ struct Entry {
 /// Most outcomes taken from one ready stream in a row.
 const STEP_BATCH: usize = 256;
 
-/// How often a following session checks its context still points at the server it was opened
-/// on, while the pod watch stays open (see [`PodSource::check`]).
-pub(crate) const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
-
 pub(crate) struct WorkloadFeed {
     logs: Arc<dyn LogSource>,
     pods: Arc<dyn PodSource>,
@@ -159,9 +156,8 @@ pub(crate) struct WorkloadFeed {
     /// the others.
     cursor: usize,
     status_dirty: bool,
-    /// When to check the context next, and the check in flight.
-    recheck: Pin<Box<Sleep>>,
-    checking: Option<BoxFuture<'static, Result<(), LogError>>>,
+    /// When to check the context next, and the check in flight (see [`PodSource::check`]).
+    recheck: Recheck<Result<(), LogError>>,
 }
 
 impl WorkloadFeed {
@@ -190,8 +186,7 @@ impl WorkloadFeed {
             queue: VecDeque::new(),
             cursor: 0,
             status_dirty: true,
-            recheck: Box::pin(tokio::time::sleep(RECHECK_EVERY)),
-            checking: None,
+            recheck: Recheck::new(RECHECK_EVERY),
         };
         match &feed.target.pods {
             PodSet::Selector(selector) if selector.trim().is_empty() => {
@@ -542,15 +537,8 @@ impl WorkloadFeed {
         if !matches!(self.watch, Watch::Events(_)) {
             return Poll::Pending;
         }
-        if self.checking.is_none() {
-            std::task::ready!(self.recheck.as_mut().poll(cx));
-            let next = tokio::time::Instant::now() + RECHECK_EVERY;
-            self.recheck.as_mut().reset(next);
-            self.checking = Some(self.pods.check());
-        }
-        let checking = self.checking.as_mut().expect("set above");
-        let result = std::task::ready!(checking.poll_unpin(cx));
-        self.checking = None;
+        let pods = &self.pods;
+        let result = std::task::ready!(self.recheck.poll_check(cx, || pods.check()));
         // Only a cluster error is about the session; a cluster that is reconnecting is the
         // streams' and the watch's business.
         Poll::Ready(result.err().filter(LogError::is_cluster).map(|e| e.message))

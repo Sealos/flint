@@ -21,6 +21,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -36,6 +37,7 @@ use tokio::time::Instant;
 use crate::api_error::ApiError;
 use crate::cluster::{ClusterError, ClusterId};
 use crate::protection::WriteRefusal;
+use crate::recheck::Recheck;
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -175,6 +177,10 @@ pub enum ExecFailureKind {
     /// The cluster is protected (ADR-0015): Flint opens no shell in it until the user unlocks
     /// or trusts it. Nothing reached the cluster.
     Protected,
+    /// The session's context was removed, or now points to another API server than the one the
+    /// session opened on, so Flint ended it (the message says which). Checked every
+    /// 30 s while the session connects or runs.
+    ContextChanged,
     /// Anything else: no cause Flint can name (the full text says what happened).
     Other,
 }
@@ -569,21 +575,55 @@ impl Launcher for KubeLauncher {
     }
 }
 
-/// Runs a session on the core runtime: with a client, against the cluster; without one, the
-/// session fails at once with the given reason (the cluster is not connected, say).
+/// Says why a session must end because its context changed ([`crate::recheck::reason`]), or
+/// `None` while the context still points at the API server the session opened on.
+pub(crate) type ContextCheck = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
+
+/// Runs a session's [`ContextCheck`] every so often (see [`crate::recheck`]).
+pub(crate) struct ContextWatch {
+    check: ContextCheck,
+    recheck: Recheck<Option<String>>,
+}
+
+impl ContextWatch {
+    pub fn new(check: ContextCheck, every: Duration) -> Self {
+        Self {
+            check,
+            recheck: Recheck::new(every),
+        }
+    }
+
+    /// Resolves with why the session must end, once a check says so. Cancel-safe: the timer
+    /// and a check in flight carry over to the next call.
+    async fn changed(&mut self) -> String {
+        let Self { check, recheck } = self;
+        std::future::poll_fn(|cx| {
+            loop {
+                if let Some(reason) = std::task::ready!(recheck.poll_check(cx, || check())) {
+                    return Poll::Ready(reason);
+                }
+            }
+        })
+        .await
+    }
+}
+
+/// Runs a session on the core runtime: with a client, against the cluster, while `watch` finds
+/// its context unchanged; without one, the session fails at once with the given reason (the
+/// cluster is not connected, say).
 pub(crate) async fn start(
-    client: Result<Client, WriteRefusal>,
+    client: Result<(Client, ContextWatch), WriteRefusal>,
     request: ExecRequest,
     channels: SessionChannels,
 ) {
     match client {
-        Ok(client) => {
+        Ok((client, watch)) => {
             let launcher = KubeLauncher {
                 api: Api::namespaced(client, &request.namespace),
                 pod: request.pod.clone(),
                 container: request.container.clone(),
             };
-            run(launcher, request, channels).await;
+            run(launcher, request, channels, watch).await;
         }
         Err(refusal) => {
             let kind = match refusal {
@@ -603,8 +643,14 @@ pub(crate) async fn start(
 }
 
 /// The session task: tries each candidate command, drives the one that starts, then keeps the
-/// screen available until the front end closes the session.
-pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels: SessionChannels) {
+/// screen available until the front end closes the session. Ends the command, closing its
+/// connection, when `watch` finds the context changed.
+pub(crate) async fn run(
+    launcher: impl Launcher,
+    request: ExecRequest,
+    channels: SessionChannels,
+    mut watch: ContextWatch,
+) {
     let mut session = Session::new(channels);
     let candidates = request.candidates();
     // Typed before the command started; sent once it has.
@@ -615,15 +661,21 @@ pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels:
         let mut launch = launcher.launch(command.clone());
         let launched = loop {
             tokio::select! {
-                result = &mut launch => break result,
+                result = &mut launch => break Some(result),
                 input = session.next_input() => {
                     if session.handle_offline(input, Some(&mut pending)) == Flow::Close {
                         session.set_state(ExecState::Closed);
                         return;
                     }
                 }
+                reason = watch.changed() => {
+                    session.set_state(ExecState::Failed(context_changed(reason)));
+                    break None;
+                }
             }
         };
+        // The context changed: the connection being opened is dropped.
+        let Some(launched) = launched else { break };
         let process = match launched {
             Ok(process) => process,
             Err(e) if e.missing_command && !last => {
@@ -640,7 +692,7 @@ pub(crate) async fn run(launcher: impl Launcher, request: ExecRequest, channels:
         });
         let executable = command.first().map_or("", String::as_str);
         match session
-            .drive(process, executable, &mut pending, !last)
+            .drive(process, executable, &mut pending, !last, &mut watch)
             .await
         {
             Outcome::MissingCommand(_) if !last => {
@@ -878,13 +930,16 @@ impl Session {
     /// closed. `pending` holds keystrokes typed before it started, which are sent first. When
     /// another shell would be tried if this one turns out not to exist (`fallback`), `pending`
     /// keeps them (with what is typed next) until the output shows the command started (it
-    /// cannot be a runtime's launch error any more); otherwise it is emptied at once.
+    /// cannot be a runtime's launch error any more); otherwise it is emptied at once. When
+    /// `watch` finds the context changed, the command ends at once: returning drops the
+    /// connection, as closing the session does.
     async fn drive(
         &mut self,
         process: Process,
         executable: &str,
         pending: &mut Vec<u8>,
         fallback: bool,
+        watch: &mut ContextWatch,
     ) -> Outcome {
         let Process {
             stdin,
@@ -951,6 +1006,11 @@ impl Session {
                 result = &mut finish, if connection.is_none() => {
                     connection = Some((result, Instant::now() + DRAIN_WAIT));
                 }
+                // Never on another server than the one the session opened on.
+                reason = watch.changed(), if connection.is_none() => {
+                    self.model.end_sync();
+                    return Outcome::Done(ExecState::Failed(context_changed(reason)));
+                }
                 // The connection is gone and the output stream never ended.
                 () = tokio::time::sleep_until(drained.unwrap_or_else(Instant::now)),
                     if drained.is_some() => break,
@@ -1014,6 +1074,10 @@ impl Session {
             }
         }
     }
+}
+
+fn context_changed(reason: String) -> ExecFailure {
+    ExecFailure::new(ExecFailureKind::ContextChanged, reason)
 }
 
 /// A spawned task that is aborted when this is dropped, so the work stops with whoever waits
@@ -1307,9 +1371,86 @@ mod tests {
     }
 
     fn open(launcher: &FakeLauncher, request: ExecRequest) -> ExecSession {
+        let never: ContextCheck = Arc::new(|| async { None }.boxed());
+        open_watched(launcher, request, never)
+    }
+
+    /// How often [`open_watched`] sessions check their context.
+    const CHECK_EVERY: Duration = Duration::from_millis(20);
+
+    fn open_watched(
+        launcher: &(impl Launcher + Clone),
+        request: ExecRequest,
+        check: ContextCheck,
+    ) -> ExecSession {
         let (session, channels) = ExecSession::new(request.clone());
-        tokio::spawn(run(launcher.clone(), request, channels));
+        let watch = ContextWatch::new(check, CHECK_EVERY);
+        tokio::spawn(run(launcher.clone(), request, channels, watch));
         session
+    }
+
+    /// A context the test re-points or removes, as kubeconfig reloads record it in the cluster
+    /// manager, and how many checks a session pinned to it (at `https://staging`) made, as
+    /// [`ContextCheck`] does through the manager.
+    #[derive(Clone)]
+    struct FakeContext {
+        history: Arc<Mutex<crate::recheck::ContextHistory>>,
+        pin: crate::recheck::ContextPin,
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeContext {
+        fn new() -> Self {
+            let mut history = crate::recheck::ContextHistory::default();
+            history.record([("main", Some("https://staging"))], true);
+            let pin = history.pin("main");
+            Self {
+                history: Arc::new(Mutex::new(history)),
+                pin,
+                checks: Arc::default(),
+            }
+        }
+
+        /// A kubeconfig reload where `main` points to `server`, or is gone (`None`).
+        fn point_to(&self, server: Option<&'static str>) {
+            let found = server.map(|server| ("main", Some(server)));
+            self.history.lock().unwrap().record(found, true);
+        }
+
+        fn check(&self) -> ContextCheck {
+            let context = self.clone();
+            Arc::new(move || {
+                context
+                    .checks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reason = context.history.lock().unwrap().check(
+                    crate::recheck::Pinned::Shell,
+                    "main",
+                    context.pin,
+                );
+                async move { reason }.boxed()
+            })
+        }
+
+        async fn checked(&self, times: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.checks.load(std::sync::atomic::Ordering::SeqCst) < times {
+                    tokio::time::sleep(CHECK_EVERY).await;
+                }
+            })
+            .await
+            .expect("the session checks its context");
+        }
+    }
+
+    /// Waits until the connection is dropped: kube's task, and with it the WebSocket, is gone.
+    async fn connection_closed(remote: &mut Remote) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            remote.finish.as_mut().expect("still connected").closed(),
+        )
+        .await
+        .expect("the connection was closed");
     }
 
     fn request() -> ExecRequest {
@@ -1569,6 +1710,107 @@ mod tests {
             .unwrap();
         assert!(rest.is_empty());
         assert!(!session.changed().await, "the session task ended");
+    }
+
+    // covers UP-06, UP-41: `aws eks update-kubeconfig --alias main` re-points `main` while a
+    // shell on it runs. The shell ends with the reason and its connection is closed, so it
+    // never goes on running on a server `main` no longer means.
+    #[tokio::test]
+    async fn a_re_pointed_context_ends_the_shell_and_closes_its_connection() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let context = FakeContext::new();
+        let mut session = open_watched(&launcher, request(), context.check());
+        remote.next_resize().await;
+        remote.print(b"staging$ ").await;
+        wait_for(&mut session, "output", |s| {
+            s.terminal.row_text(0) == "staging$"
+        })
+        .await;
+        // Checks that find the context unchanged leave the shell running.
+        context.checked(3).await;
+        assert!(matches!(session.peek().state, ExecState::Running { .. }));
+
+        context.point_to(Some("https://production"));
+        let snap = wait_for(&mut session, "the end", |s| s.state.is_finished()).await;
+        assert_eq!(
+            snap.state,
+            ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::ContextChanged,
+                "\"main\" now points to a different API server; open the shell again to run \
+                 one there"
+            ))
+        );
+        connection_closed(&mut remote).await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), remote.stdin.read_to_end(&mut rest))
+            .await
+            .expect("stdin closed")
+            .unwrap();
+        // The screen stays readable, and keystrokes go nowhere.
+        assert_eq!(snap.terminal.row_text(0), "staging$");
+        session.write(b"rm -rf /tmp/x\r".to_vec());
+        session.close();
+        wait_for(&mut session, "closed", |s| s.state.is_finished()).await;
+        assert!(!session.changed().await, "the session task ended");
+        assert!(rest.is_empty());
+    }
+
+    // covers UP-06, UP-41
+    #[tokio::test]
+    async fn a_removed_context_ends_the_shell() {
+        let launcher = FakeLauncher::default();
+        let (proc_, mut remote) = process();
+        launcher.push(Ok(proc_));
+        let context = FakeContext::new();
+        let mut session = open_watched(&launcher, request(), context.check());
+        remote.next_resize().await;
+        context.point_to(None);
+        let snap = wait_for(&mut session, "the end", |s| s.state.is_finished()).await;
+        assert_eq!(
+            snap.state,
+            ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::ContextChanged,
+                "\"main\" is no longer in your kubeconfig files"
+            ))
+        );
+        connection_closed(&mut remote).await;
+    }
+
+    // covers UP-06, UP-41: a connection still being opened when the context moves is dropped,
+    // and no shell starts.
+    #[tokio::test]
+    async fn a_context_that_moves_while_connecting_stops_the_connect() {
+        /// A launch that never finishes, and says when it is dropped.
+        #[derive(Clone)]
+        struct Hanging(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+        impl Launcher for Hanging {
+            fn launch(&self, _: Vec<String>) -> BoxFuture<'static, Result<Process, LaunchError>> {
+                let dropped = self.0.lock().unwrap().take();
+                async move {
+                    let _dropped = dropped;
+                    std::future::pending().await
+                }
+                .boxed()
+            }
+        }
+        let (dropped, connect_dropped) = oneshot::channel();
+        let launcher = Hanging(Arc::new(Mutex::new(Some(dropped))));
+        let context = FakeContext::new();
+        let mut session = open_watched(&launcher, request(), context.check());
+        context.checked(2).await;
+        assert_eq!(session.peek().state, ExecState::Connecting);
+        context.point_to(Some("https://production"));
+        let snap = wait_for(&mut session, "the end", |s| s.state.is_finished()).await;
+        let ExecState::Failed(failure) = &snap.state else {
+            panic!("{:?}", snap.state);
+        };
+        assert_eq!(failure.kind, ExecFailureKind::ContextChanged);
+        tokio::time::timeout(Duration::from_secs(5), connect_dropped)
+            .await
+            .expect("the connect was dropped")
+            .unwrap_err();
     }
 
     // covers UP-41
