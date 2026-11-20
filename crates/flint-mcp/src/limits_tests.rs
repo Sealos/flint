@@ -9,6 +9,7 @@ fn limits(running: usize, waiting: usize) -> Limits {
         waiting,
         reply_budget: 1000,
         deadline: Duration::from_secs(60),
+        unanswered: 8,
     }
 }
 
@@ -93,7 +94,7 @@ impl Transport<RoleServer> for Gated {
 #[tokio::test]
 async fn reply_bytes_count_until_written() {
     let replies = Arc::new(ReplyBytes::default());
-    let mut transport = Counted::new(Gated { gates: Vec::new() }, replies.clone());
+    let mut transport = Counted::new(Gated { gates: Vec::new() }, replies.clone(), &limits(1, 1));
     let reply: TxJsonRpcMessage<RoleServer> = rmcp::model::JsonRpcMessage::response(
         rmcp::model::ServerResult::empty(()),
         rmcp::model::NumberOrString::Number(7),

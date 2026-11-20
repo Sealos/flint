@@ -7,8 +7,11 @@
 //!   [`Limits::waiting`] more wait for a turn; a call past both is refused at once with a tool
 //!   error saying so ([`Admission::enter`]).
 //! - **Reply bytes:** replies handed to the transport but not written yet are counted
-//!   ([`Counted`]); while they pass [`Limits::reply_budget`], no call starts its work. A stalled
-//!   client therefore holds at most the budget plus what the running calls produce.
+//!   ([`Counted`]); while they pass [`Limits::reply_budget`], or while [`Limits::unanswered`]
+//!   requests are read and not answered, the server reads no more requests, and no admitted call
+//!   starts its work. A client that stops reading stdout therefore holds at most about the
+//!   budget plus that many replies — not one more per call it keeps sending, refusals and
+//!   replies to other requests included.
 //! - **Deadline:** each call ends after [`Limits::deadline`] (`ServerHandler::call_tool`).
 
 use std::future::Future;
@@ -16,7 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use std::collections::HashSet;
+
 use rmcp::RoleServer;
+use rmcp::model::{ClientNotification, JsonRpcMessage, RequestId};
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -32,6 +38,8 @@ pub struct Limits {
     pub reply_budget: usize,
     /// How long one tool call may take, from when it starts running.
     pub deadline: Duration,
+    /// Requests read and not answered yet past which no more are read.
+    pub unanswered: usize,
 }
 
 impl Default for Limits {
@@ -41,6 +49,7 @@ impl Default for Limits {
             waiting: 48,
             reply_budget: 8 * 1024 * 1024,
             deadline: Duration::from_secs(60),
+            unanswered: 128,
         }
     }
 }
@@ -145,10 +154,12 @@ impl Admission {
     }
 }
 
-/// Bytes of replies handed to the transport and not written yet.
+/// Bytes of replies handed to the transport and not written yet, and the requests read and not
+/// answered yet.
 #[derive(Default)]
 pub(crate) struct ReplyBytes {
     outstanding: AtomicUsize,
+    unanswered: std::sync::Mutex<HashSet<RequestId>>,
     released: Notify,
 }
 
@@ -167,14 +178,35 @@ impl ReplyBytes {
 
     /// Resolves once at most `budget` bytes are outstanding.
     async fn within(&self, budget: usize) {
+        self.until(|| self.outstanding() <= budget).await;
+    }
+
+    /// Resolves once `ready` holds, checked again whenever bytes or requests are released.
+    async fn until(&self, ready: impl Fn() -> bool) {
         loop {
             let released = self.released.notified();
             tokio::pin!(released);
             released.as_mut().enable();
-            if self.outstanding() <= budget {
+            if ready() {
                 return;
             }
             released.await;
+        }
+    }
+
+    fn unanswered(&self) -> std::sync::MutexGuard<'_, HashSet<RequestId>> {
+        self.unanswered.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Requests read and not answered yet.
+    pub(crate) fn unanswered_count(&self) -> usize {
+        self.unanswered().len()
+    }
+
+    /// Request `id` is answered (or cancelled: rmcp sends nothing for it then).
+    fn answered(&self, id: &RequestId) {
+        if self.unanswered().remove(id) {
+            self.released.notify_waiters();
         }
     }
 }
@@ -199,12 +231,41 @@ impl Drop for Held {
 pub(crate) struct Counted<T> {
     inner: T,
     replies: Arc<ReplyBytes>,
+    /// Past this many reply bytes not written ([`Limits::reply_budget`]), or this many
+    /// requests not answered ([`Limits::unanswered`]), no more requests are read.
+    budget: usize,
+    unanswered: usize,
 }
 
 impl<T> Counted<T> {
-    pub(crate) fn new(inner: T, replies: Arc<ReplyBytes>) -> Self {
-        Counted { inner, replies }
+    pub(crate) fn new(inner: T, replies: Arc<ReplyBytes>, limits: &Limits) -> Self {
+        Counted {
+            inner,
+            replies,
+            budget: limits.reply_budget,
+            unanswered: limits.unanswered,
+        }
     }
+}
+
+/// The request a reply answers, if it is one.
+fn answers(message: &TxJsonRpcMessage<RoleServer>) -> Option<&RequestId> {
+    match message {
+        JsonRpcMessage::Response(response) => Some(&response.id),
+        JsonRpcMessage::Error(error) => error.id.as_ref(),
+        _ => None,
+    }
+}
+
+/// The request a client's `notifications/cancelled` names, if `message` is one.
+fn cancels(message: &RxJsonRpcMessage<RoleServer>) -> Option<RequestId> {
+    let JsonRpcMessage::Notification(notification) = message else {
+        return None;
+    };
+    let ClientNotification::CancelledNotification(cancelled) = &notification.notification else {
+        return None;
+    };
+    cancelled.params.request_id.clone()
 }
 
 impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
@@ -217,6 +278,9 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
         // Its size as the transport writes it: one JSON line.
         let bytes = serde_json::to_vec(&item).map_or(0, |line| line.len() + 1);
         let held = self.replies.hold(bytes);
+        if let Some(id) = answers(&item) {
+            self.replies.answered(id);
+        }
         let send = self.inner.send(item);
         async move {
             let result = send.await;
@@ -225,8 +289,25 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
         }
     }
 
+    /// Reads the next message only while replies not written are within the budget and fewer
+    /// than the limit of requests are unanswered: a client that does not read stdout gets
+    /// nothing more run or answered (refusals and replies to other requests included) until it
+    /// does.
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
-        self.inner.receive()
+        let (replies, budget, most) = (self.replies.clone(), self.budget, self.unanswered);
+        let inner = &mut self.inner;
+        async move {
+            replies
+                .until(|| replies.outstanding() <= budget && replies.unanswered_count() < most)
+                .await;
+            let message = inner.receive().await?;
+            if let JsonRpcMessage::Request(request) = &message {
+                replies.unanswered().insert(request.id.clone());
+            } else if let Some(id) = cancels(&message) {
+                replies.answered(&id);
+            }
+            Some(message)
+        }
     }
 
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {

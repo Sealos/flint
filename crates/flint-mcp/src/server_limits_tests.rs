@@ -246,11 +246,21 @@ async fn a_stalled_client_holds_the_reply_budget_at_most() {
         ..Limits::default()
     };
     let server = server(dir.path(), None, limits);
-    let mut client = Client::start(&server, 1024).await;
-    let calls = 200;
-    for id in 1..=calls {
-        client.call(id, "list_clusters", json!({})).await;
-    }
+    let client = Client::start(&server, 1024).await;
+    let Client { mut write, read } = client;
+    let mut client_read = read;
+    let calls = 200u64;
+    // The writer blocks once the server stops reading; it runs on its own.
+    let writer = tokio::spawn(async move {
+        for id in 1..=calls {
+            let line = format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "list_clusters", "arguments": {}}})
+            );
+            write.write_all(line.as_bytes()).await.unwrap();
+        }
+    });
     // Nothing is read meanwhile.
     let replies = server.inner.admission.replies();
     let mut most = 0;
@@ -264,17 +274,86 @@ async fn a_stalled_client_holds_the_reply_budget_at_most() {
         "{most} bytes held"
     );
     assert!(most > 0, "replies were held");
-    assert!(
-        server.inner.admission.admitted() > limits.running,
-        "calls wait while the client does not read"
-    );
+    assert!(!writer.is_finished(), "the server stopped reading requests");
     // Reading again, every reply comes.
     let mut ids = Vec::new();
+    let mut line = String::new();
     for _ in 0..calls {
-        let reply = client.next().await;
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(10), client_read.read_line(&mut line))
+            .await
+            .expect("replies keep coming")
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
         assert!(reply["result"]["isError"] != json!(true), "{reply}");
         ids.push(reply["id"].as_u64().unwrap());
     }
     ids.sort_unstable();
     assert_eq!(ids, (1..=calls).collect::<Vec<_>>());
+    writer.await.unwrap();
+}
+
+// covers UP-08: calls a stalled client keeps sending are not each answered into memory: while
+// replies not written pass the budget, the server reads no more requests, so refusals (and any
+// other reply) stop piling up too.
+#[tokio::test]
+async fn refusals_to_a_stalled_client_stay_within_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        running: 1,
+        waiting: 0,
+        reply_budget: 2 * 1024,
+        unanswered: 8,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let client = Client::start(&server, 1024).await;
+    let Client {
+        mut write,
+        mut read,
+    } = client;
+    // The writer blocks once the server stops reading; it runs on its own.
+    let writer = tokio::spawn(async move {
+        for id in 1..=3000u64 {
+            let line = format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "list_resource_kinds", "arguments": {"cluster": "silent"}}})
+            );
+            if write.write_all(line.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    });
+    let replies = server.inner.admission.replies();
+    let mut most = 0;
+    for _ in 0..100 {
+        most = most.max(replies.outstanding());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // At most the budget, plus the replies to requests already read.
+    assert!(
+        most <= limits.reply_budget + limits.unanswered * 1024,
+        "{most} bytes held"
+    );
+    assert!(replies.unanswered_count() <= limits.unanswered);
+    assert!(!writer.is_finished(), "the server stopped reading requests");
+    // Reading again, the refusals come and the rest are read.
+    let mut refused = 0;
+    let mut line = String::new();
+    while refused < 2999 {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(10), read.read_line(&mut line))
+            .await
+            .expect("replies keep coming")
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            text(&reply).starts_with("too many tool calls in flight"),
+            "{reply}"
+        );
+        refused += 1;
+    }
+    writer.await.unwrap();
 }

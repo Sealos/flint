@@ -911,9 +911,11 @@ Rules:
   Flint does. At most 16 tool calls run at once and 48 more wait for a turn; past those a call is refused at once with
   a tool error ("too many tool calls in flight"; retry). A running call holds its turn until it ends: when the client
   cancels it (`notifications/cancelled`, which drops its Kubernetes requests) or after 60 s, with a timeout naming the
-  cluster's server. Replies handed to the transport and not written yet are counted by a wrapping transport; while
-  they pass 8 MiB no call starts its work, so a client that stops reading stdout holds at most that plus what the
-  running calls produce. Refused, cancelled and timed-out calls are recorded in the activity log as failed.
+  cluster's server. Replies handed to the transport and not written yet are counted by a wrapping transport, which
+  also tracks requests read and not answered; while the replies pass 8 MiB, or 128 requests are unanswered, it reads
+  no more requests and no admitted call starts its work. A client that stops reading stdout therefore holds about
+  that budget plus those replies, however many calls it keeps sending (refusals and replies to other requests
+  included). Refused, cancelled and timed-out calls are recorded in the activity log as failed.
 - **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
   `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
   app).

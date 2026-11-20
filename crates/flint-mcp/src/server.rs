@@ -441,7 +441,8 @@ impl FlintMcp {
     where
         T: rmcp::transport::Transport<rmcp::RoleServer> + 'static,
     {
-        Counted::new(transport, self.inner.admission.replies())
+        let admission = &self.inner.admission;
+        Counted::new(transport, admission.replies(), &admission.limits())
     }
 
     #[tool(
@@ -551,18 +552,22 @@ impl ServerHandler for FlintMcp {
         let admission = &self.inner.admission;
         let deadline = admission.limits().deadline;
         let turn = tokio::select! {
-            turn = admission.enter() => turn,
-            () = cancelled.cancelled() => {
-                return Err(rmcp::ErrorData::internal_error("cancelled", None));
-            }
+            turn = admission.enter() => Some(turn),
+            () = cancelled.cancelled() => None,
         };
         let (result, recorded, server) = match turn {
-            Err(busy) => (
+            // Cancelled while it waited for a turn.
+            None => (
+                Err(rmcp::ErrorData::internal_error("cancelled", None)),
+                false,
+                None,
+            ),
+            Some(Err(busy)) => (
                 Ok(CallToolResult::error(vec![ContentBlock::text(busy.to_string())]).into()),
                 false,
                 None,
             ),
-            Ok(turn) => {
+            Some(Ok(turn)) => {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
                 CALL.scope(std::cell::RefCell::default(), async {
