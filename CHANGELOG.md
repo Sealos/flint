@@ -5,9 +5,9 @@
 
 ### Features
 
-* **app:** resource switcher, pane keys and go back ([dec65e1](https://github.com/Sealos/flint/commit/dec65e16bdd53487b543254427acfb52b7715c90))
 * **app:** resource switcher, pane keys and go back ([#244](https://github.com/Sealos/flint/issues/244)) ([dec65e1](https://github.com/Sealos/flint/commit/dec65e16bdd53487b543254427acfb52b7715c90))
 * **logs:** show only matching lines, an errors-only view and context lines ([#291](https://github.com/Sealos/flint/issues/291)) ([fd7b8a6](https://github.com/Sealos/flint/commit/fd7b8a686c3052881347a813b599e717ffb1cc1e))
+* **mcp:** a GPUI-free `flint-mcp` for Linux (x86_64 and aarch64), attached to each release ([#306](https://github.com/Sealos/flint/issues/306)) ([1593367](https://github.com/Sealos/flint/commit/1593367)), closes [#275](https://github.com/Sealos/flint/issues/275)
 * **mcp:** limit an exposed cluster to chosen namespaces and kinds ([#241](https://github.com/Sealos/flint/issues/241)) ([7bc7c7f](https://github.com/Sealos/flint/commit/7bc7c7f2fa8804a4996998248d0281cf6acb8042))
 * **mcp:** record every agent call and show it per cluster ([#286](https://github.com/Sealos/flint/issues/286)) ([b4e4d7d](https://github.com/Sealos/flint/commit/b4e4d7de754e21086e8c618fb5180c2ab2306ea6)), closes [#69](https://github.com/Sealos/flint/issues/69)
 * write a rotated log file, and ask for it in the bug template ([#312](https://github.com/Sealos/flint/issues/312)) ([d476ae8](https://github.com/Sealos/flint/commit/d476ae81636e41ff2f602fad555c7bd3ca5adcf7))
