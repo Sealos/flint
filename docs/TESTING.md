@@ -324,7 +324,8 @@ Screenshots are named `upXX-<view>-light.png` and `upXX-<view>-dark.png`; a reru
 files. Without `FLINT_AUTOMATION_SCREENSHOTS` they go to the scratch config directory and are deleted with it.
 
 **In CI.** macOS runners are costly, so app e2e has no job of its own: it is a step of `macos (flint-app)`, after
-that job's tests.
+that job's tests. That job runs on every push to `master` and on PRs labelled `run-macos`, so a PR gets the
+screenshot comment only with that label.
 
 ```mermaid
 flowchart LR
@@ -567,7 +568,7 @@ Rust's ownership rules make classic leaks rare, so Flint checks for the kinds th
 | `appimage (x86_64)` | Linux | A release build packaged with `scripts/package-appimage.sh`, then `scripts/smoke-appimage.sh`: `--version` and `mcp` answering `initialize` through the AppImage, without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`). No display, so the window is not opened |
 | `leak-sanitizer (core, mcp)` | Linux, nightly | `flint-core` and `flint-mcp` tests under AddressSanitizer and LeakSanitizer (`memory.yml`) |
 | `macos-app (dmg)` | macOS | `macos-app.yml`, only on PRs that touch the macOS packaging (`scripts/package-macos-app.sh`, `scripts/smoke-macos-app.sh`, `scripts/smoke-macos-app-test.sh`, `scripts/check-no-automation.sh`, `packaging/macos/`, `assets/brand/Flint.icns`, `LICENSE`, `macos-app.yml`, `release-please.yml`) and by hand. A release build (the runner's arm64 only) packaged as `Flint.app` in a DMG with `scripts/package-macos-app.sh`, with the version from `Cargo.toml`. Then `scripts/smoke-macos-app.sh` mounts the DMG read-only and checks the bundle identifier and version (PlistBuddy), the icon and LICENSE, the ad-hoc signature (`codesign --verify --deep --strict`, identifier `se.redstack.flint`), `--version`, `mcp` answering `initialize` and exiting 0 through `Flint.app/Contents/MacOS/flint`, and that the bundled binary has no automation channel; every hdiutil, codesign and binary call is time-limited. `scripts/smoke-macos-app-test.sh` then checks that the smoke test fails on DMGs with a wrong bundle ID, version, signature or no LICENSE. The release's `build-macos` runs the packaging and smoke scripts on the universal binary before it uploads the DMG. Not required |
-| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. The only CI job on every PR that needs macOS |
+| `macos (flint-app)` | macOS | The app's clippy, view tests and docs, the same with `--features automation`, and a release build checked for automation code. A step in it runs the `flint-e2e` app tests (`--test app -- --ignored`) against the fake API server on the binary those tests built, and uploads the screenshots (light and dark) as an artifact. Runs on every push to `master`, and on a PR only with the `run-macos` label (macOS runners cost about ten times Linux ones; `linux (flint-app)` runs the app's clippy and tests on every PR). Not required |
 | `app e2e screenshots comment` | Linux | After `macos (flint-app)`, on same-repo PRs: posts or updates one PR comment linking the screenshots. The only job with `pull-requests: write` |
 | `cluster-e2e` | Linux | kind via `helm/kind-action`. Core and MCP cluster tests (`--include-ignored`), MCP e2e, and `flint-e2e`'s UP-09 and UP-10 on kind. Nightly (and by hand), the `fixture-drift` job re-records the fixtures from a fresh kind cluster and fails on structural drift from the committed set (#128) |
 
