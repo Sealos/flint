@@ -81,6 +81,7 @@ pub fn run(boot: Bootstrap) {
         Ok(core) => core,
         Err(e) => {
             tracing::error!("could not start the core runtime: {e}");
+            flint_core::bootstrap::flush_logs();
             std::process::exit(1);
         }
     };
@@ -142,6 +143,12 @@ pub fn run(boot: Bootstrap) {
             );
             registry::init(cx);
             install_menus(settings.appearance, cx);
+            // On macOS a quit ends the process without returning from `run`.
+            cx.on_app_quit(|_| {
+                flint_core::bootstrap::flush_logs();
+                async {}
+            })
+            .detach();
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

@@ -1036,7 +1036,7 @@ async fn a_shell_gets_a_bash_prompt_echoes_typing_and_resizes() {
     );
 
     // Enter is a carriage return; the echo and the output reach the screen.
-    shell.write(b"echo hi\r".to_vec());
+    shell.write(b"echo hi\r".to_vec()).unwrap();
     fake.wait_for_stdin(b"echo hi\r", WAIT).await.unwrap();
     until_exec(&mut shell, "the echo", |s| {
         has_line(s, &format!("{prompt} echo hi")) && has_line(s, "hi")
@@ -1052,15 +1052,15 @@ async fn a_shell_gets_a_bash_prompt_echoes_typing_and_resizes() {
             height: 30
         }
     );
-    shell.write(b"stty size\r".to_vec());
+    shell.write(b"stty size\r".to_vec()).unwrap();
     until_exec(&mut shell, "the new size", |s| has_line(s, "30 100")).await;
 
     // bash turned bracketed paste on, so a paste arrives bracketed; Ctrl-C drops the line.
-    shell.paste("echo a\necho b");
+    shell.paste("echo a\necho b").unwrap();
     fake.wait_for_stdin(b"\x1b[200~echo a\necho b\x1b[201~", WAIT)
         .await
         .unwrap();
-    shell.write(vec![0x03]);
+    shell.write(vec![0x03]).unwrap();
     fake.wait_for_stdin(b"\x1b[201~\x03", WAIT).await.unwrap();
     // Output the test pushes shows too.
     assert!(fake.print("\r\npushed by the test\r\n"));
@@ -1101,7 +1101,7 @@ async fn a_container_without_bash_falls_back_to_sh() {
         .wait_for_stdin(b"\x1b[1;5R", WAIT)
         .await
         .unwrap();
-    shell.write(b"echo from-sh\r".to_vec());
+    shell.write(b"echo from-sh\r".to_vec()).unwrap();
     until_exec(&mut shell, "the echo", |s| has_line(s, "from-sh")).await;
     assert_eq!(server.open_exec_sessions(), 1);
 }
@@ -1114,9 +1114,9 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
     until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
     server.wait_for_exec_sessions(1, WAIT).await.unwrap();
-    shell.write(b"echo bye\r".to_vec());
+    shell.write(b"echo bye\r".to_vec()).unwrap();
     until_exec(&mut shell, "the echo", |s| has_line(s, "bye")).await;
-    shell.write(b"exit 3\r".to_vec());
+    shell.write(b"exit 3\r".to_vec()).unwrap();
     let snap = until_exec(&mut shell, "the exit", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: Some(3) });
     assert!(has_line(&snap, "bye") && has_line(&snap, "exit"));
@@ -1127,8 +1127,8 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     // (inputs are handled in order), and says no program takes input any more: that is the
     // check that can fail. The screen and stdin checks below only document the outcome (Flint
     // doesn't echo locally, and the fake has closed the session).
-    shell.write(b"echo late\r".to_vec());
-    assert!(!shell.paste_if_bracketed("x").await);
+    shell.write(b"echo late\r".to_vec()).unwrap();
+    assert!(!shell.paste_if_bracketed("x").unwrap().await);
     let snap = shell.latest();
     assert!(
         !snap.terminal.text().contains("late"),
@@ -1140,7 +1140,7 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     // Ctrl-D on an empty line ends bash with the last status.
     let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
     until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
-    shell.write(vec![0x04]);
+    shell.write(vec![0x04]).unwrap();
     let snap = until_exec(&mut shell, "the exit", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: Some(0) });
     assert!(server.last_exec_stdin().ends_with(&[0x04]));
@@ -1494,4 +1494,68 @@ async fn a_stalled_events_request_returns_the_object_after_the_deadline() {
     assert!(error.contains("timed out"), "{error}");
     // Timing out dropped the events request.
     until_in_flight(&server, 0, GIVEN_UP, "the timed-out events request").await;
+}
+
+// covers UP-06 (#255): a reader that never reads holds a bounded queue while the core reloads
+// kubeconfig and rediscovers the cluster again and again (each confirmed against the server, not
+// through that reader), and what it then reads is the latest: the last list, and discovery of
+// the slot that list names.
+#[tokio::test]
+async fn an_unread_event_queue_stays_bounded_through_reloads_and_discoveries() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, None).await;
+    let events = core.handle.events();
+    let kubeconfig = core._dir.path().join("kubeconfig");
+    let discoveries = || {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/api" || r.path == "/apis")
+            .count()
+    };
+    let runs = 8;
+    for n in 0..runs {
+        // A new namespace changes the context: a new slot, connected and discovered again.
+        server
+            .write_kubeconfig(&kubeconfig, Some(&format!("ns-{n}")))
+            .unwrap();
+        let before = discoveries();
+        core.handle.send(Command::ReloadKubeconfig);
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if discoveries() > before && core.handle.discovery(CONTEXT).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rediscovered");
+    }
+    // The list, the active cluster, its connection (both phases), its discovery, settings and
+    // the activity log at most: not one per run.
+    assert!(events.len() <= 7, "{} events queued", events.len());
+    let mut generation = None;
+    let mut discovered = None;
+    while !events.is_empty() {
+        match events.recv().await.unwrap() {
+            Event::ClustersChanged(snapshot) => {
+                let summary = &snapshot.clusters[0];
+                assert_eq!(summary.info.namespace.as_deref(), Some("ns-7"));
+                generation = Some(summary.generation);
+            }
+            Event::DiscoveryChanged {
+                generation: of,
+                discovery,
+                ..
+            } => discovered = Some((of, discovery.is_some())),
+            _ => {}
+        }
+    }
+    let generation = generation.expect("the list");
+    assert_eq!(
+        discovered,
+        Some((generation, true)),
+        "the last slot's discovery"
+    );
 }

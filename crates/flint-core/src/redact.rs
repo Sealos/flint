@@ -7,7 +7,8 @@
 //! picks its own marker (the MCP server says `<redacted>`, the app shows dots).
 //!
 //! [`redact_credentials`] hides credential-shaped values in free text (pod logs, event
-//! messages). Only the MCP server uses it: the app shows a cluster's logs and events as they are.
+//! messages). The MCP server applies it to cluster text, and logging applies it to every line
+//! written to stderr or the log file; the app shows a cluster's logs and events as they are.
 
 mod text;
 
@@ -162,13 +163,21 @@ pub fn server_url(url: &str) -> String {
 }
 
 /// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
-/// its directory (which can name the user's home), arguments or environment. A command written
-/// with its arguments (`aws eks get-token`) keeps only the first word.
-pub fn command_name(command: &str) -> String {
-    let program = command.split_whitespace().next().unwrap_or_default();
-    std::path::Path::new(program)
+/// its directory (which can name the user's home), arguments or environment. kubeconfig's
+/// `command` is one program path, but it may have been written with arguments after it, and a
+/// path may hold spaces: with whitespace in it, nothing can tell which is which without looking
+/// at the disk (which a stalled mount can hang), so nothing of it is shown (`None`: say "the exec
+/// auth plugin"). A spaced path like `/opt/Cloud Tools/kubelogin` is therefore not named, which
+/// is the price of never showing an argument.
+pub fn command_name(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() || command.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = std::path::Path::new(command)
         .file_name()
-        .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
+        .map_or_else(|| command.to_owned(), |n| n.to_string_lossy().into_owned());
+    Some(name)
 }
 
 #[cfg(test)]
@@ -256,16 +265,27 @@ mod tests {
     }
 
     #[test]
-    fn command_names_drop_the_directory_and_arguments() {
-        assert_eq!(command_name("aws"), "aws");
+    fn command_names_show_a_plain_program_by_its_file_name() {
+        assert_eq!(command_name("kubelogin").as_deref(), Some("kubelogin"));
         assert_eq!(
-            command_name("/Users/someone/bin/gke-gcloud-auth-plugin"),
-            "gke-gcloud-auth-plugin"
+            command_name("/usr/local/bin/kubelogin").as_deref(),
+            Some("kubelogin")
         );
         assert_eq!(
-            command_name(" /opt/bin/aws eks get-token --secret x"),
-            "aws"
+            command_name("/Users/someone/bin/gke-gcloud-auth-plugin").as_deref(),
+            Some("gke-gcloud-auth-plugin")
         );
-        assert_eq!(command_name(""), "");
+        assert_eq!(command_name(""), None);
+    }
+
+    // With whitespace in the command, none of it is shown: an argument (slashes and all) never
+    // is, and so a spaced path is not named either. Nothing reads the disk.
+    #[test]
+    fn command_names_show_nothing_of_a_command_with_whitespace() {
+        let token = format!("{}{}", "abc", "/def-secret");
+        assert_eq!(command_name(&format!("/opt/bin/aws --token={token}")), None);
+        assert_eq!(command_name(&format!("aws --token={token}")), None);
+        assert_eq!(command_name(" /opt/bin/aws eks get-token --secret x"), None);
+        assert_eq!(command_name("/opt/Cloud Tools/kubelogin"), None);
     }
 }

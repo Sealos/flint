@@ -342,7 +342,7 @@ async fn discover_per_group(
         match result {
             Ok(group_kinds) => kinds.extend(group_kinds),
             Err(e) => {
-                tracing::warn!(group = name, error = %e, "discovery failed for an API group; leaving it out");
+                tracing::warn!(group = name, error = %e.summary(), "discovery failed for an API group; leaving it out");
                 skipped_groups.push(name);
             }
         }

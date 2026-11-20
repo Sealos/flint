@@ -127,7 +127,7 @@ async fn shell_sessions(core: &Core, context: &str, namespace: &str) {
             }
     })
     .await;
-    sh.write(b"echo $((6*7))\r".to_vec());
+    sh.write(b"echo $((6*7))\r".to_vec()).unwrap();
     wait_for(&mut sh, "the echo", |s| has_line(s, "42")).await;
 
     // The TTY follows resizes.
@@ -135,18 +135,18 @@ async fn shell_sessions(core: &Core, context: &str, namespace: &str) {
     // kube sends resizes and input on separate channels, so they can overtake each other, and
     // busybox's line editor drops a line typed while it handles the resize: give it a moment.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    sh.write(b"stty size\r".to_vec());
+    sh.write(b"stty size\r".to_vec()).unwrap();
     wait_for(&mut sh, "the new size", |s| has_line(s, "30 100")).await;
 
     // Switching the active cluster leaves the session running (UP-24, UP-42).
     core.connect(ALIAS).await;
-    sh.write(b"echo still-$((1+1))\r".to_vec());
+    sh.write(b"echo still-$((1+1))\r".to_vec()).unwrap();
     wait_for(&mut sh, "output after the switch", |s| {
         has_line(s, "still-2")
     })
     .await;
 
-    sh.write(b"exit 3\r".to_vec());
+    sh.write(b"exit 3\r".to_vec()).unwrap();
     let snap = wait_for(&mut sh, "the exit", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: Some(3) });
 
@@ -161,7 +161,8 @@ async fn shell_sessions(core: &Core, context: &str, namespace: &str) {
             }
     })
     .await;
-    bash.write(b"echo ${BASH_VERSION%%.*}-ok\r".to_vec());
+    bash.write(b"echo ${BASH_VERSION%%.*}-ok\r".to_vec())
+        .unwrap();
     wait_for(&mut bash, "bash output", |s| {
         (0..s.terminal.size.rows).any(|r| {
             let line = s.terminal.row_text(r);
@@ -169,7 +170,7 @@ async fn shell_sessions(core: &Core, context: &str, namespace: &str) {
         })
     })
     .await;
-    bash.write(b"exit\r".to_vec());
+    bash.write(b"exit\r".to_vec()).unwrap();
     let snap = wait_for(&mut bash, "the exit", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: Some(0) });
 

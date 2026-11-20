@@ -46,11 +46,13 @@ impl TerminalView {
     /// Pastes `text` into the shell: one line at once; several lines at once only if the
     /// program takes pastes bracketed when they reach it (the core checks its live mode), else
     /// after asking, since each line would run as it arrives; never when it is larger than
-    /// [`terminal_model::MAX_PASTE_BYTES`] (the tab says so).
+    /// [`terminal_model::MAX_PASTE_BYTES`], nor while the shell is not reading what it was
+    /// sent (the tab says so either way).
     fn paste(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         match terminal_model::paste_check(&text) {
             PasteCheck::Paste => {
-                self.session.paste(text);
+                let sent = self.session.paste(text);
+                self.input_sent(sent, true);
                 cx.notify();
             }
             PasteCheck::TooLarge { bytes } => {
@@ -58,7 +60,17 @@ impl TerminalView {
                 cx.notify();
             }
             PasteCheck::Lines { lines } => {
-                let pasted = self.session.paste_if_bracketed(text.clone());
+                let pasted = match self.session.paste_if_bracketed(text.clone()) {
+                    Ok(pasted) => {
+                        self.input_sent(Ok(()), true);
+                        pasted
+                    }
+                    Err(refused) => {
+                        self.input_sent(Err(refused), true);
+                        cx.notify();
+                        return;
+                    }
+                };
                 cx.spawn_in(window, async move |this, cx| {
                     if pasted.await {
                         return;
@@ -98,7 +110,8 @@ impl TerminalView {
             let _ = view.update(cx, |view, cx| {
                 // The shell may have ended while the question was open.
                 if view.is_live() {
-                    view.session.paste(text);
+                    let sent = view.session.paste(text);
+                    view.input_sent(sent, true);
                     cx.notify();
                 }
             });

@@ -19,7 +19,7 @@ fn kubeconfig(contexts: &[&str]) -> String {
     s
 }
 
-async fn next_clusters(events: &async_channel::Receiver<Event>) -> Vec<String> {
+async fn next_clusters(events: &flint_core::events::Events) -> Vec<String> {
     loop {
         match events.recv().await.unwrap() {
             Event::ClustersChanged(snapshot) => {
@@ -115,7 +115,7 @@ const SERVER: &str = "https://127.0.0.1:1";
 
 /// The next `SettingsChanged` event that satisfies `pred`.
 async fn settings_where(
-    events: &async_channel::Receiver<Event>,
+    events: &flint_core::events::Events,
     pred: impl Fn(&Settings, Option<&str>) -> bool,
 ) -> (Arc<Settings>, Option<String>) {
     loop {
@@ -270,14 +270,16 @@ async fn reports_the_agent_activity_log_as_it_grows() {
         truncated: false,
         outcome: Outcome::Ok,
         cluster_key: Some(activity::cluster_key("one")),
-        server_key: Some(activity::server_key(SERVER)),
+        server_key: activity::ServerKeys::with_secret(&[7; 32]).server_key(SERVER),
+        probed: Vec::new(),
+        probed_more: 0,
     };
     activity::append(&config, &record(1)).unwrap();
     let core = start(dir.path(), true);
     let events = core.events();
     let next = || async {
         loop {
-            if let Event::AgentActivity(records) = events.recv().await.unwrap() {
+            if let Event::AgentActivity(records, _) = events.recv().await.unwrap() {
                 return records;
             }
         }
@@ -300,6 +302,159 @@ async fn reports_the_agent_activity_log_as_it_grows() {
     .await
     .expect("an append is noticed");
     assert_eq!(*grown, [record(1), record(2)]);
+}
+
+/// Rewrites kubeconfig `times` times (a cloud CLI in a loop), with `contexts` contexts.
+async fn rewrite_kubeconfig(dir: &Path, times: usize, contexts: &[&str]) {
+    for n in 0..times {
+        let mut names: Vec<String> = contexts.iter().map(|c| (*c).to_owned()).collect();
+        // A fresh name every time, as a cloud CLI writing a new context might.
+        names.push(format!("burst-{n}"));
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        std::fs::write(dir.join("kubeconfig"), kubeconfig(&names)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The debounced reloads land.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+}
+
+// covers UP-06: a front end that holds the stream without reading it holds a few events,
+// however many reloads the core runs: the latest of each kind.
+#[tokio::test]
+async fn events_nobody_reads_stay_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    rewrite_kubeconfig(dir.path(), 50, &["one", "two"]).await;
+    // Clusters, settings, activity: one each, however many times they changed; and at most one
+    // discovery reset per context in the latest list (one, two, the last burst-n): the 50 others
+    // left the queue with the list.
+    assert!(events.len() <= 3 + 3, "{} events queued", events.len());
+    let mut latest = None;
+    while !events.is_empty() {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            latest = Some(snapshot);
+        }
+    }
+    let names: Vec<_> = latest
+        .expect("the cluster list is there")
+        .clusters
+        .iter()
+        .map(|c| c.info.name.clone())
+        .collect();
+    assert!(
+        names.starts_with(&["one".to_owned(), "two".to_owned()]),
+        "{names:?}"
+    );
+}
+
+/// The generation of each context in the latest list `events` holds, draining it.
+async fn latest_generations(events: &flint_core::events::Events) -> Vec<(String, u64)> {
+    let mut latest = Vec::new();
+    while !events.is_empty() {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            latest = snapshot
+                .clusters
+                .iter()
+                .map(|c| (c.info.name.clone(), c.generation))
+                .collect();
+        }
+    }
+    latest
+}
+
+// covers UP-06: a context re-pointed and pointed back, or removed and added back, before the
+// front end reads, starts over in the core: the latest list gives it a newer generation, so a
+// reader that skipped the lists in between still knows its discovery and sessions are stale. One
+// left alone keeps its generation.
+#[tokio::test]
+async fn a_context_that_starts_over_has_a_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("kubeconfig"),
+        kubeconfig(&["one", "two", "three"]),
+    )
+    .unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    let first = loop {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            break snapshot
+                .clusters
+                .iter()
+                .map(|c| (c.info.name.clone(), c.generation))
+                .collect::<Vec<_>>();
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let elsewhere = kubeconfig(&["one", "two", "three"]).replace("127.0.0.1:1", "127.0.0.1:2");
+    for text in [
+        elsewhere,
+        kubeconfig(&["one", "three"]),
+        kubeconfig(&["one", "two", "three"]),
+    ] {
+        std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let last = latest_generations(&events).await;
+    let of = |list: &[(String, u64)], name: &str| {
+        list.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, g)| *g)
+            .expect(name)
+    };
+    // Every context was re-pointed and back; two was also removed and added back.
+    for name in ["one", "two", "three"] {
+        assert!(
+            of(&last, name) > of(&first, name),
+            "{name}: {first:?} -> {last:?}"
+        );
+    }
+}
+
+// covers UP-06: the only context, removed and added back, starts over: a newer generation.
+#[tokio::test]
+async fn the_only_context_removed_and_added_back_starts_over() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    let mut first = None;
+    while first.is_none() {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            first = snapshot.clusters.first().map(|c| c.generation);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for text in [kubeconfig(&[]), kubeconfig(&["one"])] {
+        std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let last = latest_generations(&events).await;
+    assert_eq!(last.len(), 1);
+    assert!(last[0].1 > first.unwrap(), "{last:?}");
+}
+
+// covers UP-06: once the front end drops its stream, the core stops queueing events for it;
+// a new reader starts from what comes next.
+#[tokio::test]
+async fn dropping_the_reader_stops_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    next_clusters(&events).await;
+    drop(events);
+    rewrite_kubeconfig(dir.path(), 10, &["one"]).await;
+    let again = core.events();
+    assert_eq!(again.len(), 0, "nothing was queued while nobody read");
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one", "later"])).unwrap();
+    let names = tokio::time::timeout(Duration::from_secs(10), next_clusters(&again))
+        .await
+        .expect("events flow again");
+    assert_eq!(names, ["one", "later"]);
 }
 
 // covers UP-04

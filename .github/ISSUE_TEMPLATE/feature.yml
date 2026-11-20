@@ -19,6 +19,7 @@ body:
     id: flint-version
     attributes:
       label: Flint version
+      description: Choose **Flint > About Flint** or run `flint --version`.
       placeholder: "0.2.1"
   - type: input
     id: os
@@ -28,11 +29,18 @@ body:
   - type: dropdown
     id: auth
     attributes:
-      label: How the cluster authenticates, if it matters here
+      label: Authentication plugin, if relevant
       options:
         - EKS
         - GKE
         - AKS
-        - Other exec plugin
-        - Client certificate, token or basic auth
-        - Does not matter
+        - Other
+        - None
+  - type: textarea
+    id: logs
+    attributes:
+      label: Flint logs, if relevant
+      description: |
+        If logs help explain the request, paste an excerpt from `~/Library/Logs/Flint/flint.log` on macOS or
+        `$XDG_STATE_HOME/flint/flint.log` on Linux (default `~/.local/state/flint/flint.log`). Remove cluster names,
+        server URLs, credentials and other private details before sharing. Do not upload kubeconfig files or credentials.

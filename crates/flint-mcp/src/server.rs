@@ -22,6 +22,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::limits::{Admission, Counted, Limits};
 use crate::policy;
 
 /// How long `list_clusters` waits for each cluster's `/version`.
@@ -52,6 +53,32 @@ struct Inner {
     kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
     clients: SlotMap<Client>,
     discovery: SlotMap<Kinds>,
+    /// How many tool calls run and wait, and the reply bytes not yet written (#252).
+    admission: Admission,
+}
+
+/// The longest a call waits for its activity record to be written, rather than hold its reply.
+/// The write itself gives up on the log's file lock (the one wait that is not this process's
+/// own) after [`activity::LOCK_WAIT`], shorter than this, so a write never outlives its wait by
+/// much.
+const RECORD_WAIT: Duration = Duration::from_secs(2);
+const _: () = assert!(activity::LOCK_WAIT.as_millis() < RECORD_WAIT.as_millis());
+
+impl Inner {
+    /// Writes `record` to the activity log, keying the servers it `reached`, on the call's own
+    /// path, waiting at most [`RECORD_WAIT`]. A record that could not be written in time, or at
+    /// all, is logged.
+    async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
+        let dir = self.config_dir.clone();
+        let write =
+            tokio::task::spawn_blocking(move || activity::append_call(&dir, &record, &reached));
+        match tokio::time::timeout(RECORD_WAIT, write).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+            Err(_) => tracing::warn!("the agent activity log was not written in time"),
+        }
+    }
 }
 
 /// Discovery results for one cluster.
@@ -200,12 +227,21 @@ impl FlintMcp {
         };
         // The server `client` found for this call's cluster, from the call's own settings and
         // kubeconfig: none for a call that names no cluster or one not exposed.
-        let server = named
-            .cluster
-            .as_ref()
-            .and_then(|_| CALL.try_with(|c| c.borrow().server.clone()).ok().flatten());
-        let _ = CALL.try_with(|c| c.borrow_mut().recorded = true);
-        self.record(activity::ActivityRecord {
+        let (server, endpoint, probed) = CALL
+            .try_with(|c| {
+                let c = c.borrow();
+                (c.server.clone(), c.endpoint.clone(), c.probed.clone())
+            })
+            .unwrap_or_default();
+        let (server, endpoint) = match named.cluster {
+            Some(_) => (server, endpoint),
+            None => (None, None),
+        };
+        let reached = activity::Reached {
+            server: endpoint,
+            probed,
+        };
+        let record = activity::ActivityRecord {
             at_ms: activity::now_ms(),
             tool: tool.to_owned(),
             server,
@@ -220,8 +256,17 @@ impl FlintMcp {
             outcome,
             cluster_key: None,
             server_key: None,
-        })
-        .await;
+            probed: Vec::new(),
+            probed_more: 0,
+        };
+        // Within `call_tool`, the record waits for the call's outcome there: a deadline that
+        // fires after this still makes it a timeout. Called directly (tests), it is written now.
+        if let Err((record, reached)) = CALL
+            .try_with(|c| c.borrow_mut().record = Some((record.clone(), reached.clone())))
+            .map_err(|_| (record, reached))
+        {
+            self.record(record, reached).await;
+        }
         let content = vec![ContentBlock::text(text)];
         Ok(if ok {
             CallToolResult::success(content)
@@ -230,16 +275,9 @@ impl FlintMcp {
         })
     }
 
-    /// Appends `record` to the activity log. A failure to write is logged and does not fail the
-    /// call.
-    async fn record(&self, record: activity::ActivityRecord) {
-        let dir = self.inner.config_dir.clone();
-        let written = tokio::task::spawn_blocking(move || activity::append(&dir, &record)).await;
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
-            Err(e) => tracing::warn!(error = %e, "cannot write the agent activity log"),
-        }
+    /// Writes `record` to the activity log, keying the servers it `reached` ([`Inner::record`]).
+    async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
+        self.inner.record(record, reached).await;
     }
 }
 
@@ -249,8 +287,13 @@ struct CallNote {
     /// The API server of the cluster the call reads, once [`FlintMcp::client`] found it exposed
     /// (without credentials).
     server: Option<String>,
-    /// Its tool recorded it ([`FlintMcp::finish`]).
-    recorded: bool,
+    /// That server as the kubeconfig has it, for its key ([`activity::append_call`]).
+    endpoint: Option<String>,
+    /// The contexts `list_clusters` probed, with their servers as the kubeconfig has them.
+    probed: Vec<(String, Option<String>)>,
+    /// What its tool would record ([`FlintMcp::finish`]), and the servers it reached, written
+    /// once the call's outcome is settled.
+    record: Option<(activity::ActivityRecord, activity::Reached)>,
 }
 
 tokio::task_local! {
@@ -405,6 +448,16 @@ impl FlintMcp {
     /// `kubeconfig_base` is the `KUBECONFIG` list (or `~/.kube/config`); the settings'
     /// `kubeconfig_paths`, expanded with `home`, are appended on every call.
     pub fn new(config_dir: PathBuf, kubeconfig_base: Vec<PathBuf>, home: Option<PathBuf>) -> Self {
+        Self::with_limits(config_dir, kubeconfig_base, home, Limits::default())
+    }
+
+    /// [`FlintMcp::new`] with other [`Limits`].
+    pub fn with_limits(
+        config_dir: PathBuf,
+        kubeconfig_base: Vec<PathBuf>,
+        home: Option<PathBuf>,
+        limits: Limits,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config_dir,
@@ -413,9 +466,60 @@ impl FlintMcp {
                 kubeconfig: Mutex::default(),
                 clients: Mutex::default(),
                 discovery: Mutex::default(),
+                admission: Admission::new(limits),
             }),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// `transport` with the bytes of replies not yet written counted, which [`Limits`] bounds.
+    /// Serve the server over this.
+    pub fn counted<T>(
+        &self,
+        transport: T,
+    ) -> impl rmcp::transport::Transport<rmcp::RoleServer> + use<T>
+    where
+        T: rmcp::transport::Transport<rmcp::RoleServer> + 'static,
+    {
+        let admission = &self.inner.admission;
+        // A tool call refused at the transport never reaches `call_tool`:
+        // recorded from there.
+        let inner = Arc::downgrade(&self.inner);
+        admission
+            .replies()
+            .on_dropped_call(Box::new(move |tool, arguments| {
+                let inner = inner.clone();
+                Box::pin(async move {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    let named = named_in(arguments.as_ref());
+                    inner
+                        .record(
+                            activity::ActivityRecord {
+                                at_ms: activity::now_ms(),
+                                tool,
+                                server: None,
+                                cluster: named.cluster,
+                                kind: named.kind,
+                                namespace: named.namespace,
+                                name: named.name,
+                                container: named.container,
+                                items: None,
+                                bytes: 0,
+                                truncated: false,
+                                outcome: activity::Outcome::Failed,
+                                cluster_key: None,
+                                server_key: None,
+                                probed: Vec::new(),
+                                probed_more: 0,
+                            },
+                            activity::Reached::default(),
+                        )
+                        .await;
+                })
+            }));
+        Counted::new(transport, admission.replies(), &admission.limits())
     }
 
     #[tool(
@@ -508,10 +612,12 @@ impl FlintMcp {
     instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
 impl ServerHandler for FlintMcp {
-    /// Every call, with its own `CALL` note. A call the router answers without running its
-    /// tool (an unknown tool, arguments that do not fit the tool's schema) is recorded here, as
-    /// failed, with what its arguments name; the others are recorded by their tool
-    /// (`FlintMcp::finish`).
+    /// Every call, with its own `CALL` note, within the [`Limits`]: admitted (or refused at
+    /// once when too many are in flight), stopped when the client cancels it, and ended at the
+    /// deadline. A call the router answers without running its tool (an unknown tool, arguments
+    /// that do not fit the tool's schema) is recorded here, as failed, with what its arguments
+    /// name; so is one refused, cancelled or past its deadline. The others are recorded by their
+    /// tool (`FlintMcp::finish`).
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -519,14 +625,62 @@ impl ServerHandler for FlintMcp {
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
         let named = named_in(request.arguments.as_ref());
-        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let (result, recorded) = CALL
-            .scope(std::cell::RefCell::default(), async {
-                let result = self.tool_router.call(call).await;
-                (result, CALL.with(|c| c.borrow().recorded))
-            })
-            .await;
-        if !recorded {
+        let cancelled = context.ct.clone();
+        let admission = &self.inner.admission;
+        // Until this handler ends, the call counts as unanswered, cancelled or not: it may
+        // still be writing its activity record.
+        let _ended = HandlerEnded {
+            replies: admission.replies(),
+            id: context.id.clone(),
+        };
+        let deadline = admission.limits().deadline;
+        let turn = tokio::select! {
+            turn = admission.enter() => Some(turn),
+            () = cancelled.cancelled() => None,
+        };
+        let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
+        // The reply, the record its tool left when it is the outcome, and what the call learned
+        // on its way (for a record of its own otherwise).
+        let (result, record, note) = match turn {
+            // Cancelled while it waited for a turn.
+            None => (
+                Err(rmcp::ErrorData::internal_error("cancelled", None)),
+                None,
+                CallNote::default(),
+            ),
+            Some(Err(busy)) => (failed(&busy.to_string()), None, CallNote::default()),
+            Some(Ok(turn)) => {
+                let call =
+                    rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                CALL.scope(std::cell::RefCell::default(), async {
+                    // Dropping the call's future ends its Kubernetes requests.
+                    let (result, finished) = tokio::select! {
+                        result = self.tool_router.call(call) => (result, true),
+                        () = cancelled.cancelled() => {
+                            (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
+                        }
+                        () = tokio::time::sleep(deadline) => {
+                            let server = CALL.with(|c| c.borrow().server.clone());
+                            let mut text =
+                                ClusterError::timeout(deadline, server.as_deref()).for_agent();
+                            // As every reply: a server URL's path can hold anything.
+                            policy::redact_text(&mut text);
+                            (failed(&text), false)
+                        }
+                    };
+                    drop(turn);
+                    let (record, note) = CALL.with(|c| {
+                        let mut c = c.borrow_mut();
+                        let record = c.record.take().filter(|_| finished);
+                        (record, std::mem::take(&mut *c))
+                    });
+                    (result, record, note)
+                })
+                .await
+            }
+        };
+        let (record, reached) = record.unwrap_or_else(|| {
+            let names_cluster = named.cluster.is_some();
             let bytes = match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(done)) => done
                     .content
@@ -536,10 +690,16 @@ impl ServerHandler for FlintMcp {
                 Ok(_) => 0,
                 Err(error) => error.message.len(),
             };
-            self.record(activity::ActivityRecord {
+            // A call that ended early is still shown with the clusters it read about
+            // (`list_clusters`' probes).
+            let reached = activity::Reached {
+                server: note.endpoint.filter(|_| names_cluster),
+                probed: note.probed,
+            };
+            let record = activity::ActivityRecord {
                 at_ms: activity::now_ms(),
                 tool,
-                server: None,
+                server: note.server.filter(|_| names_cluster),
                 cluster: named.cluster,
                 kind: named.kind,
                 namespace: named.namespace,
@@ -551,10 +711,27 @@ impl ServerHandler for FlintMcp {
                 outcome: activity::Outcome::Failed,
                 cluster_key: None,
                 server_key: None,
-            })
-            .await;
-        }
+                probed: Vec::new(),
+                probed_more: 0,
+            };
+            (record, reached)
+        });
+        self.record(record, reached).await;
         result
+    }
+}
+
+/// Marks a tool call's handler as ended when dropped (`limits::ReplyBytes::handler_ended`).
+struct HandlerEnded {
+    replies: Arc<crate::limits::ReplyBytes>,
+    id: rmcp::model::RequestId,
+}
+
+impl Drop for HandlerEnded {
+    fn drop(&mut self) {
+        // A handler that panicked sends no reply: nothing else would let its request go.
+        self.replies
+            .handler_ended(&self.id, std::thread::panicking());
     }
 }
 
@@ -599,7 +776,9 @@ impl FlintMcp {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
         // The server this call's settings expose the cluster at: what its record names.
         let _ = CALL.try_with(|c| {
-            c.borrow_mut().server = info.server.as_deref().map(flint_core::redact::server_url);
+            let mut note = c.borrow_mut();
+            note.server = info.server.as_deref().map(flint_core::redact::server_url);
+            note.endpoint = info.server.clone();
         });
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
@@ -691,6 +870,13 @@ impl FlintMcp {
             .into_iter()
             .cloned()
             .collect();
+        // The clusters this call reads about, for its record.
+        let _ = CALL.try_with(|c| {
+            c.borrow_mut().probed = exposed
+                .iter()
+                .map(|info| (info.name.clone(), info.server.clone()))
+                .collect();
+        });
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);
         let settings = ctx.settings.clone();
         let kubeconfig_errors: Vec<Value> = ctx
@@ -1694,3 +1880,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "server_limits_tests.rs"]
+mod limits_tests;
