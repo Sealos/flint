@@ -507,6 +507,101 @@ fn prompting(kubeconfig: &mut Kubeconfig) {
         .interactive_mode = Some(ExecInteractiveMode::IfAvailable);
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_always_plugin_queues_before_a_later_if_available_plugin() {
+    let queue = Arc::new(tokio::sync::Mutex::new(()));
+    let current = queue.lock().await;
+    let foreground = std::cell::Cell::new(false);
+    let acquire = |must_prompt| {
+        Terminal::acquire_on(
+            std::fs::File::open("/dev/null").unwrap().into(),
+            &queue,
+            |_| Some(foreground.get()),
+            must_prompt,
+        )
+    };
+    let always = acquire(true);
+    let if_available = acquire(false);
+    tokio::pin!(always, if_available);
+    assert!(always.as_mut().now_or_never().is_none());
+    assert!(if_available.as_mut().now_or_never().is_none());
+
+    // The current plugin returns the terminal to Flint and releases the queue.
+    foreground.set(true);
+    drop(current);
+    assert!(if_available.as_mut().now_or_never().is_none());
+    let Some(Acquired::Terminal(owner)) = always.as_mut().now_or_never() else {
+        panic!("the earlier Always plugin should get the terminal first");
+    };
+    drop(owner);
+    assert!(matches!(if_available.await, Acquired::Terminal(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_always_plugin_releases_the_queue_while_waiting_for_the_foreground() {
+    let queue = Arc::new(tokio::sync::Mutex::new(()));
+    let acquire = |must_prompt| {
+        Terminal::acquire_on(
+            std::fs::File::open("/dev/null").unwrap().into(),
+            &queue,
+            |_| Some(false),
+            must_prompt,
+        )
+    };
+    let always = acquire(true);
+    tokio::pin!(always);
+    assert!(always.as_mut().now_or_never().is_none());
+    assert!(matches!(
+        acquire(false).now_or_never(),
+        Some(Acquired::Background)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refresh_waiting_for_the_foreground_times_out_without_cooldown() {
+    let plugin = printing(r#"{"token":"t-new","expirationTimestamp":"2999-01-01T00:00:00Z"}"#);
+    let mut exec = config(&plugin.kubeconfig("https://127.0.0.1:1"))
+        .await
+        .auth_info
+        .exec
+        .unwrap();
+    exec.interactive_mode = Some(ExecInteractiveMode::Always);
+    let context = "refresh-waiting-for-foreground".to_owned();
+    let state = Arc::new(tokio::sync::Mutex::new(TokenState {
+        context: context.clone(),
+        exec: exec.clone(),
+        token: SecretString::from("t-old"),
+        expires: "2000-01-01T00:00:00Z".parse().unwrap(),
+        refreshing: None,
+        resting: None,
+    }));
+    let token = RefreshingToken(Arc::new(TokenShared {
+        state: state.clone(),
+        task: std::sync::Mutex::default(),
+    }));
+    let waiting_for_foreground = async {
+        Terminal::acquire_on(
+            std::fs::File::open("/dev/null").unwrap().into(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            |_| Some(false),
+            true,
+        )
+        .await
+    };
+    let Err(error) = token
+        .start_refresh(exec, context, waiting_for_foreground)
+        .await
+    else {
+        panic!("the plugin should time out waiting for the foreground");
+    };
+    assert!(matches!(
+        &*error,
+        AuthError::AuthExec(message) if message == "flint:timed-out:plugin"
+    ));
+    assert_eq!(runs(&plugin), 0);
+    assert!(state.lock().await.rests_until().is_none());
+}
+
 // covers UP-04: a refresh that hangs is a sign-in failure naming the plugin, not a server that
 // cannot be reached. A plugin that may prompt then rests: requests say until when, without
 // running it, until someone retries.

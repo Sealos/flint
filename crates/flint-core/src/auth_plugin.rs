@@ -107,7 +107,8 @@ pub(crate) async fn resolve(
         return Ok(None);
     };
     let auth = &mut config.auth_info;
-    Ok(match run(&exec).await? {
+    let terminal = Terminal::acquire(exec.interactive_mode == Some(ExecInteractiveMode::Always));
+    Ok(match run(&exec, terminal, || {}).await? {
         Credential::Certificate { certificate, key } => {
             // kube reads these as base64; the plugin's certificate replaces any in kubeconfig.
             let base64 = base64::engine::general_purpose::STANDARD;
@@ -146,7 +147,11 @@ pub(crate) async fn resolve(
 
 /// Runs `exec` once and reads its `ExecCredential`. Dropping the future kills the plugin's
 /// process group.
-pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
+async fn run(
+    exec: &ExecConfig,
+    terminal: impl Future<Output = Acquired>,
+    on_start: impl FnOnce(),
+) -> Result<Credential, AuthError> {
     let program = exec.command.as_deref().ok_or(AuthError::MissingCommand)?;
     let mut cmd = tokio::process::Command::new(program);
     if let Some(args) = &exec.args {
@@ -164,9 +169,8 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     // `IfAvailable` it waits [`TERMINAL_WAIT`] at most: then it runs without prompting (it may
     // still have what it needs cached), rather than spend its whole timeout behind another
     // plugin's login. `Always` must prompt, so it waits as long as its caller does.
-    let must_prompt = exec.interactive_mode == Some(ExecInteractiveMode::Always);
     let terminal = if interactive {
-        match Terminal::acquire(must_prompt).await {
+        match terminal.await {
             Acquired::Terminal(terminal) => Some(*terminal),
             // It could not prompt now: it runs without (and may have what it needs cached).
             Acquired::Busy | Acquired::Background => {
@@ -230,6 +234,7 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     }
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().map_err(AuthError::AuthExecStart)?;
+    on_start();
     // Closed at once, as `Command::output()` does.
     drop(child.stdin.take());
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
@@ -411,23 +416,25 @@ impl Terminal {
         else {
             return Acquired::None;
         };
-        let fd = OwnedFd::from(file);
-        // SAFETY: plain calls on a descriptor this function owns.
-        let foreground = || unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
         // SAFETY: a plain call.
         let ours = unsafe { libc::getpgrp() };
+        let foreground = |fd| {
+            // SAFETY: a plain call on a descriptor `acquire_on` owns.
+            let group = unsafe { libc::tcgetpgrp(fd) };
+            (group != -1).then_some(group == ours)
+        };
+        Self::acquire_on(file.into(), &TERMINAL, foreground, must_prompt).await
+    }
+
+    async fn acquire_on(
+        fd: OwnedFd,
+        queue: &Arc<tokio::sync::Mutex<()>>,
+        foreground: impl Fn(RawFd) -> Option<bool>,
+        must_prompt: bool,
+    ) -> Acquired {
         loop {
-            if must_prompt {
-                // Until someone brings Flint to the foreground (`fg`).
-                loop {
-                    match foreground() {
-                        -1 => return Acquired::None,
-                        group if group == ours => break,
-                        _ => tokio::time::sleep(FOREGROUND_POLL).await,
-                    }
-                }
-            }
-            let lock = TERMINAL.clone().lock_owned();
+            // Join the queue first: the running plugin may still have the foreground.
+            let lock = queue.clone().lock_owned();
             let owner = if must_prompt {
                 lock.await
             } else {
@@ -436,10 +443,9 @@ impl Terminal {
                     Err(_) => return Acquired::Busy,
                 }
             };
-            // Checked again with the terminal held: it may have changed while waiting.
-            match foreground() {
-                -1 => return Acquired::None,
-                group if group == ours => {
+            match foreground(fd.as_raw_fd()) {
+                None => return Acquired::None,
+                Some(true) => {
                     return Acquired::Terminal(Box::new(Terminal {
                         fd,
                         _owner: owner,
@@ -447,8 +453,13 @@ impl Terminal {
                         ttou: None,
                     }));
                 }
-                _ if must_prompt => drop(owner),
-                _ => return Acquired::Background,
+                Some(false) if must_prompt => {
+                    // An external job has the foreground. Let other plugins try while
+                    // waiting for someone to bring Flint to the foreground (`fg`).
+                    drop(owner);
+                    tokio::time::sleep(FOREGROUND_POLL).await;
+                }
+                Some(false) => return Acquired::Background,
             }
         }
     }
@@ -735,7 +746,11 @@ impl RefreshingToken {
             match &state.refreshing {
                 Some(refresh) => refresh.clone(),
                 None => {
-                    let refresh = self.start_refresh(state.exec.clone(), state.context.clone());
+                    let terminal = Terminal::acquire(
+                        state.exec.interactive_mode == Some(ExecInteractiveMode::Always),
+                    );
+                    let refresh =
+                        self.start_refresh(state.exec.clone(), state.context.clone(), terminal);
                     state.refreshing = Some(refresh.clone());
                     refresh
                 }
@@ -753,13 +768,17 @@ impl RefreshingToken {
         &self,
         exec: ExecConfig,
         context: String,
+        terminal: impl Future<Output = Acquired> + Send + 'static,
     ) -> Shared<BoxFuture<'static, Refreshed>> {
         let state = self.0.state.clone();
         let name =
             redact::command_name(exec.command.as_deref().unwrap_or_default()).unwrap_or_default();
         let stopped = AuthError::AuthExec(format!("{STOPPED}{name}"));
         let task = tokio::spawn(async move {
-            let result = tokio::time::timeout(CONNECT_TIMEOUT, run(&exec)).await;
+            let mut started = false;
+            let result =
+                tokio::time::timeout(CONNECT_TIMEOUT, run(&exec, terminal, || started = true))
+                    .await;
             let mut state = state.lock().await;
             state.refreshing = None;
             match result {
@@ -776,7 +795,7 @@ impl RefreshingToken {
                 Ok(Ok(_)) => Err(Arc::new(AuthError::UnrefreshableTokenResponse)),
                 Ok(Err(e)) => Err(Arc::new(e)),
                 Err(_) => {
-                    if exec.interactive_mode != Some(ExecInteractiveMode::Never) {
+                    if started && exec.interactive_mode != Some(ExecInteractiveMode::Never) {
                         state.resting = Some((
                             Instant::now() + PROMPT_BACK_OFF,
                             Timestamp::now() + PROMPT_BACK_OFF,
