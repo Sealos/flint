@@ -1522,7 +1522,8 @@ pub(super) struct DialogText {
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
     let mut text = format!(
         "AI agents using Flint's MCP server will be able to read this cluster: resources, events \
-         and pod logs. They cannot change anything, and Secret values stay redacted.\n\n\
+         and pod logs. They cannot change anything, and Secret values stay redacted. Pod logs and \
+         events are sent as the cluster returns them, not redacted.\n\n\
          Context: {context}\nServer: {server}"
     );
     if let Some(previous) = previous {
@@ -1915,6 +1916,10 @@ mod tests {
                 .contains("Context: kind-dev\nServer: https://127.0.0.1:6443")
         );
         assert!(dialog.text.contains("cannot change anything"));
+        assert!(
+            dialog.text.contains("not redacted"),
+            "logs are not redacted yet (#68)"
+        );
         assert!(!dialog.text.contains("different server"));
         let moved = super::expose_dialog(
             "kind-dev",
