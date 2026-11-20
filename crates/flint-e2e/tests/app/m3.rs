@@ -125,8 +125,9 @@ fn up_54_55_protected_clusters_are_read_only_until_unlocked_or_trusted() -> Resu
         stored.contains("trusted_clusters") && stored.contains(&cluster.server),
         "{stored}"
     );
-    let (scratch, status) = app.quit()?;
-    assert!(status.success(), "{status}");
+    // Quitting checks the exit and the harness's invariants (no request before selection,
+    // kubeconfig untouched).
+    let scratch = app.quit()?;
     app = App::launch(AppOptions::new(&cluster.kubeconfig).reuse(scratch))?;
     app.wait_for(
         "/clusters",
