@@ -818,3 +818,61 @@ async fn kinds_arrive_in_an_open_switcher(cx: &mut TestAppContext) {
     assert_eq!(switcher.query, "pods");
     assert_eq!(labels(&switcher)[0], "Pods");
 }
+
+// covers UP-31: on a namespace-limited list, an object is not taken for gone on a merged list
+// published again from its namespace's old rows; only once that namespace is listed anew.
+#[gpui_kit::test]
+async fn a_limited_list_proves_an_object_gone_only_when_its_namespace_is_listed_anew(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let limited = |rows: &[(&str, &str, i64)], version: u64, demo: u64| {
+        let mut snapshot = (*objects(KindId::pods(), rows, SyncState::Synced, version)).clone();
+        snapshot.limited_to = Some(std::sync::Arc::new(flint_core::NamespaceLimit {
+            listed: vec!["demo".into()],
+            denied: Vec::new(),
+            reason: "pods is forbidden".into(),
+            versions: vec![demo],
+        }));
+        snapshot
+    };
+    // The list as a watch last merged it: `demo`'s rows of list 5, no `web`.
+    let _old = t.model.read_with(cx, |m, _| {
+        m.core()
+            .store_for_tests(limited(&[("demo", "api", 0)], 0, 5))
+    });
+    let missing = |cx: &mut TestAppContext| {
+        let workspace = t.workspace.clone();
+        cx.update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| {
+                ws.view_state(window, cx)
+                    .list
+                    .is_some_and(|l| l.banners.iter().any(|b| b.id == "list-missing"))
+            })
+        })
+        .unwrap()
+    };
+    t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        serde_json::json!({"kind": "pods", "namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    // Merged again (a newer list) from the same rows of `demo`: not proof.
+    t.feed_list(
+        cx,
+        std::sync::Arc::new(limited(&[("demo", "api", 0)], u64::MAX / 2, 5)),
+    )
+    .await;
+    assert!(!missing(cx), "old rows of demo taken for proof");
+    // `demo` listed anew, still without `web`: gone.
+    t.feed_list(
+        cx,
+        std::sync::Arc::new(limited(&[("demo", "api", 0)], u64::MAX / 2 + 1, 6)),
+    )
+    .await;
+    assert!(missing(cx));
+}

@@ -116,6 +116,9 @@ pub struct ResourceList {
     /// last publish from long ago (a kind viewed earlier keeps it), so an object is judged gone
     /// only on a snapshot published since.
     subscribed_version: u64,
+    /// For a namespace-limited list, which list of each namespace the subscription started
+    /// with: a merged list published since may still hold a namespace's old rows.
+    subscribed_lanes: Option<Arc<flint_core::NamespaceLimit>>,
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
@@ -172,6 +175,7 @@ impl ResourceList {
         let mut subscription = core.subscribe(&cluster, &kind);
         let latest = subscription.peek();
         let subscribed_version = latest.version;
+        let subscribed_lanes = latest.limited_to.clone();
         let watch = cx.spawn(async move |this, cx| {
             while subscription.changed().await {
                 let snapshot = subscription.latest();
@@ -233,6 +237,7 @@ impl ResourceList {
             pending_once: false,
             missing: None,
             subscribed_version,
+            subscribed_lanes,
             computing: false,
             dirty: false,
             remeasure: false,
@@ -328,7 +333,7 @@ impl ResourceList {
                 self.select_named(namespace.as_deref(), &name, cx);
             } else if self.pending_once
                 && self.latest.state.is_current()
-                && self.latest.version > self.subscribed_version
+                && self.listed_since_subscribed(namespace.as_deref())
             {
                 // Listed in full since the list opened, and not there: it is gone. Stop
                 // waiting, so an object made later with the name is not selected out of the
@@ -388,6 +393,29 @@ impl ResourceList {
         self.pending_select = Some((namespace, name));
         let latest = self.latest.clone();
         self.set_snapshot(latest, cx);
+    }
+
+    /// Whether the newest snapshot lists `namespace` (or the whole kind) anew since the list
+    /// subscribed, so an object missing from it is gone. A namespace-limited list is merged
+    /// from one list per namespace, and may be published again from a namespace's old rows:
+    /// that namespace's own list must be newer.
+    fn listed_since_subscribed(&self, namespace: Option<&str>) -> bool {
+        if self.latest.version <= self.subscribed_version {
+            return false;
+        }
+        let (Some(limit), Some(namespace)) = (&self.latest.limited_to, namespace) else {
+            return true;
+        };
+        let Some(now) = limit.version_of(namespace) else {
+            // Not a namespace this list covers: it cannot tell.
+            return false;
+        };
+        let then = self
+            .subscribed_lanes
+            .as_ref()
+            .and_then(|l| l.version_of(namespace))
+            .unwrap_or(0);
+        now > then
     }
 
     /// What the list says about an object asked for that it does not have.

@@ -947,6 +947,8 @@ fn merge_lanes(
         /// snapshots) when rows are not merged.
         state: SyncState,
         feed: Feed,
+        /// The version of the lane's rows merged in.
+        version: u64,
     }
     let views: Vec<View> = lanes
         .iter()
@@ -960,11 +962,16 @@ fn merge_lanes(
                 Some(s) => (s.state.clone(), s.feed),
                 None => (lane.hub.state(), lane.hub.feed()),
             };
+            let version = match &snap {
+                Some(s) => s.version,
+                None => lane.rx.borrow().version,
+            };
             View {
                 ns,
                 snap,
                 state,
                 feed,
+                version,
             }
         })
         .collect();
@@ -1036,6 +1043,7 @@ fn merge_lanes(
             listed: open.iter().map(|v| v.ns.clone()).collect(),
             denied: denied.iter().map(|v| v.ns.clone()).collect(),
             reason: reason.to_owned(),
+            versions: open.iter().map(|v| v.version).collect(),
         })),
         ..Default::default()
     }
@@ -1130,6 +1138,11 @@ mod tests {
             (limit.listed.clone(), limit.denied.clone()),
             (vec!["a".to_owned(), "b".to_owned()], vec!["c".to_owned()])
         );
+        // Each listed namespace says which of its lists was merged in.
+        let lane_version = |ns: &str| lanes[ns].rx.borrow().version;
+        assert_eq!(limit.versions, [lane_version("a"), lane_version("b")]);
+        assert_eq!(limit.version_of("b"), Some(lane_version("b")));
+        assert_eq!(limit.version_of("c"), None, "denied");
 
         // The least ready lane decides the state.
         lanes.insert("d".to_owned(), lane(SyncState::Loading, &[], &cols, "d"));

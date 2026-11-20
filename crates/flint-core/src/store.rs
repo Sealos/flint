@@ -79,6 +79,18 @@ pub struct NamespaceLimit {
     pub denied: Vec<String>,
     /// Why the list is limited: the server's answer to the all-namespaces list.
     pub reason: String,
+    /// For each of `listed`, the version of that namespace's rows merged in
+    /// ([`KindSnapshot::version`] of its own list). A merged list can be published again from
+    /// rows that did not change; these tell a namespace listed anew from one that was not.
+    pub versions: Vec<u64>,
+}
+
+impl NamespaceLimit {
+    /// The version of `namespace`'s rows merged in, if it is listed.
+    pub fn version_of(&self, namespace: &str) -> Option<u64> {
+        let at = self.listed.iter().position(|n| n == namespace)?;
+        self.versions.get(at).copied()
+    }
 }
 
 impl KindSnapshot {
