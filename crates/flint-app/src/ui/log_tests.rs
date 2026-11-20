@@ -2392,3 +2392,113 @@ async fn a_compact_toolbar_says_invalid_regex_briefly(cx: &mut TestAppContext) {
         .unwrap();
     assert!(width < 120., "{width}");
 }
+
+// covers UP-48: a regular expression's highlights are kept as drawn: touching ranges merged,
+// and none past where an unwrapped line is cut.
+#[test]
+fn highlights_are_merged_and_clipped_to_what_is_drawn() {
+    use super::highlight::drawn_ranges;
+    let dense: Vec<_> = (0..10_000).map(|i| i..i + 1).collect();
+    assert_eq!(
+        drawn_ranges(dense.clone(), None),
+        [std::ops::Range {
+            start: 0,
+            end: 10_000
+        }]
+    );
+    assert_eq!(
+        drawn_ranges(dense, Some(4096)),
+        [std::ops::Range {
+            start: 0,
+            end: 4096
+        }]
+    );
+    assert_eq!(
+        drawn_ranges(vec![0..2, 3..5, 5..6, 4100..4110], Some(4096)),
+        [0..2, 3..6]
+    );
+}
+
+// covers UP-48: a filter scanned anew replaces what was found from the old rows, even when the
+// new rows have the same count and ends.
+#[gpui_kit::test]
+async fn new_rows_with_the_same_ends_count_their_own_matches(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 4).await;
+    cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
+        .await;
+    assert_eq!(view.read_with(cx, |v, _| v.shown_match_count().0), 4);
+    // Rows 4, 5, 6 and 19: the same count and ends, two of them errors.
+    view.update(cx, |v, _| {
+        let spec = flint_core::FilterSpec {
+            query: Some(flint_core::SearchQuery {
+                regex: true,
+                ..flint_core::SearchQuery::new(r"line (4|5|6|19)$")
+            }),
+            errors_only: false,
+            context: 0,
+        };
+        let mut filter = flint_core::LogFilter::new(spec);
+        filter.update(&v.snapshot.lines);
+        assert_eq!(v.install_filter(filter), 4);
+        assert_eq!(v.shown_match_count().0, 2);
+    });
+}
+
+// covers UP-48: a regular expression over long lines catches up on the core's threads once
+// it is behind by more text than the UI thread takes on; plain text catches up in place.
+#[gpui_kit::test]
+async fn a_regex_over_long_lines_catches_up_off_the_ui_thread(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (_window, view) = open(cx, core);
+    let mut lines = Feed::new(1_000);
+    let long = "x".repeat(8 * 1024);
+    for n in 0..100 {
+        lines
+            .buffer
+            .push(LogLine::parse(&format!("{long} {n}"), false));
+    }
+    feed(cx, &view, lines.streaming());
+    view.read_with(cx, |v, _| {
+        assert!(v.catches_up_on_ui(100, false), "plain text: 100 lines");
+        assert!(!v.catches_up_on_ui(100, true), "a regex: 800 KiB of text");
+        assert!(v.catches_up_on_ui(10, true), "a regex: 80 KiB of text");
+    });
+}
+
+// covers UP-48: in a filtered tab showing nothing, Jump to Newest still follows the tail, and a
+// selection the filter hides can still be cleared (ending the pause it started).
+#[gpui_kit::test]
+async fn an_empty_filtered_tab_jumps_and_clears_its_selection(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 4).streaming());
+    draw(cx, window);
+    view.update(cx, |v, _| v.selection = Some(LineSelection::new(0, 3)));
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 0).await;
+    view.read_with(cx, |v, _| {
+        assert!(v.can_jump_to_end());
+        assert!(v.is_selecting());
+        assert!(!v.has_selection());
+    });
+    run(cx, window, "logs::JumpToEnd", serde_json::Value::Null);
+    run(cx, window, "logs::ClearSelection", serde_json::Value::Null);
+    view.read_with(cx, |v, _| assert!(v.selection.is_none()));
+}

@@ -74,6 +74,9 @@ const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 /// (well under a millisecond); further behind, a tab hidden while its pod was busy, the scan
 /// runs on the core's threads.
 pub const CATCH_UP_ON_UI: u64 = 20_000;
+/// A regular expression can take a while over long lines, so its catch-ups on the UI thread are
+/// also held to this many bytes of text; more runs on the core's threads.
+pub const REGEX_CATCH_UP_ON_UI_BYTES: usize = 256 * 1024;
 /// How long a copy or save note stays under the toolbar.
 pub const NOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -174,6 +177,9 @@ pub struct LogView {
     query_pending: bool,
     /// Bumped with every new filter, so a slow scan of an old one is dropped.
     filter_generation: u64,
+    /// Bumped whenever `filter` is replaced (a scan or catch-up landing, the filter turned
+    /// off), so what was found from the old rows is found again ([`LogView::shown_matches`]).
+    rows_generation: u64,
     _filter: Task<()>,
     search_input: Entity<InputState>,
     note: Option<Note>,
@@ -274,6 +280,7 @@ impl LogView {
             _catch_up: Task::ready(()),
             query_pending: false,
             filter_generation: 0,
+            rows_generation: 0,
             _filter: Task::ready(()),
             search_input,
             note: None,
@@ -512,12 +519,31 @@ impl LogView {
         if self.searching {
             return;
         }
-        let lines = &self.snapshot.lines;
-        if self.search.pending(lines) > CATCH_UP_ON_UI && !self.query.text.is_empty() {
+        let pending = self.search.pending(&self.snapshot.lines);
+        if !self.query.text.is_empty() && !self.catches_up_on_ui(pending, self.matcher.is_regex()) {
             self.scan(self.search.clone(), None, cx);
         } else {
-            self.search.update(lines);
+            self.search.update(&self.snapshot.lines);
         }
+    }
+
+    /// Whether a catch-up of the newest `pending` lines runs on the UI thread as the tab is
+    /// drawn: at most [`CATCH_UP_ON_UI`] lines and, for a regular expression,
+    /// [`REGEX_CATCH_UP_ON_UI_BYTES`] of text.
+    pub(super) fn catches_up_on_ui(&self, pending: u64, regex: bool) -> bool {
+        if pending > CATCH_UP_ON_UI {
+            return false;
+        }
+        if !regex {
+            return true;
+        }
+        let lines = &self.snapshot.lines;
+        let from = lines.end_id().saturating_sub(pending);
+        let mut bytes = 0;
+        lines.range(from, lines.end_id()).all(|(_, line)| {
+            bytes += line.text.len();
+            bytes <= REGEX_CATCH_UP_ON_UI_BYTES
+        })
     }
 
     /// Brings the search up to the lines shown at once, before an action uses its matches, if

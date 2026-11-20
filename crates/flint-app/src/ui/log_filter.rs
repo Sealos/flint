@@ -105,6 +105,7 @@ impl LogView {
             self.filtering = false;
             self._filter = Task::ready(());
             if self.filter.take().is_some() {
+                self.rows_generation += 1;
                 self.list.reset(self.snapshot.lines.len());
             }
             cx.notify();
@@ -128,17 +129,15 @@ impl LogView {
             let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
                 return;
             };
-            let mut filter = core
+            let filter = core
                 .filter_logs(LogFilter::with_matcher(spec, matcher), lines)
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
-                // Lines evicted while it scanned are not shown.
-                filter.evict(view.snapshot.lines.first_id());
-                view.list.reset(filter.rows().len());
-                view.filter = Some(filter);
+                let rows = view.install_filter(filter);
+                view.list.reset(rows);
                 view.filtering = false;
                 // Lines that came while it scanned are caught up with when the tab is drawn.
                 cx.notify();
@@ -148,9 +147,9 @@ impl LogView {
     }
 
     /// Brings the filter up to the lines shown before the tab is drawn, as the search does: a
-    /// hidden tab scans nothing until it is shown. A filter more than [`super::CATCH_UP_ON_UI`]
-    /// lines behind (resumed after a long pause) catches up on the core's threads, keeping the
-    /// rows shown until it lands.
+    /// hidden tab scans nothing until it is shown. A filter further behind than
+    /// [`LogView::catches_up_on_ui`] allows (resumed after a long pause, or a regular expression
+    /// over long lines) catches up on the core's threads, keeping the rows shown until it lands.
     pub(super) fn catch_up_filter(&mut self, cx: &mut Context<Self>) {
         if self.catching_up {
             return;
@@ -158,7 +157,8 @@ impl LogView {
         let Some(filter) = &self.filter else {
             return;
         };
-        if filter.pending(&self.snapshot.lines) <= super::CATCH_UP_ON_UI {
+        let regex = filter.spec().query.is_some() && self.matcher.is_regex();
+        if self.catches_up_on_ui(filter.pending(&self.snapshot.lines), regex) {
             // What the list holds now, before the update changes it.
             let shown = self.shown_rows();
             if let Some(filter) = &mut self.filter {
@@ -177,19 +177,30 @@ impl LogView {
         let behind = filter.clone();
         let lines = self.snapshot.lines.clone();
         self._catch_up = cx.spawn(async move |this, cx| {
-            let mut caught_up = core.filter_logs(behind, lines).await;
+            let caught_up = core.filter_logs(behind, lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
-                caught_up.evict(view.snapshot.lines.first_id());
                 view.catching_up = false;
                 let shown = view.shown_rows();
-                view.filter = Some(caught_up);
+                view.install_filter(caught_up);
                 view.splice_rows(shown);
                 cx.notify();
             });
         });
+    }
+
+    /// Puts `filter`, scanned on the core's threads, in place of the one shown, without the
+    /// lines evicted while it scanned. What was found from the old rows is found again
+    /// ([`LogView::shown_matches`]): rows with the same ends can differ in between. Returns how
+    /// many rows it has; the caller updates the list.
+    pub(super) fn install_filter(&mut self, mut filter: LogFilter) -> usize {
+        filter.evict(self.snapshot.lines.first_id());
+        let rows = filter.rows().len();
+        self.filter = Some(filter);
+        self.rows_generation += 1;
+        rows
     }
 
     /// What the list holds now: how many rows, and the last row's id.

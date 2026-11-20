@@ -14,14 +14,16 @@ use gpui_kit::*;
 
 use super::LogView;
 
-/// How many lines' highlights are kept; past this the cache starts over (a screen shows far
-/// fewer).
-const KEEP: usize = 4096;
+/// How many bytes of ranges are kept; past this the cache starts over (a screen's rows need far
+/// fewer, ranges merged and clipped to what is drawn).
+const KEEP_BYTES: usize = 4 << 20;
 
 /// The matches found in lines' text, for the current matcher.
 #[derive(Default)]
 pub(super) struct Highlights {
     found: HashMap<LineId, Arc<[Range<usize>]>>,
+    /// Bytes the ranges in `found` take.
+    bytes: usize,
     /// Lines drawn without their matches, to find next.
     wanted: Vec<LineId>,
     /// A search for `wanted` runs.
@@ -30,7 +32,7 @@ pub(super) struct Highlights {
 }
 
 impl Highlights {
-    /// Forgets every match: the matcher changed.
+    /// Forgets every match: the matcher, or how much of a line is drawn, changed.
     pub(super) fn clear(&mut self) {
         *self = Highlights::default();
     }
@@ -61,14 +63,17 @@ impl LogView {
             self.highlights.finding = true;
             // Spawned tasks start after this frame's rows: all of them are asked for at once.
             self.highlights._find = Some(cx.spawn(async move |this, cx| {
-                let Ok((mut ids, lines, matcher, generation)) = this.update(cx, |view, _| {
-                    (
-                        std::mem::take(&mut view.highlights.wanted),
-                        view.snapshot.lines.clone(),
-                        view.matcher.clone(),
-                        view.search_generation,
-                    )
-                }) else {
+                let Ok((mut ids, lines, matcher, generation, cutoff)) =
+                    this.update(cx, |view, _| {
+                        (
+                            std::mem::take(&mut view.highlights.wanted),
+                            view.snapshot.lines.clone(),
+                            view.matcher.clone(),
+                            view.search_generation,
+                            (!view.wrap).then_some(super::log_model::UNWRAPPED_MAX_BYTES),
+                        )
+                    })
+                else {
                     return;
                 };
                 let found: Vec<(LineId, Arc<[Range<usize>]>)> = cx
@@ -78,7 +83,8 @@ impl LogView {
                         ids.into_iter()
                             .filter_map(|id| {
                                 let line = lines.get(id)?;
-                                Some((id, matcher.match_ranges(&line.text).into()))
+                                let found = matcher.match_ranges(&line.text);
+                                Some((id, drawn_ranges(found, cutoff).into()))
                             })
                             .collect()
                     })
@@ -86,10 +92,20 @@ impl LogView {
                 let _ = this.update(cx, |view, cx| {
                     view.highlights.finding = false;
                     if view.search_generation == generation {
-                        if view.highlights.found.len() + found.len() > KEEP {
+                        let size = |r: &Arc<[Range<usize>]>| std::mem::size_of_val(&r[..]);
+                        let adding: usize = found.iter().map(|(_, r)| size(r)).sum();
+                        // Over the budget: start over. What this frame's rows need is kept
+                        // whatever it takes, so they are not asked for again and again.
+                        if view.highlights.bytes + adding > KEEP_BYTES {
                             view.highlights.found.clear();
+                            view.highlights.bytes = 0;
                         }
-                        view.highlights.found.extend(found);
+                        for (id, ranges) in found {
+                            view.highlights.bytes += size(&ranges);
+                            if let Some(old) = view.highlights.found.insert(id, ranges) {
+                                view.highlights.bytes -= size(&old);
+                            }
+                        }
                     }
                     cx.notify();
                 });
@@ -97,4 +113,24 @@ impl LogView {
         }
         Some(Arc::from([]))
     }
+}
+
+/// `found` (sorted, not overlapping) as drawn: ranges that touch merged into one (a dense
+/// pattern such as `.` is one range, not one per character), and only up to `cutoff` bytes,
+/// where an unwrapped line is cut.
+pub(super) fn drawn_ranges(found: Vec<Range<usize>>, cutoff: Option<usize>) -> Vec<Range<usize>> {
+    let cutoff = cutoff.unwrap_or(usize::MAX);
+    let mut drawn: Vec<Range<usize>> = Vec::new();
+    for r in found {
+        if r.start >= cutoff {
+            break;
+        }
+        let r = r.start..r.end.min(cutoff);
+        match drawn.last_mut() {
+            Some(last) if last.end >= r.start => last.end = last.end.max(r.end),
+            _ => drawn.push(r),
+        }
+    }
+    drawn.shrink_to_fit();
+    drawn
 }

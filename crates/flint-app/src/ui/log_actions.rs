@@ -23,6 +23,8 @@ pub(in crate::ui) struct ShownMatchesKey {
     search: u64,
     matches: (usize, Option<LineId>, Option<LineId>),
     filter: u64,
+    /// Bumped when rows are replaced: rows with the same ends can differ in between.
+    rows_generation: u64,
     rows: (usize, Option<LineId>, Option<LineId>),
     first: LineId,
 }
@@ -70,6 +72,8 @@ impl LogView {
             })
             .bind::<ToggleWrap>(|view, _, _, cx| {
                 view.wrap = !view.wrap;
+                // Highlights were clipped to what an unwrapped line draws.
+                view.highlights.clear();
                 view.list.remeasure();
                 cx.notify();
             })
@@ -168,6 +172,18 @@ impl LogView {
         self.row_count() > 0
     }
 
+    /// Jump to Newest applies: there are rows, or a filter shows none yet (following the tail
+    /// again shows what comes).
+    pub(in crate::ui) fn can_jump_to_end(&self) -> bool {
+        self.has_lines() || self.is_filtered()
+    }
+
+    /// A selection exists, shown or hidden by a filter: clearing it also ends the pause it
+    /// started.
+    pub(in crate::ui) fn is_selecting(&self) -> bool {
+        self.selection.is_some()
+    }
+
     /// Lines are selected, and some of them shown (a filter can hide them all).
     pub(in crate::ui) fn has_selection(&self) -> bool {
         self.selected_rows() > 0
@@ -197,6 +213,7 @@ impl LogView {
                 matches.back().copied(),
             ),
             filter: self.filter_generation,
+            rows_generation: self.rows_generation,
             rows: rows.map_or((0, None, None), |r| {
                 (r.len(), r.front().copied(), r.back().copied())
             }),
