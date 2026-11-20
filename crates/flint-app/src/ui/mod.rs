@@ -17,6 +17,7 @@ mod dock;
 mod dock_model;
 #[cfg(test)]
 mod dock_tests;
+mod focus;
 mod list;
 mod list_model;
 mod log_model;

@@ -9,10 +9,12 @@
 use flint_core::exec::fake::FakeExec;
 use flint_core::terminal::TerminalSize;
 use flint_core::{CoreConfig, CoreHandle, ExecState, LogSubject, LogTarget, Settings};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::input::InputState;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WeakEntity,
+    WindowBounds, WindowOptions, px, size,
 };
 use serde_json::json;
 
@@ -220,6 +222,57 @@ async fn closing_a_log_tab_leaks_nothing(cx: &mut TestAppContext) {
     let id = open_logs(cx, window, &dock, &core);
     close(cx, window, id);
     cx.update(|cx| cx.assert_no_new_leaks(&snapshot));
+}
+
+// covers UP-42: a log tab closed while its search field has focus frees that field too. The
+// window keeps the focused text input registered (gpui-component's `WindowState`, a strong
+// handle) and lets it go only once asked after focus moved on.
+#[gpui_kit::test]
+async fn closing_a_log_tab_while_searching_leaks_nothing(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, dock) = open_dock(cx);
+    let snapshot = cx.update(|cx| cx.leak_detector_snapshot());
+    let id = open_logs(cx, window, &dock, &core);
+    focus_search(cx, window);
+    close(cx, window, id);
+    cx.update(|cx| cx.assert_no_new_leaks(&snapshot));
+}
+
+// covers UP-42: a log tab whose search had focus when another tab was shown is freed when it
+// closes later.
+#[gpui_kit::test]
+async fn closing_a_log_tab_searched_before_another_tab_leaks_nothing(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, dock) = open_dock(cx);
+    let logs = open_logs(cx, window, &dock, &core);
+    let view = match dock.read_with(cx, |d, _| d.tab(logs).unwrap().clone()) {
+        DockTab::Logs(view) => view.downgrade(),
+        DockTab::Shell(_) => panic!("a log tab"),
+    };
+    let search = focus_search(cx, window);
+    let (shell, _fake) = open_shell(cx, window, &dock);
+    close(cx, window, logs);
+    view.assert_released();
+    search.assert_released();
+    close(cx, window, shell);
+}
+
+/// Moves focus to the active log tab's search field, as ⌘F does, and draws it focused. Returns
+/// the field.
+fn focus_search(cx: &mut TestAppContext, window: AnyWindowHandle) -> WeakEntity<InputState> {
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch("logs::FocusSearch", json!(null), window, cx)
+    })
+    .unwrap()
+    .unwrap();
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        let focused = window
+            .focused_input(cx)
+            .expect("the search field has focus");
+        focused.as_input().expect("a text field").downgrade()
+    })
+    .unwrap()
 }
 
 // covers UP-42: a dock that showed tabs of both kinds, switched between them and closed them

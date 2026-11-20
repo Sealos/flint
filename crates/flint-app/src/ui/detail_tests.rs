@@ -6,6 +6,7 @@
 //! that failure, then show an object as a finished fetch would ([`show_fetched`]).
 
 use flint_core::{KindId, ObjectDetail, SyncState};
+use gpui_kit::component::input::EditorState;
 use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
 use serde_json::{Value, json};
@@ -14,7 +15,8 @@ use super::{DetailTab, DetailView, Fetch};
 use crate::ui::object::MASK;
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
-    TestWorkspace, WAIT, entry, objects, open_workspace, standard_sections,
+    TestWorkspace, WAIT, assert_focused_input, entry, objects, open_workspace, standard_sections,
+    weaken,
 };
 
 /// Shows `detail` as a fetch that succeeds does ([`DetailView::show_fetched`]).
@@ -391,6 +393,114 @@ async fn the_refresh_key_refetches_or_retries(cx: &mut TestAppContext) {
     t.focus_workspace(cx);
     t.press_key_of(cx, "workspace::RetryConnection");
     t.wait_for_attempts(cx, "beta", attempts + 1).await;
+}
+
+/// Shows the open pane's YAML and moves focus into it, as a click to select and copy does, so the
+/// window holds the editor as its focused text field. Returns the pane and the editor.
+fn focus_yaml(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+) -> (Entity<DetailView>, Entity<EditorState>) {
+    t.dispatch(cx, "detail::ShowYaml", Value::Null).unwrap();
+    cx.run_until_parked();
+    let pane = view(cx, t);
+    let yaml = pane.read_with(cx, |d, _| d.yaml.clone());
+    cx.update_window(t.window, |_, window, cx| {
+        let focus = gpui_kit::Focusable::focus_handle(yaml.read(cx), cx);
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_focused_input(cx, t.window, "the YAML");
+    (pane, yaml)
+}
+
+// A detail pane closed while its YAML has focus is freed with its editor. The window keeps the
+// focused text field registered (gpui-component's `WindowState`, a strong handle) until asked
+// after focus moved on.
+#[gpui_kit::test]
+async fn a_detail_pane_closed_from_its_yaml_is_released(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.open_kind(
+        cx,
+        "pods",
+        objects(KindId::pods(), &[("demo", "api", 0)], SyncState::Synced, 1),
+    )
+    .await;
+
+    let snapshot = cx.update(|cx| cx.leak_detector_snapshot());
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "api"}),
+    )
+    .unwrap();
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    let (pane, yaml) = focus_yaml(cx, &t);
+    let (pane, yaml) = (weaken(pane), weaken(yaml));
+    t.dispatch(cx, "detail::Close", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert!(t.detail(cx).is_none());
+    pane.assert_released();
+    yaml.assert_released();
+    cx.update(|cx| cx.assert_no_new_leaks(&snapshot));
+}
+
+// A detail pane whose YAML had focus when a dock tab took it, replaced by another row's pane
+// before it draws again, is freed with its editor: focus stays in the dock, so only the
+// replacement itself can let the window drop the field.
+#[gpui_kit::test]
+async fn a_detail_pane_replaced_from_the_dock_is_released(cx: &mut TestAppContext) {
+    use crate::ui::log_view::LogRequest;
+    use crate::ui::registry::{self, SelectRow};
+    use flint_core::{LogSubject, LogTarget};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(
+        cx,
+        &t,
+        KindId::pods(),
+        &[("demo", "api", 0), ("demo", "web", 0)],
+        "api",
+    )
+    .await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    let (pane, yaml) = focus_yaml(cx, &t);
+    let (pane, yaml) = (weaken(pane), weaken(yaml));
+    let list = t.list(cx).unwrap();
+
+    // A log tab takes focus, and another row is selected before the pane draws again.
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            let request = LogRequest {
+                cluster: "alpha".into(),
+                subject: LogSubject::Pod(LogTarget {
+                    namespace: "demo".into(),
+                    pod: "api".into(),
+                    container: None,
+                }),
+                previous: false,
+            };
+            ws.open_logs(request, true, window, cx);
+        });
+        let focus = list.read(cx).focus_handle().clone();
+        let select = SelectRow {
+            namespace: Some("demo".into()),
+            name: "web".into(),
+        };
+        registry::dispatch_in(&focus, &select, window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    pane.assert_released();
+    yaml.assert_released();
 }
 
 // A closed detail pane is freed, with its YAML editor and fetch task.

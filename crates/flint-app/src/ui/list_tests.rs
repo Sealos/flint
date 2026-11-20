@@ -815,28 +815,36 @@ async fn measure_frame_cost_with_10k_rows(cx: &mut TestAppContext) {
     eprintln!("10k rows: {per_frame:?} per frame (headless, {frames} frames)");
 }
 
-// A closed list is freed, with its filter's input: when another kind replaces it, and when a
-// cluster switch closes it. Nothing it registered (for the next frame, its tasks) keeps it
-// alive. With GPUI_LEAK_DETECTION=1 a failure lists the live handles.
+// A closed list is freed, with its filter: when another kind replaces it (focus moves to the
+// new list), and when a cluster switch closes it (the workspace takes focus back). Each list is
+// closed with its filter focused, so the window holds the filter as its focused text field
+// (gpui-component's `WindowState`, a strong handle) until asked after focus moved on. Nothing
+// else the list registered (for the next frame, its tasks) keeps it alive either. With
+// GPUI_LEAK_DETECTION=1 a failure lists the live handles.
 //
 // Not `assert_no_new_leaks`: each cluster switch also rebuilds the other cluster's screen (its
 // Retry buttons' focus handles are new and alive), which is not the list's.
 #[gpui_kit::test]
 async fn a_closed_list_is_released(cx: &mut TestAppContext) {
-    use crate::ui::support_tests::{open_workspace, pods, standard_sections};
+    use crate::ui::support_tests::{
+        assert_focused_input, open_workspace, pods, standard_sections, weaken,
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.connect_alpha(cx, standard_sections()).await;
-    let parts = |cx: &mut TestAppContext| {
+    let filtering = |cx: &mut TestAppContext| {
+        t.press_key_of(cx, "resource_list::FocusFilter");
+        cx.run_until_parked();
+        assert_focused_input(cx, t.window, "the filter");
         let list = t.list(cx).unwrap();
         let filter = list.read_with(cx, |l, _| l.filter.downgrade());
-        (list.downgrade(), filter)
+        (weaken(list), filter)
     };
 
     // Replaced by another kind.
     t.open_kind(cx, "pods", pods(&[("demo", "api", 0)])).await;
-    let (pods_list, pods_filter) = parts(cx);
+    let (pods_list, pods_filter) = filtering(cx);
     t.dispatch(
         cx,
         "workspace::OpenView",
@@ -848,10 +856,65 @@ async fn a_closed_list_is_released(cx: &mut TestAppContext) {
     pods_filter.assert_released();
 
     // Closed by a cluster switch.
-    let (services_list, services_filter) = parts(cx);
+    let (services_list, services_filter) = filtering(cx);
     t.activate(cx, "beta").await;
     cx.run_until_parked();
     assert!(t.list(cx).is_none());
     services_list.assert_released();
     services_filter.assert_released();
+}
+
+// A list whose filter had focus when a dock tab took it, closed by a cluster switch before it
+// draws again, is freed: no list opens on the new cluster (no saved view) and focus stays in
+// the dock, so only the switch itself can let the window drop the field.
+#[gpui_kit::test]
+async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppContext) {
+    use crate::ui::log_view::LogRequest;
+    use crate::ui::support_tests::{
+        assert_focused_input, open_workspace, pods, standard_sections, weaken,
+    };
+    use flint_core::{LogSubject, LogTarget};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.open_kind(cx, "pods", pods(&[("demo", "api", 0)])).await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    cx.run_until_parked();
+    assert_focused_input(cx, t.window, "the filter");
+    let list = t.list(cx).unwrap();
+    let filter = list.read_with(cx, |l, _| l.filter.downgrade());
+    let list = weaken(list);
+
+    // A log tab takes focus, and the cluster switches before the list draws again.
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            let request = LogRequest {
+                cluster: "alpha".into(),
+                subject: LogSubject::Pod(LogTarget {
+                    namespace: "demo".into(),
+                    pod: "api".into(),
+                    container: None,
+                }),
+                previous: false,
+            };
+            ws.open_logs(request, true, window, cx);
+        });
+        // The core reports the switch (as after SelectCluster) in the same update, before
+        // anything is drawn.
+        t.model.update(cx, |m, cx| {
+            m.feed(flint_core::Event::ActiveChanged(Some("beta".into())), cx)
+        });
+    })
+    .unwrap();
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, crate::ui::support_tests::WAIT, move |_, cx| {
+        workspace.read(cx).shown_cluster() == Some("beta")
+    })
+    .await;
+    cx.run_until_parked();
+    assert!(t.list(cx).is_none());
+    list.assert_released();
+    filter.assert_released();
 }
