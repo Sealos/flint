@@ -662,6 +662,38 @@ async fn view_state_reports_the_rows_as_drawn(cx: &mut TestAppContext) {
     assert!(list.read_with(cx, |list, _| list.check_select_row(&row("nope")).is_err()));
 }
 
+// A snapshot with other columns replaces the drawn ones at once: the automation state read
+// before the next frame names the new columns (it named the old ones, or panicked when the new
+// snapshot had fewer).
+#[gpui_kit::test]
+async fn new_columns_are_reported_before_the_next_frame(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[("demo", "api", 0)], SyncState::Synced, 1), cx)
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-api").is_some()
+    })
+    .await;
+    let mut fewer = (*pods(&[("demo", "api", 0)], SyncState::Synced, 2)).clone();
+    fewer.columns = vec![
+        column("Name", ColumnRole::Name, ColumnType::String, 0),
+        column("Age", ColumnRole::Value, ColumnType::String, 0),
+    ]
+    .into();
+    fewer.rows = vec![Arc::new(Row {
+        cells: Box::new([Cell::Name, Cell::Text("1d".into())]),
+        ..(*fewer.rows[0]).clone()
+    })];
+    let state = list.update(cx, |list, cx| {
+        list.apply(Arc::new(fewer), vec![0].into(), None, None, cx);
+        list.view_state()
+    });
+    assert_eq!(state.columns, ["Name", "Age"]);
+    assert_eq!(state.rows[0].cells, ["api", "1d"]);
+}
+
 /// A quick measure of what one frame of a 10,000-row list costs on the UI thread (layout and
 /// paint of the visible rows, in the headless test window). Ignored: run it in release mode
 /// with `--ignored --nocapture` to compare changes to the row rendering.
