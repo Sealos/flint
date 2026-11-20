@@ -1882,7 +1882,7 @@ mod tests {
         let paths = [dir.join("first"), dir.join("second")];
         std::fs::write(&paths[0], first).unwrap();
         std::fs::write(&paths[1], second).unwrap();
-        let (events, _rx) = async_channel::unbounded();
+        let (events, _rx) = crate::events::channel();
         let config = CoreConfig {
             config_dir: PathBuf::from("/nonexistent"),
             settings: Settings::default(),
