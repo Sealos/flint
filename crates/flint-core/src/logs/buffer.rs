@@ -138,9 +138,30 @@ impl LogBuffer {
         self.next == self.first
     }
 
+    /// Drops whole blocks from the oldest end until the stored lines take at most `bytes` (the
+    /// open tail block stays), for the shared budget ([`super::LogBudget`]). Returns whether any
+    /// line was dropped.
+    pub fn trim_to(&mut self, bytes: usize) -> bool {
+        let mut trimmed = false;
+        while self.bytes > bytes
+            && let Some(block) = self.chunks.pop_front()
+        {
+            self.bytes -= block.bytes;
+            self.first = self.first.max(block.start + block.lines.len() as u64);
+            self.dropped += 1;
+            trimmed = true;
+        }
+        trimmed
+    }
+
     /// How many blocks were dropped so far; changes exactly when memory was released.
     pub fn dropped_blocks(&self) -> u64 {
         self.dropped
+    }
+
+    /// Bytes [`LogBuffer::trim_to`] can free: the sealed blocks.
+    pub fn trimmable_bytes(&self) -> usize {
+        self.bytes - self.tail_bytes
     }
 
     /// Bytes the stored lines take, by [`LogLine::heap_bytes`].

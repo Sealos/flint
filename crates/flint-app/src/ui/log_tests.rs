@@ -104,6 +104,7 @@ impl Feed {
             held_back,
             version: self.version,
             pods: None,
+            trimmed: false,
         })
     }
 
@@ -186,6 +187,38 @@ fn press(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
     cx.update_window(window, |_, window, cx| window.press(key, cx))
         .unwrap();
     cx.run_until_parked();
+}
+
+// covers UP-40, UP-42: a tab that gave lines back to the shared memory budget says so, so a
+// short history is not taken for a quiet pod (#254).
+#[gpui_kit::test]
+async fn a_trimmed_tab_says_older_lines_were_dropped(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(50);
+    feed(cx, &view, lines.push(0, 3).streaming());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(2)).is_some()
+    })
+    .await;
+    assert!(
+        cx.update_window(window, |_, window, _| window
+            .try_find("log-trimmed")
+            .is_none())
+            .unwrap()
+    );
+    assert!(!view.read_with(cx, |v, _| v.view_state().trimmed));
+
+    let trimmed = Arc::new(LogSnapshot {
+        trimmed: true,
+        ..(*lines.push(3, 6).streaming()).clone()
+    });
+    feed(cx, &view, trimmed);
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-trimmed").is_some() && window.try_find(line_id(5)).is_some()
+    })
+    .await;
+    assert!(view.read_with(cx, |v, _| v.view_state().trimmed));
 }
 
 // covers UP-40: the tab shows the session's state and its lines, and keeps the list in step
@@ -664,6 +697,7 @@ async fn a_workload_tab_shows_sources_and_stream_counts(cx: &mut TestAppContext)
             held_back: 0,
             version: 1,
             pods: Some(Arc::new(pods)),
+            trimmed: false,
         }),
     );
     cx.wait_for(window, WAIT, |window, _| {
@@ -721,6 +755,7 @@ async fn a_far_match_is_scrolled_into_view(cx: &mut TestAppContext) {
             held_back: 0,
             version: 1,
             pods: None,
+            trimmed: false,
         }),
     );
     press(cx, window, "home");
@@ -920,6 +955,7 @@ async fn the_toolbar_is_one_row_and_notices_replace_each_other(cx: &mut TestAppC
                 held_back: 53,
                 version: 1,
                 pods: Some(Arc::new(pods)),
+                trimmed: false,
             }),
         );
         view.update(cx, |v, cx| v.set_query("GET".into(), cx));
@@ -1129,6 +1165,7 @@ async fn timestamps_line_up_and_the_current_match_stands_out(cx: &mut TestAppCon
             held_back: 0,
             version: 1,
             pods: None,
+            trimmed: false,
         }),
     );
     press(cx, window, "t");
@@ -1231,6 +1268,7 @@ async fn the_overflow_menu_stays_reachable_and_holds_save(cx: &mut TestAppContex
             held_back: 0,
             version: 1,
             pods: None,
+            trimmed: false,
         })
     };
     feed(cx, &view, snapshot(LogState::Streaming));
@@ -1309,6 +1347,7 @@ async fn a_dated_separator_starts_each_day(cx: &mut TestAppContext) {
             held_back: 0,
             version: 1,
             pods: None,
+            trimmed: false,
         }),
     );
     cx.wait_for(window, WAIT, |window, _| {
@@ -1522,6 +1561,7 @@ async fn the_state_reports_a_workloads_streams_and_sources(cx: &mut TestAppConte
             held_back: 0,
             version: 1,
             pods: Some(Arc::new(pods)),
+            trimmed: false,
         }),
     );
     let tab = state(cx, &view)["tab"].clone();

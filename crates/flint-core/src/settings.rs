@@ -258,6 +258,11 @@ pub const DEFAULT_LOG_BUFFER_MIB: u32 = 64;
 /// The range [`Settings::log_buffer_bytes`] keeps the setting in, in MiB.
 pub const LOG_BUFFER_MIB_RANGE: std::ops::RangeInclusive<u32> = 8..=1024;
 
+/// MiB all log sessions together keep by default ([`Settings::log_total_mib`]).
+pub const DEFAULT_LOG_TOTAL_MIB: u32 = 512;
+/// The range [`Settings::log_total_bytes`] keeps the setting in, in MiB.
+pub const LOG_TOTAL_MIB_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
+
 /// User settings from `settings.toml`. Unknown keys are ignored so newer files still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -291,6 +296,10 @@ pub struct Settings {
     /// this or `log_buffer_lines` is exceeded. Applies to sessions opened after a change. Read it
     /// through [`Settings::log_buffer_bytes`].
     pub log_buffer_mib: u32,
+    /// MiB all log sessions together may keep. Over it, the tabs viewed least recently drop
+    /// their oldest lines first (never the tab shown, beyond its own `log_buffer_mib`), and say
+    /// so. Applies at once. Read it through [`Settings::log_total_bytes`].
+    pub log_total_mib: u32,
 }
 
 impl Default for Settings {
@@ -307,6 +316,7 @@ impl Default for Settings {
             cluster_watch_mode: BTreeMap::new(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
+            log_total_mib: DEFAULT_LOG_TOTAL_MIB,
         }
     }
 }
@@ -326,6 +336,16 @@ impl Settings {
             .log_buffer_mib
             .clamp(*LOG_BUFFER_MIB_RANGE.start(), *LOG_BUFFER_MIB_RANGE.end());
         mib as usize * 1024 * 1024
+    }
+
+    /// [`Settings::log_total_mib`] in bytes, kept within [`LOG_TOTAL_MIB_RANGE`] and never
+    /// below one session's own cap ([`Settings::log_buffer_bytes`]), so the tab shown never
+    /// wipes every other one.
+    pub fn log_total_bytes(&self) -> usize {
+        let mib = self
+            .log_total_mib
+            .clamp(*LOG_TOTAL_MIB_RANGE.start(), *LOG_TOTAL_MIB_RANGE.end());
+        (mib as usize * 1024 * 1024).max(self.log_buffer_bytes())
     }
 
     /// The watch mode for a cluster: its override if there is one, else the global mode.
@@ -574,6 +594,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "cluster_watch_mode",
     "log_buffer_lines",
     "log_buffer_mib",
+    "log_total_mib",
 ];
 
 /// The keys of `table` that are not settings but look like a misspelt one (at most two edits
@@ -945,6 +966,22 @@ mod tests {
         assert_eq!(written.log_buffer_lines, 20_000);
         assert_eq!(written.watch_mode, WatchMode::OnView);
         assert_eq!(load_settings(dir.path()).unwrap(), written);
+    }
+
+    // covers UP-42
+    #[test]
+    fn log_total_mib_is_typed_and_bounded() {
+        assert_eq!(Settings::default().log_total_bytes(), 512 * 1024 * 1024);
+        let mib = |text: &str| toml::from_str::<Settings>(text).unwrap().log_total_bytes();
+        assert_eq!(mib("log_total_mib = 1024"), 1024 * 1024 * 1024);
+        assert_eq!(mib("log_total_mib = 1"), 64 * 1024 * 1024);
+        assert_eq!(mib("log_total_mib = 99999999"), 16_384 * 1024 * 1024);
+        assert!(toml::from_str::<Settings>("log_total_mib = \"lots\"").is_err());
+        // Never below one tab's own cap.
+        assert_eq!(
+            mib("log_buffer_mib = 1024\nlog_total_mib = 512"),
+            1024 * 1024 * 1024
+        );
     }
 
     // covers UP-40

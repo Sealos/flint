@@ -703,6 +703,7 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
                 held_back: 0,
                 version: 1,
                 pods: Some(Arc::new(status)),
+                trimmed: false,
             }),
             cx,
         );

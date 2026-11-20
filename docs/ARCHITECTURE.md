@@ -341,6 +341,13 @@ ring buffer with two limits, both settings: a line count (`log_buffer_lines`, de
 (`log_buffer_mib`, default 64 MiB). Whichever is hit first evicts the oldest lines, so neither long-running streams
 nor very long lines (up to 64 KiB each) can grow memory without bound. Search runs over the buffer.
 
+All sessions also share one budget (`log_total_mib`, default 512 MiB, never below `log_buffer_mib`;
+`flint_core::logs::LogBudget`), since nothing limits how many log tabs are open. Sessions report the bytes their buffers hold when they publish; when the total is
+over the budget, the tabs viewed least recently drop their oldest blocks first (each only what its sealed blocks can
+give; the open tail block stays), then paused tabs, and never the tab shown (beyond its own `log_buffer_mib`). The dock tells the core which log tab is shown (`LogSession::set_shown`).
+Streams keep running; only history goes, and a trimmed tab says "Older lines dropped to save memory" so a short
+history is not taken for a quiet pod (#254).
+
 - **Sessions** (`flint_core::logs`): `CoreHandle::open_logs` returns a `LogSession`; dropping it stops the stream.
   Sessions belong to no cluster slot, so they keep running across cluster switches. `timestamps=true` is always
   requested, so showing timestamps is a view toggle, and a dropped stream resumes from the last timestamp (with
@@ -970,7 +977,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   on macOS and `$XDG_CONFIG_HOME/flint/` (default `~/.config/flint/`) on Linux. `state.toml` stays beside
   `settings.toml` on Linux too, rather than in `$XDG_STATE_HOME`, so one directory and one override hold everything
   ([ADR-0016](./adr/0016-linux-appimage.md)).
-- `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`), a `path`
+- `settings.toml`: `appearance`, `ai_exposed_clusters`, `trusted_clusters`, `protect_local_clusters`, extra kubeconfig paths, watch mode (global plus per-cluster), log buffer size (`log_buffer_lines`, `log_buffer_mib`, and `log_total_mib` for all tabs together), a `path`
   override, and a `helm` binary override. From M5.5 also `warm_clusters`, `warm_memory_mib`,
   `log_analysis_clusters` (context, server URL, CLI, binary path, and whether to confirm each send), the log
   analysis line limit, and a `claude` binary override.

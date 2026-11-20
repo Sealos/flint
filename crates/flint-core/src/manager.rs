@@ -235,6 +235,8 @@ pub(crate) struct ClusterManager {
     /// Running log sessions by id. They belong to no cluster slot, so they outlive cluster
     /// switches and kubeconfig reloads (UP-42).
     log_sessions: HashMap<u64, JoinHandle<()>>,
+    /// The memory budget all log sessions share (`log_total_mib`).
+    log_budget: Arc<logs::LogBudget>,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
 }
@@ -246,6 +248,11 @@ struct FileWatcher {
 }
 
 impl ClusterManager {
+    /// The log sessions' shared budget, for [`crate::LogSession::set_shown`].
+    pub(crate) fn log_budget(&self) -> Arc<logs::LogBudget> {
+        self.log_budget.clone()
+    }
+
     pub(crate) fn new(
         config: CoreConfig,
         events: async_channel::Sender<Event>,
@@ -259,6 +266,7 @@ impl ClusterManager {
             config.home.as_deref(),
         );
         let engine_config = Arc::new(EngineConfig::with_timing(&config.watch_timing));
+        let log_budget = logs::LogBudget::new(config.settings.log_total_bytes());
         Self {
             settings: Arc::new(config.settings.clone()),
             settings_error: config.settings_error.clone(),
@@ -276,6 +284,7 @@ impl ClusterManager {
             engine_config,
             subscriptions: HashMap::new(),
             log_sessions: HashMap::new(),
+            log_budget,
             unlocks,
         }
     }
@@ -409,6 +418,7 @@ impl ClusterManager {
                 options,
                 snapshots,
                 paused,
+                budget,
             } => {
                 let internal = self.internal_tx.clone();
                 // Pinned now: a reconnect must never read logs from another server that the
@@ -441,7 +451,7 @@ impl ClusterManager {
                     Arc::new(KubeLogSource::new(lookup.clone())),
                     Arc::new(KubePodSource::new(lookup)),
                 );
-                let task = tokio::spawn(logs::run(feed, config, snapshots, paused));
+                let task = tokio::spawn(logs::run(feed, config, snapshots, paused, Some(budget)));
                 self.log_sessions.retain(|_, t| !t.is_finished());
                 self.log_sessions.insert(id, task);
             }
@@ -756,6 +766,7 @@ impl ClusterManager {
         }
         self.settings = Arc::new(settings);
         self.settings_error = error;
+        self.log_budget.set_limit(self.settings.log_total_bytes());
         self.emit_settings();
         // The watch mode may have changed.
         self.reconcile_all();

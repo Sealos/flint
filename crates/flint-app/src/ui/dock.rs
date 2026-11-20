@@ -167,6 +167,8 @@ pub struct Dock {
     tabs: Vec<Tab>,
     active: Option<u64>,
     visible: bool,
+    /// The log tab whose session was last told it is shown ([`Dock::sync_shown_log`]).
+    shown_log: Option<u64>,
     next_id: u64,
     focus: FocusHandle,
     /// The tab strip's scroll position: the active tab is scrolled into view.
@@ -190,6 +192,7 @@ impl Dock {
             tabs: Vec::new(),
             active: None,
             visible: false,
+            shown_log: None,
             next_id: 1,
             focus: cx.focus_handle(),
             strip: ScrollHandle::new(),
@@ -524,6 +527,7 @@ impl Dock {
             self.visible = true;
             self.reveal_active();
         }
+        self.sync_shown_log(cx);
         cx.notify();
         id
     }
@@ -545,6 +549,26 @@ impl Dock {
         }
     }
 
+    /// Tells the log sessions which tab is shown, if any: the shared log memory budget trims
+    /// the tabs viewed least recently first, and never the one shown. Run where the shown tab
+    /// or the dock's visibility changes, and on every render for anything else (a hidden dock
+    /// is not drawn, so hiding it cannot rely on the render).
+    fn sync_shown_log(&mut self, cx: &App) {
+        let now = self
+            .active
+            .filter(|_| self.visible)
+            .filter(|id| matches!(self.tab(*id), Some(DockTab::Logs(_))));
+        if now == self.shown_log {
+            return;
+        }
+        for (id, shown) in [(self.shown_log, false), (now, true)] {
+            if let Some(DockTab::Logs(view)) = id.and_then(|id| self.tab(id)) {
+                view.read(cx).set_shown(shown);
+            }
+        }
+        self.shown_log = now;
+    }
+
     /// Shows the dock with tab `id` and focuses it.
     fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab(id).is_none() {
@@ -554,6 +578,7 @@ impl Dock {
         self.visible = true;
         self.reveal_active();
         self.focus_active(window, cx);
+        self.sync_shown_log(cx);
         cx.notify();
     }
 
@@ -595,6 +620,7 @@ impl Dock {
         release_unfocused_input(window, cx);
         // Closing a tab before the active one moves it left, maybe out of view.
         self.reveal_active();
+        self.sync_shown_log(cx);
         cx.notify();
     }
 
@@ -609,6 +635,8 @@ impl Dock {
             self.visible = true;
             self.focus_active(window, cx);
         }
+        // Hidden, the dock is not drawn, so it says so here.
+        self.sync_shown_log(cx);
         cx.notify();
     }
 
@@ -919,6 +947,7 @@ impl Dock {
 
 impl Render for Dock {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_shown_log(cx);
         let theme = cx.theme().clone();
         let root = v_flex()
             .id("dock")

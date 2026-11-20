@@ -21,6 +21,7 @@ impl LogView {
         LogTabState {
             lines: self.snapshot.lines.len(),
             held_back: self.snapshot.held_back,
+            trimmed: self.snapshot.trimmed,
             paused: !ended && (self.snapshot.paused || self.is_paused()),
             follows: self.follows(),
             following: self.list.is_following_tail(),
