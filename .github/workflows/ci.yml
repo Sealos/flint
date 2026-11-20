@@ -17,7 +17,34 @@ env:
   FLINT_CONFIG_DIR: ${{ github.workspace }}/target/ci-flint-config
 
 jobs:
+  # Which checks this change needs (scripts/ci-changes.sh): a docs-only PR skips the builds.
+  # Pushes to master run everything. If this job fails, every gated job runs (fail open).
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      appimage: ${{ steps.filter.outputs.appimage }}
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            scripts/ci-changes.sh "$BASE" "$HEAD"
+          else
+            scripts/ci-changes.sh --all
+          fi
+
   fmt:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -31,6 +58,8 @@ jobs:
   # on macOS. flint-core, flint-mcp and flint-e2e (the fake API server, no GPUI) build and test
   # on Linux, and so does the app (linux-app).
   clippy:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -47,6 +76,12 @@ jobs:
   # the macOS job below.
   test:
     name: test (${{ matrix.crate }})
+    needs: changes
+    # Gated per step, not per job: a skipped matrix job reports its check unexpanded
+    # ("test (${{ matrix.crate }})"), so the required check would never arrive.
+    if: ${{ !cancelled() }}
+    env:
+      RUN: ${{ needs.changes.result != 'success' || needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -54,20 +89,26 @@ jobs:
       matrix:
         crate: [flint-core, flint-mcp, flint-e2e]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: env.RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: env.RUN == 'true'
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - if: env.RUN == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux
           save-if: ${{ github.ref == 'refs/heads/master' }}
       # The MCP e2e tests run flint-mcp; build it here rather than inside the tests.
-      - if: matrix.crate == 'flint-e2e'
+      - if: env.RUN == 'true' && (matrix.crate == 'flint-e2e')
         run: cargo build -p flint-mcp --bin flint-mcp --locked
-      - run: cargo test -p ${{ matrix.crate }} --locked
+      - if: env.RUN == 'true'
+        run: cargo test -p ${{ matrix.crate }} --locked
         env:
           FLINT_E2E_MCP_BIN: ${{ matrix.crate == 'flint-e2e' && format('{0}/target/debug/flint-mcp', github.workspace) || '' }}
 
   docs:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -86,6 +127,8 @@ jobs:
   # `appimage` job below packages it.
   linux-app:
     name: linux (flint-app)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -115,6 +158,8 @@ jobs:
   # Ubuntu 24.04 like the release, whose glibc sets the AppImage's floor.
   appimage:
     name: appimage (x86_64)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.appimage == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -157,6 +202,8 @@ jobs:
   # links the screenshots is posted by the Linux job below.
   macos:
     name: macos (flint-app)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 60
     env:

@@ -284,6 +284,11 @@ Linux except the app, which is the only part that needs macOS. The cluster tests
 
 ### Checks CI runs
 
+On a pull request, each check runs only when the change touches what it checks: `scripts/ci-changes.sh` sorts
+the changed paths into groups (Rust code, the app, the AppImage, dependencies, scripts, workflows), so a
+docs-only PR runs just `typos` and the PR title check. A skipped check counts as passed. Pushes to `master`, and
+any change to the CI files themselves, run everything.
+
 - **CI (Linux):** `cargo fmt --check`, and for `flint-core` and `flint-mcp`: clippy with `-D warnings`,
   `cargo test -p <crate>` as a separate job per crate, and `cargo doc` with `-D warnings`. For the app,
   `linux (flint-app)` runs its clippy and view tests, and `appimage (x86_64)` packages a release build with
