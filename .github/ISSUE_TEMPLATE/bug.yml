@@ -66,6 +66,8 @@ body:
         (DMG: `... /Applications/Flint.app/Contents/MacOS/flint`; AppImage: `... ./flint-vX.Y.Z-linux-x86_64.AppImage`;
         source build: `... cargo run -p flint-app`, with the variable before `cargo`).
         Do not use a bare `FLINT_LOG=debug`: it turns on debug logging for every library.
+        If you normally open Flint from Finder or the Dock and the problem does not happen when started from a
+        terminal (the terminal can pass a different `KUBECONFIG` or `PATH`), say so instead of pasting logs.
       render: text
   - type: textarea
     id: mcp-logs
@@ -73,9 +75,11 @@ body:
       label: Log output of the MCP server (only for bugs in an AI client)
       description: |
         Launching the app does not capture `flint mcp`, which your AI client starts itself. In Flint's entry in the
-        client's MCP server settings, set the environment variable `FLINT_LOG=info` (it overrides any `RUST_LOG` the
+        client's MCP server settings, set the environment variable
+        `FLINT_LOG=warn,flint=info,flint_app=info,flint_core=info,flint_mcp=info` (it overrides any `RUST_LOG` the
         client passes on), reproduce the bug, and copy the server's stderr from the client's MCP log (the client's
-        settings or log viewer says where). Do not use a debug level for the MCP server: the protocol library then
-        logs full requests and tool results, which can include ConfigMap data and pod environment values that Flint
-        does not redact. Paste only the relevant lines.
+        settings or log viewer says where). Keep other libraries at `warn`: the protocol library logs client metadata
+        and notifications at `info`, and full requests and tool results at `debug`, which can include ConfigMap data
+        and pod environment values that Flint does not redact. Paste only the relevant lines, with anything private
+        removed.
       render: text
