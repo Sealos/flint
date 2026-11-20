@@ -32,7 +32,8 @@ const FRAME: Duration = Duration::from_millis(33);
 #[derive(Clone)]
 pub struct Target {
     pub window: AnyWindowHandle,
-    pub workspace: Entity<Workspace>,
+    /// Weak: the channel's task lives as long as the app and must not keep the workspace alive.
+    pub workspace: WeakEntity<Workspace>,
     /// Where screenshots are written.
     pub screenshots: PathBuf,
 }
@@ -285,8 +286,10 @@ fn with_workspace<R>(
 ) -> Result<R, Error> {
     let workspace = target.workspace.clone();
     in_window(target, cx, |window, cx| {
-        workspace.update(cx, |ws, cx| f(ws, window, cx))
-    })
+        workspace
+            .update(cx, |ws, cx| f(ws, window, cx))
+            .map_err(|_| Error::new(ErrorCode::Failed, "the workspace is closed"))
+    })?
 }
 
 /// An error from outside our own code (I/O, rendering), summarized as the UI would show it.
@@ -312,7 +315,7 @@ mod tests {
     fn target(t: &TestWorkspace, screenshots: &std::path::Path) -> Target {
         Target {
             window: t.window,
-            workspace: t.workspace.clone(),
+            workspace: t.workspace.downgrade(),
             screenshots: screenshots.to_owned(),
         }
     }
@@ -332,7 +335,7 @@ mod tests {
         let (window, model) = (t.window, t.model.clone());
         let target = Target {
             window,
-            workspace: t.workspace.clone(),
+            workspace: t.workspace.downgrade(),
             screenshots: dir.path().to_owned(),
         };
 
