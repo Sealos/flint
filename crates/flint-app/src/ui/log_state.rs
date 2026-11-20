@@ -33,7 +33,7 @@ impl LogView {
                 matches: self.match_count(),
                 // Among the matches of the lines shown: evicted ones lead the list until the
                 // next scan drops them.
-                current: self.shown_match_count().1.map(|at| at + 1),
+                current: self.current_match_index().map(|at| at + 1),
                 searching: self.searching,
             },
             filter: FilterState {

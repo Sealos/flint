@@ -234,18 +234,30 @@ impl LogView {
                     }
                     _ => (&[][..], 0),
                 };
-                let mut rows = rows
-                    .range(rows.partition_point(|id| *id < from)..)
-                    .peekable();
-                let found = matches
-                    .range(matches.partition_point(|id| *id < from)..)
+                let (all_rows, all_matches) = (rows, matches);
+                let rows = rows.range(rows.partition_point(|id| *id < from)..);
+                let matches = matches.range(matches.partition_point(|id| *id < from)..);
+                // Walks the shorter of the two (both sorted), looking each id up in the other:
+                // a tab showing few rows, or few matches, does little work however many the
+                // other has.
+                let found: Vec<LineId> = if rows.len() <= matches.len() {
+                    rows.copied()
+                        .filter(|id| all_matches.binary_search(id).is_ok())
+                        .collect()
+                } else {
+                    matches
+                        .copied()
+                        .filter(|id| all_rows.binary_search(id).is_ok())
+                        .collect()
+                };
+                kept.iter()
                     .copied()
-                    .filter(|id| {
-                        while rows.next_if(|row| **row < *id).is_some() {}
-                        rows.peek().is_some_and(|row| **row == *id)
-                            && self.snapshot.lines.contains(*id)
-                    });
-                kept.iter().copied().chain(found).collect()
+                    .chain(
+                        found
+                            .into_iter()
+                            .filter(|id| self.snapshot.lines.contains(*id)),
+                    )
+                    .collect()
             }
         };
         *cache = Some((key, shown.clone()));
@@ -280,26 +292,24 @@ impl LogView {
     /// The matches Next and Previous Match go to: every match, or in a filtered tab those
     /// among the rows shown. How many there are, and which of them is the current one.
     pub(in crate::ui) fn shown_match_count(&self) -> (usize, Option<usize>) {
-        if !self.is_filtered() {
-            let lines = &self.snapshot.lines;
-            let evicted = self
-                .search
-                .matches()
-                .partition_point(|m| *m < lines.first_id());
-            let at = self.current_match.and_then(|id| {
-                self.search
-                    .matches()
-                    .binary_search(&id)
-                    .ok()
-                    .map(|ix| ix - evicted)
-            });
-            return (self.search.count_in(lines), at);
+        let count = if self.is_filtered() {
+            self.shown_matches().len()
+        } else {
+            self.search.count_in(&self.snapshot.lines)
+        };
+        (count, self.current_match_index())
+    }
+
+    /// Which of the matches [`LogView::shown_match_count`] counts is the current one, from the
+    /// matches found so far: lines not scanned yet come after it, so nothing is scanned.
+    pub(in crate::ui) fn current_match_index(&self) -> Option<usize> {
+        let id = self.current_match?;
+        if self.is_filtered() {
+            return self.shown_matches().binary_search(&id).ok();
         }
-        let shown = self.shown_matches();
-        let at = self
-            .current_match
-            .and_then(|id| shown.binary_search(&id).ok());
-        (shown.len(), at)
+        let matches = self.search.matches();
+        let evicted = matches.partition_point(|m| *m < self.snapshot.lines.first_id());
+        matches.binary_search(&id).ok().map(|ix| ix - evicted)
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
