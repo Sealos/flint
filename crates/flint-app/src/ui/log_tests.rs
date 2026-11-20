@@ -1517,7 +1517,11 @@ async fn the_state_reports_a_workloads_streams_and_sources(cx: &mut TestAppConte
     let tab = state(cx, &view)["tab"].clone();
     assert_eq!(
         tab["streams"],
-        json!({"pods": 2, "live": 1, "connecting": 0, "waiting": 1, "failed": 1, "capped": 0})
+        json!({"pods": 2, "live": 1, "connecting": 0, "waiting": 1, "failed": 1, "ended": 0,
+               "capped": 0, "each": [
+            {"pod": "web-1", "container": "app", "state": "streaming"},
+            {"pod": "web-2", "container": "app", "state": "failed"},
+        ]})
     );
     assert_eq!(tab["sources"], true);
     assert_eq!(

@@ -436,8 +436,26 @@ pub struct StreamCounts {
     /// Containers that have not started yet.
     pub waiting: usize,
     pub failed: usize,
+    /// Streams that ended without an error (their container stopped).
+    pub ended: usize,
     /// Containers not read: more than the session reads at once.
     pub capped: usize,
+    /// Every stream, by pod name and container, at most [`StreamCounts::LIMIT`].
+    pub each: Vec<StreamState>,
+}
+
+impl StreamCounts {
+    /// The most streams listed; a session reads at most 32 at once.
+    pub const LIMIT: usize = 64;
+}
+
+/// One stream of a workload's logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamState {
+    pub pod: String,
+    pub container: String,
+    /// `connecting`, `streaming`, `reconnecting`, `ended` or `failed`.
+    pub state: &'static str,
 }
 
 /// One log line, as the tab holds it (without its timestamp and prefix).
@@ -494,6 +512,9 @@ pub struct MenuState {
 pub struct MenuEntryState {
     pub label: String,
     pub enabled: bool,
+    /// A toggle's state (`Wrap Lines`, the tab list's shown tab); `null` for an entry that is
+    /// not one, and in another menu for an entry it draws unchecked.
+    pub checked: Option<bool>,
     /// Why it is disabled, as the menu says under it.
     pub reason: Option<String>,
     /// A picker's entries (containers).

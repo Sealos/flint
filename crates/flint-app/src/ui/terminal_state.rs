@@ -32,19 +32,15 @@ impl TerminalView {
 
     /// The shell's state, and the status as the toolbar says it.
     pub fn status_state(&self) -> (TabStatusState, String) {
-        match &self.ended {
-            Some(why) => (
-                TabStatusState::Ended {
-                    reason: Some(why.clone()),
-                    pod_deleted: false,
-                },
-                "Ended".to_owned(),
-            ),
-            None => (
-                status(&self.snapshot.state),
-                terminal_model::state_text(&self.snapshot.state).1,
-            ),
-        }
+        let text = terminal_model::toolbar_state(&self.snapshot.state, self.ended.is_some()).1;
+        let status = match &self.ended {
+            Some(why) => TabStatusState::Ended {
+                reason: Some(why.clone()),
+                pod_deleted: false,
+            },
+            None => status(&self.snapshot.state),
+        };
+        (status, text)
     }
 
     /// Whether focus is on the terminal.

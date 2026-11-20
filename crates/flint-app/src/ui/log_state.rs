@@ -8,8 +8,10 @@ use flint_core::{LogState, PodSetStatus, Severity};
 use gpui_kit::*;
 
 use super::super::log_model;
+use super::super::log_model::MenuRow;
 use super::super::view_state::{
-    Focus, LogLineState, LogTabState, SearchState, SelectionState, StreamCounts, TabStatusState,
+    Focus, LogLineState, LogTabState, MenuEntryState, SearchState, SelectionState, StreamCounts,
+    StreamState, TabStatusState, error_text,
 };
 use super::LogView;
 
@@ -56,6 +58,16 @@ impl LogView {
         }
     }
 
+    /// The entries of the toolbar's Save menu, or of its "⋯" menu (`more`), as drawn now.
+    pub fn menu_state(&self, more: bool) -> Vec<MenuEntryState> {
+        let facts = self.menu_facts();
+        menu_entries(if more {
+            log_model::more_menu(&facts)
+        } else {
+            log_model::save_menu(&facts)
+        })
+    }
+
     /// The session's state, and the status line as drawn.
     pub fn status_state(&self) -> (TabStatusState, String) {
         let pod = !self.is_workload();
@@ -81,7 +93,7 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
             back_off: *back_off,
             reason: match error {
                 _ if *back_off => None,
-                Some(e) => Some(log_model::explain(e, pod).short.to_owned()),
+                Some(e) => Some(reconnect_reason(e, pod)),
                 None => None,
             },
         },
@@ -100,24 +112,72 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
     }
 }
 
+/// A toolbar menu's entries: its labels and separators left out.
+pub fn menu_entries(rows: Vec<MenuRow>) -> Vec<MenuEntryState> {
+    let entry = |label: &str, enabled, checked| MenuEntryState {
+        label: label.to_owned(),
+        enabled,
+        reason: None,
+        checked,
+        submenu: Vec::new(),
+    };
+    rows.into_iter()
+        .filter_map(|row| match row {
+            MenuRow::Label(_) | MenuRow::Separator => None,
+            MenuRow::Toggle { label, on, .. } => Some(entry(label, true, Some(on))),
+            MenuRow::Save { label, enabled, .. } => Some(entry(label, enabled, None)),
+        })
+        .collect()
+}
+
+/// Why a stream reconnects, as its status line says it: in plain words, or the error's gist
+/// when there are none (sanitized, as every error in the state is).
+fn reconnect_reason(error: &str, pod: bool) -> String {
+    match log_model::explain(error, pod).short {
+        "error" => error_text(&log_model::gist(error)),
+        short => short.to_owned(),
+    }
+}
+
 /// A workload's streams, counted as the toolbar counts them.
 pub fn stream_counts(status: &PodSetStatus) -> StreamCounts {
+    let ended = status
+        .streams
+        .iter()
+        .filter(|s| matches!(s.state, LogState::Ended { error: None, .. }))
+        .count();
     StreamCounts {
         pods: status.pods,
         live: status.live(),
         connecting: status.connecting(),
         waiting: status.waiting,
         failed: status.failed(),
+        ended,
         capped: status.capped,
+        each: status
+            .streams
+            .iter()
+            .take(StreamCounts::LIMIT)
+            .map(|s| StreamState {
+                pod: s.source.pod().to_owned(),
+                container: s.source.container().to_owned(),
+                state: match &s.state {
+                    LogState::Connecting => "connecting",
+                    LogState::Streaming => "streaming",
+                    LogState::Reconnecting { .. } => "reconnecting",
+                    LogState::Ended { error: Some(_), .. } => "failed",
+                    LogState::Ended { .. } => "ended",
+                },
+            })
+            .collect(),
     }
 }
 
 /// The newest `limit` lines of `lines`, oldest first.
 pub fn last_lines(lines: &LogLines, limit: usize) -> Vec<LogLineState> {
-    let skip = lines.len().saturating_sub(limit);
+    let ids = tail_ids(lines, limit);
     lines
-        .iter()
-        .skip(skip)
+        .range(ids.start, ids.end)
         .map(|(id, line)| LogLineState {
             id,
             text: line.text.to_string(),
@@ -125,6 +185,13 @@ pub fn last_lines(lines: &LogLines, limit: usize) -> Vec<LogLineState> {
             source: line.source.as_ref().map(|s| s.label().to_owned()),
         })
         .collect()
+}
+
+/// The ids of the newest `limit` lines of `lines`: a range read line by line, so `state` never
+/// walks the whole buffer (up to 100,000 lines) on every poll.
+pub fn tail_ids(lines: &LogLines, limit: usize) -> std::ops::Range<u64> {
+    let end = lines.end_id();
+    end.saturating_sub(limit as u64).max(lines.first_id())..end
 }
 
 fn severity_word(severity: Severity) -> &'static str {
@@ -236,6 +303,62 @@ mod tests {
         assert!(last_lines(&LogBuffer::new(4).view(), 50).is_empty());
     }
 
+    // The newest lines are read by id, not by walking the buffer from its start: the ids asked
+    // for are only the tail's, also once older lines were evicted.
+    #[test]
+    fn only_the_tail_is_read() {
+        let mut buffer = LogBuffer::new(100);
+        for n in 0..250 {
+            buffer.push(LogLine::parse(&format!("line {n}"), false));
+        }
+        let lines = buffer.view();
+        assert!(lines.first_id() > 0, "older lines were evicted");
+        assert_eq!(super::tail_ids(&lines, 50), 200..250);
+        assert_eq!(
+            super::tail_ids(&lines, 1000),
+            lines.first_id()..250,
+            "never before the oldest line"
+        );
+        assert_eq!(super::tail_ids(&LogBuffer::new(4).view(), 50), 0..0);
+        let last = last_lines(&lines, 50);
+        assert_eq!((last[0].id, last[49].id), (200, 249));
+        assert_eq!(last[49].text, "line 249");
+    }
+
+    // A reconnect for a reason the tab has no words for says the error's gist, as the screen
+    // does, not "error".
+    #[test]
+    fn an_unknown_reconnect_reason_is_its_gist() {
+        let reason = |error: &str| match status(
+            &LogState::Reconnecting {
+                error: Some(error.into()),
+                attempt: 3,
+                back_off: false,
+            },
+            true,
+        ) {
+            TabStatusState::Reconnecting { reason, .. } => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            reason("stream reset by the proxy\nmore detail").as_deref(),
+            Some("stream reset by the proxy")
+        );
+        let screen = crate::ui::log_model::state_text(
+            &LogState::Reconnecting {
+                error: Some("stream reset by the proxy".into()),
+                attempt: 3,
+                back_off: false,
+            },
+            true,
+        )
+        .text;
+        assert_eq!(
+            screen,
+            "Reconnecting (attempt 3) · stream reset by the proxy"
+        );
+    }
+
     #[test]
     fn streams_are_counted_as_the_toolbar_counts_them() {
         let stream = |pod: &str, state| StreamStatus {
@@ -262,6 +385,13 @@ mod tests {
                         back_off: false,
                     },
                 ),
+                stream(
+                    "web-4",
+                    LogState::Ended {
+                        error: None,
+                        pod_deleted: false,
+                    },
+                ),
             ],
             waiting: 1,
             capped: 2,
@@ -269,7 +399,25 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_value(counts).unwrap(),
-            json!({"pods": 3, "live": 1, "connecting": 1, "waiting": 1, "failed": 1, "capped": 2})
+            json!({"pods": 3, "live": 1, "connecting": 1, "waiting": 1, "failed": 1, "ended": 1,
+                   "capped": 2, "each": [
+                {"pod": "web-1", "container": "app", "state": "streaming"},
+                {"pod": "web-2", "container": "app", "state": "failed"},
+                {"pod": "web-3", "container": "app", "state": "reconnecting"},
+                {"pod": "web-4", "container": "app", "state": "ended"},
+            ]})
+        );
+        // Bounded.
+        let many = PodSetStatus {
+            pods: 100,
+            streams: (0..100)
+                .map(|n| stream(&format!("web-{n}"), LogState::Streaming))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            stream_counts(&many).each.len(),
+            crate::ui::view_state::StreamCounts::LIMIT
         );
     }
 }

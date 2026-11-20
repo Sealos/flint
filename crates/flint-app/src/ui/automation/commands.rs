@@ -299,6 +299,11 @@ async fn dispatch(
 /// past the views. Drawing here, as GPUI does before handling a key, also works while the window
 /// is hidden or the screen is locked, when no frames come on their own.
 async fn settle(target: &Target, cx: &mut AsyncApp) {
+    draw(target, cx);
+}
+
+/// Draws the window now (see [`settle`]).
+fn draw(target: &Target, cx: &mut AsyncApp) {
     let _ = in_window(target, cx, |window, cx| {
         window.refresh();
         window.draw(cx).clear(cx);
@@ -315,8 +320,10 @@ fn action_error(error: ActionError) -> Error {
     Error::new(code, error.to_string())
 }
 
-/// The visible view tree as JSON.
+/// The visible view tree as JSON, from a frame drawn now: menus and dialogs are read from the
+/// drawn elements, and a window in the background may get no frames of its own.
 fn state(target: &Target, cx: &mut AsyncApp) -> Result<Value, Error> {
+    draw(target, cx);
     let state = with_workspace(target, cx, |ws, window, cx| ws.view_state(window, cx))?;
     serde_json::to_value(state).map_err(|e| failed("could not serialize the state", &e.to_string()))
 }
@@ -573,20 +580,20 @@ mod tests {
             .await;
             assert_eq!(refused["error"]["code"], "rejected", "{refused}");
         }
-        let closed = ask(
-            cx,
-            &target,
-            json!({"cmd": "press_key", "args": {"key": "escape"}}),
-        )
-        .await;
-        assert!(ok(&closed), "{closed}");
-        let gone = ask(
-            cx,
-            &target,
-            json!({"cmd": "wait_for", "args": {"pointer": "/menu", "equals": null}}),
-        )
-        .await;
-        assert!(ok(&gone), "{gone}");
+        // The menu is dismissed while nothing draws (no frame since): `state` draws first, so
+        // it does not report a menu that is gone.
+        use gpui_kit::AppContext as _;
+        cx.update_window(target.window, |_, window, cx| {
+            window.dispatch_action(Box::new(gpui_kit::component::dialog::Cancel), cx)
+        })
+        .unwrap();
+        let state = ask(cx, &target, json!({"cmd": "state"})).await;
+        assert_eq!(
+            state["result"]["menu"],
+            Value::Null,
+            "{}",
+            state["result"]["menu"]
+        );
 
         let row = ask(
             cx,

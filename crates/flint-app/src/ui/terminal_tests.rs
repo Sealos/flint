@@ -750,8 +750,11 @@ async fn the_state_reports_the_screen_and_the_exit(cx: &mut TestAppContext) {
         .view
         .update(cx, |v, cx| v.end("Repointed.".into(), cx));
     other.settle(cx);
+    let s = state(cx, &other);
     assert_eq!(
-        state(cx, &other)["status"],
+        s["status"],
         json!({"state": "ended", "reason": "Repointed.", "pod_deleted": false})
     );
+    // As the toolbar says it.
+    assert_eq!(s["status_text"], "Ended: the context changed");
 }

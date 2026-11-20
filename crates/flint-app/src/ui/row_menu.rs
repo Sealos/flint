@@ -345,12 +345,14 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
         label,
         enabled: can.is_ok(),
         reason: can.as_ref().err().cloned(),
+        checked: None,
         submenu: Vec::new(),
     };
     let picker = |label: String, submenu: Vec<SubmenuEntryState>| MenuEntryState {
         label,
         enabled: true,
         reason: None,
+        checked: None,
         submenu,
     };
     let logs_of = |containers: &mut dyn Iterator<Item = &PodContainer>| {
@@ -457,10 +459,10 @@ pub(in crate::ui) mod tests {
         assert_eq!(
             state(&pod_actions()),
             json!({"note": null, "entries": [
-                {"label": "Logs", "enabled": true, "reason": null, "submenu": []},
+                {"label": "Logs", "enabled": true, "reason": null, "checked": null, "submenu": []},
                 {"label": "Previous Logs", "enabled": false,
-                 "reason": "No container has restarted.", "submenu": []},
-                {"label": "Shell", "enabled": true, "reason": null, "submenu": []},
+                 "reason": "No container has restarted.", "checked": null, "submenu": []},
+                {"label": "Shell", "enabled": true, "reason": null, "checked": null, "submenu": []},
             ]})
         );
 
@@ -482,14 +484,14 @@ pub(in crate::ui) mod tests {
         assert_eq!(
             state(&several)["entries"],
             json!([
-                {"label": "Logs", "enabled": true, "reason": null, "submenu": [
+                {"label": "Logs", "enabled": true, "reason": null, "checked": null, "submenu": [
                     {"label": "app (default)", "enabled": true},
                     {"label": "sidecar", "enabled": true},
                 ]},
-                {"label": "Previous Logs", "enabled": true, "reason": null, "submenu": [
+                {"label": "Previous Logs", "enabled": true, "reason": null, "checked": null, "submenu": [
                     {"label": "app (default)", "enabled": true},
                 ]},
-                {"label": "Shell", "enabled": true, "reason": null, "submenu": [
+                {"label": "Shell", "enabled": true, "reason": null, "checked": null, "submenu": [
                     {"label": "app (default)", "enabled": true},
                     {"label": "sidecar (not running)", "enabled": false},
                 ]},
@@ -514,8 +516,8 @@ pub(in crate::ui) mod tests {
         assert_eq!(
             state(&blocked),
             json!({"note": why, "entries": [
-                {"label": "Logs", "enabled": false, "reason": why, "submenu": []},
-                {"label": "Shell in web-1", "enabled": false, "reason": why, "submenu": []},
+                {"label": "Logs", "enabled": false, "reason": why, "checked": null, "submenu": []},
+                {"label": "Shell in web-1", "enabled": false, "reason": why, "checked": null, "submenu": []},
             ]})
         );
     }

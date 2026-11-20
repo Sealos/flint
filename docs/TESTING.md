@@ -149,24 +149,31 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     - `cluster`: `{context, server, chip, repointed, removed}`, the server without credentials;
     - `status`, by `state`: `connecting`; `streaming`; `reconnecting {attempt, back_off, reason}`; `ended {reason,
       pod_deleted}` (all read, the pod deleted, or a shell the tab ended); `failed {reason}`; `running {command}`;
-      `exited {code}`; `closed`. Reasons are the plain words the tab shows, not the server's text. `status_text` is
-      the status line as drawn (`Ended · no permission`, `Exited (code 3)`);
+      `exited {code}`; `closed`. Reasons are the words the tab shows (an error it has no words for as its
+      sanitized gist). `status_text` is the status line as drawn (`Ended · no permission`, `Exited (code 3)`);
     - `logs` (log tabs): `{lines, held_back, paused, follows, following, timestamps, sources, wrap, search: {query,
       matches, current, searching}, selection: {first, last, lines}, streams: {pods, live, connecting, waiting,
-      failed, capped}, last_lines}`. `follows`: the session follows new lines; `following`: the view sticks to the
-      newest. `last_lines` holds at most the 50 newest lines, oldest first, each `{id, text, severity, source}`
-      (`text` without timestamp or prefix; `severity` `normal`, `warning` or `error`; `source` `pod/container` in a
-      workload tab);
+      failed, ended, capped, each}, last_lines}`. `streams.each` lists a workload's streams (at most 64), each
+      `{pod, container, state}` with `state` one of `connecting`, `streaming`, `reconnecting`, `ended`, `failed`.
+      `follows`: the session follows new lines; `following`: the view sticks to the newest. `last_lines` holds at
+      most the 50 newest lines, oldest first, each `{id, text, severity, source}` (`text` without timestamp or
+      prefix; `severity` `normal`, `warning` or `error`; `source` `pod/container` in a workload tab);
     - `shell` (shell tabs): `{cols, rows, live, exit_code, cursor: {row, col}, scrolled_back, screen}`, where `screen`
-      is the visible rows as text (trailing blanks and the blank rows at the bottom left out, at most 200), never the
-      scrollback.
+      is the screen's rows as drawn, as text (trailing blanks and the blank rows at the bottom left out, at most 200):
+      the newest output, or history while `scrolled_back`.
   - `state.menu`: the open context menu or drop-down, or null: `{owner, note, entries: [{label, enabled, reason,
-    submenu: [{label, enabled}]}]}`. A row's menu has `owner` `row-menu-<uid>`, `note` (why nothing can open: the
-    cluster is not connected) and each entry's `reason` when disabled; a container picker lists its containers in
-    `submenu`. Other menus (the dock's tab list, the log toolbar's "⋯") list their drawn rows, with `owner` null.
+    checked, submenu: [{label, enabled}]}]}`. Entries are what can be chosen: notes and separators are left out.
+    - A row's menu has `owner` `row-menu-<uid>`, `note` (why nothing can open: the cluster is not connected) and each
+      entry's `reason` when disabled; a container picker lists its containers in `submenu`.
+    - A log tab's toolbar menus have `owner` `log-save` or `log-more` ("⋯"), with `checked` on its toggles.
+    - Another menu (the dock's tab list) lists its drawn entries with `owner` null: `checked` is true for a checked
+      entry, and `enabled` cannot be read from the drawing (true).
+    - Focus is `menu` while one is open, also when it is drawn inside a dock tab.
   - Log lines and the shell's screen are test fixtures (the fake server's lines, a test's commands). They are in the
     state so a test can wait for a line or a prompt; the channel exists only in debug builds with `--features
     automation`, and the state carries no more than that bounded tail.
+  - `state` draws the window before it answers, so menus and dialogs (read from what is drawn) are current even
+    while the window is in the background and gets no frames of its own.
   - `wait_for {pointer, <test>, timeout_ms?}`: polls `state` every 50 ms, on the app's clock, until the value at a
     JSON Pointer passes one test, and returns that state. Tests: `equals`, `not_equals`, `at_least`, `at_most`
     (numbers, or an array's length), `exists`, `contains` (a substring, or an array element matching), and `any` (an

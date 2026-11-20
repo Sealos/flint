@@ -212,8 +212,8 @@ impl Workspace {
             return Focus::NamespaceInput;
         }
         match self.dock.read(cx).focus_in(window, cx) {
-            // The tab list, drawn in the dock.
-            Some(Focus::Dock) if menu_open => return Focus::Menu,
+            // A menu drawn in the dock (the tab list, a log toolbar's Save or "⋯") has focus.
+            Some(_) if menu_open => return Focus::Menu,
             Some(focus) => return focus,
             None => {}
         }
@@ -246,8 +246,10 @@ fn row_action_states(ws: &Workspace, cx: &App) -> Vec<ActionAvailability> {
 }
 
 /// The context menu or drop-down drawn in the last frame, if any (read from the drawn
-/// elements: GPUI keeps a menu's items to itself). A row's menu is described from the row's
-/// actions, as it is built ([`row_menu::menu_state`]); another menu by its drawn entries.
+/// elements: GPUI keeps a menu's items to itself). A row's menu and a log tab's Save and "⋯"
+/// menus are described from what builds them ([`row_menu::menu_state`],
+/// `LogView::menu_state`); another menu (the dock's tab list) by its drawn entries, where a
+/// separator has no label and a disabled entry cannot be told apart.
 fn open_menu(ws: &Workspace, window: &Window, cx: &App) -> Option<MenuState> {
     let menu_id = ElementId::Name("popup-menu".into());
     let elements = window.elements();
@@ -257,14 +259,28 @@ fn open_menu(ws: &Workspace, window: &Window, cx: &App) -> Option<MenuState> {
         .filter(|e| e.path().last() == Some(&menu_id))
         .map(|e| e.path().to_vec())
         .min_by_key(Vec::len)?;
+    // A row's menu is drawn inside `row-menu-<uid>`; a drop-down inside
+    // `dropdown-menu:Name("<button>")`.
     let owner = path.iter().rev().find_map(|id| match id {
         ElementId::Name(name) if name.starts_with("row-menu-") => Some(name.to_string()),
+        ElementId::Name(name) => ["log-save", "log-more"]
+            .into_iter()
+            .find(|button| *name == format!("dropdown-menu:Name(\"{button}\")"))
+            .map(str::to_owned),
         _ => None,
     });
-    if owner.is_some()
-        && let Some(actions) = row_menu::row_actions(ws, cx)
-    {
-        let (note, entries) = row_menu::menu_state(&actions);
+    let modelled = match owner.as_deref() {
+        Some(row) if row.starts_with("row-menu-") => {
+            row_menu::row_actions(ws, cx).map(|actions| row_menu::menu_state(&actions))
+        }
+        Some(button) => ws
+            .dock
+            .read(cx)
+            .active_log()
+            .map(|log| (None, log.read(cx).menu_state(button == "log-more"))),
+        None => None,
+    };
+    if let Some((note, entries)) = modelled {
         return Some(MenuState {
             owner,
             note,
@@ -281,13 +297,15 @@ fn open_menu(ws: &Workspace, window: &Window, cx: &App) -> Option<MenuState> {
                     |id| matches!(id, ElementId::Name(n) if n == "submenu" || n == "popup-menu"),
                 )
         })
-        .filter_map(|e| match e.path().last() {
-            Some(ElementId::Integer(ix)) => Some((
+        .filter_map(|e| match (e.path().last(), e.label()) {
+            // A separator has no label.
+            (Some(ElementId::Integer(ix)), Some(label)) => Some((
                 *ix,
                 MenuEntryState {
-                    label: e.label().unwrap_or_default().to_owned(),
+                    label: label.to_owned(),
                     enabled: e.disabled() != Some(true),
                     reason: None,
+                    checked: e.checked(),
                     submenu: Vec::new(),
                 },
             )),
