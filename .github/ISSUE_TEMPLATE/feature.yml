@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest something Flint should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The task or problem, before any solution. Say what you do today instead.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like Flint to do
+    validations:
+      required: false
+  - type: input
+    id: flint-version
+    attributes:
+      label: Flint version
+      placeholder: "0.2.1"
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version, if it matters here
+      placeholder: "macOS 15.4, Ubuntu 24.04"
+  - type: dropdown
+    id: auth
+    attributes:
+      label: How the cluster authenticates, if it matters here
+      options:
+        - EKS
+        - GKE
+        - AKS
+        - Other exec plugin
+        - Client certificate, token or basic auth
+        - Does not matter

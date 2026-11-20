@@ -161,6 +161,8 @@ unless you add files with `kubeconfig_paths`.
 **Logs.** Flint logs to stderr only, so an app opened from Finder or the Dock keeps no log. To see one, start it from
 a terminal: `/Applications/Flint.app/Contents/MacOS/flint`. It prints warnings and errors only; add `--verbose` for
 info, or set `FLINT_LOG` (see [Build and run](#build-and-run)).
+A log file under `~/Library/Logs/Flint/` is not written yet ([#266](https://github.com/Sealos/flint/issues/266)); until it is,
+the bug report form asks for this terminal output.
 
 **The command-line binary.** The app's executable is also the `flint` command, for `flint mcp` (see
 [MCP server for AI agents](#mcp-server-for-ai-agents)) and `flint --version`. `flint --help` lists its commands,

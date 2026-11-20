@@ -1,0 +1,86 @@
+name: Bug report
+description: Something in Flint does not work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Screenshots help.
+    validations:
+      required: true
+  - type: input
+    id: flint-version
+    attributes:
+      label: Flint version
+      description: Run `--version` on the Flint you use, for example `flint --version`, `./flint-vX.Y.Z-linux-x86_64.AppImage --version`, `cargo run -p flint-app -- --version`, or, for the DMG, `/Applications/Flint.app/Contents/MacOS/flint --version`. If Flint cannot start, give the release tag or download filename, or `unknown`.
+      placeholder: "0.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      options:
+        - macOS app (DMG)
+        - macOS command-line archive
+        - Linux AppImage
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: macOS 15.1 on Apple Silicon
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: How the cluster authenticates
+      description: The `users[].user.exec` plugin in your kubeconfig, if any. A legacy `auth-provider` entry counts as other.
+      options:
+        - EKS (aws eks get-token / aws-iam-authenticator)
+        - GKE (gke-gcloud-auth-plugin)
+        - AKS (kubelogin)
+        - Other exec plugin or legacy auth-provider
+        - Client certificate, token or basic auth
+        - Not related to the cluster connection
+        - Other or unknown
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste cluster data or secrets.** Logs can contain object names, hostnames, ConfigMap contents,
+        environment values and tokens. Paste only the lines around the problem and remove anything private.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: |
+        Flint logs to stderr only for now, so an app opened from Finder or the Dock keeps no log file.
+        Start the executable of your install from a terminal with more detail and paste the relevant lines:
+        `FLINT_LOG=off,flint=debug,flint_app=debug,flint_core=debug flint`
+        (DMG: `... /Applications/Flint.app/Contents/MacOS/flint`; AppImage: `... ./flint-vX.Y.Z-linux-x86_64.AppImage`;
+        source build: `... cargo run -p flint-app`, with the variable before `cargo`).
+        Keep the leading `off`: other libraries can log raw Kubernetes responses, which Flint has not redacted.
+        If you normally open Flint from Finder or the Dock and the problem does not happen when started from a
+        terminal (the terminal can pass a different `KUBECONFIG` or `PATH`), say so instead of pasting logs.
+      render: text
+  - type: textarea
+    id: mcp-logs
+    attributes:
+      label: Log output of the MCP server (only for bugs in an AI client)
+      description: |
+        Launching the app does not capture `flint mcp`, which your AI client starts itself. In Flint's entry in the
+        client's MCP server settings, set the environment variable
+        `FLINT_LOG=off,flint=info,flint_app=info,flint_core=info,flint_mcp=info,rmcp::transport=error` (it overrides any `RUST_LOG` the
+        client passes on), reproduce the bug, and copy the server's stderr from the client's MCP log (the client's
+        settings or log viewer says where). Keep the leading `off`: other libraries log client metadata, raw
+        Kubernetes responses and, at `debug`, full requests and tool results, which can include ConfigMap data and pod
+        environment values that Flint does not redact. Paste only the relevant lines, with anything private removed.
+        A tool that fails normally (for example, denied by RBAC) reports the error to the client without logging it:
+        then give the tool name and the error the client showed, with anything private removed.
+      render: text
