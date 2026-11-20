@@ -709,6 +709,13 @@ fn exposing_scoped(context: &str, server: &str, namespaces: &[&str], kinds: &[&s
 #[test]
 fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
     let two = Two::start()?;
+    write_kubeconfigs(
+        &two.scratch.path().join("kubeconfig"),
+        &[
+            (&two.a, EXPOSED, Some("kube-system")),
+            (&two.b, HIDDEN, None),
+        ],
+    )?;
     two.a.set_log("demo", "web-69c6f74b8b-qv4xv", "GET / 200\n");
     two.scratch
         .write_settings(&exposing_scoped(EXPOSED, &two.a.url(), &["demo"], &[]))?;
@@ -718,6 +725,12 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
     assert_eq!(
         clusters["clusters"][0]["scope"],
         json!({"namespaces": ["demo"], "kinds": []}),
+        "{clusters}"
+    );
+    // The context's default namespace is out of scope: not named.
+    assert_eq!(
+        clusters["clusters"][0]["default_namespace"],
+        Value::Null,
         "{clusters}"
     );
 
@@ -761,6 +774,10 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
     refused(
         "get_events",
         json!({"cluster": EXPOSED, "namespace": "default"}),
+    )?;
+    refused(
+        "get_events",
+        json!({"cluster": EXPOSED, "object_kind": "Node"}),
     )?;
     refused(
         "get_pod_logs",
@@ -833,6 +850,8 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
     // Clearing the scope exposes everything again.
     two.scratch
         .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    assert_eq!(clusters["clusters"][0]["default_namespace"], "kube-system");
     mcp.call_json("list_resources", pods_in("kube-system"))?;
     assert!(two.b.requests().is_empty());
     Ok(())

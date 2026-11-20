@@ -468,16 +468,22 @@ impl FlintMcp {
                 Some(Err(e)) => (false, None, Some(e.clone())),
                 None => (false, None, None),
             };
+            let scope = scopes.get(&info.name);
+            // The context's default namespace only when the agent may read it.
+            let default_namespace = info
+                .namespace
+                .as_deref()
+                .filter(|ns| scope.is_none_or(|s| s.allows_namespace(ns)));
             let mut row = json!({
                 "name": info.name,
                 "server": info.server.as_deref().map(flint_core::redact::server_url),
-                "default_namespace": info.namespace,
+                "default_namespace": default_namespace,
                 "reachable": reachable,
                 "server_version": version,
                 "error": error,
             });
             // What the user limited the agent to, so it asks within it.
-            if let Some(scope) = scopes.get(&info.name).filter(|s| !s.is_everything()) {
+            if let Some(scope) = scope.filter(|s| !s.is_everything()) {
                 row["scope"] = json!({
                     "namespaces": scope.namespaces,
                     "kinds": scope.kinds,
@@ -688,6 +694,19 @@ impl FlintMcp {
         let conn = self.client(&ctx, &p.cluster).await?;
         check_namespace(p.namespace.as_deref())?;
         let limit = policy::EVENTS.clamp(p.limit) as usize;
+        let scoped = !conn.scope.is_everything();
+        // Events about a kind outside the scope: refused before anything is fetched.
+        let kinds = if scoped {
+            let kinds = self.kinds(&p.cluster, &conn).await?;
+            if let Some(kind) = p.object_kind.as_deref()
+                && !policy::kind_name_in_scope(&conn.scope, &kinds, kind)
+            {
+                return Err(policy::out_of_scope(&p.cluster).into());
+            }
+            Some(kinds)
+        } else {
+            None
+        };
         let involved = read::InvolvedObject {
             kind: p.object_kind.clone(),
             name: p.object_name.clone(),
@@ -718,19 +737,20 @@ impl FlintMcp {
                     (all, more)
                 }
             };
-        if !conn.scope.is_everything() {
-            let kinds = self.kinds(&p.cluster, &conn).await?;
+        if let Some(kinds) = &kinds {
             events.retain(|e| {
                 policy::event_in_scope(
                     &conn.scope,
-                    &kinds,
+                    kinds,
                     e.metadata.namespace.as_deref(),
                     e.involved_object.kind.as_deref(),
                     e.involved_object.api_version.as_deref(),
                 )
             });
         }
-        let truncated = more || events.len() > limit;
+        // On a scoped cluster, only events in scope count: whether the fetch stopped short
+        // could be about hidden ones, so it is not reported.
+        let truncated = (more && !scoped) || events.len() > limit;
         let mut redacted = 0;
         let rows: Vec<Value> = events
             .iter()
@@ -860,10 +880,7 @@ impl FlintMcp {
             .map_err(|e| conn.fail(e))?;
             match merged.as_mut() {
                 None => merged = Some(page),
-                Some(m) => {
-                    m.rows.extend(page.rows);
-                    m.more |= page.more;
-                }
+                Some(m) => merge_page(m, page),
             }
         }
         let mut page = merged.expect("a scope names at least one namespace");
@@ -888,6 +905,24 @@ impl Inner {
         *self.kubeconfig.lock().unwrap() = Some((stamps, loaded.clone()));
         loaded
     }
+}
+
+/// Adds the rows of `page` (another namespace's) to `merged`. Each row's cells follow its own
+/// page's columns; when the columns differ (a server that changed its printer columns between
+/// the requests), every row falls back to the plain layout (name, namespace, age) rather than
+/// mixing cells under the wrong headers.
+fn merge_page(merged: &mut TablePage, page: TablePage) {
+    let same = merged.columns.len() == page.columns.len()
+        && merged
+            .columns
+            .iter()
+            .zip(page.columns.iter())
+            .all(|(a, b)| a.name == b.name);
+    if !same {
+        merged.columns = Arc::from(Vec::new());
+    }
+    merged.rows.extend(page.rows);
+    merged.more |= page.more;
 }
 
 /// Column names and rows for list_resources. Each row is `{name, namespace, created, cells}`,
@@ -955,6 +990,47 @@ fn table_rows(
 mod tests {
     use super::*;
     use flint_core::table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
+
+    // covers UP-14: rows listed namespace by namespace share one column layout, or fall back to
+    // the plain one when the pages' columns differ.
+    #[test]
+    fn pages_merge_under_common_columns_only() {
+        let page = |columns: Vec<Column>, name: &str| TablePage {
+            columns: columns.into(),
+            rows: vec![Row {
+                uid: name.into(),
+                name: name.into(),
+                namespace: Some("demo".into()),
+                resource_version: "1".into(),
+                generation: None,
+                created: None,
+                labels: Box::new([]),
+                cells: Box::new([]),
+            }],
+            format: ListFormat::Table,
+            more: false,
+            continue_token: None,
+        };
+        let a = || {
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Ready", ColumnRole::Value, 0),
+            ]
+        };
+        let mut merged = page(a(), "one");
+        merge_page(&mut merged, page(a(), "two"));
+        assert_eq!(merged.columns.len(), 2);
+        assert_eq!(merged.rows.len(), 2);
+        let mut other = page(vec![col("Name", ColumnRole::Name, 0)], "three");
+        other.more = true;
+        merge_page(&mut merged, other);
+        assert!(merged.columns.is_empty(), "the plain layout");
+        assert_eq!(merged.rows.len(), 3);
+        assert!(merged.more);
+        let (columns, rows, _, _) = table_rows(&merged, false, 0, usize::MAX);
+        assert!(columns.is_empty());
+        assert_eq!(rows[2]["cells"], json!([]));
+    }
 
     fn col(name: &str, role: ColumnRole, priority: i32) -> Column {
         Column {

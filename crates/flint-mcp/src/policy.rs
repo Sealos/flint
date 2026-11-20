@@ -240,6 +240,14 @@ pub fn event_in_scope(
         .is_some_and(|k| scope.allows_kind(k.id().as_str(), k.namespaced))
 }
 
+/// Whether objects of the Kind `kind` (as an event names its object, `Pod`) may be read under
+/// `scope`: some kind of that name in `kinds` is in scope.
+pub fn kind_name_in_scope(scope: &AiScope, kinds: &[KindInfo], kind: &str) -> bool {
+    kinds
+        .iter()
+        .any(|k| k.kind() == kind && scope.allows_kind(k.id().as_str(), k.namespaced))
+}
+
 /// Whether the agent may read pod logs under `scope`: pods are in the kinds scope (the
 /// namespace is checked with [`namespaces_for`]).
 pub fn logs_in_scope(scope: &AiScope) -> bool {
@@ -779,6 +787,10 @@ mod tests {
             Some("Deployment"),
             Some("v1")
         ));
+        assert!(kind_name_in_scope(&pods, &kinds, "Pod"));
+        assert!(!kind_name_in_scope(&pods, &kinds, "Secret"));
+        assert!(!kind_name_in_scope(&ns, &kinds, "Node"));
+        assert!(!kind_name_in_scope(&ns, &kinds, "Gizmo"));
         // A kind discovery does not list is left out of a scoped cluster's events.
         assert!(!event_in_scope(
             &ns,
