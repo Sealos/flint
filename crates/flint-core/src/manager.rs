@@ -432,13 +432,14 @@ impl ClusterManager {
             } => {
                 let internal = self.internal_tx.clone();
                 // Pinned now: a reconnect must never read logs from another server that the
-                // context was re-pointed to in the meantime (UP-06).
-                let pin = self.contexts.pin(&cluster);
+                // context was re-pointed to in the meantime (UP-06). To its confirmed server: the
+                // client comes later, and a provisional one is never handed out.
+                let pin = self.contexts.pin_confirmed(&cluster);
                 let lookup: logs::ClientLookup = Arc::new(move || {
                     let (reply, rx) = oneshot::channel();
                     let _ = internal.send(Internal::LogClient {
                         cluster: cluster.clone(),
-                        pin,
+                        pin: pin.clone(),
                         reply,
                     });
                     Box::pin(async move {
@@ -472,7 +473,11 @@ impl ClusterManager {
             Request::WriteClient { cluster, reply } => {
                 // Read with the client: a shell is pinned to the context its client was built
                 // from (`CheckContext`).
-                let pin = self.contexts.pin(&cluster);
+                let server = self.cluster(&cluster).map(|c| c.info.server.as_deref());
+                let pin = match server {
+                    Some(server) => self.contexts.pin(&cluster, server),
+                    None => self.contexts.pin_confirmed(&cluster),
+                };
                 let _ = reply.send(self.write_client(&cluster).map(|client| (client, pin)));
             }
             Request::CheckContext {
@@ -480,7 +485,7 @@ impl ClusterManager {
                 pin,
                 reply,
             } => {
-                let _ = reply.send(self.contexts.check(Pinned::Shell, &cluster, pin));
+                let _ = reply.send(self.contexts.check(Pinned::Shell, &cluster, &pin));
             }
             Request::FetchObject {
                 cluster,
@@ -959,7 +964,7 @@ impl ClusterManager {
                 pin,
                 reply,
             } => {
-                let _ = reply.send(self.log_client(&cluster, pin));
+                let _ = reply.send(self.log_client(&cluster, &pin));
             }
             Internal::CrdsChanged {
                 cluster,
@@ -1010,14 +1015,19 @@ impl ClusterManager {
     /// retried here, so a broken exec plugin does not run again at every session retry. A
     /// context re-pointed or removed since `pin` (when the session opened) ends the session
     /// ([`ContextHistory::check`]).
-    fn log_client(&mut self, cluster: &str, pin: ContextPin) -> Result<Client, LogError> {
+    fn log_client(&mut self, cluster: &str, pin: &ContextPin) -> Result<Client, LogError> {
         if let Some(reason) = self.contexts.check(Pinned::Logs, cluster, pin) {
             return Err(LogError::cluster(reason));
         }
-        let Some(slot) = self.cluster(cluster) else {
-            // Its file failed to load this time (caught half-written, say): not a removal.
+        // A context unchanged since `pin` whose entry is missing or points elsewhere: a
+        // kubeconfig file failed to load (caught half-written, say), and what shows is not
+        // confirmed (`ContextHistory`). Wait for the file rather than read from it.
+        let slot = self
+            .cluster(cluster)
+            .filter(|s| s.info.server.as_deref() == pin.server());
+        let Some(slot) = slot else {
             return Err(LogError::retry(format!(
-                "\"{cluster}\" is missing while a kubeconfig file can't be read"
+                "\"{cluster}\" is uncertain while a kubeconfig file can't be read"
             )));
         };
         if let Some(client) = &slot.client {
@@ -1226,13 +1236,8 @@ impl ClusterManager {
             self.clusters.push(slot);
         }
         self.kubeconfig = loaded.clone();
-        // A file that failed to load leaves the load partial: the contexts it held are not
-        // removed by it (UP-06).
-        let found = loaded
-            .contexts
-            .iter()
-            .map(|c| (c.name.as_str(), c.server.as_deref()));
-        self.contexts.record(found, loaded.errors.is_empty());
+        // A file that failed to load masks the changes it could have made (UP-06).
+        self.contexts.record(&loaded);
 
         let snapshot = ClustersSnapshot {
             clusters: self.clusters.iter().map(Cluster::summary).collect(),
@@ -1736,9 +1741,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
         offline(&mut manager);
-        let pin = manager.contexts.pin("dev");
+        let pin = manager.contexts.pin_confirmed("dev");
 
-        let same = manager.log_client("dev", pin).err().expect("no client");
+        let same = manager.log_client("dev", &pin).err().expect("no client");
         assert!(
             !same.is_fatal() && !same.is_cluster(),
             "the same server is retried: {}",
@@ -1751,15 +1756,16 @@ mod tests {
         )
         .await;
         offline(&mut manager);
-        let moved = manager.log_client("dev", pin).err().expect("no client");
+        let moved = manager.log_client("dev", &pin).err().expect("no client");
         assert!(moved.is_cluster(), "it ends a workload session too");
         assert!(
             moved.message.contains("different API server"),
             "{}",
             moved.message
         );
+        let nowhere = manager.contexts.pin_confirmed("nowhere");
         let gone = manager
-            .log_client("other", manager.contexts.pin("nowhere"))
+            .log_client("other", &nowhere)
             .err()
             .expect("no client");
         assert!(gone.is_cluster());
@@ -1771,22 +1777,22 @@ mod tests {
     async fn a_shell_ends_once_its_context_points_elsewhere_or_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
-        let pin = manager.contexts.pin("dev");
-        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", pin), None);
+        let pin = manager.contexts.pin_confirmed("dev");
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
         rewrite(&mut manager, dir.path(), &kubeconfig_with("https://old")).await;
         let moved = manager
             .contexts
-            .check(Pinned::Shell, "dev", pin)
+            .check(Pinned::Shell, "dev", &pin)
             .expect("re-pointed");
         assert!(moved.contains("different API server"), "{moved}");
         assert!(moved.contains("open the shell again"), "{moved}");
 
-        let pin = manager.contexts.pin("dev");
+        let pin = manager.contexts.pin_confirmed("dev");
         let without_dev = "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\n";
         rewrite(&mut manager, dir.path(), without_dev).await;
         let gone = manager
             .contexts
-            .check(Pinned::Shell, "dev", pin)
+            .check(Pinned::Shell, "dev", &pin)
             .expect("removed");
         assert!(gone.contains("no longer in your kubeconfig"), "{gone}");
     }
@@ -1797,13 +1803,19 @@ mod tests {
     async fn a_re_pointing_undone_between_checks_still_ends_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://dev")).await;
-        let pin = manager.contexts.pin("dev");
+        let pin = manager.contexts.pin_confirmed("dev");
         rewrite(&mut manager, dir.path(), &kubeconfig_with("https://prod")).await;
         rewrite(&mut manager, dir.path(), &kubeconfig_with("https://dev")).await;
         offline(&mut manager);
-        let shell = manager.contexts.check(Pinned::Shell, "dev", pin);
-        assert!(shell.is_some_and(|r| r.contains("different API server")));
-        let logs = manager.log_client("dev", pin).err().expect("no client");
+        let shell = manager.contexts.check(Pinned::Shell, "dev", &pin);
+        // It points where it did, so the reason does not claim another server.
+        assert!(
+            shell
+                .as_deref()
+                .is_some_and(|r| r.contains("changed in your kubeconfig files")),
+            "{shell:?}"
+        );
+        let logs = manager.log_client("dev", &pin).err().expect("no client");
         assert!(logs.is_cluster(), "{}", logs.message);
     }
 
@@ -1815,22 +1827,121 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let yaml = kubeconfig_with("https://dev");
         let mut manager = manager_reading(dir.path(), &yaml).await;
-        let pin = manager.contexts.pin("dev");
+        let pin = manager.contexts.pin_confirmed("dev");
         rewrite(&mut manager, dir.path(), &yaml[..yaml.len() / 2]).await;
         assert!(
             !manager.kubeconfig.errors.is_empty(),
             "the file failed to load"
         );
         assert!(manager.cluster("dev").is_none(), "its contexts are skipped");
-        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", pin), None);
-        let logs = manager.log_client("dev", pin).err().expect("no client");
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+        let logs = manager.log_client("dev", &pin).err().expect("no client");
         assert!(
             !logs.is_cluster() && !logs.is_fatal(),
             "the log session retries: {}",
             logs.message
         );
         rewrite(&mut manager, dir.path(), &yaml).await;
-        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", pin), None);
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+    }
+
+    /// A manager reading `first` then `second` in `dir`, which define a context `dev` (the
+    /// first file wins), loaded once.
+    async fn manager_reading_two(dir: &Path, first: &str, second: &str) -> ClusterManager {
+        let paths = [dir.join("first"), dir.join("second")];
+        std::fs::write(&paths[0], first).unwrap();
+        std::fs::write(&paths[1], second).unwrap();
+        let (events, _rx) = async_channel::unbounded();
+        let config = CoreConfig {
+            config_dir: PathBuf::from("/nonexistent"),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: paths.to_vec(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let mut manager = ClusterManager::new(
+            config,
+            events,
+            HubRegistry::default(),
+            SessionUnlocks::default(),
+        );
+        manager.reload_kubeconfig().await;
+        manager
+    }
+
+    async fn rewrite_file(manager: &mut ClusterManager, path: &Path, yaml: &str) {
+        std::fs::write(path, yaml).unwrap();
+        manager.reload_kubeconfig().await;
+    }
+
+    const UNREADABLE: &str = "apiVersion: v1\nkind: Config\nclusters:\n- name: [";
+
+    // covers UP-06, UP-41: a file that fails to load after the one defining a context cannot
+    // change it, so it masks no removal: shells and log sessions on it end.
+    #[tokio::test]
+    async fn a_broken_later_file_does_not_mask_a_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, UNREADABLE).await;
+        assert_eq!(
+            manager.kubeconfig.errors.len(),
+            1,
+            "the second file is broken"
+        );
+        let pin = manager.contexts.pin_confirmed("dev");
+        let without_dev = "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\n";
+        rewrite_file(&mut manager, &dir.path().join("first"), without_dev).await;
+        let gone = manager.contexts.check(Pinned::Shell, "dev", &pin);
+        assert!(
+            gone.as_deref()
+                .is_some_and(|r| r.contains("no longer in your kubeconfig")),
+            "{gone:?}"
+        );
+        // A log session opened now ends at once, instead of retrying for the file.
+        let pin = manager.contexts.pin_confirmed("dev");
+        let logs = manager.log_client("dev", &pin).err().expect("no client");
+        assert!(logs.is_cluster(), "{}", logs.message);
+        assert!(
+            logs.message.contains("no longer in your kubeconfig"),
+            "{}",
+            logs.message
+        );
+    }
+
+    // covers UP-06: while the first file defining `dev` is caught half-written, the second
+    // file's `dev`, on another server, shows instead. Sessions on the first go on and are
+    // never handed the fallback's client, and nothing changed once the file is back.
+    #[tokio::test]
+    async fn a_fallback_from_a_later_file_ends_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = kubeconfig_with("https://dev");
+        let second = kubeconfig_with("https://prod");
+        let mut manager = manager_reading_two(dir.path(), &first, &second).await;
+        let pin = manager.contexts.pin_confirmed("dev");
+        assert_eq!(pin.server(), Some("https://dev"));
+
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, &first[..first.len() / 2]).await;
+        let shown = manager.cluster("dev").and_then(|c| c.info.server.clone());
+        assert_eq!(shown.as_deref(), Some("https://prod"), "the fallback shows");
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+        offline(&mut manager);
+        let logs = manager.log_client("dev", &pin).err().expect("no client");
+        assert!(
+            !logs.is_cluster() && !logs.is_fatal(),
+            "the log session waits for the file: {}",
+            logs.message
+        );
+        assert!(
+            logs.message.contains("can't be read"),
+            "not the fallback's client: {}",
+            logs.message
+        );
+
+        rewrite_file(&mut manager, &path, &first).await;
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
     }
 
     // covers UP-04: selecting or reconnecting a cluster while its exec auth plugin still runs

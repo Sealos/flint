@@ -865,7 +865,7 @@ fn context_check(
         let (reply, rx) = oneshot::channel();
         let sent = requests.try_send(Request::CheckContext {
             cluster: cluster.clone(),
-            pin,
+            pin: pin.clone(),
             reply,
         });
         Box::pin(async move {

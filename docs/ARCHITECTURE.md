@@ -593,13 +593,24 @@ opens in a tab in the bottom dock.
   (16 ms; the first after a quiet spell at once). Keystrokes, pastes (bracketed when asked for), resizes, scrolling and
   selections go back through the session. The screen stays scrollable and selectable after the command exits.
 - **Pinned to its context.** A session is pinned to its context as it was when the cluster manager handed out the
-  client, read in the same step: the context's generation in the manager's `recheck::ContextHistory`. The generation
-  changes whenever a kubeconfig load gives the context another server, or a complete load (every file read) lacks
-  it, so a re-pointing undone by a later reload still counts. A file that fails to load (caught half-written) removes
-  nothing. While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`, shared with
-  log sessions, which are pinned the same way) whether the context changed since, never the server. A change ends it
-  with `ExecFailureKind::ContextChanged` and the reason, worded as a log session's (`recheck::reason`). Ending drops
-  the exec connection, as closing the session does, so no stream stays open on the old server.
+  client, read in the same step: the context's generation in the manager's `recheck::ContextHistory`, and the
+  server the client was built for. The generation changes with each confirmed change: a load gives the context
+  another server, or lacks it. A change undone by a later reload still counts.
+  - **What a load confirms.** The loader reads the kubeconfig files in order, and the first file that defines a name
+    wins. A file that fails to load (caught half-written) is skipped, and what it defines is unknown. A context
+    missing from a load is removed only if no failed file ranks at or above the file that defined it. A context
+    with another server is a confirmed change only if no failed file ranks above the file it now comes from;
+    otherwise it may be a later file's fallback, showing while the first file is unreadable, and it stays
+    provisional. A failed file ranked after a context's file masks no change to it.
+  - **Provisional entries.** Sessions on the confirmed definition go on. A log session is never handed the
+    fallback's client: it waits for the file. A shell opened on a fallback is pinned stale, and ends at its next
+    check.
+  - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
+    shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
+    A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
+    another server, or, when it points where it did (removed and added back, say), changed since the session
+    opened. A log session opened on a removed context ends at once. Ending drops the exec connection, as closing
+    the session does, so no stream stays open on the old server.
 - **Shell choice.** Without an explicit command, `bash` is tried, then `/bin/sh`. A missing executable is reported on
   the exec status channel before the command prints anything (Docker prints it on the TTY and exits with 126 or
   127 instead), which tells it apart from a shell that ran and failed. Keystrokes typed meanwhile go to the shell that starts.
