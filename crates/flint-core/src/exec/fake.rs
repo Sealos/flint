@@ -78,6 +78,15 @@ impl FakeExec {
                     self.written.extend(bytes);
                     self.model().scroll_to_bottom();
                 }
+                Input::PasteIfBracketed(text, reply) => {
+                    let bracketed = !finished && self.channels.model.bracketed_paste();
+                    if bracketed {
+                        let bytes = self.channels.model.paste_bytes(&text);
+                        self.written.extend(bytes);
+                        self.model().scroll_to_bottom();
+                    }
+                    let _ = reply.send(bracketed);
+                }
                 Input::Write(_) | Input::Paste(_) => {}
                 Input::Resize(size) => {
                     self.resizes.push(size);

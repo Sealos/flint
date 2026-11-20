@@ -159,6 +159,8 @@ pub struct ExecSnapshot {
 pub(crate) enum Input {
     Write(Vec<u8>),
     Paste(String),
+    /// Paste only if the program has bracketed paste on; the reply says whether it did.
+    PasteIfBracketed(String, oneshot::Sender<bool>),
     Resize(TerminalSize),
     Scroll(i32),
     ScrollToBottom,
@@ -235,6 +237,19 @@ impl ExecSession {
     /// [`TerminalModel::paste_bytes`]).
     pub fn paste(&self, text: impl Into<String>) {
         self.send(Input::Paste(text.into()));
+    }
+
+    /// Pastes `text` only if the program has bracketed paste on when the paste reaches it, and
+    /// resolves to whether it did. A front end asks before pasting several lines that would
+    /// each run; deciding from its last snapshot could miss the program turning the mode off
+    /// (bash does while it runs a command). `false` once the session ended too.
+    pub fn paste_if_bracketed(
+        &self,
+        text: impl Into<String>,
+    ) -> impl Future<Output = bool> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        self.send(Input::PasteIfBracketed(text.into(), reply));
+        async move { rx.await.unwrap_or(false) }
     }
 
     /// Resizes the terminal and tells the pod's TTY.
@@ -621,6 +636,10 @@ impl Session {
                     pending.extend(self.model.paste_bytes(&text));
                 }
             }
+            // No program runs yet (or any more), so none asked for bracketed paste.
+            Input::PasteIfBracketed(_, reply) => {
+                let _ = reply.send(false);
+            }
             Input::Resize(size) => {
                 self.model.resize(size);
                 self.screen_changed();
@@ -669,6 +688,14 @@ impl Session {
         let bytes = match input {
             Ok(Input::Write(bytes)) => bytes,
             Ok(Input::Paste(text)) => self.model.paste_bytes(&text),
+            Ok(Input::PasteIfBracketed(text, reply)) => {
+                let bracketed = self.model.bracketed_paste();
+                let _ = reply.send(bracketed);
+                if !bracketed {
+                    return Flow::Continue;
+                }
+                self.model.paste_bytes(&text)
+            }
             other => return self.handle_live_control(other, remote),
         };
         self.follow_output();
@@ -1231,6 +1258,18 @@ mod tests {
         assert_eq!(remote.read_stdin(3).await, b"ls\r");
         session.paste("a\nb");
         assert_eq!(remote.read_stdin(3).await, b"a\rb");
+        // A paste that waits for bracketed paste mode is refused while it is off, and sent
+        // bracketed once the program turns it on.
+        assert!(!session.paste_if_bracketed("c\nd").await);
+        remote.print(b"\x1b[?2004h").await;
+        wait_for(&mut session, "bracketed paste", |s| {
+            s.terminal
+                .mode
+                .contains(crate::terminal::TermMode::BRACKETED_PASTE)
+        })
+        .await;
+        assert!(session.paste_if_bracketed("c\nd").await);
+        assert_eq!(remote.read_stdin(9).await, b"\x1b[200~c\nd");
         assert_eq!(launcher.launched(), vec![vec!["bash".to_owned()]]);
     }
 

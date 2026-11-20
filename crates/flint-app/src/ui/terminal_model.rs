@@ -147,24 +147,20 @@ pub const MAX_PASTE_BYTES: usize = 256 * 1024;
 /// What pasting a text into a shell takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasteCheck {
-    /// Send it.
+    /// Send it: one line.
     Paste,
-    /// Ask first: it holds `lines` lines and the program did not ask for bracketed paste, so
-    /// each line runs as it arrives.
-    Confirm { lines: usize },
+    /// Send it only if the program takes pastes bracketed (the core checks its live mode,
+    /// `ExecSession::paste_if_bracketed`); otherwise ask first, since each of its `lines`
+    /// lines would run as it arrives.
+    Lines { lines: usize },
     /// Refuse it: it holds `bytes` bytes, more than [`MAX_PASTE_BYTES`].
     TooLarge { bytes: usize },
 }
 
-/// Whether `text` can be pasted at once, given whether the program asked for bracketed paste
-/// (a shell like bash does; BusyBox `sh` never does). A line break at the very end does not
-/// count as another line.
-pub fn paste_check(text: &str, bracketed: bool) -> PasteCheck {
+/// What pasting `text` takes. A line break at the very end does not count as another line.
+pub fn paste_check(text: &str) -> PasteCheck {
     if text.len() > MAX_PASTE_BYTES {
         return PasteCheck::TooLarge { bytes: text.len() };
-    }
-    if bracketed {
-        return PasteCheck::Paste;
     }
     let lines = text
         .trim_end_matches(['\r', '\n'])
@@ -172,7 +168,7 @@ pub fn paste_check(text: &str, bracketed: bool) -> PasteCheck {
         .flat_map(|line| line.split(['\r', '\n']))
         .count();
     if lines > 1 {
-        PasteCheck::Confirm { lines }
+        PasteCheck::Lines { lines }
     } else {
         PasteCheck::Paste
     }
@@ -440,17 +436,16 @@ mod tests {
     // so they are confirmed first; a huge clipboard is refused.
     #[test]
     fn pastes_are_checked_before_they_run() {
-        assert_eq!(paste_check("ls -la", false), PasteCheck::Paste);
-        assert_eq!(paste_check("ls -la\n", false), PasteCheck::Paste);
+        assert_eq!(paste_check("ls -la"), PasteCheck::Paste);
+        assert_eq!(paste_check("ls -la\n"), PasteCheck::Paste);
         assert_eq!(
-            paste_check("echo a\necho b\r\necho c\n", false),
-            PasteCheck::Confirm { lines: 3 }
+            paste_check("echo a\necho b\r\necho c\n"),
+            PasteCheck::Lines { lines: 3 }
         );
-        assert_eq!(paste_check("a\rb", false), PasteCheck::Confirm { lines: 2 });
-        assert_eq!(paste_check("echo a\necho b", true), PasteCheck::Paste);
+        assert_eq!(paste_check("a\rb"), PasteCheck::Lines { lines: 2 });
         let huge = "x".repeat(MAX_PASTE_BYTES + 1);
         assert_eq!(
-            paste_check(&huge, true),
+            paste_check(&huge),
             PasteCheck::TooLarge {
                 bytes: MAX_PASTE_BYTES + 1
             }

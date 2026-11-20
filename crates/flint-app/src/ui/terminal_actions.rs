@@ -2,7 +2,6 @@
 //! the workspace's guards share with them. The toolbar's buttons dispatch these actions; mouse
 //! selection and keystrokes for the shell are not actions (they are the program's input).
 
-use flint_core::terminal::TermMode;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
@@ -51,16 +50,12 @@ impl TerminalView {
             })
     }
 
-    /// Pastes `text` into the shell: at once when the program takes pastes bracketed or it is
-    /// one line; after asking when several lines would each run as they arrive; never when it
-    /// is larger than [`terminal_model::MAX_PASTE_BYTES`] (the tab says so).
+    /// Pastes `text` into the shell: one line at once; several lines at once only if the
+    /// program takes pastes bracketed when they reach it (the core checks its live mode), else
+    /// after asking, since each line would run as it arrives; never when it is larger than
+    /// [`terminal_model::MAX_PASTE_BYTES`] (the tab says so).
     fn paste(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        let bracketed = self
-            .snapshot
-            .terminal
-            .mode
-            .contains(TermMode::BRACKETED_PASTE);
-        match terminal_model::paste_check(&text, bracketed) {
+        match terminal_model::paste_check(&text) {
             PasteCheck::Paste => {
                 self.session.paste(text);
                 cx.notify();
@@ -69,34 +64,57 @@ impl TerminalView {
                 self.set_note(Tone::Warning, terminal_model::paste_too_large(bytes));
                 cx.notify();
             }
-            PasteCheck::Confirm { lines } => {
-                let (title, description) = terminal_model::paste_question(lines);
-                let view = cx.weak_entity();
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    let (view, text) = (view.clone(), text.clone());
-                    // Test builds open it at once, so automation sees it without waiting.
-                    #[cfg(feature = "automation")]
-                    let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-                    alert
-                        .confirm()
-                        .title(title.clone())
-                        .description(description.clone())
-                        .ok_text("Paste")
-                        .cancel_text("Cancel")
-                        .on_ok(move |_, _, cx| {
-                            let text = text.clone();
-                            let _ = view.update(cx, |view, cx| {
-                                // The shell may have ended while the question was open.
-                                if view.is_live() {
-                                    view.session.paste(text);
-                                    cx.notify();
-                                }
-                            });
-                            true
-                        })
-                });
+            PasteCheck::Lines { lines } => {
+                let pasted = self.session.paste_if_bracketed(text.clone());
+                cx.spawn_in(window, async move |this, cx| {
+                    if pasted.await {
+                        return;
+                    }
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        view.ask_to_paste(text, lines, window, cx)
+                    });
+                })
+                .detach();
             }
         }
+    }
+
+    /// Asks before pasting `lines` lines that would each run as they arrive.
+    fn ask_to_paste(
+        &mut self,
+        text: String,
+        lines: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_live() {
+            return;
+        }
+        let (title, description) = terminal_model::paste_question(lines);
+        let view = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (view, text) = (view.clone(), text.clone());
+            // Test builds open it at once, so automation sees it without waiting.
+            #[cfg(feature = "automation")]
+            let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
+            alert
+                .confirm()
+                .title(title.clone())
+                .description(description.clone())
+                .ok_text("Paste")
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    let text = text.clone();
+                    let _ = view.update(cx, |view, cx| {
+                        // The shell may have ended while the question was open.
+                        if view.is_live() {
+                            view.session.paste(text);
+                            cx.notify();
+                        }
+                    });
+                    true
+                })
+        });
     }
 
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {

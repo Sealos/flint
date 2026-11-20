@@ -119,6 +119,11 @@ impl Shell {
             .read_with(cx, |v, _| v.snapshot().terminal.clone())
     }
 
+    fn has_dialog(&self, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.window, |_, window, cx| window.has_active_dialog(cx))
+            .unwrap()
+    }
+
     fn dispatch(
         &self,
         cx: &mut TestAppContext,
@@ -310,7 +315,13 @@ async fn copy_and_paste(cx: &mut TestAppContext) {
     .await;
     shell.dispatch(cx, "ui::Cancel", json!(null)).unwrap();
     assert_eq!(shell.sent(cx), b"", "cancelled");
+    let view = shell.view.clone();
+    cx.wait_for(shell.window, WAIT, move |window, cx| {
+        !window.has_active_dialog(cx) && view.read(cx).focus.is_focused(window)
+    })
+    .await;
     shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"");
     cx.wait_for(shell.window, WAIT, |window, cx| {
         window.has_active_dialog(cx)
     })
@@ -340,6 +351,16 @@ async fn copy_and_paste(cx: &mut TestAppContext) {
     cx.write_to_clipboard(ClipboardItem::new_string("echo a\necho b".into()));
     shell.press(cx, TERMINAL_PASTE[0]);
     assert_eq!(shell.sent(cx), b"\x1b[200~echo a\necho b\x1b[201~");
+    assert!(!shell.has_dialog(cx));
+    // The program turns bracketed paste off (as bash does while it runs a command) before the
+    // tab has drawn that: the shell's live mode decides, so the paste still waits for a yes.
+    shell.fake.print(b"\x1b[?2004l");
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert_eq!(shell.sent(cx), b"", "not pasted as typed lines");
+    cx.wait_for(shell.window, WAIT, |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
 }
 
 // covers UP-41: the wheel scrolls back through the output; typing returns to the bottom. In a
