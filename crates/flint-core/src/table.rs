@@ -463,6 +463,9 @@ pub(crate) struct Interner {
     inserts: usize,
     /// How many strings the last prune kept.
     kept: usize,
+    /// The most strings a relist kept since the table was last given back: a small table is
+    /// given back once it keeps half that or less, however gradually it got there.
+    high: usize,
     #[cfg(test)]
     prunes: usize,
 }
@@ -509,15 +512,36 @@ impl Interner {
         self.relist += 1;
     }
 
+    /// Marks again, for a new relist, exactly the strings in `used`: the relist's rows, when
+    /// some rows it asked for were replaced or removed before it completed, so their strings
+    /// are not kept for rows that are gone.
+    pub fn remark<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
+        self.relist += 1;
+        for s in used {
+            if let Some(last) = self.set.get_mut(&**s) {
+                *last = self.relist;
+            }
+        }
+    }
+
     /// Keeps only the strings the relist asked for, so strings only older snapshots hold leave
     /// the set at once and are freed with them.
     pub fn keep_relisted(&mut self) {
         let relist = self.relist;
+        let before = self.set.len();
         self.set.retain(|_, last| *last == relist);
         self.kept = self.set.len();
-        // After a big drop (a kind scaled down), give the table back too, as a prune does.
-        if self.set.capacity() > 4 * self.kept.max(PRUNE_MIN) {
+        // After a big drop (a kind scaled down), give the table back too, as a prune does. Below
+        // PRUNE_MIN strings that rule never fires, so a small table is also given back once it
+        // keeps half or less of the most it held since it was last given back, in one relist
+        // or over several: steady polling, which keeps about as many, does not shrink and
+        // regrow it.
+        self.high = self.high.max(before);
+        let cap = self.set.capacity();
+        let halved = self.kept * 2 <= self.high;
+        if cap > 4 * self.kept.max(PRUNE_MIN) || (halved && cap > 4 * self.kept.max(16)) {
             self.set.shrink_to_fit();
+            self.high = self.kept;
         }
         self.inserts = 0;
         #[cfg(test)]
@@ -1138,6 +1162,61 @@ pub(crate) mod tests {
             "{}",
             interner.set.capacity()
         );
+    }
+
+    // covers UP-20: a scale-down well under PRUNE_MIN strings gives the table back too.
+    #[test]
+    fn a_small_relist_after_a_drop_gives_the_table_back() {
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        let rows: Vec<Arc<str>> = (0..3_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
+        let big = interner.set.capacity();
+        interner.begin_relist();
+        for s in &rows[..10] {
+            interner.intern(s);
+        }
+        interner.keep_relisted();
+        assert_eq!(interner.len(), 10);
+        assert!(
+            interner.set.capacity() < big / 4,
+            "{}",
+            interner.set.capacity()
+        );
+        // A relist that keeps most of what it had keeps its table.
+        let kept = interner.set.capacity();
+        interner.begin_relist();
+        for s in &rows[..10] {
+            interner.intern(s);
+        }
+        interner.keep_relisted();
+        assert_eq!(interner.set.capacity(), kept);
+    }
+
+    // covers UP-20: a kind scaled down in steps, each keeping more than half its strings, still
+    // gives the table back once it is well over what is left, below PRUNE_MIN strings too.
+    #[test]
+    fn a_gradual_scale_down_gives_the_table_back() {
+        for n in [16 * PRUNE_MIN, 3 * PRUNE_MIN] {
+            let mut interner = Interner::default();
+            interner.begin_relist();
+            let rows: Vec<Arc<str>> = (0..n).map(|i| interner.intern(&format!("s-{i}"))).collect();
+            let big = interner.set.capacity();
+            // Each relist keeps 60% of the one before.
+            let mut keep = n;
+            while keep > 20 {
+                keep = keep * 6 / 10;
+                interner.begin_relist();
+                for s in &rows[..keep] {
+                    interner.intern(s);
+                }
+                interner.keep_relisted();
+                assert_eq!(interner.len(), keep);
+            }
+            let cap = interner.set.capacity();
+            assert!(cap <= 4 * keep.max(16), "{n}: {cap} of {big} for {keep}");
+        }
     }
 
     // covers UP-20
