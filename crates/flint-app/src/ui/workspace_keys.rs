@@ -399,7 +399,7 @@ impl Workspace {
         self.switcher_key = Some(key);
     }
 
-    /// [`OpenView`] and [`OpenObject`] from the switcher name the cluster their row was listed
+    /// [`OpenView`](super::super::registry::OpenView) and [`OpenObject`] from the switcher name the cluster their row was listed
     /// on: refused once another cluster, or another API server, is active.
     pub(super) fn check_listed_on<A: Action>(
         &self,

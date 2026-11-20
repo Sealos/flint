@@ -950,6 +950,13 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     one made later with the name is not selected. Only a list published after the list subscribed counts: the
     first snapshot a subscription gets may be a watch's last publish from long before (a kind viewed earlier). Clearing the selection drops a pick still waited for. Both go through the registry from where focus
     was, as the palette runs any action, and are not recorded as recent actions.
+  - An open switcher follows what is active: when another cluster (or API server) becomes active, or the
+    active cluster's discovery arrives or fails, or its watch mode changes, it lists anew with what was typed
+    kept. An Enter names the cluster and server its row was listed on, and Open Kind… and Open Object… refuse it
+    once another is active, so a row of one cluster never opens a same-named object on another.
+  - On a namespace-limited list, an object opened is judged gone only once its own namespace was listed anew:
+    the merged list says which list of each namespace it holds (`NamespaceLimit::versions`), since it can be
+    published again from a namespace's old rows.
   - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
     in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.
 - **Panes and Go Back (UP-33, `workspace_keys.rs`):** the cluster sidebar (key context `ClusterSidebar`) and the
@@ -963,6 +970,10 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     section, Right opens a section and Left closes it, from a kind its own (`navigation::*`). These are bound on the
     pane's own element, so they are available, and listed by the palette, only while it has focus; their keys are in
     `ClusterSidebar && !Input` and `Navigation && !Input`, deeper than the list's arrows in `Workspace && !Input`.
+  - The list and the detail pane, which have no cursor of their own, show focus with a 1 px ring in the same
+    colour drawn over their edge while the pane itself has focus, so the layout does not move and clicks reach
+    the rows. The sidebar's cursor brings its cluster into view as it moves. Enter on the kind already open puts
+    focus in its list.
   - The cursor shows as a 1 px border in the theme's `ring` color while its pane has focus; every row has the
     border, transparent off the cursor, so the ring moving shifts nothing (nor a row's lock button). The lock
     button is not a tab stop; from the sidebar, the palette's Unlock Cluster…, Lock Cluster Again…, Trust
