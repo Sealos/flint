@@ -169,16 +169,26 @@ impl LogLine {
 /// - **Escape sequences** (ECMA-48): CSI (`ESC [` … final byte, which covers SGR colors and
 ///   cursor codes), OSC (`ESC ]` … BEL or ST, such as titles and hyperlinks), the other control
 ///   strings (DCS, SOS, PM, APC, up to ST), and two- and three-byte escapes (`ESC 7`,
-///   `ESC ( B`). Their 8-bit C1 forms (U+009B for CSI, …) are removed the same way. A sequence
-///   the line ends in the middle of (a cut line, say) is removed to the end of the line.
-/// - **Control characters:** the other C0 characters except tab, DEL, and the other C1
-///   characters are removed rather than replaced with a visible mark. They are not text: a
-///   terminal acts on them (a bell, a backspace, a carriage return redrawing a progress bar)
-///   instead of printing them, so a mark would show something the program never meant to show
-///   and split the words around it for search. Tab is kept: it is text spacing.
+///   `ESC ( B`). A sequence the line ends in the middle of (a cut line, say) is removed to the
+///   end of the line.
+/// - **Carriage returns:** a terminal redraws the line from its start at each `\r`, so a
+///   progress bar (`10%\r20%\r100%`) ends up showing only its last state. Only the text after
+///   the last `\r` is kept, as a terminal and `kubectl logs` show it; trailing ones (a CRLF line
+///   ending) do not count.
+/// - **Control characters:** the other C0 characters except tab, DEL, and the C1 characters
+///   (U+0080 to U+009F) are removed rather than replaced with a visible mark. They are not text:
+///   a terminal acts on them (a bell, a backspace) instead of printing them, so a mark would show
+///   something the program never meant to show and split the words around it for search. Tab
+///   is kept: it is text spacing. A C1 character goes alone, without parsing a sequence after
+///   it: raw C1 bytes are not UTF-8 and reach Flint as U+FFFD, so a decoded U+009B or U+009D
+///   is double-encoded text (`”` read as Latin-1 ends in U+009D), and treating it as the start
+///   of a control string would remove the rest of the line.
 ///
 /// Borrows `text` when there is nothing to remove, which is the common case.
 pub fn strip_controls(text: &str) -> Cow<'_, str> {
+    // Text before the last carriage return was drawn over.
+    let body = text.trim_end_matches('\r');
+    let text = body.rfind('\r').map_or(text, |cr| &text[cr + 1..]);
     let bytes = text.as_bytes();
     let mut out: Option<String> = None;
     // The end of the text already copied to `out` (or skipped).
@@ -213,7 +223,7 @@ fn control_end(bytes: &[u8], i: usize) -> Option<usize> {
         0x00..=0x1f | 0x7f => Some(i + 1),
         // C1 controls, U+0080 to U+009F, are 0xC2 0x80 to 0xC2 0x9F in UTF-8.
         0xc2 => match bytes.get(i + 1) {
-            Some(&c1 @ 0x80..=0x9f) => Some(c1_end(c1, bytes, i + 2)),
+            Some(0x80..=0x9f) => Some(i + 2),
             _ => None,
         },
         _ => None,
@@ -244,17 +254,6 @@ fn escape_end(bytes: &[u8], i: usize) -> usize {
         Some(0x30..=0x7e) => i + 1,
         // Not an escape sequence: only the ESC goes.
         Some(_) => i,
-    }
-}
-
-/// The end of a C1 control character (its second UTF-8 byte is `c1`) that ends at `i`, with
-/// the sequence it introduces.
-fn c1_end(c1: u8, bytes: &[u8], i: usize) -> usize {
-    match c1 {
-        0x9b => csi_end(bytes, i),
-        0x9d => string_end(bytes, i, true),
-        0x90 | 0x98 | 0x9e | 0x9f => string_end(bytes, i, false),
-        _ => i,
     }
 }
 
@@ -409,8 +408,6 @@ mod tests {
             stripped("\x1b[2K\x1b[1G\x1b[?25lprogress\x1b[?25h \x1b(Bdone\x1b7\x1b8"),
             "progress done"
         );
-        // The 8-bit CSI.
-        assert_eq!(stripped("\u{9b}31mred\u{9b}0m"), "red");
     }
 
     // covers UP-40
@@ -423,7 +420,6 @@ mod tests {
             "see docs now"
         );
         assert_eq!(stripped("\x1bPq#0;2;0;0;0\x1b\\after"), "after");
-        assert_eq!(stripped("\u{9d}2;title\u{9c}after"), "after");
     }
 
     // covers UP-40
@@ -444,9 +440,42 @@ mod tests {
     #[test]
     fn control_characters_other_than_tab_are_stripped() {
         assert_eq!(
-            stripped("a\x00b\x07c\x08d\re\x0bf\x0cg\x7fh\u{85}i\tj"),
+            stripped("a\x00b\x07c\x08d\x1ae\x0bf\x0cg\x7fh\u{85}i\tj"),
             "abcdefghi\tj"
         );
+    }
+
+    // covers UP-40
+    #[test]
+    fn only_the_text_after_the_last_carriage_return_is_kept() {
+        assert_eq!(
+            stripped("Downloading 10%\rDownloading 20%\rDownloading 100%"),
+            "Downloading 100%"
+        );
+        // A CRLF ending (or several) is not a redraw.
+        assert_eq!(stripped("done\r"), "done");
+        assert_eq!(stripped("a\rdone\r\r"), "done");
+        assert_eq!(
+            stripped("\x1b[32m10%\x1b[0m\r\x1b[2K\x1b[32m100%\x1b[0m"),
+            "100%"
+        );
+        let line = LogLine::parse("2024-05-01T12:00:00Z ERROR 1\rok 2\r\n", false);
+        assert_eq!(&*line.text, "ok 2");
+        assert_eq!(line.severity, Severity::Normal);
+        assert!(line.timestamp.is_some());
+    }
+
+    // covers UP-40
+    #[test]
+    fn c1_characters_go_alone_without_a_sequence() {
+        // `”` (U+201D) double-encoded through Latin-1: U+00E2 U+0080 U+009D.
+        assert_eq!(
+            stripped("say \u{e2}\u{80}\u{9d}hi\u{e2}\u{80}\u{9d} to all"),
+            "say \u{e2}hi\u{e2} to all"
+        );
+        assert_eq!(stripped("a\u{90}rest of the line"), "arest of the line");
+        assert_eq!(stripped("a\u{9b}31mred"), "a31mred");
+        assert_eq!(stripped("a\u{85}b\u{9f}c"), "abc");
     }
 
     // covers UP-43
