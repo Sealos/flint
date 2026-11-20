@@ -316,7 +316,10 @@ impl Dock {
                 continue;
             }
             tab.repointed = true;
-            if let DockTab::Shell(view) = &tab.tab {
+            // A shell that already ended keeps saying how it ended.
+            if let DockTab::Shell(view) = &tab.tab
+                && view.read(cx).is_live()
+            {
                 let note = dock_model::repointed_note(&tab.cluster.context);
                 view.update(cx, |view, cx| view.end(note, cx));
             }
