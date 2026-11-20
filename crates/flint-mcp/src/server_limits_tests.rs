@@ -441,12 +441,12 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
     let server = server(dir.path(), Some(&url), limits);
     let admission = || &server.inner.admission;
     let mut client = Client::start(&server, 64 * 1024).await;
-    for id in 1..=3 {
+    for (id, kind) in [(1, "pods"), (2, "pods"), (3, "services")] {
         client
             .call(
                 id,
                 "list_resource_kinds",
-                json!({"cluster": "silent", "kind": "pods"}),
+                json!({"cluster": "silent", "kind": kind}),
             )
             .await;
     }
@@ -462,6 +462,12 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
     wait_for("two calls running", || admission().running() == 2).await;
     client.cancel(1).await;
     wait_for("the cancelled call left", || admission().running() == 1).await;
+    // Its turn goes before its handler has recorded it and ended; only then is a place free.
+    let replies = admission().replies();
+    wait_for("the cancelled call is answered", || {
+        replies.unanswered_count() == 1
+    })
+    .await;
     client
         .call(4, "list_resource_kinds", json!({"cluster": "silent"}))
         .await;
@@ -473,7 +479,7 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
     .await;
     let refused_record = records()
         .into_iter()
-        .find(|r| r.kind.as_deref() == Some("pods"))
+        .find(|r| r.kind.as_deref() == Some("services"))
         .expect("the refused call");
     assert_eq!(refused_record.cluster.as_deref(), Some("silent"));
     assert!(

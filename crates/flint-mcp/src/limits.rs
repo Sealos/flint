@@ -7,11 +7,11 @@
 //!   [`Limits::waiting`] more wait for a turn; a call past both is refused at once with a tool
 //!   error saying so ([`Admission::enter`]).
 //! - **Reply bytes:** replies handed to the transport but not written yet are counted
-//!   ([`Counted`]); while they pass [`Limits::reply_budget`], or while [`Limits::unanswered`]
-//!   requests are read and not answered, the server reads no more requests, and no admitted call
-//!   starts its work. A client that stops reading stdout therefore holds at most about the
-//!   budget plus that many replies — not one more per call it keeps sending, refusals and
-//!   replies to other requests included.
+//!   ([`Counted`]); while they pass [`Limits::reply_budget`], the server reads no more requests,
+//!   and no admitted call starts its work. A request read while [`Limits::unanswered`] are not
+//!   answered is refused at once. A client that stops reading stdout therefore holds at most
+//!   about the budget plus that many replies — not one more per call it keeps sending, refusals
+//!   and replies to other requests included.
 //! - **Deadline:** each call ends after [`Limits::deadline`] (`ServerHandler::call_tool`).
 
 use std::future::Future;
@@ -434,6 +434,7 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                         let id = &request.id;
                         if replies.unanswered().contains_key(id) {
                             refuse(inner, &replies, id.clone(), DUPLICATE);
+                            replies.dropped(&message).await;
                         } else if replies.unanswered_count() >= most {
                             refuse(inner, &replies, id.clone(), BUSY);
                             replies.dropped(&message).await;
