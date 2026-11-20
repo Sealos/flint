@@ -856,7 +856,9 @@ impl Engine {
     /// Answers one-off reads of the merged rows ([`Hub::peek`]). The lanes publish only while
     /// the merged list has subscribers, so each lane is asked for its current rows the same
     /// way, and the answers are merged. Nothing is published and the state is not touched: a
-    /// read must not change what status displays show.
+    /// read must not change what status displays show. While it waits for the lanes (at most
+    /// [`LANE_PEEK_WAIT`]), this task follows no scope change and publishes nothing; the lanes
+    /// keep watching meanwhile.
     async fn answer_namespaced_peeks(&self, lanes: &BTreeMap<String, Lane>, reason: &str) {
         let asked: Vec<(String, oneshot::Receiver<Arc<KindSnapshot>>)> = lanes
             .iter()

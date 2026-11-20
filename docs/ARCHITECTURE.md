@@ -932,7 +932,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     grew, over the last query's matches; a subsequence pass rules out most objects, a linear-time score with no
     allocation (`Matcher::quick_points`) ranks the rest, and only the best 200 get the palette's full scoring for
     their order and highlights. The rows are a virtual list. A unit test types a name over 50,000 objects within
-    50 ms a keystroke in an unoptimized build.
+    100 ms a keystroke in an unoptimized build (about 16-23 ms here).
   - "pods web" finds the pod `web`: an object also matches its kind's label followed by its text, with less weight.
   - The name counts most: the query being the whole name (the object's without its namespace, or the kind's label)
     earns the most extra points, the name starting with it fewer, and the query found in the name alone a few (always

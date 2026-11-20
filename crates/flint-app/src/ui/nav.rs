@@ -445,13 +445,19 @@ impl Render for NavPanel {
                                 })
                                 .xsmall(),
                             )
-                            .child(div().flex_1().min_w_0().truncate().child(
-                                if section.kind == SectionKind::ApiGroup {
-                                    section.title.clone()
-                                } else {
-                                    section.title.to_uppercase()
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .id(("nav-section-label", i))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(if section.kind == SectionKind::ApiGroup {
+                                        section.title.clone()
+                                    } else {
+                                        section.title.to_uppercase()
+                                    })
+                                    .test_support(),
+                            )
                             .when(is_collapsed, |el| {
                                 el.child(
                                     div()

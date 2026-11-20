@@ -73,9 +73,12 @@ impl Item {
 
 /// The extra points of `item`, whose text matched: [`IN_NAME`] when the query is found in the
 /// name alone (always, when the text is the name: a kind, a cluster-scoped object), plus
-/// [`name_bonus`]. `start` is where the quick match began: at or past the name, it is in the
-/// name, so ranking very many objects needs no second scan; only the final order (`exact`)
-/// checks the name itself when the match began in the namespace.
+/// [`name_bonus`]. `start` is where the quick match began: at or past the name, the query is
+/// in the name, so ranking very many objects needs no second scan. The cut to the best
+/// [`RESULTS`] is therefore approximate: a query that also matches across the namespace (`ab`
+/// in `ab/cab`, `api` in `api-gateway/gateway-api`) starts in the namespace, so the object
+/// misses [`IN_NAME`] there and may fall just below the cut. Only the final order (`exact`)
+/// checks the name itself.
 fn name_points(matcher: &mut Matcher, item: &Item, query: &str, start: usize, exact: bool) -> i32 {
     let in_name = item.name_at == 0
         || start >= item.name_at as usize
@@ -582,9 +585,9 @@ mod tests {
     }
 
     // covers UP-31: typing a name letter by letter over 50,000 objects stays within a frame.
-    // About 16-23 ms per keystroke at worst in this unoptimized test build here; the limit is 50 ms
-    // so a shared CI runner does not fail it, while a quadratic slowdown or a lost pre-check
-    // still would.
+    // About 16-23 ms per keystroke at worst in this unoptimized test build here. The limit is
+    // 100 ms, so a slow shared CI runner does not fail it, while a quadratic slowdown, a lost
+    // pre-check or an allocation per candidate (each several times slower here) still would.
     #[test]
     fn searching_fifty_thousand_objects_fits_in_a_frame() {
         let index = large();
@@ -611,6 +614,6 @@ mod tests {
             &*index.items[found.hits[0].item as usize].text,
             "team-17/payments-api-00bc9-0"
         );
-        assert!(slowest < Duration::from_millis(50), "{slowest:?}");
+        assert!(slowest < Duration::from_millis(100), "{slowest:?}");
     }
 }

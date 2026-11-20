@@ -316,18 +316,31 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
             .bounds()
             .origin
     };
+    let header = |cx: &mut TestAppContext| {
+        t.find(cx, ("nav-section-label", 0usize))
+            .expect("the Workloads header is drawn")
+            .bounds()
+            .origin
+    };
     t.focus_workspace(cx);
     let (dot, label) = (
         origin(cx, "cluster-dot-alpha"),
         origin(cx, "nav-label-pods"),
     );
-    // The sidebar's cursor on alpha, then the navigation's on Pods.
+    let title = header(cx);
+    // The sidebar's cursor on alpha, then the navigation's on the Workloads header and Pods.
     t.press(cx, "tab");
     assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
     assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
     t.press(cx, "tab");
+    assert_eq!(
+        nav_cursor(&nav(cx, &t)).as_deref(),
+        Some("section:Workloads")
+    );
+    assert_eq!(header(cx), title);
     t.press(cx, "down");
     assert_eq!(nav_cursor(&nav(cx, &t)).as_deref(), Some("kind:pods"));
+    assert_eq!(header(cx), title);
     assert_eq!(origin(cx, "nav-label-pods"), label);
     assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
 }
