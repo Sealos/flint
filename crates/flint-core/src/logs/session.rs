@@ -418,6 +418,11 @@ pub(crate) async fn run(
                 }
                 let paused = *paused.borrow_and_update();
                 out.set_paused(paused);
+                // Paused tabs are trimmed after idle ones: say so now, not with the next
+                // snapshot.
+                if let Some(b) = &budget {
+                    b.budget.set_paused(b.id, paused);
+                }
             }
             () = trim_asked() => {
                 if let Some(b) = &budget

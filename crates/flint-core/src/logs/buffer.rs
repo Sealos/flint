@@ -271,10 +271,17 @@ impl LogLines {
         } else {
             keep_from
         };
+        // A tail none of whose lines remain is let go too: a paused view must not keep a block
+        // the buffer has dropped (it keeps `end`, for the held-back count).
+        let tail = if first >= self.tail_start + self.tail.len() as u64 {
+            Arc::from(Vec::new())
+        } else {
+            self.tail.clone()
+        };
         LogLines {
             starts: self.starts[keep_from..].into(),
             chunks: self.chunks[keep_from..].into(),
-            tail: self.tail.clone(),
+            tail,
             tail_start: self.tail_start,
             first,
             end: self.end,
@@ -298,6 +305,35 @@ mod tests {
 
     fn texts(lines: &LogLines) -> Vec<String> {
         lines.iter().map(|(_, l)| l.text.to_string()).collect()
+    }
+
+    // covers UP-40, UP-42: a paused view whose open tail block was later sealed and dropped
+    // lets go of it too, keeping its end for the held-back count (#254).
+    #[test]
+    fn a_trimmed_view_lets_go_of_a_tail_with_no_lines_left() {
+        let mut buffer = LogBuffer::new(10_000);
+        for n in 0..10 {
+            buffer.push(line(n));
+        }
+        // Paused here: the view holds the open tail, lines 0..10.
+        let paused = buffer.view();
+        assert_eq!(paused.tail.len(), 10);
+        // The tail fills, is sealed, and the buffer drops it.
+        for n in 10..(CHUNK_LINES as u64 * 2) {
+            buffer.push(line(n));
+        }
+        assert!(buffer.trim_to(0));
+        let trimmed = paused.trimmed(buffer.first_id());
+        assert!(trimmed.tail.is_empty(), "the frozen tail is let go");
+        assert!(trimmed.is_empty());
+        assert_eq!(
+            trimmed.end_id(),
+            10,
+            "the end stays, for the held-back count"
+        );
+        // A tail with lines left is kept.
+        let partial = buffer.view().trimmed(buffer.first_id());
+        assert_eq!(partial.tail.len(), buffer.view().tail.len());
     }
 
     // covers UP-40

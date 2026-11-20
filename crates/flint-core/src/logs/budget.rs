@@ -36,7 +36,7 @@ struct Inner {
 
 #[derive(Debug)]
 struct Entry {
-    /// What the session's buffer held at its last report.
+    /// What the session's buffer held at its last report (measured, never projected).
     bytes: usize,
     /// How much of it the session can give back: its sealed blocks (the open tail block
     /// stays). Asking for more would free nothing and skip sessions that could.
@@ -45,7 +45,9 @@ struct Entry {
     viewed: u64,
     shown: bool,
     paused: bool,
-    /// Bytes the session should trim its buffer down to, until it does.
+    /// Bytes the session should trim its buffer down to, as the current plan has it. Planned
+    /// again from the measured sizes on every change ([`Inner::rebalance`]), so a tab shown
+    /// since, or resumed, is never left with an old target.
     trim_to: Option<usize>,
     wake: Arc<Notify>,
 }
@@ -122,35 +124,37 @@ impl LogBudget {
         self.lock().sessions.get(&id).is_some_and(|e| e.shown)
     }
 
+    /// Session `id` was paused or resumed: paused tabs are trimmed after idle ones, at once.
+    pub(crate) fn set_paused(&self, id: u64, paused: bool) {
+        let mut inner = self.lock();
+        if let Some(entry) = inner.sessions.get_mut(&id)
+            && entry.paused != paused
+        {
+            entry.paused = paused;
+            inner.rebalance();
+        }
+    }
+
     /// Session `id`'s buffer holds `bytes` now, `trimmable` of them in sealed blocks, and it
-    /// is or is not paused. A trim it was asked for and has not done yet still counts as done,
-    /// so the excess is not asked of others too.
+    /// is or is not paused.
     pub(crate) fn report(&self, id: u64, bytes: usize, trimmable: usize, paused: bool) {
         let mut inner = self.lock();
         if let Some(entry) = inner.sessions.get_mut(&id) {
-            match entry.trim_to {
-                Some(target) => {
-                    let gone = bytes.saturating_sub(target);
-                    entry.bytes = bytes.min(target);
-                    entry.trimmable = trimmable.saturating_sub(gone);
-                }
-                None => {
-                    entry.bytes = bytes;
-                    entry.trimmable = trimmable;
-                }
-            }
+            entry.bytes = bytes;
+            entry.trimmable = trimmable;
             entry.paused = paused;
             inner.rebalance();
         }
     }
 
     /// Session `id` trimmed as asked and holds `bytes` now, `trimmable` of them in sealed
-    /// blocks. Recorded without asking anyone again; the next [`LogBudget::report`] looks
-    /// again.
+    /// blocks. Recorded without planning again: what a session cannot give back would
+    /// otherwise have it asked again at once, in a loop. The next change plans again.
     pub(crate) fn trimmed(&self, id: u64, bytes: usize, trimmable: usize) {
         if let Some(entry) = self.lock().sessions.get_mut(&id) {
             entry.bytes = bytes;
             entry.trimmable = trimmable;
+            entry.trim_to = None;
         }
     }
 
@@ -162,39 +166,50 @@ impl LogBudget {
             .and_then(|e| e.trim_to.take())
     }
 
-    /// Bytes all sessions held at their last reports.
+    /// Bytes all sessions hold as planned: what they reported, less the trims asked of them.
     pub fn total(&self) -> usize {
-        self.lock().sessions.values().map(|e| e.bytes).sum()
+        self.lock()
+            .sessions
+            .values()
+            .map(|e| e.trim_to.map_or(e.bytes, |t| t.min(e.bytes)))
+            .sum()
     }
 }
 
 impl Inner {
-    /// While over the limit, asks sessions to give bytes back: idle ones least recently viewed
-    /// first, then paused ones; never the shown one. Each is asked once; it reports again after
-    /// trimming.
+    /// Plans, from the sizes the sessions last measured, which ones give bytes back while
+    /// over the limit: idle ones least recently viewed first, then paused ones, never the
+    /// shown one, each at most what its sealed blocks hold. Every pending trim is planned again,
+    /// so one asked of a tab that is shown or resumed since is withdrawn, and nothing counts as
+    /// freed before it is. Sessions whose target changed are woken.
     fn rebalance(&mut self) {
-        let total: usize = self.sessions.values().map(|e| e.bytes).sum();
-        let Some(mut excess) = total.checked_sub(self.limit).filter(|e| *e > 0) else {
-            return;
-        };
-        let mut order: Vec<(&u64, &mut Entry)> = self
+        let before: HashMap<u64, Option<usize>> = self
             .sessions
             .iter_mut()
-            .filter(|(_, e)| !e.shown && e.trimmable > 0)
+            .map(|(id, e)| (*id, e.trim_to.take()))
             .collect();
-        order.sort_by_key(|(id, e)| (e.paused, e.viewed, **id));
-        for (_, entry) in order {
-            if excess == 0 {
-                break;
+        let total: usize = self.sessions.values().map(|e| e.bytes).sum();
+        let mut excess = total.saturating_sub(self.limit);
+        if excess > 0 {
+            let mut order: Vec<(&u64, &mut Entry)> = self
+                .sessions
+                .iter_mut()
+                .filter(|(_, e)| !e.shown && e.trimmable > 0)
+                .collect();
+            order.sort_by_key(|(id, e)| (e.paused, e.viewed, **id));
+            for (_, entry) in order {
+                if excess == 0 {
+                    break;
+                }
+                let cut = excess.min(entry.trimmable);
+                entry.trim_to = Some(entry.bytes - cut);
+                excess -= cut;
             }
-            let cut = excess.min(entry.trimmable);
-            let target = entry.bytes - cut;
-            // Count what it will give back now, so the next report does not ask again.
-            entry.bytes = target;
-            entry.trimmable -= cut;
-            entry.trim_to = Some(entry.trim_to.map_or(target, |t| t.min(target)));
-            entry.wake.notify_one();
-            excess -= cut;
+        }
+        for (id, entry) in &self.sessions {
+            if entry.trim_to.is_some() && before.get(id).copied().flatten() != entry.trim_to {
+                entry.wake.notify_one();
+            }
         }
     }
 }
@@ -222,11 +237,11 @@ mod tests {
         assert_eq!(budget.take_trim(1), None, "within the budget");
         budget.report(3, 50 * MIB, 50 * MIB, false);
         // 30 MiB over: all of it from 1, the least recently viewed.
+        assert_eq!(budget.total(), 100 * MIB, "as planned");
         assert_eq!(budget.take_trim(1), Some(10 * MIB));
         assert_eq!(budget.take_trim(2), None);
         assert_eq!(budget.take_trim(3), None, "the shown tab keeps its own cap");
         assert_eq!(budget.take_trim(1), None, "asked once");
-        assert_eq!(budget.total(), 100 * MIB);
     }
 
     #[test]
@@ -263,11 +278,53 @@ mod tests {
         // 1, the least recently viewed, holds only its open tail block; 2 has sealed blocks.
         budget.report(1, 3 * MIB, 0, false);
         budget.report(2, 9 * MIB, 8 * MIB, false);
-        // A report before 2 has trimmed does not undo the request, nor ask anyone else.
+        // A report before 2 has trimmed keeps the same plan, and asks no one else.
         budget.report(2, 9 * MIB, 8 * MIB, false);
         assert_eq!(budget.total(), 10 * MIB);
         assert_eq!(budget.take_trim(1), None, "nothing it could free");
         assert_eq!(budget.take_trim(2), Some(7 * MIB));
+    }
+
+    // covers UP-42: a tab shown, or resumed, after a trim was planned for it keeps its lines,
+    // and the bytes are asked of others instead.
+    #[test]
+    fn a_trim_planned_for_a_tab_shown_since_is_withdrawn() {
+        let budget = LogBudget::new(10 * MIB);
+        for id in 1..=3 {
+            budget.register(id);
+        }
+        budget.set_shown(3, true);
+        budget.report(1, 6 * MIB, 6 * MIB, false);
+        budget.report(2, 6 * MIB, 6 * MIB, false);
+        budget.report(3, 2 * MIB, 2 * MIB, false);
+        // 4 MiB over: planned for 1, the least recently viewed, before it has trimmed.
+        assert_eq!(budget.total(), 10 * MIB);
+        // 1 is shown now: its trim is withdrawn and asked of 2.
+        budget.set_shown(3, false);
+        budget.set_shown(1, true);
+        assert_eq!(budget.total(), 10 * MIB, "as planned");
+        assert_eq!(budget.take_trim(1), None, "the tab shown keeps its lines");
+        assert_eq!(budget.take_trim(2), Some(2 * MIB));
+    }
+
+    // covers UP-42: pausing counts at once, not with the next snapshot.
+    #[test]
+    fn pausing_or_resuming_a_tab_plans_again_at_once() {
+        let budget = LogBudget::new(10 * MIB);
+        for id in 1..=2 {
+            budget.register(id);
+        }
+        budget.report(1, 6 * MIB, 6 * MIB, false);
+        budget.report(2, 6 * MIB, 6 * MIB, false);
+        // 2 MiB over: from 1, the least recently viewed.
+        budget.set_paused(1, true);
+        // Paused now: 2 gives instead, and 1 is not asked.
+        assert_eq!(budget.take_trim(1), None);
+        assert_eq!(budget.take_trim(2), Some(4 * MIB));
+        // Resumed: 1 is first again.
+        budget.trimmed(2, 6 * MIB, 6 * MIB);
+        budget.set_paused(1, false);
+        assert_eq!(budget.take_trim(1), Some(4 * MIB));
     }
 
     #[test]
