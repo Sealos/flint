@@ -327,8 +327,9 @@ impl ClusterManager {
             Command::SetAiScope {
                 cluster,
                 server,
+                from,
                 scope,
-            } => self.set_ai_scope(cluster, server, scope).await,
+            } => self.set_ai_scope(cluster, server, from, scope).await,
             Command::SetTrusted {
                 cluster,
                 server,
@@ -624,7 +625,13 @@ impl ClusterManager {
 
     /// Changes what agents may read of `cluster`, exposed at `server`, to `scope`; never
     /// exposes it ([`settings::set_ai_scope`]).
-    async fn set_ai_scope(&mut self, cluster: ClusterId, server: String, scope: AiScope) {
+    async fn set_ai_scope(
+        &mut self,
+        cluster: ClusterId,
+        server: String,
+        from: AiScope,
+        scope: AiScope,
+    ) {
         let current = self
             .clusters
             .iter()
@@ -638,7 +645,7 @@ impl ClusterManager {
             return;
         }
         self.write_settings("the AI scope", move |dir| {
-            settings::set_ai_scope(dir, &cluster, &server, &scope)
+            settings::set_ai_scope(dir, &cluster, &server, &from, &scope)
         })
         .await;
     }

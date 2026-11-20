@@ -56,6 +56,8 @@ pub struct ScopePicker {
     /// A namespace typed by name: for a cluster whose namespaces are not listed here (not the
     /// active one, or one whose namespaces cannot be listed).
     input: Entity<InputState>,
+    /// Why the typed name was not taken (not a namespace name).
+    input_error: Option<String>,
     focus: FocusHandle,
     _input: Subscription,
 }
@@ -72,9 +74,11 @@ impl ScopePicker {
     ) -> Self {
         let mut offered: BTreeSet<String> = namespaces.iter().cloned().collect();
         offered.extend(scope.namespaces.iter().cloned());
+        // Events are not offered: agents read them with get_events, which follows the
+        // namespaces and kinds chosen here.
         let mut choices: Vec<KindChoice> = kinds
             .iter()
-            .filter(|k| k.is_listable())
+            .filter(|k| k.is_listable() && !is_event_kind(k))
             .map(KindChoice::of)
             .collect();
         for id in &scope.kinds {
@@ -91,9 +95,7 @@ impl ScopePicker {
             cx.new(|cx| InputState::new(window, cx).placeholder("Add a namespace by name…"));
         let on_input = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
-                let namespace = input.read(cx).value().trim().to_owned();
-                this.add_namespace(namespace);
-                input.update(cx, |input, cx| input.set_value("", window, cx));
+                let _ = this.take_typed(input, window, cx);
                 cx.notify();
             }
         });
@@ -103,9 +105,50 @@ impl ScopePicker {
             selected_namespaces: scope.namespaces.iter().cloned().collect(),
             selected_kinds: scope.kinds.iter().cloned().collect(),
             input,
+            input_error: None,
             focus: cx.focus_handle(),
             _input: on_input,
         }
+    }
+
+    /// Adds the namespace typed in the field, if any, and clears the field. A name that is not
+    /// a namespace name stays in the field, and the pickers say why.
+    fn take_typed(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ()> {
+        let typed = input.read(cx).value().trim().to_owned();
+        if typed.is_empty() {
+            self.input_error = None;
+            return Ok(());
+        }
+        if !is_namespace_name(&typed) {
+            self.input_error = Some(format!(
+                "\u{201c}{typed}\u{201d} is not a namespace name (lowercase letters, digits and \
+                 -): fix it or clear the field."
+            ));
+            return Err(());
+        }
+        self.input_error = None;
+        self.add_namespace(typed);
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        Ok(())
+    }
+
+    /// The scope to save on confirming: the one checked, with a namespace still typed in the
+    /// field added first. `Err` (the pickers say why) when the typed text is not a namespace
+    /// name: dropping it would leave nothing checked, which means every namespace.
+    pub fn confirmed_scope(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<AiScope, ()> {
+        let input = self.input.clone();
+        let taken = self.take_typed(&input, window, cx);
+        cx.notify();
+        taken.map(|()| self.scope())
     }
 
     /// Offers `namespace` and checks it (a name typed in the field).
@@ -171,6 +214,25 @@ impl ScopePicker {
             .test_support()
             .into_any_element()
     }
+}
+
+/// Core v1 events and `events.k8s.io` events: not offered (agents read events with
+/// `get_events`, which follows the scope).
+fn is_event_kind(kind: &KindInfo) -> bool {
+    kind.plural() == "events" && matches!(kind.group(), "" | "events.k8s.io")
+}
+
+/// A namespace name: a DNS-1123 label (at most 63 lowercase letters, digits and `-`, starting
+/// and ending with a letter or digit).
+fn is_namespace_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && bytes[0] != b'-'
+        && bytes[bytes.len() - 1] != b'-'
 }
 
 /// Adds `name` to `set`, or takes it out if it is there. Empty names are ignored.
@@ -302,6 +364,17 @@ impl Render for ScopePicker {
                     .child(div().w_px().self_stretch().bg(theme.border))
                     .child(kinds),
             )
+            .when_some(self.input_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .id("scope-ns-error")
+                        .aria_label(error.clone())
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(error)
+                        .test_support(),
+                )
+            })
             .when(hide_cluster_wide, |el| {
                 el.child(Self::empty(
                     "scope-cluster-wide-note",
@@ -309,6 +382,11 @@ impl Render for ScopePicker {
                     cx,
                 ))
             })
+            .child(Self::empty(
+                "scope-events-note",
+                "Events follow these choices: agents read the events about objects they may read.",
+                cx,
+            ))
             .test_support();
         Self::bind_actions(OnView::new(element, cx)).into_element()
     }

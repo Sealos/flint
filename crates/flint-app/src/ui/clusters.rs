@@ -137,12 +137,20 @@ impl ClustersModel {
         });
     }
 
-    /// Changes what AI agents may read of `cluster`, exposed at `server`, to `scope`. Never
-    /// exposes it: if it was hidden or re-pointed meanwhile, nothing is written.
-    pub fn set_ai_scope(&mut self, cluster: ClusterId, server: String, scope: AiScope) {
+    /// Changes what AI agents may read of `cluster`, exposed at `server`, from `from` (the scope
+    /// the dialog opened with) to `scope`. Never exposes it: if it was hidden or re-pointed
+    /// meanwhile, or its scope changed on disk, nothing is written.
+    pub fn set_ai_scope(
+        &mut self,
+        cluster: ClusterId,
+        server: String,
+        from: AiScope,
+        scope: AiScope,
+    ) {
         self.send(Command::SetAiScope {
             cluster,
             server,
+            from,
             scope,
         });
     }

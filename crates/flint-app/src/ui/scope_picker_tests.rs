@@ -4,7 +4,7 @@
 use flint_core::settings::AiScope;
 use gpui_kit::{AppContext as _, TestAppContext};
 
-use super::{ScopePicker, summary, toggle};
+use super::{ScopePicker, is_namespace_name, summary, toggle};
 use crate::ui::support_tests::{discovery, standard_sections};
 
 fn scope(namespaces: &[&str], kinds: &[&str]) -> AiScope {
@@ -38,6 +38,35 @@ fn the_pickers_offer_discovery_and_the_scope(cx: &mut TestAppContext) {
         assert_eq!(deployments.label, "Deployment (apps)");
         assert_eq!(p.scope(), saved);
     });
+    // Events are not offered: they follow the namespaces and kinds chosen.
+    let mut with_events = kinds.clone();
+    let mut event = kinds[0].clone();
+    event.resource.plural = "events".into();
+    event.resource.kind = "Event".into();
+    with_events.push(event.clone());
+    event.resource.group = "events.k8s.io".into();
+    with_events.push(event);
+    let picker = window.update(|window, cx| {
+        cx.new(|cx| ScopePicker::new(&[], &with_events, &AiScope::default(), window, cx))
+    });
+    picker.read_with(window, |p, _| {
+        let (_, kinds) = p.offered();
+        assert!(
+            kinds.iter().all(|k| !k.id.starts_with("events")),
+            "{kinds:?}"
+        );
+    });
+}
+
+// covers UP-14: only a namespace name is taken from the field.
+#[test]
+fn typed_namespaces_must_be_namespace_names() {
+    for ok in ["demo", "kube-system", "a1"] {
+        assert!(is_namespace_name(ok), "{ok}");
+    }
+    for bad in ["", "Demo", "-a", "a-", "a/b", "a b", "a.b", &"a".repeat(64)] {
+        assert!(!is_namespace_name(bad), "{bad}");
+    }
 }
 
 // covers UP-14

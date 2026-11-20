@@ -92,6 +92,9 @@ pub enum Command {
     SetAiScope {
         cluster: ClusterId,
         server: String,
+        /// The scope the user started editing: if it changed on disk since, nothing is
+        /// written.
+        from: crate::settings::AiScope,
         scope: crate::settings::AiScope,
     },
     /// Trust a cluster at `server` (`Some`), or stop trusting it (`None`), in `settings.toml`

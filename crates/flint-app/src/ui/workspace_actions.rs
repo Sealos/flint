@@ -888,6 +888,8 @@ impl Workspace {
                 let model = self.model.clone();
                 let dialog = scope_dialog(&action.cluster, &server, &scope);
                 let picker = self.scope_picker(&action.cluster, &scope, window, cx);
+                // Saved only if the scope on disk is still the one shown.
+                let from = scope.clone();
                 let target = (action.cluster.clone(), server);
                 // Changes the scope only: never exposes a cluster hidden meanwhile.
                 confirm_expose(
@@ -897,7 +899,9 @@ impl Workspace {
                     target,
                     dialog,
                     picker,
-                    ClustersModel::set_ai_scope,
+                    move |m: &mut ClustersModel, cluster, server, scope| {
+                        m.set_ai_scope(cluster, server, from.clone(), scope)
+                    },
                 );
             }
             Err(e) => tracing::warn!("{e}"),

@@ -731,19 +731,23 @@ Rules:
 - **Scope (#67):** an exposed cluster's entry may list the namespaces and kinds an agent may read
   ([ADR-0013](./adr/0013-agent-trust-model.md)): `namespaces` and `kinds` (kind ids, `pods`, `deployments.apps`) on
   its `ai_exposed_clusters` entry (`settings::AiExposure`, `settings::AiScope`). Missing or empty means everything,
-  so entries written before scopes load unchanged. A list naming only blank entries was meant to limit the
-  cluster, so the file is refused (nothing is exposed) rather than read as everything. A Flint older than this reads
-  a scoped entry as the whole cluster: an agent configured with an old `flint mcp` binary is not limited. The policy
-  (`flint-mcp`'s `policy.rs`) applies it to every tool, after the names are checked (above), so a name that is not
-  valid gets the same not-found scoped or not:
-  - `list_clusters` reports a cluster's scope, so the agent asks within it;
+  so entries written before scopes load unchanged. The file is refused (nothing is exposed) rather than read as
+  everything when an entry has a key it does not know (`namespace` for `namespaces`; the error names it), when a list
+  names only blank entries, or when two entries name the same context and server (the first would decide). A Flint
+  older than this reads a scoped entry as the whole cluster: an agent configured with an old `flint mcp` binary is
+  not limited. The policy (`flint-mcp`'s `policy.rs`) applies it to every tool, after the names are checked (above),
+  so a name that is not valid gets the same not-found scoped or not:
+  - `list_clusters` reports a cluster's scope, so the agent asks within it, and its default namespace only when
+    the scope allows it;
   - `list_resource_kinds` lists only kinds in scope; with a namespace scope, cluster-scoped kinds (nodes, namespaces,
     CRDs) only when the kinds scope names them;
   - `list_resources` and `get_resource` resolve kinds among those in scope only, and check the namespace; a list
     across all namespaces on a namespace-scoped cluster lists each namespace of the scope in turn, with no continue
-    token (the agent pages one namespace at a time; a server token could name objects outside the scope);
+    token (the agent pages one namespace at a time; a server token could name objects outside the scope); when the
+    namespaces' pages come with different columns, every row falls back to the plain layout (name, namespace, age);
   - `get_events` follows the namespace scope the same way, and drops events about objects of kinds out of scope
-    (looked up in discovery by Kind and group; a kind discovery does not list is dropped on a scoped cluster). On a
+    (looked up in discovery by Kind and group; a kind discovery does not list is dropped on a scoped cluster); an
+    `object_kind` out of scope fails before anything is fetched, and `truncated` counts only events in scope. On a
     scoped cluster, events are read only this way: the event kinds (`events`, `events.events.k8s.io`) are out of
     scope for `list_resources` and `get_resource`, even when named, since an event in an allowed namespace can be
     about a node or a Secret the scope hides;
@@ -759,7 +763,10 @@ Rules:
   (`Command::SetAiExposed`, which, as before, writes nothing if the context moved since the dialog opened); exposing
   a re-pointed context again starts from the scope its old entry had. Edit AI Scope saves through
   `Command::SetAiScope` (`settings::set_ai_scope`), which changes the lists of an entry the file still holds for that
-  context and server, and never exposes a cluster hidden while the dialog was open.
+  context and server, with the scope the dialog opened with: it never exposes a cluster hidden while the dialog was
+  open, nor overwrites a scope changed on disk meanwhile (it says to open the dialog again). A namespace still typed
+  in the field is added on confirming; text that is not a namespace name keeps the dialog open, saying why. The
+  kind picker does not offer the event kinds: events follow the namespaces and kinds chosen.
   - What a scope cannot hide: text in objects the agent may read can still name things outside it, such as the node
     a pod runs on (`spec.nodeName`, a scheduling event's message). Naming `namespaces` in the kinds scope shows every
     namespace's name.

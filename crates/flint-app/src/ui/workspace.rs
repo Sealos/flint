@@ -1943,12 +1943,18 @@ fn confirm_expose(
     (context, server): (String, String),
     dialog: DialogText,
     picker: Entity<ScopePicker>,
-    save: fn(&mut ClustersModel, String, String, AiScope),
+    save: impl Fn(&mut ClustersModel, String, String, AiScope) + 'static,
 ) {
     let content = picker.clone().into();
-    confirm::open_with(window, cx, dialog, Some(content), move |_, cx| {
-        let scope = picker.read(cx).scope();
+    confirm::open_with(window, cx, dialog, Some(content), move |window, cx| {
+        // A name still typed in the namespace field is added first; one that is not a
+        // namespace name keeps the dialog open, saying so, rather than being dropped (which,
+        // with nothing checked, would expose every namespace).
+        let Ok(scope) = picker.update(cx, |p, cx| p.confirmed_scope(window, cx)) else {
+            return false;
+        };
         model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
+        true
     });
 }
 

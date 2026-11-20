@@ -235,3 +235,65 @@ async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) 
     );
     assert!(!t.settings_toml().contains("alpha"));
 }
+
+// covers UP-14: confirming with a namespace still typed in the field adds it first; one that is
+// not a namespace name keeps the dialog open, saying why, and exposes nothing.
+#[gpui_kit::test]
+async fn text_left_in_the_namespace_field_is_never_dropped(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    click(cx, &t, "scope-ns-add");
+    t.type_text(cx, "Not/A Namespace");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(t.has_dialog(cx), "kept open");
+    let error = t.label(cx, "scope-ns-error").unwrap_or_default();
+    assert!(error.contains("is not a namespace name"), "{error}");
+    assert_eq!(scope_of(cx, &t), None, "nothing exposed");
+
+    // Fixed, and confirmed without pressing Enter: the name is added first.
+    click(cx, &t, "scope-ns-add");
+    t.press(cx, "secondary-a");
+    t.type_text(cx, "shop");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["shop"], &[])).await;
+}
+
+// covers UP-14: Edit AI Scope saves only if the scope on disk is still the one it opened with.
+#[gpui_kit::test]
+async fn a_scope_changed_on_disk_is_not_overwritten(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let server = t.server.clone();
+    t.model.update(cx, |m, _| {
+        m.expose_to_ai("alpha".into(), server, scope(&["shop"], &[]))
+    });
+    wait_for_scope(cx, &t, scope(&["shop"], &[])).await;
+    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    // Meanwhile, another change of the scope lands (by hand, or another Flint).
+    let server = t.server.clone();
+    t.model.update(cx, |m, _| {
+        m.expose_to_ai("alpha".into(), server, scope(&["billing"], &[]))
+    });
+    wait_for_scope(cx, &t, scope(&["billing"], &[])).await;
+    click(cx, &t, "scope-ns-all");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).last_error.is_some()
+    })
+    .await;
+    let error = t.model.read_with(cx, |m, _| m.last_error.clone()).unwrap();
+    assert!(
+        error.contains("changed while it was being edited"),
+        "{error}"
+    );
+    assert_eq!(scope_of(cx, &t), Some(scope(&["billing"], &[])));
+}

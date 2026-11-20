@@ -36,6 +36,11 @@ pub enum SettingsError {
     /// A scope change for a cluster that is no longer exposed at that server.
     #[error("\"{context}\" is no longer exposed to AI agents at that server")]
     NotExposed { context: String },
+    /// A scope change made from a scope that has changed on disk since.
+    #[error(
+        "the AI scope of \"{context}\" changed while it was being edited; open Edit AI Scope again"
+    )]
+    ScopeChanged { context: String },
 }
 
 /// Which kinds are watched while a cluster is active (ADR-0008).
@@ -87,7 +92,11 @@ impl ClusterPin {
 /// One cluster the user exposed to AI agents (ADR-0009), pinned to its server like a
 /// [`ClusterPin`], and what agents may read of it (ADR-0013). An entry written before scopes
 /// existed has neither list, and exposes the whole cluster as it did.
+///
+/// Unknown keys are refused (`namespace` for `namespaces`): a misspelt scope would otherwise be
+/// ignored and expose the whole cluster, so the file is treated as unreadable instead.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AiExposure {
     pub context: String,
     pub server: String,
@@ -516,6 +525,24 @@ pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
 /// that names only blank entries. It was clearly meant to limit the cluster, and read as empty
 /// it would expose everything, so the whole file is treated as unreadable instead.
 fn validate(settings: &Settings, path: &Path) -> Result<(), SettingsError> {
+    // Two entries for one context and server: the first one found would decide, and an
+    // unscoped copy could undo a scope.
+    let entries = &settings.ai_exposed_clusters;
+    let duplicate = entries.iter().enumerate().find_map(|(i, e)| {
+        entries[..i]
+            .iter()
+            .any(|other| other.pin().matches(&e.context, &e.server))
+            .then_some(e)
+    });
+    if let Some(e) = duplicate {
+        return Err(SettingsError::Invalid {
+            path: path.to_owned(),
+            reason: format!(
+                "\"{}\" is listed twice in ai_exposed_clusters for the same server; keep one entry",
+                e.context
+            ),
+        });
+    }
     let blank = |names: &[String]| !names.is_empty() && names.iter().all(|n| n.trim().is_empty());
     match settings
         .ai_exposed_clusters
@@ -647,15 +674,17 @@ pub fn set_ai_exposed(
     })
 }
 
-/// Changes what agents may read of `context`, exposed at `server`, to `scope`, and writes
-/// `settings.toml`. Unlike [`set_ai_exposed`], it never exposes anything: if the file, as read
-/// for this write, no longer exposes the context at that server (it was hidden or re-pointed
-/// meanwhile, by hand or by another Flint), nothing is written and
-/// [`SettingsError::NotExposed`] says so.
+/// Changes what agents may read of `context`, exposed at `server`, from `from` (the scope the
+/// user started editing) to `scope`, and writes `settings.toml`. Unlike [`set_ai_exposed`], it
+/// never exposes anything: if the file, as read for this write, no longer exposes the context
+/// at that server (hidden or re-pointed meanwhile, by hand or by another Flint), nothing is
+/// written and [`SettingsError::NotExposed`] says so; if its scope there is no longer `from`,
+/// [`SettingsError::ScopeChanged`].
 pub fn set_ai_scope(
     dir: &Path,
     context: &str,
     server: &str,
+    from: &AiScope,
     scope: &AiScope,
 ) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, path| {
@@ -677,6 +706,13 @@ pub fn set_ai_scope(
                 context: context.to_owned(),
             });
         };
+        // Edited from `from`: a change on disk since (by hand, or another Flint) would be
+        // overwritten unseen.
+        if entry.scope() != *from {
+            return Err(SettingsError::ScopeChanged {
+                context: context.to_owned(),
+            });
+        }
         entry.namespaces = scope.namespaces.clone();
         entry.kinds = scope.kinds.clone();
         table.insert(
@@ -1255,6 +1291,48 @@ mod tests {
         );
     }
 
+    // covers UP-14: a misspelt scope key, or two entries for one context and server, make the
+    // file invalid (nothing exposed) rather than exposing the whole cluster; the error names
+    // what is wrong.
+    #[test]
+    fn misspelt_scope_keys_and_duplicate_entries_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\nnamespace = [\"shop\"]\n",
+        )
+        .unwrap();
+        let error = load_settings(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("namespace"), "{error}");
+        assert!(
+            load_settings_or_fallback(dir.path())
+                .0
+                .ai_exposed_clusters
+                .is_empty()
+        );
+
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\n\
+             namespaces = [\"shop\"]\n\
+             [[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p/\"\n",
+        )
+        .unwrap();
+        let error = load_settings(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("listed twice") && error.contains("prod"),
+            "{error}"
+        );
+        // The same context at two servers is not a duplicate.
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\n\
+             [[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://q\"\n",
+        )
+        .unwrap();
+        assert!(load_settings(dir.path()).is_ok());
+    }
+
     // covers UP-14: changing a scope never exposes a cluster that was hidden or re-pointed
     // meanwhile; a re-pointed context's old scope is kept to start from.
     #[test]
@@ -1262,15 +1340,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shop = AiScope::new(vec!["shop".into()], Vec::new());
         assert!(matches!(
-            set_ai_scope(dir.path(), "prod", "https://p", &shop),
+            set_ai_scope(dir.path(), "prod", "https://p", &AiScope::default(), &shop),
             Err(SettingsError::NotExposed { .. })
         ));
         assert!(!dir.path().join(SETTINGS_FILE).exists());
         set_ai_exposed(dir.path(), "prod", Some("https://p"), &AiScope::default()).unwrap();
-        let s = set_ai_scope(dir.path(), "prod", "https://p/", &shop).unwrap();
+        let s = set_ai_scope(dir.path(), "prod", "https://p/", &AiScope::default(), &shop).unwrap();
+        // Edited from a scope that changed on disk since: refused, nothing written.
+        assert!(matches!(
+            set_ai_scope(
+                dir.path(),
+                "prod",
+                "https://p",
+                &AiScope::default(),
+                &AiScope::default()
+            ),
+            Err(SettingsError::ScopeChanged { .. })
+        ));
+        assert_eq!(
+            load_settings(dir.path())
+                .unwrap()
+                .ai_scope("prod", Some("https://p")),
+            Some(shop.clone())
+        );
         assert_eq!(s.ai_scope("prod", Some("https://p")), Some(shop.clone()));
         assert!(matches!(
-            set_ai_scope(dir.path(), "prod", "https://elsewhere", &AiScope::default()),
+            set_ai_scope(
+                dir.path(),
+                "prod",
+                "https://elsewhere",
+                &shop,
+                &AiScope::default()
+            ),
             Err(SettingsError::NotExposed { .. })
         ));
         assert_eq!(s.ai_scope_saved("prod"), Some(shop.clone()));
