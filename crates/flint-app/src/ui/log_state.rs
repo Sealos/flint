@@ -8,10 +8,9 @@ use flint_core::{LogState, PodSetStatus, Severity};
 use gpui_kit::*;
 
 use super::super::log_model;
-use super::super::log_model::MenuRow;
 use super::super::view_state::{
-    Focus, LogLineState, LogTabState, MenuEntryState, SearchState, SelectionState, StreamCounts,
-    StreamState, TabStatusState, error_text,
+    Focus, LogLineState, LogTabState, SearchState, SelectionState, StreamCounts, StreamState,
+    TabStatusState, error_text,
 };
 use super::LogView;
 
@@ -58,16 +57,6 @@ impl LogView {
         }
     }
 
-    /// The entries of the toolbar's Save menu, or of its "⋯" menu (`more`), as drawn now.
-    pub fn menu_state(&self, more: bool) -> Vec<MenuEntryState> {
-        let facts = self.menu_facts();
-        menu_entries(if more {
-            log_model::more_menu(&facts)
-        } else {
-            log_model::save_menu(&facts)
-        })
-    }
-
     /// The session's state, and the status line as drawn.
     pub fn status_state(&self) -> (TabStatusState, String) {
         let pod = !self.is_workload();
@@ -110,24 +99,6 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
             pod_deleted: *pod_deleted,
         },
     }
-}
-
-/// A toolbar menu's entries: its labels and separators left out.
-pub fn menu_entries(rows: Vec<MenuRow>) -> Vec<MenuEntryState> {
-    let entry = |label: &str, enabled, checked| MenuEntryState {
-        label: label.to_owned(),
-        enabled,
-        reason: None,
-        checked,
-        submenu: Vec::new(),
-    };
-    rows.into_iter()
-        .filter_map(|row| match row {
-            MenuRow::Label(_) | MenuRow::Separator => None,
-            MenuRow::Toggle { label, on, .. } => Some(entry(label, true, Some(on))),
-            MenuRow::Save { label, enabled, .. } => Some(entry(label, enabled, None)),
-        })
-        .collect()
 }
 
 /// Why a stream reconnects, as its status line says it: in plain words, or the error's gist

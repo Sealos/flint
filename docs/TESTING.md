@@ -165,9 +165,12 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     checked, submenu: [{label, enabled}]}]}`. Entries are what can be chosen: notes and separators are left out.
     - A row's menu has `owner` `row-menu-<uid>`, `note` (why nothing can open: the cluster is not connected) and each
       entry's `reason` when disabled; a container picker lists its containers in `submenu`.
-    - A log tab's toolbar menus have `owner` `log-save` or `log-more` ("⋯"), with `checked` on its toggles.
-    - Another menu (the dock's tab list) lists its drawn entries with `owner` null: `checked` is true for a checked
-      entry, and `enabled` cannot be read from the drawing (true).
+    - Menus that record what they were built with report exactly that, as it stays on screen until dismissed: a log
+      tab's toolbar menus (`owner` `log-save`, `log-more` for "⋯", with `checked` on its toggles), the detail pane's
+      container pickers (`detail-logs`, `detail-shell`) and the dock's tab list (`dock-tab-list`, the shown tab
+      `checked`).
+    - Any other menu lists its drawn entries with `owner` null: a separator is left out, but a note cannot be told
+      from an entry, and `enabled` is false only where the drawing says the entry is disabled.
     - Focus is `menu` while one is open, also when it is drawn inside a dock tab.
   - Log lines and the shell's screen are test fixtures (the fake server's lines, a test's commands). They are in the
     state so a test can wait for a line or a prompt; the channel exists only in debug builds with `--features

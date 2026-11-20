@@ -753,6 +753,18 @@ pub fn save_menu(f: &MenuFacts) -> Vec<MenuRow> {
     ]
 }
 
+/// What a toolbar menu offers: its entries, without its note and separators.
+pub fn menu_entries(rows: &[MenuRow]) -> Vec<super::menu_record::Entry> {
+    use super::menu_record::Entry;
+    rows.iter()
+        .filter_map(|row| match row {
+            MenuRow::Label(_) | MenuRow::Separator => None,
+            MenuRow::Toggle { label, on, .. } => Some(Entry::toggle(*label, *on)),
+            MenuRow::Save { label, enabled, .. } => Some(Entry::new(*label, *enabled)),
+        })
+        .collect()
+}
+
 /// The "⋯" menu of a narrow tab: the view toggles, then Save's entries once there are lines.
 pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
     let toggle = |label, on, toggle| MenuRow::Toggle { label, on, toggle };

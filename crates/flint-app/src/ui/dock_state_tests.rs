@@ -117,8 +117,25 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     draw(cx, &t);
     assert_eq!(state(cx, &t)["menu"], Value::Null);
 
-    // A log tab, opened from the detail pane, takes focus.
+    // The detail pane's Logs picker: its containers, then those with a previous instance; its
+    // notes ("Container", "Previous instance") are not entries.
     show_fetched(cx, &t, pod_detail("web"));
+    t.click(cx, "detail-logs");
+    draw(cx, &t);
+    let s = state(cx, &t);
+    assert_eq!(s["menu"]["owner"], "detail-logs");
+    let labels: Vec<&str> = s["menu"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["app (default)", "sidecar", "app (default)"]);
+    press(cx, &t, "escape");
+    draw(cx, &t);
+    assert_eq!(state(cx, &t)["menu"], Value::Null);
+
+    // A log tab, opened from the detail pane, takes focus.
     dispatch(cx, &t, "detail::OpenLogs", Value::Null).unwrap();
     draw(cx, &t);
     let s = state(cx, &t);
@@ -142,7 +159,24 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     );
     assert_eq!(log["shell"], Value::Null);
 
-    // Its lines and status, as fed.
+    // The toolbar's "⋯" menu (the tab is narrow) is drawn inside the tab, yet focus is in the
+    // menu. It says what it was built with: no lines yet, so no Save entries, and toggles say
+    // whether they are on.
+    assert!(t.find(cx, "log-more").is_some(), "a narrow toolbar");
+    t.click(cx, "log-more");
+    draw(cx, &t);
+    let toggles = [
+        json!({"label": "Timestamps", "enabled": true, "reason": null,
+               "checked": false, "submenu": []}),
+        json!({"label": "Wrap Lines", "enabled": true, "reason": null,
+               "checked": false, "submenu": []}),
+    ];
+    let s = state(cx, &t);
+    assert_eq!(s["focus"], "menu");
+    assert_eq!(s["menu"]["owner"], "log-more");
+    assert_eq!(s["menu"]["entries"], Value::from(toggles.to_vec()));
+
+    // Lines arrive while it is open: the menu stays as built, and so does the state.
     let view = log_view(cx, &t, id);
     let mut buffer = LogBuffer::new(100);
     for text in ["ready", "WARN slow"] {
@@ -166,52 +200,35 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     });
     draw(cx, &t);
     let s = state(cx, &t);
+    assert_eq!(s["menu"]["entries"], Value::from(toggles.to_vec()));
     let log = tab(&s, id);
     assert_eq!(log["status"], json!({"state": "streaming"}));
     assert_eq!(log["status_text"], "Streaming");
     assert_eq!(log["logs"]["lines"], 2);
     assert_eq!(log["logs"]["last_lines"][1]["severity"], "warning");
-
-    // The toolbar's menu ("⋯" in a tab this narrow, else Save) is drawn inside the tab, yet
-    // focus is in the menu; its entries leave out its note, and toggles say if they are on.
-    let button = if t.find(cx, "log-more").is_some() {
-        "log-more"
-    } else {
-        "log-save"
-    };
-    t.click(cx, button);
-    draw(cx, &t);
-    let s = state(cx, &t);
-    assert_eq!(s["focus"], "menu");
-    assert_eq!(s["menu"]["owner"], button);
-    let save = json!([
-        {"label": "Save All Lines…", "enabled": true, "reason": null, "checked": null,
-         "submenu": []},
-        {"label": "Save Matching Lines…", "enabled": false, "reason": null, "checked": null,
-         "submenu": []},
-        {"label": "Save Selected Lines…", "enabled": false, "reason": null, "checked": null,
-         "submenu": []},
-    ]);
-    let entries = s["menu"]["entries"].as_array().unwrap().clone();
-    if button == "log-more" {
-        assert_eq!(
-            entries[..2],
-            [
-                json!({"label": "Timestamps", "enabled": true, "reason": null,
-                       "checked": false, "submenu": []}),
-                json!({"label": "Wrap Lines", "enabled": true, "reason": null,
-                       "checked": false, "submenu": []}),
-            ]
-        );
-        assert_eq!(Value::from(entries[2..].to_vec()), save);
-    } else {
-        assert_eq!(Value::from(entries), save);
-    }
     press(cx, &t, "escape");
     draw(cx, &t);
     let s = state(cx, &t);
     assert_eq!(s["menu"], Value::Null);
     assert_eq!(s["focus"], "log");
+
+    // Opened again, it offers Save; its note is not an entry.
+    t.click(cx, "log-more");
+    draw(cx, &t);
+    let entries = state(cx, &t)["menu"]["entries"].clone();
+    let mut expected = toggles.to_vec();
+    expected.extend([
+        json!({"label": "Save All Lines…", "enabled": true, "reason": null, "checked": null,
+               "submenu": []}),
+        json!({"label": "Save Matching Lines…", "enabled": false, "reason": null,
+               "checked": null, "submenu": []}),
+        json!({"label": "Save Selected Lines…", "enabled": false, "reason": null,
+               "checked": null, "submenu": []}),
+    ]);
+    assert_eq!(entries, Value::from(expected));
+    press(cx, &t, "escape");
+    draw(cx, &t);
+    assert_eq!(state(cx, &t)["focus"], "log");
 
     // The save confirmation says what it asks, with focus in it.
     dispatch(cx, &t, "logs::SaveLines", json!({"lines": "all"})).unwrap();
@@ -256,12 +273,12 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     assert_eq!(tab(&s, id)["active"], false);
     assert_eq!(tab(&s, id)["focused"], false);
 
-    // The tab list is a menu of its own, listed as drawn.
+    // The tab list is a menu of its own, listed as it was built.
     dispatch(cx, &t, "dock::ShowTabList", Value::Null).unwrap();
     draw(cx, &t);
     let s = state(cx, &t);
     assert_eq!(s["focus"], "menu");
-    assert_eq!(s["menu"]["owner"], Value::Null);
+    assert_eq!(s["menu"]["owner"], "dock-tab-list");
     let labels: Vec<&str> = s["menu"]["entries"]
         .as_array()
         .unwrap()
@@ -275,14 +292,14 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
             "Shell: web · app — alpha · live"
         ]
     );
-    // The shown tab is checked (the others are drawn as plain entries).
+    // The shown tab is checked.
     let checked: Vec<&Value> = s["menu"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .map(|e| &e["checked"])
         .collect();
-    assert_eq!(checked, [&Value::Null, &json!(true)]);
+    assert_eq!(checked, [&json!(false), &json!(true)]);
     press(cx, &t, "escape");
     draw(cx, &t);
     assert_eq!(state(cx, &t)["menu"], Value::Null);

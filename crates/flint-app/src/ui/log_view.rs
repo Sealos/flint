@@ -53,6 +53,7 @@ use jiff::tz::TimeZone;
 use super::confirm::{self, DialogText};
 use super::dock::{DockItem, TabKey, TabStatus};
 use super::log_model::{self, ListChange, SourceLabels, Tone};
+use super::menu_record;
 use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
@@ -1097,11 +1098,13 @@ impl LogView {
                                     .disabled(!has_lines)
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
-                                        move |menu, _, _| {
+                                        move |menu, _, cx| {
                                             fill_menu(
                                                 menu,
                                                 log_model::save_menu(&facts),
                                                 facts.timestamps,
+                                                "log-save",
+                                                cx,
                                             )
                                         },
                                     ),
@@ -1115,11 +1118,13 @@ impl LogView {
                                     .tooltip("View options and Save")
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
-                                        move |menu, _, _| {
+                                        move |menu, _, cx| {
                                             fill_menu(
                                                 menu,
                                                 log_model::more_menu(&facts),
                                                 facts.timestamps,
+                                                "log-more",
+                                                cx,
                                             )
                                         },
                                     ),
@@ -1370,10 +1375,18 @@ fn reconnect_button() -> Button {
         .on_click(registry::on_click(ReconnectLogs))
 }
 
-/// A toolbar menu with `rows`, each entry performing its registered action. Saves write
-/// timestamps as `timestamps` says (as shown when the menu opened, as its note says).
-fn fill_menu(menu: PopupMenu, rows: Vec<log_model::MenuRow>, timestamps: bool) -> PopupMenu {
+/// A toolbar menu with `rows`, each entry performing its registered action, opened from the
+/// button `owner`. Saves write timestamps as `timestamps` says (as shown when the menu opened,
+/// as its note says). The menu stays as built until it is dismissed.
+fn fill_menu(
+    menu: PopupMenu,
+    rows: Vec<log_model::MenuRow>,
+    timestamps: bool,
+    owner: &'static str,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
     use log_model::{MenuRow, Toggle};
+    menu_record::record(cx, owner, || log_model::menu_entries(&rows));
     rows.into_iter().fold(menu, |menu, row| match row {
         MenuRow::Label(text) => menu.label(text),
         MenuRow::Separator => menu.separator(),
