@@ -318,7 +318,10 @@ impl Workspace {
         });
         let key = SwitcherKey {
             cluster: cluster_id.clone(),
-            kinds: entries.iter().map(|e| e.id.clone()).collect(),
+            kinds: entries
+                .iter()
+                .map(|e| (e.id.clone(), e.kind.clone(), e.label.clone(), e.listable))
+                .collect(),
             discovery_failed,
             on_view,
         };
@@ -426,7 +429,8 @@ impl Workspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::ui) struct SwitcherKey {
     cluster: Option<(String, Option<String>)>,
-    kinds: Vec<KindId>,
+    /// Each kind's id, Kind, label as shown, and whether it can be listed: what its rows say.
+    kinds: Vec<(KindId, String, String, bool)>,
     discovery_failed: bool,
     on_view: bool,
 }

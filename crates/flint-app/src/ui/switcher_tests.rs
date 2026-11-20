@@ -922,3 +922,46 @@ async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
     assert_eq!(switcher.query, "web");
     assert_eq!(focus, Focus::Palette);
 }
+
+// covers UP-31: discovery that renames a kind (the same kinds, the same count) lists anew in
+// an open switcher.
+#[gpui_kit::test]
+async fn a_renamed_kind_lists_anew(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    open_switcher(cx, &t).await;
+    t.type_text(cx, "widg");
+    assert_eq!(labels(&shown(cx, &t)), ["Widgets"]);
+    let mut sections = standard_sections();
+    for section in &mut sections {
+        for entry in &mut section.entries {
+            if entry.label == "Widgets" {
+                entry.label = "Widget Gadgets".into();
+            }
+        }
+    }
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                sections,
+            ))),
+            error: None,
+        },
+    );
+    // As the window draws it, once the change reached the switcher.
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).palette_view().is_some_and(|p| {
+            p.read(cx)
+                .view_state()
+                .rows
+                .iter()
+                .any(|r| r.label == "Widget Gadgets")
+        })
+    })
+    .await;
+    assert_eq!(labels(&shown(cx, &t)), ["Widget Gadgets"]);
+}
