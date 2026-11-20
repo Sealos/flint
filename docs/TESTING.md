@@ -13,7 +13,7 @@ must keep working. This document covers *how* it is tested. The choices behind i
 | **Cluster** | Core and MCP behave correctly against a real API server | Linux CI with kind; locally with `scripts/dev-cluster.sh` | Yes on master and nightly |
 | **App e2e** | The real app, driven like a user, completes a user path | macOS CI against the fake API server; locally against kind | Yes |
 | **Screenshots** | Key views look right in light and dark | Captured during app e2e and attached to the PR | No (reviewed by people) |
-| **Manual** | Things only a real machine shows: Gatekeeper, real cloud auth | By hand at release | Release checklist |
+| **Manual** | Things only a real machine shows: Gatekeeper, real cloud auth | By hand at release | [Release checklist](./RELEASING.md) |
 
 ### Unit tests per module
 

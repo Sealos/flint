@@ -417,10 +417,12 @@ stay unsigned.
 
 After every published release:
 
-1. **Reviews of the shipped build:** usability (install and use it as a new user), product development (is the
+1. **The release checklist** ([`docs/RELEASING.md`](docs/RELEASING.md)): the release page is Latest with all four
+   binaries and their checksums, and the DMG installs and opens on a clean Mac (UP-80).
+2. **Reviews of the shipped build:** usability (install and use it as a new user), product development (is the
    roadmap right?) and market fit (against Lens, Freelens, k9s, Headlamp and other tools). Their findings become
    issues.
-2. **A refactor pass:** behaviour-preserving `refactor(<scope>): …` PRs that work through the
+3. **A refactor pass:** behaviour-preserving `refactor(<scope>): …` PRs that work through the
    [refactor backlog](https://github.com/Sealos/flint/issues/87) and the duplication the release added. Existing
    tests must pass unchanged; add tests first where coverage is thin.
 
@@ -434,6 +436,7 @@ The version lives in the workspace `Cargo.toml` (marked `x-release-please-versio
 
 - [Website](https://sealos.github.io/flint/): the static site in `site/`, published by `.github/workflows/pages.yml`
 - [Architecture](docs/ARCHITECTURE.md)
+- [Release checklist](docs/RELEASING.md)
 - [Architecture decision records](docs/adr/)
 
 ## License

@@ -19,7 +19,7 @@ review (#15). "#116" marks view tests that have since merged (aa59738). The app 
 | 02 | U, ui | 6 tests in `kubeconfig.rs` (U); `app/m0.rs::up_02_launch_with_no_usable_kubeconfig` (A) | — | — |
 | 03 | K, ui | `dev_cluster.rs::core_handle_connects_and_reads_version` (K); `e2e/core.rs::connects_and_discovers_every_recorded_kind` (F); `app/m0.rs::up_03_connect_to_a_cluster` (A, also on kind) | — | — |
 | 04 | U, K, ui | `cluster.rs` timeouts and missing plugin (U); `core_handle.rs::unreachable_cluster_fails_with_a_readable_error`; `app/m0.rs::up_04_connection_fails_with_a_plain_cause_and_retries` (A, unreachable only, loose text `TODO(#98)`) | missing and hanging exec plugins in the app | #130, #127 |
-| 05 | U, Man | 9 tests in `env_path.rs` (U) | — | release checklist |
+| 05 | U, Man | 9 tests in `env_path.rs` (U) | — | [release checklist](./RELEASING.md#3-exec-plugin-auth-from-finder-up-05) |
 | 06 | U, K | `core_handle.rs::reloads_when_kubeconfig_changes`; `app/m0.rs::up_06_kubeconfig_changes_on_disk` (A) | its half-written file lasts 30 ms, under the 300 ms debounce, so a file held half-written is untested | #131 |
 | 07 | U, ui | `core_handle.rs::set_ai_exposed_writes_context_and_server` (U); `ui/workspace_tests.rs::the_expose_dialog_answers_confirm_and_cancel` (V); `app/m0.rs::up_07_expose_a_cluster_to_ai` (A); #116 `expose_tests.rs` | — | — |
 | 08 | U, M, ui | `policy.rs::same_name_with_a_different_server_is_not_exposed` (U); `mcp_stdio.rs::mcp_policy_without_a_cluster` (M); `app/m0.rs::up_08_up_12_app_and_flint_mcp_agree_on_exposure` (A) | — | — |
@@ -72,7 +72,7 @@ None of these features is built yet; each issue lists its tests and is written w
 | 75–77, 93, 14–16 | U, ui (fake `claude`), mcp | #137 |
 | 78–79, 82–85 | U, K, ui, e2e | #138 |
 | 86–87 | U, K, ui, e2e | deferred with #199 |
-| 80 | Man | release checklist (clean Mac, Apple Silicon and Intel); the DMG is mounted and checked in CI (`scripts/smoke-macos-app.sh`) |
+| 80 | Man | [release checklist](./RELEASING.md#2-install-from-the-dmg-on-a-clean-mac-up-80) (clean Mac, Apple Silicon and Intel); the DMG is mounted and checked in CI (`scripts/smoke-macos-app.sh`) |
 | 81 | Man, CI smoke | #139 |
 | 90 | U, review | `core_handle.rs::commands_never_write_kubeconfig_files` (U); every app test: #127 |
 | 91 | U, ui | `app/m0.rs::up_01` and `e2e/mcp.rs::up_11` assert no requests; every app test: #127 |
