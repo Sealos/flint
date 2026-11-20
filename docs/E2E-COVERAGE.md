@@ -74,7 +74,7 @@ None of these features is built yet; each issue lists its tests and is written w
 | 86–87 | U, K, ui, e2e | deferred with #199 |
 | 80 | Man | [release checklist](./RELEASING.md#2-install-from-the-dmg-on-a-clean-mac-up-80) (clean Mac, Apple Silicon and Intel); the DMG is mounted and checked in CI (`scripts/smoke-macos-app.sh`) |
 | 81 | Man, CI smoke | #139 |
-| 90 | U, review | `core_handle.rs::commands_never_write_kubeconfig_files` (U); every app test: #127 |
-| 91 | U, ui | `app/m0.rs::up_01` and `e2e/mcp.rs::up_11` assert no requests; every app test: #127 |
+| 90 | U, review | `core_handle.rs::commands_never_write_kubeconfig_files` (U); every app test checks its kubeconfig files at teardown (A, `flint_e2e::teardown`, #127) |
+| 91 | U, ui | `app/m0.rs::up_01` and `e2e/mcp.rs::up_11` assert no requests; every app test checks at teardown that no fake server was contacted before or without its selection (A, `flint_e2e::teardown`, #127) |
 | 100–101 | U, e2e | P2, with #82 |
 | 110–116 | U, e2e, cluster, ui, mcp | P2, with #109 to #113 (M8) |

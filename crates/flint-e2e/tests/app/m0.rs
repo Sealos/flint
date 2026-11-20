@@ -275,9 +275,11 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
     // A context is added (written in two steps, as a slow writer does): fake-b appears, and
     // fake-a never disappears on the way.
     let half = &both[..both.len() / 2];
-    std::fs::write(&kubeconfig, half)?;
-    std::thread::sleep(Duration::from_millis(30));
-    std::fs::write(&kubeconfig, &both)?;
+    app.edit_kubeconfig(|| {
+        std::fs::write(&kubeconfig, half)?;
+        std::thread::sleep(Duration::from_millis(30));
+        Ok(std::fs::write(&kubeconfig, &both)?)
+    })?;
     let deadline = Instant::now() + WAIT;
     loop {
         let state = app.state()?;
@@ -298,7 +300,9 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
     }
 
     // The active cluster is removed: it is deselected, with a notice.
-    flint_e2e::fake_api::write_kubeconfigs(&kubeconfig, &[(&two.b, TwoClusters::B, None)])?;
+    app.edit_kubeconfig(|| {
+        flint_e2e::fake_api::write_kubeconfigs(&kubeconfig, &[(&two.b, TwoClusters::B, None)])
+    })?;
     let state = app.wait_for("/active_cluster", Equals(Value::Null))?;
     assert_eq!(cluster_names(&state), [TwoClusters::B]);
     let state = app.wait_for("/banners", Any(json!({"id": "last-error"})))?;
@@ -381,7 +385,7 @@ fn up_08_up_12_app_and_flint_mcp_agree_on_exposure() -> Result<()> {
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
     let config_dir = app.config_dir();
-    let settings = |extra: &str| flint_e2e::scratch::write_settings(&config_dir, extra);
+    let settings = |extra: &str| app.write_settings(extra);
     let mut mcp = Mcp::flint(app.binary(), two.kubeconfig(), &config_dir)?;
     let listed = |mcp: &mut Mcp| -> Result<Vec<String>> {
         let clusters = mcp.call_json("list_clusters", json!({}))?;
@@ -393,7 +397,9 @@ fn up_08_up_12_app_and_flint_mcp_agree_on_exposure() -> Result<()> {
             .collect())
     };
 
-    // Exposed by hand in settings.toml: the app shows it, and `flint mcp` lists it.
+    // Exposed by hand in settings.toml: the app shows it, and `flint mcp` lists it. Exposed,
+    // fake-a may be contacted from here on (UP-91).
+    app.mark_selected(TwoClusters::A);
     settings(&format!(
         "[[ai_exposed_clusters]]\ncontext = \"{}\"\nserver = \"{}\"\n",
         TwoClusters::A,

@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
@@ -127,7 +127,29 @@ struct Inner {
     scripts: Mutex<Scripts>,
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
+    /// Every request as it arrived, before faults or answers: what the app sent, and when.
+    arrivals: Mutex<Vec<RequestRecord>>,
     shutdown: watch::Receiver<()>,
+}
+
+/// Every fake server running in this process, by URL, so the app harness can read the requests
+/// of the servers a kubeconfig names ([`arrivals_at`]).
+static RUNNING: Mutex<Vec<(String, Weak<Inner>)>> = Mutex::new(Vec::new());
+
+/// The requests that have reached the fake server at `url` in this process so far, as they
+/// arrived (before any fault delays them, and without a status), oldest first; `None` when no
+/// fake server runs there (another cluster, such as kind, or a closed port).
+pub fn arrivals_at(url: &str) -> Option<Vec<RequestRecord>> {
+    let url = url.trim_end_matches('/');
+    let running = lock(&RUNNING);
+    // The newest first: a port can be reused while a stopped server's tasks still wind down.
+    let inner = running
+        .iter()
+        .rev()
+        .find(|(u, _)| u == url)
+        .and_then(|(_, inner)| inner.upgrade())?;
+    drop(running);
+    Some(lock(&inner.arrivals).clone())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -193,10 +215,16 @@ impl FakeApiServer {
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
+            arrivals: Mutex::default(),
             shutdown,
         });
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.clone());
         let accept = tokio::spawn(accept_loop(listener, acceptor, inner.clone()));
+        {
+            let mut running = lock(&RUNNING);
+            running.retain(|(_, inner)| inner.strong_count() > 0);
+            running.push((format!("https://{addr}"), Arc::downgrade(&inner)));
+        }
         Ok(FakeApiServer {
             inner,
             addr,
@@ -451,9 +479,15 @@ impl FakeApiServer {
         lock(&self.inner.faults).clear();
     }
 
-    /// Every request so far, oldest first.
+    /// Every request answered (or dropped) so far, oldest first.
     pub fn requests(&self) -> Vec<RequestRecord> {
         lock(&self.inner.requests).clone()
+    }
+
+    /// Every request that has arrived so far, oldest first, including those still delayed by a
+    /// fault or not yet answered (their `status` is `None`).
+    pub fn arrivals(&self) -> Vec<RequestRecord> {
+        lock(&self.inner.arrivals).clone()
     }
 
     fn last_requests(&self, n: usize) -> String {
@@ -585,6 +619,7 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Result<Response<Bo
         verb,
         status: None,
     };
+    lock(&inner.arrivals).push(record.clone());
     let upgrade = remote::is_websocket_upgrade(req.headers());
     let effect = lock(&inner.faults).take(verb, &route, upgrade);
     let response = match effect {

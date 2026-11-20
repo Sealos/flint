@@ -23,6 +23,13 @@
 //! # }
 //! ```
 //!
+//! When the app goes away ([`App::quit`], or dropping it), [`crate::teardown`] checks what every
+//! test must leave true: no fake server contacted before the test selected it, or at all when it
+//! never did (UP-91); the kubeconfig files untouched (UP-90); the app exited on Quit and removed
+//! its socket. A violation fails the test. Tests select clusters with [`App::select_cluster`]
+//! (or say so with [`App::mark_selected`]), change kubeconfig files inside
+//! [`App::edit_kubeconfig`], and start on a cluster with [`AppOptions::cluster_at_startup`].
+//!
 //! Only one [`App`] runs at a time in a test process: [`App::launch`] waits for the previous one
 //! to be dropped, so `cargo test` can run app tests on several threads without starting several
 //! windows at once.
@@ -41,6 +48,7 @@ use serde_json::{Value, json};
 
 use crate::binaries;
 use crate::scratch::Scratch;
+use crate::teardown::{self, Teardown};
 
 /// The default wait for data to arrive in the app: most waits end in well under a second, but a
 /// cold debug build on a busy machine can be slow.
@@ -63,6 +71,9 @@ pub const REFUSED_EXIT_CODE: i32 = 3;
 /// Where screenshots go when set (an absolute directory; created if missing). Otherwise they stay
 /// in the scratch config directory and go away with it.
 pub const SCREENSHOTS_ENV: &str = "FLINT_AUTOMATION_SCREENSHOTS";
+
+/// The cluster the app activates once its kubeconfig is loaded.
+const CLUSTER_ENV: &str = "FLINT_CLUSTER";
 
 /// Tells the app to quit when its stdin closes (`flint::ui::automation`).
 const EXIT_ON_STDIN_EOF_ENV: &str = "FLINT_AUTOMATION_EXIT_ON_STDIN_EOF";
@@ -91,6 +102,7 @@ pub struct AppOptions {
     settings: String,
     env: Vec<(String, String)>,
     scratch: Option<Scratch>,
+    cluster_at_startup: Option<String>,
 }
 
 impl AppOptions {
@@ -106,6 +118,7 @@ impl AppOptions {
             settings: String::new(),
             env: Vec::new(),
             scratch: None,
+            cluster_at_startup: None,
         }
     }
 
@@ -117,6 +130,7 @@ impl AppOptions {
             settings: String::new(),
             env: Vec::new(),
             scratch: None,
+            cluster_at_startup: None,
         }
     }
 
@@ -126,11 +140,18 @@ impl AppOptions {
         self
     }
 
-    /// One more environment variable, such as `FLINT_CLUSTER` or `FLINT_APPEARANCE`.
-    /// `KUBECONFIG`, `HOME`, `FLINT_CONFIG_DIR` and `FLINT_AUTOMATION_*` are the harness's own:
-    /// [`App::launch`] refuses them.
+    /// One more environment variable, such as `FLINT_APPEARANCE`. `KUBECONFIG`, `HOME`,
+    /// `FLINT_CONFIG_DIR` and `FLINT_AUTOMATION_*` are the harness's own, and `FLINT_CLUSTER` is
+    /// set with [`AppOptions::cluster_at_startup`]: [`App::launch`] refuses them.
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Starts on `cluster` (`FLINT_CLUSTER`): the app contacts it without a selection, so the
+    /// teardown treats it as selected from the launch.
+    pub fn cluster_at_startup(mut self, cluster: &str) -> Self {
+        self.cluster_at_startup = Some(cluster.to_owned());
         self
     }
 
@@ -152,6 +173,9 @@ impl AppOptions {
             });
             if reserved {
                 bail!("AppOptions::env cannot set {key}: the harness sets it");
+            }
+            if key == CLUSTER_ENV {
+                bail!("AppOptions::env cannot set {key}: use AppOptions::cluster_at_startup");
             }
         }
         if let Some(k) = &self.kubeconfig
@@ -252,6 +276,12 @@ pub struct App {
     screenshots: PathBuf,
     binary: PathBuf,
     next_id: std::sync::atomic::AtomicU64,
+    /// The test said it is failing ([`App::mark_failing`]): the teardown prints its report
+    /// instead of panicking over the test's own error.
+    failing: std::sync::atomic::AtomicBool,
+    /// The `KUBECONFIG` the app runs with, for [`App::write_settings`].
+    kubeconfig: Option<OsString>,
+    teardown: Mutex<Teardown>,
     _turn: MutexGuard<'static, ()>,
 }
 
@@ -294,6 +324,11 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis())
         ));
+        let mut teardown =
+            Teardown::at_launch(kubeconfig_files(options.kubeconfig.clone(), &scratch));
+        if let Some(cluster) = &options.cluster_at_startup {
+            teardown.selecting(cluster);
+        }
         let mut command = Command::new(&binary);
         for (key, _) in std::env::vars_os() {
             let key = key.to_string_lossy();
@@ -310,6 +345,7 @@ impl App {
             .env("FLINT_LOG", "info")
             .env(EXIT_ON_STDIN_EOF_ENV, "1")
             .envs(options.env.iter().map(|(k, v)| (k, v)))
+            .envs(options.cluster_at_startup.iter().map(|c| (CLUSTER_ENV, c)))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log)?)
@@ -331,9 +367,16 @@ impl App {
             screenshots,
             binary,
             next_id: Default::default(),
+            failing: Default::default(),
+            kubeconfig: options.kubeconfig.clone(),
+            teardown: Mutex::new(teardown),
             _turn: turn,
         };
-        app.wait_for_socket()?;
+        if let Err(error) = app.wait_for_socket() {
+            // The launch failed: that error is the test's failure, not the teardown's.
+            app.abandon();
+            return Err(error);
+        }
         Ok(app)
     }
 
@@ -455,9 +498,66 @@ impl App {
         }
     }
 
-    /// Clicks a cluster in the sidebar.
+    /// Clicks a cluster in the sidebar. From here on the app may contact it (UP-91).
     pub fn select_cluster(&self, cluster: &str) -> Result<Value, AppError> {
+        self.mark_selected(cluster);
         self.request("select_cluster", json!({ "cluster": cluster }))
+    }
+
+    /// Tells the teardown that the test selects `context` another way (the switcher, the
+    /// palette), exposes it to AI, or contacts it itself, now: nothing must have contacted it
+    /// yet, and anything may from here on (UP-91).
+    pub fn mark_selected(&self, context: &str) {
+        self.teardown().selecting(context);
+    }
+
+    /// Runs `edit`, the test's own change to the kubeconfig files (UP-06), and takes the files as
+    /// they are after it as the ones the app must leave untouched (UP-90).
+    pub fn edit_kubeconfig<T>(&self, edit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let result = edit();
+        self.teardown().kubeconfig_edited();
+        result
+    }
+
+    /// Writes the app's `settings.toml` (see [`crate::scratch::write_settings`]). Kubeconfig
+    /// files the new settings add (`kubeconfig_paths`) are snapshotted first, with the request
+    /// counts of the servers they name, before the app can read them (UP-90, UP-91). Tests
+    /// change settings through this, not by writing the file.
+    pub fn write_settings(&self, settings: &str) -> Result<()> {
+        let staged = tempfile::tempdir()?;
+        crate::scratch::write_settings(staged.path(), settings)?;
+        let files = kubeconfig_files_in(self.kubeconfig.as_deref(), &self.home(), staged.path());
+        self.teardown().expect_files(files);
+        crate::scratch::write_settings(&self.config_dir(), settings)
+    }
+
+    /// Says the test is failing with an error it is about to return: dropping the app then
+    /// prints the teardown's violations instead of panicking, so that error is the one shown.
+    /// The teardown is otherwise fatal, whatever requests failed on the way.
+    pub fn mark_failing(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn teardown(&self) -> MutexGuard<'_, Teardown> {
+        self.teardown.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Kills the app without the teardown checks.
+    fn abandon(&mut self) {
+        self.stdin.take();
+        if let Some(mut child) = self.child.take() {
+            kill_group(&child);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Stops the app and runs the teardown checks.
+    fn finish(&mut self) -> Vec<String> {
+        let exit = self.stop().map_err(|e| format!("{e:#}"));
+        let socket = self.socket.clone();
+        self.teardown().finish(exit, &socket)
     }
 
     /// Clicks a kind in the navigation (`pods`, `deployments.apps`).
@@ -560,11 +660,13 @@ impl App {
     }
 
     /// Quits the app and waits for it to exit, keeping its scratch directories for
-    /// [`AppOptions::reuse`]. Returns them with the exit status.
-    pub fn quit(mut self) -> Result<(Scratch, ExitStatus)> {
-        let status = self.stop()?;
-        let scratch = self.scratch.take().expect("the app's scratch directory");
-        Ok((scratch, status))
+    /// [`AppOptions::reuse`], and runs the teardown checks: an error lists what they found.
+    pub fn quit(mut self) -> Result<Scratch> {
+        let violations = self.finish();
+        if !violations.is_empty() {
+            bail!("{}", report(&violations));
+        }
+        Ok(self.scratch.take().expect("the app's scratch directory"))
     }
 
     /// Asks the app to quit; kills its process group if it has not exited within a few seconds.
@@ -640,17 +742,63 @@ fn kill_group(child: &Child) {
     }
 }
 
+/// The teardown's violations, as a failure says them.
+fn report(violations: &[String]) -> String {
+    let mut text =
+        String::from("app e2e teardown checks failed (docs/TESTING.md, \"Teardown checks\"):");
+    for violation in violations {
+        text.push_str("\n  - ");
+        text.push_str(violation);
+    }
+    text
+}
+
+/// The kubeconfig files the app reads, as it finds them: the `KUBECONFIG` list (or the scratch
+/// `HOME`'s `.kube/config` when unset), then the `kubeconfig_paths` of its `settings.toml` as it
+/// is when called.
+fn kubeconfig_files(kubeconfig: Option<OsString>, scratch: &Scratch) -> teardown::Files {
+    let home = scratch.home();
+    let config_dir = scratch.config_dir();
+    Box::new(move || kubeconfig_files_in(kubeconfig.as_deref(), &home, &config_dir))
+}
+
+/// The kubeconfig files the app reads with `KUBECONFIG` set to `kubeconfig`, `HOME` at `home`
+/// and the `settings.toml` in `config_dir`.
+fn kubeconfig_files_in(kubeconfig: Option<&OsStr>, home: &Path, config_dir: &Path) -> Vec<PathBuf> {
+    let base = flint_core::kubeconfig::base_paths(kubeconfig, Some(home));
+    match flint_core::settings::load_settings(config_dir) {
+        Ok(settings) => flint_core::kubeconfig::paths_for_settings(&base, &settings, Some(home)),
+        Err(_) => base,
+    }
+}
+
 impl Drop for App {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            let _ = self.stop();
-        }
+        // After App::quit, the checks have run.
+        let violations = if self.child.is_some() {
+            self.finish()
+        } else {
+            Vec::new()
+        };
         // libtest captures this and shows it only for a failing test.
         eprintln!(
             "---- flint log ({}) ----\n{}\n---- end of flint log ----",
             self.log.display(),
             self.log_tail()
         );
+        if violations.is_empty() {
+            return;
+        }
+        let report = report(&violations);
+        // A second panic would abort the test binary: the first failure stands, and this one
+        // is in the test's output.
+        // So does a test that said it is failing (`App::mark_failing`): its error is the one to
+        // read, and the report is printed after the log.
+        if std::thread::panicking() || self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("{report}");
+        } else {
+            panic!("{report}");
+        }
     }
 }
 
