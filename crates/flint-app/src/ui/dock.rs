@@ -21,7 +21,9 @@
 //!    them to the active tab of that kind (see `Workspace::register_actions`, which does it for
 //!    [`Dock::active_log`] and [`Dock::active_terminal`]) and guard them, as for any view.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -165,6 +167,9 @@ pub struct Dock {
     focus: FocusHandle,
     /// The tab strip's scroll position: the active tab is scrolled into view.
     strip: ScrollHandle,
+    /// The tab bar's width when last painted, and whether it changed since: the next frame
+    /// scrolls the active tab into view again.
+    strip_width: Rc<(Cell<f32>, Cell<bool>)>,
     /// Every kubeconfig context, and the chip each one's tabs show ([`chip_labels`]).
     contexts: Vec<String>,
     labels: HashMap<String, String>,
@@ -179,6 +184,7 @@ impl Dock {
             next_id: 1,
             focus: cx.focus_handle(),
             strip: ScrollHandle::new(),
+            strip_width: Rc::default(),
             contexts: Vec::new(),
             labels: HashMap::new(),
         }
@@ -502,7 +508,6 @@ impl Dock {
                 .get(ix)
                 .or_else(|| ix.checked_sub(1).and_then(|i| self.tabs.get(i)))
                 .map(|t| t.id);
-            self.reveal_active();
             if self.active.is_some() {
                 if had_focus {
                     self.focus_active(window, cx);
@@ -514,6 +519,8 @@ impl Dock {
                 }
             }
         }
+        // Closing a tab before the active one moves it left, maybe out of view.
+        self.reveal_active();
         cx.notify();
     }
 
@@ -792,13 +799,40 @@ impl Render for Dock {
             .iter()
             .map(|tab| self.render_tab(tab, &theme, cx))
             .collect();
+        // A strip that changes width (the window or a pane was resized) scrolls the active tab
+        // into view again. The width is known only once laid out, so it is checked while
+        // painting and the scroll applies on the frame after.
+        // A strip that changes width (the window or a pane was resized) scrolls the active tab
+        // into view again. The width is known only once laid out, so it is checked while
+        // painting, and the next frame scrolls (with the strip's new bounds).
+        if self.strip_width.1.take() {
+            self.reveal_active();
+        }
+        let watch_width = {
+            let watch = self.strip_width.clone();
+            canvas(
+                move |bounds, window, _| {
+                    let now = f32::from(bounds.size.width);
+                    let before = watch.0.replace(now);
+                    if before > 0. && (now - before).abs() > 0.5 {
+                        watch.1.set(true);
+                        window.refresh();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        };
         root.child(
             h_flex()
                 .h(px(TAB_BAR_HEIGHT))
                 .flex_none()
+                .relative()
                 .bg(theme.tab_bar)
                 .border_b_1()
                 .border_color(theme.border)
+                .child(watch_width)
                 .child(
                     h_flex()
                         .id("dock-tabs")

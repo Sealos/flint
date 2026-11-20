@@ -667,3 +667,34 @@ async fn a_long_context_and_title_keep_the_tab_narrow(cx: &mut TestAppContext) {
     assert!(width <= 360., "a tab is {width} wide");
     assert_eq!(shell_chip(&dock, id, cx).0, "payment…-cluster");
 }
+
+// covers UP-42: the active tab stays in view when the strip narrows (the window or a pane was
+// resized), and when a tab before it closes.
+#[gpui_kit::test]
+async fn the_active_tab_stays_in_view_through_resizes_and_closes(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let mut tabs = Vec::new();
+    let mut fakes = Vec::new();
+    for n in 1..=8 {
+        let (id, fake) = open_shell_in(cx, window, &dock, &format!("web-{n}"));
+        tabs.push(id);
+        fakes.push(fake);
+    }
+    draw(cx, window);
+    let last = *tabs.last().unwrap();
+    assert!(tab_in_view(cx, window, last));
+    cx.simulate_window_resize(window, size(px(600.), px(400.)));
+    draw(cx, window);
+    draw(cx, window);
+    assert!(tab_in_view(cx, window, last), "after the window narrowed");
+
+    // The second tab shown at the strip's left edge; the first one closes.
+    activate(cx, window, tabs[1]);
+    assert!(tab_in_view(cx, window, tabs[1]));
+    close(cx, window, tabs[0]);
+    draw(cx, window);
+    assert!(
+        tab_in_view(cx, window, tabs[1]),
+        "after a tab before it closed"
+    );
+}
