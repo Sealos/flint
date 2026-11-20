@@ -371,17 +371,14 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-48 Filter a log to what matters
 - **When** I search a log tab and turn on "Matching" (M), turn on "Errors" (E), or both, and choose how many lines
-  of context to keep around each line (0 to 10 from the toolbar, up to 100 from the palette); and when I turn on
-  ".*" (Option-Cmd-X) to search with a regular expression.
+  of context to keep around each line (0 to 10 from the toolbar, up to 100 from the palette).
 - **Then** the tab shows only the lines that match (and are warnings or errors, with "Errors"), with the context
   around them, and keeps doing so as lines arrive; the toolbar counts them against the buffer ("12 of 1,234
-  lines"). A filtered tab with nothing to show says why and that new lines show as they come. A regular expression
-  that does not compile matches nothing and the toolbar says what is wrong. Next and Previous Match, selecting,
-  copying and saving work on the rows shown: Save writes them, Save Matching Lines the matches among them. Turning
-  the toggles off shows every line again; so does "Matching" while the search is empty. A full buffer (100,000
-  lines) is filtered without the tab stalling: what was shown stays until the filter is ready, and the toolbar says
-  it is filtering. In a narrow tab the toggles move to the More menu, and the regular expression's error shows
-  as a short "Invalid regex" with the details on hover.
+  lines"). A filtered tab with nothing to show says why and that new lines show as they come. Next and Previous
+  Match, selecting, copying and saving work on the rows shown: Save writes them, Save Matching Lines the matches
+  among them. Turning the toggles off shows every line again; so does "Matching" while the search is empty. A full
+  buffer (100,000 lines) is filtered without the tab stalling: what was shown stays until the filter is ready, and
+  the toolbar says it is filtering. In a narrow tab the toggles move to the More menu.
 - Tests: unit, ui.
 
 ---

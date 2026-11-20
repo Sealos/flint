@@ -12,7 +12,7 @@ use super::super::registry::{
     ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, OnView,
     PrevMatch, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
     SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, SetLogContext, ToggleErrorsOnly,
-    ToggleMatchingOnly, TogglePause, ToggleRegex, ToggleSources, ToggleTimestamps, ToggleWrap,
+    ToggleMatchingOnly, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
@@ -72,8 +72,6 @@ impl LogView {
             })
             .bind::<ToggleWrap>(|view, _, _, cx| {
                 view.wrap = !view.wrap;
-                // Highlights were clipped to what an unwrapped line draws.
-                view.highlights.clear();
                 view.list.remeasure();
                 cx.notify();
             })
@@ -84,13 +82,6 @@ impl LogView {
             .bind::<ToggleErrorsOnly>(|view, _, _, cx| {
                 view.errors_only = !view.errors_only;
                 view.refilter(None, cx);
-            })
-            .bind::<ToggleRegex>(|view, _, _, cx| {
-                view.regex = !view.regex;
-                let text = std::mem::take(&mut view.query.text);
-                view.query = Default::default();
-                view.set_query(text, cx);
-                cx.notify();
             })
             .bind::<SetLogContext>(|view, action, _, cx| {
                 let context = (action.lines as usize).min(flint_core::logs::MAX_CONTEXT);

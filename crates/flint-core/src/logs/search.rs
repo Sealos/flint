@@ -19,16 +19,13 @@ use memchr::memmem;
 use super::buffer::LogLines;
 use super::line::{LineId, LogLine};
 
-/// What to look for: a plain substring of a line's text (timestamps are not searched), or a
-/// regular expression, and optionally of its `pod/container` source.
+/// What to look for: a plain substring of a line's text (timestamps are not searched), and
+/// optionally of its `pod/container` source.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchQuery {
     pub text: String,
     /// Off by default: `error` finds `ERROR`.
     pub case_sensitive: bool,
-    /// `text` is a regular expression (Rust `regex` syntax, no look-around). An invalid one
-    /// matches nothing; [`SearchMatcher::error`] says why.
-    pub regex: bool,
     /// Also match a workload line's `pod/container` source, as the prefix shows it (set this
     /// when the prefix is shown). Off by default.
     pub sources: bool,
@@ -39,7 +36,6 @@ impl SearchQuery {
         SearchQuery {
             text: text.into(),
             case_sensitive: false,
-            regex: false,
             sources: false,
         }
     }
@@ -91,10 +87,6 @@ enum Find {
     /// The empty query: matches nothing.
     #[default]
     Nothing,
-    /// A regular expression, case folded unless the query is case-sensitive.
-    Regex(regex::Regex),
-    /// A regular expression that does not compile: matches nothing, and says why.
-    Invalid(String),
     Exact(memmem::Finder<'static>),
     /// The pattern in lowercase ASCII.
     AsciiFolded(memmem::Finder<'static>),
@@ -110,17 +102,6 @@ impl SearchMatcher {
         let text = query.text.as_str();
         let find = if text.is_empty() {
             Find::Nothing
-        } else if query.regex {
-            match regex::RegexBuilder::new(text)
-                .case_insensitive(!query.case_sensitive)
-                // A pattern typed in a search box: bounded, so a huge repetition cannot use
-                // memory or time without limit (8 MiB still fits `\w{100}` with Unicode).
-                .size_limit(8 << 20)
-                .build()
-            {
-                Ok(re) => Find::Regex(re),
-                Err(e) => Find::Invalid(regex_error(&e)),
-            }
         } else if query.case_sensitive
             || (text.is_ascii() && !text.bytes().any(|b| b.is_ascii_alphabetic()))
         {
@@ -142,25 +123,6 @@ impl SearchMatcher {
         }
     }
 
-    /// Whether the query is a regular expression (that compiled): matching a long line can
-    /// take a while, so a view finds its highlights off the UI thread.
-    pub fn is_regex(&self) -> bool {
-        matches!(self.find, Find::Regex(_))
-    }
-
-    /// Whether the query also matches a workload line's source.
-    pub fn covers_sources(&self) -> bool {
-        self.sources
-    }
-
-    /// Why the query matches nothing although it is not empty: an invalid regular expression.
-    pub fn error(&self) -> Option<&str> {
-        match &self.find {
-            Find::Invalid(error) => Some(error),
-            _ => None,
-        }
-    }
-
     /// Whether `line` matches: its text, or its source when the query covers sources.
     pub fn matches_line(&self, line: &LogLine) -> bool {
         self.is_match(&line.text)
@@ -174,8 +136,7 @@ impl SearchMatcher {
     /// Whether `text` contains the query.
     pub fn is_match(&self, text: &str) -> bool {
         match &self.find {
-            Find::Nothing | Find::Invalid(_) => false,
-            Find::Regex(re) => re.is_match(text),
+            Find::Nothing => false,
             Find::Exact(finder) => finder.find(text.as_bytes()).is_some(),
             Find::AsciiFolded(finder) => finder.find(&self.lowered(text)).is_some(),
             Find::Folded { chars, .. } => {
@@ -192,13 +153,7 @@ impl SearchMatcher {
             finder.find_iter(hay).map(|at| at..at + len).collect()
         };
         match &self.find {
-            Find::Nothing | Find::Invalid(_) => Vec::new(),
-            // Empty matches (`a*` on "b") highlight nothing.
-            Find::Regex(re) => re
-                .find_iter(text)
-                .map(|m| m.range())
-                .filter(|r| !r.is_empty())
-                .collect(),
+            Find::Nothing => Vec::new(),
             Find::Exact(finder) => ranges(finder, text.as_bytes()),
             // Lowercasing ASCII keeps byte offsets, so ranges map back onto `text`.
             Find::AsciiFolded(finder) => ranges(finder, &self.lowered(text)),
@@ -242,21 +197,6 @@ impl SearchMatcher {
             i += c.len_utf8();
         }
         lower.find(&text_lower).is_some()
-    }
-}
-
-/// A regex error in one line, as the search box can show it: the parser's last line says
-/// what is wrong (`unclosed group`), without the pattern drawn with carets.
-fn regex_error(error: &regex::Error) -> String {
-    match error {
-        regex::Error::CompiledTooBig(_) => "pattern too large".to_owned(),
-        other => other
-            .to_string()
-            .lines()
-            .rev()
-            .find_map(|l| l.trim().strip_prefix("error: "))
-            .unwrap_or("invalid pattern")
-            .to_owned(),
     }
 }
 
@@ -309,15 +249,8 @@ pub struct LogSearch {
 
 impl LogSearch {
     pub fn new(query: SearchQuery) -> Self {
-        let matcher = query.matcher();
-        LogSearch::with_matcher(query, matcher)
-    }
-
-    /// A search with `matcher` already prepared from `query` (a front end that compiled a
-    /// regular expression once, off its UI thread, and highlights with the same matcher).
-    pub fn with_matcher(query: SearchQuery, matcher: SearchMatcher) -> Self {
         LogSearch {
-            matcher,
+            matcher: query.matcher(),
             query,
             matches: VecDeque::new(),
             scanned_to: 0,
@@ -454,45 +387,6 @@ mod tests {
         assert_eq!(search.prev_before(None), Some(5));
         assert_eq!(search.prev_before(Some(3)), Some(2));
         assert_eq!(search.prev_before(Some(2)), None);
-    }
-
-    // covers UP-48
-    #[test]
-    fn regular_expressions_match_highlight_and_say_what_is_wrong() {
-        let query = |text: &str| SearchQuery {
-            regex: true,
-            ..SearchQuery::new(text)
-        };
-        let status = query(r"status=(5\d\d|429)");
-        assert!(status.is_match("GET / status=503 took 2ms"));
-        assert!(status.is_match("STATUS=429"), "case folded by default");
-        assert!(!status.is_match("status=200"));
-        assert_eq!(
-            status.match_ranges("a status=500 b status=429"),
-            [2..12, 15..25]
-        );
-        let sensitive = SearchQuery {
-            case_sensitive: true,
-            ..query("Error")
-        };
-        assert!(!sensitive.is_match("error"));
-        // Empty matches highlight nothing.
-        assert!(query("x*").match_ranges("abc").is_empty());
-
-        let broken = query("(unclosed").matcher();
-        assert_eq!(broken.error(), Some("unclosed group"));
-        assert!(!broken.is_match("(unclosed"));
-        assert!(query("ok").matcher().error().is_none());
-        assert_eq!(
-            query("a{99999999}")
-                .matcher()
-                .error()
-                .map(|e| !e.is_empty()),
-            Some(true)
-        );
-        // Plausible Unicode patterns fit the size limit.
-        assert!(query(r"\w{100}").matcher().error().is_none());
-        assert!(query(r"[\p{L}\d]{20,50}@\w+").matcher().error().is_none());
     }
 
     #[test]

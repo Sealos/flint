@@ -498,16 +498,12 @@ impl LogTabState {
 pub struct FilterState {
     pub matching_only: bool,
     pub errors_only: bool,
-    /// The search is a regular expression.
-    pub regex: bool,
     /// Lines shown around each line that passes.
     pub context: usize,
     /// Rows shown while filtered (`None`: every line is shown).
     pub rows: Option<usize>,
     /// The first scan of a new filter runs on the core's threads.
     pub filtering: bool,
-    /// Why the regular expression matches nothing.
-    pub regex_error: Option<String>,
 }
 
 /// A log tab's search.

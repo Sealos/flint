@@ -112,14 +112,6 @@ impl LogView {
             return;
         }
         self.filtering = true;
-        // The search is still being prepared: it filters once it is ([`LogView::use_matcher`]).
-        if spec.query.is_some() && self.query_pending {
-            self._filter = Task::ready(());
-            cx.notify();
-            return;
-        }
-        // The search's matcher, compiled once (never here, on the UI thread).
-        let matcher = spec.query.is_some().then(|| self.matcher.clone());
         let generation = self.filter_generation;
         let core = self.core.clone();
         self._filter = cx.spawn(async move |this, cx| {
@@ -129,9 +121,7 @@ impl LogView {
             let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
                 return;
             };
-            let filter = core
-                .filter_logs(LogFilter::with_matcher(spec, matcher), lines)
-                .await;
+            let filter = core.filter_logs(LogFilter::new(spec), lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
@@ -147,9 +137,9 @@ impl LogView {
     }
 
     /// Brings the filter up to the lines shown before the tab is drawn, as the search does: a
-    /// hidden tab scans nothing until it is shown. A filter further behind than
-    /// [`LogView::catches_up_on_ui`] allows (resumed after a long pause, or a regular expression
-    /// over long lines) catches up on the core's threads, keeping the rows shown until it lands.
+    /// hidden tab scans nothing until it is shown. A filter more than [`super::CATCH_UP_ON_UI`]
+    /// lines behind (resumed after a long pause) catches up on the core's threads, keeping the
+    /// rows shown until it lands.
     pub(super) fn catch_up_filter(&mut self, cx: &mut Context<Self>) {
         if self.catching_up {
             return;
@@ -157,8 +147,7 @@ impl LogView {
         let Some(filter) = &self.filter else {
             return;
         };
-        let regex = filter.spec().query.is_some() && self.matcher.is_regex();
-        if self.catches_up_on_ui(filter.pending(&self.snapshot.lines), regex) {
+        if filter.pending(&self.snapshot.lines) <= super::CATCH_UP_ON_UI {
             // What the list holds now, before the update changes it.
             let shown = self.shown_rows();
             if let Some(filter) = &mut self.filter {

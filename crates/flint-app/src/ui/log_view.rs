@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use flint_core::{
     ClusterId, CoreHandle, LineFormat, LineId, LineSelection, LogFilter, LogOptions, LogSearch,
-    LogSession, LogSnapshot, LogState, LogSubject, SearchMatcher, SearchQuery, Severity,
+    LogSession, LogSnapshot, LogState, LogSubject, SearchQuery, Severity,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -59,8 +59,8 @@ use super::menu_record;
 use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
-    SelectLine, SetLogContext, ToggleErrorsOnly, ToggleMatchingOnly, TogglePause, ToggleRegex,
-    ToggleSources, ToggleTimestamps, ToggleWrap,
+    SelectLine, SetLogContext, ToggleErrorsOnly, ToggleMatchingOnly, TogglePause, ToggleSources,
+    ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
 
@@ -74,9 +74,6 @@ const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 /// (well under a millisecond); further behind, a tab hidden while its pod was busy, the scan
 /// runs on the core's threads.
 pub const CATCH_UP_ON_UI: u64 = 20_000;
-/// A regular expression can take a while over long lines, so its catch-ups on the UI thread are
-/// also held to this many bytes of text; more runs on the core's threads.
-pub const REGEX_CATCH_UP_ON_UI_BYTES: usize = 256 * 1024;
 /// How long a copy or save note stays under the toolbar.
 pub const NOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -138,16 +135,7 @@ pub struct LogView {
     /// A mouse selection is being dragged.
     drag_selecting: bool,
     query: SearchQuery,
-    /// `query` made ready to test lines, built once per query: what drawn lines are
-    /// highlighted with (a regular expression compiles once, not once per row).
-    matcher: SearchMatcher,
-    /// The search is a regular expression.
-    regex: bool,
-    /// Why the regular expression matches nothing, if it does not compile.
-    regex_error: Option<String>,
     search: LogSearch,
-    /// A regular expression's matches in the lines drawn, found off the UI thread.
-    highlights: highlight::Highlights,
     /// The matches among the rows shown in a filtered tab, kept until the search or the rows
     /// change ([`LogView::shown_matches`]).
     shown_matches: std::cell::RefCell<Option<(actions::ShownMatchesKey, Arc<[LineId]>)>>,
@@ -173,8 +161,6 @@ pub struct LogView {
     /// threads; the rows shown stay until it lands.
     catching_up: bool,
     _catch_up: Task<()>,
-    /// The query changed and its matcher is being prepared ([`LogView::set_query`]).
-    query_pending: bool,
     /// Bumped with every new filter, so a slow scan of an old one is dropped.
     filter_generation: u64,
     /// Bumped whenever `filter` is replaced (a scan or catch-up landing, the filter turned
@@ -262,11 +248,7 @@ impl LogView {
             selection: None,
             drag_selecting: false,
             query: SearchQuery::default(),
-            matcher: SearchMatcher::default(),
-            regex: false,
-            regex_error: None,
             search: LogSearch::default(),
-            highlights: Default::default(),
             shown_matches: Default::default(),
             search_generation: 0,
             searching: false,
@@ -278,7 +260,6 @@ impl LogView {
             filtering: false,
             catching_up: false,
             _catch_up: Task::ready(()),
-            query_pending: false,
             filter_generation: 0,
             rows_generation: 0,
             _filter: Task::ready(()),
@@ -420,14 +401,11 @@ impl LogView {
         }
     }
 
-    /// Searches for `text` from now on. Once the query has stayed for a moment, it is prepared
-    /// once, off the UI thread (a regular expression compiles there), and that one matcher
-    /// highlights, searches (first scan on the core's threads) and filters. The search covers
-    /// workload sources while their prefix is shown.
+    /// Searches for `text` from now on: the first scan runs on the core's threads. The search
+    /// covers workload sources while their prefix is shown.
     fn set_query(&mut self, text: String, cx: &mut Context<Self>) {
         let query = SearchQuery {
             sources: self.format().source,
-            regex: self.regex,
             ..SearchQuery::new(text)
         };
         if query == self.query {
@@ -436,48 +414,22 @@ impl LogView {
         self.query = query.clone();
         self.current_match = None;
         self.search_generation += 1;
-        self.query_pending = !query.text.is_empty();
-        self.highlights.clear();
-        // A filter of the old query on its way is dropped; what is shown stays until the new
-        // one lands.
-        if self.matching_only && self.query_pending {
-            self.refilter(None, cx);
+        self.search = LogSearch::new(query.clone());
+        // The matching lines shown follow the search, once it has stayed for a moment; a filter
+        // of the old query on its way is dropped, and what is shown stays until the new one
+        // lands.
+        if self.matching_only {
+            self.refilter(Some(SEARCH_DELAY), cx);
         }
         if query.text.is_empty() {
-            self.use_matcher(SearchMatcher::default(), cx);
             self.searching = false;
             self._search = Task::ready(());
             cx.notify();
             return;
         }
-        // Typing replaces the wait: only a query that stays for a moment is prepared and scans.
-        self.searching = true;
-        let generation = self.search_generation;
-        self._search = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SEARCH_DELAY).await;
-            let prepared = query.clone();
-            let matcher = cx.background_spawn(async move { prepared.matcher() }).await;
-            let _ = this.update(cx, |view, cx| {
-                if view.search_generation == generation {
-                    view.use_matcher(matcher, cx);
-                    view.scan(view.search.clone(), None, cx);
-                }
-            });
-        });
+        // Typing replaces the scan: only a query that stays for a moment scans the buffer.
+        self.scan(LogSearch::new(query), Some(SEARCH_DELAY), cx);
         cx.notify();
-    }
-
-    /// Highlights, searches and filters with `matcher`, prepared from the current query.
-    fn use_matcher(&mut self, matcher: SearchMatcher, cx: &mut Context<Self>) {
-        self.query_pending = false;
-        self.regex_error = matcher.error().map(str::to_owned);
-        self.search = LogSearch::with_matcher(self.query.clone(), matcher.clone());
-        self.matcher = matcher;
-        self.highlights.clear();
-        // The matching lines shown follow the search.
-        if self.matching_only {
-            self.refilter(None, cx);
-        }
     }
 
     /// Brings `search` up to the lines shown on the core's threads, after `delay`. Its result
@@ -519,31 +471,12 @@ impl LogView {
         if self.searching {
             return;
         }
-        let pending = self.search.pending(&self.snapshot.lines);
-        if !self.query.text.is_empty() && !self.catches_up_on_ui(pending, self.matcher.is_regex()) {
+        let lines = &self.snapshot.lines;
+        if self.search.pending(lines) > CATCH_UP_ON_UI && !self.query.text.is_empty() {
             self.scan(self.search.clone(), None, cx);
         } else {
-            self.search.update(&self.snapshot.lines);
+            self.search.update(lines);
         }
-    }
-
-    /// Whether a catch-up of the newest `pending` lines runs on the UI thread as the tab is
-    /// drawn: at most [`CATCH_UP_ON_UI`] lines and, for a regular expression,
-    /// [`REGEX_CATCH_UP_ON_UI_BYTES`] of text.
-    pub(super) fn catches_up_on_ui(&self, pending: u64, regex: bool) -> bool {
-        if pending > CATCH_UP_ON_UI {
-            return false;
-        }
-        if !regex {
-            return true;
-        }
-        let lines = &self.snapshot.lines;
-        let from = lines.end_id().saturating_sub(pending);
-        let mut bytes = 0;
-        lines.range(from, lines.end_id()).all(|(_, line)| {
-            bytes += line.text.len();
-            bytes <= REGEX_CATCH_UP_ON_UI_BYTES
-        })
     }
 
     /// Brings the search up to the lines shown at once, before an action uses its matches, if
@@ -591,7 +524,6 @@ impl LogView {
             has_matches: self.has_matches(),
             has_selection: self.has_selection(),
             errors_only: self.errors_only,
-            regex: self.regex,
             matching_only: self.matching_only,
             context: self.filter_spec().is_active().then_some(self.context),
         }
@@ -871,20 +803,16 @@ impl LogView {
     }
 
     fn render_line(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(id) = self
+        let theme = cx.theme();
+        // The item's row: a line still in the buffer.
+        let Some((id, line)) = self
             .row_id(ix)
-            .filter(|id| self.snapshot.lines.contains(*id))
+            .and_then(|id| Some((id, self.snapshot.lines.get(id)?)))
         else {
             return div().into_any_element();
         };
-        let found = self.text_matches(id, cx);
-        let theme = cx.theme();
-        let Some(line) = self.snapshot.lines.get(id) else {
-            return div().into_any_element();
-        };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
-        let shown =
-            log_model::shown_line(line, self.line_view(), &self.matcher, found.as_deref(), max);
+        let shown = log_model::shown_line(line, self.line_view(), &self.query, max);
         let selected = self.selection.is_some_and(|s| s.contains(id));
         let color = match line.severity {
             Severity::Error => theme.danger,
@@ -1209,27 +1137,7 @@ impl LogView {
                                     .flex_none()
                                     .font_features(super::list::tabular_figures())
                                     .text_color(theme.muted_foreground)
-                                    .when(self.regex_error.is_some(), |el| {
-                                        el.text_color(theme.danger)
-                                    })
-                                    // With the toggles folded away the toolbar is tight:
-                                    // the short form, with the reason on hover.
-                                    .when_some(
-                                        self.regex_error.clone().filter(|_| !fit.toggles),
-                                        |el, error| {
-                                            el.tooltip(move |window, cx| {
-                                                Tooltip::new(format!("Invalid regex: {error}"))
-                                                    .build(window, cx)
-                                            })
-                                        },
-                                    )
-                                    .child(if let Some(error) = &self.regex_error {
-                                        if fit.toggles {
-                                            format!("Invalid regex: {error}")
-                                        } else {
-                                            "Invalid regex".to_owned()
-                                        }
-                                    } else if self.searching {
+                                    .child(if self.searching {
                                         "Searching…".to_owned()
                                     } else {
                                         let (count, at) = self.shown_match_count();
@@ -1256,15 +1164,6 @@ impl LogView {
                     // menu when the tab is too narrow.
                     .when(fit.toggles, |el| {
                         el.child(
-                            Button::new("log-regex")
-                                .xsmall()
-                                .ghost()
-                                .label(".*")
-                                .selected(self.regex)
-                                .tooltip("Search with a regular expression (⌥⌘X)")
-                                .on_click(registry::on_click(ToggleRegex)),
-                        )
-                        .child(
                             Button::new("log-matching-only")
                                 .xsmall()
                                 .ghost()
@@ -1302,24 +1201,6 @@ impl LogView {
                             )
                         })
                     })
-                    // The regex error, when the match count has no room.
-                    .when_some(
-                        self.regex_error.clone().filter(|_| !fit.match_count),
-                        |el, error| {
-                            el.child(
-                                div()
-                                    .id("log-regex-error")
-                                    .flex_none()
-                                    .text_color(theme.danger)
-                                    .child("Invalid regex")
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(format!("Invalid regex: {error}"))
-                                            .build(window, cx)
-                                    })
-                                    .test_support(),
-                            )
-                        },
-                    )
                     .when(has_query && !fit.match_count, |el| {
                         el.children(Self::match_buttons(has_matches))
                     })
@@ -1684,8 +1565,6 @@ impl LogView {
     fn render_filtered_empty(&self, theme: &Theme) -> AnyElement {
         let (spinner, text) = if self.filtering || self.catching_up {
             (true, "Filtering…".to_owned())
-        } else if let Some(error) = self.regex_error.as_ref().filter(|_| self.matching_only) {
-            (false, format!("Invalid regex: {error}"))
         } else {
             (false, log_model::filter_empty_text(&self.filter_spec()))
         };
@@ -1753,7 +1632,6 @@ fn fill_menu(
                 Toggle::Sources => item.on_click(registry::on_click(ToggleSources)),
                 Toggle::Wrap => item.on_click(registry::on_click(ToggleWrap)),
                 Toggle::ErrorsOnly => item.on_click(registry::on_click(ToggleErrorsOnly)),
-                Toggle::Regex => item.on_click(registry::on_click(ToggleRegex)),
                 Toggle::MatchingOnly => item.on_click(registry::on_click(ToggleMatchingOnly)),
                 Toggle::Context(lines) => item.on_click(registry::on_click(SetLogContext {
                     lines: lines as u32,
@@ -1902,9 +1780,6 @@ mod actions;
 
 #[path = "log_filter.rs"]
 mod filter;
-
-#[path = "log_highlight.rs"]
-mod highlight;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "log_state.rs"]

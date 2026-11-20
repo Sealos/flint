@@ -236,8 +236,6 @@ actions!(
         ToggleSources,
         /// Show only the lines matching the search (with context), or every line.
         ToggleMatchingOnly,
-        /// Search with a regular expression, or for plain text.
-        ToggleRegex,
         /// Show only warnings and errors, or every line.
         ToggleErrorsOnly,
         /// Move focus to the log search field.
@@ -2303,12 +2301,6 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Logs, S::Logs)
         .keys(&["m"], Some(LOG_PLAIN)),
-        Spec::unit::<ToggleRegex>(
-            "Toggle Regex Search",
-            "Search with a regular expression, or for plain text.",
-        )
-        .of(C::Logs, S::Logs)
-        .keys(&["secondary-alt-x"], Some(LOG_VIEW)),
         Spec::unit::<ToggleErrorsOnly>(
             "Toggle Errors Only",
             "Show only warnings and errors, or every line.",

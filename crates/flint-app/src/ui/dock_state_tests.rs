@@ -172,8 +172,6 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
                "checked": false, "submenu": []}),
         json!({"label": "Errors and Warnings Only", "enabled": true, "reason": null,
                "checked": false, "submenu": []}),
-        json!({"label": "Regex Search", "enabled": true, "reason": null,
-               "checked": false, "submenu": []}),
         json!({"label": "Matching Lines Only", "enabled": true, "reason": null,
                "checked": false, "submenu": []}),
     ];

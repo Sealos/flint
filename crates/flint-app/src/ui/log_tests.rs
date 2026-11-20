@@ -418,7 +418,7 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
             [4, 9, 14, 19]
         );
         let line = v.snapshot.lines.get(9).unwrap();
-        let shown = crate::ui::log_model::shown_line(line, v.line_view(), &v.matcher, None, None);
+        let shown = crate::ui::log_model::shown_line(line, v.line_view(), &v.query, None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "ERROR");
         assert_eq!(line.severity, flint_core::Severity::Error);
     });
@@ -560,7 +560,7 @@ async fn timestamps_and_wrap_toggle_without_reloading(cx: &mut TestAppContext) {
     let shown = |cx: &mut TestAppContext| {
         view.read_with(cx, |v, _| {
             let line = v.snapshot.lines.get(4).unwrap();
-            crate::ui::log_model::shown_line(line, v.line_view(), &v.matcher, None, None).text
+            crate::ui::log_model::shown_line(line, v.line_view(), &v.query, None).text
         })
     };
     assert_eq!(shown(cx), "ERROR line 4");
@@ -2042,18 +2042,17 @@ async fn errors_only_shows_warnings_and_errors_as_they_come(cx: &mut TestAppCont
     assert!(!view.read_with(cx, |v, _| v.is_filtered()));
 }
 
-// covers UP-48: a regular expression search, matching lines only, and context around them; an
-// invalid pattern says what is wrong and matches nothing.
+// covers UP-48: matching lines only, and context around them; a search no line matches says
+// so.
 #[gpui_kit::test]
-async fn matching_lines_only_with_a_regex_and_context(cx: &mut TestAppContext) {
+async fn matching_lines_only_with_context(cx: &mut TestAppContext) {
     let (core, _dir) = core();
     let (window, view) = open(cx, core);
     let mut lines = Feed::new(1000);
     feed(cx, &view, lines.push(0, 20).streaming());
     draw(cx, window);
 
-    run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
-    view.update(cx, |v, cx| v.set_query("line 1[05]$".into(), cx));
+    view.update(cx, |v, cx| v.set_query("error line 1".into(), cx));
     run(
         cx,
         window,
@@ -2061,7 +2060,7 @@ async fn matching_lines_only_with_a_regex_and_context(cx: &mut TestAppContext) {
         serde_json::Value::Null,
     );
     until_rows(cx, window, &view, 2).await;
-    assert_eq!(rows(cx, &view), [10, 15]);
+    assert_eq!(rows(cx, &view), [14, 19]);
 
     run(
         cx,
@@ -2069,8 +2068,8 @@ async fn matching_lines_only_with_a_regex_and_context(cx: &mut TestAppContext) {
         "logs::SetLogContext",
         serde_json::json!({"lines": 1}),
     );
-    until_rows(cx, window, &view, 6).await;
-    assert_eq!(rows(cx, &view), [9, 10, 11, 14, 15, 16]);
+    until_rows(cx, window, &view, 5).await;
+    assert_eq!(rows(cx, &view), [13, 14, 15, 18, 19]);
     cx.wait_for(window, WAIT, |window, _| {
         window.try_find("log-context").is_some()
     })
@@ -2083,22 +2082,13 @@ async fn matching_lines_only_with_a_regex_and_context(cx: &mut TestAppContext) {
     })
     .await;
     run(cx, window, "logs::NextMatch", serde_json::Value::Null);
-    assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(10));
+    assert_eq!(view.read_with(cx, |v, _| v.current_match), Some(14));
 
-    // An invalid pattern matches nothing, and says why.
+    // A search no line matches shows nothing, and says so.
     view.update(cx, |v, cx| v.set_query("line (".into(), cx));
     until_rows(cx, window, &view, 0).await;
-    let state = view.read_with(cx, |v, _| v.view_state());
-    assert_eq!(state.filter.regex_error.as_deref(), Some("unclosed group"));
     cx.wait_for(window, WAIT, |window, _| {
         window.try_find("log-filter-empty").is_some()
-    })
-    .await;
-    // Plain text again: "(" is just a character, and no line has one.
-    run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
-    cx.wait_for(window, WAIT, |_, cx| {
-        let v = view.read(cx);
-        !v.searching && v.regex_error.is_none()
     })
     .await;
 }
@@ -2344,81 +2334,6 @@ async fn evicted_rows_go_with_the_snapshot(cx: &mut TestAppContext) {
     assert_eq!(rows(cx, &view), [9, 14]);
 }
 
-// covers UP-48: a regular expression's highlights are found off the UI thread, against the
-// whole line, and drawn once found.
-#[gpui_kit::test]
-async fn regex_highlights_are_found_off_the_ui_thread(cx: &mut TestAppContext) {
-    let (core, _dir) = core();
-    let (window, view) = open(cx, core);
-    let mut lines = Feed::new(100);
-    feed(cx, &view, lines.push(0, 10).streaming());
-    run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
-    view.update(cx, |v, cx| v.set_query(r"line \d$".into(), cx));
-    cx.wait_for(window, WAIT, |_, cx| {
-        let v = view.read(cx);
-        !v.searching && v.highlights.found(4).is_some()
-    })
-    .await;
-    view.read_with(cx, |v, _| {
-        // "ERROR line 4": the match is at the end of the whole line.
-        assert_eq!(
-            v.highlights.found(4),
-            Some(&[std::ops::Range { start: 6, end: 12 }][..])
-        );
-    });
-}
-
-// covers UP-48: with the toggles in the More menu, an invalid regex reads "Invalid regex",
-// with the reason on hover, so a long reason does not crowd the toolbar.
-#[gpui_kit::test]
-async fn a_compact_toolbar_says_invalid_regex_briefly(cx: &mut TestAppContext) {
-    let (core, _dir) = core();
-    let (window, view) = open_sized(cx, core, request(), 700.);
-    let mut lines = Feed::new(100);
-    feed(cx, &view, lines.push(0, 10).streaming());
-    run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
-    view.update(cx, |v, cx| v.set_query("(unclosed".into(), cx));
-    cx.wait_for(window, WAIT, |window, cx| {
-        view.read(cx).regex_error.is_some()
-            && window
-                .try_find("log-matches")
-                .is_some_and(|el| f32::from(el.bounds().size.width) > 0.)
-    })
-    .await;
-    let width = cx
-        .update_window(window, |_, window, _| {
-            f32::from(window.try_find("log-matches").unwrap().bounds().size.width)
-        })
-        .unwrap();
-    assert!(width < 120., "{width}");
-}
-
-// covers UP-48: a regular expression's highlights are kept as drawn: touching ranges merged,
-// and none past where an unwrapped line is cut.
-#[test]
-fn highlights_are_merged_and_clipped_to_what_is_drawn() {
-    use super::highlight::drawn_ranges;
-    let dense: Vec<_> = (0..10_000).map(|i| i..i + 1).collect();
-    assert_eq!(
-        drawn_ranges(dense.clone(), None),
-        [std::ops::Range {
-            start: 0,
-            end: 10_000
-        }]
-    );
-    assert_eq!(
-        drawn_ranges(dense, Some(4096)),
-        [std::ops::Range {
-            start: 0,
-            end: 4096
-        }]
-    );
-    assert_eq!(
-        drawn_ranges(vec![0..2, 3..5, 5..6, 4100..4110], Some(4096)),
-        [0..2, 3..6]
-    );
-}
-
 // covers UP-48: a filter scanned anew replaces what was found from the old rows, even when the
 // new rows have the same count and ends.
 #[gpui_kit::test]
@@ -2426,7 +2341,10 @@ async fn new_rows_with_the_same_ends_count_their_own_matches(cx: &mut TestAppCon
     let (core, _dir) = core();
     let (window, view) = open(cx, core);
     let mut lines = Feed::new(100);
-    feed(cx, &view, lines.push(0, 20).streaming());
+    for text in ["ERROR a x", "ERROR b", "info c x", "ERROR d x"] {
+        lines.buffer.push(LogLine::parse(text, false));
+    }
+    feed(cx, &view, lines.streaming());
     view.update(cx, |v, cx| v.set_query("error".into(), cx));
     run(
         cx,
@@ -2434,45 +2352,21 @@ async fn new_rows_with_the_same_ends_count_their_own_matches(cx: &mut TestAppCon
         "logs::ToggleErrorsOnly",
         serde_json::Value::Null,
     );
-    until_rows(cx, window, &view, 4).await;
+    until_rows(cx, window, &view, 3).await;
     cx.wait_for(window, WAIT, |_, cx| !view.read(cx).searching)
         .await;
-    assert_eq!(view.read_with(cx, |v, _| v.shown_match_count().0), 4);
-    // Rows 4, 5, 6 and 19: the same count and ends, two of them errors.
+    assert_eq!(view.read_with(cx, |v, _| v.shown_match_count().0), 3);
+    // Rows 0, 2 and 3: the same count and ends, two of them errors.
     view.update(cx, |v, _| {
         let spec = flint_core::FilterSpec {
-            query: Some(flint_core::SearchQuery {
-                regex: true,
-                ..flint_core::SearchQuery::new(r"line (4|5|6|19)$")
-            }),
+            query: Some(flint_core::SearchQuery::new("x")),
             errors_only: false,
             context: 0,
         };
         let mut filter = flint_core::LogFilter::new(spec);
         filter.update(&v.snapshot.lines);
-        assert_eq!(v.install_filter(filter), 4);
+        assert_eq!(v.install_filter(filter), 3);
         assert_eq!(v.shown_match_count().0, 2);
-    });
-}
-
-// covers UP-48: a regular expression over long lines catches up on the core's threads once
-// it is behind by more text than the UI thread takes on; plain text catches up in place.
-#[gpui_kit::test]
-async fn a_regex_over_long_lines_catches_up_off_the_ui_thread(cx: &mut TestAppContext) {
-    let (core, _dir) = core();
-    let (_window, view) = open(cx, core);
-    let mut lines = Feed::new(1_000);
-    let long = "x".repeat(8 * 1024);
-    for n in 0..100 {
-        lines
-            .buffer
-            .push(LogLine::parse(&format!("{long} {n}"), false));
-    }
-    feed(cx, &view, lines.streaming());
-    view.read_with(cx, |v, _| {
-        assert!(v.catches_up_on_ui(100, false), "plain text: 100 lines");
-        assert!(!v.catches_up_on_ui(100, true), "a regex: 800 KiB of text");
-        assert!(v.catches_up_on_ui(10, true), "a regex: 80 KiB of text");
     });
 }
 

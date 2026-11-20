@@ -53,17 +53,10 @@ pub struct LogFilter {
 }
 
 impl LogFilter {
-    pub fn new(spec: FilterSpec) -> Self {
-        let matcher = spec.query.as_ref().map(SearchQuery::matcher);
-        LogFilter::with_matcher(spec, matcher)
-    }
-
-    /// A filter with the search's `matcher` already prepared from `spec.query` (`None` when the
-    /// spec has no query), so a regular expression is compiled once for search and filter.
-    pub fn with_matcher(mut spec: FilterSpec, matcher: Option<SearchMatcher>) -> Self {
+    pub fn new(mut spec: FilterSpec) -> Self {
         spec.context = spec.context.min(MAX_CONTEXT);
         LogFilter {
-            matcher: matcher.filter(|_| spec.query.is_some()),
+            matcher: spec.query.as_ref().map(SearchQuery::matcher),
             spec,
             ..LogFilter::default()
         }
@@ -264,15 +257,8 @@ mod tests {
         }
         filter.update(&gap.view());
         assert!(filter.rows().is_empty(), "{:?}", filter.rows());
-        // A regex works as the query too, and context is capped.
-        let regex = LogFilter::new(FilterSpec {
-            query: Some(SearchQuery {
-                regex: true,
-                ..SearchQuery::new("^h.t$")
-            }),
-            errors_only: false,
-            context: 10_000,
-        });
-        assert_eq!(regex.spec().context, MAX_CONTEXT);
+        // Context is capped.
+        let wide = LogFilter::new(matching("hit", 10_000));
+        assert_eq!(wide.spec().context, MAX_CONTEXT);
     }
 }

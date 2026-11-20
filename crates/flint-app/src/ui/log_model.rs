@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use flint_core::{
     LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogState, LogSubject, PodSet,
-    PodSetStatus, SearchMatcher, WorkloadTarget,
+    PodSetStatus, SearchQuery, WorkloadTarget,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -310,13 +310,10 @@ pub struct ShownLine {
 /// `line` as shown with `view`: its search matches (in the prefix too, when the query searches
 /// sources and the prefix is shown), and at most `max_bytes` of its text (on a character
 /// boundary). A line without a timestamp gets blanks in its place, so the text lines up.
-/// `found` are the matches in the line's whole text when already known (a regular expression's,
-/// found off the UI thread); `None` matches it here.
 pub fn shown_line(
     line: &LogLine,
     view: LineView<'_>,
-    query: &SearchMatcher,
-    found: Option<&[Range<usize>]>,
+    query: &SearchQuery,
     max_bytes: Option<usize>,
 ) -> ShownLine {
     let mut text = String::new();
@@ -325,27 +322,13 @@ pub fn shown_line(
     if let Some(source) = line.source.as_ref().filter(|_| view.format.source) {
         let short = view.labels.short(source);
         text.push('[');
-        if query.covers_sources() {
-            // Matched against the full `pod/container`, as the search does, then placed on the
-            // short label drawn: a match inside it is marked there, one in the part the label
-            // leaves out marks the whole label.
-            // Only the whole label then, so no two ranges overlap.
-            let label = source.label();
-            let at = label.find(short.as_str());
-            let mut inside = Vec::new();
-            let mut whole = false;
-            for r in query.match_ranges(label) {
-                match at {
-                    Some(k) if r.start >= k && r.end <= k + short.len() => {
-                        inside.push(r.start - k + 1..r.end - k + 1);
-                    }
-                    _ => whole = true,
-                }
-            }
-            if whole {
+        if query.sources {
+            let found = query.match_ranges(&short);
+            if !found.is_empty() {
+                matches.extend(found.into_iter().map(|r| r.start + 1..r.end + 1));
+            } else if !query.match_ranges(source.label()).is_empty() {
+                // The match is in the part of the name the label leaves out: mark the label.
                 matches.push(1..1 + short.len());
-            } else {
-                matches.extend(inside);
             }
         }
         text.push_str(&short);
@@ -376,17 +359,11 @@ pub fn shown_line(
         cut = true;
     }
     text.push_str(body);
-    // Matched against the whole line, as the search does (`error$` must not match where the
-    // drawn text is cut), then clipped to what is drawn.
-    let found = match found {
-        Some(found) => std::borrow::Cow::Borrowed(found),
-        None => std::borrow::Cow::Owned(query.match_ranges(&line.text)),
-    };
     matches.extend(
-        found
-            .iter()
-            .filter(|r| r.start < body.len())
-            .map(|r| r.start + prefix..r.end.min(body.len()) + prefix),
+        query
+            .match_ranges(body)
+            .into_iter()
+            .map(|r| r.start + prefix..r.end + prefix),
     );
     ShownLine {
         text,
@@ -768,7 +745,6 @@ pub enum Toggle {
     Sources,
     Wrap,
     ErrorsOnly,
-    Regex,
     MatchingOnly,
     /// Lines of context around each row a filter shows.
     Context(usize),
@@ -804,8 +780,6 @@ pub struct MenuFacts {
     pub has_selection: bool,
     /// Only warnings and errors are shown.
     pub errors_only: bool,
-    /// The search is a regular expression.
-    pub regex: bool,
     /// Only the lines matching the search are shown.
     pub matching_only: bool,
     /// Lines of context, while a filter is on.
@@ -860,9 +834,8 @@ pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
         f.errors_only,
         Toggle::ErrorsOnly,
     ));
-    // The search's toggles, which a narrow toolbar leaves out.
+    // The search's toggle, which a narrow toolbar leaves out.
     rows.push(MenuRow::Separator);
-    rows.push(toggle("Regex Search", f.regex, Toggle::Regex));
     rows.push(toggle(
         "Matching Lines Only",
         f.matching_only,
@@ -1016,7 +989,7 @@ mod tests {
     use flint_core::{LogTarget, StreamStatus, WorkloadKind, WorkloadTarget};
 
     use super::*;
-    use flint_core::{LogSearch, SearchQuery};
+    use flint_core::LogSearch;
 
     /// Timestamps on or off, no source prefix.
     fn ts(timestamps: bool) -> LineFormat {
@@ -1039,27 +1012,7 @@ mod tests {
             labels: &labels,
             tz: &TimeZone::UTC,
         };
-        shown_line(line, view, &query.matcher(), None, max)
-    }
-
-    // covers UP-48: highlights come from the whole line, as the search matches it, then are
-    // clipped to what is drawn: an anchored pattern never lights up at a cut.
-    #[test]
-    fn highlights_match_the_whole_line_not_the_cut() {
-        let line = LogLine::parse("an error in the middle of a long line", false);
-        let anchored = SearchQuery {
-            regex: true,
-            ..SearchQuery::new("error$")
-        };
-        let plain = LineFormat::default();
-        assert!(show(&line, plain, &anchored, Some(8)).matches.is_empty());
-        let word = SearchQuery {
-            regex: true,
-            ..SearchQuery::new("middle of")
-        };
-        // Cut inside the match: the part drawn is marked.
-        let shown = show(&line, plain, &word, Some(20));
-        assert_eq!(shown.matches, vec![16..20_usize]);
+        shown_line(line, view, query, max)
     }
 
     fn lines(texts: &[&str]) -> LogLines {
@@ -1527,7 +1480,7 @@ mod tests {
             sources: true,
             ..SearchQuery::new("cd27k")
         };
-        let shown = shown_line(&line, view, &query.matcher(), None, None);
+        let shown = shown_line(&line, view, &query, None);
         let pad = labels.width() - "79db669d5-cd27k".len();
         assert_eq!(
             shown.text,
@@ -1541,7 +1494,7 @@ mod tests {
             sources: true,
             ..SearchQuery::new("api-79db")
         };
-        let shown = shown_line(&line, view, &query.matcher(), None, None);
+        let shown = shown_line(&line, view, &query, None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "79db669d5-cd27k");
         // The three drawn parts carry their own runs.
         assert_eq!(
@@ -1553,14 +1506,6 @@ mod tests {
             ]
         );
         assert!(parts_in(&line_parts(&shown), shown.prefix..shown.text.len()).is_empty());
-        // Both a left-out part and the label shown match: the whole label, once.
-        let query = SearchQuery {
-            sources: true,
-            regex: true,
-            ..SearchQuery::new("api|cd27k")
-        };
-        let shown = shown_line(&line, view, &query.matcher(), Some(&[]), None);
-        assert_eq!(shown.matches, vec![1..16_usize]);
     }
 
     // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.

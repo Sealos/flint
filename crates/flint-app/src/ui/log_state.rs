@@ -39,11 +39,9 @@ impl LogView {
             filter: FilterState {
                 matching_only: self.matching_only,
                 errors_only: self.errors_only,
-                regex: self.regex,
                 context: self.context,
                 rows: self.is_filtered().then(|| self.row_count()),
                 filtering: self.filtering,
-                regex_error: self.regex_error.clone(),
             },
             selection: self.selection.map(|s| SelectionState {
                 first: s.start(),
