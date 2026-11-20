@@ -7,8 +7,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use flint_core::handle::{Command, ConnectionState, Event};
 use flint_core::{
@@ -23,7 +22,7 @@ use serde_json::json;
 
 mod support;
 
-use support::{Core, client, init_logging, test_kubeconfig, two_context_kubeconfig};
+use support::{Core, client, init_logging, test_kubeconfig, two_context_kubeconfig, unique_name};
 
 fn start(kubeconfig: PathBuf, settings: Settings) -> (tempfile::TempDir, Core) {
     init_logging();
@@ -72,15 +71,7 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let kube = client(&test_kubeconfig()).await;
-    // The clock may tick in microseconds (macOS), so tests starting together also need the
-    // counter to get distinct names.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let ns = format!("logs-test-{}-{nanos}-{n}", std::process::id());
+    let ns = unique_name("logs-test");
     let namespaces: Api<Namespace> = Api::all(kube.clone());
     namespaces
         .create(

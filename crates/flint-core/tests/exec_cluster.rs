@@ -15,7 +15,7 @@ use serde_json::json;
 
 mod support;
 
-use support::{Core, client, init_logging, two_context_kubeconfig};
+use support::{Core, client, init_logging, two_context_kubeconfig, unique_name};
 
 /// A second context for the same cluster, to switch the active cluster away and back.
 const ALIAS: &str = "exec-test-alias";
@@ -192,13 +192,7 @@ async fn shell_into_a_container() {
     let dir = tempfile::tempdir().unwrap();
     let (path, context, _) = two_context_kubeconfig(dir.path(), Some(ALIAS));
     let admin = client(&path).await;
-    let namespace = format!(
-        "exec-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
+    let namespace = unique_name("exec-test");
     let core = Core::start(path, dir.path().join("config"), Default::default());
     // Run the checks on their own task so the namespace is deleted even when one fails.
     let result = tokio::spawn({

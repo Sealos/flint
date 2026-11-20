@@ -1,7 +1,8 @@
 //! Shared setup for integration tests against the dev cluster.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flint_core::handle::{ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::{Settings, cluster, kubeconfig};
@@ -36,6 +37,22 @@ pub(super) fn two_context_kubeconfig(dir: &Path, alias: Option<&str>) -> (PathBu
     // JSON is YAML, and kubeconfig is read as YAML.
     std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
     (path, first.name, second)
+}
+
+/// A name for an object a test creates (a namespace), unique among the tests of this process and
+/// of other test processes running at the same time: `prefix`, the process id and a counter. The
+/// time in seconds keeps it apart from leftovers of an earlier run whose process had the same id.
+/// The clock alone is not enough: it may tick in microseconds (macOS), so tests starting
+/// together could get the same name.
+#[allow(dead_code, reason = "not every cluster test creates its own objects")]
+pub(super) fn unique_name(prefix: &str) -> String {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    format!("{prefix}-{secs}-{}-{n}", std::process::id())
 }
 
 pub(super) async fn client(path: &Path) -> Client {
@@ -112,4 +129,16 @@ impl Core {
         })
         .await
     }
+}
+
+#[test]
+fn unique_names_differ_and_keep_their_prefix() {
+    let names: std::collections::BTreeSet<String> = (0..1000).map(|_| unique_name("t")).collect();
+    assert_eq!(names.len(), 1000);
+    let pid = format!("-{}-", std::process::id());
+    assert!(
+        names
+            .iter()
+            .all(|n| n.starts_with("t-") && n.contains(&pid) && n.len() <= 63)
+    );
 }
