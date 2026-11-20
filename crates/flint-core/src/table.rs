@@ -515,6 +515,10 @@ impl Interner {
         let relist = self.relist;
         self.set.retain(|_, last| *last == relist);
         self.kept = self.set.len();
+        // After a big drop (a kind scaled down), give the table back too, as a prune does.
+        if self.set.capacity() > 4 * self.kept.max(PRUNE_MIN) {
+            self.set.shrink_to_fit();
+        }
         self.inserts = 0;
         #[cfg(test)]
         {
@@ -1105,6 +1109,27 @@ pub(crate) mod tests {
         drop(many);
         interner.prune();
         assert_eq!(interner.len(), 0);
+        assert!(
+            interner.set.capacity() < big / 4,
+            "{}",
+            interner.set.capacity()
+        );
+    }
+
+    // covers UP-20: a relist after a big drop gives the table back, as a prune does (#295).
+    #[test]
+    fn a_relist_after_a_drop_gives_the_table_back() {
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        for i in 0..100_000 {
+            interner.intern(&format!("s-{i}"));
+        }
+        let big = interner.set.capacity();
+        interner.begin_relist();
+        let kept = interner.intern("s-1");
+        interner.keep_relisted();
+        assert_eq!(interner.len(), 1);
+        assert!(Arc::ptr_eq(&kept, &interner.intern("s-1")));
         assert!(
             interner.set.capacity() < big / 4,
             "{}",
