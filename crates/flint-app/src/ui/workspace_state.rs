@@ -8,7 +8,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestQueryExt as _;
 use gpui_kit::*;
 
-use super::super::clusters::Presence;
+use super::super::clusters::{Presence, state_name};
 use super::super::confirm;
 use super::super::menu_record;
 use super::super::row_menu;
@@ -41,18 +41,16 @@ impl Workspace {
             .clusters
             .iter()
             .map(|cluster| {
-                let (connection, error) = match &cluster.state {
-                    ConnectionState::Disconnected => ("disconnected", None),
-                    ConnectionState::Connecting => ("connecting", None),
-                    ConnectionState::Connected(_) => ("connected", None),
-                    ConnectionState::Failed(e) => ("failed", Some(connection_error_text(e))),
+                let error = match &cluster.state {
+                    ConnectionState::Failed(e) => Some(connection_error_text(e)),
+                    _ => None,
                 };
                 let is_active = active.as_deref() == Some(cluster.info.name.as_str());
                 ClusterState {
                     name: cluster.info.name.clone(),
                     label: display::short_name(&cluster.info.name).to_string(),
                     active: is_active,
-                    connection,
+                    connection: state_name(&cluster.state),
                     presence: Presence::of(&cluster.state, is_active).name(),
                     error,
                     ai: match model.ai_exposure(cluster) {

@@ -271,6 +271,18 @@ impl Presence {
     }
 }
 
+/// A connection state's name in the automation state: `disconnected`, `connecting`,
+/// `connected` or `failed`. The e2e tests read these words.
+#[cfg(any(test, feature = "automation"))]
+pub fn state_name(state: &ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Disconnected => "disconnected",
+        ConnectionState::Connecting => "connecting",
+        ConnectionState::Connected(_) => "connected",
+        ConnectionState::Failed(_) => "failed",
+    }
+}
+
 /// A short label for a connection state.
 pub fn state_label(state: &ConnectionState) -> &'static str {
     match state {
@@ -284,7 +296,9 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
-    use super::{Discovered, Presence, forget_removed, replace_clusters, startup_cluster};
+    use super::{
+        Discovered, Presence, forget_removed, replace_clusters, startup_cluster, state_name,
+    };
     use flint_core::kubeconfig::ContextInfo;
     use flint_core::{ClusterSummary, ConnectionState, ServerVersion};
     use std::collections::HashMap;
@@ -389,6 +403,27 @@ mod tests {
             Presence::NotConnected
         );
         assert_eq!(Presence::Idle.name(), "idle");
+    }
+
+    // The automation state's words for a connection; the e2e tests read them.
+    #[test]
+    fn connection_states_have_fixed_names() {
+        let connected = ConnectionState::Connected(ServerVersion {
+            git_version: "v1.31.0".into(),
+            platform: "linux/arm64".into(),
+        });
+        let failed = ConnectionState::Failed(flint_core::SafeErrorText::reduced("refused"));
+        assert_eq!(
+            [
+                ConnectionState::Disconnected,
+                ConnectionState::Connecting,
+                connected,
+                failed,
+            ]
+            .each_ref()
+            .map(state_name),
+            ["disconnected", "connecting", "connected", "failed"]
+        );
     }
 }
 
