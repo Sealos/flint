@@ -318,6 +318,7 @@ mod tests {
                     user: None,
                     namespace: None,
                     server: Some(server(n)),
+                    proxy_url: None,
                     source: PathBuf::from("/k"),
                 })
                 .collect(),

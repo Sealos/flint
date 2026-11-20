@@ -248,6 +248,20 @@ impl Settings {
         }
     }
 
+    /// What applies while `settings.toml` cannot be read, keeping the harmless parts of `self`
+    /// (the settings in force before, or the defaults): nothing is exposed to AI agents or
+    /// trusted, and clusters on this machine are protected too, since the file may have said
+    /// `protect_local_clusters = true` (a local tunnel to a remote cluster). Every choice that
+    /// opens something up is dropped until the file parses again.
+    pub fn unreadable_fallback(self) -> Settings {
+        Settings {
+            ai_exposed_clusters: Vec::new(),
+            trusted_clusters: Vec::new(),
+            protect_local_clusters: true,
+            ..self
+        }
+    }
+
     /// `kubeconfig_paths` with a leading `~` replaced by `home`.
     pub fn expanded_kubeconfig_paths(&self, home: Option<&Path>) -> Vec<PathBuf> {
         self.kubeconfig_paths
@@ -345,7 +359,79 @@ fn config_dir_from(
 }
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
-    load_toml(&dir.join(SETTINGS_FILE))
+    let path = dir.join(SETTINGS_FILE);
+    let settings = load_toml(&path)?;
+    // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
+    // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(table) = toml::from_str::<toml::Table>(&text)
+    {
+        for (unknown, known) in misspelled_keys(&table) {
+            tracing::warn!(
+                "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
+            );
+        }
+    }
+    Ok(settings)
+}
+
+/// The top-level keys of [`Settings`].
+const SETTINGS_KEYS: &[&str] = &[
+    "appearance",
+    "ai_exposed_clusters",
+    "trusted_clusters",
+    "protect_local_clusters",
+    "kubeconfig_paths",
+    "path",
+    "helm",
+    "watch_mode",
+    "cluster_watch_mode",
+    "log_buffer_lines",
+    "log_buffer_mib",
+];
+
+/// The keys of `table` that are not settings but look like a misspelt one (at most two edits
+/// away, or one with an `s` added or dropped), each with the key it resembles.
+fn misspelled_keys(table: &toml::Table) -> Vec<(String, &'static str)> {
+    table
+        .keys()
+        .filter(|k| !SETTINGS_KEYS.contains(&k.as_str()))
+        .filter_map(|k| {
+            SETTINGS_KEYS
+                .iter()
+                .find(|known| known.len() > 4 && edit_distance(k, known) <= 2)
+                .map(|known| (k.clone(), *known))
+        })
+        .collect()
+}
+
+/// Levenshtein distance, by characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+/// [`load_settings`], or, when the file cannot be read, the defaults made safe with
+/// [`Settings::unreadable_fallback`] and why it could not be read. A missing file is the
+/// defaults, with no error.
+pub fn load_settings_or_fallback(dir: &Path) -> (Settings, Option<String>) {
+    match load_settings(dir) {
+        Ok(s) => (s, None),
+        Err(e) => (
+            Settings::default().unreadable_fallback(),
+            Some(e.to_string()),
+        ),
+    }
 }
 
 pub fn load_state(dir: &Path) -> Result<State, SettingsError> {
@@ -859,6 +945,65 @@ mod tests {
             AiExposureState::Hidden
         );
         assert!(toml::from_str::<Settings>("trusted_clusters = [\"staging\"]").is_err());
+    }
+
+    // covers UP-54: a settings.toml that does not parse opens nothing up. It may have said
+    // `protect_local_clusters = true` for a tunnel to production on a loopback address, so that
+    // address is protected until the file parses again; a missing or valid file keeps the
+    // exemption.
+    #[test]
+    fn an_unreadable_file_protects_local_clusters_and_trusts_nothing() {
+        use crate::protection::{Protection, SessionUnlocks, protection};
+        let unlocks = SessionUnlocks::default();
+        let tunnel = Some("https://127.0.0.1:8443");
+        let of = |s: &Settings| protection(s, &unlocks, "prod-tunnel", tunnel, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (missing, error) = load_settings_or_fallback(dir.path());
+        assert_eq!(error, None);
+        assert_eq!(of(&missing), Protection::Local);
+
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "protect_local_clusters = true\n\
+             trusted_clusters = [{ context = \"prod-tunnel\", server = \"https://127.0.0.1:8443\" }]\n\
+             watch_mode = ",
+        )
+        .unwrap();
+        let (broken, error) = load_settings_or_fallback(dir.path());
+        assert!(error.is_some());
+        assert!(broken.trusted_clusters.is_empty() && broken.ai_exposed_clusters.is_empty());
+        assert_eq!(of(&broken), Protection::Protected);
+
+        std::fs::write(dir.path().join(SETTINGS_FILE), "watch_mode = \"all\"\n").unwrap();
+        let (valid, error) = load_settings_or_fallback(dir.path());
+        assert_eq!(error, None);
+        assert_eq!(of(&valid), Protection::Local);
+    }
+
+    // covers UP-54: a misspelt key is ignored like any unknown one, so it is named in the log.
+    #[test]
+    fn misspelt_keys_are_found_and_new_ones_are_not() {
+        let table: toml::Table = toml::from_str(
+            "protect_local_cluster = true\nprotect_locale_clusters = true\n\
+             trusted_cluster = []\nwatch_mode = \"all\"\nsome_future_key = 3\npth = \"/bin\"\n",
+        )
+        .unwrap();
+        let mut found = misspelled_keys(&table);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("protect_local_cluster".to_owned(), "protect_local_clusters"),
+                (
+                    "protect_locale_clusters".to_owned(),
+                    "protect_local_clusters"
+                ),
+                ("trusted_cluster".to_owned(), "trusted_clusters"),
+            ]
+        );
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "abc"), 3);
     }
 
     // covers UP-55

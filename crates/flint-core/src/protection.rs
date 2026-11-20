@@ -47,20 +47,23 @@ impl Protection {
     }
 }
 
-/// The protection of `context`, now pointing at `server`. A context with no server is
-/// protected: nothing can be pinned to it, and nothing can connect either.
+/// The protection of `context`, now pointing at `server` through `proxy_url` (its cluster
+/// entry's `proxy-url`, if any). A context with no server is protected: nothing can be pinned
+/// to it, and nothing can connect either. A context behind a proxy is never local: the proxy
+/// decides where a loopback address leads.
 pub fn protection(
     settings: &Settings,
     unlocks: &SessionUnlocks,
     context: &str,
     server: Option<&str>,
+    proxy_url: Option<&str>,
 ) -> Protection {
     let Some(server) = server else {
         return Protection::Protected;
     };
     if settings.trust(context, Some(server)).is_trusted() {
         Protection::Trusted
-    } else if !settings.protect_local_clusters && is_local_server(server) {
+    } else if !settings.protect_local_clusters && proxy_url.is_none() && is_local_server(server) {
         Protection::Local
     } else if unlocks.is_unlocked(context, server) {
         Protection::Unlocked
@@ -190,7 +193,7 @@ mod tests {
         let prod = "https://prod.example:6443";
         let kind = "https://127.0.0.1:6443";
         let of = |s: &Settings, context: &str, server: Option<&str>| {
-            protection(s, &unlocks, context, server)
+            protection(s, &unlocks, context, server, None)
         };
         assert_eq!(of(&settings, "prod", Some(prod)), Protection::Protected);
         assert_eq!(of(&settings, "prod", None), Protection::Protected);
@@ -226,6 +229,39 @@ mod tests {
         // Unlocking at a new server replaces the old unlock.
         unlocks.unlock("kind", "https://127.0.0.1:7443");
         assert_eq!(of(&settings, "kind", Some(kind)), Protection::Protected);
+    }
+
+    // covers UP-54: behind a `proxy-url`, a loopback server is wherever the proxy sends it.
+    #[test]
+    fn a_context_behind_a_proxy_is_never_local() {
+        let settings = Settings::default();
+        let unlocks = SessionUnlocks::default();
+        let kind = Some("https://127.0.0.1:6443");
+        assert_eq!(
+            protection(&settings, &unlocks, "kind", kind, None),
+            Protection::Local
+        );
+        assert_eq!(
+            protection(
+                &settings,
+                &unlocks,
+                "kind",
+                kind,
+                Some("socks5://proxy.example:1080")
+            ),
+            Protection::Protected
+        );
+        unlocks.unlock("kind", "https://127.0.0.1:6443");
+        assert_eq!(
+            protection(
+                &settings,
+                &unlocks,
+                "kind",
+                kind,
+                Some("http://127.0.0.1:3128")
+            ),
+            Protection::Unlocked
+        );
     }
 
     #[test]

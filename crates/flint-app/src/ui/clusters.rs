@@ -187,6 +187,7 @@ impl ClustersModel {
             self.core.unlocks(),
             &cluster.info.name,
             cluster.info.server.as_deref(),
+            cluster.info.proxy_url.as_deref(),
         )
     }
 
@@ -369,6 +370,7 @@ mod tests {
                 user: None,
                 namespace: None,
                 server: None,
+                proxy_url: None,
                 source: PathBuf::from("/k"),
             },
             state: ConnectionState::Disconnected,

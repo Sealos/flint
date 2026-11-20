@@ -661,19 +661,16 @@ impl ClusterManager {
         let (settings, error) = match result {
             Ok(s) => (s, None),
             Err(e) => {
-                // Expose nothing (as the MCP server does) and trust nothing (as at startup), but
-                // keep the other settings, so a typo does not make clusters from extra
-                // kubeconfig files disappear. An entry removed by hand behind the typo must not
-                // stay in force.
+                // Expose nothing (as the MCP server does), trust nothing and protect local
+                // clusters too (as at startup), but keep the other settings, so a typo does
+                // not make clusters from extra kubeconfig files disappear. An entry removed by
+                // hand behind the typo must not stay in force.
                 tracing::warn!(
-                    "settings.toml unreadable; nothing is exposed to AI or trusted: {}",
+                    "settings.toml unreadable; nothing is exposed to AI or trusted, and local \
+                     clusters are protected: {}",
                     crate::redact::safe_error_summary(&e)
                 );
-                let kept = Settings {
-                    ai_exposed_clusters: Vec::new(),
-                    trusted_clusters: Vec::new(),
-                    ..(*self.settings).clone()
-                };
+                let kept = (*self.settings).clone().unreadable_fallback();
                 (kept, Some(e))
             }
         };
@@ -945,8 +942,8 @@ impl ClusterManager {
         };
         // A context Flint does not know has no client either: say that, not "protected".
         let slot = self.cluster(cluster).ok_or_else(not_connected)?;
-        let server = slot.info.server.as_deref();
-        if !protection(&self.settings, &self.unlocks, cluster, server).allows_changes() {
+        let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
+        if !protection(&self.settings, &self.unlocks, cluster, server, proxy).allows_changes() {
             return Err(WriteRefusal::Protected {
                 cluster: cluster.to_owned(),
             });
@@ -1475,6 +1472,7 @@ mod tests {
             user: None,
             namespace: namespace.map(str::to_owned),
             server: Some("https://dev".into()),
+            proxy_url: None,
             source: PathBuf::from("/k"),
         }
     }
@@ -1606,6 +1604,7 @@ mod tests {
         // by hand behind a typo is not kept in force.
         manager.apply_settings(Err("expected `=`".into())).await;
         assert!(manager.settings.trusted_clusters.is_empty());
+        assert!(manager.settings.protect_local_clusters);
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
     }
 
