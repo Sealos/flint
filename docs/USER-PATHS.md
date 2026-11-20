@@ -249,14 +249,20 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   full-screen programs (`top`, `vi`, `less`) work. Tab, Esc, the arrows and Ctrl keys go to the shell; Cmd-C and
   Cmd-V (Ctrl-Shift-C and Ctrl-Shift-V on Linux) copy the mouse selection and paste. The wheel scrolls back through
   the output. Images without `bash` fall back to `sh`. The tab says whether the shell is connecting, running, exited
-  (with its exit code) or failed (and why), and the output stays readable and copyable until I close the tab.
+  (with its exit code) or failed (and why), and the output stays readable and copyable until I close the tab; Restart
+  shell (Cmd-R) starts a new shell in it. The tab and its toolbar name the cluster the shell runs on. Pasting several
+  lines into a shell that would run each one as it arrives asks first, and a huge clipboard is refused. If the
+  context is re-pointed at another API server, the shell ends and says why.
 - Tests: unit (terminal model, session logic, key encoding, colors, grid size), cluster, ui.
 
 ### UP-42 Sessions outlive navigation
 - **Then** log and shell tabs keep running when I change views or clusters, and end only when I close them (the tab's
   close button, or Cmd-W while the dock has focus; elsewhere Cmd-W still closes the window). A closed tab frees
   everything it held. Cmd-J shows and hides the
-  dock, and its height is remembered.
+  dock, and its height is remembered. Every tab names its cluster beside its title. With many tabs, the tab I open
+  or show scrolls into view, and the tab list at the strip's end shows every tab with its cluster and status. Opening
+  the same logs or shell again shows its tab while it runs; once it ended or failed, a fresh tab opens beside it, and
+  Reconnect (logs) or Restart shell starts it again in place. An empty dock says how to open logs or a shell.
 - Tests: ui.
 
 ### UP-43 Spot errors in a log stream

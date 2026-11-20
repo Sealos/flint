@@ -1,17 +1,20 @@
 //! The bottom dock (#13): a resizable panel under the main area with one tab per session that
-//! outlives navigation (UP-42): log tabs and shell tabs (#14); AI log analysis (#56) next. Tabs belong to no cluster, so they keep running when the user switches
-//! clusters or views, and end only when closed. The dock's height is kept in `state.toml`
-//! (`[panes] dock`); its tabs are not, since their sessions end with the app.
+//! outlives navigation (UP-42): log tabs and shell tabs (#14); AI log analysis (#56) next. Tabs
+//! keep running when the user switches clusters or views, and end only when closed. Each tab
+//! names the cluster its session runs on and is pinned to it: the context and the API server it
+//! pointed at ([`TabCluster`]). The strip scrolls the active tab into view, and a tab list at its
+//! end names every tab. The dock's height is kept in `state.toml` (`[panes] dock`); its tabs are
+//! not, since their sessions end with the app.
 //!
 //! # Adding a tab kind
 //!
 //! 1. Implement [`DockItem`] for the tab's view: its [`TabKey`] (so opening the same thing again
-//!    shows the existing tab instead of a second session), title, tooltip, [`TabStatus`] and
-//!    focus handle. The view notifies when its title or status changes; the dock redraws the
+//!    shows the existing tab while it answers for it, [`dock_model::reopens`]), title, tooltip,
+//!    [`TabStatus`] and focus handle. The view notifies when its title or status changes; the dock redraws the
 //!    tab bar then.
 //! 2. Add a [`DockTab`] variant holding the view's entity and a [`TabKey`] variant, and fill in
-//!    the `match`es in this file ([`DockTab::item`], [`DockTab::view`], [`Dock::open`]'s
-//!    observation).
+//!    the `match`es in this file ([`DockTab::item`], [`DockTab::view`], `observe`), and the
+//!    workspace's `restart_tab` if its session can start again.
 //! 3. Open it with [`Dock::open`] from wherever the user asks for it (the workspace opens log
 //!    tabs on the detail pane's `OpenLogs`).
 //! 4. Give its controls a registry scope and a `bind_actions`, and have the workspace forward
