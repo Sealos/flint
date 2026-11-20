@@ -1,0 +1,876 @@
+//! View tests for the command palette (UP-30): opening it with its key, filtering, running an
+//! action from where focus was, the argument steps, listing only what is available, shortcut
+//! hints, recent actions first, Esc, clicks, and its automation state.
+
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{AppContext as _, Entity, TestAppContext};
+use serde_json::{Value, json};
+
+use super::{ArgInput, Choice, CommandPalette, arg_value, refusal};
+use crate::ui::registry::{self, ActionError, ArgKind};
+use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, weaken};
+use crate::ui::view_state::{Focus, PaletteState};
+
+/// Opens the palette with its key, where focus is, and waits until it lists actions.
+async fn open_palette(cx: &mut TestAppContext, t: &TestWorkspace) -> Entity<CommandPalette> {
+    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace
+            .read(cx)
+            .palette_view()
+            .is_some_and(|p| !p.read(cx).rows.is_empty())
+    })
+    .await;
+    palette(cx, t).expect("the palette is open")
+}
+
+fn palette(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<Entity<CommandPalette>> {
+    t.workspace.read_with(cx, |ws, _| ws.palette_view())
+}
+
+/// The palette's state, as the automation channel reports it, with the focus.
+fn state(cx: &mut TestAppContext, t: &TestWorkspace) -> (Option<PaletteState>, Focus) {
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        window.render_frame(cx);
+        workspace.update(cx, |ws, cx| {
+            let state = ws.view_state(window, cx);
+            (state.palette, state.focus)
+        })
+    })
+    .unwrap()
+}
+
+fn shown(cx: &mut TestAppContext, t: &TestWorkspace) -> PaletteState {
+    state(cx, t).0.expect("the palette is open")
+}
+
+fn labels(state: &PaletteState) -> Vec<&str> {
+    state.rows.iter().map(|r| r.label.as_str()).collect()
+}
+
+/// The label of the selected row.
+fn selected(state: &PaletteState) -> &str {
+    &state.rows[state.selected.expect("a row is selected")].label
+}
+
+// covers UP-30: Cmd-Shift-P opens the palette with focus in its field; typing filters; Esc
+// closes it and gives focus back to where it was.
+#[gpui_kit::test]
+async fn opens_filters_and_closes_with_esc(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    let list = t.list(cx).unwrap();
+    let list_focus = list.read_with(cx, |l, _| l.focus_handle().clone());
+    cx.update_window(t.window, |_, window, cx| window.focus(&list_focus, cx))
+        .unwrap();
+
+    open_palette(cx, &t).await;
+    let (palette, focus) = state(cx, &t);
+    let palette = palette.unwrap();
+    assert_eq!(focus, Focus::Palette);
+    assert_eq!(palette.query, "");
+    assert_eq!(palette.step, None);
+    assert_eq!(palette.selected, Some(0));
+    assert!(palette.total > 20, "{palette:?}");
+    // The selected action says what it does.
+    assert!(palette.footer.is_some());
+
+    t.type_text(cx, "focus fil");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.query, "focus fil");
+    assert_eq!(selected(&palette), "Focus Filter");
+    assert!(
+        labels(&palette).iter().all(|l| !l.contains("Quit")),
+        "{palette:?}"
+    );
+    t.type_text(cx, "zzz");
+    let palette = shown(cx, &t);
+    assert!(palette.rows.is_empty());
+    assert_eq!(palette.selected, None);
+    assert_eq!(
+        palette.footer.as_deref(),
+        Some("No matching action available here")
+    );
+
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    let focused = cx
+        .update_window(t.window, |_, window, cx| {
+            list_focus.is_focused(window) && window.focused(cx).is_some()
+        })
+        .unwrap();
+    assert!(focused, "focus went back to the list");
+    // The same key toggles it closed too.
+    open_palette(cx, &t).await;
+    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    assert!(palette_closed(cx, &t));
+    assert!(list_focus_is_focused(cx, &t, &list_focus));
+}
+
+fn palette_closed(cx: &mut TestAppContext, t: &TestWorkspace) -> bool {
+    palette(cx, t).is_none() && state(cx, t).0.is_none()
+}
+
+fn list_focus_is_focused(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    focus: &gpui_kit::FocusHandle,
+) -> bool {
+    cx.update_window(t.window, |_, window, _| focus.is_focused(window))
+        .unwrap()
+}
+
+// covers UP-30: Enter runs the selected action from where focus was, as its key would: Focus
+// Filter moves focus into the list's filter.
+#[gpui_kit::test]
+async fn enter_runs_the_selected_action(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "focus filter");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    assert_eq!(state(cx, &t).1, Focus::ListFilter);
+}
+
+// covers UP-30: the arrows and Ctrl-N / Ctrl-P move the selection, wrapping around; a click on
+// a row runs it.
+#[gpui_kit::test]
+async fn keys_move_the_selection_and_a_click_runs_a_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    open_palette(cx, &t).await;
+    let total = shown(cx, &t).total;
+    t.press(cx, "down");
+    assert_eq!(shown(cx, &t).selected, Some(1));
+    t.press(cx, "ctrl-n");
+    assert_eq!(shown(cx, &t).selected, Some(2));
+    t.press(cx, "ctrl-p");
+    t.press(cx, "up");
+    assert_eq!(shown(cx, &t).selected, Some(0));
+    t.press(cx, "up");
+    assert_eq!(shown(cx, &t).selected, Some(total - 1));
+    // Typing starts again from the best match.
+    t.type_text(cx, "focus filter");
+    assert_eq!(shown(cx, &t).selected, Some(0));
+    assert_eq!(selected(&shown(cx, &t)), "Focus Filter");
+    t.click(cx, ("palette-row", 0usize));
+    assert!(palette_closed(cx, &t));
+    assert_eq!(state(cx, &t).1, Focus::ListFilter);
+}
+
+// covers UP-30: only actions available now are listed (no Open Kind without a cluster, no
+// list actions without a list, none of the palette's own), each with its category and its
+// live shortcut as the OS writes it.
+#[gpui_kit::test]
+async fn lists_available_actions_with_categories_and_shortcuts(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    let all = labels(&palette);
+    assert!(all.contains(&"Select Cluster…"), "{all:?}");
+    assert!(all.contains(&"Quit Flint"), "{all:?}");
+    assert!(all.contains(&"About Flint"), "{all:?}");
+    assert!(
+        !all.contains(&"Open Kind…"),
+        "no cluster is active: {all:?}"
+    );
+    assert!(!all.contains(&"Focus Filter"), "no list is open: {all:?}");
+    assert!(!all.contains(&"Show Command Palette"), "{all:?}");
+    assert!(!all.contains(&"Close Command Palette"), "{all:?}");
+    // The Edit actions are listed only where they act: a text field, or a shell tab. (Copy is
+    // handled everywhere, by gpui-component's root, for text selected in the window.)
+    for edit in ["Cut", "Copy", "Paste", "Select All"] {
+        assert!(!all.contains(&edit), "{edit}: {all:?}");
+    }
+    assert_eq!(all.contains(&"Hide Flint"), cfg!(target_os = "macos"));
+    let quit = palette
+        .rows
+        .iter()
+        .find(|r| r.label == "Quit Flint")
+        .unwrap();
+    assert_eq!(quit.detail.as_deref(), Some("Flint"));
+    assert_eq!(
+        quit.shortcut.as_deref(),
+        Some(registry::key_hint("secondary-q").as_str())
+    );
+    t.press(cx, "escape");
+
+    // With a list open and focus in its filter, the list's actions and the Edit menu's appear.
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    assert_eq!(state(cx, &t).1, Focus::ListFilter);
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    let all = labels(&palette);
+    assert!(all.contains(&"Open Kind…"), "{all:?}");
+    assert!(all.contains(&"Sort by Column…"), "{all:?}");
+    assert!(all.contains(&"Copy"), "{all:?}");
+    assert!(all.contains(&"Select All"), "{all:?}");
+    assert!(!all.contains(&"Close Detail"), "no detail is open: {all:?}");
+    let copy = palette.rows.iter().find(|r| r.label == "Copy").unwrap();
+    assert_eq!(
+        copy.shortcut.as_deref(),
+        Some(registry::key_hint("secondary-c").as_str())
+    );
+    t.press(cx, "escape");
+
+    // From the list's rows, Focus Filter shows its key; the Edit actions are gone.
+    let list = t.list(cx).unwrap();
+    let rows = list.read_with(cx, |l, _| l.focus_handle().clone());
+    cx.update_window(t.window, |_, window, cx| window.focus(&rows, cx))
+        .unwrap();
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    assert!(!labels(&palette).contains(&"Copy"));
+    let focus = palette
+        .rows
+        .iter()
+        .find(|r| r.label == "Focus Filter")
+        .unwrap();
+    assert_eq!(focus.detail.as_deref(), Some("List"));
+    assert_eq!(
+        focus.shortcut.as_deref(),
+        Some(registry::key_hint("secondary-f").as_str())
+    );
+}
+
+// covers UP-30: an action that takes an argument asks for it in a second step, from a list:
+// Select Cluster…, Open Kind… and Sort by Column… (reachable only from the palette, #29).
+#[gpui_kit::test]
+async fn actions_with_arguments_ask_for_them(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "select cluster");
+    assert_eq!(selected(&shown(cx, &t)), "Select Cluster…");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.step.as_deref(), Some("Select Cluster…"));
+    assert_eq!(palette.argument.as_deref(), Some("cluster"));
+    assert_eq!(palette.query, "", "the field is cleared for the argument");
+    assert_eq!(labels(&palette), ["alpha", "beta"]);
+    t.type_text(cx, "bet");
+    assert_eq!(labels(&shown(cx, &t)), ["beta"]);
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).shown_cluster() == Some("beta")
+    })
+    .await;
+
+    // Open Kind… lists the kinds the cluster serves.
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "open kind");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.step.as_deref(), Some("Open Kind…"));
+    assert!(labels(&palette).contains(&"Pods"), "{palette:?}");
+    t.type_text(cx, "pods");
+    assert_eq!(selected(&shown(cx, &t)), "Pods");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    t.feed_list(
+        cx,
+        crate::ui::support_tests::pods(&[("demo", "a", 3), ("demo", "b", 1)]),
+    )
+    .await;
+    let workspace = t.workspace.clone();
+    let kind = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).list.unwrap().kind)
+        })
+        .unwrap();
+    assert_eq!(kind, "pods");
+
+    // Sort by Column… lists the columns drawn.
+    open_palette(cx, &t).await;
+    t.type_text(cx, "sort by");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.argument.as_deref(), Some("column"));
+    assert_eq!(labels(&palette), ["Name", "Namespace", "Restarts"]);
+    t.type_text(cx, "rest");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let workspace = t.workspace.clone();
+    let sort = cx
+        .update_window(t.window, |_, window, cx| {
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).list.unwrap().sort)
+        })
+        .unwrap()
+        .expect("sorted");
+    assert_eq!(sort.column, "Restarts");
+}
+
+// covers UP-45 (#29): Open Logs by Label Selector… asks for a namespace (one may be typed that
+// is not listed), then for the selector as text, and opens the tab in the dock.
+#[gpui_kit::test]
+async fn selector_logs_take_typed_arguments(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "label selector");
+    assert_eq!(selected(&shown(cx, &t)), "Open Logs by Label Selector…");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.argument.as_deref(), Some("namespace"));
+    t.type_text(cx, "demo");
+    let palette = shown(cx, &t);
+    let typed = &palette.rows[0];
+    assert_eq!(typed.label, "“demo”");
+    assert_eq!(typed.detail.as_deref(), Some("typed"));
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.argument.as_deref(), Some("selector"));
+    assert_eq!(palette.action.as_deref(), Some("logs::OpenSelectorLogs"));
+    // The heading keeps what was picked.
+    assert_eq!(
+        palette.step.as_deref(),
+        Some("Open Logs by Label Selector… · demo")
+    );
+    // Enter with nothing typed says what to type, and keeps the step.
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert!(
+        palette
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("label selector")),
+        "{palette:?}"
+    );
+    assert_eq!(palette.argument.as_deref(), Some("selector"));
+    t.type_text(cx, "app=web,tier!=db");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let dock = t.workspace.read_with(cx, |ws, _| ws.dock_view());
+    assert_eq!(dock.read_with(cx, |d, _| d.tab_count()), 1);
+}
+
+// covers UP-30: a refused action keeps the palette open, saying why (the guard's reason).
+#[gpui_kit::test]
+async fn a_refusal_stays_in_the_palette(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "hide cluster from ai");
+    t.press(cx, "enter");
+    t.type_text(cx, "alpha");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(
+        palette.error.as_deref(),
+        Some("The cluster is hidden already")
+    );
+    assert_eq!(palette.footer.as_deref(), palette.error.as_deref());
+    assert_eq!(palette.step.as_deref(), Some("Hide Cluster from AI…"));
+    // Typing again clears it.
+    t.type_text(cx, "x");
+    assert_eq!(shown(cx, &t).error, None);
+}
+
+// covers UP-30: recently run actions come first, latest first.
+#[gpui_kit::test]
+async fn recent_actions_come_first(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    for query in ["show all namespaces", "focus filter"] {
+        // Back to the list, so both are available.
+        let list = t.list(cx).unwrap();
+        let focus = list.read_with(cx, |l, _| l.focus_handle().clone());
+        cx.update_window(t.window, |_, window, cx| window.focus(&focus, cx))
+            .unwrap();
+        open_palette(cx, &t).await;
+        t.type_text(cx, query);
+        t.press(cx, "enter");
+        assert!(palette_closed(cx, &t), "{query}");
+    }
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    assert_eq!(
+        labels(&palette)[..2],
+        ["Focus Filter", "Show All Namespaces"]
+    );
+    // With a query, a recent action that matches comes before the others that match.
+    t.type_text(cx, "s");
+    assert_eq!(selected(&shown(cx, &t)), "Show All Namespaces");
+}
+
+// About Flint (the app menu's first item, and in the palette) says the version, with only OK.
+#[gpui_kit::test]
+async fn about_flint_says_the_version(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.dispatch(cx, "flint::About", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    let workspace = t.workspace.clone();
+    let dialog = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).dialog)
+        })
+        .unwrap()
+        .expect("the dialog is open");
+    assert_eq!(dialog.title, "Flint");
+    assert!(
+        dialog.text.contains(env!("CARGO_PKG_VERSION")),
+        "{}",
+        dialog.text
+    );
+    assert_eq!(dialog.buttons, ["OK"]);
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+}
+
+// The Edit menu's actions act on the focused text field, from the palette too: Select All then
+// Cut empties the list's filter.
+#[gpui_kit::test]
+async fn edit_actions_reach_the_focused_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    let filtered = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        filtered.read(cx).shown().1 == 1
+    })
+    .await;
+    assert!(
+        t.available(cx).contains(&"input::SelectAll"),
+        "a focused field handles it"
+    );
+    open_palette(cx, &t).await;
+    t.type_text(cx, "select all");
+    assert_eq!(selected(&shown(cx, &t)), "Select All");
+    t.press(cx, "enter");
+    assert_eq!(state(cx, &t).1, Focus::ListFilter);
+    t.dispatch(cx, "input::Cut", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| list.read(cx).shown().1 == 2)
+        .await;
+    // Without a focused field, nothing handles them.
+    t.focus_workspace(cx);
+    assert_eq!(
+        t.dispatch(cx, "input::Paste", Value::Null),
+        Err(ActionError::NotAvailable("input::Paste".into()))
+    );
+}
+
+// The palette is released once closed, its field included.
+#[gpui_kit::test]
+async fn a_closed_palette_is_released(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let palette = open_palette(cx, &t).await;
+    let query = palette.read_with(cx, |p, _| p.query.clone());
+    let (palette, query) = (weaken(palette), weaken(query));
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    cx.run_until_parked();
+    palette.assert_released();
+    query.assert_released();
+}
+
+#[test]
+fn arguments_are_parsed_by_kind() {
+    assert_eq!(arg_value(ArgKind::Text, " app=web "), Ok(json!("app=web")));
+    assert_eq!(arg_value(ArgKind::Number, "240"), Ok(json!(240)));
+    assert_eq!(arg_value(ArgKind::Number, "1.5"), Ok(json!(1.5)));
+    assert!(arg_value(ArgKind::Number, "wide").is_err());
+    assert_eq!(arg_value(ArgKind::Bool, "Yes"), Ok(json!(true)));
+    assert_eq!(arg_value(ArgKind::Bool, "false"), Ok(json!(false)));
+    assert!(arg_value(ArgKind::Bool, "maybe").is_err());
+    assert_eq!(
+        arg_value(ArgKind::List, "a, b,,c"),
+        Ok(json!(["a", "b", "c"]))
+    );
+    assert!(arg_value(ArgKind::Namespace, "  ").is_err());
+}
+
+#[test]
+fn refusals_read_as_sentences() {
+    assert_eq!(
+        refusal(&ActionError::Rejected {
+            action: "workspace::OpenView".into(),
+            reason: "no such kind".into()
+        }),
+        "No such kind"
+    );
+    assert_eq!(
+        refusal(&ActionError::NotAvailable("detail::Close".into())),
+        "Not available here any more"
+    );
+}
+
+#[test]
+fn choices_name_their_values() {
+    let plain = Choice::plain("demo");
+    assert_eq!(
+        (plain.value.as_str(), plain.label.as_str()),
+        ("demo", "demo")
+    );
+    assert_ne!(
+        ArgInput::Text,
+        ArgInput::Choices {
+            items: vec![plain],
+            free: true
+        }
+    );
+}
+
+#[test]
+fn every_palette_action_is_bound() {
+    crate::ui::registry::tests::assert_binds_scope(
+        crate::ui::registry::Scope::Palette,
+        CommandPalette::bind_actions,
+    );
+}
+
+// The standard macOS menus (#29): every item a registered action, the palette in View.
+#[gpui_kit::test]
+async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
+    use gpui_kit::OwnedMenuItem;
+    let dir = tempfile::tempdir().unwrap();
+    let _t = open_workspace(cx, dir.path()).await;
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let items = |name: &str| -> Vec<String> {
+        let menu = menus.iter().find(|m| m.name == name).unwrap();
+        menu.items
+            .iter()
+            .filter_map(|item| match item {
+                OwnedMenuItem::Action { name, action, .. } => {
+                    assert!(registry::spec_of(&**action).is_some(), "{name}");
+                    Some(name.to_string())
+                }
+                OwnedMenuItem::Submenu(menu) => Some(menu.name.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let names: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
+    assert_eq!(names, ["Flint", "Edit", "View", "Window"]);
+    assert_eq!(
+        items("Flint"),
+        [
+            "About Flint",
+            "Hide Flint",
+            "Hide Others",
+            "Show All",
+            "Quit Flint"
+        ]
+    );
+    assert_eq!(items("Edit"), ["Cut", "Copy", "Paste", "Select All"]);
+    assert_eq!(items("View"), ["Show Command Palette", "Appearance"]);
+}
+
+/// A pod `name` in `demo` with containers `app` and `sidecar`, selected and shown in the detail
+/// pane.
+async fn show_pod(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": name}),
+    )
+    .unwrap();
+    let detail = t.detail(cx).expect("the detail pane is open");
+    let pod = flint_core::ObjectDetail {
+        object: json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "demo", "uid": format!("uid-{name}")},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "restartCount": 0},
+                {"name": "sidecar", "restartCount": 0}
+            ]}
+        }),
+        yaml: String::new(),
+        managed_fields: None,
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    };
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| d.show_fetched(pod, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+// covers UP-30: a container argument lists the shown pod's containers.
+#[gpui_kit::test]
+async fn the_container_step_lists_the_pods_containers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    show_pod(cx, &t, "web").await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "open container logs");
+    assert_eq!(selected(&shown(cx, &t)), "Open Container Logs…");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.argument.as_deref(), Some("container"));
+    assert_eq!(labels(&palette), ["app", "sidecar"]);
+    t.type_text(cx, "side");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let dock = t.workspace.read_with(cx, |ws, _| ws.dock_view());
+    let titles: Vec<String> = dock.read_with(cx, |dock, cx| {
+        dock.tab_ids()
+            .into_iter()
+            .map(|id| dock.tab(id).unwrap().item(cx).tab_title().to_string())
+            .collect()
+    });
+    assert_eq!(titles, ["web · sidecar"]);
+}
+
+// covers UP-30: Esc, or Backspace in the empty field, goes back a step and keeps the earlier
+// picks; back at the actions, the query that found the action is there again.
+#[gpui_kit::test]
+async fn esc_and_backspace_go_back_a_step(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "label selector");
+    t.press(cx, "enter");
+    t.type_text(cx, "demo");
+    t.press(cx, "enter");
+    assert_eq!(shown(cx, &t).argument.as_deref(), Some("selector"));
+    // Esc: back to the namespace, the pick undone.
+    t.press(cx, "escape");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.argument.as_deref(), Some("namespace"));
+    assert_eq!(
+        palette.step.as_deref(),
+        Some("Open Logs by Label Selector…")
+    );
+    assert_eq!(palette.query, "");
+    // Forward again, then Backspace in the empty selector field goes back too.
+    t.type_text(cx, "prod");
+    t.press(cx, "enter");
+    t.type_text(cx, "a");
+    t.press(cx, "backspace");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.query, "", "the first Backspace deletes, as usual");
+    assert_eq!(palette.argument.as_deref(), Some("selector"));
+    t.press(cx, "backspace");
+    assert_eq!(shown(cx, &t).argument.as_deref(), Some("namespace"));
+    t.press(cx, "backspace");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.step, None, "back at the actions");
+    assert_eq!(palette.query, "label selector");
+    assert_eq!(selected(&palette), "Open Logs by Label Selector…");
+    // At the actions, Esc closes.
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+}
+
+// covers UP-30: when the text typed is not one of the values listed, it comes first and is
+// selected, so Enter on "kube" takes "kube", not "kube-system".
+#[gpui_kit::test]
+async fn typed_text_comes_before_listed_values(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    t.workspace.update(cx, |ws, _| {
+        ws.set_namespaces_for_tests(vec!["demo".into(), "kube-system".into()])
+    });
+    open_palette(cx, &t).await;
+    t.type_text(cx, "add namespace");
+    t.press(cx, "enter");
+    assert_eq!(labels(&shown(cx, &t)), ["demo", "kube-system"]);
+    t.type_text(cx, "kube");
+    let palette = shown(cx, &t);
+    assert_eq!(labels(&palette), ["“kube”", "kube-system"]);
+    assert_eq!(palette.selected, Some(0));
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let filter = t
+        .workspace
+        .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()));
+    assert_eq!(filter, ["kube"]);
+}
+
+// covers UP-30: a pick list with nothing in it says so, and Enter does nothing.
+#[gpui_kit::test]
+async fn an_empty_pick_list_says_so(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    // Alpha never answers, so discovery never finishes: no kinds yet.
+    t.activate(cx, "alpha").await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "open kind");
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert!(palette.rows.is_empty());
+    assert_eq!(
+        palette.footer.as_deref(),
+        Some("No kinds (discovery has not finished)")
+    );
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(palette.error, None);
+    assert_eq!(palette.argument.as_deref(), Some("kind"));
+    // With some listed, a query that matches none says so.
+    t.press(cx, "escape");
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    open_palette(cx, &t).await;
+    t.type_text(cx, "select cluster");
+    t.press(cx, "enter");
+    t.type_text(cx, "zzz");
+    assert_eq!(shown(cx, &t).footer.as_deref(), Some("Nothing matches"));
+}
+
+// covers UP-30: opened from a menu that closes as the palette takes focus, the palette lists
+// and runs actions from the workspace instead: a workspace action and an App one both work.
+#[gpui_kit::test]
+async fn a_closed_menu_behind_the_palette_does_not_strand_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (_, _shell) = crate::ui::support_tests::open_fake_shell(cx, &t);
+    t.dispatch(cx, "dock::ShowTabList", Value::Null).unwrap();
+    assert_eq!(state(cx, &t).1, Focus::Menu);
+    open_palette(cx, &t).await;
+    // The tab list closes behind the palette (its entry picked elsewhere, say): the focus the
+    // palette came from is no longer drawn.
+    close_tab_list(cx, &t);
+    let workspace = t.workspace.clone();
+    let menu = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| ws.view_state(window, cx).menu)
+        })
+        .unwrap();
+    assert!(menu.is_none(), "{menu:?}");
+    let palette = shown(cx, &t);
+    let all = labels(&palette);
+    assert!(all.contains(&"Toggle Dock"), "{all:?}");
+    assert!(all.contains(&"Quit Flint"), "{all:?}");
+
+    // A workspace action.
+    t.type_text(cx, "toggle dock");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let dock = t.workspace.read_with(cx, |ws, _| ws.dock_view());
+    assert!(!dock.read_with(cx, |d, _| d.is_visible()), "the dock hid");
+    assert_eq!(state(cx, &t).1, Focus::Workspace);
+
+    // An App one, from the same stale focus: Quit asks first, since a shell runs.
+    t.dispatch(cx, "dock::ShowTabList", Value::Null).unwrap();
+    open_palette(cx, &t).await;
+    close_tab_list(cx, &t);
+    t.type_text(cx, "quit flint");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    t.dispatch(cx, "ui::Cancel", Value::Null).unwrap();
+}
+
+/// Dismisses the dock's tab list, as picking an entry or clicking elsewhere does.
+fn close_tab_list(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let dock = t.workspace.read_with(cx, |ws, _| ws.dock_view());
+    let menu = dock
+        .read_with(cx, |d, _| d.tab_menu_for_tests())
+        .expect("the tab list is open");
+    menu.update(cx, |_, cx| cx.emit(gpui_kit::DismissEvent));
+    cx.run_until_parked();
+}
+
+// covers UP-30: the window going to the background (Cmd-Tab) keeps the palette open, as a
+// dialog stays; Esc then closes it and gives focus back.
+#[gpui_kit::test]
+async fn the_palette_stays_open_while_the_window_is_inactive(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    let list = t.list(cx).unwrap();
+    let list_focus = list.read_with(cx, |l, _| l.focus_handle().clone());
+    cx.update_window(t.window, |_, window, cx| window.focus(&list_focus, cx))
+        .unwrap();
+    let active = |cx: &mut TestAppContext| {
+        cx.update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.is_window_active()
+        })
+        .unwrap()
+    };
+    cx.update_window(t.window, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert!(active(cx));
+    open_palette(cx, &t).await;
+    t.type_text(cx, "focus");
+    gpui_kit::VisualTestContext::from_window(t.window, cx).deactivate_window();
+    assert!(!active(cx), "the window went to the background");
+    cx.run_until_parked();
+    assert!(palette(cx, &t).is_some(), "still open in the background");
+    cx.update_window(t.window, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let (palette, focus) = state(cx, &t);
+    assert_eq!(palette.expect("still open").query, "focus");
+    assert_eq!(focus, Focus::Palette);
+    t.press(cx, "escape");
+    assert!(palette_closed(cx, &t));
+    assert!(list_focus_is_focused(cx, &t, &list_focus));
+}
+
+// Edit > Copy and Paste act in a shell tab (its own copy and paste), and the palette lists
+// them there; Cut and Select All are not.
+#[gpui_kit::test]
+async fn edit_copy_and_paste_work_in_a_shell_tab(cx: &mut TestAppContext) {
+    use gpui_kit::ClipboardItem;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let (_, mut shell) = crate::ui::support_tests::open_fake_shell(cx, &t);
+    assert_eq!(state(cx, &t).1, Focus::Shell);
+    open_palette(cx, &t).await;
+    let all = labels(&shown(cx, &t))
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>();
+    assert!(all.iter().any(|l| l == "Copy"), "{all:?}");
+    assert!(all.iter().any(|l| l == "Paste"), "{all:?}");
+    assert!(
+        !all.iter().any(|l| l == "Cut" || l == "Select All"),
+        "{all:?}"
+    );
+    // Not a second Cmd-C next to Copy Terminal Selection: Copy's key is a text field's.
+    let copy = shown(cx, &t)
+        .rows
+        .into_iter()
+        .find(|r| r.label == "Copy")
+        .unwrap();
+    assert_eq!(copy.shortcut, None);
+    t.press(cx, "escape");
+
+    cx.write_to_clipboard(ClipboardItem::new_string("echo one".into()));
+    shell.clear_written();
+    t.dispatch(cx, "input::Paste", Value::Null).unwrap();
+    shell.pump();
+    assert_eq!(shell.written(), b"echo one");
+}

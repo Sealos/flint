@@ -62,6 +62,14 @@ impl ResourceList {
         }
     }
 
+    /// The names of the columns drawn, left to right: what [`SortBy`] takes.
+    pub(in crate::ui) fn drawn_column_names(&self) -> Vec<String> {
+        self.drawn
+            .iter()
+            .map(|&(col, _)| self.shown.columns[col].name.to_string())
+            .collect()
+    }
+
     /// [`ToggleWide`] does something only when the kind has `-o wide` columns.
     pub(in crate::ui) fn has_wide_columns(&self) -> bool {
         list_model::has_wide_columns(&self.shown.columns)

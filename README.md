@@ -140,10 +140,40 @@ TMPDIR=$(mktemp -d) APPIMAGE_EXTRACT_AND_RUN=1 flint
 ```
 
 The AppImage is unsigned; the `.sha256` file is the check.
-On Linux there is no menu bar: Quit is Ctrl-Q, Close Window is Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the
-window when the dock shows none; inside a shell tab Ctrl-W goes to the shell and Ctrl-Shift-W closes the tab, as in
-Linux terminals), and every Cmd shortcut is Ctrl. Settings and
+On Linux there is no menu bar: the command palette (Ctrl-Shift-P) has every menu item, Quit is Ctrl-Q, Close Window is
+Ctrl-Shift-W (Ctrl-W closes the active dock tab, or the window when the dock shows none; inside a shell tab Ctrl-W goes
+to the shell and Ctrl-Shift-W closes the tab, as in Linux terminals), and every Cmd shortcut is Ctrl. Settings and
 state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
+
+## Keys
+
+Cmd-Shift-P opens the command palette: type part of any action's name and press Enter. It lists only what can run
+now, with each action's shortcut, and asks for what an action needs (a cluster, a namespace, a kind, a column, a
+label selector). These are the default keys on macOS; on Linux, Cmd is Ctrl.
+
+| Key | Action | Where |
+|---|---|---|
+| ⇧⌘P | Show Command Palette (again to close it) | anywhere |
+| ↑ ↓ or ⌃P ⌃N, ⏎, ⎋ | Move, run the selected action, close (or go back a step) | in the palette |
+| ⌘F | Focus Filter | a list |
+| ↑ ↓, Home, End | Select the previous, next, first, last row | a list |
+| ⎋ | Close Detail | the detail pane |
+| ⌘1, ⌘2 | Show Overview, Show YAML | the detail pane |
+| ⌘R | Refresh Object; Retry Connection; Reconnect Logs or Restart Shell | the detail pane; a failed cluster; the dock |
+| ⌘L, ⇧⌘L | Open Logs, Open Previous Logs | the selected pod or workload |
+| ⇧⌘E | Open Shell | the selected pod or workload |
+| ⌘J, ⇧⌘J | Toggle Dock, Show Dock Tabs | anywhere |
+| ⌃⇥, ⌃⇧⇥ | Next, Previous Dock Tab | the dock |
+| ⌘W, ⇧⌘W | Close Dock Tab (the window when no tab is shown), Close Window | anywhere |
+| ␣, T, P, W | Toggle Pause, Timestamps, Pod Prefix, Line Wrap | a log tab |
+| ⌘F, ⌘G, ⇧⌘G | Search Logs, Next Match, Previous Match | a log tab |
+| ⌘S, ⇧⌘S, ⌥⌘S | Save Logs, Save Matching Lines, Save Selected Lines | a log tab |
+| ↑ ↓, ⇧↑ ⇧↓, ⌘A, ⌘C, ⎋ | Select a line, extend the selection, select all, copy, clear | a log tab |
+| ⇧⇞ ⇧⇟, ⇧↖ ⇧↘ | Scroll a page, to the top or bottom | a shell tab |
+| ⌘C, ⌘V | Copy, Paste (Ctrl-Shift-C, Ctrl-Shift-V on Linux; Edit > Copy and Paste too) | a shell tab |
+| ⌘X, ⌘C, ⌘V, ⌘A | Cut, Copy, Paste, Select All | a text field |
+| ⌘H, ⌥⌘H | Hide Flint, Hide Others (macOS only) | anywhere |
+| ⌘Q | Quit Flint | anywhere |
 
 ## Build and run
 

@@ -41,6 +41,16 @@ impl Workspace {
         self.dock.clone()
     }
 
+    /// Sets the active cluster's namespace names, as the namespace watch would.
+    pub(in crate::ui) fn set_namespaces_for_tests(&mut self, names: Vec<String>) {
+        self.namespaces = names;
+    }
+
+    /// The command palette, while it is open.
+    pub(in crate::ui) fn palette_view(&self) -> Option<Entity<crate::ui::palette::CommandPalette>> {
+        self.palette.as_ref().map(|(p, _)| p.clone())
+    }
+
     /// The namespace filter remembered for `cluster`.
     pub(in crate::ui) fn namespace_filter_of(&self, cluster: &ClusterId) -> Vec<String> {
         self.ui_state.namespace_filter(cluster).to_vec()

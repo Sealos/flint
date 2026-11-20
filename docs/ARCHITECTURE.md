@@ -513,8 +513,8 @@ opens in its first ready pod by name.
 - The workspace forwards these actions to the detail pane showing when they arrive (`registry::ForwardCurrent`), not
   the one last drawn, so a key right after moving to another row acts on that row.
 
-`logs::OpenSelectorLogs` (palette) opens a label selector's pods on the active cluster; core refuses an empty
-selector.
+`logs::OpenSelectorLogs` (palette: Open Logs by Label Selector…, which asks for the namespace and then the selector)
+opens a label selector's pods on the active cluster; core refuses an empty selector.
 
 ### Exec terminal
 
@@ -711,15 +711,51 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 - **Theme tokens only:** views take every color from theme tokens and never hard-code one. This applies from M0
   onward, so the M1.5 theme work does not mean restyling every view.
 - **Keys:** default keys use GPUI's `secondary-` modifier, which is Cmd on macOS and Ctrl on Linux, so the shortcuts
-  below read Ctrl-… on Linux. Linux has no menu bar: Quit and Close Window work by their keys, and View > Appearance only through the
-  `appearance` setting until the palette exists; then the palette reaches every menu item.
-- **Command palette (Cmd-Shift-P):** a fuzzy search over every action. Each feature registers its actions, such as
-  switch cluster, change namespace, toggle watch mode, toggle Expose to AI, disconnect a cluster, open the diagram,
-  or analyze the selected log lines.
+  below read Ctrl-… on Linux. Linux has no menu bar: Quit and Close Window work by their keys, and the palette
+  (Ctrl-Shift-P) reaches every menu item, View > Appearance included.
+- **Menus (macOS):** the standard ones, every item a registered action in category Flint. The app menu has About
+  Flint, Hide Flint (Cmd-H), Hide Others (Option-Cmd-H), Show All and Quit; Edit has Cut, Copy, Paste and Select All,
+  which the focused text field handles (the list filter, the namespace field, the log search, the palette), and
+  Copy and Paste also a shell tab; View has
+  Show Command Palette and Appearance; Window has Close Dock Tab and Close Window. The Edit actions are bound only in
+  a text field's key context (`Input`), so a shell tab keeps Cmd-C and Cmd-V for itself (and Linux shells keep Ctrl-C,
+  Ctrl-V, Ctrl-X and Ctrl-A, which are in `TERMINAL_PASSTHROUGH`). Hide has no key on Linux, where Ctrl-H is a
+  shell's backspace.
+- **Command palette (Cmd-Shift-P, `ui/palette.rs`):** a fuzzy search over every action that is available where
+  focus was when it opened: `registry::available_in(previous_focus)`, palette-visible actions only, through the
+  registry's guards, so it never offers what would do nothing. Each row shows the label, the category and the
+  shortcut that works there (`ActionSpec::shortcut_in`, only bindings whose key context applies at that focus), in a
+  column of its own so the categories line up. Typing filters (a subsequence match, ignoring case, that prefers word
+  starts and runs, `palette_model.rs`); the arrows or Ctrl-N and Ctrl-P move the selection; Enter or a click runs
+  it; Esc or a click outside closes it and gives focus back. With no query, recently run actions come first (for the
+  app session); with one, the closer match wins and recency only breaks ties.
+  - Where from: the focus before the palette opened, while it is still drawn in the workspace; once it is not (a
+    menu that closed behind the palette), the workspace's focus target, as `registry::perform` uses. GPUI would
+    otherwise treat the stale focus as the window's root, where Flint's actions are refused and App ones lost.
+  - Running: the palette checks the action from there (`registry::check_in`), gives focus back, closes, and
+    dispatches it there (`registry::dispatch_in`), exactly as its key would. A refusal (the guard's reason) stays
+    in the palette's footer instead of closing it.
+  - Arguments: an action that takes them (Select Cluster…, Open Kind…, Sort by Column…, Open Logs by Label
+    Selector…, the namespace and container ones) asks for each required one in turn: a list of the clusters,
+    namespaces, kinds the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label
+    selector). Where a typed value is allowed (a namespace not listed, a selector), the text typed is the first row
+    and selected unless it equals a listed value. An empty pick list says so ("No clusters", "No containers").
+    Optional arguments keep their defaults. The heading shows the action and the picks so far; Esc, or Backspace in
+    the empty field, goes back a step keeping the earlier picks, and back to the actions with the query that found it.
+  - The Edit actions are listed only where they act: in a text field, or in a shell tab, which handles Edit > Copy and
+    Edit > Paste with its own copy and paste (the paste checks included). gpui-component's root handles Copy for text
+    selected anywhere, so availability alone would list it everywhere.
+  - The window going to the background (Cmd-Tab, Hide) keeps the palette open, as a dialog stays; focus moving
+    elsewhere in the window closes it.
+  - Speed: matching runs when the query changes, never while drawing, over labels prepared when the palette opens,
+    with a cheap subsequence pass before the scoring; the rows are a virtual list, so long argument lists (thousands
+    of namespaces) stay within a frame per keystroke.
+  - Later features register their actions and the palette lists them: change namespace, toggle watch mode, toggle
+    Expose to AI, disconnect a cluster, open the diagram, analyze the selected log lines.
 - **Action registry (`flint-app/src/ui/registry.rs`):** every interactive control is a named GPUI action with a Title
-  Case label, a description, a category (Flint, Cluster, Namespace, View, List, Detail), typed arguments (so a palette
-  can offer pickers), default keys, and whether the palette shows it (automation-only actions such as a pane width or
-  a column header are hidden).
+  Case label, a description, a category (Flint, Cluster, Namespace, View, List, Detail, Logs, Terminal), typed
+  arguments (so a palette can offer pickers), default keys, and whether the palette shows it (automation-only actions
+  such as a pane width, a row or a log line by id are hidden).
   - Views own the handlers and list them once (a `bind_actions` function per view). The workspace also forwards the
     list's, the detail pane's and the navigation's actions, so they and their keys work wherever focus is.
   - The workspace installs guards: when each action is enabled, and whether given arguments would do anything.
@@ -728,8 +764,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   - Every click is `registry::on_click(action)`, so clicks, keys, the palette and the test automation channel take
     one path. `scripts/check-click-actions.sh` (CI) fails on a click handler that is not.
   - Plain keys (arrows, Esc) are bound in `Workspace && !Input`, so they never fire while typing in a field.
-  - A palette lists `registry::available_in(previous_focus)` with `ActionSpec::shortcut` (the live binding), and
-    dispatches with `registry::dispatch_in(previous_focus, …)`.
+  - The palette lists `registry::available_in(previous_focus)` with `ActionSpec::shortcut` (the live binding), and
+    dispatches with `registry::dispatch_in(previous_focus, …)`. Its own keys (`palette::*`) are registry actions too,
+    bound in `CommandPalette > Input` so they win over the search field's arrows, Enter and Esc, and hidden from it.
   - A new control is not done until it is in the registry; a unit test per view checks that it binds every action
     of its scope.
 - **Resource switcher (Cmd-P):** fuzzy search over the kinds and objects of the active cluster, jumping straight to

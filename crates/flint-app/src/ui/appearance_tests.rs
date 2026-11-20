@@ -81,7 +81,10 @@ fn checked(cx: &mut TestAppContext) -> Vec<String> {
     use gpui_kit::OwnedMenuItem;
     let menus = cx.update(|cx| cx.get_menus()).unwrap();
     let view = menus.iter().find(|menu| menu.name == "View").unwrap();
-    let Some(OwnedMenuItem::Submenu(appearance)) = view.items.first() else {
+    let Some(appearance) = view.items.iter().find_map(|item| match item {
+        OwnedMenuItem::Submenu(menu) if menu.name == "Appearance" => Some(menu),
+        _ => None,
+    }) else {
         panic!("View has no Appearance submenu");
     };
     appearance

@@ -69,6 +69,7 @@ The tests sit next to the view they test, as child modules, so they can read its
 | Workspace actions, focus, typing, Close Window | `ui/workspace_tests.rs` | (the registry across views) |
 | Cmd-W, Close Window and Quit with dock sessions | `ui/closing_tests.rs` | UP-42 |
 | Appearance | `ui/appearance_tests.rs` | UP-32 |
+| Command palette, About Flint, the Edit actions | `ui/palette_tests.rs`, `ui/palette_model.rs` | UP-30, UP-45 |
 
 Together they cover the UI parts of UP-01, 02, 07, 08, 20, 21, 23, 24, 25 and 27, and part of UP-22: a CRD appears
 under its API group and opens. The rest needs a real API server, so it stays in the cluster tests: UP-22's printer
@@ -134,8 +135,8 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     (`row-<uid>`); right-clicking it selects the row and opens its menu, which `state.menu` then lists. `rejected`
     when no element, or more than one, is drawn with that id, or it is out of view (rows are virtualized).
   - `state`: the visible view tree: `focus` (`workspace`, `list`, `list_filter`, `namespace_input`, `detail_yaml`,
-    `dock`, `log`, `log_search`, `shell`, `dialog`, `menu`, `other` or `none`), `dialog` (`{title, text, buttons}`
-    while one is open: Expose to AI, Save logs, a multi-line paste), `appearance`,
+    `dock`, `log`, `log_search`, `shell`, `dialog`, `menu`, `palette`, `other` or `none`), `dialog` (`{title, text,
+    buttons}` while one is open: Expose to AI, Save logs, a multi-line paste, About Flint with only `OK`), `appearance`,
     `kubeconfig` (`{loaded, paths, env}`), `clusters` (with each one's `label`, `connection`, and `presence`: `live`
     only for the watched cluster, `idle` for one connected but not watched), sidebar `banners`, `active_cluster`,
     `main` (`no_contexts` when no kubeconfig file had a context), `header` (`namespace_button` and `watch_mode` are
@@ -143,7 +144,7 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     entries of open ones), `list` (`count` as the toolbar shows it, columns as drawn and up to 500 rows in display
     order, each with its element `id`, `cells` and `cells_by_column`, Secret cells masked, with its `banners` and
     `placeholder`), `detail` (which object, tab, fetch state, and its sections with entry counts; never values),
-    `dock` and `menu` (below). Errors in it are sanitized summaries. The JSON is stable: fields are added, never
+    `dock`, `menu` and `palette` (below). Errors in it are sanitized summaries. The JSON is stable: fields are added, never
     renamed or removed without updating the tests that read them.
   - `state.dock`: `{visible, height, focused, active, tabs}`. `height` is in points (what the dock gets when shown,
     if hidden); `active` is the shown tab's id, which `dock::ActivateTab` and `dock::CloseTab` take. Each tab:
@@ -174,6 +175,13 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     - Any other menu lists its drawn entries with `owner` null: a separator is left out, but a note cannot be told
       from an entry, and `enabled` is false only where the drawing says the entry is disabled.
     - Focus is `menu` while one is open, also when it is drawn inside a dock tab.
+  - `state.palette`: the open command palette, or null: `{query, action, step, argument, rows: [{label, action,
+    detail, shortcut}], total, selected, footer, error}`. `action` is the name of the action whose `argument` it asks
+    for (`logs::OpenSelectorLogs`), and `step` the heading shown then (its label and the picks so far: `Open Logs by
+    Label Selector… · demo`); both are null while it lists actions. A row's `action` is its action's name; `detail`
+    is an action's category, a choice's detail, or `typed` for the text typed; at most 200 rows, `total` counting
+    all. Drive it with `press_key` (`secondary-shift-p`, the arrows, `enter`, `escape`, `backspace`) and
+    `type_text`, or the `palette::*` actions.
   - Log lines and the shell's screen are test fixtures (the fake server's lines, a test's commands). They are in the
     state so a test can wait for a line or a prompt; the channel exists only in debug builds with `--features
     automation`, and the state carries no more than that bounded tail.

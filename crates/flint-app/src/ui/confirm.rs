@@ -16,6 +16,7 @@ pub struct DialogText {
     pub title: String,
     pub text: String,
     pub ok: String,
+    /// The Cancel button's text; empty for a notice with only OK (About Flint).
     pub cancel: String,
     /// The element id of the description, for view tests.
     pub id: &'static str,
@@ -69,6 +70,7 @@ pub fn open(
             )
             .ok_text(dialog.ok.clone())
             .cancel_text(dialog.cancel.clone())
+            .when(dialog.cancel.is_empty(), |this| this.show_cancel(false))
             .when_some(default_cancel.as_ref(), |this, focus| {
                 this.keyboard(false)
                     .footer(default_cancel_footer(&dialog, focus))

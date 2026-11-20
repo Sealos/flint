@@ -208,9 +208,15 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ## M1.5: Look and keyboard
 
 ### UP-30 Command palette
-- **When** I press Cmd-Shift-P and type part of an action name.
-- **Then** matching actions appear with their shortcuts, and Enter runs the selected one.
-- Tests: ui.
+- **When** I press Cmd-Shift-P (Ctrl-Shift-P on Linux) and type part of an action name.
+- **Then** only actions that can run now are listed, each with its category and shortcut, the ones I ran recently
+  first; typing filters them as I type, loosely ("opl" finds Open Logs), and the closest match comes first. The arrows
+  or Ctrl-N and Ctrl-P move the selection, Enter (or a click) runs it where focus was before the palette opened, and
+  Esc closes the palette and puts focus back. An action that needs something asks for it next: a cluster, a namespace
+  (one I type is fine, and what I typed comes first), a kind, a column or a container from a list, or typed text such
+  as a label selector; the heading shows what I picked so far, and Esc or Backspace in the empty field goes back a
+  step. If it cannot run, the palette says why and stays open. Switching to another app and back keeps it open. Every menu item is in the palette, so on Linux, where there is no menu bar, it reaches them all.
+- Tests: unit (matching and ranking), ui.
 
 ### UP-31 Jump to a resource
 - **When** I press Cmd-P and type part of a kind or object name.
@@ -300,7 +306,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-45 Follow a workload's logs
 - **When** I open logs for a Deployment, StatefulSet, DaemonSet, ReplicaSet or Job (Logs on its row or in its detail
-  pane, or Cmd-L), or for a label selector (Open Logs by Label Selector in the palette).
+  pane, or Cmd-L), or for a label selector (Open Logs by Label Selector in the palette, which asks for the namespace
+  and then the selector).
 - **Then** one tab, titled with the kind and name, shows the lines of every pod and container merged in arrival order, each prefixed with its pod (the
   part of its name that tells it from the others, and its container when it has several) in a colour of its own; the
   full pod and container are on hover and in copies, and the prefix can be hidden. Pods that start, restart or replace deleted ones are followed without

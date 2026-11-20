@@ -13,24 +13,29 @@ use flint_core::{
 };
 use gpui_kit::*;
 
+use std::rc::Rc;
+
+use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::Dock;
 use super::super::focus::release_unfocused_input;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
+use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, PaletteEvent};
 use super::super::registry::{
-    ActionError, ActivateTab, AddNamespace, Bind, ClearSelection, Close, CloseActiveTab,
-    CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly,
-    DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusSearch,
-    Forward, ForwardCurrent, Guards, HideFromAi, JumpToEnd, JumpToStart, LeaveSearch, NextMatch,
-    NextTab, OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs,
-    OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
-    Refresh, RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope,
-    SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
-    SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
-    SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
-    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
+    About, ActionError, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection, Close,
+    CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
+    DefaultWatchOpenViewsOnly, DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp,
+    FocusFilter, FocusSearch, Forward, ForwardCurrent, Guards, Hide, HideFromAi, HideOthers,
+    JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
+    OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenSelectorLogs, OpenShell, OpenView,
+    PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, RestartShell, RetryConnection,
+    SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines, ScrollPageDown,
+    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines, SelectCluster, SelectFirst,
+    SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev, SelectPrevLine, SelectRow,
+    SelectText, SetDockHeight, SetNamespaces, SetPaneWidth, ShowAll, ShowAllNamespaces,
+    ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations, ToggleCommandPalette,
     ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause,
     ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
     UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
@@ -54,7 +59,9 @@ macro_rules! view_open {
 impl Workspace {
     /// Every workspace action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
-        bind.bind::<SelectCluster>(Self::select_cluster)
+        bind.bind::<ToggleCommandPalette>(Self::toggle_palette)
+            .bind::<About>(Self::about)
+            .bind::<SelectCluster>(Self::select_cluster)
             .bind::<ExposeToAi>(Self::expose_to_ai)
             .bind::<HideFromAi>(Self::hide_from_ai)
             .bind::<RetryConnection>(Self::retry_connection)
@@ -121,6 +128,10 @@ impl Workspace {
     /// whether its arguments would do anything. The handlers use the same checks.
     pub(super) fn guards(this: WeakEntity<Self>) -> Guards<Self> {
         Guards::new(this)
+            // macOS has these in its app menu; Linux desktops have nothing they would do.
+            .when::<Hide>(|_, _| cfg!(target_os = "macos"))
+            .when::<HideOthers>(|_, _| cfg!(target_os = "macos"))
+            .when::<ShowAll>(|_, _| cfg!(target_os = "macos"))
             .add::<SelectCluster>(
                 |_, _| true,
                 |ws, a, cx| ws.check_cluster::<SelectCluster>(&a.cluster, cx),
@@ -315,6 +326,139 @@ impl Workspace {
                     None => Err(ActionError::unavailable::<DragSelection>()),
                 },
             )
+    }
+
+    /// Opens the command palette over the actions available where focus is, or closes it.
+    fn toggle_palette(
+        &mut self,
+        _: &ToggleCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((palette, _)) = self.palette.take() {
+            let previous = palette.read(cx).origin(window);
+            window.focus(&previous, cx);
+            release_unfocused_input(window, cx);
+            cx.notify();
+            return;
+        }
+        let previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        let this = cx.weak_entity();
+        let choices: ChoiceSource = Rc::new(move |arg, cx| match this.upgrade() {
+            Some(ws) => ws.read(cx).palette_choices(arg, cx),
+            None => ArgInput::Text,
+        });
+        let palette =
+            cx.new(|cx| CommandPalette::new(previous, self.focus.clone(), choices, window, cx));
+        let dismissed = cx.subscribe_in(
+            &palette,
+            window,
+            |this, _, event: &PaletteEvent, window, cx| match event {
+                PaletteEvent::Dismissed => {
+                    this.palette = None;
+                    // Focus went back (or elsewhere): the palette's field must not stay the
+                    // window's focused one.
+                    release_unfocused_input(window, cx);
+                    cx.notify();
+                }
+            },
+        );
+        self.palette = Some((palette.clone(), dismissed));
+        // Listing reads the guards, which read this workspace: once this update is done.
+        window.defer(cx, move |window, cx| {
+            palette.update(cx, |palette, cx| palette.load(window, cx))
+        });
+        cx.notify();
+    }
+
+    /// What the palette offers for an argument of an action: the values it can take now, or
+    /// text to type.
+    pub(in crate::ui) fn palette_choices(&self, arg: &Arg, cx: &App) -> ArgInput {
+        let model = self.model.read(cx);
+        let choices = |items: Vec<Choice>| ArgInput::Choices { items, free: false };
+        match arg.kind {
+            ArgKind::Cluster => choices(
+                model
+                    .clusters
+                    .iter()
+                    .map(|c| {
+                        let name = c.info.name.clone();
+                        let short = flint_core::display::short_name(&name).to_string();
+                        Choice {
+                            detail: (short != name).then(|| name.clone()),
+                            label: short,
+                            value: name,
+                        }
+                    })
+                    .collect(),
+            ),
+            // Also one the user may not list (Add Namespace to Filter).
+            ArgKind::Namespace => ArgInput::Choices {
+                items: self.namespaces.iter().map(Choice::plain).collect(),
+                free: true,
+            },
+            ArgKind::Kind => {
+                let sections = model
+                    .active
+                    .as_ref()
+                    .and_then(|c| model.discovery.get(c))
+                    .and_then(|d| d.discovery.as_ref())
+                    .map(|d| d.navigation.sections.as_slice())
+                    .unwrap_or_default();
+                choices(
+                    sections
+                        .iter()
+                        .flat_map(|s| &s.entries)
+                        .filter(|e| e.listable)
+                        .map(|e| Choice {
+                            value: e.id.to_string(),
+                            label: e.label.clone(),
+                            detail: Some(e.id.to_string()),
+                        })
+                        .collect(),
+                )
+            }
+            ArgKind::Column => choices(
+                self.list
+                    .as_ref()
+                    .map(|l| l.read(cx).drawn_column_names())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Choice::plain)
+                    .collect(),
+            ),
+            ArgKind::Container => choices(
+                detail(self, cx)
+                    .map(|d| d.log_containers())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| Choice {
+                        value: c.name.clone(),
+                        label: c.name.clone(),
+                        detail: c.init.then(|| "init".to_owned()),
+                    })
+                    .collect(),
+            ),
+            ArgKind::Choice(words) => choices(words.iter().copied().map(Choice::plain).collect()),
+            ArgKind::Bool => choices(vec![
+                Choice {
+                    value: "true".into(),
+                    label: "Yes".into(),
+                    detail: None,
+                },
+                Choice {
+                    value: "false".into(),
+                    label: "No".into(),
+                    detail: None,
+                },
+            ]),
+            ArgKind::Text | ArgKind::Number | ArgKind::List => ArgInput::Text,
+        }
+    }
+
+    /// About Flint: its version, in a dialog with only OK.
+    fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        confirm::open(window, cx, about_dialog(), |_, _| {});
     }
 
     /// Gives focus back after it left with a closed view (or a hidden dock): to the open list,
@@ -675,6 +819,21 @@ fn check_dock_height(action: &SetDockHeight) -> Result<(), ActionError> {
         Err(ActionError::rejected::<SetDockHeight>(
             "height must be positive",
         ))
+    }
+}
+
+/// What About Flint says.
+pub(in crate::ui) fn about_dialog() -> DialogText {
+    DialogText {
+        title: "Flint".into(),
+        text: format!(
+            "Version {}. A native Kubernetes desktop manager.",
+            env!("CARGO_PKG_VERSION")
+        ),
+        ok: "OK".into(),
+        cancel: String::new(),
+        id: "about-text",
+        default_cancel: false,
     }
 }
 

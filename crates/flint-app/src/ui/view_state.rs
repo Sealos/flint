@@ -38,6 +38,8 @@ pub struct AppState {
     pub dock: DockState,
     /// The open context menu, if any.
     pub menu: Option<MenuState>,
+    /// The command palette, while it is open.
+    pub palette: Option<PaletteState>,
 }
 
 /// Where keyboard focus is.
@@ -66,6 +68,8 @@ pub enum Focus {
     Dialog,
     /// A context menu or a drop-down.
     Menu,
+    /// The command palette's search field.
+    Palette,
     /// Something else.
     Other,
     None,
@@ -97,6 +101,45 @@ impl Banner {
             text: text.into(),
         }
     }
+}
+
+/// The open command palette: what was typed, what it asks for, and the rows it lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaletteState {
+    pub query: String,
+    /// The action whose argument it asks for, by name (`logs::OpenSelectorLogs`), or `null`
+    /// while it lists actions.
+    pub action: Option<String>,
+    /// The heading over the field while it asks for an argument: the action's label and what
+    /// was picked so far (`Open Logs by Label Selector… · demo`).
+    pub step: Option<String>,
+    /// The argument asked for, by name (`selector`), with `step`.
+    pub argument: Option<String>,
+    /// The rows in order, at most [`PALETTE_ROWS`].
+    pub rows: Vec<PaletteRowState>,
+    /// How many rows there are in all.
+    pub total: usize,
+    /// The selected row's index, if any row is listed.
+    pub selected: Option<usize>,
+    /// The line under the rows: what the selected action does, or the refusal in `error`.
+    pub footer: Option<String>,
+    /// Why the last Enter did nothing, if it did nothing.
+    pub error: Option<String>,
+}
+
+/// At most this many palette rows are in the state.
+pub const PALETTE_ROWS: usize = 200;
+
+/// A palette row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaletteRowState {
+    pub label: String,
+    /// An action row's action, by name.
+    pub action: Option<String>,
+    /// The action's category, a choice's detail, or `typed` for the text typed.
+    pub detail: Option<String>,
+    /// The action's key, as the OS writes it (`⇧⌘P`).
+    pub shortcut: Option<String>,
 }
 
 /// An open dialog: what it says and the buttons it offers.
