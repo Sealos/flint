@@ -173,8 +173,8 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
     (`settings::ClusterPin`), so a re-pointed context is protected again;
   - clusters unlocked for this session (`protection::SessionUnlocks`): one confirmation naming the context and its
     server, pinned to that server, until Flint quits or Lock Again. Nothing is written to disk.
-- **A `settings.toml` that does not parse** (or a symlink to one that is gone, which is not a fresh install) opens
-  nothing up (`Settings::unreadable_fallback`), at launch and on a
+- **A `settings.toml` that does not parse** (or a symlink to one that is gone, which is not a fresh install, and
+  whose target is watched so restoring it reloads) opens nothing up (`Settings::unreadable_fallback`), at launch and on a
   reload alike: nothing is exposed or trusted, and clusters on this machine are protected too, since the file may
   have asked for that. The sidebar's banner says so. Unknown keys are ignored so newer files load; one within two
   edits of a known key (`protect_local_cluster`) is named in the log, since it would otherwise fail open silently.
@@ -186,7 +186,10 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   unlocks are shared between the front end and the core (`CoreHandle::unlock`, `lock`, `unlocks`), so an unlock
   takes effect before the next action is asked for. Stop Trusting (`CoreHandle::untrust`) revokes the trust in that
   shared state at once, before `Command::SetTrusted` writes the file, since commands and the gate's requests take
-  separate queues; the revocation is dropped once the settings no longer trust the context. Trust goes through
+  separate queues. The revocation is dropped only when settings that were read or written (never the fallback for
+  a broken file) no longer hold a pin for the context, or once a new trust for the confirmed server is checked and
+  saved; a failed write leaves the cluster protected, and the lock menu offers the removal again while a pin is on
+  disk. Trust goes through
   `Command::SetTrusted`, which, like exposure, writes nothing if the context moved since the user confirmed. `flint mcp` stays read-only either way.
 - **In the app.** The sidebar shows a lock button per cluster (`lock-<context>`): a closed lock while protected, an
   open one (in the warning tone) while unlocked, a shield while trusted, nothing for a cluster on this machine. Its
