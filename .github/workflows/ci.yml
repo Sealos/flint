@@ -4,8 +4,6 @@ on:
   push:
     branches: [master]
   pull_request:
-    # labeled: adding the run-macos label starts the macOS job on a PR (see the macos job).
-    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -205,14 +203,18 @@ jobs:
   # Not on PRs by default: it takes about 15 minutes on a runner that costs ten times a Linux
   # one, and linux (flint-app) already runs the app's clippy and tests. It runs on every push to
   # master, so a macOS-only break shows up there before a release is cut. Add the run-macos
-  # label to a PR to run it before merging (for example, macOS-only code or packaging changes).
+  # label to a PR to run it before merging (for example, macOS-only code or packaging changes);
+  # the label counts from the next push, so add it before pushing (labelling alone does not
+  # start CI, which would rerun every other job too). On a labelled PR it runs whatever the
+  # paths are.
   macos:
     name: macos (flint-app)
     needs: changes
     if: >-
-      ${{ !cancelled() &&
-      (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-macos')) &&
-      (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true') }}
+      ${{ !cancelled() && (github.event_name == 'pull_request'
+      && contains(github.event.pull_request.labels.*.name, 'run-macos')
+      || github.event_name != 'pull_request'
+      && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true')) }}
     runs-on: macos-latest
     timeout-minutes: 60
     env:
