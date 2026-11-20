@@ -196,6 +196,7 @@ impl LogView {
     }
 
     pub(super) fn next_match(&mut self, _: &NextMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.catch_up_search(cx);
         let next = self
             .search
             .next_after(self.current_match)
@@ -204,6 +205,7 @@ impl LogView {
     }
 
     pub(super) fn prev_match(&mut self, _: &PrevMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.catch_up_search(cx);
         let prev = self
             .search
             .prev_before(self.current_match)

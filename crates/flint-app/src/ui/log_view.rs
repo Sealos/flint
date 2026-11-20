@@ -11,7 +11,8 @@
 //! - **Pause** freezes the lines shown while the buffer keeps filling; the toolbar counts the
 //!   lines held back. Selecting lines pauses too, until the selection is cleared.
 //! - **Search** runs its first scan on the core's threads ([`CoreHandle::search_logs`]) and then
-//!   keeps up with new lines snapshot by snapshot; matches are highlighted with
+//!   keeps up with new lines when the tab is drawn ([`LogView::catch_up_search`]), so a hidden
+//!   tab scans nothing until it is shown; matches are highlighted with
 //!   [`flint_core::SearchQuery::match_ranges`].
 //! - **Selection** is a [`LineSelection`] of line ids, counted without visiting its lines: copy
 //!   and save write its lines as shown (timestamps only when shown, in full), without
@@ -68,6 +69,10 @@ pub const LINE_HEIGHT: f32 = 18.;
 const REVEAL_CONTEXT: usize = 3;
 /// How long a search query must stay unchanged before the buffer is scanned for it.
 const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+/// A search at most this many lines behind catches up on the UI thread when the tab is drawn
+/// (well under a millisecond); further behind, a tab hidden while its pod was busy, the scan
+/// runs on the core's threads.
+pub const CATCH_UP_ON_UI: u64 = 20_000;
 /// How long a copy or save note stays under the toolbar.
 pub const NOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -132,7 +137,8 @@ pub struct LogView {
     search: LogSearch,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
-    /// The first scan of `query` runs on the core's threads.
+    /// A scan of `search` runs on the core's threads: the first of `query`, or a long
+    /// catch-up.
     searching: bool,
     current_match: Option<LineId>,
     search_input: Entity<InputState>,
@@ -276,8 +282,9 @@ impl LogView {
         self._pump = Task::ready(());
     }
 
-    /// Takes in a newer snapshot of the session: splices the list, keeps the selection on the
-    /// lines still present, and brings the search up to date.
+    /// Takes in a newer snapshot of the session: splices the list and keeps the selection on the
+    /// lines still present. The search catches up when the tab is drawn
+    /// ([`LogView::catch_up_search`]).
     pub fn set_snapshot(&mut self, snapshot: Arc<LogSnapshot>, cx: &mut Context<Self>) {
         let old = &self.snapshot.lines;
         let new = &snapshot.lines;
@@ -318,11 +325,6 @@ impl LogView {
                 self.end_selection();
             }
         }
-        // While a first scan runs, it catches up when it lands; scanning here would scan the
-        // whole buffer on the UI thread.
-        if !self.searching {
-            self.search.update(&lines);
-        }
         if self.current_match.is_some_and(|id| !lines.contains(id)) {
             self.current_match = None;
         }
@@ -362,26 +364,56 @@ impl LogView {
             cx.notify();
             return;
         }
+        // Typing replaces the scan: only a query that stays for a moment scans the buffer.
+        self.scan(LogSearch::new(query), Some(SEARCH_DELAY), cx);
+        cx.notify();
+    }
+
+    /// Brings `search` up to the lines shown on the core's threads, after `delay`. Its result
+    /// is dropped if the query changed meanwhile; lines that arrived meanwhile are caught up
+    /// with when the tab is drawn next.
+    fn scan(
+        &mut self,
+        search: LogSearch,
+        delay: Option<std::time::Duration>,
+        cx: &mut Context<Self>,
+    ) {
         self.searching = true;
         let generation = self.search_generation;
         let core = self.core.clone();
         self._search = cx.spawn(async move |this, cx| {
-            // Typing replaces this task: only a query that stays for a moment scans the buffer.
-            cx.background_executor().timer(SEARCH_DELAY).await;
+            if let Some(delay) = delay {
+                cx.background_executor().timer(delay).await;
+            }
             let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
                 return;
             };
-            let search = core.search_logs(LogSearch::new(query), lines).await;
+            let search = core.search_logs(search, lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.search_generation == generation {
                     view.search = search;
-                    view.search.update(&view.snapshot.lines);
                     view.searching = false;
                     cx.notify();
                 }
             });
         });
-        cx.notify();
+    }
+
+    /// Brings the search up to the lines shown: before the tab is drawn, and before a match is
+    /// used. Snapshots do not scan, so a hidden tab scans nothing until it is shown again; then
+    /// it catches up at once, or on the core's threads when it is more than
+    /// [`CATCH_UP_ON_UI`] lines behind. Nothing to do while a scan runs: it catches up when it
+    /// lands.
+    pub fn catch_up_search(&mut self, cx: &mut Context<Self>) {
+        if self.searching {
+            return;
+        }
+        let lines = &self.snapshot.lines;
+        if self.search.pending(lines) > CATCH_UP_ON_UI && !self.query.text.is_empty() {
+            self.scan(self.search.clone(), None, cx);
+        } else {
+            self.search.update(lines);
+        }
     }
 
     /// Pauses delivery while the user paused or is selecting.
@@ -507,6 +539,7 @@ impl LogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up_search(cx);
         let save = PendingSave {
             scope,
             format: LineFormat {
@@ -1464,6 +1497,7 @@ impl DockItem for LogView {
 
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.catch_up_search(cx);
         let theme = cx.theme().clone();
         // The toolbar needs the tab's width, known only after layout: when it changed, draw
         // again with the new one.
