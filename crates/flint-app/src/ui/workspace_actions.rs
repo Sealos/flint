@@ -273,7 +273,11 @@ impl Workspace {
             })
             .when::<ShowTabList>(|ws, cx| ws.dock.read(cx).tab_count() > 0)
             .when::<ReconnectLogs>(|ws, cx| ws.dock.read(cx).restartable(true, cx).is_some())
-            .when::<RestartShell>(|ws, cx| ws.dock.read(cx).restartable(false, cx).is_some())
+            // Not on a protected cluster: the tab says why, with Unlock… beside it.
+            .when::<RestartShell>(|ws, cx| {
+                ws.dock.read(cx).restartable(false, cx).is_some()
+                    && shell(ws, cx).is_some_and(|s| s.restart_blocked().is_none())
+            })
             .add::<ActivateTab>(
                 |ws, cx| ws.dock.read(cx).tab_count() > 0,
                 |ws, a, cx| ws.dock.read(cx).check_tab::<ActivateTab>(a.tab),

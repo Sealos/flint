@@ -41,12 +41,14 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::detail::{Opening, refused};
 use super::dock::{DockItem, TabKey, TabStatus, cluster_chip};
 use super::dock_model;
+use super::icons::FlintIcon;
 use super::log_model::Tone;
 use super::log_view::Note;
 use super::notice::{notice, notice_detail, notice_with};
-use super::registry::{self, CopyText, PasteText, RestartShell, ScrollToBottom};
+use super::registry::{self, CopyText, PasteText, RestartShell, ScrollToBottom, UnlockCluster};
 use super::terminal_keys::{self, ALT_IS_META};
 use super::terminal_model::{
     self, CellSize, CursorLook, PADDING, Segment, ShellRequest, WheelLines, cell_at, cursor_look,
@@ -126,6 +128,9 @@ pub struct TerminalView {
     note: Option<Note>,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
+    /// Why Restart Shell cannot run: the tab's cluster is protected (ADR-0015), as the
+    /// workspace says it. Restart shell is disabled, saying so, with Unlock… beside it.
+    protected: Option<String>,
     /// The toolbar's cluster chip, as the dock names the tab's cluster: its label, its tooltip
     /// (the full context and server), and whether the context points elsewhere now.
     chip: (SharedString, SharedString, bool),
@@ -184,6 +189,7 @@ impl TerminalView {
             bell: false,
             note: None,
             ended: None,
+            protected: None,
             chip,
             focus,
             _pump: pump,
@@ -561,19 +567,56 @@ impl TerminalView {
             )
     }
 
+    /// Says why Restart Shell cannot run (the tab's cluster is protected), or `None` once it can.
+    pub(super) fn set_protected(&mut self, why: Option<String>, cx: &mut Context<Self>) {
+        if self.protected != why {
+            self.protected = why;
+            cx.notify();
+        }
+    }
+
+    /// Why Restart Shell cannot run now: the tab's cluster is protected.
+    pub(super) fn restart_blocked(&self) -> Option<&str> {
+        self.protected.as_deref()
+    }
+
     /// The strips under the toolbar: why the command ended, and the last copy.
     fn render_notes(&self, theme: &Theme) -> Vec<AnyElement> {
         let mut notes = Vec::new();
-        let restart = || {
-            Button::new("terminal-restart")
+        let restart = || -> AnyElement {
+            let button = Button::new("terminal-restart")
                 .xsmall()
                 .label("Restart shell")
-                .tab_stop(false)
-                .tooltip(format!(
-                    "Start a new shell in a tab beside this one ({})",
-                    registry::key_hint(registry::RESTART_SHELL[0])
-                ))
-                .on_click(registry::on_click(RestartShell))
+                .tab_stop(false);
+            let Some(why) = &self.protected else {
+                return button
+                    .tooltip(format!(
+                        "Start a new shell in a tab beside this one ({})",
+                        registry::key_hint(registry::RESTART_SHELL[0])
+                    ))
+                    .on_click(registry::on_click(RestartShell))
+                    .into_any_element();
+            };
+            // Disabled, saying why, with the unlock in place (UP-54).
+            h_flex()
+                .gap_1()
+                .child(button.disabled(true).tooltip(why.clone()))
+                .child(
+                    Button::new("terminal-unlock")
+                        .xsmall()
+                        .ghost()
+                        .icon(FlintIcon::Lock)
+                        .label("Unlock…")
+                        .tab_stop(false)
+                        .tooltip(format!(
+                            "Unlock {} until Flint quits, after a confirmation naming its server",
+                            self.request.cluster
+                        ))
+                        .on_click(registry::on_click(UnlockCluster {
+                            cluster: self.request.cluster.clone(),
+                        })),
+                )
+                .into_any_element()
         };
         let ended = match &self.snapshot.state {
             _ if self.ended.is_some() => self.ended.clone().map(|why| (theme.warning, why)),
@@ -612,6 +655,17 @@ impl TerminalView {
                 notice_with("terminal-ended", text, color, restart())
                     .test_support()
                     .into_any_element(),
+            );
+        }
+        if let (Some(why), true) = (&self.protected, self.can_restart()) {
+            notes.push(
+                notice(
+                    "terminal-protected",
+                    refused(Opening::RestartShell, why),
+                    theme.muted_foreground,
+                )
+                .test_support()
+                .into_any_element(),
             );
         }
         if let Some(note) = &self.note {

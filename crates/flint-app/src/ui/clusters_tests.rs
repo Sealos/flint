@@ -215,7 +215,9 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     let banner = t.find(cx, "settings-error").unwrap();
     assert_eq!(
         banner.label(),
-        Some("settings.toml is invalid. Nothing is exposed to AI until it is fixed.")
+        Some(
+            "settings.toml is invalid. Until it is fixed, nothing is exposed to AI or trusted, and clusters on this machine are protected too."
+        )
     );
     assert!(!banner.description().unwrap_or_default().is_empty());
     t.activate(cx, "alpha").await;

@@ -150,6 +150,12 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;
     assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    // Enter cancels too: only the Unlock button unlocks.
+    t.click(cx, "detail-unlock");
+    wait_for_dialog(cx, &t, true).await;
+    t.press(cx, "enter");
+    wait_for_dialog(cx, &t, false).await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
 
     t.click(cx, "detail-unlock");
     wait_for_dialog(cx, &t, true).await;
@@ -194,14 +200,24 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
         m.core().unlocks().is_unlocked("alpha", &t.server)
     }));
     assert_eq!(disabled(cx, &t, "detail-shell"), Some(true));
+    // The failed shell's Restart shell is disabled, saying why, with Unlock… beside it; the key
+    // and the palette find it unavailable.
+    assert_eq!(disabled(cx, &t, "terminal-restart"), Some(true));
+    assert_eq!(disabled(cx, &t, "terminal-unlock"), Some(false));
+    assert!(
+        disabled(cx, &t, "terminal-protected").is_some(),
+        "the note is drawn"
+    );
+    assert_eq!(
+        shell.read_with(cx, |s, _| s.restart_blocked().map(str::to_owned)),
+        Some(why.to_owned())
+    );
     let tabs = t
         .workspace
         .read_with(cx, |ws, cx| ws.dock.read(cx).tab_ids().len());
-    t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
-    cx.run_until_parked();
     assert_eq!(
-        refusal(cx, &t).as_deref(),
-        Some(format!("Can't restart the shell: {why}.").as_str())
+        t.dispatch(cx, "dock::RestartShell", Value::Null),
+        Err(ActionError::NotAvailable("dock::RestartShell".into()))
     );
     assert_eq!(
         t.workspace
@@ -209,6 +225,14 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
         tabs,
         "no tab opened"
     );
+    assert_eq!(refusal(cx, &t), None);
+    // Unlock in place: Restart shell is enabled again.
+    t.click(cx, "terminal-unlock");
+    wait_for_dialog(cx, &t, true).await;
+    t.click(cx, "ok");
+    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    assert_eq!(disabled(cx, &t, "terminal-restart"), Some(false));
+    assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
 }
 
 // covers UP-55: trusting asks first, naming the server, and writes the trust to settings.toml,
@@ -293,6 +317,63 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
         t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "alpha"})),
         Err(ActionError::Rejected { .. })
     ));
+}
+
+// covers UP-55: a trusted context whose cluster entry is gone has no server: it cannot be
+// unlocked or trusted, but its old trust can still be removed from the sidebar.
+#[gpui_kit::test]
+async fn an_old_trust_on_a_context_without_a_server_can_be_removed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "trusted_clusters = [{ context = \"gamma\", server = \"https://10.0.0.3:6443\" }]\n",
+    )
+    .unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let mut files = alpha_and_beta(dir, servers);
+        let lost = dir.join("lost");
+        std::fs::write(
+            &lost,
+            "apiVersion: v1\nkind: Config\nclusters: []\nusers:\n- name: u\n  user: {token: t}\n\
+             contexts:\n- name: gamma\n  context: {cluster: gone, user: u}\n",
+        )
+        .unwrap();
+        files.push(lost);
+        files
+    })
+    .await;
+    assert_eq!(protection(cx, &t, "gamma"), Protection::Protected);
+    assert_eq!(disabled(cx, &t, "lock-gamma"), Some(false));
+    assert!(
+        t.description(cx, "lock-gamma")
+            .unwrap_or_default()
+            .contains("remove its old trust")
+    );
+    for action in ["UnlockCluster", "TrustCluster"] {
+        assert!(
+            matches!(
+                t.dispatch(
+                    cx,
+                    &format!("workspace::{action}"),
+                    json!({"cluster": "gamma"})
+                ),
+                Err(ActionError::Rejected { .. })
+            ),
+            "{action}"
+        );
+    }
+    t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "gamma"}))
+        .unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.trusted_clusters.is_empty()
+    })
+    .await;
+    assert_eq!(
+        disabled(cx, &t, "lock-gamma"),
+        Some(true),
+        "nothing left to do"
+    );
 }
 
 // covers UP-54: clusters on this machine start unlocked: no lock button, Shell enabled, and

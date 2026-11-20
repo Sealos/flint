@@ -1724,7 +1724,8 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Cluster, S::Workspace),
         Spec::with_args::<LockCluster>(
             "Lock Cluster Again…",
-            "Protect a cluster unlocked for this session again: read-only in Flint.",
+            "Protect a cluster unlocked for this session again: read-only in Flint. Shells \
+             already open keep running.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),
@@ -1737,7 +1738,8 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Cluster, S::Workspace),
         Spec::with_args::<UntrustCluster>(
             "Stop Trusting Cluster…",
-            "Protect a trusted cluster again, or remove a stale trust.",
+            "Protect a trusted cluster again, or remove a stale trust. Shells already open keep \
+             running.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),

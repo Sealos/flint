@@ -33,7 +33,7 @@ use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
 };
-use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
+use super::dock::{self, Dock, DockEvent, DockItem as _, DockTab, TabKey};
 use super::dock_model::{LiveSessions, TabCluster};
 use super::focus::release_unfocused_input;
 use super::icons::FlintIcon;
@@ -663,11 +663,25 @@ impl Workspace {
         });
     }
 
+    /// Tells each shell tab whether its cluster is protected, so its Restart shell is disabled,
+    /// saying why, with Unlock… beside it (UP-54).
+    fn tell_shells_protected(&mut self, cx: &mut Context<Self>) {
+        let shells: Vec<_> = self.dock.read(cx).terminals().cloned().collect();
+        for shell in shells {
+            let cluster = shell.read(cx).tab_key().context().to_owned();
+            let why = self
+                .is_protected(&cluster, cx)
+                .then(|| protected_reason(&cluster));
+            shell.update(cx, |s, cx| s.set_protected(why, cx));
+        }
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
+        self.tell_shells_protected(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();
@@ -956,7 +970,7 @@ impl Workspace {
         if let Some(error) = &model.settings_error {
             list = list.child(sidebar_error(
                 "settings-error",
-                "settings.toml is invalid. Nothing is exposed to AI until it is fixed.",
+                "settings.toml is invalid. Until it is fixed, nothing is exposed to AI or trusted, and clusters on this machine are protected too.",
                 error,
                 theme,
             ));
@@ -1654,7 +1668,8 @@ fn render_lock_button(
             button.ghost().icon(FlintIcon::LockOpen),
             "On this machine: unlocked. Click to remove an old trust.",
         ),
-        Protection::Protected if !has_server => {
+        // A context with no server cannot be unlocked or trusted; an old trust can still go.
+        Protection::Protected if !has_server && !(stale_trust && settings_ok) => {
             return Some(
                 button
                     .ghost()
@@ -1664,17 +1679,23 @@ fn render_lock_button(
                     .into_any_element(),
             );
         }
+        Protection::Protected if !has_server => (
+            button.ghost().icon(FlintIcon::Lock),
+            "Protected. This context has no API server now. Click to remove its old trust.",
+        ),
         Protection::Protected => (
             button.ghost().icon(FlintIcon::Lock),
             "Protected: read-only in Flint. Click to unlock or trust it.",
         ),
         Protection::Unlocked => (
             button.warning().icon(FlintIcon::LockOpen),
-            "Unlocked until Flint quits. Click to lock it again or trust it.",
+            "Unlocked until Flint quits. Click to lock it again (shells already open keep \
+             running) or trust it.",
         ),
         Protection::Trusted => (
             button.ghost().icon(FlintIcon::ShieldCheck),
-            "Trusted: unlocked across restarts. Click to stop trusting it.",
+            "Trusted: unlocked across restarts. Click to stop trusting it (shells already open \
+             keep running).",
         ),
     };
     let cluster = name.to_owned();
@@ -1683,7 +1704,7 @@ fn render_lock_button(
             .tooltip(tip)
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                 let cluster = cluster.clone();
-                let protected = protection == Protection::Protected;
+                let protected = protection == Protection::Protected && has_server;
                 let unlocked = protection == Protection::Unlocked;
                 let trusted = protection == Protection::Trusted;
                 menu.when(protected, |menu| {
@@ -1754,13 +1775,15 @@ fn unlock_dialog(context: &str, server: &str) -> DialogText {
         text: format!(
             "Until Flint quits, or until you lock it again, actions that change this cluster or \
              run code in it work without asking again: opening a shell, today. It stays unlocked \
-             only while the context points at this server.\n\n\
+             only while the context points at this server. Locking it again stops new shells; \
+             shells already open keep running.\n\n\
              Context: {context}\nServer: {server}"
         ),
         ok: "Unlock".into(),
         cancel: "Cancel".into(),
         id: "unlock-description",
-        default_cancel: false,
+        // Unlocking takes the button: Enter cancels, as closing and quitting do.
+        default_cancel: true,
     }
 }
 
@@ -1799,7 +1822,8 @@ fn trust_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogTe
         ok: "Trust".into(),
         cancel: "Cancel".into(),
         id: "trust-description",
-        default_cancel: false,
+        // Trusting takes the button: Enter cancels.
+        default_cancel: true,
     }
 }
 
