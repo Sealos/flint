@@ -253,6 +253,41 @@ pub struct HideFromAi {
     pub cluster: String,
 }
 
+/// Change which namespaces and kinds AI agents may read of an exposed cluster: opens the
+/// dialog with its pickers (ADR-0013).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct EditAiScope {
+    pub cluster: String,
+}
+
+actions!(
+    ai_scope,
+    [
+        /// In the AI scope pickers: let agents read every namespace.
+        ScopeAllNamespaces,
+        /// In the AI scope pickers: let agents read every kind.
+        ScopeAllKinds
+    ]
+);
+
+/// In the AI scope pickers: add a namespace to the scope, or take it out.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = ai_scope, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleScopeNamespace {
+    pub namespace: String,
+}
+
+/// In the AI scope pickers: add a kind (`pods`, `deployments.apps`) to the scope, or take it out.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = ai_scope, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleScopeKind {
+    pub kind: String,
+}
+
 /// Ask to unlock a protected cluster until Flint quits: opens the confirmation naming its
 /// server (ADR-0015).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -1520,6 +1555,12 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 }
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const SCOPE_NAMESPACE: &[Arg] = &[arg("namespace", "namespace name", ArgKind::Text)];
+const SCOPE_KIND: &[Arg] = &[arg(
+    "kind",
+    "kind id: plural or plural.group",
+    ArgKind::Text,
+)];
 const NAMESPACE: &[Arg] = &[arg("namespace", "namespace name", ArgKind::Namespace)];
 const KIND: &[Arg] = &[arg(
     "kind",
@@ -1739,6 +1780,38 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),
+        Spec::with_args::<EditAiScope>(
+            "Edit AI Scope…",
+            "Choose which namespaces and kinds AI agents may read of an exposed cluster.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::unit::<ScopeAllNamespaces>(
+            "Scope All Namespaces",
+            "In the AI scope pickers, let agents read every namespace.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::unit::<ScopeAllKinds>(
+            "Scope All Kinds",
+            "In the AI scope pickers, let agents read every kind.",
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::with_args::<ToggleScopeNamespace>(
+            "Toggle Scope Namespace…",
+            "In the AI scope pickers, add a namespace to the scope or take it out.",
+            SCOPE_NAMESPACE,
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
+        Spec::with_args::<ToggleScopeKind>(
+            "Toggle Scope Kind…",
+            "In the AI scope pickers, add a kind (pods, deployments.apps) to the scope or take it out.",
+            SCOPE_KIND,
+        )
+        .of(C::Cluster, S::Dialog)
+        .hidden(),
         Spec::with_args::<UnlockCluster>(
             "Unlock Cluster…",
             "Let Flint change a protected cluster and open shells in it until Flint quits, after \

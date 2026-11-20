@@ -127,15 +127,21 @@ impl ClustersModel {
         self.core.send(command);
     }
 
-    /// Exposes `cluster` at `server`, the URL the user confirmed, in full.
-    pub fn expose_to_ai(&mut self, cluster: ClusterId, server: String) {
+    /// Exposes `cluster` at `server`, the URL the user confirmed, limited to `scope`
+    /// (ADR-0013). For a cluster exposed already, this rewrites its entry with the new scope.
+    pub fn expose_to_ai(&mut self, cluster: ClusterId, server: String, scope: AiScope) {
         self.send(Command::SetAiExposed {
             cluster,
             server: Some(server),
-            scope: AiScope::default(),
+            scope,
         });
     }
 
+    /// What AI agents may read of `cluster`, if it is exposed at the server it points at now.
+    pub fn ai_scope(&self, cluster: &ClusterSummary) -> Option<AiScope> {
+        self.settings
+            .ai_scope(&cluster.info.name, cluster.info.server.as_deref())
+    }
 
     /// Sets the global watch mode (`cluster: None`), or a cluster's override (`mode: None`
     /// removes it). Written to `settings.toml`; the change comes back as a settings event.

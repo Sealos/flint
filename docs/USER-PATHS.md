@@ -122,7 +122,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** the agent sees only those namespaces and kinds. Asking for anything else returns the same "not found" error
   as an unexposed cluster. Cluster-scoped kinds are hidden unless I named them. Clearing the scope exposes everything
   again.
-- Tests: unit (policy), mcp + cluster, ui.
+- Tests: unit (policy), mcp (fake API server), ui.
 
 ### UP-15 Credentials in logs don't reach the agent
 - **When** an agent reads pod logs or events that contain a token, a password pair (also a passphrase of several words

@@ -36,6 +36,7 @@ mod palette;
 mod palette_model;
 mod registry;
 mod row_menu;
+mod scope_picker;
 mod startup;
 #[cfg(test)]
 mod support_tests;

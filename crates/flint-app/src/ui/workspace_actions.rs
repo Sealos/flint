@@ -7,7 +7,7 @@
 //! the active log or shell tab's actions to them, and installs their guards, so those work and
 //! are checked wherever focus is.
 
-use flint_core::settings::{AiExposureState, TrustState};
+use flint_core::settings::{AiExposureState, AiScope, TrustState};
 use flint_core::{
     ClusterSummary, ConnectionState, LogSubject, NavEntry, PodSet, Protection, WatchMode,
     WorkloadTarget,
@@ -25,6 +25,7 @@ use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
 use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, PaletteEvent};
+use super::super::registry::EditAiScope;
 use super::super::registry::{
     About, ActionError, ActionSpec, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection,
     Close, CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
@@ -43,9 +44,12 @@ use super::super::registry::{
     UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{LockCluster, TrustCluster, UnlockCluster, UntrustCluster};
+use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
-use super::{Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog};
+use super::{
+    Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog, scope_dialog,
+};
 
 /// A guard: the view `$view` returns (`log`, `shell`, `detail` or `list_wide`) is open and,
 /// given `$check`, passes it. It expands to a closure that captures nothing, so it is the plain
@@ -67,6 +71,7 @@ impl Workspace {
             .bind::<SelectCluster>(Self::select_cluster)
             .bind::<ExposeToAi>(Self::expose_to_ai)
             .bind::<HideFromAi>(Self::hide_from_ai)
+            .bind::<EditAiScope>(Self::edit_ai_scope)
             .bind::<UnlockCluster>(Self::unlock_cluster)
             .bind::<LockCluster>(Self::lock_cluster)
             .bind::<TrustCluster>(Self::trust_cluster)
@@ -145,6 +150,9 @@ impl Workspace {
             )
             .add::<ExposeToAi>(Self::settings_ok, |ws, a, cx| ws.check_expose(a, cx))
             .add::<HideFromAi>(Self::settings_ok, |ws, a, cx| ws.check_hide(a, cx))
+            .add::<EditAiScope>(Self::settings_ok, |ws, a, cx| {
+                ws.scope_change(a, cx).map(drop)
+            })
             .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
             .add::<LockCluster>(|_, _| true, |ws, a, cx| ws.check_lock(a, cx))
             .add::<TrustCluster>(Self::settings_ok, |ws, a, cx| {
@@ -827,10 +835,90 @@ impl Workspace {
             Ok((server, previous)) => {
                 let model = self.model.clone();
                 let dialog = expose_dialog(&action.cluster, &server, previous.as_deref());
-                confirm_expose(window, cx, model, action.cluster.clone(), server, dialog);
+                let picker = self.scope_picker(&action.cluster, &AiScope::default(), cx);
+                confirm_expose(
+                    window,
+                    cx,
+                    model,
+                    action.cluster.clone(),
+                    server,
+                    dialog,
+                    picker,
+                );
             }
             Err(e) => tracing::warn!("{e}"),
         }
+    }
+
+    /// [`EditAiScope`]: an exposed context, at the server it points at now. Returns the server
+    /// and the scope it has.
+    fn scope_change(
+        &self,
+        action: &EditAiScope,
+        cx: &App,
+    ) -> Result<(String, AiScope), ActionError> {
+        if !self.settings_ok(cx) {
+            return Err(ActionError::rejected::<EditAiScope>(
+                "settings.toml is invalid",
+            ));
+        }
+        self.check_cluster::<EditAiScope>(&action.cluster, cx)?;
+        let cluster = self.cluster_summary(&action.cluster, cx).expect("checked");
+        let model = self.model.read(cx);
+        match (model.ai_scope(cluster), cluster.info.server.clone()) {
+            (Some(scope), Some(server)) => Ok((server, scope)),
+            _ => Err(ActionError::rejected::<EditAiScope>(
+                "the cluster is not exposed to AI agents",
+            )),
+        }
+    }
+
+    /// Opens the scope dialog of an exposed cluster; saving rewrites its entry with the new
+    /// scope.
+    fn edit_ai_scope(&mut self, action: &EditAiScope, window: &mut Window, cx: &mut Context<Self>) {
+        match self.scope_change(action, cx) {
+            Ok((server, scope)) => {
+                let model = self.model.clone();
+                let dialog = scope_dialog(&action.cluster, &server, &scope);
+                let picker = self.scope_picker(&action.cluster, &scope, cx);
+                confirm_expose(
+                    window,
+                    cx,
+                    model,
+                    action.cluster.clone(),
+                    server,
+                    dialog,
+                    picker,
+                );
+            }
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
+    /// The scope pickers for `cluster`, with `scope` checked: its kinds from discovery, and its
+    /// namespaces when it is the active cluster (whose namespaces are watched).
+    fn scope_picker(
+        &self,
+        cluster: &str,
+        scope: &AiScope,
+        cx: &mut Context<Self>,
+    ) -> Entity<ScopePicker> {
+        let kinds = self
+            .model
+            .read(cx)
+            .discovery
+            .get(cluster)
+            .and_then(|d| d.discovery.clone());
+        let namespaces = if self.cluster.as_deref() == Some(cluster) {
+            self.namespaces.clone()
+        } else {
+            Vec::new()
+        };
+        let scope = scope.clone();
+        cx.new(|cx| {
+            let kinds = kinds.as_ref().map_or(&[][..], |d| d.kinds.as_slice());
+            ScopePicker::new(&namespaces, kinds, &scope, cx)
+        })
     }
 
     /// Opens the confirmation naming the context and its server; confirming unlocks it until
@@ -1140,6 +1228,10 @@ mod header_tests;
 #[cfg(test)]
 #[path = "expose_tests.rs"]
 mod expose_tests;
+
+#[cfg(test)]
+#[path = "scope_tests.rs"]
+mod scope_tests;
 
 #[cfg(test)]
 #[path = "protect_tests.rs"]

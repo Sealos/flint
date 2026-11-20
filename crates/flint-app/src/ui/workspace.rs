@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flint_core::redact::safe_error_summary;
-use flint_core::settings::{AiExposureState, PaneWidths, State, TrustState};
+use flint_core::settings::{AiExposureState, AiScope, PaneWidths, State, TrustState};
 use flint_core::{
     ClusterId, ClusterSummary, ConnectionState, KindId, NavEntry, Protection, SyncState, WatchMode,
 };
@@ -42,11 +42,13 @@ use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
 use super::palette::CommandPalette;
 use super::registry::{
-    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
-    LockCluster, RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace, TrustCluster,
-    UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditAiScope, ExposeToAi,
+    HideFromAi, LockCluster, RetryConnection, SelectCluster, ShowAllNamespaces, ToggleNamespace,
+    TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode, WatchAllKinds,
+    WatchOpenViewsOnly,
 };
 use super::row_menu;
+use super::scope_picker::{self, ScopePicker};
 use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
@@ -1017,7 +1019,7 @@ impl Workspace {
         }
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
-            let exposure = model.ai_exposure(cluster);
+            let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
             let protection = (model.protection(cluster), model.trust(cluster));
             list = list.child(self.render_cluster_row(
@@ -1097,7 +1099,7 @@ impl Workspace {
         &self,
         cluster: &ClusterSummary,
         is_active: bool,
-        exposure: AiExposureState,
+        (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
         settings_ok: bool,
         theme: &Theme,
@@ -1118,7 +1120,10 @@ impl Workspace {
         };
         let exposure_text = match &exposure {
             AiExposureState::Hidden => "Hidden from AI agents".to_owned(),
-            AiExposureState::Exposed => "Exposed to AI agents (flint mcp, read-only)".to_owned(),
+            AiExposureState::Exposed => format!(
+                "Exposed to AI agents (flint mcp, read-only): {}",
+                scope_picker::summary(&ai_scope.clone().unwrap_or_default())
+            ),
             AiExposureState::ServerChanged { exposed_server } => format!(
                 "Cluster changed: exposed at {exposed_server}, now points elsewhere. Hidden from \
                  AI agents until you expose it again."
@@ -1209,9 +1214,28 @@ impl Workspace {
                         )
                     }),
             )
-            // Neutral: the toggle next to it already shows the exposure in the accent.
-            .when(exposure.is_exposed(), |row| {
-                row.child(Tag::secondary().outline().xsmall().flex_none().child("AI"))
+            // Neutral: the toggle next to it already shows the exposure in the accent. "AI·" when
+            // agents may read only part of the cluster; a click edits what they may read.
+            .when_some(ai_scope.filter(|_| exposure.is_exposed()), |row, scope| {
+                let label = if scope.is_everything() { "AI" } else { "AI·" };
+                let tip = format!(
+                    "AI agents may read {}. Click to change it.",
+                    scope_picker::summary(&scope)
+                );
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("ai-scope-{name}")))
+                        .flex_none()
+                        .cursor_pointer()
+                        .aria_label(label)
+                        .aria_description(tip.clone())
+                        .child(Tag::secondary().outline().xsmall().child(label))
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .on_click(registry::on_click_contained(EditAiScope {
+                            cluster: name.clone(),
+                        }))
+                        .test_support(),
+                )
             })
             .children(render_lock_button(
                 &name,
@@ -1909,6 +1933,9 @@ fn trust_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogTe
 }
 
 /// Asks before exposing a cluster to AI agents, naming the context and the server it points at.
+/// Asks before exposing a cluster to AI agents (or before changing what they may read of an
+/// exposed one), naming the context and the server it points at, with the scope pickers under
+/// the text. Confirming writes the entry and its scope in one change.
 fn confirm_expose(
     window: &mut Window,
     cx: &mut App,
@@ -1916,10 +1943,33 @@ fn confirm_expose(
     context: String,
     server: String,
     dialog: DialogText,
+    picker: Entity<ScopePicker>,
 ) {
-    confirm::open(window, cx, dialog, move |_, cx| {
-        model.update(cx, |m, _| m.expose_to_ai(context.clone(), server.clone()));
+    let content = picker.clone().into();
+    confirm::open_with(window, cx, dialog, Some(content), move |_, cx| {
+        let scope = picker.read(cx).scope();
+        model.update(cx, |m, _| {
+            m.expose_to_ai(context.clone(), server.clone(), scope)
+        });
     });
+}
+
+/// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
+fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
+    DialogText {
+        title: "What may AI agents read?".into(),
+        text: format!(
+            "Agents using Flint's MCP server read only the namespaces and kinds checked below; \
+             anything else looks to them as if the cluster were not exposed. Nothing checked \
+             means everything. Now: {}.\n\n\
+             Context: {context}\nServer: {server}",
+            scope_picker::summary(scope)
+        ),
+        ok: "Save".into(),
+        cancel: "Cancel".into(),
+        id: "scope-description",
+        default_cancel: false,
+    }
 }
 
 /// The Expose to AI confirmation, naming the context and the server it points at.
@@ -1930,7 +1980,8 @@ fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogT
          pod logs, event messages and container arguments that look like credentials (tokens, \
          passwords, keys). \
          Everything else, ConfigMaps and env values included, reaches the agent as the cluster \
-         returns it, and a credential in an unusual format can get through.\n\n\
+         returns it, and a credential in an unusual format can get through. Below, you can limit \
+         them to some namespaces and kinds.\n\n\
          Context: {context}\nServer: {server}"
     );
     if let Some(previous) = previous {

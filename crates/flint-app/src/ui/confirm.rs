@@ -40,6 +40,17 @@ pub fn open(
     dialog: DialogText,
     on_ok: impl Fn(&mut Window, &mut App) + 'static,
 ) {
+    open_with(window, cx, dialog, None, on_ok);
+}
+
+/// [`open`], with `content` (a view of its own, such as pickers) drawn under the text.
+pub fn open_with(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    content: Option<AnyView>,
+    on_ok: impl Fn(&mut Window, &mut App) + 'static,
+) {
     #[cfg(any(test, feature = "automation"))]
     remember(window, dialog.clone(), cx);
     let on_ok = Rc::new(on_ok);
@@ -63,6 +74,7 @@ pub fn open(
                     .id(dialog.id)
                     .aria_label(dialog.text.clone())
                     .child(dialog.text.clone())
+                    .when_some(content.clone(), |this, content| this.child(content))
                     .when_some(default_cancel.as_ref(), |this, focus| {
                         this.track_focus(focus).key_context(DEFAULT_CANCEL)
                     })
