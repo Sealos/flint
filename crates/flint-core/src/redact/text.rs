@@ -397,15 +397,13 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
         (
             BEARER,
             rule(
-                r#"(?i)\bbearer[ \t]+(?P<v>[A-Za-z0-9\-._~+/]+=*)(?P<f>["'][^\s,;})"']?)?"#,
-                |c, v| {
+                r#"(?i)\bbearer[ \t]+(?P<v>[A-Za-z0-9\-._~+/]+=*)(?P<f>["'][^\s,;:})\]"']?)?"#,
+                |_, v| {
                     // "bearer authentication", "Bearer token": words, not tokens. A short token
-                    // is taken as one when it holds a digit. `Bearer password="x"`: the next
-                    // field's key, whose value the pair rule hides.
+                    // is taken as one when it holds a digit.
                     let word = v.bytes().all(|b| b.is_ascii_alphabetic()) && v.len() < 20;
                     let digit = v.bytes().any(|b| b.is_ascii_digit());
-                    let key = v.ends_with('=') && c.name("f").is_some_and(|f| f.len() == 2);
-                    ((v.len() >= 8 || digit) && !word && !key).then_some("bearer")
+                    ((v.len() >= 8 || digit) && !word).then_some("bearer")
                 },
             ),
         ),
@@ -579,10 +577,7 @@ static RULES: LazyLock<Vec<(u32, Rule)>> = LazyLock::new(|| {
                         || v.bytes().all(|b| b == b'*')
                         || NOT_VALUES.iter().any(|w| v.eq_ignore_ascii_case(w))
                         || path_key && v.starts_with(['/', '~'])
-                        || short_key
-                            && v.split_ascii_whitespace()
-                                .next()
-                                .is_some_and(|w| w.bytes().all(|b| b.is_ascii_digit()))
+                        || short_key && v.bytes().all(|b| b.is_ascii_digit())
                     {
                         return None;
                     }
@@ -644,29 +639,9 @@ fn is_basic_auth(value: &str) -> bool {
             .is_ok_and(|raw| raw.len() >= 2 && raw.contains(&b':'))
 }
 
-/// Authentication schemes that can open a value; the credential is the word after.
+/// Authentication schemes that can open a value; the credential is the word after, and the
+/// two are hidden together.
 const SCHEMES: &[&str] = &["bearer", "basic"];
-
-/// The length of the scheme and the spaces after it when `value` opens with one followed by
-/// more text (`Bearer abc`), else 0.
-fn scheme_len(value: &str) -> usize {
-    let bytes = value.as_bytes();
-    SCHEMES
-        .iter()
-        .find_map(|scheme| {
-            let n = scheme.len();
-            let rest = bytes.get(n..)?;
-            let spaces = rest
-                .iter()
-                .take_while(|&&b| b == b' ' || b == b'\t')
-                .count();
-            (bytes[..n].eq_ignore_ascii_case(scheme.as_bytes())
-                && spaces > 0
-                && spaces < rest.len())
-            .then_some(n + spaces)
-        })
-        .unwrap_or(0)
-}
 
 static FLAG_ONLY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"(?i)^(?P<k>--?(?:{FLAG_KEYS}))$")).expect("flag rule builds")
@@ -731,6 +706,17 @@ fn redact_line(text: &str, range: Range<usize>, mask: u32, out: &mut Builder) {
 fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>> {
     let whole = caps.get(0)?;
     if let Some(v) = caps.name("v") {
+        // `Bearer password="x"`: what looked like a token is a key, and its quoted value goes
+        // with it.
+        if let Some(f) = caps
+            .name("f")
+            .filter(|f| f.len() == 2 && v.as_str().ends_with('='))
+        {
+            let quote = line.as_bytes()[f.start()];
+            let end = memchr::memchr(quote, &line.as_bytes()[f.start() + 1..])
+                .map_or(line.len(), |i| f.start() + 1 + i);
+            return Some(v.start()..end);
+        }
         return Some(v.range());
     }
     if let Some(v) = caps.name("vm") {
@@ -742,19 +728,23 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
     if let Some(v) = caps.name("vl") {
         // Only a password runs to the end of the line (a passphrase); after `token: ` or
         // `secret: ` the rest is more often an error message than part of the value.
-        if caps.name("k").is_some() && key_kind(caps) != "password" {
+        // The first word decides: a count after a bare `pass` (`pass: 3 fail: 0`), a working
+        // directory (`PWD: /app`) and a private key's BEGIN line are one word, which the pair
+        // rule leaves alone.
+        let key = caps.name("k");
+        let name = key.map_or(String::new(), |k| k.as_str().to_ascii_lowercase());
+        let first = &line[v.start()..];
+        let one_word = (name == "pass" && first.starts_with(|c: char| c.is_ascii_digit()))
+            || (matches!(name.as_str(), "pwd" | "oldpwd") && first.starts_with(['/', '~']))
+            || first.starts_with("-----");
+        if one_word || key.is_some() && key_kind(caps) != "password" {
             return Some(word_value(line, v.start()..word_end(line, v.start())));
         }
-        let mut len = line_value_len(&line[v.start()..]);
         // A header in single quotes (`curl -H 'Cookie: a=b' url`) ends at the closing quote.
-        let key = caps.name("k").map_or(whole.start(), |k| k.start());
-        if key > 0 && line.as_bytes()[key - 1] == b'\'' {
-            let quoted = &line[v.start()..v.start() + len];
-            len = memchr::memchr(b'\'', quoted.as_bytes())
-                .map_or(len, |i| quoted[..i].trim_end().len());
-        }
-        let skip = scheme_len(&line[v.start()..v.start() + len]);
-        return Some(v.start() + skip..v.start() + len);
+        let at = key.map_or(whole.start(), |k| k.start());
+        let quoted = at > 0 && line.as_bytes()[at - 1] == b'\'';
+        let len = line_value_len(&line[v.start()..], quoted);
+        return Some(v.start()..v.start() + len);
     }
     if let Some(v) = caps.name("vb") {
         let close = if caps.name("b").is_some_and(|b| b.len() > 1) {
@@ -770,7 +760,7 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
             // After an escaped `\n` the header is a line inside a JSON string: it ends at the
             // next escaped `\n` or the string's closing quote.
             None if whole.as_str().starts_with('\\') => {
-                v.start() + line_value_len(&line[v.start()..])
+                v.start() + line_value_len(&line[v.start()..], false)
             }
             None => line.len(),
         };
@@ -783,13 +773,15 @@ fn value_range(caps: &Captures, line: &str, floor: usize) -> Option<Range<usize>
 
 /// The password of a MySQL DSN whose `@` before the protocol is at `at`, searching no earlier
 /// than `floor`: from the first `:` of the DSN to `at`. A DSN in quotes starts after the last
-/// quote before `at`, so a password can hold spaces and brackets; a bare one starts after the
+/// double quote before `at` (or, with none, the last apostrophe), so a password can hold spaces and brackets; a bare one starts after the
 /// last space. `None` when there is no `:` (no password) or the password already holds a
 /// marker (a URL rule hid it).
 fn dsn_password(line: &str, floor: usize, at: usize) -> Option<Range<usize>> {
     let bytes = &line.as_bytes()[floor..at];
     let start = floor
-        + match memchr::memrchr2(b'"', b'\'', bytes) {
+        // A double quote encloses the DSN when there is one; an apostrophe can be in the
+        // password.
+        + match memchr::memrchr(b'"', bytes).or_else(|| memchr::memrchr(b'\'', bytes)) {
             Some(quote) => quote + 1,
             None => bytes
                 .iter()
@@ -810,8 +802,12 @@ fn dsn_password(line: &str, floor: usize, at: usize) -> Option<Range<usize>> {
 /// the list runs to the end. One forward scan.
 fn list_len(rest: &str, close: u8) -> usize {
     let bytes = rest.as_bytes();
-    let lead = bytes.iter().take_while(|&&b| b == b'\\').count();
-    let level = if bytes.get(lead) == Some(&b'"') {
+    let first = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let lead = bytes[first..].iter().take_while(|&&b| b == b'\\').count();
+    let level = if bytes.get(first + lead) == Some(&b'"') {
         lead
     } else {
         0
@@ -877,8 +873,8 @@ fn word_end(line: &str, from: usize) -> usize {
         .count()
 }
 
-/// A bare value matched at `word`, without the closing punctuation after it. After a scheme
-/// (`token=Bearer abc`), the credential is the word after it.
+/// A bare value matched at `word`, without the closing punctuation after it. A scheme
+/// (`token=Bearer abc`) is hidden with the word after it, unless that word is another field.
 fn word_value(line: &str, word: Range<usize>) -> Range<usize> {
     let trimmed = |range: Range<usize>| {
         range.start
@@ -899,8 +895,12 @@ fn word_value(line: &str, word: Range<usize>) -> Range<usize> {
                 .take_while(|&&b| b == b' ' || b == b'\t')
                 .count();
         let token = trimmed(from..word_end(line, from));
-        if from > value.end && !token.is_empty() && !is_field(line, token.clone()) {
-            return token;
+        if from > value.end
+            && !token.is_empty()
+            && !line[token.clone()].starts_with(MARKER_PREFIX)
+            && !is_field(line, token.clone())
+        {
+            return value.start..token.end;
         }
     }
     value
@@ -923,19 +923,38 @@ fn is_field(line: &str, word: Range<usize>) -> bool {
 }
 
 /// The length of an unquoted value that starts `rest` and runs to the end of the line: up to
-/// the first unescaped double quote (the end of the string the line is quoted in) or escaped
-/// `\n` (the end of a line inside a JSON string), without trailing spaces. An escaped quote
-/// (`\"`) is part of the value. One forward scan.
-fn line_value_len(rest: &str) -> usize {
+/// the first unescaped double quote (the end of the string the line is quoted in), an escaped
+/// `\n` (the end of a line inside a JSON string), or, when `apostrophe` (a single-quoted
+/// header), an apostrophe; without trailing spaces. An escaped quote (`\"`) is part of the
+/// value, and so is a quoted value after `=` (a cookie's `session="v"`, or a field the value
+/// runs into, `pass="x"`, also escaped). One forward scan.
+fn line_value_len(rest: &str, apostrophe: bool) -> usize {
     let bytes = rest.as_bytes();
+    let opens_value = |at: usize| at > 0 && bytes[at - 1] == b'=';
     let mut i = 0;
     let end = loop {
-        match memchr::memchr2(b'"', b'\\', &bytes[i..]) {
-            None => break bytes.len(),
-            Some(at) if bytes[i + at] == b'"' => break i + at,
-            Some(at) if bytes.get(i + at + 1) == Some(&b'n') => break i + at,
-            // Any other escape pair, `\"` and `\\` among them, is part of the value.
-            Some(at) => i = (i + at + 2).min(bytes.len()),
+        let Some(at) = memchr::memchr3(b'"', b'\\', b'\'', &bytes[i..]).map(|at| i + at) else {
+            break bytes.len();
+        };
+        match bytes[at] {
+            b'\'' if apostrophe => break at,
+            b'\'' => i = at + 1,
+            b'"' if opens_value(at) => match memchr::memchr(b'"', &bytes[at + 1..]) {
+                Some(close) => i = at + 1 + close + 1,
+                None => break bytes.len(),
+            },
+            b'"' => break at,
+            _ => match bytes.get(at + 1) {
+                Some(b'n') => break at,
+                Some(b'"') if opens_value(at) => {
+                    match memchr::memmem::find(&bytes[at + 2..], b"\\\"") {
+                        Some(close) => i = at + 2 + close + 2,
+                        None => break bytes.len(),
+                    }
+                }
+                // Any other escape pair, `\"` and `\\` among them, is part of the value.
+                _ => i = (at + 2).min(bytes.len()),
+            },
         }
     };
     rest[..end].trim_end().len()
@@ -954,9 +973,11 @@ fn apply(rule: &Rule, line: &str, count: &mut usize) -> Option<String> {
         let mut next = whole.end().max(whole.start() + 1);
         if let Some(mut value) = value_range(&caps, line, at) {
             // A value can run past the match (to its closing quote, the end of the line, or
-            // the word after a scheme); the next match starts after it.
+            // the word after a scheme); the next match starts after it. A rest-of-line value
+            // that is not hidden (`pass: 3 fail: 0 token=x`) is searched again from its start.
+            let rest_of_line = caps.name("vl").is_some();
             next = next.max(value.end);
-            if caps.name("vl").is_some() {
+            if rest_of_line {
                 // A passphrase whose first words an earlier rule hid: the rest is hidden too.
                 while line[value.clone()].starts_with(MARKER_PREFIX)
                     && let Some(close) = line[value.clone()].find(']')
@@ -980,6 +1001,11 @@ fn apply(rule: &Rule, line: &str, count: &mut usize) -> Option<String> {
                 out.push(']');
                 done = value.end;
                 *count += 1;
+            } else if rest_of_line {
+                // Only a value the rule rejects whole is searched again (a mask, `null`), and
+                // the first word decides paths, counts and key headers (see `value_range`), so
+                // no long rest of a line is scanned twice.
+                next = whole.end().max(whole.start() + 1);
             }
         }
         at = next;

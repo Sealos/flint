@@ -916,14 +916,12 @@ fn mysql_dsns_without_a_scheme() {
 
 #[test]
 fn short_bearer_tokens() {
+    // After a credential key the scheme is hidden with its token, so neither shows.
     for (line, want) in [
-        ("token: Bearer abc", "token: Bearer [REDACTED:token]"),
-        ("token=Bearer abc", "token=Bearer [REDACTED:token]"),
-        (
-            "X-Auth-Token: bearer xy",
-            "X-Auth-Token: bearer [REDACTED:token]",
-        ),
-        ("api_key=Basic Zm9v", "api_key=Basic [REDACTED:key]"),
+        ("token: Bearer abc", "token: [REDACTED:token]"),
+        ("token=Bearer abc", "token=[REDACTED:token]"),
+        ("X-Auth-Token: bearer xy", "X-Auth-Token: [REDACTED:token]"),
+        ("api_key=Basic Zm9v", "api_key=[REDACTED:key]"),
         (
             "using Bearer ab12 upstream",
             "using Bearer [REDACTED:bearer] upstream",
@@ -943,23 +941,28 @@ fn short_bearer_tokens() {
 #[test]
 fn a_scheme_is_not_continued_by_the_next_field() {
     for (line, want) in [
-        (
-            r#"token=Bearer password="hunter2""#,
-            r#"token=[REDACTED:token] password="[REDACTED:password]""#,
-        ),
         ("token=Bearer user=app", "token=[REDACTED:token] user=app"),
-        (
-            r#"Bearer password="hunter2""#,
-            r#"Bearer password="[REDACTED:password]""#,
-        ),
         (
             "auth_token=Basic --verbose",
             "auth_token=[REDACTED:token] --verbose",
         ),
-        // Base64 padding before a closing quote is still the credential.
+        // What follows `Bearer` looks like a token: it is hidden with its quoted value.
+        (
+            r#"token=Bearer password="hunter2""#,
+            r#"token=[REDACTED:token] [REDACTED:bearer]""#,
+        ),
+        (
+            r#"Bearer password="hunter2""#,
+            r#"Bearer [REDACTED:bearer]""#,
+        ),
+        // A padded token before a closing quote is still the credential.
+        (
+            r#"["Bearer abcdef12=="]"#,
+            r#"["Bearer [REDACTED:bearer]"]"#,
+        ),
         (
             r#"msg="token=Basic Zm9vYmFy==" next=1"#,
-            r#"msg="token=Basic [REDACTED:token]" next=1"#,
+            r#"msg="token=[REDACTED:token]" next=1"#,
         ),
     ] {
         let n = want.matches("[REDACTED").count();
@@ -1062,6 +1065,71 @@ fn yaml_auth_with_a_space_before_the_colon() {
     same("auth : enabled");
 }
 
+#[test]
+fn quoted_cookie_values_inside_a_raw_header() {
+    for (line, want) in [
+        (
+            r#"Cookie: session="example-value"; theme=dark"#,
+            "Cookie: [REDACTED:cookie]",
+        ),
+        (
+            r#"{"msg":"Cookie: session=\"v\"; theme=dark","level":"info"}"#,
+            r#"{"msg":"Cookie: [REDACTED:cookie]","level":"info"}"#,
+        ),
+        (
+            r#"curl -H 'Cookie: session="v"; theme=dark' https://example.com"#,
+            "curl -H 'Cookie: [REDACTED:cookie]' https://example.com",
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    same(r#"{"msg":"cookie consent \"ok\""}"#);
+}
+
+#[test]
+fn a_pass_count_is_only_a_bare_number() {
+    for (line, want) in [
+        (
+            r#"pass="123 example phrase""#,
+            r#"pass="[REDACTED:password]""#,
+        ),
+        ("pass: 123 abc", "pass: 123 abc"),
+        (
+            "pass: 3 fail: 0 token=example",
+            "pass: 3 fail: 0 token=[REDACTED:token]",
+        ),
+        (
+            "PWD: /app password: two words",
+            "PWD: /app password: [REDACTED:password]",
+        ),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+    for line in ["pass: 3 fail: 0", "pass=1 failed=0", "PWD: /app"] {
+        same(line);
+    }
+}
+
+#[test]
+fn a_double_quoted_dsn_with_an_apostrophe_in_its_password() {
+    assert_eq!(
+        redacted(r#"dsn="app:it's private@tcp(db)/app""#, 1),
+        r#"dsn="app:[REDACTED:password]@tcp(db)/app""#
+    );
+}
+
+#[test]
+fn cookie_list_quote_level_skips_leading_spaces() {
+    assert_eq!(
+        redacted(
+            r#"{\"Set-Cookie\":[ \"a=1; Path=/]\",\"b=s3cr3tB\"],\"Vary\":\"Accept\"}"#,
+            1
+        ),
+        r#"{\"Set-Cookie\":[[REDACTED:cookie]],\"Vary\":\"Accept\"}"#
+    );
+}
+
 /// About 10 MB of realistic log lines, with a few secrets.
 fn synthetic_log() -> String {
     let lines = [
@@ -1132,6 +1200,8 @@ fn long_lines_of_quoted_values_are_linear() {
         r#""a:b c@tcp(" "#,
         r#"\nAuthorization: Digest a"#,
         r#"token=Bearer x="y" "#,
+        "-H 'Cookie: a' ",
+        r#"-H 'Cookie: a="b"' "#,
     ] {
         let line = unit.repeat(MIB / unit.len());
         let start = std::time::Instant::now();
@@ -1139,6 +1209,20 @@ fn long_lines_of_quoted_values_are_linear() {
         let secs = start.elapsed().as_secs_f64();
         println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
         assert_eq!(out.count, MIB / unit.len(), "{unit}");
+        assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
+    }
+    // Values the pair rule leaves alone are not scanned to the end of the line again and again.
+    for unit in [
+        "pass: 3 ",
+        "PWD: /a ",
+        "password: ***** ",
+        "password: null ",
+    ] {
+        let line = unit.repeat(MIB / unit.len());
+        let start = std::time::Instant::now();
+        redact_credentials(&line);
+        let secs = start.elapsed().as_secs_f64();
+        println!("{unit}: 1 MiB line in {:.1} ms", secs * 1000.0);
         assert!(secs < 2.0, "{unit}: {secs:.2} s for 1 MiB");
     }
 }
