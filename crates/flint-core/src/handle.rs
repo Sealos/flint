@@ -85,6 +85,15 @@ pub enum Command {
         server: Option<String>,
         scope: crate::settings::AiScope,
     },
+    /// Change what agents may read of a cluster exposed at `server` to `scope` (Edit AI Scope),
+    /// in `settings.toml`. Never exposes anything: if the context no longer points at
+    /// `server`, or the file no longer exposes it there (hidden meanwhile), nothing is written
+    /// and an error is reported.
+    SetAiScope {
+        cluster: ClusterId,
+        server: String,
+        scope: crate::settings::AiScope,
+    },
     /// Trust a cluster at `server` (`Some`), or stop trusting it (`None`), in `settings.toml`
     /// (ADR-0015). As with [`Command::SetAiExposed`], `server` is the URL the user confirmed; if
     /// the context no longer points there, nothing is written and an error is reported.

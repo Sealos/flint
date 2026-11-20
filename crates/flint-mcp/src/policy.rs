@@ -167,13 +167,21 @@ pub fn out_of_scope(cluster: &str) -> PolicyError {
 }
 
 /// The kinds of `kinds` the agent may read: those the scope allows. Under a namespace scope,
-/// cluster-scoped kinds only when the kinds scope names them.
+/// cluster-scoped kinds only when the kinds scope names them. On a scoped cluster, events are
+/// read only through `get_events`, which drops those about objects out of scope: listed as a
+/// kind, an event in an allowed namespace could name a node or a Secret the scope hides.
 pub fn kinds_in_scope(scope: &AiScope, kinds: &[KindInfo]) -> Vec<KindInfo> {
     kinds
         .iter()
+        .filter(|k| scope.is_everything() || !is_event_kind(k))
         .filter(|k| scope.allows_kind(k.id().as_str(), k.namespaced))
         .cloned()
         .collect()
+}
+
+/// Core v1 events and `events.k8s.io` events.
+fn is_event_kind(kind: &KindInfo) -> bool {
+    kind.plural() == "events" && matches!(kind.group(), "" | "events.k8s.io")
 }
 
 /// Which namespaces a request may read.
@@ -675,6 +683,24 @@ mod tests {
         assert_eq!(
             names(&scoped(&["shop"], &["deployments.apps", "nodes"])),
             ["nodes", "deployments.apps"]
+        );
+        // On a scoped cluster events are read through get_events only, even when named.
+        let with_events = [
+            kind("", "v1", "Pod", "pods", true),
+            kind("", "v1", "Event", "events", true),
+            kind("events.k8s.io", "v1", "Event", "events", true),
+        ];
+        let ids = |scope: &AiScope| -> Vec<String> {
+            kinds_in_scope(scope, &with_events)
+                .iter()
+                .map(|k| k.id().as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(&AiScope::default()).len(), 3);
+        assert_eq!(ids(&scoped(&["default"], &[])), ["pods"]);
+        assert_eq!(
+            ids(&scoped(&[], &["events", "events.events.k8s.io"])),
+            Vec::<String>::new()
         );
         assert!(logs_in_scope(&scoped(&["shop"], &[])));
         assert!(logs_in_scope(&scoped(&[], &["pods"])));

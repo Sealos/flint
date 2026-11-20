@@ -753,6 +753,11 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
         "list_resources",
         json!({"cluster": EXPOSED, "kind": "gizmos"}),
     )?;
+    // Events are read through get_events only, which keeps them in scope.
+    refused(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "events", "namespace": "demo"}),
+    )?;
     refused(
         "get_events",
         json!({"cluster": EXPOSED, "namespace": "default"}),

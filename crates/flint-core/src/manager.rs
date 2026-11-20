@@ -324,6 +324,11 @@ impl ClusterManager {
             } => {
                 self.set_pin(Pins::AiExposure(scope), cluster, server).await;
             }
+            Command::SetAiScope {
+                cluster,
+                server,
+                scope,
+            } => self.set_ai_scope(cluster, server, scope).await,
             Command::SetTrusted {
                 cluster,
                 server,
@@ -615,6 +620,27 @@ impl ClusterManager {
             // anyway, so the front end shows the protection that holds now.
             self.emit_settings();
         }
+    }
+
+    /// Changes what agents may read of `cluster`, exposed at `server`, to `scope`; never
+    /// exposes it ([`settings::set_ai_scope`]).
+    async fn set_ai_scope(&mut self, cluster: ClusterId, server: String, scope: AiScope) {
+        let current = self
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .and_then(|c| c.info.server.as_deref());
+        if current != Some(server.as_str()) {
+            self.emit(Event::Error(format!(
+                "\"{cluster}\" now points to a different server; its AI scope was not changed. \
+                 Review it and try again."
+            )));
+            return;
+        }
+        self.write_settings("the AI scope", move |dir| {
+            settings::set_ai_scope(dir, &cluster, &server, &scope)
+        })
+        .await;
     }
 
     /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in

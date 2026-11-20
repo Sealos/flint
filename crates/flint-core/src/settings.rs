@@ -30,6 +30,12 @@ pub enum SettingsError {
     Serialize(#[from] toml::ser::Error),
     #[error("neither FLINT_CONFIG_DIR nor HOME is set")]
     NoConfigDir,
+    /// The file parses but says something Flint will not guess at.
+    #[error("invalid {path}: {reason}")]
+    Invalid { path: PathBuf, reason: String },
+    /// A scope change for a cluster that is no longer exposed at that server.
+    #[error("\"{context}\" is no longer exposed to AI agents at that server")]
+    NotExposed { context: String },
 }
 
 /// Which kinds are watched while a cluster is active (ADR-0008).
@@ -335,6 +341,15 @@ impl Settings {
         }
     }
 
+    /// The scope saved for `context` at whatever server it was exposed at: what a re-pointed
+    /// context's entry still says, to start from when exposing it again.
+    pub fn ai_scope_saved(&self, context: &str) -> Option<AiScope> {
+        self.ai_exposed_clusters
+            .iter()
+            .find(|e| e.context == context)
+            .map(AiExposure::scope)
+    }
+
     /// What agents may read of `context`, if it is exposed at `server` (ADR-0013). `None` when it
     /// is not exposed there.
     pub fn ai_scope(&self, context: &str, server: Option<&str>) -> Option<AiScope> {
@@ -482,6 +497,7 @@ fn config_dir_from(
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let settings = load_toml(&path)?;
+    validate(&settings, &path)?;
     // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
     // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
     if let Ok(text) = std::fs::read_to_string(&path)
@@ -494,6 +510,28 @@ pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
         }
     }
     Ok(settings)
+}
+
+/// Refuses what parses but cannot be taken at its word: a scope list (`namespaces`, `kinds`)
+/// that names only blank entries. It was clearly meant to limit the cluster, and read as empty
+/// it would expose everything, so the whole file is treated as unreadable instead.
+fn validate(settings: &Settings, path: &Path) -> Result<(), SettingsError> {
+    let blank = |names: &[String]| !names.is_empty() && names.iter().all(|n| n.trim().is_empty());
+    match settings
+        .ai_exposed_clusters
+        .iter()
+        .find(|e| blank(&e.namespaces) || blank(&e.kinds))
+    {
+        Some(entry) => Err(SettingsError::Invalid {
+            path: path.to_owned(),
+            reason: format!(
+                "the AI scope of \"{}\" lists only blank names; remove the list to expose \
+                 everything, or name what agents may read",
+                entry.context
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The top-level keys of [`Settings`].
@@ -601,6 +639,46 @@ pub fn set_ai_exposed(
             });
         }
         current.sort();
+        table.insert(
+            "ai_exposed_clusters".into(),
+            toml::Value::try_from(&current)?,
+        );
+        Ok(())
+    })
+}
+
+/// Changes what agents may read of `context`, exposed at `server`, to `scope`, and writes
+/// `settings.toml`. Unlike [`set_ai_exposed`], it never exposes anything: if the file, as read
+/// for this write, no longer exposes the context at that server (it was hidden or re-pointed
+/// meanwhile, by hand or by another Flint), nothing is written and
+/// [`SettingsError::NotExposed`] says so.
+pub fn set_ai_scope(
+    dir: &Path,
+    context: &str,
+    server: &str,
+    scope: &AiScope,
+) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, path| {
+        let mut current: Vec<AiExposure> = match table.get("ai_exposed_clusters") {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(|source| SettingsError::Parse {
+                    path: path.to_owned(),
+                    source,
+                })?,
+            None => Vec::new(),
+        };
+        let Some(entry) = current
+            .iter_mut()
+            .find(|e| e.pin().matches(context, server))
+        else {
+            return Err(SettingsError::NotExposed {
+                context: context.to_owned(),
+            });
+        };
+        entry.namespaces = scope.namespaces.clone();
+        entry.kinds = scope.kinds.clone();
         table.insert(
             "ai_exposed_clusters".into(),
             toml::Value::try_from(&current)?,
@@ -738,6 +816,7 @@ fn edit_settings(
         path: path.clone(),
         source,
     })?;
+    validate(&settings, &path)?;
     write_atomic(&path, &text)?;
     Ok(settings)
 }
@@ -1138,6 +1217,65 @@ mod tests {
             "{raw}"
         );
         assert_eq!(load_settings(dir.path()).unwrap(), s);
+    }
+
+    // covers UP-14: a scope list of only blank names was meant to limit the cluster; read as
+    // empty it would expose everything, so the file is refused (and nothing is exposed).
+    #[test]
+    fn a_scope_of_blank_names_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for list in ["namespaces = [\"\"]", "kinds = [\"  \"]"] {
+            std::fs::write(
+                dir.path().join(SETTINGS_FILE),
+                format!(
+                    "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\n{list}\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    load_settings(dir.path()),
+                    Err(SettingsError::Invalid { .. })
+                ),
+                "{list}"
+            );
+            let (fallback, error) = load_settings_or_fallback(dir.path());
+            assert!(error.is_some() && fallback.ai_exposed_clusters.is_empty());
+        }
+        // A blank name beside real ones is just dropped.
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\nnamespaces = [\"\", \"shop\"]\n",
+        )
+        .unwrap();
+        let s = load_settings(dir.path()).unwrap();
+        assert_eq!(
+            s.ai_scope("prod", Some("https://p")).unwrap().namespaces,
+            ["shop"]
+        );
+    }
+
+    // covers UP-14: changing a scope never exposes a cluster that was hidden or re-pointed
+    // meanwhile; a re-pointed context's old scope is kept to start from.
+    #[test]
+    fn a_scope_change_needs_the_exposure_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let shop = AiScope::new(vec!["shop".into()], Vec::new());
+        assert!(matches!(
+            set_ai_scope(dir.path(), "prod", "https://p", &shop),
+            Err(SettingsError::NotExposed { .. })
+        ));
+        assert!(!dir.path().join(SETTINGS_FILE).exists());
+        set_ai_exposed(dir.path(), "prod", Some("https://p"), &AiScope::default()).unwrap();
+        let s = set_ai_scope(dir.path(), "prod", "https://p/", &shop).unwrap();
+        assert_eq!(s.ai_scope("prod", Some("https://p")), Some(shop.clone()));
+        assert!(matches!(
+            set_ai_scope(dir.path(), "prod", "https://elsewhere", &AiScope::default()),
+            Err(SettingsError::NotExposed { .. })
+        ));
+        assert_eq!(s.ai_scope_saved("prod"), Some(shop.clone()));
+        assert_eq!(s.ai_scope("prod", Some("https://elsewhere")), None);
+        assert_eq!(s.ai_scope_saved("other"), None);
     }
 
     // covers UP-14: what a scope lets agents read.
