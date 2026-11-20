@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flint_core::settings::{AiExposureState, TrustState};
+use flint_core::settings::{AiExposureState, AiScope, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
     Event, Protection, Settings, WatchMode,
@@ -127,13 +127,15 @@ impl ClustersModel {
         self.core.send(command);
     }
 
-    /// Exposes `cluster` at `server`, the URL the user confirmed.
+    /// Exposes `cluster` at `server`, the URL the user confirmed, in full.
     pub fn expose_to_ai(&mut self, cluster: ClusterId, server: String) {
         self.send(Command::SetAiExposed {
             cluster,
             server: Some(server),
+            scope: AiScope::default(),
         });
     }
+
 
     /// Sets the global watch mode (`cluster: None`), or a cluster's override (`mode: None`
     /// removes it). Written to `settings.toml`; the change comes back as a settings event.
@@ -166,6 +168,7 @@ impl ClustersModel {
         self.send(Command::SetAiExposed {
             cluster,
             server: None,
+            scope: AiScope::default(),
         });
     }
 

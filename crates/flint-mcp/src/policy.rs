@@ -1,10 +1,11 @@
-//! What the MCP server may show (ADR-0009): opt-in clusters, redaction, and output bounds.
-//! Everything here is pure so it can be tested without a cluster.
+//! What the MCP server may show (ADR-0009): opt-in clusters, their scopes (ADR-0013),
+//! redaction, and output bounds. Everything here is pure so it can be tested without a cluster.
 
 use flint_core::Settings;
 use flint_core::kubeconfig::{ContextInfo, LoadedKubeconfig};
-use flint_core::read::{is_dns1123_label, is_dns1123_subdomain, is_path_segment};
+use flint_core::read::{KindInfo, is_dns1123_label, is_dns1123_subdomain, is_path_segment};
 use flint_core::settings::AiExposureState;
+pub use flint_core::settings::AiScope;
 use serde_json::Value;
 
 /// Replaces every redacted value.
@@ -149,6 +150,92 @@ pub fn is_object_name(name: &str) -> bool {
             || name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '@')))
+}
+
+/// What the agent may read of an exposed cluster (ADR-0013): the scope its entry in
+/// `settings.toml` names, or everything for an entry without one.
+pub fn cluster_scope(settings: &Settings, info: &ContextInfo) -> AiScope {
+    settings
+        .ai_scope(&info.name, info.server.as_deref())
+        .unwrap_or_default()
+}
+
+/// The error for anything outside a cluster's scope: exactly the one a cluster that is not
+/// exposed gives, so an agent cannot tell what exists beyond its scope.
+pub fn out_of_scope(cluster: &str) -> PolicyError {
+    PolicyError::ClusterNotFound(cluster.to_owned())
+}
+
+/// The kinds of `kinds` the agent may read: those the scope allows. Under a namespace scope,
+/// cluster-scoped kinds only when the kinds scope names them.
+pub fn kinds_in_scope(scope: &AiScope, kinds: &[KindInfo]) -> Vec<KindInfo> {
+    kinds
+        .iter()
+        .filter(|k| scope.allows_kind(k.id().as_str(), k.namespaced))
+        .cloned()
+        .collect()
+}
+
+/// Which namespaces a request may read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Namespaces {
+    /// The one namespace asked for.
+    One(String),
+    /// Every namespace (no namespace scope), or none at all (a cluster-scoped kind).
+    All,
+    /// Every namespace of the scope, one by one: a request for all namespaces on a cluster
+    /// limited to these.
+    Only(Vec<String>),
+}
+
+/// Which namespaces a request for `requested` (`None`: all) may read, for a `namespaced` kind
+/// on `cluster` under `scope`. A namespace outside the scope gives [`out_of_scope`].
+pub fn namespaces_for(
+    scope: &AiScope,
+    cluster: &str,
+    namespaced: bool,
+    requested: Option<&str>,
+) -> Result<Namespaces, PolicyError> {
+    if !namespaced {
+        return Ok(Namespaces::All);
+    }
+    match requested {
+        Some(ns) if scope.allows_namespace(ns) => Ok(Namespaces::One(ns.to_owned())),
+        Some(_) => Err(out_of_scope(cluster)),
+        None if scope.namespaces.is_empty() => Ok(Namespaces::All),
+        None => Ok(Namespaces::Only(scope.namespaces.clone())),
+    }
+}
+
+/// Whether an event may be shown: its namespace is in scope, and the object it is about is of
+/// a kind in scope (looked up in the cluster's `kinds` by Kind and API group; an object of a
+/// kind discovery does not list is left out of a scoped cluster's events).
+pub fn event_in_scope(
+    scope: &AiScope,
+    kinds: &[KindInfo],
+    namespace: Option<&str>,
+    involved_kind: Option<&str>,
+    involved_api_version: Option<&str>,
+) -> bool {
+    if scope.is_everything() {
+        return true;
+    }
+    if !scope.namespaces.is_empty() && !namespace.is_some_and(|ns| scope.allows_namespace(ns)) {
+        return false;
+    }
+    let group = involved_api_version
+        .and_then(|v| v.split_once('/').map(|(g, _)| g))
+        .unwrap_or("");
+    kinds
+        .iter()
+        .find(|k| Some(k.kind()) == involved_kind && k.group() == group)
+        .is_some_and(|k| scope.allows_kind(k.id().as_str(), k.namespaced))
+}
+
+/// Whether the agent may read pod logs under `scope`: pods are in the kinds scope (the
+/// namespace is checked with [`namespaces_for`]).
+pub fn logs_in_scope(scope: &AiScope) -> bool {
+    scope.allows_kind("pods", true)
 }
 
 /// Makes an object safe to show: removes `metadata.managedFields`, redacts Secret values, and
@@ -411,10 +498,7 @@ mod tests {
         Settings {
             ai_exposed_clusters: exposed
                 .iter()
-                .map(|n| AiExposure {
-                    context: (*n).into(),
-                    server: server(n),
-                })
+                .map(|n| AiExposure::new(*n, server(n)))
                 .collect(),
             ..Default::default()
         }
@@ -438,10 +522,7 @@ mod tests {
     fn same_name_with_a_different_server_is_not_exposed() {
         let kc = kubeconfig(&["dev", "prod"]);
         let s = Settings {
-            ai_exposed_clusters: vec![AiExposure {
-                context: "dev".into(),
-                server: "https://old-dev".into(),
-            }],
+            ai_exposed_clusters: vec![AiExposure::new("dev", "https://old-dev")],
             ..Default::default()
         };
         assert!(exposed_clusters(&s, &kc).is_empty());
@@ -482,6 +563,204 @@ mod tests {
             exposed_cluster(&s, &kc, "ghost").unwrap_err().to_string(),
             unknown.replace("nope", "ghost")
         );
+    }
+
+    fn kind(group: &str, version: &str, kind: &str, plural: &str, namespaced: bool) -> KindInfo {
+        let api_version = if group.is_empty() {
+            version.to_owned()
+        } else {
+            format!("{group}/{version}")
+        };
+        KindInfo {
+            resource: kube::discovery::ApiResource {
+                group: group.into(),
+                version: version.into(),
+                api_version,
+                kind: kind.into(),
+                plural: plural.into(),
+            },
+            namespaced,
+            verbs: ["get", "list"].map(String::from).to_vec(),
+            singular: kind.to_lowercase(),
+            short_names: Vec::new(),
+        }
+    }
+
+    fn scoped(namespaces: &[&str], kinds: &[&str]) -> AiScope {
+        AiScope::new(
+            namespaces.iter().map(|s| (*s).to_owned()).collect(),
+            kinds.iter().map(|s| (*s).to_owned()).collect(),
+        )
+    }
+
+    // covers UP-14: the scope comes from the cluster's entry; one without a scope is whole.
+    #[test]
+    fn a_clusters_scope_comes_from_its_entry() {
+        let kc = kubeconfig(&["dev", "prod"]);
+        let mut s = settings(&["dev", "prod"]);
+        s.ai_exposed_clusters[1].namespaces = vec!["shop".into()];
+        let dev = exposed_cluster(&s, &kc, "dev").unwrap();
+        let prod = exposed_cluster(&s, &kc, "prod").unwrap();
+        assert!(cluster_scope(&s, dev).is_everything());
+        assert_eq!(cluster_scope(&s, prod).namespaces, ["shop"]);
+    }
+
+    // covers UP-14: anything out of scope fails exactly as an unexposed cluster does, in text
+    // and in type, so nothing can be probed.
+    #[test]
+    fn out_of_scope_is_the_unexposed_error() {
+        let kc = kubeconfig(&["dev", "prod"]);
+        let s = settings(&["dev"]);
+        let unexposed = exposed_cluster(&s, &kc, "prod").unwrap_err();
+        assert_eq!(out_of_scope("prod"), unexposed);
+        assert_eq!(out_of_scope("prod").to_string(), unexposed.to_string());
+        let scope = scoped(&["shop"], &[]);
+        assert_eq!(
+            namespaces_for(&scope, "prod", true, Some("kube-system")),
+            Err(unexposed)
+        );
+    }
+
+    // covers UP-14
+    #[test]
+    fn namespaces_follow_the_scope() {
+        let everything = AiScope::default();
+        assert_eq!(
+            namespaces_for(&everything, "c", true, None),
+            Ok(Namespaces::All)
+        );
+        assert_eq!(
+            namespaces_for(&everything, "c", true, Some("a")),
+            Ok(Namespaces::One("a".into()))
+        );
+        let scope = scoped(&["shop", "billing"], &[]);
+        assert_eq!(
+            namespaces_for(&scope, "c", true, None),
+            Ok(Namespaces::Only(vec!["billing".into(), "shop".into()]))
+        );
+        assert_eq!(
+            namespaces_for(&scope, "c", true, Some("shop")),
+            Ok(Namespaces::One("shop".into()))
+        );
+        assert!(namespaces_for(&scope, "c", true, Some("other")).is_err());
+        // A cluster-scoped kind (already allowed by name) has no namespace to check.
+        assert_eq!(
+            namespaces_for(&scope, "c", false, Some("x")),
+            Ok(Namespaces::All)
+        );
+    }
+
+    // covers UP-14: kinds outside the scope are hidden; under a namespace scope, cluster-scoped
+    // kinds too unless named.
+    #[test]
+    fn kinds_follow_the_scope() {
+        let kinds = [
+            kind("", "v1", "Pod", "pods", true),
+            kind("", "v1", "Secret", "secrets", true),
+            kind("", "v1", "Node", "nodes", false),
+            kind("apps", "v1", "Deployment", "deployments", true),
+        ];
+        let names = |scope: &AiScope| -> Vec<String> {
+            kinds_in_scope(scope, &kinds)
+                .iter()
+                .map(|k| k.id().as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(names(&AiScope::default()).len(), 4);
+        assert_eq!(
+            names(&scoped(&["shop"], &[])),
+            ["pods", "secrets", "deployments.apps"]
+        );
+        assert_eq!(names(&scoped(&[], &["pods", "nodes"])), ["pods", "nodes"]);
+        assert_eq!(
+            names(&scoped(&["shop"], &["deployments.apps", "nodes"])),
+            ["nodes", "deployments.apps"]
+        );
+        assert!(logs_in_scope(&scoped(&["shop"], &[])));
+        assert!(logs_in_scope(&scoped(&[], &["pods"])));
+        assert!(!logs_in_scope(&scoped(&[], &["deployments.apps"])));
+    }
+
+    // covers UP-14: events follow the namespace scope, and the kinds scope through the object
+    // they are about.
+    #[test]
+    fn events_follow_the_scope() {
+        let kinds = [
+            kind("", "v1", "Pod", "pods", true),
+            kind("", "v1", "Secret", "secrets", true),
+            kind("", "v1", "Node", "nodes", false),
+            kind("apps", "v1", "Deployment", "deployments", true),
+        ];
+        let everything = AiScope::default();
+        assert!(event_in_scope(
+            &everything,
+            &kinds,
+            None,
+            Some("Whatever"),
+            None
+        ));
+        let ns = scoped(&["shop"], &[]);
+        assert!(event_in_scope(
+            &ns,
+            &kinds,
+            Some("shop"),
+            Some("Pod"),
+            Some("v1")
+        ));
+        assert!(!event_in_scope(
+            &ns,
+            &kinds,
+            Some("kube-system"),
+            Some("Pod"),
+            Some("v1")
+        ));
+        // Node events land in "default": the node is a cluster-scoped kind, hidden here.
+        let default = scoped(&["default"], &[]);
+        assert!(!event_in_scope(
+            &default,
+            &kinds,
+            Some("default"),
+            Some("Node"),
+            Some("v1")
+        ));
+        let pods = scoped(&[], &["pods"]);
+        assert!(event_in_scope(
+            &pods,
+            &kinds,
+            Some("a"),
+            Some("Pod"),
+            Some("v1")
+        ));
+        assert!(!event_in_scope(
+            &pods,
+            &kinds,
+            Some("a"),
+            Some("Secret"),
+            Some("v1")
+        ));
+        let apps = scoped(&[], &["deployments.apps"]);
+        assert!(event_in_scope(
+            &apps,
+            &kinds,
+            Some("a"),
+            Some("Deployment"),
+            Some("apps/v1")
+        ));
+        assert!(!event_in_scope(
+            &apps,
+            &kinds,
+            Some("a"),
+            Some("Deployment"),
+            Some("v1")
+        ));
+        // A kind discovery does not list is left out of a scoped cluster's events.
+        assert!(!event_in_scope(
+            &ns,
+            &kinds,
+            Some("shop"),
+            Some("Gizmo"),
+            Some("x.io/v1")
+        ));
     }
 
     // covers UP-10

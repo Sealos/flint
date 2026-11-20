@@ -22,7 +22,7 @@ use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
-use crate::settings::{self, Settings};
+use crate::settings::{self, AiScope, Settings};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 
@@ -176,27 +176,27 @@ enum Internal {
 }
 
 /// A list of pinned clusters in `settings.toml` ([`crate::settings::ClusterPin`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Pins {
-    /// `ai_exposed_clusters` (ADR-0009).
-    AiExposure,
+    /// `ai_exposed_clusters` (ADR-0009), with what agents may read (ADR-0013).
+    AiExposure(AiScope),
     /// `trusted_clusters` (ADR-0015).
     Trust,
 }
 
 impl Pins {
     /// What the list is, in errors.
-    fn what(self) -> &'static str {
+    fn what(&self) -> &'static str {
         match self {
-            Pins::AiExposure => "exposure",
+            Pins::AiExposure(_) => "exposure",
             Pins::Trust => "trust",
         }
     }
 
     /// What pinning a cluster did, in errors.
-    fn done(self) -> &'static str {
+    fn done(&self) -> &'static str {
         match self {
-            Pins::AiExposure => "exposed",
+            Pins::AiExposure(_) => "exposed",
             Pins::Trust => "trusted",
         }
     }
@@ -317,8 +317,12 @@ impl ClusterManager {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::Activate(id) => self.activate(id),
-            Command::SetAiExposed { cluster, server } => {
-                self.set_pin(Pins::AiExposure, cluster, server).await;
+            Command::SetAiExposed {
+                cluster,
+                server,
+                scope,
+            } => {
+                self.set_pin(Pins::AiExposure(scope), cluster, server).await;
             }
             Command::SetTrusted {
                 cluster,
@@ -595,8 +599,6 @@ impl ClusterManager {
         }
     }
 
-    /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
-    /// `settings.toml`.
     /// Trusts `cluster` at `server` (`Some`) or stops trusting it (`None`): request `request`,
     /// numbered when it was made ([`crate::protection::SessionUnlocks`]). A Trust reports how
     /// its write went, which lifts an earlier Stop Trusting only if no request was made since.
@@ -615,7 +617,8 @@ impl ClusterManager {
         }
     }
 
-    /// Returns whether the change was saved.
+    /// Pins `cluster` at `server` in a list of pins (`Some`), or removes it (`None`), in
+    /// `settings.toml`. Returns whether the change was saved.
     async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
         if let Some(server) = &server {
             // The user confirmed this server. If the context moved since, do not pin the new
@@ -644,7 +647,9 @@ impl ClusterManager {
         }
         let dir = self.config.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || match pins {
-            Pins::AiExposure => settings::set_ai_exposed(&dir, &cluster, server.as_deref()),
+            Pins::AiExposure(scope) => {
+                settings::set_ai_exposed(&dir, &cluster, server.as_deref(), &scope)
+            }
             Pins::Trust => settings::set_trusted(&dir, &cluster, server.as_deref()),
         })
         .await;

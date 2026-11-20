@@ -138,6 +138,7 @@ async fn set_ai_exposed_writes_context_and_server() {
     core.send(Command::SetAiExposed {
         cluster: "one".into(),
         server: Some(SERVER.into()),
+        scope: Default::default(),
     });
     let (settings, _) = tokio::time::timeout(
         Duration::from_secs(5),
@@ -184,6 +185,7 @@ async fn exposing_a_server_the_context_no_longer_has_is_refused() {
     core.send(Command::SetAiExposed {
         cluster: "one".into(),
         server: Some("https://somewhere-else".into()),
+        scope: Default::default(),
     });
     let message = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -330,6 +332,7 @@ async fn commands_never_write_kubeconfig_files() {
     core.send(Command::SetAiExposed {
         cluster: "one".into(),
         server: Some(SERVER.into()),
+        scope: Default::default(),
     });
     core.send(Command::SetWatchMode {
         cluster: Some("one".into()),

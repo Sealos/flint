@@ -85,6 +85,8 @@ struct Conn {
     client: Client,
     fingerprint: u64,
     target: Target,
+    /// What the agent may read of the cluster (ADR-0013).
+    scope: policy::AiScope,
 }
 
 impl Conn {
@@ -351,6 +353,7 @@ impl FlintMcp {
     /// context's kubeconfig entries change.
     async fn client(&self, ctx: &CallContext, name: &str) -> Result<Conn, ToolError> {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
+        let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
             .ok_or_else(|| ToolError(format!("cluster \"{name}\" not found")))?;
         // Derived from the same kubeconfig entries as the fingerprint, so it always matches the
@@ -375,6 +378,7 @@ impl FlintMcp {
             client,
             fingerprint,
             target,
+            scope,
         })
     }
 
@@ -398,8 +402,20 @@ impl FlintMcp {
         Ok(kinds.clone())
     }
 
-    /// The connection and the resolved kind. `check` runs once the cluster is known to be
-    /// exposed and before discovery, so a call it refuses sends no request at all.
+    /// The kinds of `cluster` the agent may read: all of them, or those its scope allows.
+    async fn kinds_in_scope(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
+        let kinds = self.kinds(cluster, conn).await?;
+        if conn.scope.is_everything() {
+            return Ok(kinds);
+        }
+        Ok(Arc::new(policy::kinds_in_scope(&conn.scope, &kinds)))
+    }
+
+    /// The connection and the resolved kind. `check` (the names the call carries) runs once the
+    /// cluster is known to be exposed and before discovery or the scope, so a call it refuses
+    /// sends no request at all. The kind is resolved among those the agent may read: on a
+    /// scoped cluster one that does not resolve gives the unexposed-cluster error, whether it
+    /// is out of scope or does not exist, so the two cannot be told apart.
     async fn resolve(
         &self,
         cluster: &str,
@@ -410,10 +426,14 @@ impl FlintMcp {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, cluster).await?;
         check()?;
-        let kinds = self.kinds(cluster, &conn).await?;
-        let kind = read::resolve_kind(&kinds, kind, api_version)
-            .map_err(kind_error)?
-            .clone();
+        let kinds = self.kinds_in_scope(cluster, &conn).await?;
+        let kind = match read::resolve_kind(&kinds, kind, api_version) {
+            Ok(kind) => kind.clone(),
+            Err(ResolveKindError::NotFound(_)) if !conn.scope.is_everything() => {
+                return Err(policy::out_of_scope(cluster).into());
+            }
+            Err(e) => return Err(kind_error(e)),
+        };
         Ok((conn, kind))
     }
 
@@ -424,6 +444,7 @@ impl FlintMcp {
             .cloned()
             .collect();
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);
+        let settings = ctx.settings.clone();
         let kubeconfig_errors: Vec<Value> = ctx
             .kubeconfig
             .errors
@@ -437,20 +458,32 @@ impl FlintMcp {
             .collect();
         let mut rows = Vec::new();
         let results = self.probe_all(ctx, &exposed).await;
+        let scopes: BTreeMap<String, policy::AiScope> = exposed
+            .iter()
+            .map(|info| (info.name.clone(), policy::cluster_scope(&settings, info)))
+            .collect();
         for info in &exposed {
             let (reachable, version, error) = match results.get(&info.name) {
                 Some(Ok(v)) => (true, Some(v.clone()), None),
                 Some(Err(e)) => (false, None, Some(e.clone())),
                 None => (false, None, None),
             };
-            rows.push(json!({
+            let mut row = json!({
                 "name": info.name,
                 "server": info.server.as_deref().map(flint_core::redact::server_url),
                 "default_namespace": info.namespace,
                 "reachable": reachable,
                 "server_version": version,
                 "error": error,
-            }));
+            });
+            // What the user limited the agent to, so it asks within it.
+            if let Some(scope) = scopes.get(&info.name).filter(|s| !s.is_everything()) {
+                row["scope"] = json!({
+                    "namespaces": scope.namespaces,
+                    "kinds": scope.kinds,
+                });
+            }
+            rows.push(row);
         }
         let mut out = json!({ "clusters": rows });
         if let Some(hint) = policy::list_clusters_hint(exposed.len(), changed) {
@@ -508,7 +541,7 @@ impl FlintMcp {
     async fn do_list_kinds(&self, p: ClusterParams) -> Result<String, ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
-        let kinds = self.kinds(&p.cluster, &conn).await?;
+        let kinds = self.kinds_in_scope(&p.cluster, &conn).await?;
         let rows: Vec<Value> = kinds.iter().map(kind_row).collect();
         to_json(&json!({ "cluster": p.cluster, "count": rows.len(), "kinds": rows }))
     }
@@ -523,19 +556,48 @@ impl FlintMcp {
             return Err(ToolError(format!("{} cannot be listed", kind.kind())));
         }
         let limit = policy::OBJECTS.clamp(p.limit);
-        let page = table::list_table(
-            &conn.client,
-            &kind,
-            &read::ListQuery {
-                namespace: p.namespace.clone(),
+        let namespaces = policy::namespaces_for(
+            &conn.scope,
+            &p.cluster,
+            kind.namespaced,
+            p.namespace.as_deref(),
+        )?;
+        let query = |namespace: Option<String>, limit: u32, continue_token: Option<String>| {
+            read::ListQuery {
+                namespace,
                 label_selector: p.label_selector.clone(),
                 field_selector: None,
                 limit: Some(limit),
-                continue_token: p.continue_token.clone(),
-            },
-        )
-        .await
-        .map_err(|e| conn.fail(e))?;
+                continue_token,
+            }
+        };
+        let page = match namespaces {
+            policy::Namespaces::One(ns) => table::list_table(
+                &conn.client,
+                &kind,
+                &query(Some(ns), limit, p.continue_token.clone()),
+            )
+            .await
+            .map_err(|e| conn.fail(e))?,
+            policy::Namespaces::All => table::list_table(
+                &conn.client,
+                &kind,
+                &query(None, limit, p.continue_token.clone()),
+            )
+            .await
+            .map_err(|e| conn.fail(e))?,
+            policy::Namespaces::Only(namespaces) => {
+                if p.continue_token.is_some() {
+                    return Err(ToolError(
+                        "This cluster's objects are listed namespace by namespace: pass a \
+                         namespace from list_clusters' scope to page through it."
+                            .to_owned(),
+                    ));
+                }
+                self.list_in_namespaces(&conn, &kind, &namespaces, limit, &query)
+                    .await?
+            }
+        };
         let is_secret = is_secret_kind(&kind);
         let (columns, rows, cut, redacted) =
             table_rows(&page, is_secret, table::unix_now(), policy::LIST_BYTES);
@@ -579,6 +641,16 @@ impl FlintMcp {
                 Ok(())
             })
             .await?;
+        // One object: a namespaced kind needs a namespace in scope.
+        if kind.namespaced
+            && !conn.scope.namespaces.is_empty()
+            && !p
+                .namespace
+                .as_deref()
+                .is_some_and(|ns| conn.scope.allows_namespace(ns))
+        {
+            return Err(policy::out_of_scope(&p.cluster).into());
+        }
         let object = read::get(&conn.client, &kind, p.namespace.as_deref(), &p.name)
             .await
             .map_err(|e| conn.fail(e))?;
@@ -620,17 +692,44 @@ impl FlintMcp {
             kind: p.object_kind.clone(),
             name: p.object_name.clone(),
         };
-        let (events, more) = read::events(
-            &conn.client,
-            &read::EventQuery {
-                namespace: p.namespace.clone(),
-                involved: Some(involved),
+        let fetch = |namespace: Option<String>| {
+            let query = read::EventQuery {
+                namespace,
+                involved: Some(involved.clone()),
                 field_selector: None,
                 fetch_limit: Some(EVENTS_FETCH),
-            },
-        )
-        .await
-        .map_err(|e| conn.fail(e))?;
+            };
+            let client = conn.client.clone();
+            async move { read::events(&client, &query).await }
+        };
+        let (mut events, more) =
+            match policy::namespaces_for(&conn.scope, &p.cluster, true, p.namespace.as_deref())? {
+                policy::Namespaces::One(ns) => fetch(Some(ns)).await.map_err(|e| conn.fail(e))?,
+                policy::Namespaces::All => fetch(None).await.map_err(|e| conn.fail(e))?,
+                policy::Namespaces::Only(namespaces) => {
+                    let mut all = Vec::new();
+                    let mut more = false;
+                    for ns in namespaces {
+                        let (events, cut) = fetch(Some(ns)).await.map_err(|e| conn.fail(e))?;
+                        all.extend(events);
+                        more |= cut;
+                    }
+                    all.sort_by_key(|e| std::cmp::Reverse(read::event_time(e)));
+                    (all, more)
+                }
+            };
+        if !conn.scope.is_everything() {
+            let kinds = self.kinds(&p.cluster, &conn).await?;
+            events.retain(|e| {
+                policy::event_in_scope(
+                    &conn.scope,
+                    &kinds,
+                    e.metadata.namespace.as_deref(),
+                    e.involved_object.kind.as_deref(),
+                    e.involved_object.api_version.as_deref(),
+                )
+            });
+        }
         let truncated = more || events.len() > limit;
         let mut redacted = 0;
         let rows: Vec<Value> = events
@@ -678,6 +777,10 @@ impl FlintMcp {
                 p.pod
             )));
         }
+        // Logs are a pod's: pods and the pod's namespace must be in scope.
+        if !policy::logs_in_scope(&conn.scope) || !conn.scope.allows_namespace(&p.namespace) {
+            return Err(policy::out_of_scope(&p.cluster).into());
+        }
         let lines = policy::LOG_LINES.clamp(p.tail_lines);
         // Ask for one extra line to learn whether older lines exist.
         let mut tail = i64::from(lines) + 1;
@@ -724,6 +827,48 @@ impl FlintMcp {
             result["note"] = json!(note);
         }
         to_json(&result)
+    }
+}
+
+impl FlintMcp {
+    /// Lists `kind` in each of `namespaces` in turn, up to `limit` rows in all: a request for
+    /// all namespaces on a cluster limited to these. The result carries no continue token
+    /// (`more` says rows were left out); the agent pages one namespace at a time.
+    async fn list_in_namespaces(
+        &self,
+        conn: &Conn,
+        kind: &KindInfo,
+        namespaces: &[String],
+        limit: u32,
+        query: &impl Fn(Option<String>, u32, Option<String>) -> read::ListQuery,
+    ) -> Result<TablePage, ToolError> {
+        let mut merged: Option<TablePage> = None;
+        for ns in namespaces {
+            let taken = merged.as_ref().map_or(0, |m| m.rows.len()) as u32;
+            if taken >= limit {
+                if let Some(m) = merged.as_mut() {
+                    m.more = true;
+                }
+                break;
+            }
+            let page = table::list_table(
+                &conn.client,
+                kind,
+                &query(Some(ns.clone()), limit - taken, None),
+            )
+            .await
+            .map_err(|e| conn.fail(e))?;
+            match merged.as_mut() {
+                None => merged = Some(page),
+                Some(m) => {
+                    m.rows.extend(page.rows);
+                    m.more |= page.more;
+                }
+            }
+        }
+        let mut page = merged.expect("a scope names at least one namespace");
+        page.continue_token = None;
+        Ok(page)
     }
 }
 
