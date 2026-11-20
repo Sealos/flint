@@ -13,7 +13,7 @@ body:
     id: flint-version
     attributes:
       label: Flint version
-      description: Run `--version` on the Flint you use, for example `flint --version`, `./flint-vX.Y.Z-linux-x86_64.AppImage --version`, or, for the DMG, `/Applications/Flint.app/Contents/MacOS/flint --version`.
+      description: Run `--version` on the Flint you use, for example `flint --version`, `./flint-vX.Y.Z-linux-x86_64.AppImage --version`, `cargo run -p flint-app -- --version`, or, for the DMG, `/Applications/Flint.app/Contents/MacOS/flint --version`.
       placeholder: "0.2.1"
     validations:
       required: true
@@ -50,24 +50,31 @@ body:
         - Other or unknown
     validations:
       required: true
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste cluster data or secrets.** Logs can contain object names, hostnames, ConfigMap contents,
+        environment values and tokens. Paste only the lines around the problem and remove anything private.
   - type: textarea
     id: logs
     attributes:
       label: Log output
       description: |
         Flint logs to stderr only for now, so an app opened from Finder or the Dock keeps no log file.
-        Start the executable of your install from a terminal with more detail and paste what it prints:
-        `FLINT_LOG=debug flint` (DMG: `FLINT_LOG=debug /Applications/Flint.app/Contents/MacOS/flint`;
-        AppImage: `FLINT_LOG=debug ./flint-vX.Y.Z-linux-x86_64.AppImage`; source build: `FLINT_LOG=debug cargo run`).
-        Remove anything private (cluster names, hostnames, tokens) first.
+        Start the executable of your install from a terminal with more detail and paste the relevant lines:
+        `FLINT_LOG=warn,flint=debug,flint_app=debug,flint_core=debug flint`
+        (DMG: `... /Applications/Flint.app/Contents/MacOS/flint`; AppImage: `... ./flint-vX.Y.Z-linux-x86_64.AppImage`;
+        source build: `... cargo run -p flint-app`, with the variable before `cargo`).
+        Do not use a bare `FLINT_LOG=debug`: it turns on debug logging for every library.
       render: text
   - type: textarea
     id: mcp-logs
     attributes:
       label: Log output of the MCP server (only for bugs in an AI client)
       description: |
-        Launching the app does not capture `flint mcp`, which your AI client starts itself. In the client's MCP
-        server entry for Flint, add `FLINT_LOG=debug` to its `env` (or `--verbose` to its `args`), then reproduce the
-        bug and copy the server's stderr from the client's MCP log (the client's settings or log viewer says where).
-        Remove anything private first.
+        Launching the app does not capture `flint mcp`, which your AI client starts itself. Add `--verbose` to the
+        `args` of Flint's entry in the client's MCP server settings, reproduce the bug, and copy the server's stderr
+        from the client's MCP log (the client's settings or log viewer says where). Do not set `FLINT_LOG=debug` for
+        the MCP server: the protocol library then logs full requests and tool results, which can include ConfigMap data
+        and pod environment values that Flint does not redact. Paste only the relevant lines.
       render: text
