@@ -106,6 +106,9 @@ unset UPDATE_INFORMATION LDAI_UPDATE_INFORMATION
   --icon-file "$repo/packaging/linux/flint.png" \
   --icon-filename flint
 install -Dm644 "$repo/LICENSE" "$appdir/usr/share/doc/flint/LICENSE"
+# The Lucide icons compiled into the binary (crates/flint-app/src/ui/icons.rs) are ISC: their
+# notice travels with every AppImage.
+install -Dm644 "$repo/crates/flint-app/assets/icons/LICENSE-LUCIDE" "$appdir/usr/share/doc/flint/LICENSE-LUCIDE"
 # The runtime is MIT: its notice must travel with every AppImage. linuxdeploy already copies the
 # bundled libraries' copyright files into usr/share/doc.
 runtime_license=$repo/packaging/linux/appimage-runtime-LICENSE

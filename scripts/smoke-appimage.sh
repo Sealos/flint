@@ -3,9 +3,10 @@
 #
 #   scripts/smoke-appimage.sh <AppImage> <version>
 #
-# `--version` must print "flint <version>", and `mcp` must reach the MCP server (arguments pass
-# through the AppImage) and answer `initialize`. Runs with APPIMAGE_EXTRACT_AND_RUN=1, since CI
-# runners have no FUSE; the kubeconfig points at a port that refuses connections.
+# `--version` must print "flint <version>", LICENSE and LICENSE-LUCIDE must be inside, and `mcp`
+# must reach the MCP server (arguments pass through the AppImage) and answer `initialize`. Runs
+# with APPIMAGE_EXTRACT_AND_RUN=1, since CI runners have no FUSE; the kubeconfig points at a port
+# that refuses connections.
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
@@ -29,6 +30,19 @@ if [ "$got" != "flint $version" ]; then
   exit 1
 fi
 echo "--version: $got"
+
+# The notices travel with the AppImage: Flint's LICENSE, and LICENSE-LUCIDE for the Lucide icons
+# compiled into the binary.
+repo=$(cd "$(dirname "$0")/.." && pwd)
+(cd "$scratch" && "$appimage" --appimage-extract 'usr/share/doc/flint/*' >/dev/null)
+for notice in LICENSE crates/flint-app/assets/icons/LICENSE-LUCIDE; do
+  name=$(basename "$notice")
+  if ! cmp -s "$scratch/squashfs-root/usr/share/doc/flint/$name" "$repo/$notice"; then
+    echo "error: the AppImage has no usr/share/doc/flint/$name" >&2
+    exit 1
+  fi
+done
+echo "notices: LICENSE, LICENSE-LUCIDE"
 
 mkdir -p "$scratch/config"
 # A fixed PATH, so no login shell runs.

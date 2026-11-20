@@ -113,7 +113,7 @@ jobs:
             target/x86_64-apple-darwin/release/flint
           lipo -info dist/flint/flint
           test "$(dist/flint/flint --version)" = "flint $VERSION"
-          cp LICENSE README.md dist/flint/
+          cp LICENSE README.md crates/flint-app/assets/icons/LICENSE-LUCIDE dist/flint/
       - name: Package
         run: |
           ARCHIVE="flint-${TAG}-macos-universal.tar.gz"
