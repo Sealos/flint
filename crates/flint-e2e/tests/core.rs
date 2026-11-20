@@ -1251,24 +1251,20 @@ async fn a_stopped_container_fails_with_the_kubelets_reason_before_or_after_the_
             .handle
             .exec(ExecRequest::shell(CONTEXT, "demo", "fixture-job-qd9jf"));
         let snap = until_exec(&mut shell, "the failure", |s| s.state.is_finished()).await;
-        match &snap.state {
-            // After the upgrade, the status says why.
-            ExecState::Failed(failure) if !kubelet_websockets => {
-                assert_eq!(failure.kind, ExecFailureKind::Server, "{failure}");
-                assert!(
-                    failure.contains("container not found (\"job\")"),
-                    "{failure}"
-                );
-            }
-            // Before it, the kubelet's reason is plain text, which kube wraps as an unparsed
-            // body and Flint shows as a bare 500 (`ClusterError::Http`), dropping the reason.
-            // This pins today's behaviour; reported on #168.
-            ExecState::Failed(failure) => {
-                assert_eq!(failure.kind, ExecFailureKind::Other, "{failure}");
-                assert!(failure.contains("500"), "{failure}");
-            }
-            other => panic!("{kubelet_websockets}: {other:?}"),
-        }
+        // After the upgrade the status says why; before it, the kubelet's plain-text reason,
+        // which kube wraps as an unparsed body, is read as the server's too.
+        let ExecState::Failed(failure) = &snap.state else {
+            panic!("{kubelet_websockets}: {:?}", snap.state);
+        };
+        assert_eq!(
+            failure.kind,
+            ExecFailureKind::Server,
+            "{kubelet_websockets}: {failure}"
+        );
+        assert!(
+            failure.contains("container not found (\"job\")"),
+            "{kubelet_websockets}: {failure}"
+        );
         // Not a missing shell: `/bin/sh` is not tried.
         assert_eq!(server.exec_requests().len(), 1, "{kubelet_websockets}");
         assert_eq!(
