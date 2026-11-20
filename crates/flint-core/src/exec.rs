@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use crate::api_error::ApiError;
 use crate::cluster::{ClusterError, ClusterId};
 use crate::protection::WriteRefusal;
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
@@ -488,8 +489,12 @@ impl LaunchError {
     /// ("No such file or directory") must not make the next shell be tried.
     fn kube(err: kube::Error, executable: &str) -> Self {
         let from_server = matches!(err, kube::Error::Api(_));
-        // Classified from kube's error as well as core's, which keeps less of it.
-        let error = ClusterError::kube_ref(&err);
+        // Classified from kube's error as well as core's, which keeps less of it. The kubelet's
+        // plain-text refusal of a stopped container is the server's reason here, and only here.
+        let error = match ApiError::from_kube(&err).and_then(|api| api.kubelet_refusal()) {
+            Some(reason) => ClusterError::Api(reason),
+            None => ClusterError::kube_ref(&err),
+        };
         let kind = ExecFailureKind::of(&err, &error);
         let message = error.to_string();
         let missing_command = from_server && is_missing_command(&message, executable);

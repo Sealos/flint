@@ -609,7 +609,9 @@ opens in a tab in the bottom dock.
   a refused or timed-out connection is reaching the cluster; only the API server's own `Status` is the server's, and
   only those are told apart by their words (no permission, pod or exec not found, container not running). A plain-text
   body is never shown, except the kubelet's refusal of a stopped container before the upgrade, `container not found
-  ("<name>")`, matched exactly (a valid container name, at most 63 characters), which is the server's too. A bare HTTP
+  ("<name>")`, matched exactly (a valid container name, at most 63 characters), which is the server's too. That phrase
+  is read only when launching an exec, and only from a plain 500; any other request or status keeps it a bare HTTP
+  code, whose diagnostic says more (a proxy's 502, `/version`). A bare HTTP
   code (a proxy's page, a wrong server path) and anything else read "The shell could not start." with the full text.
   After the end the screen stays scrollable and copyable. Closing the tab drops the session.
 - **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,
