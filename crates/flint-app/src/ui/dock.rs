@@ -671,8 +671,7 @@ impl Dock {
             .on_click(registry::on_click(ToggleDock))
     }
 
-    /// What the dock shows with no tab open: no tab strip, a line on how to open one, and the
-    /// button that hides it.
+    /// What the dock shows with no tab open, instead of a tab strip: how to open one.
     fn render_empty(&self, theme: &Theme) -> AnyElement {
         v_flex()
             .id("dock-empty")
@@ -689,7 +688,6 @@ impl Dock {
                 registry::key_hint("secondary-l"),
                 registry::key_hint("secondary-shift-e")
             )))
-            .child(div().absolute().top_1().right_1().child(self.render_hide()))
             .test_support()
             .into_any_element()
     }
@@ -706,7 +704,13 @@ impl Render for Dock {
             .size_full()
             .bg(theme.background);
         let Some(active) = self.active_tab() else {
-            return root.child(self.render_empty(&theme)).test_support();
+            // The hide button keeps its place in the element tree (under `dock`), so it is the
+            // same control with and without tabs.
+            return root
+                .relative()
+                .child(self.render_empty(&theme))
+                .child(div().absolute().top_1().right_1().child(self.render_hide()))
+                .test_support();
         };
         let content = div()
             .flex_1()

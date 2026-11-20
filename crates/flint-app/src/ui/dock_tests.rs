@@ -168,14 +168,15 @@ fn open_logs(
     id
 }
 
-/// Closes tab `id` as its close button does.
+/// Closes tab `id` as its close button does, and draws the dock without it, as the app does
+/// next: what only its frame held (the tab list's menu state, say) is dropped then.
 fn close(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) {
     cx.update_window(window, |_, window, cx| {
         registry::dispatch("dock::CloseTab", json!({ "tab": id }), window, cx)
     })
     .unwrap()
     .unwrap();
-    cx.run_until_parked();
+    draw(cx, window);
 }
 
 // covers UP-42: closing a shell tab frees its view and ends its session.
