@@ -189,9 +189,11 @@ pub struct Discovered {
 }
 
 /// Drops the discovery of contexts that left kubeconfig (`before` -> `now`), or that now point at
-/// another API server under the same name: the core dropped them too (a re-pointed context starts
-/// over and is discovered again), and the model would otherwise keep every such context's kinds
-/// for as long as the app runs, or show the old server's kinds for the new one.
+/// another API server under the same name: the core dropped their slots (a re-pointed context
+/// starts over and is discovered again), and the model would otherwise keep every such context's
+/// kinds for as long as the app runs, or show the old server's kinds for the new one. (Other
+/// changes to a context, such as its user, start it over in the core too; its kinds come from the
+/// same server, so they are kept until it is discovered again.)
 fn forget_removed(
     discovery: &mut HashMap<ClusterId, Discovered>,
     before: &[ClusterSummary],
