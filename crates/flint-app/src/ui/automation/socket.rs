@@ -25,9 +25,10 @@ pub struct SocketFile {
 }
 
 impl SocketFile {
-    /// Removes the socket, unless something else has replaced it since. The file type is
-    /// checked too: once the socket is gone, a new file at the path can be given the same
-    /// inode number (Linux reuses freed inodes at once).
+    /// Removes the socket, unless something else has replaced it since. The device and inode
+    /// identify it exactly while the listener is open (the app keeps it open until it quits). The
+    /// file type is checked as well, for the case where the listener has been dropped and a new
+    /// file at the path was given the freed inode number (Linux reuses them at once).
     pub fn remove(&self) {
         if let Ok(meta) = fs::symlink_metadata(&self.path)
             && meta.file_type().is_socket()
@@ -286,12 +287,13 @@ mod tests {
         file.remove();
         assert!(!path.exists());
 
-        // Replaced by someone else since: left alone.
+        // Replaced by someone else since: left alone. The listener stays open, as it does in the
+        // app until it quits, so the socket's inode stays allocated and cannot be reused.
         let (listener, file) = bind(&path).unwrap();
-        drop(listener);
         fs::remove_file(&path).unwrap();
         fs::write(&path, "theirs").unwrap();
         file.remove();
         assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        drop(listener);
     }
 }
