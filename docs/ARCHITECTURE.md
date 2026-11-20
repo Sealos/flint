@@ -910,22 +910,18 @@ Rules:
 - **Bounded work (`flint_mcp::Limits`, #252):** rmcp starts a task per request and per reply and limits neither, so
   Flint does. At most 16 tool calls run at once and 48 more wait for a turn; past those a call is refused at once with
   a tool error ("too many tool calls in flight"; retry). A running call holds its turn until it ends: when the client
-  cancels it (`notifications/cancelled`, which drops its Kubernetes requests) or after 60 s, with a timeout naming the
-  cluster's server. Replies handed to the transport and not written yet are counted by a wrapping transport, which
-  also tracks requests read and not answered; while the replies pass 8 MiB, or 128 requests are unanswered, it reads
-  no more requests and no admitted call starts its work. A client that stops reading stdout therefore holds about
-  that budget plus those replies, however many calls it keeps sending (refusals and replies to other requests
-  included). A request read at that limit waits at the transport (up to as many again; past that it is refused
-  there, and a refused tool call recorded) while reading goes on, so a cancellation always gets through; when the
-  client closes its end, what waits still runs, and the stream ends only once every request read is answered. A request counts until its reply reaches the transport (where its bytes count), or, once cancelled,
-  until nothing works on it (a tool call's handler has ended). A request whose id is still in flight is refused at
-  the transport. A cluster's connection (and its exec auth plugin) is made in a task of its own that later calls
-  join; at most 4 run at once. A connection waits for its turn only while some call waits for it, then holds it until
-  it ends; the task alone caches the client, then leaves the map. `list_clusters` reports a cluster whose connection
-  never got a turn as not checked (`reachable: null`), not unreachable. Each call writes one activity record once its outcome is settled (refused, cancelled,
-  timed-out and cancelled-while-waiting calls as failed), through one writer task with a bounded queue (capped as written, and awaited: a writer
-  that falls behind slows calls rather than losing records), so no reply waits for the file; the server flushes it when the client disconnects. The timeout reply is redacted like every
-  other.
+  cancels it (`notifications/cancelled`, which drops its Kubernetes requests, a connecting exec plugin included) or
+  after 60 s, with a timeout naming the cluster's server (redacted like every reply). A wrapping transport counts the
+  bytes of replies handed to it and not written yet, and the requests read and not answered: while the replies pass
+  8 MiB it reads nothing more, so a client that stops reading stdout gets nothing more run or answered (refusals and
+  replies to other requests included); a request read while 128 are unanswered is refused there at once, as is one
+  whose id is still in flight; notifications, a cancellation in particular, always pass. A request counts until its
+  reply reaches the transport, or, once cancelled, until nothing works on it (a tool call's handler has ended). When
+  the client closes its end, the stream ends only once every request read is answered. Clusters connect through the
+  per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
+  connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
+  as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
+  written in time is skipped and logged.
 - **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
   `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
   app).

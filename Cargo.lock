@@ -2056,7 +2056,6 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "flint-core",
- "futures",
  "kube",
  "rmcp",
  "serde",

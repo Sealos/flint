@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use rmcp::RoleServer;
 use rmcp::model::{ClientNotification, ClientRequest, JsonRpcMessage, RequestId};
@@ -170,8 +170,8 @@ impl Admission {
 /// answered yet.
 #[derive(Default)]
 pub(crate) struct ReplyBytes {
-    /// Told of a tool call the client cancelled while it waited at the transport (it never
-    /// reaches a handler): its tool and arguments.
+    /// Told of a tool call refused at the transport (it never reaches a handler): its tool and
+    /// arguments, so it is recorded.
     dropped_call: std::sync::OnceLock<DroppedCall>,
     outstanding: AtomicUsize,
     /// Requests read and not done with yet, and whether each is a tool call.
@@ -214,8 +214,8 @@ impl ReplyBytes {
         let _ = self.dropped_call.set(tell);
     }
 
-    /// Tells of a tool call that never reaches a handler (cancelled while it waited, refused
-    /// at the transport), so it is recorded; awaited, so a slow activity log slows reading.
+    /// Tells of a tool call refused at the transport, which never reaches a handler, so it is
+    /// recorded; awaited, so a slow activity log slows reading.
     async fn dropped(&self, message: &RxJsonRpcMessage<RoleServer>) {
         if let (JsonRpcMessage::Request(request), Some(tell)) = (message, self.dropped_call.get())
             && let ClientRequest::CallToolRequest(call) = &request.request
@@ -323,12 +323,6 @@ impl Drop for Held {
 pub(crate) struct Counted<T> {
     inner: T,
     replies: Arc<ReplyBytes>,
-    /// Requests read while [`Limits::unanswered`] were not done with: passed on in order as
-    /// those are. Reading goes on meanwhile (a cancellation must get through); past as many
-    /// again waiting, a request is refused.
-    deferred: VecDeque<RxJsonRpcMessage<RoleServer>>,
-    /// The client closed its end: what is deferred still goes out, then the stream ends.
-    eof: bool,
     /// Past this many reply bytes not written ([`Limits::reply_budget`]), or this many
     /// requests not answered ([`Limits::unanswered`]), no more requests are read.
     budget: usize,
@@ -340,8 +334,6 @@ impl<T> Counted<T> {
         Counted {
             inner,
             replies,
-            deferred: VecDeque::new(),
-            eof: false,
             budget: limits.reply_budget,
             unanswered: limits.unanswered,
         }
@@ -357,14 +349,6 @@ fn answers(message: &TxJsonRpcMessage<RoleServer>) -> Option<&RequestId> {
     }
 }
 
-/// The id of `message`, if it is a request.
-fn request_id(message: &RxJsonRpcMessage<RoleServer>) -> Option<&RequestId> {
-    match message {
-        JsonRpcMessage::Request(request) => Some(&request.id),
-        _ => None,
-    }
-}
-
 fn work(request: &rmcp::model::JsonRpcRequest<ClientRequest>) -> Work {
     Work {
         tool: matches!(request.request, ClientRequest::CallToolRequest(_)),
@@ -374,7 +358,7 @@ fn work(request: &rmcp::model::JsonRpcRequest<ClientRequest>) -> Work {
 
 /// Why a request is refused at the transport.
 const DUPLICATE: &str = "a request with this id is still in flight; use a new id";
-const BUSY: &str = "too many requests waiting; retry when some have been answered";
+const BUSY: &str = "too many requests in flight; retry when some have been answered";
 
 /// Answers a request with an error, without passing it to rmcp: one whose id is still in
 /// flight (rmcp would start a second handler), or one past what may wait. The reply is counted
@@ -430,73 +414,36 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
 
     /// The next message for rmcp. Nothing is read while replies not written pass the budget: a
     /// client that does not read stdout gets nothing more run or answered (refusals and replies
-    /// to other requests included) until it does. A request read while [`Limits::unanswered`]
-    /// are not done with waits ([`Counted::deferred`]) for one of them; notifications, a
-    /// cancellation in particular, pass at once. A request whose id is still in flight is
-    /// refused here, its reply counted like any other.
+    /// to other requests included) until it does. Otherwise reading goes on, so a cancellation
+    /// always gets through. A request read while [`Limits::unanswered`] are not done with is
+    /// refused here at once ("busy"), as is one whose id is still in flight; a tool call refused
+    /// so is recorded. When the client closes its end, the stream ends once every request read
+    /// is answered (rmcp waits only briefly for running handlers after it ends).
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
         let (replies, budget, most) = (self.replies.clone(), self.budget, self.unanswered);
-        let (inner, deferred, eof) = (&mut self.inner, &mut self.deferred, &mut self.eof);
+        let inner = &mut self.inner;
         async move {
             loop {
-                let free = || replies.unanswered_count() < most;
-                if *eof && deferred.is_empty() {
-                    // rmcp stops waiting for handlers soon after the stream ends: it ends once
-                    // every request read has its answer (or is done with).
+                replies.within(budget).await;
+                let Some(message) = inner.receive().await else {
                     replies.until(|| replies.unanswered_count() == 0).await;
                     return None;
-                }
-                if free()
-                    && let Some(request) = deferred.pop_front()
-                {
-                    if let JsonRpcMessage::Request(r) = &request {
-                        replies.unanswered().insert(r.id.clone(), work(r));
-                    }
-                    return Some(request);
-                }
-                let within = || replies.outstanding() <= budget;
-                // Reading goes on while bytes allow, so a cancellation always gets through.
-                let reading = !*eof && within();
-                let message = tokio::select! {
-                    message = inner.receive(), if reading => match message {
-                        Some(message) => message,
-                        None => {
-                            *eof = true;
-                            continue;
-                        }
-                    },
-                    () = replies.until(|| free() && !deferred.is_empty()),
-                        if !deferred.is_empty() => continue,
-                    () = replies.until(within), if !reading && !*eof => continue,
                 };
                 match &message {
                     JsonRpcMessage::Request(request) => {
                         let id = &request.id;
-                        let in_flight = replies.unanswered().contains_key(id)
-                            || deferred.iter().any(|d| request_id(d) == Some(id));
-                        if in_flight {
+                        if replies.unanswered().contains_key(id) {
                             refuse(inner, &replies, id.clone(), DUPLICATE);
-                        } else if !free() && deferred.len() >= most {
-                            // As many wait here already: refused, its reply counted, and a
-                            // tool call recorded.
+                        } else if replies.unanswered_count() >= most {
                             refuse(inner, &replies, id.clone(), BUSY);
                             replies.dropped(&message).await;
-                        } else if free() {
+                        } else {
                             replies.unanswered().insert(id.clone(), work(request));
                             return Some(message);
-                        } else {
-                            deferred.push_back(message);
                         }
                     }
                     _ => {
                         if let Some(id) = cancels(&message) {
-                            // One still waiting here never reaches rmcp: told of here.
-                            if let Some(at) =
-                                deferred.iter().position(|d| request_id(d) == Some(&id))
-                            {
-                                let dropped = deferred.remove(at).expect("found");
-                                replies.dropped(&dropped).await;
-                            }
                             replies.cancelled(&id);
                         }
                         return Some(message);

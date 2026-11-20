@@ -2,7 +2,7 @@
 //! once), recomputes the kubeconfig file list from it, reloads kubeconfig when a file changed,
 //! checks the cluster against the opt-in list, and only then touches the network.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,8 +14,6 @@ use flint_core::kubeconfig::{self, ContextInfo, FileStamps, LoadedKubeconfig};
 use flint_core::read::{self, KindInfo, ResolveKindError};
 use flint_core::settings;
 use flint_core::table::{self, TablePage};
-use futures::FutureExt as _;
-use futures::future::{BoxFuture, Shared};
 use kube::Client;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -57,80 +55,29 @@ struct Inner {
     discovery: SlotMap<Kinds>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
     admission: Admission,
-    /// Connections being made, by cluster and fingerprint, with the number of the attempt
-    /// ([`FlintMcp::connecting`]).
-    connecting: Mutex<HashMap<(String, u64), InFlight>>,
-    next_connect: std::sync::atomic::AtomicU64,
-    /// Connect tasks running at once: a cancelled call leaves its connection running for the
-    /// next ones, so calls on many clusters must not leave one each.
-    connect_turns: Arc<tokio::sync::Semaphore>,
-    /// Writes activity records in order, off every reply's path ([`Inner::record`]).
-    activity: Mutex<Option<ActivityWriter>>,
 }
 
-/// Connect tasks that run at once.
-const CONNECTS_AT_ONCE: usize = 4;
-/// Activity records waiting to be written; past that one is dropped (and logged).
-const RECORDS_QUEUED: usize = 256;
-
-/// The task that writes activity records, and its queue.
-struct ActivityWriter {
-    queue: tokio::sync::mpsc::Sender<activity::ActivityRecord>,
-    task: tokio::task::JoinHandle<()>,
-}
+/// The longest a call waits for its activity record to be written. Past it the record is
+/// skipped (and logged) rather than holding the reply: the log's file lock is the one wait that
+/// is not this process's own.
+const RECORD_WAIT: Duration = Duration::from_secs(2);
 
 impl Inner {
-    /// Queues `record` for the activity log, written in order by a task of its own: no reply
-    /// waits for the file, only for room in the bounded queue, so a writer that falls behind (a
-    /// stalled disk) slows calls down instead of losing records. Held capped, as written.
+    /// Writes `record` to the activity log, on the call's own path, waiting at most
+    /// [`RECORD_WAIT`]. A record that could not be written in time, or at all, is logged.
     async fn record(&self, record: activity::ActivityRecord) {
-        let Some(queue) = self.activity_queue() else {
-            tracing::warn!("no runtime to write the agent activity log; record dropped");
-            return;
-        };
-        if queue.send(activity::capped(&record)).await.is_err() {
-            tracing::warn!("the agent activity log was closed; a record was dropped");
+        let dir = self.config_dir.clone();
+        let write = tokio::task::spawn_blocking(move || activity::append(&dir, &record));
+        match tokio::time::timeout(RECORD_WAIT, write).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
+            Err(_) => {
+                tracing::warn!("the agent activity log is not writable in time; record skipped")
+            }
         }
     }
-
-    /// The writer's queue, starting the writer the first time.
-    fn activity_queue(&self) -> Option<tokio::sync::mpsc::Sender<activity::ActivityRecord>> {
-        let mut writer = self.activity.lock().unwrap_or_else(|e| e.into_inner());
-        if writer.is_none() {
-            let runtime = tokio::runtime::Handle::try_current().ok()?;
-            let (queue, mut records) = tokio::sync::mpsc::channel(RECORDS_QUEUED);
-            let dir = self.config_dir.clone();
-            let task = runtime.spawn(async move {
-                while let Some(record) = records.recv().await {
-                    let dir = dir.clone();
-                    let written =
-                        tokio::task::spawn_blocking(move || activity::append(&dir, &record)).await;
-                    match written {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "cannot write the agent activity log")
-                        }
-                        Err(e) => tracing::warn!(error = %e, "cannot write the agent activity log"),
-                    }
-                }
-            });
-            *writer = Some(ActivityWriter { queue, task });
-        }
-        Some(writer.as_ref().expect("started").queue.clone())
-    }
 }
-
-/// A connection attempt in [`Inner::connecting`]: its number, whether it got a turn yet (a
-/// probe that gave up before then did not check the cluster), and the attempt itself.
-struct InFlight {
-    attempt: u64,
-    started: Arc<std::sync::atomic::AtomicBool>,
-    connecting: Connecting,
-}
-
-/// A connection being made, shared by the calls that wait for it ([`FlintMcp::connecting`]); its
-/// error is already worded for the agent.
-type Connecting = Shared<BoxFuture<'static, Result<Client, Arc<String>>>>;
 
 /// Discovery results for one cluster.
 type Kinds = Arc<Vec<KindInfo>>;
@@ -318,20 +265,6 @@ impl FlintMcp {
     async fn record(&self, record: activity::ActivityRecord) {
         self.inner.record(record).await;
     }
-
-    /// Writes the activity records still queued, waiting up to 5 seconds: when the server stops.
-    pub async fn flush_activity(&self) {
-        let writer = self
-            .inner
-            .activity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(ActivityWriter { queue, task }) = writer {
-            drop(queue);
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        }
-    }
 }
 
 /// What one tool call learned on its way, for its record.
@@ -516,10 +449,6 @@ impl FlintMcp {
                 clients: Mutex::default(),
                 discovery: Mutex::default(),
                 admission: Admission::new(limits),
-                connecting: Mutex::default(),
-                next_connect: std::sync::atomic::AtomicU64::new(0),
-                connect_turns: Arc::new(tokio::sync::Semaphore::new(CONNECTS_AT_ONCE)),
-                activity: Mutex::default(),
             }),
             tool_router: Self::tool_router(),
         }
@@ -535,7 +464,7 @@ impl FlintMcp {
         T: rmcp::transport::Transport<rmcp::RoleServer> + 'static,
     {
         let admission = &self.inner.admission;
-        // A call the client cancels while it waits at the transport never reaches `call_tool`:
+        // A tool call refused at the transport never reaches `call_tool`:
         // recorded from there.
         let inner = Arc::downgrade(&self.inner);
         admission
@@ -821,127 +750,26 @@ impl FlintMcp {
         // cached client.
         let target = Target::of(&ctx.kubeconfig.merged, &info.name);
         let slot = slot(&self.inner.clients, name, fingerprint, None);
-        // Cached by the connection's own task, which this call joins when there is none yet.
-        let client = match slot.cell.get() {
-            Some(client) => client.clone(),
-            None => self
-                .connecting(
-                    name,
-                    fingerprint,
-                    &ctx.kubeconfig,
-                    &info.name,
-                    &target,
-                    slot.clone(),
+        let client = slot
+            .cell
+            .get_or_try_init(|| async {
+                tokio::time::timeout(
+                    TOOL_CONNECT_TIMEOUT,
+                    cluster::connect(&ctx.kubeconfig.merged, &info.name),
                 )
                 .await
-                .map_err(|e| ToolError::new(e.as_str()))?,
-        };
+                .map_err(|_| ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None))?
+            })
+            .await
+            .map_err(|e| e.for_target(&target).for_agent())
+            .map_err(ToolError::new)?
+            .clone();
         Ok(Conn {
             client,
             fingerprint,
             target,
             scope,
         })
-    }
-
-    /// The connection to `context` being made for cluster `name` at `fingerprint`, shared by
-    /// every call that waits for it. It runs in a task of its own, bounded by
-    /// [`TOOL_CONNECT_TIMEOUT`]: a call that is cancelled or past its deadline stops waiting,
-    /// and the next call waits for the same connection (and exec auth plugin) instead of
-    /// starting another.
-    fn connecting(
-        &self,
-        name: &str,
-        fingerprint: u64,
-        kubeconfig: &Arc<LoadedKubeconfig>,
-        context: &str,
-        target: &Target,
-        cached: Arc<flint_core::cache::Slot<Client>>,
-    ) -> Connecting {
-        let mut connecting = self
-            .inner
-            .connecting
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Cached meanwhile: the task caches before it leaves the map, both before this lock.
-        if let Some(client) = cached.cell.get() {
-            return futures::future::ready(Ok(client.clone())).boxed().shared();
-        }
-        let key = (name.to_owned(), fingerprint);
-        if let Some(in_flight) = connecting.get(&key) {
-            return in_flight.connecting.clone();
-        }
-        let attempt = self
-            .inner
-            .next_connect
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (kubeconfig, context, target) =
-            (kubeconfig.clone(), context.to_owned(), target.clone());
-        let (turns, inner, entry, begun) = (
-            self.inner.connect_turns.clone(),
-            Arc::downgrade(&self.inner),
-            key.clone(),
-            started.clone(),
-        );
-        // The turn is waited for here, while some call waits for the connection: once every
-        // call left, nothing waits for a turn any more. Once it has one, the connection runs in
-        // a task of its own, holding the turn until it ends, plugin included, and later calls
-        // join it.
-        let shared = async move {
-            let turn = turns
-                .acquire_owned()
-                .await
-                .map_err(|_| Arc::new("no connection could start".to_owned()))?;
-            begun.store(true, std::sync::atomic::Ordering::Release);
-            let task = tokio::spawn(async move {
-                let _turn = turn;
-                let result = tokio::time::timeout(
-                    TOOL_CONNECT_TIMEOUT,
-                    cluster::connect(&kubeconfig.merged, &context),
-                )
-                .await
-                .unwrap_or_else(|_| Err(ClusterError::timeout(TOOL_CONNECT_TIMEOUT, None)))
-                .map_err(|e| Arc::new(e.for_target(&target).for_agent()));
-                // The one place the client is cached: before the attempt leaves the map, so a
-                // call finds it in one or the other.
-                if let Ok(client) = &result {
-                    let _ = cached.cell.set(client.clone());
-                }
-                if let Some(inner) = inner.upgrade() {
-                    let mut connecting = inner.connecting.lock().unwrap_or_else(|e| e.into_inner());
-                    if connecting.get(&entry).is_some_and(|f| f.attempt == attempt) {
-                        connecting.remove(&entry);
-                    }
-                }
-                result
-            });
-            task.await
-                .unwrap_or_else(|e| Err(Arc::new(format!("connection task failed: {e}"))))
-        }
-        .boxed()
-        .shared();
-        connecting.insert(
-            key,
-            InFlight {
-                attempt,
-                started,
-                connecting: shared.clone(),
-            },
-        );
-        shared
-    }
-
-    /// Whether a connection to `name` at `fingerprint` waits for a turn (none has started).
-    fn connect_waits(&self, name: &str, fingerprint: u64) -> bool {
-        let connecting = self
-            .inner
-            .connecting
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        connecting
-            .get(&(name.to_owned(), fingerprint))
-            .is_some_and(|f| !f.started.load(std::sync::atomic::Ordering::Acquire))
     }
 
     async fn kinds(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
@@ -1026,17 +854,9 @@ impl FlintMcp {
             .collect();
         for info in &exposed {
             let (reachable, version, error) = match results.get(&info.name) {
-                Some(Some(Ok(v))) => (Some(true), Some(v.clone()), None),
-                Some(Some(Err(e))) => (Some(false), None, Some(e.clone())),
-                Some(None) => (
-                    None,
-                    None,
-                    Some(
-                        "not checked: other connections were being made; call list_clusters again"
-                            .to_owned(),
-                    ),
-                ),
-                None => (Some(false), None, None),
+                Some(Ok(v)) => (true, Some(v.clone()), None),
+                Some(Err(e)) => (false, None, Some(e.clone())),
+                None => (false, None, None),
             };
             let scope = scopes.get(&info.name);
             // The context's default namespace only when the agent may read it.
@@ -1076,13 +896,12 @@ impl FlintMcp {
         &self,
         ctx: CallContext,
         exposed: &[ContextInfo],
-    ) -> BTreeMap<String, Option<Result<String, String>>> {
+    ) -> BTreeMap<String, Result<String, String>> {
         let ctx = Arc::new(ctx);
         let mut set = tokio::task::JoinSet::new();
         for info in exposed {
             let name = info.name.clone();
             let target = Target::of(&ctx.kubeconfig.merged, &info.name);
-            let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name);
             let this = self.clone();
             let ctx = ctx.clone();
             set.spawn(async move {
@@ -1093,15 +912,16 @@ impl FlintMcp {
                         .map(|v| v.git_version)
                         .map_err(|e| conn.fail(e))
                 };
-                let result = match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
-                    Ok(result) => Some(result.map_err(|e| e.message)),
-                    // Its connection never got a turn (others were being made): not checked,
-                    // which says nothing of whether it can be reached.
-                    Err(_) if fingerprint.is_some_and(|f| this.connect_waits(&name, f)) => None,
-                    Err(_) => Some(Err(ClusterError::timeout(PROBE_TIMEOUT, None)
-                        .for_target(&target)
-                        .to_string())),
-                };
+                let result = tokio::time::timeout(PROBE_TIMEOUT, probe)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ToolError::new(
+                            ClusterError::timeout(PROBE_TIMEOUT, None)
+                                .for_target(&target)
+                                .to_string(),
+                        ))
+                    })
+                    .map_err(|e| e.message);
                 (name, result)
             });
         }
@@ -1880,10 +1700,8 @@ mod tests {
     }
 
     // covers UP-04: tool calls on a context whose exec auth plugin never answers (a login that
-    // never comes) share one plugin run. Calls that give up (cancelled, past their deadline)
-    // leave it running for the next ones, which wait for the same run instead of starting
-    // another, so repeated calls never pile up plugin processes. (The connection's own timeout
-    // ends it.)
+    // never comes) share one plugin run, and when they give up the plugin and what it started
+    // are killed, so repeated calls never pile up plugin processes.
     #[tokio::test]
     async fn tool_calls_on_a_hanging_plugin_leave_at_most_one_plugin() {
         use std::os::unix::fs::PermissionsExt;
@@ -1914,6 +1732,7 @@ mod tests {
         };
 
         for round in 1..=2 {
+            let _ = std::fs::remove_file(traces.join("child"));
             let calls: Vec<_> = (0..3)
                 .map(|_| {
                     let server = server.clone();
@@ -1928,27 +1747,29 @@ mod tests {
                 .collect();
             let child = first_line(&traces.join("child")).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert_eq!(
-                starts(),
-                1,
-                "round {round}: one plugin for every call in flight"
-            );
+            assert_eq!(starts(), round, "one plugin for every call in flight");
             let leader = std::fs::read_to_string(traces.join("starts"))
                 .unwrap()
                 .lines()
                 .last()
                 .unwrap()
                 .to_owned();
-            assert!(exists(&leader) && live(&child));
-            // The calls give up, as at their deadline; the plugin runs on for the next ones.
+            assert!(exists(&leader) && exists(&child));
+            // The calls give up, as at their timeout.
             for call in calls {
                 call.abort();
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(
-                exists(&leader),
-                "round {round}: the shared connection goes on"
-            );
+            // The plugin is Flint's child, so it is reaped too; its own child need only be dead.
+            let gone = [(&leader, exists as fn(&str) -> bool), (&child, live)];
+            for (pid, running) in gone {
+                for _ in 0..500 {
+                    if !running(pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(!running(pid), "plugin process {pid} outlived its calls");
+            }
         }
     }
 

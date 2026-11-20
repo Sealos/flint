@@ -65,11 +65,8 @@ pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
                 rmcp::transport::stdio(),
             );
         let transport = server.counted(stdio);
-        let service = server.clone().serve(transport).await?;
-        let ended = service.waiting().await;
-        // The records of the last calls, before the process ends.
-        server.flush_activity().await;
-        ended?;
+        let service = server.serve(transport).await?;
+        service.waiting().await?;
         anyhow::Ok(())
     });
     // stdin reads cannot be cancelled; do not wait for them on the way out, on success or error.

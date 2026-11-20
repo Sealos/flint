@@ -24,8 +24,6 @@ serde-saphyr.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-# Connections shared by the calls that wait for them (`FlintMcp::connecting`); already in the tree.
-futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

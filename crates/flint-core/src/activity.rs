@@ -162,10 +162,8 @@ fn ends_unterminated(file: &mut std::fs::File) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// `record` as [`append`] writes it: its keys from the full names, each text field cut at
-/// [`MAX_FIELD_BYTES`], saying how much was left out. For a writer that holds records before
-/// appending them.
-pub fn capped(record: &ActivityRecord) -> ActivityRecord {
+/// `record` with each text field cut at [`MAX_FIELD_BYTES`], saying how much was left out.
+fn capped(record: &ActivityRecord) -> ActivityRecord {
     let cap = |text: &String| {
         if text.len() <= MAX_FIELD_BYTES {
             return text.clone();
