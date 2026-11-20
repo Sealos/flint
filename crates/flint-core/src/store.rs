@@ -314,6 +314,11 @@ impl Store {
     pub fn get(&self, uid: &str) -> Option<&Arc<Row>> {
         self.rows.get(uid)
     }
+
+    #[cfg(test)]
+    pub fn interned(&self) -> usize {
+        self.interner.len()
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +346,35 @@ mod tests {
         assert!(store.apply_changed(obj(&[("u1", "b", "x", "Running")], "4"), true, 0));
         assert!(!store.apply_changed(obj(&[("u1", "b", "x", "Running")], "4"), true, 0));
         assert_eq!(store.len(), 1);
+    }
+
+    // covers UP-20: hours of pod churn on a watch that never relists keep the interner bounded
+    // (#257).
+    #[test]
+    fn churn_without_a_relist_keeps_the_interner_bounded() {
+        let mut store = Store::new(true);
+        for i in 0..50 {
+            let uid = format!("live-{i}");
+            let name = format!("web-{i}");
+            let status = format!("live-status-{i}");
+            store.apply(obj(&[(&uid, "demo", &name, &status)], "1"), false, 0);
+        }
+        let live = store.interned();
+        // Each new pod has a unique status (as it would a unique IP), and is deleted again.
+        for i in 0..40_000 {
+            let uid = format!("u{i}");
+            let name = format!("job-{i}");
+            let status = format!("ip-10-0-{}-{}", i / 256, i % 256);
+            let rv = i.to_string();
+            store.apply(obj(&[(&uid, "demo", &name, &status)], &rv), false, 0);
+            store.apply(obj(&[(&uid, "demo", &name, &status)], &rv), true, 0);
+            assert!(
+                store.interned() < 2 * live + 4096,
+                "{} strings after {i} pods, {live} live",
+                store.interned()
+            );
+        }
+        assert_eq!(store.len(), 50);
     }
 
     // covers UP-27

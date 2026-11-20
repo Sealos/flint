@@ -437,11 +437,26 @@ pub(crate) enum EventType {
 // ---------------------------------------------------------------------------------------------
 // Building rows
 
+/// The fewest new strings between two prunes that [`Interner::intern`] triggers.
+const PRUNE_MIN: usize = 4096;
+
 /// Interns repeated strings (statuses, node names, label keys, namespaces) for one kind.
+///
+/// Strings no row uses are dropped once as many new strings came in since the last prune as
+/// that prune kept (and at least [`PRUNE_MIN`]), so a watch that runs for days through steady
+/// churn (rollouts, CronJobs, autoscaling: every new pod brings a unique name, IP and labels)
+/// holds fewer than `2 × kept + PRUNE_MIN` strings, where `kept` is what was live at the last
+/// prune. Pruning walks the set, and at most once per `max(PRUNE_MIN, kept)` inserts: amortised
+/// O(1) per insert.
 #[derive(Debug, Default)]
 pub(crate) struct Interner {
     set: HashSet<Arc<str>>,
+    /// New strings since the last prune.
     inserts: usize,
+    /// How many strings the last prune kept.
+    kept: usize,
+    #[cfg(test)]
+    prunes: usize,
 }
 
 impl Interner {
@@ -452,16 +467,22 @@ impl Interner {
         let fresh: Arc<str> = s.into();
         self.set.insert(fresh.clone());
         self.inserts += 1;
-        if self.inserts >= 4096 && self.inserts >= self.set.len() {
+        if self.inserts >= PRUNE_MIN.max(self.kept) {
             self.prune();
         }
         fresh
     }
 
-    /// Drops strings no row uses any more.
+    /// Drops strings no row uses any more. A string the last published snapshot still holds
+    /// survives until a later prune.
     pub fn prune(&mut self) {
         self.set.retain(|s| Arc::strong_count(s) > 1);
+        self.kept = self.set.len();
         self.inserts = 0;
+        #[cfg(test)]
+        {
+            self.prunes += 1;
+        }
     }
 
     #[cfg(test)]
@@ -1002,6 +1023,36 @@ pub(crate) mod tests {
         assert_eq!(row.cells[5], Cell::Age);
         assert_eq!(row.cell_text(5, 1_767_225_700), "100s");
         assert_eq!(row.cell_text(3, 0), "Running");
+    }
+
+    // covers UP-20: a watch that keeps resuming through churn does not keep dead strings (#257).
+    #[test]
+    fn interned_strings_stay_bounded_through_steady_churn() {
+        let mut interner = Interner::default();
+        // Strings rows still use.
+        let live: Vec<Arc<str>> = (0..10_000)
+            .map(|i| interner.intern(&format!("live-{i}")))
+            .collect();
+        interner.prune();
+        let bound = 2 * live.len() + PRUNE_MIN;
+        // Pods come and go, each with strings of its own, dropped at once.
+        let churn = 200_000;
+        let mut largest = 0;
+        for i in 0..churn {
+            drop(interner.intern(&format!("gone-{i}")));
+            largest = largest.max(interner.len());
+        }
+        assert!(largest < bound, "{largest} strings, bound {bound}");
+        // The live ones are all still there.
+        for s in &live {
+            assert!(Arc::ptr_eq(s, &interner.intern(s)));
+        }
+        // Amortised: one prune per `max(PRUNE_MIN, kept)` new strings, not one per insert.
+        assert!(
+            interner.prunes <= 1 + churn / PRUNE_MIN.max(live.len()) + 1,
+            "{} prunes for {churn} inserts",
+            interner.prunes
+        );
     }
 
     // covers UP-20
