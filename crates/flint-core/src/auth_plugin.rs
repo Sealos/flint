@@ -167,7 +167,7 @@ pub(crate) async fn run(exec: &ExecConfig) -> Result<Credential, AuthError> {
     let must_prompt = exec.interactive_mode == Some(ExecInteractiveMode::Always);
     let terminal = if interactive {
         match Terminal::acquire(must_prompt).await {
-            Acquired::Terminal(terminal) => Some(terminal),
+            Acquired::Terminal(terminal) => Some(*terminal),
             // It could not prompt now: it runs without (and may have what it needs cached).
             Acquired::Busy | Acquired::Background => {
                 interactive = false;
@@ -384,7 +384,8 @@ struct Terminal {
 
 /// What [`Terminal::acquire`] got.
 enum Acquired {
-    Terminal(Terminal),
+    // Boxed: `Terminal` holds termios and sigaction, which are large on Linux.
+    Terminal(Box<Terminal>),
     /// Another plugin has had the terminal for [`TERMINAL_WAIT`]: this one may not prompt.
     Busy,
     /// Flint runs in the background of its terminal (a shell job): a plugin reading it would
@@ -439,12 +440,12 @@ impl Terminal {
             match foreground() {
                 -1 => return Acquired::None,
                 group if group == ours => {
-                    return Acquired::Terminal(Terminal {
+                    return Acquired::Terminal(Box::new(Terminal {
                         fd,
                         _owner: owner,
                         saved: None,
                         ttou: None,
-                    });
+                    }));
                 }
                 _ if must_prompt => drop(owner),
                 _ => return Acquired::Background,
