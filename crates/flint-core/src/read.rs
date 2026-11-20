@@ -585,6 +585,25 @@ pub async fn object_detail(
     namespace: Option<&str>,
     name: &str,
 ) -> Result<ObjectDetail, ClusterError> {
+    object_detail_at(
+        client,
+        kind,
+        namespace,
+        name,
+        &crate::cluster::Target::default(),
+    )
+    .await
+}
+
+/// [`object_detail`], with `events_error` naming `target`'s server, as safe to show
+/// ([`ClusterError::summary`]).
+pub(crate) async fn object_detail_at(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+    name: &str,
+    target: &crate::cluster::Target,
+) -> Result<ObjectDetail, ClusterError> {
     let object = get(client, kind, namespace, name).await?;
     let uid = object.metadata.uid.clone();
     let mut value = serde_json::to_value(&object)
@@ -617,7 +636,11 @@ pub async fn object_detail(
             match found {
                 Ok((events, truncated)) => (events, truncated, None),
                 // Many roles may read an object but not list events: still show the object.
-                Err(e) => (Vec::new(), false, Some(e.to_string())),
+                Err(e) => (
+                    Vec::new(),
+                    false,
+                    Some(e.for_target(target).summary().to_string()),
+                ),
             }
         }
         None => (Vec::new(), false, None),

@@ -29,6 +29,8 @@ pub struct TestWorkspace {
     pub window: AnyWindowHandle,
     pub workspace: Entity<Workspace>,
     pub model: Entity<ClustersModel>,
+    /// `beta`'s server: a local port nothing listens on.
+    pub refused_server: String,
     /// Keeps `alpha`'s silent server listening.
     _server: TcpListener,
 }
@@ -37,6 +39,13 @@ pub async fn open_workspace(cx: &mut TestAppContext, dir: &Path) -> TestWorkspac
     cx.executor().allow_parking();
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = server.local_addr().unwrap().port();
+    // A port the OS just handed out, released again: nothing listens there.
+    let refused_port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let refused_server = format!("https://127.0.0.1:{refused_port}");
     let kubeconfig = dir.join("kubeconfig");
     std::fs::write(
         &kubeconfig,
@@ -47,7 +56,7 @@ clusters:
 - name: silent
   cluster: {{server: \"https://127.0.0.1:{port}\"}}
 - name: refused
-  cluster: {{server: \"https://127.0.0.1:9\"}}
+  cluster: {{server: \"{refused_server}\"}}
 users:
 - name: u
   user: {{token: t}}
@@ -70,6 +79,7 @@ contexts:
         window,
         workspace,
         model,
+        refused_server,
         _server: server,
     }
 }

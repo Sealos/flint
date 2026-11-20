@@ -93,6 +93,19 @@ pub fn safe_error_summary(error: &str) -> String {
     redact_quoted(&crate::kubeconfig::error_summary(error))
 }
 
+/// The first non-empty line of `text`, trimmed, cut to `max_chars` characters (with `…`).
+pub fn first_line(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    match line.char_indices().nth(max_chars) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line.to_owned(),
+    }
+}
+
 /// Shown instead of a server URL that cannot be shown safely.
 pub const HIDDEN_SERVER_URL: &str = "<server URL not shown>";
 
@@ -195,6 +208,13 @@ mod tests {
             redact_quoted("unknown variant `abc`"),
             "unknown variant `…`"
         );
+    }
+
+    #[test]
+    fn first_lines_are_cut() {
+        assert_eq!(first_line("\n  one \"x\"\ntwo", 50), "one \"x\"");
+        assert_eq!(first_line("abcdef", 3), "abc…");
+        assert_eq!(first_line("", 3), "");
     }
 
     #[test]

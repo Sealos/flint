@@ -727,9 +727,9 @@ pub(crate) enum FetchError {
 }
 
 impl FetchError {
-    pub fn from_kube(err: kube::Error) -> Self {
-        let kind = ApiError::from_kube(&err).map_or(ApiErrorKind::Other, |api| api.kind());
-        Self::from_kind(kind, ClusterError::kube(err).to_string())
+    /// A failed request to `target`'s server, in [`ClusterError::kube`]'s words.
+    pub fn from_kube(err: kube::Error, target: &cluster::Target) -> Self {
+        PageError::from_kube(err).into_fetch(target)
     }
 
     pub fn from_code(code: u16, message: String) -> Self {
@@ -745,7 +745,7 @@ impl FetchError {
             ApiErrorKind::BadRequest | ApiErrorKind::UnprocessableEntity => {
                 FetchError::Invalid(message)
             }
-            ApiErrorKind::Other => FetchError::Other(message),
+            ApiErrorKind::Unauthorized | ApiErrorKind::Other => FetchError::Other(message),
         }
     }
 
@@ -790,22 +790,58 @@ pub(crate) fn as_table_request(
     Ok(req)
 }
 
+/// Why a page request failed: how the API classified it ([`ApiErrorKind::Other`] when there
+/// was no API status) and the error, which can still be told whose server it was
+/// ([`ClusterError::for_target`]).
+#[derive(Debug)]
+pub(crate) struct PageError {
+    pub kind: ApiErrorKind,
+    pub error: ClusterError,
+}
+
+impl PageError {
+    fn from_kube(err: kube::Error) -> Self {
+        let kind = ApiError::from_kube(&err).map_or(ApiErrorKind::Other, |api| api.kind());
+        PageError {
+            kind,
+            error: ClusterError::kube(err),
+        }
+    }
+
+    /// The error as the watch engine sorts it, naming `target`'s server.
+    pub fn into_fetch(self, target: &cluster::Target) -> FetchError {
+        FetchError::from_kind(
+            self.kind,
+            self.error.for_target(target).summary().to_string(),
+        )
+    }
+}
+
+impl From<FetchError> for PageError {
+    fn from(err: FetchError) -> Self {
+        PageError {
+            kind: ApiErrorKind::Other,
+            error: ClusterError::Kube(err.to_string()),
+        }
+    }
+}
+
 /// One page of a Table list.
 pub(crate) async fn fetch_page(
     client: &Client,
     path: &str,
     params: &ListParams,
-) -> Result<WireObject, FetchError> {
+) -> Result<WireObject, PageError> {
     let req = Request::new(path)
         .list(params)
         .map_err(|e| FetchError::Other(cluster::error_chain(&e)))?;
     let req = as_table_request(req)?;
-    let object: WireObject = client.request(req).await.map_err(FetchError::from_kube)?;
+    let object: WireObject = client.request(req).await.map_err(PageError::from_kube)?;
     if object.is_status() {
-        return Err(FetchError::from_code(
-            object.code.unwrap_or(0),
-            object.status_message(),
-        ));
+        return Err(PageError {
+            kind: ApiErrorKind::from_code(object.code.unwrap_or(0)),
+            error: ClusterError::Api(object.status_message()),
+        });
     }
     Ok(object)
 }
@@ -833,7 +869,7 @@ pub async fn list_table(
     let path = collection_path(kind, query.namespace.as_deref());
     let mut object = fetch_page(client, &path, &query.to_params())
         .await
-        .map_err(|e| ClusterError::Kube(e.to_string()))?;
+        .map_err(|e| e.error)?;
     let token = object.metadata.continue_.take();
     let mut layout = None;
     let mut interner = Interner::default();

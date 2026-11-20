@@ -53,6 +53,8 @@ pub(crate) trait Source: Send + Sync + 'static {
 /// The API server, through kube's raw request API with a Table Accept header.
 pub(crate) struct KubeSource {
     client: Client,
+    /// Names the server in errors.
+    target: cluster::Target,
     streaming: AtomicBool,
 }
 
@@ -61,12 +63,17 @@ pub(crate) struct KubeSource {
 const STREAMING_LISTS_MIN_MINOR: u32 = 27;
 
 impl KubeSource {
-    pub fn new(client: Client, version: Option<&cluster::ServerVersion>) -> Arc<Self> {
+    pub fn new(
+        client: Client,
+        version: Option<&cluster::ServerVersion>,
+        target: cluster::Target,
+    ) -> Arc<Self> {
         let streaming = version
             .and_then(|v| server_minor(&v.git_version))
             .is_some_and(|minor| minor >= STREAMING_LISTS_MIN_MINOR);
         Arc::new(KubeSource {
             client,
+            target,
             streaming: AtomicBool::new(streaming),
         })
     }
@@ -116,7 +123,13 @@ impl Source for KubeSource {
             continue_token,
             ..ListQuery::default()
         };
-        async move { table::fetch_page(&client, &path, &query.to_params()).await }.boxed()
+        let target = self.target.clone();
+        async move {
+            table::fetch_page(&client, &path, &query.to_params())
+                .await
+                .map_err(|e| e.into_fetch(&target))
+        }
+        .boxed()
     }
 
     fn watch(
@@ -126,6 +139,7 @@ impl Source for KubeSource {
         request: WatchRequest,
     ) -> BoxFuture<'static, Result<EventStream, FetchError>> {
         let client = self.client.clone();
+        let target = self.target.clone();
         let path = table::collection_path(kind, namespace);
         async move {
             let mut params = WatchParams::default().timeout(request.timeout_secs);
@@ -145,14 +159,21 @@ impl Source for KubeSource {
             let body = client
                 .request_stream(req)
                 .await
-                .map_err(FetchError::from_kube)?;
+                .map_err(|e| FetchError::from_kube(e, &target))?;
             let lines = Box::pin(body).lines();
-            let events = lines.filter_map(|line| async move {
-                match line {
+            let events = lines.filter_map(move |line| {
+                let result = match line {
                     Ok(l) if l.trim().is_empty() => None,
                     Ok(l) => Some(parse_event_line(&l)),
-                    Err(e) => Some(Err(FetchError::Other(format!("watch stream broke: {e}")))),
-                }
+                    // Says "the connection to https://… dropped", not hyper's "error reading a
+                    // body from connection".
+                    Err(e) => Some(Err(FetchError::Other(
+                        cluster::ClusterError::stream("watch stream", &e, &target)
+                            .summary()
+                            .to_string(),
+                    ))),
+                };
+                std::future::ready(result)
             });
             Ok(events.boxed())
         }

@@ -214,16 +214,23 @@ fn logs_stay_off_stdout_and_eof_ends_the_server() {
     assert!(stderr.contains("mcp server failed"), "{stderr}");
 }
 
-/// Runs on every `cargo test`: no cluster. The only server named is 127.0.0.1:1, which refuses
-/// connections, so nothing leaves the machine.
+/// A local port nothing listens on: one the OS just handed out, released again.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Runs on every `cargo test`: no cluster. The only server named is a local port nothing
+/// listens on, which refuses connections, so nothing leaves the machine.
 // covers UP-02, UP-08, UP-09, UP-11, UP-12
 #[test]
 fn mcp_policy_without_a_cluster() {
     let scratch = tempfile::tempdir().unwrap();
     let kubeconfig = scratch.path().join("kubeconfig");
+    let refusing = format!("https://127.0.0.1:{}", closed_port());
     std::fs::write(
         &kubeconfig,
-        "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: https://127.0.0.1:1\nusers:\n- name: u\n  user:\n    token: SECRETTOKEN\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n- name: other\n  context:\n    cluster: c\n    user: u\n",
+        format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {refusing}\nusers:\n- name: u\n  user:\n    token: SECRETTOKEN\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n- name: other\n  context:\n    cluster: c\n    user: u\n"),
     )
     .unwrap();
     let broken = scratch.path().join("broken");
@@ -274,12 +281,20 @@ fn mcp_policy_without_a_cluster() {
     );
 
     // Settings are re-read on every call: exposing `dev` at its real server shows it at once.
-    std::fs::write(&settings, exposing("dev", "https://127.0.0.1:1")).unwrap();
+    std::fs::write(&settings, exposing("dev", &refusing)).unwrap();
     let clusters = server.call_json("list_clusters", json!({}));
     let listed = clusters["clusters"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{clusters}");
     assert_eq!(listed[0]["name"], "dev");
     assert_eq!(listed[0]["reachable"], false);
+    // In the same words the app shows (UP-04).
+    assert_eq!(
+        listed[0]["error"],
+        format!(
+            "connection refused by {refusing}; is the API server running, and is the port right?"
+        ),
+        "{clusters}"
+    );
     assert!(clusters.get("hint").is_none(), "{clusters}");
 
     // A malformed file exposes nothing, and the error does not quote the file.

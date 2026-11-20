@@ -7,7 +7,7 @@ use std::time::Duration;
 use kube::Client;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
-use crate::api_error::ApiError;
+use crate::api_error::{self, ApiError, Transport};
 use crate::redact;
 
 /// How long a connection attempt may take, exec auth plugin included. Some plugins (SSO logins)
@@ -23,8 +23,14 @@ pub enum ClusterError {
     UnknownContext(String),
     #[error("invalid kubeconfig for context \"{context}\": {message}")]
     Config { context: String, message: String },
+    /// Text from kube or below it (an error chain, a client error), which can quote anything.
     #[error("{0}")]
     Kube(String),
+    /// A `Status` the API server sent that explains itself (`"NotFound: pods \"x\" not
+    /// found"`, RBAC's `"forbidden: User \"jane\" cannot …"`). The names it quotes are what the
+    /// user needs to act on, so they are shown, on one line.
+    #[error("{0}")]
+    Api(String),
     /// A request or the whole attempt took too long. `after` is the limit, when known (a
     /// connection timeout inside kube does not say). Build it with [`ClusterError::timeout`] or
     /// [`ClusterError::kube`]; [`ClusterError::for_target`] names the server and the plugin.
@@ -39,6 +45,18 @@ pub enum ClusterError {
     /// ([`redact::command_name`]), filled in by [`ClusterError::for_target`].
     #[error("{}", exec_not_found_message(command.as_deref()))]
     ExecPluginNotFound { command: Option<String> },
+    /// The network failed below HTTP: refused, DNS, TLS, reset, dropped ([`Transport`]).
+    /// `server` is filled in by [`ClusterError::for_target`].
+    #[error("{}", problem.message(server.as_deref()))]
+    Transport {
+        problem: Transport,
+        server: Option<String>,
+    },
+    /// The server answered with an HTTP error and no Kubernetes `Status` that explains it (a
+    /// proxy's HTML page, an empty body), or with 401, whose `Status` only says "Unauthorized".
+    /// `server` is filled in by [`ClusterError::for_target`].
+    #[error("{}", api_error::status_meaning(*code, server.as_deref()))]
+    Http { code: u16, server: Option<String> },
 }
 
 /// `timed out after 10s reaching https://host:6443 (including exec plugin `aws`)`.
@@ -92,12 +110,19 @@ fn go_duration(d: Duration) -> String {
 }
 
 impl ClusterError {
-    /// API errors become `"<reason>: <message>"` (for example `"NotFound: pods \"x\" not found"`);
-    /// other errors keep their full source chain, except auth plugin errors (see
-    /// [`error_chain`]).
+    /// API errors become `"<reason>: <message>"` (for example `"NotFound: pods \"x\" not found"`),
+    /// or [`ClusterError::Http`] when the server's answer does not explain itself. Network
+    /// failures become [`ClusterError::Timeout`] or [`ClusterError::Transport`]. Other errors
+    /// keep their full source chain, except auth plugin errors (see [`error_chain`]).
     pub fn kube(err: kube::Error) -> Self {
         match ApiError::from_kube(&err) {
-            Some(api) => ClusterError::Kube(api_status_message(api)),
+            Some(api) => match api.explanation() {
+                Some(message) => ClusterError::Api(message),
+                None => ClusterError::Http {
+                    code: api.code,
+                    server: None,
+                },
+            },
             None if is_exec_not_found(&err) => ClusterError::ExecPluginNotFound { command: None },
             // kube's own connection timeout: the server did not answer at all.
             None if is_transport_timeout(&err) => ClusterError::Timeout {
@@ -105,7 +130,57 @@ impl ClusterError {
                 server: None,
                 exec_command: None,
             },
-            None => ClusterError::Kube(error_chain(&err)),
+            // An auth provider's failure can hold a refused or reset connection of its own (a
+            // token endpoint): it is not the API server's.
+            None if find_auth_error(&err).is_some() => ClusterError::Kube(error_chain(&err)),
+            None => match api_error::classify_transport(&err) {
+                Some(problem) => ClusterError::Transport {
+                    problem,
+                    server: None,
+                },
+                None => ClusterError::Kube(error_chain(&err)),
+            },
+        }
+    }
+
+    /// An error reading a response that was already streaming (a watch, a log): a dropped
+    /// connection in plain words, naming `target`'s server, or `"the <what> broke: <chain>"`.
+    pub fn stream(what: &str, err: &(dyn StdError + 'static), target: &Target) -> Self {
+        match api_error::classify_transport(err) {
+            Some(problem) => ClusterError::Transport {
+                problem,
+                server: target.server.clone(),
+            },
+            None => ClusterError::Kube(format!("the {what} broke: {}", error_chain(err))),
+        }
+    }
+
+    /// What the app shows and logs ([`SafeErrorText`]): Flint's own wording whole (the server
+    /// URL and plugin name are already safe, [`Target`]); a server's `Status` on one line, its
+    /// quoted names kept; and other text from kube or the kubeconfig reduced to one line with
+    /// quoted values hidden ([`redact::safe_error_summary`]).
+    pub fn summary(&self) -> SafeErrorText {
+        SafeErrorText(match self {
+            ClusterError::Kube(message) => redact::safe_error_summary(message),
+            ClusterError::Config { context, message } => format!(
+                "invalid kubeconfig for context \"{context}\": {}",
+                redact::safe_error_summary(message)
+            ),
+            ClusterError::Api(message) => redact::first_line(message, SHOWN_CHARS),
+            other => other.to_string(),
+        })
+    }
+
+    /// What an AI agent reads (the MCP server): like [`ClusterError::summary`], but text from
+    /// the server or kube keeps its quoted values (an agent needs the names to act) and is cut
+    /// to one line of at most 300 characters, so a server cannot hand it a long, multi-line
+    /// message.
+    pub fn for_agent(&self) -> String {
+        match self {
+            ClusterError::Kube(_) | ClusterError::Api(_) | ClusterError::Config { .. } => {
+                redact::first_line(&self.to_string(), AGENT_CHARS)
+            }
+            other => other.to_string(),
         }
     }
 
@@ -124,7 +199,7 @@ impl ClusterError {
         matches!(self, ClusterError::Timeout { .. })
     }
 
-    /// Names what failed: the API server a timeout was reaching, the plugin that is missing.
+    /// Names what failed: the API server a request was reaching, the plugin that is missing.
     /// Only details missing from the error are filled in.
     pub fn for_target(self, target: &Target) -> Self {
         match self {
@@ -142,8 +217,50 @@ impl ClusterError {
                     command: target.exec_command.clone(),
                 }
             }
+            ClusterError::Transport { problem, server } => ClusterError::Transport {
+                problem,
+                server: server.or_else(|| target.server.clone()),
+            },
+            ClusterError::Http { code, server } => ClusterError::Http {
+                code,
+                server: server.or_else(|| target.server.clone()),
+            },
             other => other,
         }
+    }
+}
+
+/// How much of a server's or kube's text the app shows, and an agent reads.
+const SHOWN_CHARS: usize = 200;
+const AGENT_CHARS: usize = 300;
+
+/// Error text that is safe to show in the window, in logs and in the automation state. Only
+/// flint-core builds it ([`ClusterError::summary`]), so nothing unsanitized can be rendered as
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeErrorText(String);
+
+impl SafeErrorText {
+    /// Text Flint wrote itself, with nothing from outside in it.
+    #[cfg(test)]
+    pub(crate) fn fixed(text: impl Into<String>) -> Self {
+        SafeErrorText(text.into())
+    }
+
+    /// Any text, reduced as [`redact::safe_error_summary`] does: safe whatever its source, so
+    /// public (the app's tests build failed states with it).
+    pub fn reduced(text: &str) -> Self {
+        SafeErrorText(redact::safe_error_summary(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SafeErrorText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -181,19 +298,6 @@ impl Target {
             server,
             exec_command,
         }
-    }
-}
-
-fn api_status_message(status: ApiError<'_>) -> String {
-    let reason = if status.reason.is_empty() {
-        format!("HTTP {}", status.code)
-    } else {
-        status.reason.to_owned()
-    };
-    if status.message.is_empty() {
-        reason
-    } else {
-        format!("{reason}: {}", status.message)
     }
 }
 
@@ -291,7 +395,8 @@ pub fn context_fingerprint(kubeconfig: &Kubeconfig, context: &str) -> Option<u64
 }
 
 /// Formats an error with its sources, since kube's top-level messages are often vague
-/// ("ServiceError: client error (Connect)").
+/// ("ServiceError: client error (Connect)"). Network failures are said in plain words instead
+/// ([`api_error::classify_transport`]); [`ClusterError::kube`] does the same and can name the server.
 ///
 /// Exec auth plugin errors are summarised instead: kube formats them with the command's `Debug`
 /// form, which includes the environment set from kubeconfig (for example AWS keys), and with the
@@ -299,6 +404,9 @@ pub fn context_fingerprint(kubeconfig: &Kubeconfig, context: &str) -> Option<u64
 pub fn error_chain(err: &(dyn StdError + 'static)) -> String {
     if let Some(auth) = find_auth_error(err) {
         return auth_error_message(auth);
+    }
+    if let Some(problem) = api_error::classify_transport(err) {
+        return problem.message(None);
     }
     let mut out = err.to_string();
     let mut source = err.source();
@@ -315,17 +423,11 @@ pub fn error_chain(err: &(dyn StdError + 'static)) -> String {
 
 /// Whether `err` is a connection or read that timed out below kube (its `connect_timeout`).
 fn is_transport_timeout(err: &(dyn StdError + 'static)) -> bool {
-    let mut current = Some(err);
-    while let Some(e) = current {
-        if e.is::<tokio::time::error::Elapsed>()
+    api_error::causes(err).any(|e| {
+        e.is::<tokio::time::error::Elapsed>()
             || e.downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return true;
-        }
-        current = e.source();
-    }
-    false
+    })
 }
 
 /// Whether `err` is an exec auth plugin whose program could not be found.
@@ -461,7 +563,76 @@ mod tests {
             ..Default::default()
         };
         let err = ClusterError::kube(kube::Error::Api(Box::new(bare)));
-        assert_eq!(err.to_string(), "HTTP 500");
+        assert_eq!(
+            err.to_string(),
+            "the API server failed with an internal error (500 Internal Server Error); try \
+             again, or check the API server's logs"
+        );
+    }
+
+    // covers UP-04
+    #[test]
+    fn auth_failures_are_not_blamed_on_the_api_server() {
+        // An auth provider that cannot reach its own endpoint.
+        let err = kube::Error::Auth(kube::client::AuthError::AuthExecStart(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        ));
+        let message = ClusterError::kube(err).to_string();
+        assert!(message.starts_with("authentication failed"), "{message}");
+        assert!(!message.contains("connection refused by"), "{message}");
+    }
+
+    // covers UP-04
+    #[test]
+    fn http_statuses_say_what_they_mean() {
+        let server = Some("https://h:6443");
+        for (code, message) in [
+            (
+                401,
+                "https://h:6443 rejected the credentials (401 Unauthorized); log in again or renew \
+                 the credentials",
+            ),
+            (
+                403,
+                "https://h:6443 denied access (403 Forbidden); check your RBAC permissions",
+            ),
+            (
+                404,
+                "https://h:6443 answered 404 Not Found; is the server URL (and its path) right?",
+            ),
+            (
+                429,
+                "https://h:6443 is limiting requests (429 Too Many Requests); try again later",
+            ),
+            (
+                503,
+                "https://h:6443 is unavailable (503 Service Unavailable); it may be starting or \
+                 overloaded",
+            ),
+            (
+                504,
+                "a proxy in front of https://h:6443 timed out waiting for it (504 Gateway Timeout)",
+            ),
+            (418, "https://h:6443 answered 418 I'm a teapot"),
+            (599, "https://h:6443 answered HTTP 599"),
+        ] {
+            assert_eq!(api_error::status_meaning(code, server), message);
+        }
+        // An empty or unparsed body says nothing more; a 401's Status never does.
+        let unparsed = kube::core::Status {
+            code: 503,
+            reason: "Failed to parse error data".into(),
+            message: "<html>".into(),
+            ..Default::default()
+        };
+        let target = Target::of(&kubeconfig("https://u:p@h:6443/?token=x"), "ctx");
+        assert_eq!(
+            ClusterError::kube(kube::Error::Api(Box::new(unparsed)))
+                .for_target(&target)
+                .to_string(),
+            "https://h:6443 is unavailable (503 Service Unavailable); it may be starting or \
+             overloaded"
+        );
     }
 
     // covers UP-04
@@ -501,6 +672,25 @@ mod tests {
         for secret in ["s3cr3t", "secret-arg", "someone", "pw", "token"] {
             assert!(!message.contains(secret), "{message}");
         }
+        // What the app shows keeps the name; foreign text is still reduced.
+        let shown = ClusterError::kube(exec_not_found())
+            .for_target(&target)
+            .summary();
+        assert_eq!(shown.as_str(), message);
+        assert_eq!(
+            ClusterError::Kube("bad value \"s3cr3t\"\nmore".into())
+                .summary()
+                .as_str(),
+            "bad value \"…\""
+        );
+        let config = ClusterError::Config {
+            context: "ctx".into(),
+            message: "unknown variant `s3cr3t`".into(),
+        };
+        assert_eq!(
+            config.summary().as_str(),
+            "invalid kubeconfig for context \"ctx\": unknown variant `…`"
+        );
         // Without a target, and in strings built from the chain (watch errors), the wording is
         // the same, without the command.
         let anonymous = "exec auth plugin not found on PATH (inherited PATH); install it, or set \

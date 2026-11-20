@@ -24,8 +24,9 @@ use crate::support::*;
 const ARN: &str = "arn:aws:eks:us-east-1:123456789012:cluster/payments";
 
 fn unreachable_kubeconfig(contexts: &[&str]) -> String {
-    let mut text = String::from(
-        "apiVersion: v1\nkind: Config\nclusters:\n- name: nowhere\n  cluster: {server: \"https://127.0.0.1:1\"}\nusers:\n- name: u\n  user: {}\ncontexts:\n",
+    let mut text = format!(
+        "apiVersion: v1\nkind: Config\nclusters:\n- name: nowhere\n  cluster: {{server: \"https://127.0.0.1:{}\"}}\nusers:\n- name: u\n  user: {{}}\ncontexts:\n",
+        closed_port()
     );
     for context in contexts {
         text.push_str(&format!(
@@ -193,9 +194,12 @@ fn up_04_connection_fails_with_a_plain_cause_and_retries() -> Result<()> {
     let two = TwoClusters::start()?;
     let (failing, healthy) = (&two.a, &two.b);
     let others = two.scratch.path().join("others");
+    let nowhere = format!("https://127.0.0.1:{}", closed_port());
     write(
         &others,
-        "apiVersion: v1\nkind: Config\nclusters:\n- name: nowhere\n  cluster: {server: \"https://127.0.0.1:1\"}\nusers:\n- name: plugin\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1beta1\n      command: flint-e2e-no-such-plugin\n      interactiveMode: Never\n- name: u\n  user: {}\ncontexts:\n- name: unreachable\n  context: {cluster: nowhere, user: u}\n- name: missing-plugin\n  context: {cluster: nowhere, user: plugin}\n",
+        &format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: nowhere\n  cluster: {{server: \"{nowhere}\"}}\nusers:\n- name: plugin\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1beta1\n      command: flint-e2e-no-such-plugin\n      interactiveMode: Never\n- name: u\n  user: {{}}\ncontexts:\n- name: unreachable\n  context: {{cluster: nowhere, user: u}}\n- name: missing-plugin\n  context: {{cluster: nowhere, user: plugin}}\n"
+        ),
     )?;
     failing.inject(Fault::status(500));
     let list = format!("{}:{}", two.kubeconfig().display(), others.display());
@@ -209,10 +213,14 @@ fn up_04_connection_fails_with_a_plain_cause_and_retries() -> Result<()> {
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    assert!(error.to_lowercase().contains("refused"), "{error}");
-    // TODO(#98): the error is still the client's raw text ("ServiceError: client error
-    // (Connect): tcp connect error: Connection refused (os error 61)"). Once #98 lands:
-    // assert!(!error.contains("ServiceError") && !error.contains("os error"), "{error}");
+    // In plain words, naming the server, not the client's chain ("ServiceError: client error
+    // (Connect): tcp connect error: Connection refused (os error 61)").
+    assert_eq!(
+        error,
+        format!(
+            "connection refused by {nowhere}; is the API server running, and is the port right?"
+        )
+    );
     app.screenshot_themes("up04-unreachable")?;
 
     // A missing exec plugin is named as one, with how to fix it.
@@ -220,6 +228,11 @@ fn up_04_connection_fails_with_a_plain_cause_and_retries() -> Result<()> {
     let state = app.wait_for("/main/error", Contains("exec auth plugin".into()))?;
     let error = state["main"]["error"].as_str().unwrap_or_default();
     assert!(error.contains("not found on PATH"), "{state}");
+    // The program's name is kept (only its directory and arguments are hidden).
+    assert!(
+        error.starts_with("exec auth plugin `flint-e2e-no-such-plugin` not found"),
+        "{state}"
+    );
     assert!(error.contains("settings.toml"), "{state}");
     app.screenshot_themes("up04-missing-plugin")?;
 

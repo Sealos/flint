@@ -408,9 +408,10 @@ fn up_27_recover_from_a_broken_watch() -> Result<()> {
     assert!(!row(&state, "missed-1").is_null(), "{}", state["list"]);
     let banners = state["list"]["banners"].to_string();
     assert!(banners.contains("Reconnecting"), "{banners}");
-    // TODO(#98): the banner quotes the raw error ("watch stream broke: ServiceError: error
-    // reading a body from connection"). Once #98 lands, check it is plain words:
-    // assert!(!banners.contains("ServiceError"), "{banners}");
+    // In plain words ("the connection to https://… dropped"), not the client's chain
+    // ("watch stream broke: ServiceError: error reading a body from connection").
+    assert!(!banners.contains("ServiceError"), "{banners}");
+    assert!(banners.contains("the connection to https://"), "{banners}");
     app.screenshot_themes("up27-reconnecting")?;
     assert_eq!(app.state()?["list"]["sync"], "reconnecting");
 

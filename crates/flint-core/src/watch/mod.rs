@@ -24,6 +24,8 @@ use crate::store::{Feed, KindSnapshot, SyncState};
 
 pub(crate) use engine::EngineConfig;
 pub(crate) use hub::{Hub, HubRegistry};
+#[cfg(test)]
+pub(crate) use source::WatchRequest;
 pub(crate) use source::{KubeSource, Source};
 
 /// Initial lists running at once per cluster. Activation in All mode starts dozens of kinds;

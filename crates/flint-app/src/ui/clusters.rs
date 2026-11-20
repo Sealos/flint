@@ -290,7 +290,7 @@ mod tests {
         });
         assert_eq!(Presence::of(&connected, true), Presence::Live);
         assert_eq!(Presence::of(&connected, false), Presence::Idle);
-        let failed = ConnectionState::Failed("refused".into());
+        let failed = ConnectionState::Failed(flint_core::SafeErrorText::reduced("refused"));
         assert_eq!(Presence::of(&failed, false), Presence::Failed);
         assert_eq!(
             Presence::of(&ConnectionState::Connecting, false),

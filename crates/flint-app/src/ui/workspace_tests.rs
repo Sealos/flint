@@ -117,6 +117,19 @@ async fn registered_actions_drive_the_workspace(cx: &mut TestAppContext) {
         Err(ActionError::Rejected { .. })
     ));
     activate(cx, &t, "beta").await;
+    // Nothing listens on beta's port: the sidebar and the main pane say so, naming the server.
+    let refused = format!(
+        "connection refused by {}; is the API server running, and is the port right?",
+        t.refused_server
+    );
+    let model = t.model.clone();
+    let expected = refused.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).clusters.iter().any(|c| {
+            matches!(&c.state, flint_core::ConnectionState::Failed(e) if e.as_str() == expected)
+        })
+    })
+    .await;
 
     // The automation `state` sees the same: the active cluster, its row, where focus is.
     let workspace = t.workspace.clone();

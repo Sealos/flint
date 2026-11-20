@@ -116,15 +116,7 @@ pub fn default_base_paths() -> Vec<PathBuf> {
 /// characters. Parse errors span several lines and can quote the file, which may hold
 /// credentials, so callers show this and keep the full text out of agent output.
 pub fn error_summary(error: &str) -> String {
-    let line = error
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    match line.char_indices().nth(200) {
-        Some((i, _)) => format!("{}…", &line[..i]),
-        None => line.to_owned(),
-    }
+    crate::redact::first_line(error, 200)
 }
 
 /// What [`load`] depends on: each file's modification time and size, or `None` if it does not
