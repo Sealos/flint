@@ -457,6 +457,7 @@ mod tests {
             cluster_key: Some(activity::cluster_key(cluster)),
             server_key: Some(server_key("https://prod:6443")),
             probed: Vec::new(),
+            probed_more: 0,
         }
     }
 

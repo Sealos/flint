@@ -126,7 +126,7 @@ pub struct Reached {
 pub struct Probed {
     /// [`cluster_key`] of the context.
     pub cluster_key: String,
-    /// [`server_key`] of the server it is exposed with.
+    /// [`ServerKeys::server_key`] of the server it is exposed with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_key: Option<String>,
 }
