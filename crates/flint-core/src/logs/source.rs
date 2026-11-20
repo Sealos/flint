@@ -376,12 +376,20 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
 /// The waiting reason of a container the kubelet restarts after a back-off.
 pub(crate) const CRASH_LOOP: &str = "CrashLoopBackOff";
 
-/// The line the kubelet sends as the whole log when it cannot read a container's log file (the
-/// previous instance's, early in a restart): `unable to retrieve container logs for
-/// containerd://…`. A real log line always starts with a timestamp (Flint asks for them), so
-/// this one, without, is the kubelet speaking.
+/// A line the kubelet sends as the whole log when it cannot read a container's log file: `unable
+/// to retrieve container logs for containerd://…` (early in a restart, or the container was
+/// removed) or `failed to try resolving symlinks in path "/var/log/pods/…": … no such file or
+/// directory` (the file is gone). A real log line always starts with a timestamp (Flint asks
+/// for them), so one without, saying this, is the kubelet speaking.
 pub(crate) fn is_unavailable_notice(line: &str) -> bool {
     line.starts_with("unable to retrieve container logs for ")
+        || line.starts_with("failed to try resolving symlinks in path ")
+}
+
+/// Whether an error opening the previous instance's log says there is no such instance (its
+/// container is gone): `previous terminated container "app" in pod "p" not found`.
+pub(crate) fn is_previous_missing(message: &str) -> bool {
+    message.contains("previous terminated container")
 }
 
 /// Splits a byte stream into lines. Invalid UTF-8 is replaced rather than ending the stream, and
@@ -663,6 +671,13 @@ mod tests {
         ));
         assert!(!is_unavailable_notice(
             "2024-05-01T12:00:00Z unable to retrieve container logs for x"
+        ));
+        assert!(is_unavailable_notice(
+            "failed to try resolving symlinks in path \"/var/log/pods/demo_p_1/app/0.log\": \
+             lstat /var/log/pods/demo_p_1/app/0.log: no such file or directory"
+        ));
+        assert!(is_previous_missing(
+            "BadRequest: previous terminated container \"app\" in pod \"p\" not found"
         ));
     }
 

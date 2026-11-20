@@ -120,14 +120,16 @@ pub enum LogState {
     },
 }
 
-/// How an ended session's `error` starts when the kubelet could not read the previous
-/// instance's log (it answers with one line, "unable to retrieve container logs for …", early
-/// in a restart). The kubelet's line follows after `": "`.
-pub const PREVIOUS_NOT_AVAILABLE: &str = "the previous instance's logs are not available yet";
+/// How an ended session's `error` starts when the previous instance's log could not be read:
+/// the kubelet answered with one line instead of the log ("unable to retrieve container logs
+/// for …", "failed to try resolving symlinks in path …"), or the API server said the previous
+/// terminated container was not found. The container may still be restarting, or may have been
+/// removed (garbage-collected, or its node restarted). The server's words follow after `": "`.
+pub const PREVIOUS_NOT_AVAILABLE: &str = "the previous instance's logs are not available";
 
 impl LogState {
-    /// The kubelet's words, when the session ended because the previous instance's log is not
-    /// available (yet): see [`PREVIOUS_NOT_AVAILABLE`].
+    /// The server's words, when the session ended because the previous instance's log is not
+    /// available: see [`PREVIOUS_NOT_AVAILABLE`].
     pub fn previous_not_available(&self) -> Option<&str> {
         match self {
             LogState::Ended { error: Some(e), .. } => e

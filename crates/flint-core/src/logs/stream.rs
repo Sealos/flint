@@ -21,7 +21,7 @@ use super::line::{LineSource, LogLine};
 use super::session::{LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE};
 use super::source::{
     AfterEnd, CRASH_LOOP, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines,
-    is_unavailable_notice,
+    is_previous_missing, is_unavailable_notice,
 };
 
 /// Reconnect delays: `first`, doubling up to `max`.
@@ -127,6 +127,9 @@ pub(crate) struct Stream {
     /// The current open has delivered no line yet: a first line that is the kubelet's "unable to
     /// retrieve container logs" is its answer, not the container's log.
     fresh: bool,
+    /// The kubelet's "cannot read the log" answer, from the last read that got one instead of
+    /// lines: the error a stream that then ends or waits reports. Cleared by a real line.
+    notice: Option<String>,
     deadline: Option<Pin<Box<Sleep>>>,
     /// The stream ended on an error about the cluster rather than this container.
     cluster_error: bool,
@@ -171,6 +174,7 @@ impl Stream {
             terminating: false,
             opened: false,
             fresh: false,
+            notice: None,
             deadline: None,
             cluster_error: false,
         };
@@ -249,21 +253,23 @@ impl Stream {
     pub fn handle(&mut self, step: Step, out: &mut dyn FnMut(LogLine)) -> bool {
         self.changed = false;
         let next = match step {
-            // The kubelet could not read the log: for the previous instance that is all there
-            // is (until the restart settles); the current one is tried again.
+            // The kubelet could not read the log. For the previous instance that is the end.
+            // For the current one it is an end of stream like any other, with the kubelet's
+            // words as the error: not following, it ends; following, the pod's status decides
+            // whether to wait for a restart or end (a finished container whose log is gone).
             Step::Line(Ok(raw)) if self.fresh && is_unavailable_notice(&raw.text) => {
                 self.fresh = false;
                 let notice = raw.text.trim_end().to_owned();
-                if self.draining {
-                    self.drained()
-                } else if self.options.previous {
+                if self.options.previous {
                     self.end(Some(format!("{PREVIOUS_NOT_AVAILABLE}: {notice}")))
                 } else {
-                    self.retry(Some(LogError::retry(notice)))
+                    self.notice = Some(notice);
+                    self.at_end()
                 }
             }
             Step::Line(Ok(raw)) => {
                 self.fresh = false;
+                self.notice = None;
                 self.push(raw, out);
                 return false;
             }
@@ -304,23 +310,22 @@ impl Stream {
             }
             // The last catch-up of a finished container: what was read is all there is.
             Step::Opened(Err(e)) if e.is_fatal() && self.draining => self.drained(),
+            // No previous instance (its container was removed): said like the kubelet's answer.
+            Step::Opened(Err(e)) if self.options.previous && is_previous_missing(&e.message) => {
+                self.end(Some(format!("{PREVIOUS_NOT_AVAILABLE}: {}", e.message)))
+            }
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => {
                 self.end(Some(e.message))
             }
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
                 self.retry(Some(e))
             }
-            Step::Eof if self.draining => self.drained(),
-            Step::Eof if !self.options.follow || self.options.previous => self.end(None),
-            Step::Eof => {
-                let uid = self.member.as_ref().map(|m| m.uid.as_str());
-                Phase::CheckEnd(self.source.after_end(&self.target, uid))
-            }
-            Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(None),
-            Step::AfterEnd(Ok(AfterEnd::BackOff)) => self.wait(None, true),
+            Step::Eof => self.at_end(),
+            Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(self.notice_error()),
+            Step::AfterEnd(Ok(AfterEnd::BackOff)) => self.wait(self.notice_error(), true),
             Step::AfterEnd(Ok(AfterEnd::Terminating)) => {
                 self.terminating = self.member.is_none();
-                self.retry(None)
+                self.retry(self.notice_error())
             }
             Step::AfterEnd(Ok(end @ (AfterEnd::Finished | AfterEnd::Deleting))) => {
                 // Pods of a workload come and go; a deleted one ends its stream quietly.
@@ -479,8 +484,29 @@ impl Stream {
         if self.deleted {
             self.end_deleted()
         } else {
-            self.end(None)
+            let notice = self.notice.take();
+            self.end(notice)
         }
+    }
+
+    /// The read ended (or the kubelet could not serve it): a drain is over, a read that does not
+    /// follow ends (with the kubelet's words, if that is what came), and a followed one asks the
+    /// pod's status whether the container can log again.
+    fn at_end(&mut self) -> Phase {
+        if self.draining {
+            self.drained()
+        } else if !self.options.follow || self.options.previous {
+            let notice = self.notice.take();
+            self.end(notice)
+        } else {
+            let uid = self.member.as_ref().map(|m| m.uid.as_str());
+            Phase::CheckEnd(self.source.after_end(&self.target, uid))
+        }
+    }
+
+    /// The kubelet's answer as the error to wait with, if that is what the last read got.
+    fn notice_error(&self) -> Option<LogError> {
+        self.notice.clone().map(LogError::retry)
     }
 
     fn end(&mut self, error: Option<String>) -> Phase {
@@ -730,17 +756,108 @@ mod tests {
         );
         assert!(previous.is_done());
 
-        let mut current = previous_stream(&[notice], false);
-        assert!(drain(&mut current).await.is_empty());
-        assert!(matches!(
-            current.state(),
-            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false } if e == notice
-        ));
+        // A removed container's log, in a read that does not follow: it ends, saying why.
+        let mut once = previous_stream(&[notice], false);
+        once.options.follow = false;
+        assert!(drain(&mut once).await.is_empty());
+        assert_eq!(
+            once.state(),
+            &LogState::Ended {
+                error: Some(notice.into()),
+                pod_deleted: false
+            }
+        );
+        // The previous terminated container is gone: said the same way.
+        let mut missing = previous_stream(&[], true);
+        missing.handle(
+            Step::Opened(Err(LogError::fatal(
+                "BadRequest: previous terminated container \"c\" in pod \"p\" not found",
+            ))),
+            &mut |_| {},
+        );
+        assert!(missing.state().previous_not_available().is_some());
 
         // Only as the first line of a read: later, the same words are the container's.
         let mut logged = previous_stream(&["2024-05-01T12:00:00Z hello", notice], true);
         assert_eq!(drain(&mut logged).await.len(), 2);
         assert_eq!(logged.state().previous_not_available(), None);
+    }
+
+    /// Serves `lines` at every open and ends; the pod's fate after the end is `fate`.
+    struct Fated {
+        lines: Vec<String>,
+        fate: AfterEnd,
+    }
+
+    impl LogSource for Fated {
+        fn open(&self, _: &LogRequest) -> BoxFuture<'static, Result<RawLines, LogError>> {
+            let lines: Vec<_> = self
+                .lines
+                .iter()
+                .map(|t| {
+                    Ok(RawLine {
+                        text: t.clone(),
+                        truncated: false,
+                    })
+                })
+                .collect();
+            async move { Ok(stream::iter(lines).boxed()) }.boxed()
+        }
+
+        fn after_end(
+            &self,
+            _: &LogTarget,
+            _: Option<&str>,
+        ) -> BoxFuture<'static, Result<AfterEnd, LogError>> {
+            let fate = self.fate;
+            async move { Ok(fate) }.boxed()
+        }
+    }
+
+    // covers UP-40: following a container whose log the kubelet cannot read is decided by the
+    // pod's status like any end of stream: a finished container (a completed Job pod whose
+    // container was removed) ends with the kubelet's words instead of reconnecting forever; one
+    // that restarts is waited for, saying why.
+    #[tokio::test(start_paused = true)]
+    async fn the_kubelets_answer_for_the_current_instance_goes_through_the_end_check() {
+        let notice = "unable to retrieve container logs for containerd://c54f232e5b";
+        let followed = |fate| {
+            Stream::new(
+                Arc::new(Fated {
+                    lines: vec![notice.to_owned()],
+                    fate,
+                }),
+                LogTarget {
+                    namespace: "ns".into(),
+                    pod: "p".into(),
+                    container: Some("c".into()),
+                },
+                LogOptions::default(),
+                10,
+                Backoff {
+                    first: Duration::from_secs(1),
+                    max: Duration::from_secs(30),
+                },
+                None,
+            )
+        };
+        let mut finished = followed(AfterEnd::Finished);
+        assert!(drain(&mut finished).await.is_empty());
+        assert_eq!(
+            finished.state(),
+            &LogState::Ended {
+                error: Some(notice.into()),
+                pod_deleted: false
+            }
+        );
+        assert!(finished.is_done());
+
+        let mut restarts = followed(AfterEnd::Restarts);
+        assert!(drain(&mut restarts).await.is_empty());
+        assert!(matches!(
+            restarts.state(),
+            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false } if e == notice
+        ));
     }
 
     // covers UP-40: a container in CrashLoopBackOff is waited for as the kubelet's back-off.
