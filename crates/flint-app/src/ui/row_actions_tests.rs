@@ -25,7 +25,7 @@ use crate::ui::registry::{self, ActionError};
 use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, pods};
 use crate::ui::view_state::{ActionAvailability, AppState, Focus};
 
-async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
+pub(super) async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static str) {
     dispatch(
         cx,
         t,
@@ -40,7 +40,7 @@ async fn activate(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &'static 
     .await;
 }
 
-fn dispatch(
+pub(super) fn dispatch(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
     name: &str,
@@ -52,7 +52,7 @@ fn dispatch(
     .unwrap()
 }
 
-fn draw(cx: &mut TestAppContext, t: &TestWorkspace) {
+pub(super) fn draw(cx: &mut TestAppContext, t: &TestWorkspace) {
     cx.run_until_parked();
     cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
         .unwrap();
@@ -61,7 +61,7 @@ fn draw(cx: &mut TestAppContext, t: &TestWorkspace) {
 
 /// Opens a list of `entry`'s kind on the active cluster with `snapshot`, fed by hand, and waits
 /// for `first`'s row.
-async fn open_list(
+pub(super) async fn open_list(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
     entry: NavEntry,
@@ -87,7 +87,7 @@ async fn open_list(
     .await;
 }
 
-fn pods_entry() -> NavEntry {
+pub(super) fn pods_entry() -> NavEntry {
     NavEntry {
         id: KindId::pods(),
         label: "Pods".into(),
@@ -154,7 +154,7 @@ fn deployments(names: &[&str]) -> Arc<KindSnapshot> {
 
 /// Pod `name` as fetched: containers `app` (restarted once, so it has previous logs) and
 /// `sidecar`.
-fn pod_detail(name: &str) -> ObjectDetail {
+pub(super) fn pod_detail(name: &str) -> ObjectDetail {
     detail(json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -179,7 +179,7 @@ fn detail(object: Value) -> ObjectDetail {
 }
 
 /// Shows `object` in the detail pane, as if its fetch had returned.
-fn show_fetched(cx: &mut TestAppContext, t: &TestWorkspace, object: ObjectDetail) {
+pub(super) fn show_fetched(cx: &mut TestAppContext, t: &TestWorkspace, object: ObjectDetail) {
     let detail = t
         .workspace
         .read_with(cx, |ws, _| ws.detail.clone().unwrap());
@@ -284,7 +284,7 @@ fn let_pods_list(cx: &mut TestAppContext, t: &TestWorkspace) {
 }
 
 /// The window's state, as the automation channel reports it.
-fn app_state(cx: &mut TestAppContext, t: &TestWorkspace) -> AppState {
+pub(super) fn app_state(cx: &mut TestAppContext, t: &TestWorkspace) -> AppState {
     let workspace = t.workspace.clone();
     cx.update_window(t.window, |_, window, cx| {
         workspace.update(cx, |ws, cx| ws.view_state(window, cx))
@@ -343,7 +343,7 @@ fn workload_pod(name: &str, ready: bool, containers: &[&str]) -> WorkloadPod {
 }
 
 /// Right-clicks the row of `name` and waits for its menu.
-async fn right_click(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
+pub(super) async fn right_click(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
     let row = SharedString::from(format!("row-uid-{name}"));
     cx.update_window(t.window, |_, window, cx| window.right_click(row, cx))
         .unwrap();
@@ -356,7 +356,7 @@ async fn right_click(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
 /// The open menu's rows: its entries and the labels under disabled ones that say why. (A
 /// menu row does not report whether it is disabled: the tests click a disabled entry and
 /// check that nothing opened and nothing was refused, and read the state's `actions`.)
-fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
+pub(super) fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| {
         let menu = window.within("popup-menu");
@@ -419,7 +419,7 @@ fn dock_tabs(cx: &mut TestAppContext, t: &TestWorkspace) -> (Vec<String>, Option
     })
 }
 
-fn press(cx: &mut TestAppContext, t: &TestWorkspace, key: &str) {
+pub(super) fn press(cx: &mut TestAppContext, t: &TestWorkspace, key: &str) {
     cx.update_window(t.window, |_, window, cx| window.press(key, cx))
         .unwrap();
     cx.run_until_parked();

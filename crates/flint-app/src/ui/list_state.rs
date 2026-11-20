@@ -43,6 +43,7 @@ impl ResourceList {
                     })
                     .collect();
                 RowState {
+                    id: format!("row-{}", row.uid),
                     namespace: row.namespace.as_deref().map(str::to_owned),
                     name: row.name.to_string(),
                     selected: selected == Some(&*row.uid),

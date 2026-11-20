@@ -589,7 +589,7 @@ const GIST_CHARS: usize = 40;
 
 /// An error the status line cannot say in plain words, cut short: its first line, at most
 /// [`GIST_CHARS`] characters (the whole is in the tooltip).
-fn gist(error: &str) -> String {
+pub fn gist(error: &str) -> String {
     let line = error.lines().next().unwrap_or_default().trim();
     if line.chars().count() <= GIST_CHARS {
         line.to_owned()
@@ -690,6 +690,94 @@ pub fn match_text(search: &LogSearch, current: Option<LineId>) -> String {
         (1, None) => "1 match".to_owned(),
         (n, None) => format!("{} matches", thousands(n as u64)),
     }
+}
+
+/// A view toggle a log tab's "⋯" menu offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    Timestamps,
+    Sources,
+    Wrap,
+}
+
+/// A row of a log tab's toolbar menu (Save, or "⋯" in a narrow tab).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuRow {
+    /// A note, not an entry.
+    Label(&'static str),
+    Separator,
+    Toggle {
+        label: &'static str,
+        on: bool,
+        toggle: Toggle,
+    },
+    Save {
+        label: &'static str,
+        scope: SaveScope,
+        enabled: bool,
+    },
+}
+
+/// What a log tab's toolbar menus depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuFacts {
+    pub timestamps: bool,
+    pub workload: bool,
+    pub sources: bool,
+    pub wrap: bool,
+    pub has_lines: bool,
+    pub has_matches: bool,
+    pub has_selection: bool,
+}
+
+/// The Save menu: how lines are written, then a Save entry per scope.
+pub fn save_menu(f: &MenuFacts) -> Vec<MenuRow> {
+    let save = |label, scope, enabled| MenuRow::Save {
+        label,
+        scope,
+        enabled,
+    };
+    vec![
+        MenuRow::Label(if f.timestamps {
+            "As shown, with full timestamps. Not redacted."
+        } else {
+            "As shown, without timestamps. Not redacted."
+        }),
+        save("Save All Lines…", SaveScope::All, true),
+        save("Save Matching Lines…", SaveScope::Matches, f.has_matches),
+        save(
+            "Save Selected Lines…",
+            SaveScope::Selection,
+            f.has_selection,
+        ),
+    ]
+}
+
+/// What a toolbar menu offers: its entries, without its note and separators.
+pub fn menu_entries(rows: &[MenuRow]) -> Vec<super::menu_record::Entry> {
+    use super::menu_record::Entry;
+    rows.iter()
+        .filter_map(|row| match row {
+            MenuRow::Label(_) | MenuRow::Separator => None,
+            MenuRow::Toggle { label, on, .. } => Some(Entry::toggle(*label, *on)),
+            MenuRow::Save { label, enabled, .. } => Some(Entry::new(*label, *enabled)),
+        })
+        .collect()
+}
+
+/// The "⋯" menu of a narrow tab: the view toggles, then Save's entries once there are lines.
+pub fn more_menu(f: &MenuFacts) -> Vec<MenuRow> {
+    let toggle = |label, on, toggle| MenuRow::Toggle { label, on, toggle };
+    let mut rows = vec![toggle("Timestamps", f.timestamps, Toggle::Timestamps)];
+    if f.workload {
+        rows.push(toggle("Pod Prefix", f.sources, Toggle::Sources));
+    }
+    rows.push(toggle("Wrap Lines", f.wrap, Toggle::Wrap));
+    rows.push(MenuRow::Separator);
+    if f.has_lines {
+        rows.extend(save_menu(f));
+    }
+    rows
 }
 
 /// A workload session's streams in a few words: `3 pods · 4 live · 1 failed · 2 not read`.

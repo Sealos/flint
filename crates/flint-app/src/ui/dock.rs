@@ -36,6 +36,7 @@ use gpui_kit::*;
 pub use super::dock_model::TabStatus;
 use super::dock_model::{self, TabCluster, chip_labels, chip_tooltip};
 use super::log_view::{LogRequest, LogView};
+use super::menu_record;
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
     ReconnectLogs, RestartShell, ShowTabList, ToggleDock,
@@ -613,7 +614,17 @@ impl Dock {
                 Some((tab.id, label, self.active == Some(tab.id)))
             })
             .collect();
-        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+        let menu = PopupMenu::build(window, cx, move |menu, _, cx| {
+            menu_record::record(cx, "dock-tab-list", || {
+                entries
+                    .iter()
+                    .map(|(_, label, active)| menu_record::Entry {
+                        label: label.clone(),
+                        enabled: true,
+                        checked: Some(*active),
+                    })
+                    .collect()
+            });
             entries.iter().fold(menu, |menu, (id, label, active)| {
                 menu.item(
                     PopupMenuItem::new(label.clone())
@@ -963,6 +974,10 @@ impl Render for Dock {
         .test_support()
     }
 }
+
+#[cfg(any(test, feature = "automation"))]
+#[path = "dock_state.rs"]
+mod state;
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,6 @@
 //! the workspace's guards share with them. The toolbar's buttons dispatch these actions; mouse
 //! selection and keystrokes for the shell are not actions (they are the program's input).
 
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 use super::super::registry::{
@@ -10,6 +9,7 @@ use super::super::registry::{
     ScrollToTop, SelectText,
 };
 use super::TerminalView;
+use crate::ui::confirm::{self, DialogText};
 use crate::ui::log_model::Tone;
 use crate::ui::terminal_model::{self, PasteCheck};
 
@@ -90,30 +90,24 @@ impl TerminalView {
         if !self.is_live() {
             return;
         }
-        let (title, description) = terminal_model::paste_question(lines);
+        let (title, question) = terminal_model::paste_question(lines);
+        let dialog = DialogText {
+            title,
+            text: question,
+            ok: "Paste".into(),
+            cancel: "Cancel".into(),
+            id: "paste-description",
+        };
         let view = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let (view, text) = (view.clone(), text.clone());
-            // Test builds open it at once, so automation sees it without waiting.
-            #[cfg(feature = "automation")]
-            let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-            alert
-                .confirm()
-                .title(title.clone())
-                .description(description.clone())
-                .ok_text("Paste")
-                .cancel_text("Cancel")
-                .on_ok(move |_, _, cx| {
-                    let text = text.clone();
-                    let _ = view.update(cx, |view, cx| {
-                        // The shell may have ended while the question was open.
-                        if view.is_live() {
-                            view.session.paste(text);
-                            cx.notify();
-                        }
-                    });
-                    true
-                })
+        confirm::open(window, cx, dialog, move |_, cx| {
+            let text = text.clone();
+            let _ = view.update(cx, |view, cx| {
+                // The shell may have ended while the question was open.
+                if view.is_live() {
+                    view.session.paste(text);
+                    cx.notify();
+                }
+            });
         });
     }
 

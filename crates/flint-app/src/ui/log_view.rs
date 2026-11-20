@@ -43,15 +43,17 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Theme,
-    WindowExt as _, h_flex, v_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use jiff::tz::TimeZone;
 
+use super::confirm::{self, DialogText};
 use super::dock::{DockItem, TabKey, TabStatus};
 use super::log_model::{self, ListChange, SourceLabels, Tone};
+use super::menu_record;
 use super::notice::notice;
 use super::registry::{
     self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
@@ -402,6 +404,19 @@ impl LogView {
         log_model::has_ended(&self.snapshot.state)
     }
 
+    /// What the toolbar's menus offer now.
+    fn menu_facts(&self) -> log_model::MenuFacts {
+        log_model::MenuFacts {
+            timestamps: self.timestamps,
+            workload: self.is_workload(),
+            sources: self.sources,
+            wrap: self.wrap,
+            has_lines: !self.snapshot.lines.is_empty(),
+            has_matches: self.search.count() > 0,
+            has_selection: self.selection.is_some(),
+        }
+    }
+
     /// How lines are drawn now.
     fn line_view(&self) -> log_model::LineView<'_> {
         log_model::LineView {
@@ -522,19 +537,16 @@ impl LogView {
             },
         );
         let view = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let (view, save) = (view.clone(), save.clone());
-            alert
-                .confirm()
-                .title("Save logs to a file?")
-                .description(description.clone())
-                .ok_text("Choose File…")
-                .cancel_text("Cancel")
-                .on_ok(move |_, _, cx| {
-                    let save = save.clone();
-                    let _ = view.update(cx, |view, cx| view.write_lines(save, cx));
-                    true
-                })
+        let dialog = DialogText {
+            title: "Save logs to a file?".into(),
+            text: description,
+            ok: "Choose File…".into(),
+            cancel: "Cancel".into(),
+            id: "save-logs-description",
+        };
+        confirm::open(window, cx, dialog, move |_, cx| {
+            let save = save.clone();
+            let _ = view.update(cx, |view, cx| view.write_lines(save, cx));
         });
     }
 
@@ -843,7 +855,6 @@ impl LogView {
         let following = self.list.is_following_tail();
         let has_query = !self.query.text.is_empty();
         let has_matches = self.search.count() > 0;
-        let has_selection = self.selection.is_some();
         let timestamps = self.timestamps;
         let workload = self.is_workload();
         let sources = self.sources;
@@ -865,32 +876,7 @@ impl LogView {
             }
             parts.join("\n")
         };
-        let save_menu = move |menu: PopupMenu| {
-            let item = |label: &str, lines, enabled: bool| {
-                PopupMenuItem::new(label.to_owned())
-                    .disabled(!enabled)
-                    .on_click(registry::on_click(SaveLines {
-                        lines,
-                        timestamps: Some(timestamps),
-                    }))
-            };
-            menu.label(if timestamps {
-                "As shown, with full timestamps. Not redacted."
-            } else {
-                "As shown, without timestamps. Not redacted."
-            })
-            .item(item("Save All Lines…", SaveScope::All, true))
-            .item(item(
-                "Save Matching Lines…",
-                SaveScope::Matches,
-                has_matches,
-            ))
-            .item(item(
-                "Save Selected Lines…",
-                SaveScope::Selection,
-                has_selection,
-            ))
-        };
+        let facts = self.menu_facts();
         let has_lines = !lines.is_empty();
         h_flex()
             .id("log-toolbar")
@@ -1112,7 +1098,15 @@ impl LogView {
                                     .disabled(!has_lines)
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
-                                        move |menu, _, _| save_menu(menu),
+                                        move |menu, _, cx| {
+                                            fill_menu(
+                                                menu,
+                                                log_model::save_menu(&facts),
+                                                facts.timestamps,
+                                                "log-save",
+                                                cx,
+                                            )
+                                        },
                                     ),
                             )
                         } else {
@@ -1124,23 +1118,14 @@ impl LogView {
                                     .tooltip("View options and Save")
                                     .dropdown_menu_with_anchor(
                                         Anchor::TopRight,
-                                        move |menu, _, _| {
-                                            let menu = menu
-                                                .item(toggle_item(
-                                                    "Timestamps",
-                                                    timestamps,
-                                                    ToggleTimestamps,
-                                                ))
-                                                .when(workload, |menu| {
-                                                    menu.item(toggle_item(
-                                                        "Pod Prefix",
-                                                        sources,
-                                                        ToggleSources,
-                                                    ))
-                                                })
-                                                .item(toggle_item("Wrap Lines", wrap, ToggleWrap))
-                                                .separator();
-                                            if has_lines { save_menu(menu) } else { menu }
+                                        move |menu, _, cx| {
+                                            fill_menu(
+                                                menu,
+                                                log_model::more_menu(&facts),
+                                                facts.timestamps,
+                                                "log-more",
+                                                cx,
+                                            )
                                         },
                                     ),
                             )
@@ -1390,11 +1375,42 @@ fn reconnect_button() -> Button {
         .on_click(registry::on_click(ReconnectLogs))
 }
 
-/// A checked entry of the "⋯" menu that performs `action`.
-fn toggle_item<A: Action>(label: &str, on: bool, action: A) -> PopupMenuItem {
-    PopupMenuItem::new(label.to_owned())
-        .checked(on)
-        .on_click(registry::on_click(action))
+/// A toolbar menu with `rows`, each entry performing its registered action, opened from the
+/// button `owner`. Saves write timestamps as `timestamps` says (as shown when the menu opened,
+/// as its note says). The menu stays as built until it is dismissed.
+fn fill_menu(
+    menu: PopupMenu,
+    rows: Vec<log_model::MenuRow>,
+    timestamps: bool,
+    owner: &'static str,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    use log_model::{MenuRow, Toggle};
+    menu_record::record(cx, owner, || log_model::menu_entries(&rows));
+    rows.into_iter().fold(menu, |menu, row| match row {
+        MenuRow::Label(text) => menu.label(text),
+        MenuRow::Separator => menu.separator(),
+        MenuRow::Toggle { label, on, toggle } => {
+            let item = PopupMenuItem::new(label).checked(on);
+            menu.item(match toggle {
+                Toggle::Timestamps => item.on_click(registry::on_click(ToggleTimestamps)),
+                Toggle::Sources => item.on_click(registry::on_click(ToggleSources)),
+                Toggle::Wrap => item.on_click(registry::on_click(ToggleWrap)),
+            })
+        }
+        MenuRow::Save {
+            label,
+            scope,
+            enabled,
+        } => menu.item(
+            PopupMenuItem::new(label)
+                .disabled(!enabled)
+                .on_click(registry::on_click(SaveLines {
+                    lines: scope,
+                    timestamps: Some(timestamps),
+                })),
+        ),
+    })
 }
 
 impl DockItem for LogView {
@@ -1517,6 +1533,10 @@ impl Render for LogView {
 
 #[path = "log_actions.rs"]
 mod actions;
+
+#[cfg(any(test, feature = "automation"))]
+#[path = "log_state.rs"]
+mod state;
 
 #[cfg(test)]
 #[path = "log_tests.rs"]

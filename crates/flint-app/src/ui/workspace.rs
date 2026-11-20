@@ -22,12 +22,13 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
-    ThemeMode, WindowExt as _, h_flex, v_flex,
+    ThemeMode, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::clusters::{ClustersModel, Presence, state_label};
+use super::confirm::{self, DialogText};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, refused};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
 use super::dock_model::TabCluster;
@@ -210,8 +211,6 @@ pub struct Workspace {
     _list_subscriptions: Vec<Subscription>,
     _detail_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
-    /// The confirmation last opened, which the automation state shows while it is open.
-    dialog: Option<DialogText>,
 }
 
 impl Workspace {
@@ -317,7 +316,6 @@ impl Workspace {
             _tick: tick,
             _list_subscriptions: Vec::new(),
             _detail_subscriptions: Vec::new(),
-            dialog: None,
             _subscriptions: vec![
                 observe,
                 appearance,
@@ -1576,40 +1574,11 @@ fn confirm_expose(
     model: Entity<ClustersModel>,
     context: String,
     server: String,
-    dialog: &DialogText,
+    dialog: DialogText,
 ) {
-    let dialog = dialog.clone();
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let (model, context, server) = (model.clone(), context.clone(), server.clone());
-        // Test builds open it at once, so automation sees it without waiting for an animation.
-        #[cfg(feature = "automation")]
-        let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
-        alert
-            .confirm()
-            .title(dialog.title)
-            .description(
-                div()
-                    .id("expose-description")
-                    .aria_label(dialog.text.clone())
-                    .child(dialog.text.clone())
-                    .test_support(),
-            )
-            .ok_text(dialog.ok)
-            .cancel_text(dialog.cancel)
-            .on_ok(move |_, _, cx| {
-                model.update(cx, |m, _| m.expose_to_ai(context.clone(), server.clone()));
-                true
-            })
+    confirm::open(window, cx, dialog, move |_, cx| {
+        model.update(cx, |m, _| m.expose_to_ai(context.clone(), server.clone()));
     });
-}
-
-/// What a confirmation dialog says; the workspace keeps the open one for the automation state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DialogText {
-    pub title: &'static str,
-    pub text: String,
-    pub ok: &'static str,
-    pub cancel: &'static str,
 }
 
 /// The Expose to AI confirmation, naming the context and the server it points at.
@@ -1627,10 +1596,11 @@ fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogT
         ));
     }
     DialogText {
-        title: "Expose to AI agents?",
+        title: "Expose to AI agents?".into(),
         text,
-        ok: "Expose",
-        cancel: "Cancel",
+        ok: "Expose".into(),
+        cancel: "Cancel".into(),
+        id: "expose-description",
     }
 }
 
@@ -2036,7 +2006,11 @@ mod tests {
     fn the_expose_confirmation_names_the_context_and_servers() {
         let dialog = super::expose_dialog("kind-dev", "https://127.0.0.1:6443", None);
         assert_eq!(
-            (dialog.title, dialog.ok, dialog.cancel),
+            (
+                dialog.title.as_str(),
+                dialog.ok.as_str(),
+                dialog.cancel.as_str()
+            ),
             ("Expose to AI agents?", "Expose", "Cancel")
         );
         assert!(

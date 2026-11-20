@@ -1328,3 +1328,206 @@ async fn a_dated_separator_starts_each_day(cx: &mut TestAppContext) {
     .unwrap();
     assert!(view.read_with(cx, |v, _| !v.tz_name.is_empty()));
 }
+
+/// The tab's part of the automation state, and where focus is in it.
+fn state(cx: &mut TestAppContext, view: &Entity<LogView>) -> serde_json::Value {
+    view.read_with(cx, |v, _| {
+        let (status, text) = v.status_state();
+        serde_json::json!({
+            "status": status,
+            "status_text": text,
+            "tab": v.view_state(),
+        })
+    })
+}
+
+fn focus_in(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<LogView>,
+) -> Option<crate::ui::view_state::Focus> {
+    cx.update_window(window, |_, window, cx| view.read(cx).focus_in(window, cx))
+        .unwrap()
+}
+
+// covers UP-40, UP-43, UP-44: the automation state reports what the tab shows: its status in
+// plain words, its line count and newest lines with their severity, held-back lines, following,
+// the toggles, the search and its current match, the selection, and where focus is.
+#[gpui_kit::test]
+async fn the_state_reports_lines_toggles_search_and_selection(cx: &mut TestAppContext) {
+    use crate::ui::view_state::{Focus, LogTabState};
+    use serde_json::json;
+
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1000);
+    feed(cx, &view, lines.snapshot(LogState::Connecting, false, 0));
+    let s = state(cx, &view);
+    assert_eq!(s["status"], json!({"state": "connecting"}));
+    assert_eq!(s["tab"]["lines"], 0);
+    assert_eq!(s["tab"]["last_lines"], json!([]));
+
+    feed(cx, &view, lines.push(0, 20).streaming());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(19)).is_some()
+    })
+    .await;
+    let s = state(cx, &view);
+    assert_eq!(s["status"], json!({"state": "streaming"}));
+    assert_eq!(s["status_text"], "Streaming");
+    let tab = &s["tab"];
+    assert_eq!(tab["lines"], 20);
+    assert_eq!(
+        (&tab["follows"], &tab["following"]),
+        (&json!(true), &json!(true))
+    );
+    assert_eq!(
+        (&tab["timestamps"], &tab["wrap"], &tab["sources"]),
+        (&json!(false), &json!(false), &json!(false))
+    );
+    assert_eq!(tab["last_lines"].as_array().unwrap().len(), 20);
+    assert_eq!(
+        tab["last_lines"][19],
+        json!({"id": 19, "text": "ERROR line 19", "severity": "error", "source": null})
+    );
+    assert_eq!(focus_in(cx, window, &view), Some(Focus::Log));
+
+    // The search: its query, matches and current match, with focus in its field.
+    press(cx, window, "secondary-f");
+    assert_eq!(focus_in(cx, window, &view), Some(Focus::LogSearch));
+    cx.update_window(window, |_, window, cx| window.input("error", cx))
+        .unwrap();
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.search.count() == 4
+    })
+    .await;
+    press(cx, window, "enter");
+    assert_eq!(
+        state(cx, &view)["tab"]["search"],
+        json!({"query": "error", "matches": 4, "current": 1, "searching": false})
+    );
+
+    // Toggles.
+    let focus = view.read_with(cx, |v, _| v.focus.clone());
+    cx.update_window(window, |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    press(cx, window, "t");
+    press(cx, window, "w");
+    let tab = state(cx, &view)["tab"].clone();
+    assert_eq!(
+        (&tab["timestamps"], &tab["wrap"]),
+        (&json!(true), &json!(true))
+    );
+
+    // A selection pauses; lines that arrive meanwhile are held back.
+    cx.update_window(window, |_, window, cx| window.click(line_id(2), cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.click_with_modifiers(line_id(4), Modifiers::shift(), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    feed(cx, &view, lines.snapshot(LogState::Streaming, true, 3));
+    let tab = state(cx, &view)["tab"].clone();
+    assert_eq!(tab["selection"], json!({"first": 2, "last": 4, "lines": 3}));
+    assert_eq!(
+        (&tab["paused"], &tab["held_back"]),
+        (&json!(true), &json!(3))
+    );
+    press(cx, window, "escape");
+    assert_eq!(state(cx, &view)["tab"]["selection"], json!(null));
+
+    // Only the newest lines go out.
+    feed(cx, &view, lines.push(20, 120).streaming());
+    let tab = state(cx, &view)["tab"].clone();
+    assert_eq!(tab["lines"], 120);
+    let last = tab["last_lines"].as_array().unwrap();
+    assert_eq!(last.len(), LogTabState::LINE_LIMIT);
+    assert_eq!(last[0]["id"], 70);
+    assert_eq!(last[LogTabState::LINE_LIMIT - 1]["id"], 119);
+
+    // An error, in plain words.
+    feed(
+        cx,
+        &view,
+        lines.snapshot(
+            LogState::Ended {
+                error: Some("Forbidden: pods \"web-1\" is forbidden".into()),
+                pod_deleted: false,
+            },
+            false,
+            0,
+        ),
+    );
+    let s = state(cx, &view);
+    assert_eq!(
+        s["status"],
+        json!({"state": "failed", "reason": "You don't have permission to read this pod's logs."})
+    );
+    assert_eq!(s["status_text"], "Ended · no permission");
+    assert_eq!(s["tab"]["paused"], false);
+}
+
+// covers UP-45: a workload tab reports its streams and each line's source, with the prefix on.
+#[gpui_kit::test]
+async fn the_state_reports_a_workloads_streams_and_sources(cx: &mut TestAppContext) {
+    use serde_json::json;
+
+    let (core, _dir) = core();
+    let (window, view) = open_request(cx, core, workload_request());
+    let mut buffer = LogBuffer::new(100);
+    let mut line = LogLine::parse("2024-05-01T12:00:00Z WARN slow", false);
+    line.source = Some(Arc::new(LineSource::new("web-2", "app")));
+    buffer.push(line);
+    let stream = |pod: &str, state| StreamStatus {
+        source: Arc::new(LineSource::new(pod, "app")),
+        state,
+    };
+    let pods = PodSetStatus {
+        selector: Some("app=web".into()),
+        pods: 2,
+        streams: vec![
+            stream("web-1", LogState::Streaming),
+            stream(
+                "web-2",
+                LogState::Ended {
+                    error: Some("Forbidden".into()),
+                    pod_deleted: false,
+                },
+            ),
+        ],
+        waiting: 1,
+        max_streams: 50,
+        ..Default::default()
+    };
+    feed(
+        cx,
+        &view,
+        Arc::new(LogSnapshot {
+            lines: buffer.view(),
+            state: LogState::Streaming,
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: Some(Arc::new(pods)),
+        }),
+    );
+    let tab = state(cx, &view)["tab"].clone();
+    assert_eq!(
+        tab["streams"],
+        json!({"pods": 2, "live": 1, "connecting": 0, "waiting": 1, "failed": 1, "ended": 0,
+               "capped": 0, "each": [
+            {"pod": "web-1", "container": "app", "state": "streaming"},
+            {"pod": "web-2", "container": "app", "state": "failed"},
+        ]})
+    );
+    assert_eq!(tab["sources"], true);
+    assert_eq!(
+        tab["last_lines"],
+        json!([{"id": 0, "text": "WARN slow", "severity": "warning", "source": "web-2/app"}])
+    );
+    press(cx, window, "p");
+    assert_eq!(state(cx, &view)["tab"]["sources"], false);
+}

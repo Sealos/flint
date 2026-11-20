@@ -32,6 +32,8 @@ use gpui_kit::*;
 use super::detail::{Opening, ShellPod, Subject, log_item, reason, refused, shell_item};
 use super::object::PodContainer;
 use super::registry::{self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell};
+#[cfg(any(test, feature = "automation"))]
+use super::view_state::{MenuEntryState, SubmenuEntryState};
 use super::workspace::Workspace;
 
 /// Builds a row's context menu (gpui-component's `context_menu` builder).
@@ -331,6 +333,81 @@ pub(in crate::ui) fn refusal(
     refused(opening, why.as_deref().unwrap_or("it cannot run now"))
 }
 
+/// What the menu `fill` builds from `a` shows, as data: the note above its entries (why nothing
+/// can open) and every entry, a picker with its containers. Whether an entry is enabled and why
+/// not come from the same checks as the menu's (a disabled entry's reason is given even where
+/// the menu says it once, in the note).
+#[cfg(any(test, feature = "automation"))]
+pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
+    use super::detail::{container_label, shell_label};
+
+    let entry = |label: String, can: &Availability| MenuEntryState {
+        label,
+        enabled: can.is_ok(),
+        reason: can.as_ref().err().cloned(),
+        checked: None,
+        submenu: Vec::new(),
+    };
+    let picker = |label: String, submenu: Vec<SubmenuEntryState>| MenuEntryState {
+        label,
+        enabled: true,
+        reason: None,
+        checked: None,
+        submenu,
+    };
+    let logs_of = |containers: &mut dyn Iterator<Item = &PodContainer>| {
+        containers
+            .map(|c| SubmenuEntryState {
+                label: container_label(&c.name, c.init, c.default),
+                enabled: true,
+            })
+            .collect()
+    };
+    let several = a.log_containers.len() > 1;
+    let mut entries = Vec::new();
+    entries.push(if several && a.logs.is_ok() {
+        picker("Logs".into(), logs_of(&mut a.log_containers.iter()))
+    } else {
+        entry("Logs".into(), &a.logs)
+    });
+    if let Some(previous) = &a.previous {
+        let mut restarted = a
+            .log_containers
+            .iter()
+            .filter(|c| c.has_previous)
+            .peekable();
+        entries.push(
+            if several && restarted.peek().is_some() && a.blocked.is_none() {
+                picker("Previous Logs".into(), logs_of(&mut restarted))
+            } else {
+                entry("Previous Logs".into(), previous)
+            },
+        );
+    }
+    let label = match (&a.shell_pod, a.subject) {
+        (Some(shell), Subject::Workload(_)) => format!("Shell in {}", shell.pod),
+        _ => "Shell".to_owned(),
+    };
+    entries.push(match &a.shell_pod {
+        Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
+            label,
+            shell
+                .containers
+                .iter()
+                .map(|name| {
+                    let running = !shell.not_running.contains(name);
+                    SubmenuEntryState {
+                        label: shell_label(name, *name == shell.default, running),
+                        enabled: running,
+                    }
+                })
+                .collect(),
+        ),
+        _ => entry(label, &a.shell),
+    });
+    (a.blocked.clone(), entries)
+}
+
 #[cfg(test)]
 pub(in crate::ui) mod tests {
     use std::cell::Cell;
@@ -338,5 +415,110 @@ pub(in crate::ui) mod tests {
     thread_local! {
         /// How many times an open menu was built again, on this test's thread.
         pub static REBUILDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    use flint_core::WorkloadKind;
+    use serde_json::json;
+
+    use super::{RowActions, menu_state};
+    use crate::ui::detail::{ShellPod, Subject};
+    use crate::ui::object::PodContainer;
+
+    fn container(name: &str, default: bool, has_previous: bool) -> PodContainer {
+        PodContainer {
+            name: name.into(),
+            init: false,
+            not_running: false,
+            has_previous,
+            default,
+        }
+    }
+
+    fn pod_actions() -> RowActions {
+        RowActions {
+            blocked: None,
+            subject: Subject::Pod,
+            logs: Ok(()),
+            previous: Some(Err("No container has restarted.".into())),
+            shell: Ok(()),
+            shell_pod: None,
+            shell_picker: false,
+            log_containers: vec![container("app", true, false)],
+        }
+    }
+
+    fn state(a: &RowActions) -> serde_json::Value {
+        let (note, entries) = menu_state(a);
+        json!({"note": note, "entries": entries})
+    }
+
+    // The state names a row menu's entries as `fill` draws them: plain entries with why they are
+    // disabled, pickers with their containers, and the cluster's reason once above.
+    #[test]
+    fn a_row_menus_entries_are_named_as_drawn() {
+        assert_eq!(
+            state(&pod_actions()),
+            json!({"note": null, "entries": [
+                {"label": "Logs", "enabled": true, "reason": null, "checked": null, "submenu": []},
+                {"label": "Previous Logs", "enabled": false,
+                 "reason": "No container has restarted.", "checked": null, "submenu": []},
+                {"label": "Shell", "enabled": true, "reason": null, "checked": null, "submenu": []},
+            ]})
+        );
+
+        let several = RowActions {
+            previous: Some(Ok(())),
+            log_containers: vec![
+                container("app", true, true),
+                container("sidecar", false, false),
+            ],
+            shell_pod: Some(ShellPod {
+                pod: "web-1".into(),
+                containers: vec!["app".into(), "sidecar".into()],
+                default: "app".into(),
+                not_running: vec!["sidecar".into()],
+            }),
+            shell_picker: true,
+            ..pod_actions()
+        };
+        assert_eq!(
+            state(&several)["entries"],
+            json!([
+                {"label": "Logs", "enabled": true, "reason": null, "checked": null, "submenu": [
+                    {"label": "app (default)", "enabled": true},
+                    {"label": "sidecar", "enabled": true},
+                ]},
+                {"label": "Previous Logs", "enabled": true, "reason": null, "checked": null, "submenu": [
+                    {"label": "app (default)", "enabled": true},
+                ]},
+                {"label": "Shell", "enabled": true, "reason": null, "checked": null, "submenu": [
+                    {"label": "app (default)", "enabled": true},
+                    {"label": "sidecar (not running)", "enabled": false},
+                ]},
+            ])
+        );
+
+        let why = "alpha is not connected.".to_owned();
+        let blocked = RowActions {
+            blocked: Some(why.clone()),
+            logs: Err(why.clone()),
+            previous: None,
+            shell: Err(why.clone()),
+            subject: Subject::Workload(WorkloadKind::Deployment),
+            shell_pod: Some(ShellPod {
+                pod: "web-1".into(),
+                containers: vec!["app".into()],
+                default: "app".into(),
+                not_running: Vec::new(),
+            }),
+            ..several
+        };
+        assert_eq!(
+            state(&blocked),
+            json!({"note": why, "entries": [
+                {"label": "Logs", "enabled": false, "reason": why, "checked": null, "submenu": []},
+                {"label": "Shell in web-1", "enabled": false, "reason": why, "checked": null, "submenu": []},
+            ]})
+        );
     }
 }

@@ -26,6 +26,7 @@ use gpui_kit::*;
 
 use super::list::tabular_figures;
 use super::log_view::LogRequest;
+use super::menu_record;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
@@ -568,7 +569,16 @@ impl DetailView {
                         containers.iter().find(|c| c.default).map(|c| &c.name[..]),
                         &keys,
                     ))
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+                        menu_record::record(cx, "detail-logs", || {
+                            let label =
+                                |c: &PodContainer| container_label(&c.name, c.init, c.default);
+                            containers
+                                .iter()
+                                .chain(containers.iter().filter(|c| c.has_previous))
+                                .map(|c| menu_record::Entry::new(label(c), true))
+                                .collect()
+                        });
                         let mut menu = menu.label("Container");
                         for c in &containers {
                             let (item, action) = log_item(c, false);
@@ -667,7 +677,19 @@ impl DetailView {
                         _ => hint,
                     }
                 })
-                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+                    menu_record::record(cx, "detail-shell", || {
+                        containers
+                            .iter()
+                            .map(|name| {
+                                let running = !not_running.contains(name);
+                                menu_record::Entry::new(
+                                    shell_label(name, *name == default, running),
+                                    running,
+                                )
+                            })
+                            .collect()
+                    });
                     let mut menu = menu.label("Container");
                     for name in &containers {
                         let running = !not_running.contains(name);

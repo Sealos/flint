@@ -471,10 +471,8 @@ impl TerminalView {
     }
 
     fn render_toolbar(&self, theme: &Theme) -> impl IntoElement {
-        let (tone, state) = match &self.ended {
-            Some(_) => (Tone::Warning, "Ended: the context changed".to_owned()),
-            None => terminal_model::state_text(&self.snapshot.state),
-        };
+        let (tone, state) =
+            terminal_model::toolbar_state(&self.snapshot.state, self.ended.is_some());
         let color = tone_color(tone, theme);
         let full_state = state.clone();
         let title = self.snapshot.terminal.title.clone();
@@ -1139,6 +1137,10 @@ impl InputHandler for TerminalInput {
 
 #[path = "terminal_actions.rs"]
 mod actions;
+
+#[cfg(any(test, feature = "automation"))]
+#[path = "terminal_state.rs"]
+mod state;
 
 #[cfg(test)]
 #[path = "terminal_tests.rs"]

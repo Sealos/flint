@@ -492,6 +492,12 @@ impl App {
         self.request("press_key", json!({ "key": key }))
     }
 
+    /// Right-clicks the drawn element `id` (a row's `row-<uid>`, from the state's
+    /// `list.rows[].id`), as the mouse does: opens its context menu (`state.menu`).
+    pub fn right_click(&self, id: &str) -> Result<Value, AppError> {
+        self.request("right_click", json!({ "id": id }))
+    }
+
     /// The visible view tree.
     pub fn state(&self) -> Result<Value, AppError> {
         self.request("state", Value::Null)

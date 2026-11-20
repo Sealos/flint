@@ -511,8 +511,7 @@ impl Workspace {
             Ok((server, previous)) => {
                 let model = self.model.clone();
                 let dialog = expose_dialog(&action.cluster, &server, previous.as_deref());
-                confirm_expose(window, cx, model, action.cluster.clone(), server, &dialog);
-                self.dialog = Some(dialog);
+                confirm_expose(window, cx, model, action.cluster.clone(), server, dialog);
             }
             Err(e) => tracing::warn!("{e}"),
         }
@@ -756,3 +755,7 @@ mod expose_tests;
 #[cfg(test)]
 #[path = "row_actions_tests.rs"]
 mod row_actions_tests;
+
+#[cfg(test)]
+#[path = "dock_state_tests.rs"]
+mod dock_state_tests;

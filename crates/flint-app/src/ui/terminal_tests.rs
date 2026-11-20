@@ -699,3 +699,62 @@ async fn a_drag_past_the_grid_selects_to_its_edge(cx: &mut TestAppContext) {
         Some("aaa\nbbbb\nccc")
     );
 }
+
+// covers UP-41: the automation state reports the shell's status, size, cursor and the visible
+// screen as text, whether keys reach it, and its exit code once it ends.
+#[gpui_kit::test]
+async fn the_state_reports_the_screen_and_the_exit(cx: &mut TestAppContext) {
+    use crate::ui::view_state::Focus;
+
+    let mut shell = open(cx);
+    shell.print(cx, b"$ echo hi\r\nhi\r\n$ ");
+    let state = |cx: &mut TestAppContext, shell: &Shell| {
+        shell.view.read_with(cx, |v, _| {
+            let (status, text) = v.status_state();
+            json!({"status": status, "status_text": text, "shell": v.view_state()})
+        })
+    };
+    let s = state(cx, &shell);
+    let size = shell.screen(cx).size;
+    assert_eq!(s["status"], json!({"state": "running", "command": "bash"}));
+    assert_eq!(s["status_text"], "Running bash");
+    assert_eq!(
+        (&s["shell"]["cols"], &s["shell"]["rows"]),
+        (&json!(size.cols), &json!(size.rows))
+    );
+    assert_eq!(s["shell"]["screen"], json!(["$ echo hi", "hi", "$"]));
+    assert_eq!(s["shell"]["cursor"], json!({"row": 2, "col": 2}));
+    assert_eq!(s["shell"]["live"], true);
+    assert_eq!(s["shell"]["exit_code"], json!(null));
+    assert_eq!(s["shell"]["scrolled_back"], false);
+    let focus = cx
+        .update_window(shell.window, |_, window, cx| {
+            shell.view.read(cx).focus_in(window, cx)
+        })
+        .unwrap();
+    assert_eq!(focus, Some(Focus::Shell));
+
+    shell.fake.set_state(ExecState::Exited { code: Some(3) });
+    shell.settle(cx);
+    let s = state(cx, &shell);
+    assert_eq!(s["status"], json!({"state": "exited", "code": 3}));
+    assert_eq!(s["status_text"], "Exited (code 3)");
+    assert_eq!(s["shell"]["exit_code"], 3);
+    assert_eq!(s["shell"]["live"], false);
+    // The screen stays.
+    assert_eq!(s["shell"]["screen"], json!(["$ echo hi", "hi", "$"]));
+
+    // A shell the tab ended itself says why.
+    let mut other = open_window(cx, TerminalSize::default());
+    other
+        .view
+        .update(cx, |v, cx| v.end("Repointed.".into(), cx));
+    other.settle(cx);
+    let s = state(cx, &other);
+    assert_eq!(
+        s["status"],
+        json!({"state": "ended", "reason": "Repointed.", "pod_deleted": false})
+    );
+    // As the toolbar says it.
+    assert_eq!(s["status_text"], "Ended: the context changed");
+}

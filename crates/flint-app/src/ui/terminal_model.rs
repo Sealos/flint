@@ -251,6 +251,16 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
     }
 }
 
+/// What the toolbar says: that the tab ended the shell itself (`ended_by_tab`: its context was
+/// re-pointed), else the session's state ([`state_text`]).
+pub fn toolbar_state(state: &ExecState, ended_by_tab: bool) -> (Tone, String) {
+    if ended_by_tab {
+        (Tone::Warning, "Ended: the context changed".to_owned())
+    } else {
+        state_text(state)
+    }
+}
+
 /// Why a shell could not run, in plain words, and what was said (by the server, the
 /// connection or Flint's client), as the detail: the tab's banner says both, once. Where the
 /// failure came from is typed ([`ExecFailureKind`]), so a local error (a missing auth plugin,

@@ -11,6 +11,7 @@ mod appearance_tests;
 #[cfg(feature = "automation")]
 mod automation;
 mod clusters;
+mod confirm;
 mod detail;
 mod dock;
 mod dock_model;
@@ -20,6 +21,7 @@ mod list;
 mod list_model;
 mod log_model;
 mod log_view;
+mod menu_record;
 mod nav;
 mod notice;
 mod object;
