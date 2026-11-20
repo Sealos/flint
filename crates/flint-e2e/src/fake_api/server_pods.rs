@@ -70,7 +70,10 @@ impl FakeApiServer {
 
     /// Ends a container's open log streams cleanly (EOF), as the kubelet does when the
     /// container stops. The pod stays as it is, so a client that checks the pod finds it
-    /// running and reconnects. Returns how many streams ended.
+    /// running and reconnects. On a pod [`FakeApiServer::begin_delete_pod`] started deleting,
+    /// this is the kubelet's status lag: the stream ends before the pod's status shows the
+    /// container stopped, and [`FakeApiServer::finish_delete`] may remove the pod before it
+    /// ever does. Returns how many streams ended.
     pub fn end_log_streams(&self, log: &ContainerLog) -> usize {
         let state = lock(&self.inner.state);
         let key = FakeApiServer::log_key(&state, log);

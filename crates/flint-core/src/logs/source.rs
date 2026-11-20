@@ -83,6 +83,10 @@ pub(crate) enum ErrorKind {
     Cluster,
     /// The pod is gone: deleted, or replaced by another pod of the same name.
     PodGone,
+    /// A 404: the pod (or its log) does not exist. Retrying cannot help, as for
+    /// [`ErrorKind::Fatal`]; a stream that already read the pod, or saw it being deleted, takes
+    /// it as the pod's deletion.
+    NotFound,
 }
 
 impl LogError {
@@ -127,6 +131,8 @@ impl LogError {
     }
 
     pub fn from_kube(err: kube::Error) -> Self {
+        let not_found =
+            ApiError::from_kube(&err).is_some_and(|api| api.kind() == ApiErrorKind::NotFound);
         let fatal = ApiError::from_kube(&err).is_some_and(|api| match api.kind() {
             ApiErrorKind::Forbidden | ApiErrorKind::NotFound => true,
             // A container that is still starting is worth waiting for; a missing container
@@ -135,7 +141,12 @@ impl LogError {
             _ => false,
         });
         let message = ClusterError::kube(err).summary().to_string();
-        if fatal {
+        if not_found {
+            LogError {
+                message,
+                kind: ErrorKind::NotFound,
+            }
+        } else if fatal {
             LogError::fatal(message)
         } else {
             LogError::retry(message)
@@ -161,6 +172,10 @@ pub(crate) enum AfterEnd {
     Restarts,
     /// The container finished for good.
     Finished,
+    /// The pod is being deleted (it has a `deletionTimestamp`) but the container has not
+    /// stopped: it may still log its shutdown (or never started). Reconnect; the pod may go
+    /// before the container shows as stopped.
+    Terminating,
     /// The pod is being deleted (it has a `deletionTimestamp`) and the container stopped (or
     /// the pod reached Succeeded or Failed): it will not run again, though the pod and its
     /// logs may still be there.
@@ -287,6 +302,8 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
     };
     // A pod being deleted (it has a `deletionTimestamp`) never runs its containers again, but
     // one may still be shutting down and logging: until it stops, the stream is reopened.
+    // The kubelet ends the stream before the pod's status shows the container stopped, so
+    // `Terminating` may well be the last look before the pod goes.
     let deleting = pod.metadata.deletion_timestamp.is_some();
     let status = pod.status.as_ref();
     if matches!(
@@ -338,7 +355,7 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         return if exit_code.is_some() {
             AfterEnd::Deleting
         } else {
-            AfterEnd::Restarts
+            AfterEnd::Terminating
         };
     }
     match (exit_code, policy) {
@@ -496,7 +513,10 @@ mod tests {
         let missing = LogError::from_kube(api_error(400, "container x is not valid for pod p"));
         assert!(missing.is_fatal());
         assert!(missing.message.contains("not valid"), "{}", missing.message);
-        assert!(LogError::from_kube(api_error(404, "pods \"p\" not found")).is_fatal());
+        let not_found = LogError::from_kube(api_error(404, "pods \"p\" not found"));
+        assert!(not_found.is_fatal());
+        assert_eq!(not_found.kind, ErrorKind::NotFound);
+        assert_eq!(missing.kind, ErrorKind::Fatal);
         assert!(!LogError::from_kube(api_error(500, "boom")).is_fatal());
     }
 
@@ -542,9 +562,12 @@ mod tests {
                      "state": state}]},
             }))
         };
-        // Still shutting down (and maybe logging): the stream is reopened, not ended.
+        // Still shutting down (and maybe logging), or never started: the stream is reopened,
+        // not ended.
         let running = terminating(json!({"running": {}}));
-        assert_eq!(fate(Some(&running), Some("app")), AfterEnd::Restarts);
+        assert_eq!(fate(Some(&running), Some("app")), AfterEnd::Terminating);
+        let waiting = terminating(json!({"waiting": {"reason": "ContainerCreating"}}));
+        assert_eq!(fate(Some(&waiting), Some("app")), AfterEnd::Terminating);
         // Stopped: the pod is going and the container will not run again.
         let stopped = terminating(json!({"terminated": {"exitCode": 0}}));
         assert_eq!(fate(Some(&stopped), Some("app")), AfterEnd::Deleting);

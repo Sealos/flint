@@ -674,6 +674,56 @@ async fn a_terminating_pod_keeps_its_log_until_its_container_stops() {
     server.finish_delete("demo", "slow");
 }
 
+// covers UP-40
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_gone_before_its_status_caught_up_ends_as_deleted() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, Some("demo")).await;
+    server.add_pod(FakePod::new("demo", "lagging", &["app"]).label("app", "lagging"));
+    let log = ContainerLog::new("demo", "lagging");
+    let target = LogTarget {
+        namespace: "demo".into(),
+        pod: "lagging".into(),
+        container: None,
+    };
+    let mut session = core
+        .handle
+        .open_logs(CONTEXT, target, LogOptions::default());
+    until_log(&mut session, "streaming", |s| {
+        s.state == LogState::Streaming
+    })
+    .await;
+    server.wait_for_log_streams(1, WAIT).await.unwrap();
+    server.append_log(&log, "bye\n");
+    until_log(&mut session, "the line", |s| log_texts(s) == ["bye"]).await;
+
+    // The kubelet ends the stream before the pod's status shows the container stopped: Flint
+    // looks, finds it Terminating but running, and waits to reconnect. Meanwhile the pod goes.
+    server.begin_delete_pod("demo", "lagging");
+    assert_eq!(server.end_log_streams(&log), 1);
+    server
+        .wait_for_request(WAIT, |r| {
+            r.path == "/api/v1/namespaces/demo/pods/lagging" && r.status == Some(200)
+        })
+        .await
+        .unwrap();
+    server.finish_delete("demo", "lagging");
+
+    // The reopen finds no pod: it was deleted, which is no error.
+    let ended = until_log(&mut session, "ended", |s| {
+        matches!(s.state, LogState::Ended { .. })
+    })
+    .await;
+    assert_eq!(
+        ended.state,
+        LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        }
+    );
+    assert_eq!(log_texts(&ended), ["bye"]);
+}
+
 // covers UP-45
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_workload_log_outlives_a_deleted_pod() {
