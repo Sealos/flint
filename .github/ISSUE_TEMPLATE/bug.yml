@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in Flint does not work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Screenshots help.
+    validations:
+      required: true
+  - type: input
+    id: flint-version
+    attributes:
+      label: Flint version
+      description: Flint > About Flint, or run `/Applications/Flint.app/Contents/MacOS/flint --version`.
+      placeholder: "0.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      options:
+        - macOS app (DMG)
+        - macOS command-line archive
+        - Linux AppImage
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: macOS 15.1 on Apple Silicon
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: How the cluster authenticates
+      description: The `users[].user.exec` plugin in your kubeconfig, if any.
+      options:
+        - EKS (aws eks get-token / aws-iam-authenticator)
+        - GKE (gke-gcloud-auth-plugin)
+        - AKS (kubelogin)
+        - Other exec plugin
+        - Client certificate, token or basic auth
+        - Not related to the cluster connection
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: |
+        Flint logs to stderr only for now, so an app opened from Finder or the Dock keeps no log file.
+        Start it from a terminal with more detail and paste what it prints:
+        `FLINT_LOG=debug /Applications/Flint.app/Contents/MacOS/flint`
+        Remove anything private (cluster names, hostnames, tokens) first.
+      render: text
