@@ -115,6 +115,13 @@ impl Server {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let msg = self.exchange(method, params);
+        assert!(msg.get("error").is_none(), "{method} failed: {msg}");
+        msg["result"].clone()
+    }
+
+    /// Sends a request and returns the whole response, error or result.
+    fn exchange(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -126,8 +133,7 @@ impl Server {
             let msg: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|e| panic!("stdout must carry only JSON-RPC ({e}): {line}"));
             if msg["id"] == json!(id) {
-                assert!(msg.get("error").is_none(), "{method} failed: {msg}");
-                return msg["result"].clone();
+                return msg;
             }
         }
     }
@@ -252,6 +258,128 @@ fn plain_runs_log_warnings_only_and_verbose_adds_info() {
 fn closed_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Every call lands in the activity log, ended or denied, with what it named and never what came
+/// back. No cluster: the exposed context points at a port nothing listens on.
+// covers UP-16
+#[test]
+fn every_call_is_recorded_in_the_activity_log() {
+    let scratch = tempfile::tempdir().unwrap();
+    let kubeconfig = scratch.path().join("kubeconfig");
+    let refusing = format!("https://127.0.0.1:{}", closed_port());
+    std::fs::write(
+        &kubeconfig,
+        format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {refusing}\nusers:\n- name: u\n  user:\n    token: SECRETTOKEN\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n- name: other\n  context:\n    cluster: c\n    user: u\n"),
+    )
+    .unwrap();
+    let config_dir = scratch.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("settings.toml"),
+        exposing("dev", &refusing) + "namespaces = [\"web\"]\n",
+    )
+    .unwrap();
+    let mut server = Server::start(kubeconfig.as_os_str(), &config_dir);
+
+    let clusters = server.call_json("list_clusters", json!({}));
+    assert_eq!(clusters["clusters"].as_array().unwrap().len(), 1);
+    // Not exposed: denied, though the agent reads "not found".
+    let (failed, _) = server.call(
+        "list_resources",
+        json!({"cluster": "other", "kind": "secrets", "namespace": "web"}),
+    );
+    assert!(failed);
+    // Outside the scope: denied.
+    let (failed, _) = server.call(
+        "get_pod_logs",
+        json!({"cluster": "dev", "namespace": "kube-system", "pod": "etcd-0", "container": "etcd"}),
+    );
+    assert!(failed);
+    // In scope, but the server is unreachable: failed.
+    let (failed, _) = server.call(
+        "get_resource",
+        json!({"cluster": "dev", "kind": "pods", "namespace": "web", "name": "web-0"}),
+    );
+    assert!(failed);
+    // Rejected before the tool runs (no `pod`): still recorded, with what the arguments name.
+    let rejected = server.exchange(
+        "tools/call",
+        json!({"name": "get_pod_logs", "arguments": {"cluster": "dev", "namespace": "web"}}),
+    );
+    let refused = rejected.get("error").is_some() || rejected["result"]["isError"] == json!(true);
+    assert!(refused, "{rejected}");
+    drop(server);
+
+    let records = flint_core::activity::read(&config_dir);
+    let summary: Vec<_> = records
+        .iter()
+        .map(|r| {
+            (
+                r.tool.as_str(),
+                r.cluster.as_deref(),
+                r.kind.as_deref(),
+                r.namespace.as_deref(),
+                r.name.as_deref(),
+                r.container.as_deref(),
+                r.outcome,
+            )
+        })
+        .collect();
+    use flint_core::activity::Outcome::{Denied, Failed, Ok};
+    assert_eq!(
+        summary,
+        [
+            ("list_clusters", None, None, None, None, None, Ok),
+            (
+                "list_resources",
+                Some("other"),
+                Some("secrets"),
+                Some("web"),
+                None,
+                None,
+                Denied
+            ),
+            (
+                "get_pod_logs",
+                Some("dev"),
+                Some("pods"),
+                Some("kube-system"),
+                Some("etcd-0"),
+                Some("etcd"),
+                Denied
+            ),
+            (
+                "get_resource",
+                Some("dev"),
+                Some("pods"),
+                Some("web"),
+                Some("web-0"),
+                None,
+                Failed
+            ),
+            (
+                "get_pod_logs",
+                Some("dev"),
+                None,
+                Some("web"),
+                None,
+                None,
+                Failed
+            ),
+        ]
+    );
+    assert_eq!(records[0].items, Some(1));
+    assert!(records.iter().all(|r| r.bytes > 0 && !r.truncated));
+    // The server a cluster is exposed with; none for one that is not exposed.
+    assert_eq!(records[2].server.as_deref(), Some(refusing.as_str()));
+    assert_eq!(records[1].server, None);
+    // What came back is never stored.
+    let log =
+        std::fs::read_to_string(config_dir.join(flint_core::activity::ACTIVITY_FILE)).unwrap();
+    for absent in ["SECRETTOKEN", "not found", "reachable", "refused"] {
+        assert!(!log.contains(absent), "{absent} in {log}");
+    }
 }
 
 /// Runs on every `cargo test`: no cluster. The only server named is a local port nothing

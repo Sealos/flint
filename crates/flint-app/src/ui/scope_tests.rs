@@ -56,8 +56,8 @@ fn scope(namespaces: &[&str], kinds: &[&str]) -> AiScope {
 }
 
 // covers UP-14: exposing offers the cluster's namespaces and kinds; what is checked is written
-// with the exposure. The AI tag then says what agents may read and opens Edit AI Scope, whose
-// pickers show the scope; clearing it exposes everything again, in one rewrite of the entry.
+// with the exposure. The AI tag then says what agents may read and opens the cluster's agent
+// activity, whose Edit AI Scope shows the scope in the pickers; clearing it exposes everything again, in one rewrite of the entry.
 #[gpui_kit::test]
 async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -111,6 +111,8 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     );
     assert_eq!(t.label(cx, "ai-scope-alpha").as_deref(), Some("AI·"));
     t.click(cx, "ai-scope-alpha");
+    t.wait_for_element(cx, "activity-edit-scope").await;
+    t.click(cx, "activity-edit-scope");
     wait_for_dialog(cx, &t, true).await;
     let saved = scope(&["shop"], &["deployments.apps", "nodes"]);
     assert_eq!(

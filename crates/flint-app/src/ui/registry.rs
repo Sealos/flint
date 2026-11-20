@@ -262,6 +262,15 @@ pub struct EditAiScope {
     pub cluster: String,
 }
 
+/// Show what AI agents asked Flint's MCP server for on a cluster: its agent activity, in a dock
+/// tab that updates while they work (UP-16).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ShowAgentActivity {
+    pub cluster: String,
+}
+
 actions!(
     ai_scope,
     [
@@ -1783,6 +1792,12 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::with_args::<EditAiScope>(
             "Edit AI Scope…",
             "Choose which namespaces and kinds AI agents may read of an exposed cluster.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<ShowAgentActivity>(
+            "Show Agent Activity…",
+            "See every call AI agents made to Flint's MCP server on a cluster, as they make them.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),

@@ -17,16 +17,16 @@ use gpui_kit::*;
 
 use std::rc::Rc;
 
+use super::super::activity_view::ActivityView;
 use super::super::clusters::ClustersModel;
 use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
-use super::super::dock::Dock;
+use super::super::dock::{Dock, DockTab, TabKey};
 use super::super::focus::release_unfocused_input;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
 use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, PaletteEvent};
-use super::super::registry::EditAiScope;
 use super::super::registry::{
     About, ActionError, ActionSpec, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection,
     Close, CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
@@ -44,6 +44,7 @@ use super::super::registry::{
     ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
     UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::super::registry::{EditAiScope, ShowAgentActivity};
 use super::super::registry::{LockCluster, TrustCluster, UnlockCluster, UntrustCluster};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
@@ -73,6 +74,7 @@ impl Workspace {
             .bind::<ExposeToAi>(Self::expose_to_ai)
             .bind::<HideFromAi>(Self::hide_from_ai)
             .bind::<EditAiScope>(Self::edit_ai_scope)
+            .bind::<ShowAgentActivity>(Self::show_agent_activity)
             .bind::<UnlockCluster>(Self::unlock_cluster)
             .bind::<LockCluster>(Self::lock_cluster)
             .bind::<TrustCluster>(Self::trust_cluster)
@@ -154,6 +156,10 @@ impl Workspace {
             .add::<EditAiScope>(Self::settings_ok, |ws, a, cx| {
                 ws.scope_change(a, cx).map(drop)
             })
+            .add::<ShowAgentActivity>(
+                |_, _| true,
+                |ws, a, cx| ws.check_cluster::<ShowAgentActivity>(&a.cluster, cx),
+            )
             .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
             .add::<LockCluster>(|_, _| true, |ws, a, cx| ws.check_lock(a, cx))
             .add::<TrustCluster>(Self::settings_ok, |ws, a, cx| {
@@ -880,6 +886,34 @@ impl Workspace {
         }
     }
 
+    /// Opens (or shows) the cluster's agent activity tab, focused (UP-16). Any context has one:
+    /// a cluster hidden from agents again still shows what they read while it was exposed.
+    fn show_agent_activity(
+        &mut self,
+        action: &ShowAgentActivity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_cluster::<ShowAgentActivity>(&action.cluster, cx) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let model = self.model.clone();
+        let cluster = action.cluster.clone();
+        let tab_cluster = self.tab_cluster(&cluster, cx);
+        let server = tab_cluster.server.clone();
+        self.open_tab(
+            TabKey::Activity(cluster.clone()),
+            tab_cluster,
+            move |_, cx| {
+                DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, server, cx)))
+            },
+            true,
+            window,
+            cx,
+        );
+    }
+
     /// Opens the scope dialog of an exposed cluster; saving rewrites its entry with the new
     /// scope.
     fn edit_ai_scope(&mut self, action: &EditAiScope, window: &mut Window, cx: &mut Context<Self>) {
@@ -1243,6 +1277,9 @@ mod header_tests;
 #[path = "expose_tests.rs"]
 mod expose_tests;
 
+#[cfg(test)]
+#[path = "activity_tests.rs"]
+mod activity_tests;
 #[cfg(test)]
 #[path = "scope_tests.rs"]
 mod scope_tests;

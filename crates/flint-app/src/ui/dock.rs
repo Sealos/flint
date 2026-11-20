@@ -1,5 +1,6 @@
 //! The bottom dock (#13): a resizable panel under the main area with one tab per session that
-//! outlives navigation (UP-42): log tabs and shell tabs (#14); AI log analysis (#56) next. Tabs
+//! outlives navigation (UP-42): log tabs, shell tabs (#14) and a cluster's agent activity
+//! (UP-16); AI log analysis (#56) next. Tabs
 //! keep running when the user switches clusters or views, and end only when closed. Each tab
 //! names the cluster its session runs on and is pinned to it: the context and the API server it
 //! pointed at ([`TabCluster`]). The strip scrolls the active tab into view, and a tab list at its
@@ -25,6 +26,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use flint_core::ClusterId;
+
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -33,6 +36,7 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, Theme, h_fle
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::activity_view::ActivityView;
 pub use super::dock_model::TabStatus;
 use super::dock_model::{self, LiveSessions, TabCluster, chip_labels, chip_tooltip};
 use super::focus::release_unfocused_input;
@@ -75,6 +79,8 @@ pub fn dock_height(saved: Option<u32>, window_height: f32) -> f32 {
 pub enum TabKey {
     Logs(LogRequest),
     Shell(ShellRequest),
+    /// A cluster's agent activity: no session, one tab per cluster.
+    Activity(ClusterId),
 }
 
 impl TabKey {
@@ -83,6 +89,7 @@ impl TabKey {
         match self {
             TabKey::Logs(request) => &request.cluster,
             TabKey::Shell(request) => &request.cluster,
+            TabKey::Activity(cluster) => cluster,
         }
     }
 }
@@ -107,6 +114,7 @@ pub trait DockItem {
 pub enum DockTab {
     Logs(Entity<LogView>),
     Shell(Entity<TerminalView>),
+    Activity(Entity<ActivityView>),
 }
 
 impl DockTab {
@@ -114,6 +122,7 @@ impl DockTab {
         match self {
             DockTab::Logs(view) => view.read(cx),
             DockTab::Shell(view) => view.read(cx),
+            DockTab::Activity(view) => view.read(cx),
         }
     }
 
@@ -121,6 +130,7 @@ impl DockTab {
         match self {
             DockTab::Logs(view) => view.clone().into(),
             DockTab::Shell(view) => view.clone().into(),
+            DockTab::Activity(view) => view.clone().into(),
         }
     }
 }
@@ -143,6 +153,7 @@ fn observe(tab: &DockTab, id: u64, cx: &mut Context<Dock>) -> Subscription {
     match tab {
         DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
         DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        DockTab::Activity(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
     }
 }
 
@@ -245,7 +256,7 @@ impl Dock {
     pub fn active_log(&self) -> Option<&Entity<LogView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Logs(view) => Some(view),
-            DockTab::Shell(_) => None,
+            DockTab::Shell(_) | DockTab::Activity(_) => None,
         }
     }
 
@@ -254,14 +265,14 @@ impl Dock {
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
         self.tabs.iter().filter_map(|t| match &t.tab {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) => None,
+            DockTab::Logs(_) | DockTab::Activity(_) => None,
         })
     }
 
     pub fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         match self.active_tab().filter(|_| self.visible)? {
             DockTab::Shell(view) => Some(view),
-            DockTab::Logs(_) => None,
+            DockTab::Logs(_) | DockTab::Activity(_) => None,
         }
     }
 
@@ -274,6 +285,8 @@ impl Dock {
             let (reads_to_end, count) = match item.tab_key() {
                 TabKey::Shell(_) => (false, &mut live.shells),
                 TabKey::Logs(request) => (request.previous, &mut live.logs),
+                // Runs no session: closing it ends nothing.
+                TabKey::Activity(_) => continue,
             };
             if dock_model::ends_a_session(item.tab_status(), reads_to_end) {
                 *count += 1;

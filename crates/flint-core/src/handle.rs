@@ -242,6 +242,9 @@ pub enum Event {
         discovery: Option<Arc<ClusterDiscovery>>,
         error: Option<String>,
     },
+    /// The agent activity log ([`crate::activity`]), at start and whenever `flint mcp` adds to
+    /// it: every record kept, oldest first, for all clusters.
+    AgentActivity(Arc<Vec<crate::activity::ActivityRecord>>),
     /// A problem worth showing that is not tied to one cluster's connection.
     Error(String),
 }
