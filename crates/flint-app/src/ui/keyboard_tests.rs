@@ -428,3 +428,41 @@ async fn enter_on_the_open_kind_focuses_its_list(cx: &mut TestAppContext) {
     t.press(cx, "enter");
     assert_eq!(focus(cx, &t), Focus::List);
 }
+
+// covers UP-33: the sidebar's cursor brings its cluster into view: moving past the last row
+// shown scrolls the clusters.
+#[gpui_kit::test]
+async fn the_sidebar_cursor_scrolls_into_view(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{kubeconfig_yaml, open_workspace_with};
+
+    let dir = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..40).map(|i| format!("ctx{i:02}")).collect();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let contexts: Vec<(&str, &str)> = names
+            .iter()
+            .map(|n| (n.as_str(), servers.refused.as_str()))
+            .collect();
+        let path = dir.join("kubeconfig");
+        std::fs::write(&path, kubeconfig_yaml(&contexts)).unwrap();
+        vec![path]
+    })
+    .await;
+    let shown = |cx: &mut TestAppContext, name: &str| {
+        t.find(cx, format!("cluster-{name}"))
+            .is_some_and(|row| row.visible())
+    };
+    assert!(
+        !shown(cx, "ctx35"),
+        "the window shows only the first clusters"
+    );
+    t.focus_workspace(cx);
+    t.press(cx, "tab");
+    for _ in 0..35 {
+        t.press(cx, "down");
+    }
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("ctx35"));
+    assert!(
+        shown(cx, "ctx35"),
+        "the cursor's row was not brought into view"
+    );
+}

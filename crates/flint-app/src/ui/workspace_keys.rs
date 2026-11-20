@@ -107,6 +107,9 @@ impl Workspace {
         };
         let next = (at as isize + step).clamp(0, model.clusters.len() as isize - 1) as usize;
         self.sidebar_cursor = Some(model.clusters[next].info.name.clone());
+        // Into view, on the next layout: the rows follow the settings error card, if shown.
+        let before = usize::from(model.settings_error.is_some());
+        self.sidebar_scroll.scroll_to_item(before + next);
         cx.notify();
     }
 

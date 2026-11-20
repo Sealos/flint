@@ -194,6 +194,8 @@ pub struct Workspace {
     _switcher: Task<()>,
     /// The cluster sidebar's own focus, for its keys (UP-33).
     sidebar_focus: FocusHandle,
+    /// Scrolls the cluster rows, so the keyboard cursor's row is brought into view.
+    sidebar_scroll: ScrollHandle,
     /// The sidebar's keyboard cursor, once the arrows (or a click) moved it
     /// ([`Workspace::sidebar_cursor`]).
     sidebar_cursor: Option<String>,
@@ -338,6 +340,7 @@ impl Workspace {
             _switcher: Task::ready(()),
             sidebar_focus: cx.focus_handle(),
             sidebar_cursor: None,
+            sidebar_scroll: ScrollHandle::new(),
             history: keys::History::default(),
             namespaces: Vec::new(),
             namespaces_state: SyncState::Idle,
@@ -1045,7 +1048,17 @@ impl Workspace {
         let model = self.model.read(cx);
         let active = model.active.clone();
 
-        let mut list = v_flex().gap_px().px_1p5().py_1();
+        // Scrolls by itself, so the keyboard cursor can bring a cluster row into view
+        // (`Workspace::move_sidebar_cursor`): its rows are its children.
+        let mut list = v_flex()
+            .id("cluster-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .gap_px()
+            .px_1p5()
+            .py_1();
         if let Some(error) = &model.settings_error {
             list = list.child(sidebar_error(
                 "settings-error",
@@ -1137,13 +1150,7 @@ impl Workspace {
                     .text_color(theme.muted_foreground)
                     .child("CLUSTERS"),
             )
-            .child(
-                div()
-                    .id("cluster-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .child(list),
-            )
+            .child(list)
             .child(pane_handle(
                 "clusters-edge",
                 Pane::Clusters,
