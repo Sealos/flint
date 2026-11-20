@@ -904,6 +904,7 @@ impl Workspace {
             let next = keys::Place {
                 kind: entry.id.clone(),
                 object: None,
+                seen: None,
             };
             self.remember_place(&next, cx);
         }

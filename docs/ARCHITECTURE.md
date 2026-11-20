@@ -959,7 +959,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     `KindSnapshot::revision` of that namespace's list), since it can be published again from a namespace's old
     rows. A revision moves only when a list completes or a row changes, never on a republish of the same rows; a
     quiet namespace is not proven gone until it is listed again, and the pick waits (clearing the selection drops
-    it).
+    it). Go Back knows more: each remembered object carries the revision of the rows it was last seen in, so rows
+    newer than that without it prove it gone at once, even the rows the list opened again starts from (an object
+    deleted while another kind was shown).
   - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
     in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.
 - **Panes and Go Back (UP-33, `workspace_keys.rs`):** the cluster sidebar (key context `ClusterSidebar`) and the

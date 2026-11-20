@@ -22,11 +22,22 @@ use super::Workspace;
 const HISTORY: usize = 50;
 
 /// A place Go Back returns to: a kind's list, and the object selected in it, if any.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub(in crate::ui) struct Place {
     pub kind: KindId,
     /// Namespace (`None`: cluster-scoped) and name.
     pub object: Option<(Option<String>, String)>,
+    /// The revision of the rows the object was last seen in, if known
+    /// (`ResourceList::selected_seen`): rows newer than that without it prove it gone on the
+    /// way back, though the list opened again may start from them.
+    pub seen: Option<u64>,
+}
+
+/// The same place whatever was known about its object.
+impl PartialEq for Place {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.object == other.object
+    }
 }
 
 /// The places shown before on the active cluster, oldest first, at most [`HISTORY`]. It
@@ -172,6 +183,7 @@ impl Workspace {
         });
         Some(Place {
             kind: list.kind().clone(),
+            seen: object.as_ref().and(list.selected_seen()),
             object,
         })
     }
@@ -208,7 +220,7 @@ impl Workspace {
             if let Some(list) = &self.list {
                 let focus = list.read(cx).focus_handle().clone();
                 list.update(cx, |list, cx| match place.object {
-                    Some((namespace, name)) => list.select_listed(namespace, name, cx),
+                    Some((namespace, name)) => list.select_listed(namespace, name, place.seen, cx),
                     None => list.clear_selection(cx),
                 });
                 // Also when the kind was open already.
@@ -266,12 +278,13 @@ impl Workspace {
         let target = Place {
             kind: entry.id.clone(),
             object: Some((namespace.clone(), name.clone())),
+            seen: None,
         };
         self.remember_place(&target, cx);
         self.show_kind(&entry, false, true, window, cx);
         if let Some(list) = &self.list {
             let focus = list.read(cx).focus_handle().clone();
-            list.update(cx, |list, cx| list.select_listed(namespace, name, cx));
+            list.update(cx, |list, cx| list.select_listed(namespace, name, None, cx));
             window.focus(&focus, cx);
         }
     }
@@ -445,6 +458,7 @@ mod tests {
         Place {
             kind: KindId::new("", kind),
             object: name.map(|n| (Some("demo".to_owned()), n.to_owned())),
+            seen: None,
         }
     }
 

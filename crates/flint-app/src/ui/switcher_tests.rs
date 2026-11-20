@@ -965,3 +965,88 @@ async fn a_renamed_kind_lists_anew(cx: &mut TestAppContext) {
     .await;
     assert_eq!(labels(&shown(cx, &t)), ["Widget Gadgets"]);
 }
+
+// covers UP-33: Go Back to an object deleted meanwhile, on a namespace-limited list. The list
+// opened again starts from rows that already lack it; the rows it was last seen in are older,
+// so those prove it gone at once: the list says so and stops waiting, and an object made later
+// with the name is not selected.
+#[gpui_kit::test]
+async fn going_back_to_an_object_deleted_meanwhile_says_so(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let limited = |rows: &[(&str, &str, i64)], version: u64, demo: u64| {
+        let mut snapshot = (*objects(KindId::pods(), rows, SyncState::Synced, version)).clone();
+        snapshot.limited_to = Some(std::sync::Arc::new(flint_core::NamespaceLimit {
+            listed: vec!["demo".into()],
+            denied: Vec::new(),
+            reason: "pods is forbidden".into(),
+            revisions: vec![demo],
+        }));
+        snapshot
+    };
+    let missing = |cx: &mut TestAppContext| {
+        let workspace = t.workspace.clone();
+        cx.update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            workspace.update(cx, |ws, cx| {
+                ws.view_state(window, cx)
+                    .list
+                    .and_then(|l| l.banners.into_iter().find(|b| b.id == "list-missing"))
+                    .map(|b| b.text)
+            })
+        })
+        .unwrap()
+    };
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "pods"}),
+    )
+    .unwrap();
+    t.feed_list(
+        cx,
+        std::sync::Arc::new(limited(&[("demo", "api", 0), ("demo", "web", 0)], 1, 10)),
+    )
+    .await;
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        serde_json::json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    // web is deleted: demo is listed again without it.
+    t.feed_list(
+        cx,
+        std::sync::Arc::new(limited(&[("demo", "api", 0)], 2, 11)),
+    )
+    .await;
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "services"}),
+    )
+    .unwrap();
+    // What the watch holds when Pods opens again: the rows without web.
+    let _kept = t.model.read_with(cx, |m, _| {
+        m.core()
+            .store_for_tests(limited(&[("demo", "api", 0)], 0, 11))
+    });
+    t.press_key_of(cx, "workspace::GoBack");
+    assert_eq!(
+        missing(cx).as_deref(),
+        Some("web no longer exists in demo."),
+        "the rows it was last seen in are older than these"
+    );
+    // A pod made later under the same name is not selected out of the blue.
+    t.feed_list(
+        cx,
+        std::sync::Arc::new(limited(
+            &[("demo", "api", 0), ("demo", "web", 0)],
+            u64::MAX / 2,
+            12,
+        )),
+    )
+    .await;
+    assert_eq!(t.selected(cx), None);
+}
