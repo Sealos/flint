@@ -1153,3 +1153,31 @@ async fn an_index_read_for_an_earlier_scope_is_dropped(cx: &mut TestAppContext) 
     switcher.update(cx, |p, cx| p.set_index(late, before, cx));
     assert_eq!(labels(&shown(cx, &t)), ["Widget Gadgets"]);
 }
+
+// covers UP-31 (#255): a context that started over between reads (re-pointed and put back, so
+// its name, server and kinds match again) lists anew in an open switcher: its objects are the
+// new slot's, not the old one's.
+#[gpui_kit::test]
+async fn a_cluster_that_starts_over_lists_anew(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    let switcher = open_switcher(cx, &t).await;
+    let before = switcher.read_with(cx, |p, _| p.scope_generation());
+    t.model.update(cx, |m, cx| {
+        let alpha = m
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "alpha")
+            .expect("alpha is listed");
+        alpha.generation += 1;
+        let generation = alpha.generation;
+        let discovered = m.discovery.get_mut("alpha").expect("alpha was discovered");
+        discovered.generation = generation;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let after = switcher.read_with(cx, |p, _| p.scope_generation());
+    assert!(after > before, "the switcher was rebuilt for the new slot");
+    assert!(state(cx, &t).0.is_some(), "the switcher stays open");
+}

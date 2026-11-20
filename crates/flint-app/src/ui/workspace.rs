@@ -663,8 +663,7 @@ impl Workspace {
         let server = self
             .cluster_summary(context, cx)
             .and_then(|c| c.info.server.as_deref());
-        let generation = self.cluster_summary(context, cx).map(|c| c.generation);
-        TabCluster::new(context, server).at_generation(generation)
+        TabCluster::new(context, server)
     }
 
     /// Tells the dock kubeconfig's contexts (its chips tell alike names apart), and ends the
@@ -682,12 +681,15 @@ impl Workspace {
         if self.dock.read(cx).tab_count() == 0 {
             return;
         }
-        let servers: HashMap<String, (Option<String>, u64)> = self
+        // By server only: a context that started over at the same server (a namespace edit, a
+        // rotated token) is the same cluster to a shell. One re-pointed and put back between
+        // reads is ended by the core, which checks each shell's pin against the context's history.
+        let servers: HashMap<String, Option<String>> = self
             .model
             .read(cx)
             .clusters
             .iter()
-            .map(|c| (c.info.name.clone(), (c.info.server.clone(), c.generation)))
+            .map(|c| (c.info.name.clone(), c.info.server.clone()))
             .collect();
         self.dock.update(cx, |dock, cx| {
             dock.check_servers(|context| servers.get(context).cloned(), cx)

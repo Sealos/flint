@@ -321,16 +321,17 @@ impl Workspace {
             .cluster
             .as_deref()
             .is_some_and(|c| model.settings.watch_mode_for(c) == WatchMode::OnView);
-        let cluster_id = self.cluster.as_ref().map(|c| {
-            let server = model
-                .clusters
-                .iter()
-                .find(|s| s.info.name == *c)
-                .and_then(|s| s.info.server.clone());
-            (c.to_string(), server)
-        });
+        let summary = self
+            .cluster
+            .as_ref()
+            .and_then(|c| model.clusters.iter().find(|s| s.info.name == *c));
+        let cluster_id = self
+            .cluster
+            .as_ref()
+            .map(|c| (c.to_string(), summary.and_then(|s| s.info.server.clone())));
         let key = SwitcherKey {
             cluster: cluster_id.clone(),
+            generation: summary.map(|s| s.generation),
             kinds: entries
                 .iter()
                 .map(|e| (e.id.clone(), e.kind.clone(), e.label.clone(), e.listable))
@@ -443,6 +444,9 @@ impl Workspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::ui) struct SwitcherKey {
     cluster: Option<(String, Option<String>)>,
+    /// The active context's slot: one that started over (re-pointed and put back between reads,
+    /// so name, server and kinds match again) has other objects, and the index is rebuilt.
+    generation: Option<u64>,
     /// Each kind's id, Kind, label as shown, and whether it can be listed: what its rows say.
     kinds: Vec<(KindId, String, String, bool)>,
     discovery_failed: bool,

@@ -360,14 +360,14 @@ async fn a_shell_ends_when_its_context_is_re_pointed(cx: &mut TestAppContext) {
     };
     dock.update(cx, |d, cx| d.check_servers(|_| None, cx));
     dock.update(cx, |d, cx| {
-        d.check_servers(|_| Some((Some("https://10.0.0.1:6443/".into()), 0)), cx)
+        d.check_servers(|_| Some(Some("https://10.0.0.1:6443/".into())), cx)
     });
     draw(cx, window);
     assert_eq!(status(cx), super::dock::TabStatus::Live);
     assert!(!fake.is_closed());
 
     dock.update(cx, |d, cx| {
-        d.check_servers(|_| Some((Some("https://10.0.0.9:6443".into()), 0)), cx)
+        d.check_servers(|_| Some(Some("https://10.0.0.9:6443".into())), cx)
     });
     draw(cx, window);
     fake.pump();
@@ -715,16 +715,13 @@ async fn alike_clusters_get_different_chips(cx: &mut TestAppContext) {
     dock.update(cx, |d, cx| {
         d.check_servers(
             |context| {
-                Some((
-                    Some(
-                        if context == STAGING {
-                            "https://10.9.9.9"
-                        } else {
-                            "https://10.0.0.1:6443"
-                        }
-                        .to_owned(),
-                    ),
-                    0,
+                Some(Some(
+                    if context == STAGING {
+                        "https://10.9.9.9"
+                    } else {
+                        "https://10.0.0.1:6443"
+                    }
+                    .to_owned(),
                 ))
             },
             cx,

@@ -119,8 +119,9 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   back), so the core numbers its slots: each `ClusterSummary` and each `DiscoveryChanged` carries the slot's
   generation, and a new slot gets a newer one. The app keeps (and uses) only discovery of a cluster's current
   generation, holding back one that came ahead of its list; the workspace closes its views when the active cluster's
-  generation moves, as on a switch; and the dock marks a tab opened on an older generation re-pointed, ending its
-  shell. A list also takes the queued connection and discovery events of contexts it no longer has, so contexts that
+  generation moves, as on a switch, and an open resource switcher lists anew. The dock still compares servers: a
+  context that started over at the same server (a namespace edit, a rotated token) keeps its shells, and one
+  re-pointed and put back between reads is ended by the core's `ContextHistory` pin recheck. A list also takes the queued connection and discovery events of contexts it no longer has, so contexts that
   come and go under new names do not pile up. The reader owns
   the queue: `CoreHandle::events` hands out readers, and once every reader is dropped the core stops queueing.
 - Watches can change faster than the UI should redraw. The core marks the store as changed and sends at most one

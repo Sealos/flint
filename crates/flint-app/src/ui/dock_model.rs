@@ -105,31 +105,11 @@ impl std::ops::AddAssign for LiveSessions {
 /// when the tab opened. Like an AI exposure (ADR-0009) and a trusted cluster (ADR-0015), a tab is
 /// pinned to both, so a context re-pointed at another server is another cluster: opening the
 /// same pod there opens a new tab instead of showing the old server's.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TabCluster {
     pub context: ClusterId,
     /// The server URL without a trailing slash; `None` when the context names no cluster entry.
     pub server: Option<String>,
-    /// The generation of the context's slot in the core when the tab opened, if known: a newer
-    /// one means the context started over (re-pointed, even and back), whatever cluster lists the
-    /// app skipped (#255). Not part of what the tab is (equality and hashing): a tab whose
-    /// context started over is marked re-pointed, and never reused.
-    pub generation: Option<u64>,
-}
-
-impl PartialEq for TabCluster {
-    fn eq(&self, other: &Self) -> bool {
-        self.context == other.context && self.server == other.server
-    }
-}
-
-impl Eq for TabCluster {}
-
-impl std::hash::Hash for TabCluster {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.context.hash(state);
-        self.server.hash(state);
-    }
 }
 
 impl TabCluster {
@@ -137,25 +117,12 @@ impl TabCluster {
         TabCluster {
             context: context.into(),
             server: server.map(normalize_server),
-            generation: None,
         }
     }
 
-    #[must_use]
-    pub fn at_generation(mut self, generation: Option<u64>) -> Self {
-        self.generation = generation;
-        self
-    }
-
-    /// Whether the context, now pointing at `server` with a slot of `generation`, is still this
-    /// tab's cluster: the same server, and no newer slot than the tab's.
-    pub fn is_at(&self, server: Option<&str>, generation: Option<u64>) -> bool {
-        let same_server = self.server.as_deref() == server.map(normalize_server).as_deref();
-        let same_slot = match (self.generation, generation) {
-            (Some(was), Some(now)) => now <= was,
-            _ => true,
-        };
-        same_server && same_slot
+    /// Whether the context, now pointing at `server`, is still this tab's cluster.
+    pub fn is_at(&self, server: Option<&str>) -> bool {
+        self.server.as_deref() == server.map(normalize_server).as_deref()
     }
 }
 
@@ -331,26 +298,12 @@ mod tests {
     fn a_tab_cluster_is_its_context_and_server() {
         let tab = TabCluster::new("prod", Some("https://10.0.0.1:6443/"));
         assert_eq!(tab.server.as_deref(), Some("https://10.0.0.1:6443"));
-        assert!(tab.is_at(Some("https://10.0.0.1:6443"), None));
-        assert!(tab.is_at(Some("https://10.0.0.1:6443/"), None));
-        assert!(!tab.is_at(Some("https://10.0.0.2:6443"), None));
-        assert!(!tab.is_at(None, None));
+        assert!(tab.is_at(Some("https://10.0.0.1:6443")));
+        assert!(tab.is_at(Some("https://10.0.0.1:6443/")));
+        assert!(!tab.is_at(Some("https://10.0.0.2:6443")));
+        assert!(!tab.is_at(None));
         assert_ne!(tab, TabCluster::new("prod", Some("https://10.0.0.2:6443")));
-        assert!(TabCluster::new("x", None).is_at(None, None));
-    }
-
-    // covers UP-41: a context that started over in the core (a newer slot), even back at the
-    // same server, is no longer the tab's cluster; the generation is not part of the tab's
-    // identity.
-    #[test]
-    fn a_newer_slot_is_another_cluster() {
-        let tab = TabCluster::new("prod", Some("https://a")).at_generation(Some(2));
-        assert!(tab.is_at(Some("https://a"), Some(2)));
-        assert!(
-            !tab.is_at(Some("https://a"), Some(3)),
-            "re-pointed and back"
-        );
-        assert_eq!(tab, TabCluster::new("prod", Some("https://a")));
+        assert!(TabCluster::new("x", None).is_at(None));
     }
 
     // covers UP-42: opening a request again shows its tab while the session lives; an ended
