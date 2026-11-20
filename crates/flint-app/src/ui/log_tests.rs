@@ -1960,3 +1960,22 @@ async fn a_copy_lands_after_its_tab_closes(cx: &mut TestAppContext) {
     assert!(released.upgrade().is_none(), "the tab is gone");
     assert_eq!(clipboard(cx).as_deref(), Some("line 5\nline 6"));
 }
+
+// covers UP-42: an ended tab the budget emptied says so, not that the pod logged nothing.
+#[test]
+fn an_emptied_ended_tab_says_its_lines_were_dropped() {
+    use super::{ended_empty, log_model::TRIMMED_TOOLTIP};
+    assert_eq!(
+        ended_empty(false, false),
+        ("No log lines.".to_owned(), None)
+    );
+    assert_eq!(
+        ended_empty(true, false).1.as_deref(),
+        Some("The pod was deleted.")
+    );
+    for deleted in [false, true] {
+        let (text, detail) = ended_empty(deleted, true);
+        assert_eq!(text, "All lines dropped to save memory.");
+        assert_eq!(detail.as_deref(), Some(TRIMMED_TOOLTIP));
+    }
+}
