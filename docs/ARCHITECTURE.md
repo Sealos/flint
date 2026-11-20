@@ -690,16 +690,18 @@ Rules:
       of the line, so its `response` never shows however the parameters are separated or quoted; an AWS SigV4
       value is hidden through its last parameter, so its `Signature` never shows) and bearer tokens (8 characters
       or more, or shorter with a digit; after a credential key, `token: Bearer abc`, the word after the scheme
-      whatever its length);
+      whatever its length, unless that word is the next field, a flag or `key=`, whose value the pair rule hides);
     - `Cookie` and `Set-Cookie` header values, every cookie with its name: to the closing quote when quoted, to the
-      closing bracket of a list (a JSON array, a Go header map, `[]string{...}`), or else to the end of the line.
-      This header rule and the `Authorization` one also match right after an escaped `\n`, as in a request dumped
-      into a JSON string;
+      closing bracket of a list (a JSON array, a Go header map, `[]string{...}`; a bracket inside a quoted cookie
+      does not end it), to the closing apostrophe of a single-quoted header (`curl -H 'Cookie: ...'`), or else to
+      the end of the line. This header rule and the `Authorization` one also match right after an escaped `\n`, as
+      in a request dumped into a JSON string, where the value (a Digest one too) ends at the next escaped `\n`;
     - passwords in URLs (`scheme://user:pass@host`), up to the authority's last `@`; a password with an unencoded
       `/`, `?` or `#` is caught too, unless the part after the colon is a port (`:8443/`); and in Go MySQL DSNs,
-      which have no `://` (`user:pass@tcp(host:3306)/db`, also `unix(` and `udp(`);
+      which have no `://` (`user:pass@tcp(host:3306)/db`, also `unix(` and `udp(`), from the DSN's first `:` to
+      the `@` before the protocol; a quoted DSN's password can hold spaces and brackets;
     - registry `auth` values in docker config JSON (`"auth": "<base64 user:pass>"`, at any escape level, and the
-      same key in YAML or a Python dict), when the value decodes to `user:password`;
+      same key in YAML, also `auth :`, or a Python dict), when the value decodes to `user:password`;
     - AWS access key ids (`AKIA`/`ASIA`) and secret access keys (by key name, or a 40-character mixed-case value on
       the same line as a key id), GCP API keys, GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`),
       GitLab (`glpat-`, `glrt-`, `gldt-`) and Slack (`xox?-`, `xapp-`) tokens, Slack webhook paths, Stripe live keys
@@ -714,7 +716,8 @@ Rules:
       JSON (escaped JSON at any level, with escaped quotes inside the value), YAML, Ruby and Go, plus command-line
       flags such as `--password hunter2`. A quoted value runs to its closing quote. A bare password after `: ` (an
       unquoted password key, a colon and a space, as in YAML, headers and prose) runs to the end of the line, or to
-      an unescaped double quote or escaped `\n` before it, so `password: correct horse battery` is hidden whole;
+      an unescaped double quote or escaped `\n` before it, so `password: correct horse battery` is hidden whole, also when an earlier
+      rule already hid its first word, and a single-quoted header ends at its closing apostrophe;
       any other bare value runs to the next space or quote, so `oauth token: unexpected status: 401` keeps the
       error. Masks a workload already wrote (`****`, `[REDACTED]`) are left alone, and so are a few values that
       are not credentials: a path after `PWD`/`OLDPWD` or a `credentials` key (`PWD=/app`,
@@ -727,8 +730,9 @@ Rules:
     under a `note` key or a key ending in `message` or `messages` (also each string of a list there) in
     `get_resource` (event messages and notes, status and condition messages, container termination messages, which
     can be the last log lines, operators' `failureMessage` or `errorMessage`, and lists such as `messages`), every
-    annotation value, at any depth (tools keep whole objects there, such as kubectl's last-applied
-    configuration), and container
+    annotation value, at any depth (tools keep whole objects there; kubectl's last-applied configuration is
+    parsed and redacted like the live object, so an argument after `--password` is hidden there too), and
+    container
     `args` and `command` lists, where the element after a
     flag such as `--password` is hidden whole; and tool error text. ConfigMaps are left as they are. Logs are
     redacted before the 256 KiB cap, so each value is seen next to its label, and the cap drops a line it would cut

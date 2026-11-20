@@ -940,6 +940,128 @@ fn short_bearer_tokens() {
     }
 }
 
+#[test]
+fn a_scheme_is_not_continued_by_the_next_field() {
+    for (line, want) in [
+        (
+            r#"token=Bearer password="hunter2""#,
+            r#"token=[REDACTED:token] password="[REDACTED:password]""#,
+        ),
+        ("token=Bearer user=app", "token=[REDACTED:token] user=app"),
+        (
+            r#"Bearer password="hunter2""#,
+            r#"Bearer password="[REDACTED:password]""#,
+        ),
+        (
+            "auth_token=Basic --verbose",
+            "auth_token=[REDACTED:token] --verbose",
+        ),
+        // Base64 padding before a closing quote is still the credential.
+        (
+            r#"msg="token=Basic Zm9vYmFy==" next=1"#,
+            r#"msg="token=Basic [REDACTED:token]" next=1"#,
+        ),
+    ] {
+        let n = want.matches("[REDACTED").count();
+        assert_eq!(redacted(line, n), want, "{line}");
+    }
+}
+
+#[test]
+fn cookie_lists_end_at_their_closing_bracket_outside_quotes() {
+    for (line, want) in [
+        (
+            r#"{"Set-Cookie":["a=1; Path=/x]y","b=s3cr3tB; Path=/"],"Vary":"Accept"}"#,
+            r#"{"Set-Cookie":[[REDACTED:cookie]],"Vary":"Accept"}"#,
+        ),
+        (
+            r#"{\"Set-Cookie\":[\"a=1; Path=/]\",\"b=s3cr3tB\"],\"Vary\":\"Accept\"}"#,
+            r#"{\"Set-Cookie\":[[REDACTED:cookie]],\"Vary\":\"Accept\"}"#,
+        ),
+        (
+            r#"http.Header{"Cookie":[]string{"a=}b", "sid=s3cr3t"}, "Accept":[]string{"*/*"}}"#,
+            r#"http.Header{"Cookie":[]string{[REDACTED:cookie]}, "Accept":[]string{"*/*"}}"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+}
+
+#[test]
+fn mysql_dsn_passwords_with_spaces_and_brackets() {
+    for (line, want) in [
+        (
+            r#"{"dsn":"app:p w[1]@tcp(db:3306)/app"}"#,
+            r#"{"dsn":"app:[REDACTED:password]@tcp(db:3306)/app"}"#,
+        ),
+        (
+            "dsn: 'root:a b@tcp(db)/x' ok",
+            "dsn: 'root:[REDACTED:password]@tcp(db)/x' ok",
+        ),
+        (
+            r#""dsn": root:pw@tcp(db)/x"#,
+            r#""dsn": root:[REDACTED:password]@tcp(db)/x"#,
+        ),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    for line in [
+        r#"{"ts":"10:15:30","addr":"user@tcp(db:3306)"}"#,
+        "connected at 10:15 to user@tcp(db)",
+    ] {
+        same(line);
+    }
+}
+
+#[test]
+fn a_passphrase_with_a_hidden_first_word_is_hidden_whole() {
+    assert_eq!(
+        redacted("password: <<aws>>IOSFODNN7EXAMPLE and more words", 2),
+        "password: [REDACTED:aws-access-key-id] [REDACTED:password]"
+    );
+    same("password: [REDACTED:password]");
+}
+
+#[test]
+fn digest_after_an_escaped_newline_ends_with_its_header() {
+    assert_eq!(
+        redacted(
+            r#"{"msg":"GET /\nAuthorization: Digest username=\"a\", response=\"6629fae4\"\nHost: x","level":"info"}"#,
+            1
+        ),
+        r#"{"msg":"GET /\nAuthorization: Digest [REDACTED:authorization]\nHost: x","level":"info"}"#
+    );
+    same(r#"{"msg":"GET /\nHost: x\nAccept: */*"}"#);
+}
+
+#[test]
+fn single_quoted_headers_end_at_the_closing_quote() {
+    for (line, want) in [
+        (
+            "curl -H 'Cookie: sid=abc123; theme=dark' https://example.com/api",
+            "curl -H 'Cookie: [REDACTED:cookie]' https://example.com/api",
+        ),
+        (
+            "curl -H 'X-Password: two words' -d x",
+            "curl -H 'X-Password: [REDACTED:password]' -d x",
+        ),
+        // Not a quoted header: an apostrophe inside the passphrase is part of it.
+        ("password: it's a secret", "password: [REDACTED:password]"),
+    ] {
+        assert_eq!(redacted(line, 1), want, "{line}");
+    }
+    same("curl -H 'Accept: */*' https://example.com/api");
+}
+
+#[test]
+fn yaml_auth_with_a_space_before_the_colon() {
+    assert_eq!(
+        redacted("auth : dXNlcjpwYXNz", 1),
+        "auth : [REDACTED:registry-auth]"
+    );
+    same("auth : enabled");
+}
+
 /// About 10 MB of realistic log lines, with a few secrets.
 fn synthetic_log() -> String {
     let lines = [
@@ -1006,6 +1128,10 @@ fn long_lines_of_quoted_values_are_linear() {
         r#"Cookie: a" "#,
         "a:b@tcp( ",
         r#""auth":"YTpi","#,
+        r#"Cookie:["a]","b"] "#,
+        r#""a:b c@tcp(" "#,
+        r#"\nAuthorization: Digest a"#,
+        r#"token=Bearer x="y" "#,
     ] {
         let line = unit.repeat(MIB / unit.len());
         let start = std::time::Instant::now();
