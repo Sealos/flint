@@ -5,8 +5,11 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::mpsc::{self, SyncSender};
+use std::time::{Duration, Instant};
 
-use tracing_subscriber::filter::{EnvFilter, filter_fn};
+use tracing_subscriber::filter::{EnvFilter, FilterExt as _, filter_fn};
 use tracing_subscriber::prelude::*;
 
 use crate::redact::redact_credentials;
@@ -14,24 +17,50 @@ use crate::redact::redact_credentials;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const BACKUPS: usize = 3;
 /// How long a log write waits for another process's write to finish before dropping the event.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+const LOCK_WAIT: Duration = Duration::from_millis(50);
+/// Events waiting for the writer thread. When it falls behind (a stalled disk, a held lock),
+/// further events are dropped from the file instead of blocking the thread that emitted them.
+const QUEUE: usize = 1024;
+/// How long [`flush`] waits for queued events to reach the file.
+const FLUSH_WAIT: Duration = Duration::from_millis(500);
 
-pub(crate) fn init(filter: EnvFilter) {
+static FILE_QUEUE: OnceLock<SyncSender<Message>> = OnceLock::new();
+
+/// Sets up the global subscriber: stderr filtered by `stderr_filter`, and Flint's events to the
+/// rotating log file filtered by `file_filter`.
+pub(crate) fn init(stderr_filter: EnvFilter, file_filter: EnvFilter) {
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let file = log_path(
         cfg!(target_os = "macos"),
         std::env::home_dir().as_deref(),
         state_home.as_deref().map(Path::new),
     )
-    .map(|path| FileLog::open(path, MAX_BYTES))
+    .map(|path| FileLog::spawn(path, MAX_BYTES))
     .transpose();
     let (file, error) = match file {
         Ok(file) => (file, None),
         Err(error) => (None, Some(error)),
     };
-    subscriber(filter, file, io::stderr).init();
+    if let Some(file) = &file {
+        let _ = FILE_QUEUE.set(file.queue.clone());
+    }
+    subscriber(stderr_filter, file_filter, file, io::stderr).init();
     if let Some(error) = error {
         tracing::warn!(%error, "could not open Flint's log file; logging to stderr");
+    }
+}
+
+/// Waits briefly for queued events to reach the log file. Call it before the process exits.
+pub(crate) fn flush() {
+    if let Some(queue) = FILE_QUEUE.get() {
+        flush_queue(queue);
+    }
+}
+
+fn flush_queue(queue: &SyncSender<Message>) {
+    let (done, wait) = mpsc::sync_channel(1);
+    if queue.try_send(Message::Flush(done)).is_ok() {
+        let _ = wait.recv_timeout(FLUSH_WAIT);
     }
 }
 
@@ -48,13 +77,15 @@ fn log_path(macos: bool, home: Option<&Path>, state_home: Option<&Path>) -> Opti
 }
 
 fn subscriber<W: Write>(
-    filter: EnvFilter,
+    stderr_filter: EnvFilter,
+    file_filter: EnvFilter,
     file: Option<FileLog>,
     stderr: impl Fn() -> W + Send + Sync + 'static,
 ) -> impl tracing::Subscriber + Send + Sync {
     let stderr = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .with_writer(move || RedactingWriter(stderr()));
+        .with_writer(move || RedactingWriter(stderr()))
+        .with_filter(stderr_filter);
     let file = file.map(|file| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -62,18 +93,15 @@ fn subscriber<W: Write>(
             .with_writer(file)
             // Dependencies may trace whole API responses or protocol messages. Keep only
             // Flint's diagnostics in the report file and omit span fields from dependencies.
-            .with_filter(filter_fn(|metadata| {
+            .with_filter(file_filter.and(filter_fn(|metadata| {
                 metadata.is_event()
                     && matches!(
                         metadata.target().split("::").next(),
                         Some("flint" | "flint_app" | "flint_core" | "flint_mcp")
                     )
-            }))
+            })))
     });
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(stderr)
-        .with(file)
+    tracing_subscriber::registry().with(stderr).with(file)
 }
 
 struct RedactingWriter<W>(W);
@@ -92,49 +120,134 @@ impl<W: Write> Write for RedactingWriter<W> {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileLog {
-    type Writer = RedactingWriter<&'a FileLog>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        RedactingWriter(self)
-    }
+enum Message {
+    Event(Vec<u8>),
+    Flush(SyncSender<()>),
 }
 
+/// The file layer's writer: hands each formatted event to the writer thread, so no file or lock
+/// work runs on the thread that emitted it (the UI thread, an MCP runtime worker).
 struct FileLog {
-    path: PathBuf,
-    lock_path: PathBuf,
-    max_bytes: u64,
+    queue: SyncSender<Message>,
 }
 
 impl FileLog {
-    fn open(path: PathBuf, max_bytes: u64) -> io::Result<Self> {
-        fs::create_dir_all(path.parent().expect("log path has a parent directory"))?;
-        let log = Self {
-            lock_path: path.with_extension("log.lock"),
-            path,
-            max_bytes,
-        };
-        let _lock = log.lock()?;
-        open_private(&log.path)?;
-        Ok(log)
+    fn spawn(path: PathBuf, max_bytes: u64) -> io::Result<Self> {
+        Self::spawn_writer(FileWriter::open(path, max_bytes, LOCK_WAIT)?)
     }
 
-    /// Takes the cross-process lock, giving up after [`LOCK_WAIT`]. Logging runs on whatever
-    /// thread emits the event (the UI thread too), so a process stopped while holding the lock
-    /// must never stall the others: the event is then dropped from the file (stderr keeps it).
-    fn lock(&self) -> io::Result<File> {
-        let file = open_private(&self.lock_path)?;
-        let deadline = std::time::Instant::now() + LOCK_WAIT;
+    fn spawn_writer(mut writer: FileWriter) -> io::Result<Self> {
+        let (queue, events) = mpsc::sync_channel(QUEUE);
+        std::thread::Builder::new()
+            .name("flint-log".into())
+            .spawn(move || {
+                for message in events {
+                    match message {
+                        // Redact here, off the emitting thread. A failed write drops the event;
+                        // stderr keeps it.
+                        Message::Event(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            let _ = writer.write(redact_credentials(&text).text.as_bytes());
+                        }
+                        Message::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            })?;
+        Ok(Self { queue })
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileLog {
+    type Writer = &'a FileLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self
+    }
+}
+
+impl Write for &FileLog {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // A full queue drops the event rather than wait for the writer thread.
+        let _ = self.queue.try_send(Message::Event(bytes.to_vec()));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Appends events to the log file on the writer thread. The app and several MCP processes can
+/// share the file: each event is written under a cross-process `flock`, and the file is reopened
+/// each time so no writer keeps appending to a rotated file.
+struct FileWriter {
+    path: PathBuf,
+    lock_path: PathBuf,
+    lock: File,
+    max_bytes: u64,
+    lock_wait: Duration,
+}
+
+impl FileWriter {
+    /// Creates the directory and checks the files can be opened. Takes no lock: opening with
+    /// `O_APPEND` is safe while another process writes.
+    fn open(path: PathBuf, max_bytes: u64, lock_wait: Duration) -> io::Result<Self> {
+        fs::create_dir_all(path.parent().expect("log path has a parent directory"))?;
+        let lock_path = path.with_extension("log.lock");
+        let lock = open_private(&lock_path)?;
+        open_private(&path)?;
+        Ok(Self {
+            path,
+            lock_path,
+            lock,
+            max_bytes,
+            lock_wait,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let event = if bytes.len() as u64 > self.max_bytes {
+            b"[log event omitted: exceeds file size limit]\n"
+        } else {
+            bytes
+        };
+        let _lock = self.lock()?;
+        let mut file = match open_private(&self.path) {
+            // The directory was removed while running: recreate it. Later events lock the new
+            // lock file; this one is written under the old one.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(self.path.parent().expect("log path has a parent directory"))?;
+                let file = open_private(&self.path)?;
+                let lock = open_private(&self.lock_path)?;
+                drop(_lock);
+                self.lock = lock;
+                file
+            }
+            other => other?,
+        };
+        if file.metadata()?.len() + event.len() as u64 > self.max_bytes {
+            self.rotate()?;
+            file = open_private(&self.path)?;
+        }
+        file.write_all(event)
+    }
+
+    /// Takes the cross-process lock, giving up after `lock_wait`: a process stopped while
+    /// holding it must not stop this one from logging for good, only drop events meanwhile.
+    fn lock(&self) -> io::Result<Locked<'_>> {
+        let deadline = Instant::now() + self.lock_wait;
         loop {
-            // SAFETY: the descriptor belongs to `file`. Closing it releases the lock.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(file);
+            // SAFETY: the descriptor belongs to `self.lock`, which outlives the guard.
+            if unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Locked(&self.lock));
             }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => {}
-                io::ErrorKind::WouldBlock if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                io::ErrorKind::WouldBlock if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
                 }
                 _ => return Err(error),
             }
@@ -154,27 +267,13 @@ impl FileLog {
     }
 }
 
-impl Write for &FileLog {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let event = if bytes.len() as u64 > self.max_bytes {
-            b"[log event omitted: exceeds file size limit]\n"
-        } else {
-            bytes
-        };
-        // The app and multiple MCP processes can log at once. Reopen the current file under
-        // the same lock each time so no writer keeps appending to a rotated file.
-        let _lock = self.lock()?;
-        let mut file = open_private(&self.path)?;
-        if file.metadata()?.len() + event.len() as u64 > self.max_bytes {
-            self.rotate()?;
-            file = open_private(&self.path)?;
-        }
-        file.write_all(event)?;
-        Ok(bytes.len())
-    }
+/// Holds the `flock` until dropped.
+struct Locked<'a>(&'a File);
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor belongs to the borrowed file.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -227,14 +326,19 @@ mod tests {
         assert_eq!(log_path(false, None, None), None);
     }
 
+    /// A writer that waits long enough for the lock that contention in tests never drops events.
+    fn writer(path: &Path, max_bytes: u64) -> FileWriter {
+        FileWriter::open(path.to_path_buf(), max_bytes, Duration::from_secs(10)).unwrap()
+    }
+
     #[test]
     fn rotation_keeps_the_current_file_and_three_backups() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs/flint.log");
-        let first = FileLog::open(path.clone(), 8).unwrap();
-        let second = FileLog::open(path.clone(), 8).unwrap();
-        for (n, mut log) in [&first, &second].into_iter().cycle().take(10).enumerate() {
-            log.write_all(format!("{n}!!\n").as_bytes()).unwrap();
+        // Two writers on one file, as the app and an MCP process would be.
+        let mut writers = [writer(&path, 8), writer(&path, 8)];
+        for n in 0..10 {
+            writers[n % 2].write(format!("{n}!!\n").as_bytes()).unwrap();
         }
         let read = |path| fs::read_to_string(path).unwrap();
         assert_eq!(read(path.clone()), "8!!\n9!!\n");
@@ -253,9 +357,7 @@ mod tests {
     fn an_oversized_event_is_replaced_and_cannot_overflow_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flint.log");
-        (&FileLog::open(path.clone(), 64).unwrap())
-            .write_all(&[b'x'; 65])
-            .unwrap();
+        writer(&path, 64).write(&[b'x'; 65]).unwrap();
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "[log event omitted: exceeds file size limit]\n"
@@ -263,16 +365,16 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_writes_keep_every_event_during_rotation() {
+    fn concurrent_writers_keep_every_event_during_rotation() {
         let dir = tempfile::tempdir().unwrap();
-        let log = FileLog::open(dir.path().join("flint.log"), 8).unwrap();
+        let path = dir.path().join("flint.log");
         let events = b"0123456789abcdef";
         std::thread::scope(|scope| {
             for chunk in events.chunks(4) {
-                let mut writer = &log;
+                let mut writer = writer(&path, 8);
                 scope.spawn(move || {
                     for &event in chunk {
-                        writer.write_all(&[event, b'\n']).unwrap();
+                        writer.write(&[event, b'\n']).unwrap();
                     }
                 });
             }
@@ -291,11 +393,29 @@ mod tests {
     }
 
     #[test]
-    fn file_logs_use_the_env_filter_and_exclude_credentials_and_dependency_payloads() {
+    fn a_removed_log_directory_is_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/flint.log");
+        let mut writer = writer(&path, 1024);
+        fs::remove_dir_all(dir.path().join("logs")).unwrap();
+        writer.write(b"after\n").unwrap();
+        writer.write(b"again\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\nagain\n");
+        assert!(path.with_extension("log.lock").exists());
+    }
+
+    #[test]
+    fn file_logs_use_their_filter_and_exclude_credentials_and_dependency_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flint.log");
-        let log = FileLog::open(path.clone(), MAX_BYTES).unwrap();
-        let subscriber = subscriber(EnvFilter::new("info"), Some(log), io::sink);
+        let log = FileLog::spawn(path.clone(), MAX_BYTES).unwrap();
+        let queue = log.queue.clone();
+        let subscriber = subscriber(
+            EnvFilter::new("warn"),
+            EnvFilter::new("info"),
+            Some(log),
+            io::sink,
+        );
         tracing::subscriber::with_default(subscriber, || {
             let span =
                 tracing::info_span!(target: "rmcp", "detail", raw = "dependency span payload");
@@ -304,6 +424,7 @@ mod tests {
             tracing::debug!("filtered out");
             tracing::info!("auth failed with token=example-credential");
         });
+        flush_queue(&queue);
         let log = fs::read_to_string(path).unwrap();
         assert!(
             log.contains("auth failed with token=[REDACTED:token]"),
@@ -318,14 +439,31 @@ mod tests {
     fn a_held_lock_drops_the_event_instead_of_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flint.log");
-        let log = FileLog::open(path.clone(), 1024).unwrap();
-        let held = log.lock().unwrap();
-        let started = std::time::Instant::now();
-        let error = (&log).write_all(b"dropped\n").unwrap_err();
+        let other = writer(&path, 1024);
+        let mut writer = FileWriter::open(path.clone(), 1024, LOCK_WAIT).unwrap();
+        let held = other.lock().unwrap();
+        let started = Instant::now();
+        let error = writer.write(b"dropped\n").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(1));
         drop(held);
-        (&log).write_all(b"kept\n").unwrap();
+        writer.write(b"kept\n").unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn a_stalled_writer_never_blocks_the_emitting_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flint.log");
+        let other = writer(&path, 1024);
+        let held = other.lock().unwrap();
+        // The writer thread waits for the held lock on every event; the queue fills up.
+        let mut log = &FileLog::spawn_writer(writer(&path, 1024)).unwrap();
+        let started = Instant::now();
+        for _ in 0..QUEUE * 2 {
+            log.write_all(b"event\n").unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
     }
 }

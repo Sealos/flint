@@ -35,12 +35,38 @@ pub unsafe fn serve_stdio_main(program: &str, verbose: bool) -> ExitCode {
     };
     bootstrap::init_logging(verbose);
     boot.log_summary();
-    match run_stdio(&boot) {
+    let code = match run_stdio(&boot) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("mcp server failed: {e:#}");
+            tracing::error!("mcp server failed: {}", failure_summary(&e));
             ExitCode::FAILURE
         }
+    };
+    bootstrap::flush_logs();
+    code
+}
+
+/// What to log of the server's failure. rmcp's handshake errors Debug-format the client's whole
+/// message, which can carry anything (tool arguments, notification params), so those are
+/// reduced to what went wrong.
+fn failure_summary(e: &anyhow::Error) -> String {
+    use rmcp::service::ServerInitializeError as Init;
+    match e.downcast_ref::<Init>() {
+        Some(Init::ExpectedInitializeRequest(None)) => {
+            "the client closed the connection before initializing".to_owned()
+        }
+        Some(Init::ExpectedInitializeRequest(Some(_))) => {
+            "the client sent another message before initializing".to_owned()
+        }
+        Some(Init::UnexpectedInitializeResponse(_)) => {
+            "the client answered initialize unexpectedly".to_owned()
+        }
+        Some(Init::InitializeFailed(_)) => "initialize failed".to_owned(),
+        Some(Init::ConnectionClosed(_)) => "the connection closed during initialize".to_owned(),
+        Some(Init::TransportError { context, .. }) => {
+            format!("transport error during initialize, when {context}")
+        }
+        _ => format!("{e:#}"),
     }
 }
 

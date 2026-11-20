@@ -62,16 +62,23 @@ impl Bootstrap {
 
 /// Sends diagnostics to stderr and Flint events to a rotating file, filtered by [`log_filter`]
 /// from `FLINT_LOG` and `RUST_LOG`. Stdout is reserved for the MCP protocol. Call it once,
-/// after [`bootstrap`].
-/// `verbose` (`--verbose`) raises the default from warnings to info.
+/// after [`bootstrap`], and call [`flush_logs`] before the process exits.
+/// `verbose` (`--verbose`) raises stderr's default from warnings to info. The file always
+/// defaults to info: a launch from Finder or the Dock can't pass a flag, and the file is what a
+/// bug report attaches. A variable still sets both.
 pub fn init_logging(verbose: bool) {
     let flint_log = std::env::var("FLINT_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
-    logging::init(log_filter(
-        flint_log.as_deref(),
-        rust_log.as_deref(),
-        verbose,
-    ));
+    logging::init(
+        log_filter(flint_log.as_deref(), rust_log.as_deref(), verbose),
+        log_filter(flint_log.as_deref(), rust_log.as_deref(), true),
+    );
+}
+
+/// Waits briefly (at most half a second) for queued events to reach the log file. Call it on
+/// the way out, so the last error before exit isn't lost.
+pub fn flush_logs() {
+    logging::flush();
 }
 
 /// The log filter: `FLINT_LOG` if set, else `RUST_LOG`, else `info` when `verbose` and `warn`

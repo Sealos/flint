@@ -76,4 +76,5 @@ body:
         On macOS, the log is `~/Library/Logs/Flint/flint.log`. Use **Go > Go to Folder** in Finder to open `~/Library/Logs/Flint/`.
         On Linux, look in `$XDG_STATE_HOME/flint/flint.log` (default `~/.local/state/flint/flint.log`).
         Attach a sanitized copy of the relevant log or paste the relevant lines. If the log rotated, check
-        `flint.log.1` through `flint.log.3`. For an MCP tool error, include the tool name and the sanitized error shown by your AI client.
+        `flint.log.1` through `flint.log.3`. For an MCP tool error, include the tool name and the sanitized error shown by your AI client. If the MCP
+        server disconnected, also include the sanitized `flint mcp` stderr from your AI client's MCP log.

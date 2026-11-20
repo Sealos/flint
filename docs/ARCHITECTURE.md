@@ -962,8 +962,10 @@ Rules:
   as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
   written in time is skipped and logged.
 - **stdout is the protocol channel.** Diagnostics go to stderr and Flint's own events also go to the rotating log
-  shared with the app. Both destinations use `FLINT_LOG` (else `RUST_LOG`) or the default filter, which enables
-  warnings and errors and adds info with `--verbose` (`flint_core::bootstrap::log_filter`).
+  shared with the app. Both destinations use `FLINT_LOG` (else `RUST_LOG`) if set. Otherwise stderr shows warnings
+  and errors, adding info with `--verbose`, and the file records info (`flint_core::bootstrap::log_filter`). A
+  writer thread owns the file, so logging never blocks the thread that emits an event; when it falls behind, events
+  are dropped from the file but still reach stderr.
 
 The read functions (dynamic list, get, events, logs) live in `flint-core`, where the UI uses them as well. Only the
 tool layer and the policy (opt-in, limits) live in `flint-mcp`. The redaction rules live in `flint_core::redact`, so

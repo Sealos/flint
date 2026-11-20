@@ -79,6 +79,9 @@ impl Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
+            // Keeps the log file out of the real home.
+            .env("HOME", config_dir.join("home"))
+            .env("XDG_STATE_HOME", config_dir.join("state"))
             .env("FLINT_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -256,6 +259,8 @@ fn plain_runs_log_warnings_only_and_verbose_adds_info() {
             .args(args)
             .env("KUBECONFIG", scratch.path().join("none"))
             .env("FLINT_CONFIG_DIR", &config_dir)
+            .env("HOME", scratch.path().join("home"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
             .env_remove("FLINT_LOG")
             .env_remove("RUST_LOG")
             .env("SHELL", "/nonexistent")
@@ -273,6 +278,51 @@ fn plain_runs_log_warnings_only_and_verbose_adds_info() {
     let verbose = run(&["--verbose"]);
     assert!(verbose.contains(" INFO "), "{verbose}");
     assert!(verbose.contains("config directory"), "{verbose}");
+}
+
+/// A message other than `initialize` ends the server, and its payload stays out of stderr and
+/// the log file. The file logs info by default, unlike stderr. No cluster, no network.
+#[test]
+fn a_message_before_initialize_is_not_logged() {
+    let scratch = tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let config_dir = scratch.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_flint-mcp"))
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &home)
+        .env("KUBECONFIG", scratch.path().join("none"))
+        .env("FLINT_CONFIG_DIR", &config_dir)
+        .env_remove("FLINT_LOG")
+        .env_remove("RUST_LOG")
+        .env("SHELL", "/nonexistent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let message = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progressToken": "private-payload-marker", "progress": 1}
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{message}").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("mcp server failed"), "{stderr}");
+    assert!(!stderr.contains("private-payload-marker"), "{stderr}");
+    let path = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/Flint/flint.log")
+    } else {
+        home.join("flint/flint.log")
+    };
+    let log = std::fs::read_to_string(path).unwrap();
+    assert!(log.contains("mcp server failed"), "{log}");
+    assert!(log.contains(" INFO "), "{log}");
+    assert!(!log.contains("private-payload-marker"), "{log}");
 }
 
 /// A local port nothing listens on: one the OS just handed out, released again.

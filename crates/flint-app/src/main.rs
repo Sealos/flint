@@ -140,6 +140,7 @@ fn main() -> ExitCode {
     bootstrap::init_logging(verbose);
     boot.log_summary();
     ui::run(boot);
+    bootstrap::flush_logs();
     ExitCode::SUCCESS
 }
 

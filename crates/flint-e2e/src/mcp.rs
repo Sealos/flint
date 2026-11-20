@@ -69,6 +69,8 @@ impl Mcp {
             .env("KUBECONFIG", kubeconfig)
             .env("FLINT_CONFIG_DIR", config_dir)
             .env("HOME", home.home())
+            // Keeps the log file in the scratch home on Linux too.
+            .env("XDG_STATE_HOME", home.home())
             .env("FLINT_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

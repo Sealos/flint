@@ -326,8 +326,9 @@ On Linux it is `$XDG_STATE_HOME/flint/flint.log`, defaulting to `~/.local/state/
 Flint's own diagnostics with credential redaction and rotates at 4 MiB, keeping three older files (`flint.log.1`
 through `flint.log.3`). If the file is unavailable, logging continues on stderr. MCP uses stdout for the protocol.
 
-The default logs warnings and errors. `flint --verbose` (or `flint mcp --verbose`) adds info. `FLINT_LOG` takes
-precedence over `--verbose` and sets the filter for both destinations, for example `FLINT_LOG=debug` or
+By default stderr shows warnings and errors, and `flint --verbose` (or `flint mcp --verbose`) adds info. The file
+always records info and above, so a bug report has context. `FLINT_LOG` takes precedence over `--verbose` and sets
+the filter for both destinations, for example `FLINT_LOG=debug` or
 `FLINT_LOG=flint_core=debug`. Flint reads `RUST_LOG` when `FLINT_LOG` is unset, empty or invalid. `flint --help` lists
 the commands, options and environment variables, with the development aids below under their own heading.
 
