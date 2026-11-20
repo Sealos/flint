@@ -85,13 +85,17 @@ impl ContextPin {
     }
 }
 
-/// A context's confirmed definition, as kubeconfig loads last saw it.
+/// A context's definition, as kubeconfig loads last saw it.
 #[derive(Debug)]
 struct Record {
     server: Option<String>,
     /// The file that defined it.
     source: PathBuf,
     present: bool,
+    /// A load confirmed it. Unconfirmed: only seen while a file before its own failed to load
+    /// (at startup, say), so it may be a fallback; a load that confirms it on the same server
+    /// keeps its generation.
+    confirmed: bool,
     /// Bumped whenever a confirmed change gives the context another server, or removes it, so
     /// a change that a later reload undoes is still seen by sessions pinned before it.
     generation: u64,
@@ -114,6 +118,11 @@ struct Record {
 ///   ([`Change::Unconfirmed`]): it never moves to the confirmed server.
 ///
 /// A failed file ranked below a context's file cannot change it, so it masks nothing.
+///
+/// What a load shows but cannot confirm never replaces confirmed history. A context first seen
+/// that way (a file before it already unreadable at startup) is recorded as unconfirmed, with
+/// its file, so its absence is masked the same way; sessions opened on it run, and a load that
+/// confirms it on the same server leaves them running.
 #[derive(Debug, Default)]
 pub(crate) struct ContextHistory {
     records: HashMap<String, Record>,
@@ -139,18 +148,25 @@ impl ContextHistory {
             if !seen.insert(name) {
                 continue;
             }
+            // A failed file before its own could define it: the entry may be a fallback.
+            let provisional = masked(&info.source, false);
             match self.records.get_mut(name) {
+                // A confirmed definition stays until a load confirms a change: a fallback never
+                // replaces it, nor its file.
+                Some(r) if r.present && r.confirmed && provisional => {}
                 Some(r) if r.present && r.server.as_deref() == server => {
-                    r.source = info.source.clone();
+                    if !provisional {
+                        r.source = info.source.clone();
+                        r.confirmed = true;
+                    }
                 }
-                // A fallback while a file before it is unreadable: provisional.
-                Some(r) if r.present && masked(&info.source, false) => {}
                 Some(r) => {
                     self.last += 1;
                     *r = Record {
                         server: server.map(str::to_owned),
                         source: info.source.clone(),
                         present: true,
+                        confirmed: !provisional,
                         generation: self.last,
                     };
                 }
@@ -162,6 +178,7 @@ impl ContextHistory {
                             server: server.map(str::to_owned),
                             source: info.source.clone(),
                             present: true,
+                            confirmed: !provisional,
                             generation: self.last,
                         },
                     );
@@ -440,6 +457,41 @@ mod tests {
             h.check(Pinned::Shell, "main", &pin),
             Some(reason(Pinned::Shell, "main", Change::Repointed))
         );
+    }
+
+    // covers UP-06: a fallback on the same server never replaces the confirmed definition's
+    // file, and a context first seen while a file before it is unreadable is not confirmed
+    // history: its absence while that file still fails removes nothing.
+    #[test]
+    fn what_a_load_cannot_confirm_never_replaces_confirmed_history() {
+        let mut h = history(&[("main", STAGING, "a")]);
+        h.record(&load(&[("main", STAGING, "b")], &["a"]));
+        let r = &h.records["main"];
+        assert!(r.confirmed && r.source == Path::new("a"), "{r:?}");
+
+        // At startup, the first file already unreadable.
+        let mut h = ContextHistory::default();
+        h.record(&load(&[("main", STAGING, "c")], &["a"]));
+        let r = &h.records["main"];
+        assert!(!r.confirmed, "{r:?}");
+        let pin = h.pin("main", STAGING);
+        assert_eq!(
+            h.check(Pinned::Shell, "main", &pin),
+            None,
+            "sessions on it run"
+        );
+        // The fallback goes while the first file still fails: the first may define it.
+        h.record(&load(&[], &["a"]));
+        assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
+        // The first file loads and confirms it on the same server: nothing changed.
+        h.record(&load(&[("main", STAGING, "a")], &[]));
+        assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
+        assert!(h.records["main"].confirmed);
+        // Then a fallback on the same server while it fails again, and a removal from that
+        // fallback's file: the confirmed file is still the one that counts.
+        h.record(&load(&[("main", STAGING, "c")], &["a"]));
+        h.record(&load(&[], &["a"]));
+        assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
     }
 
     /// Polls `recheck` once; a check it starts takes the next of `answers`.
