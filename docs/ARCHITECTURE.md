@@ -623,9 +623,8 @@ opens in a tab in the bottom dock.
     the fallback's server) is pinned to that server, stale: its first check ends it with why, so it never moves to
     the confirmed server once the first file loads again. A log tab passes the server it is labelled with
     (`CoreHandle::open_logs_at`), so a request the core takes after the fallback went is still pinned to it. A log
-    session is never handed a client for another server than its pin. While any kubeconfig file can't be read,
-    the dock does not take another server for a re-pointed context (it may be a fallback); the core's checks end
-    the shells whose context changed for certain. An unconfirmed entry follows the file it comes from on the same
+    session is never handed a client for another server than its pin. A shell does the same (`ExecRequest::at`): it is
+    refused before it starts if the context shows another server than its tab when the core takes the request. An unconfirmed entry follows the file it comes from on the same
     server, so a failed file between masks its removal.
   - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.

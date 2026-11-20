@@ -585,7 +585,8 @@ impl Workspace {
                         DockTab::Logs(cx.new(|cx| LogView::at(core, request, server, window, cx)))
                     }
                     TabKey::Shell(request) => {
-                        let session = core.exec(request.exec_request(Default::default()));
+                        let session =
+                            core.exec(request.exec_request(Default::default()).at(server));
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     }
                     // It returned above: an activity tab has no session to start again.
@@ -647,11 +648,12 @@ impl Workspace {
         }
         let core = self.model.read(cx).core().clone();
         let cluster = self.tab_cluster(&request.cluster, cx);
+        let server = self.shown_server(&request.cluster, cx);
         self.open_tab(
             TabKey::Shell(request.clone()),
             cluster,
             |window, cx| {
-                let session = core.exec(request.exec_request(Default::default()));
+                let session = core.exec(request.exec_request(Default::default()).at(server));
                 DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
             },
             focus,
@@ -685,12 +687,6 @@ impl Workspace {
         self.dock
             .update(cx, |dock, cx| dock.set_contexts(contexts, cx));
         if self.dock.read(cx).tab_count() == 0 {
-            return;
-        }
-        // While a kubeconfig file can't be read, another server may be a later file's fallback,
-        // showing only until it loads again: the core ends the shells whose context changed
-        // for certain (each checks its pin against confirmed history), and the dock waits.
-        if !self.model.read(cx).kubeconfig_errors.is_empty() {
             return;
         }
         // By server only: a context that started over at the same server (a namespace edit, a

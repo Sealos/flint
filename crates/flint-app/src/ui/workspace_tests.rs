@@ -1200,39 +1200,3 @@ async fn a_cluster_that_starts_over_closes_its_views(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(t.list(cx).is_none(), "the old slot's view closed");
 }
-
-// covers UP-06, UP-41: while a kubeconfig file can't be read, another server for a context may
-// be a later file's fallback: its tabs are not taken for re-pointed (a live shell would end).
-// Once the files load, a server that is still another one is.
-#[gpui_kit::test]
-async fn a_fallback_server_while_a_file_fails_re_points_no_tab(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let t = open_workspace(cx, dir.path()).await;
-    t.open_pods(cx, &[("demo", "web", 1)]).await;
-    show_pod(cx, &t, "web").await;
-    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
-    cx.run_until_parked();
-    let repointed = |cx: &mut TestAppContext| {
-        t.workspace.read_with(cx, |ws, cx| {
-            let dock = ws.dock.read(cx);
-            dock.tab_ids().into_iter().any(|id| dock.is_repointed(id))
-        })
-    };
-    let repoint = |cx: &mut TestAppContext, errors: Vec<(std::path::PathBuf, String)>| {
-        t.model.update(cx, |model, cx| {
-            model.kubeconfig_errors = errors;
-            let alpha = model
-                .clusters
-                .iter_mut()
-                .find(|c| c.info.name == "alpha")
-                .unwrap();
-            alpha.info.server = Some("https://10.0.0.9:6443".into());
-            cx.notify();
-        });
-        cx.run_until_parked();
-    };
-    repoint(cx, vec![("first".into(), "did not parse".into())]);
-    assert!(!repointed(cx), "maybe a fallback");
-    repoint(cx, Vec::new());
-    assert!(repointed(cx), "confirmed once the files load");
-}

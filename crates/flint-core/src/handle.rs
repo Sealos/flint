@@ -192,6 +192,9 @@ pub(crate) enum Request {
     /// started with it is pinned to.
     WriteClient {
         cluster: ClusterId,
+        /// The server the session is for (its tab's), if it names one: refused if the context
+        /// shows another.
+        server: Option<Option<String>>,
         reply: oneshot::Sender<Result<(kube::Client, ContextPin), WriteRefusal>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
@@ -567,7 +570,7 @@ impl CoreHandle {
         // auth plugin again (the cached client may hold it back after a timed-out refresh).
         crate::auth_plugin::retry_now(&request.cluster);
         let (session, channels) = ExecSession::new(request.clone());
-        let client = self.write_client(&request.cluster);
+        let client = self.write_client(&request.cluster, request.server.clone());
         let requests = self.requests.clone();
         let cluster = request.cluster.clone();
         self.runtime.spawn(async move {
@@ -586,11 +589,13 @@ impl CoreHandle {
     fn write_client(
         &self,
         cluster: &str,
+        server: Option<Option<String>>,
     ) -> impl Future<Output = Result<(kube::Client, ContextPin), WriteRefusal>> + Send + 'static
     {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::WriteClient {
             cluster: cluster.to_owned(),
+            server,
             reply,
         });
         async move {

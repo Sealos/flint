@@ -93,6 +93,10 @@ pub struct ExecRequest {
     pub command: Option<Vec<String>>,
     /// The terminal's size at the start; later changes go through [`ExecSession::resize`].
     pub size: TerminalSize,
+    /// The server the shell is for: what its tab is labelled with, as the cluster list gave
+    /// it. Refused before it starts if the context shows another one when the core takes the
+    /// request. `None` for whatever it shows then.
+    pub server: Option<Option<String>>,
 }
 
 impl ExecRequest {
@@ -109,7 +113,15 @@ impl ExecRequest {
             container: None,
             command: None,
             size: TerminalSize::default(),
+            server: None,
         }
+    }
+
+    /// For the context's definition at `server`, the one its tab shows (UP-06).
+    #[must_use]
+    pub fn at(mut self, server: Option<String>) -> Self {
+        self.server = Some(server);
+        self
     }
 
     #[must_use]
@@ -720,6 +732,7 @@ pub(crate) async fn start(
         Err(refusal) => {
             let kind = match refusal {
                 WriteRefusal::Protected { .. } => ExecFailureKind::Protected,
+                WriteRefusal::Moved { .. } => ExecFailureKind::ContextChanged,
                 WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => {
                     ExecFailureKind::Unreachable
                 }

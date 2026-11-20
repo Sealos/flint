@@ -485,11 +485,12 @@ impl ClusterManager {
             Request::Client { cluster, reply } => {
                 let _ = reply.send(self.client(&cluster));
             }
-            Request::WriteClient { cluster, reply } => {
-                // Read with the client: a shell is pinned to the context its client was built
-                // from (`CheckContext`).
-                let pin = self.session_pin(&cluster);
-                let _ = reply.send(self.write_client(&cluster).map(|client| (client, pin)));
+            Request::WriteClient {
+                cluster,
+                server,
+                reply,
+            } => {
+                let _ = reply.send(self.shell_client(&cluster, server));
             }
             Request::CheckContext {
                 cluster,
@@ -1058,6 +1059,28 @@ impl ClusterManager {
                 Err(LogError::retry(format!("connecting to \"{cluster}\"")))
             }
         }
+    }
+
+    /// The client for a shell on `cluster`, with its pin, read in the same step: a shell is
+    /// pinned to the context its client was built from (`CheckContext`). Given the server its
+    /// tab shows, refused if the context shows another now (a fallback that came or went since
+    /// the tab's view), so it never runs on a server its tab does not name (UP-06).
+    fn shell_client(
+        &self,
+        cluster: &str,
+        server: Option<Option<String>>,
+    ) -> Result<(Client, ContextPin), WriteRefusal> {
+        if let Some(expected) = &server
+            && self
+                .cluster(cluster)
+                .is_some_and(|slot| slot.info.server != *expected)
+        {
+            return Err(WriteRefusal::Moved {
+                cluster: cluster.to_owned(),
+            });
+        }
+        let pin = self.session_pin(cluster);
+        self.write_client(cluster).map(|client| (client, pin))
     }
 
     /// The pin for a session opened on `cluster` now: to the server its slot shows (what a tab
@@ -2185,6 +2208,22 @@ mod tests {
             cluster: "dev".into(),
         };
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        // A shell for another server than the context shows (its tab's view is older) is
+        // refused before it starts, whatever the gate says.
+        let moved = WriteRefusal::Moved {
+            cluster: "dev".into(),
+        };
+        let shown = manager.cluster("dev").unwrap().info.server.clone();
+        assert_eq!(
+            manager
+                .shell_client("dev", Some(Some("https://other".into())))
+                .err(),
+            Some(moved)
+        );
+        assert_eq!(
+            manager.shell_client("dev", Some(shown)).err(),
+            Some(protected("dev"))
+        );
         // A context Flint does not know is never handed a client.
         assert_eq!(
             manager.write_client("gone").err(),
