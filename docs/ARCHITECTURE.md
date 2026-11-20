@@ -236,10 +236,13 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   backoff, skipping lines already shown). A followed stream that ends is reopened only while the container can log
   again (it restarts, or the pod still runs). When the pod's status says the container waits in `CrashLoopBackOff`,
   `LogState::Reconnecting` carries `back_off`, and the tab says it waits for the restart rather than counting
-  reconnect attempts. The kubelet answers a log it cannot read (the previous instance's, early in a restart) with one
-  line without a timestamp, `unable to retrieve container logs for …`: as the first line of a read it ends a
-  previous-instance session with `PREVIOUS_NOT_AVAILABLE` (`LogState::previous_not_available`) and makes a
-  current-instance stream retry, so it never shows as a log line.
+  reconnect attempts. The kubelet answers a log it cannot read with one line without a timestamp (`unable to
+  retrieve container logs for …`, or `failed to try resolving symlinks in path …`): as the first line of a read it
+  is never shown as a log line. A previous-instance session ends with `PREVIOUS_NOT_AVAILABLE`
+  (`LogState::previous_not_available`), as it does when the API server says the previous terminated container was
+  not found; a current-instance read treats it as an end of stream, with the kubelet's words as the error: it ends
+  when not following, and otherwise the pod's status decides (a finished container whose log is gone ends, one that
+  restarts is waited for).
 - **Delivery** follows [ADR-0002](./adr/0002-tokio-core-gpui-ui-bridge.md): at most one `Arc<LogSnapshot>` per
   ~100 ms. The buffer is stored in shared blocks (at most 1024 lines, or 1/32 of the memory budget), so a snapshot
   of 100k lines costs a few hundred pointer copies. Every line has a `LineId` that never changes, so a view diffs
@@ -255,16 +258,23 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
   the native save dialog) write lines as shown, not redacted. Its pure parts (snapshot diff, line text and
   highlights, state and error wording, toolbar fit, save text) are in `log_model.rs`.
   - **Toolbar:** one row at any width (`toolbar_fit`, from the tab's measured width): the status (state, pause and
-    held-back count) has a slot that truncates, with everything in its tooltip; the toggles, Pause, Jump and Save are
-    one group that never wraps, and below about 980 points the toggles and Save fold into a "⋯" menu, then the
-    counts and the match count go. Away from the newest line it says "Not following" beside Jump. Pause and
+    held-back count) has a slot that truncates with an ellipsis, with everything in its tooltip; the toggles, Pause,
+    Jump and Save are one group that never wraps and is never cut (the rest of the toolbar gives way first), and
+    below about 980 points the toggles and Save fold into a "⋯" menu, then the counts and the match count go. Away
+    from the newest line of a running, followed stream it says "Not following" beside Jump. Pause and
     "Paused" go once the stream has ended (held-back lines then show).
   - **Notices:** one strip under the toolbar, the latest transient thing: a copy or save note (a muted one times
     out after 4 s; any goes when the selection changes), else the selection hint. An ended session's error has its
     own banner: plain words (`explain`: a 403 is "You don't have permission to read this pod's logs.", a transport
-    failure "Can't reach the API server.") over the server's text, which wraps; the status says only a few words.
-    A previous-instance tab the kubelet could not serve says so, with Try Again (`ReloadLogs`).
-  - **Lines:** a shown timestamp is local `HH:MM:SS.mmm`, muted and fixed-width; a workload line's prefix is the
+    failure "Can't reach the API server.", and an API server error proxying to an unreachable kubelet (an
+    `InternalError`, or a `:10250` address) "Can't reach the node running this pod.") over the server's text,
+    which wraps; the status says only a few words, or a short form of an error it has no words for. A
+    previous-instance tab whose log could not be read says the container may have been removed, with Try Again
+    (`ReloadLogs`).
+  - **Lines:** a shown timestamp is `HH:MM:SS.mmm` in the system's time zone (UTC, said as such in the toggle's
+    tooltip, when it cannot be read), muted and fixed-width. A dated separator row (inside the line's list item)
+    starts the first line shown and each change of day or UTC offset, so a tail spanning days, or a fall-back hour,
+    is unambiguous; a workload line's prefix is the
     pod name after the prefix all its pods share (the container only when the pod has several), padded to the
     widest, in a colour per pod (`theme::log_source_colors`, by first sight). Prefix, timestamp and text are
     separate elements, so wrapped text hangs past both; hovering over the timestamp or prefix shows the full value.

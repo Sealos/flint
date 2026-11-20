@@ -240,8 +240,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   Jump to Newest Line) follows again; while it does not follow, the toolbar says "Not following" beside Jump. The tab
   says whether it is connecting, streaming, reconnecting (and which attempt), waiting for a crash-looping container
   to restart (back-off) or ended, and why in plain words (no permission, can't reach the API server) with the
-  server's text under them. Once a stream has ended there is nothing to pause. A previous instance whose log the
-  kubelet cannot read yet says so, with Try Again, instead of showing the kubelet's answer as a line. The toolbar
+  server's text under them; an unreachable node is told apart from an unreachable API server. Once a stream has
+  ended there is nothing to pause. A previous instance whose log cannot be read says so (the container may have
+  been removed), with Try Again, instead of showing the kubelet's answer as a line. The toolbar
   stays one row in a narrow dock (the toggles and Save move into a "⋯" menu), and one notice line at a time shows
   under it. Esc in the search field clears the search, then returns to the lines; Esc in the lines clears the
   selection and never closes the detail pane. Memory stays bounded on chatty pods.
@@ -279,8 +280,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** error lines are marked in the error color and warning lines in the warning color, in both themes.
   Matching ignores case and works on whole words: `ERROR`, `FATAL`, `panic`, and words ending in `Exception` or
   `Error` are errors, `WARN` and `WARNING` are warnings. Timestamps appear and disappear without reloading the
-  stream; they show muted, in local time to the millisecond, all one width, with the full timestamp on hover and in
-  copies and saves. Wrapped lines hang past the timestamp. Searching keeps the highlighting, and the current match
+  stream; they show muted, in local time to the millisecond (the toggle's tooltip names the zone), all one width,
+  with the full timestamp on hover and in copies and saves, and a dated separator where a day begins. Wrapped lines hang past the timestamp. Searching keeps the highlighting, and the current match
   stands out from the others.
 - Tests: unit (pattern matching), cluster, ui.
 
