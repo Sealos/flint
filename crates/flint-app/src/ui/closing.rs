@@ -133,6 +133,8 @@ pub fn dialog(ending: Ending, live: LiveSessions) -> DialogText {
         ok: ok.into(),
         cancel: "Cancel".into(),
         id,
+        // Ending sessions takes the button: Enter cancels.
+        default_cancel: true,
     }
 }
 

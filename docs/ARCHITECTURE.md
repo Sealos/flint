@@ -358,8 +358,10 @@ session that outlives navigation (log tabs and shell tabs now; AI log analysis l
 cluster switches. Cmd-J shows and hides the dock; Cmd-W closes the active tab wherever focus is in the window, and
 closes the window only when the dock shows no tab; Shift-Cmd-W (Close Window) always closes the window. Closing the
 window or quitting while a shell runs or a log tab follows asks first, naming how many sessions end (`ui/closing.rs`,
-#177). A new tab kind implements `DockItem` and adds a `DockTab` and `TabKey` variant; the module documentation lists
-the steps.
+#177). That confirmation sets `DialogText::default_cancel`: the dialog's own keys are off, and its description (which
+takes focus) and its buttons sit in the `DefaultCancel` key context, where Enter and Escape are bound to Cancel. Enter
+cancels even after Tab moved focus onto a button, so only a click on the confirm button ends the sessions. A new tab
+kind implements `DockItem` and adds a `DockTab` and `TabKey` variant; the module documentation lists the steps.
 
 - **Titles.** One pattern for every kind: `chatty · app`, `chatty · app (previous)`, `api (Deployment)`,
   `-l app=web`, `Shell: web-1 · app`, cut in the middle past 26 characters. Every tab shows its cluster in a chip

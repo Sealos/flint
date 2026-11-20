@@ -177,6 +177,56 @@ async fn closing_the_window_with_a_live_shell_asks_first(cx: &mut TestAppContext
     }
 }
 
+// covers UP-42 (#177): in the quit and close confirmations Enter cancels, as Escape does, also
+// once Tab or Shift-Tab moved focus onto a button: ending the sessions takes a click on the
+// confirm button. The app runs on, the window stays, the shell runs on.
+#[gpui_kit::test]
+async fn enter_and_escape_cancel_the_quit_and_close_confirmations(cx: &mut TestAppContext) {
+    // Quitting last: the count of quits is the app's.
+    for (ask, title) in [
+        ("flint::CloseWindow", "Close the window?"),
+        ("flint::Quit", "Quit Flint?"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(cx, dir.path()).await;
+        let (_, mut web) = open_fake_shell_in(cx, &t, "web");
+        focus_list(cx, &t);
+        for keys in [
+            &["enter"][..],
+            &["escape"],
+            &["tab", "enter"],
+            &["tab", "tab", "enter"],
+            &["shift-tab", "enter"],
+            &["tab", "escape"],
+        ] {
+            t.press_key_of(cx, ask);
+            assert_eq!(shown_dialog(cx, &t).await.title, title, "{ask}");
+            for key in keys {
+                t.press(cx, key);
+            }
+            cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+                .await;
+            assert_eq!(quits(cx), 0, "{ask}, {keys:?}: nothing quits");
+            assert!(window_is_open(cx, &t), "{ask}, {keys:?}: the window stays");
+            assert_eq!(tab_count(cx, &t), 1, "{ask}, {keys:?}");
+            assert!(!web.is_closed(), "{ask}, {keys:?}: the shell runs on");
+        }
+        // Its buttons answer it: Cancel keeps everything, the confirm button ends the sessions.
+        t.press_key_of(cx, ask);
+        shown_dialog(cx, &t).await;
+        t.click(cx, "confirm-cancel");
+        assert!(!t.has_dialog(cx), "{ask}: Cancel closes the dialog");
+        assert!(window_is_open(cx, &t) && !web.is_closed() && quits(cx) == 0);
+        t.press_key_of(cx, ask);
+        shown_dialog(cx, &t).await;
+        t.click(cx, "confirm-ok");
+        match ask {
+            "flint::Quit" => assert_eq!(quits(cx), 1, "the Quit button quits"),
+            _ => assert!(!window_is_open(cx, &t), "Close Window closes it"),
+        }
+    }
+}
+
 // covers UP-42 (#177): Window > Close Dock Tab never closes the window. With no tab shown it is
 // unavailable (the menu disables it), and dispatching it as the menu does changes nothing;
 // Cmd-W still falls through to Close Window.
@@ -273,4 +323,8 @@ fn the_dialog_names_the_sessions_that_end() {
     );
     assert_eq!(app.ok, "Quit");
     assert_ne!(window.id, app.id);
+    assert!(
+        window.default_cancel && app.default_cancel,
+        "Enter cancels both"
+    );
 }

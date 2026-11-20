@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// What a confirmation says.
@@ -18,7 +19,16 @@ pub struct DialogText {
     pub cancel: String,
     /// The element id of the description, for view tests.
     pub id: &'static str,
+    /// Enter cancels instead of confirming, for a confirmation whose OK ends work that cannot be
+    /// got back (quitting, closing the window): only a click on the OK button confirms it, also
+    /// once Tab moved focus onto a button. Escape cancels either way.
+    pub default_cancel: bool,
 }
+
+/// The key context of a [`DialogText::default_cancel`] confirmation's description (which holds
+/// focus while it is open) and of its buttons: Enter and Escape are bound to Cancel there. The
+/// dialog's own keys (Enter confirms) are turned off, so they cannot answer for it either.
+pub const DEFAULT_CANCEL: &str = "DefaultCancel";
 
 /// Opens a confirmation saying `dialog`; confirming runs `on_ok` and closes it. Test builds open
 /// it at once, without the entrance animation, so automation sees it without waiting.
@@ -31,6 +41,9 @@ pub fn open(
     #[cfg(any(test, feature = "automation"))]
     remember(window, dialog.clone(), cx);
     let on_ok = Rc::new(on_ok);
+    // Focus moves into the description, whose key context turns Enter into Cancel.
+    let default_cancel = dialog.default_cancel.then(|| cx.focus_handle());
+    let focus = default_cancel.clone();
     window.open_alert_dialog(cx, move |alert, _, _| {
         let on_ok = on_ok.clone();
         #[cfg(feature = "automation")]
@@ -43,15 +56,55 @@ pub fn open(
                     .id(dialog.id)
                     .aria_label(dialog.text.clone())
                     .child(dialog.text.clone())
+                    .when_some(default_cancel.as_ref(), |this, focus| {
+                        this.track_focus(focus).key_context(DEFAULT_CANCEL)
+                    })
                     .test_support(),
             )
             .ok_text(dialog.ok.clone())
             .cancel_text(dialog.cancel.clone())
+            .when_some(default_cancel.as_ref(), |this, focus| {
+                this.keyboard(false)
+                    .footer(default_cancel_footer(&dialog, focus))
+            })
             .on_ok(move |_, window, cx| {
                 on_ok(window, cx);
                 true
             })
     });
+    // The dialog took focus as it opened: hand it on to the description.
+    if let Some(focus) = focus {
+        focus.focus(window, cx);
+    }
+}
+
+/// The buttons of a [`DialogText::default_cancel`] confirmation, as the dialog's own footer draws
+/// them but under [`DEFAULT_CANCEL`], so Enter on a button Tab reached cancels too. They answer
+/// from the description's `focus`, inside the dialog, whatever holds focus.
+fn default_cancel_footer(dialog: &DialogText, focus: &FocusHandle) -> impl IntoElement {
+    use gpui_kit::base::actions::{Cancel, Confirm};
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+
+    use super::registry;
+
+    div().w_full().key_context(DEFAULT_CANCEL).child(
+        DialogFooter::new()
+            .child(
+                Button::new("confirm-cancel")
+                    .label(dialog.cancel.clone())
+                    .on_click(registry::on_click_in(focus.clone(), Cancel)),
+            )
+            .child(
+                Button::new("confirm-ok")
+                    .label(dialog.ok.clone())
+                    .primary()
+                    .on_click(registry::on_click_in(
+                        focus.clone(),
+                        Confirm { secondary: false },
+                    )),
+            ),
+    )
 }
 
 /// The confirmations opened per window, oldest first, as long as they are drawn. GPUI stacks
@@ -127,6 +180,7 @@ mod tests {
             ok: "Go".into(),
             cancel: "Cancel".into(),
             id: "test-description",
+            default_cancel: false,
         }
     }
 
@@ -206,6 +260,80 @@ mod tests {
 
         open_text(cx, window, "Second");
         assert_eq!(shown_title(cx, window).as_deref(), Some("Second"));
+    }
+
+    // Enter confirms a confirmation, unless it is a `default_cancel` one: Enter cancels that,
+    // and only its OK confirms it. Escape cancels both.
+    #[gpui_kit::test]
+    async fn enter_cancels_only_a_default_cancel_dialog(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+
+        let window = window(cx);
+        for (default_cancel, keys, confirms) in [
+            (false, &["enter"][..], true),
+            (false, &["escape"], false),
+            (true, &["enter"], false),
+            (true, &["escape"], false),
+            (true, &["tab", "enter"], false),
+            (true, &["shift-tab", "enter"], false),
+        ] {
+            let confirmed = Rc::new(Cell::new(false));
+            let set = confirmed.clone();
+            let dialog = DialogText {
+                default_cancel,
+                ..text("Asked")
+            };
+            cx.update_window(window, |_, window, cx| {
+                open(window, cx, dialog, move |_, _| set.set(true))
+            })
+            .unwrap();
+            assert_eq!(shown_title(cx, window).as_deref(), Some("Asked"));
+            for key in keys {
+                cx.update_window(window, |_, window, cx| window.press(key, cx))
+                    .unwrap();
+            }
+            assert_eq!(shown_title(cx, window), None, "{keys:?} closes it");
+            assert_eq!(
+                confirmed.get(),
+                confirms,
+                "default_cancel {default_cancel}, {keys:?}"
+            );
+        }
+        // Clicking its OK button confirms a default_cancel dialog.
+        let confirmed = Rc::new(Cell::new(false));
+        let set = confirmed.clone();
+        let dialog = DialogText {
+            default_cancel: true,
+            ..text("Asked")
+        };
+        cx.update_window(window, |_, window, cx| {
+            open(window, cx, dialog, move |_, _| set.set(true))
+        })
+        .unwrap();
+        shown_title(cx, window);
+        cx.update_window(window, |_, window, cx| window.click("confirm-ok", cx))
+            .unwrap();
+        assert_eq!(shown_title(cx, window), None);
+        assert!(confirmed.get());
+        // So does automation's Confirm.
+        let confirmed = Rc::new(Cell::new(false));
+        let set = confirmed.clone();
+        let dialog = DialogText {
+            default_cancel: true,
+            ..text("Asked")
+        };
+        cx.update_window(window, |_, window, cx| {
+            open(window, cx, dialog, move |_, _| set.set(true))
+        })
+        .unwrap();
+        shown_title(cx, window);
+        cx.update_window(window, |_, window, cx| {
+            registry::dispatch("ui::Confirm", serde_json::Value::Null, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+        cx.run_until_parked();
+        assert!(confirmed.get());
     }
 
     // GPUI stacks dialogs: one opened over another is shown, and closing it shows the one

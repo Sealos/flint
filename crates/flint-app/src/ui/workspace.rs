@@ -1620,6 +1620,7 @@ fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogT
         ok: "Expose".into(),
         cancel: "Cancel".into(),
         id: "expose-description",
+        default_cancel: false,
     }
 }
 

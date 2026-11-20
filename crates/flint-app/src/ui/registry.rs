@@ -882,6 +882,19 @@ pub fn on_click<E: ?Sized, A: Action>(action: A) -> impl Fn(&E, &mut Window, &mu
     }
 }
 
+/// [`on_click`] for a control that answers something other than the workspace (a dialog's
+/// button): `action` is dispatched from `focus`, a node inside that thing.
+pub fn on_click_in<E: ?Sized, A: Action>(
+    focus: FocusHandle,
+    action: A,
+) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if let Err(e) = dispatch_in(&focus, &action, window, cx) {
+            tracing::warn!("{e}");
+        }
+    }
+}
+
 /// [`on_click`] that also hands a refusal to `refused`, for a control drawn from state that may
 /// be older than the click (a menu left open), so the user learns why nothing happened.
 pub fn on_click_or<E: ?Sized>(
@@ -973,6 +986,15 @@ pub fn init(cx: &mut App) {
             Ok(binding) => bindings.push(binding),
             Err(e) => tracing::error!(keys, "invalid terminal key: {e}"),
         }
+    }
+    // In a confirmation whose OK ends sessions, Enter cancels, as Escape does: that dialog's own
+    // keys are off, and these answer for it.
+    for keys in ["enter", "escape"] {
+        bindings.push(KeyBinding::new(
+            keys,
+            Cancel,
+            Some(super::confirm::DEFAULT_CANCEL),
+        ));
     }
     cx.bind_keys(bindings);
 }
