@@ -478,7 +478,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** besides Name, Status and Age, each row shows Problems (failing or crash-looping pods and workloads short
   of replicas, counted as the dashboard counts them), Pods, and CPU and Memory as "used / requested". Without
   metrics-server the used part is blank and the requests still show. The list is sorted by name; clicking a column
-  sorts by it, and the choice is remembered. Counts update live.
+  sorts by it, and the choice is remembered per cluster. Counts update live.
 - Tests: unit (aggregation, problem rules), ui, e2e (fake API server).
 
 M4 used every number in the 6x block, so its later paths continue at UP-120.
@@ -487,7 +487,7 @@ M4 used every number in the 6x block, so its later paths continue at UP-120.
 - **When** I click the `demo` row in Namespaces.
 - **Then** an overview of `demo` opens: problem counts that open the matching lists filtered to `demo`, CPU and
   memory usage against requests with sparklines of the last hour, recent Warning events and rollouts, and
-  ResourceQuota and LimitRange use when the namespace has them. Its YAML tab shows the namespace object, and Show
+  ResourceQuota use and LimitRange limits when the namespace has them. Its YAML tab shows the namespace object, and Show
   YAML in the row's context menu does too.
 - Tests: unit (namespace scope), ui, e2e.
 

@@ -10,11 +10,13 @@ itself, and a row opens a dashboard scoped to that namespace.
     ([ADR-0017](./0017-cluster-dashboards.md)).
   - **Pods:** a count.
   - **CPU** and **Memory:** each "used / requested". Usage comes from metrics-server, and the used part is blank
-    without it ([ADR-0005](./0005-metrics-server-only.md)). Requests are summed from the pod specs.
+    without it ([ADR-0005](./0005-metrics-server-only.md)). Requests are summed from the pod specs of pods that have
+    not finished, counted as the scheduler counts them (the larger of the init containers and the sum of the
+    containers, plus pod overhead).
 - **Sort:** the default stays by name. A column click changes it, and the choice is remembered per cluster.
 - **Namespace overview:** a row click opens the cluster dashboard scoped to the namespace. It shows problem counts
   that open filtered lists, CPU and memory usage against requests with sparklines of the last hour, recent Warning
-  events and rollouts, and ResourceQuota and LimitRange use when the namespace has them. A **YAML** tab shows the
+  events and rollouts, and ResourceQuota use and LimitRange limits when the namespace has them. A **YAML** tab shows the
   namespace object, and the row's context menu also has **Show YAML**.
 - **Sequencing:** the columns ship first. They need only the pod and workload watches and the metrics-server poll. The
   overview lands right after the cluster dashboard, built from its components. Until then a row click keeps opening
@@ -51,12 +53,17 @@ itself, and a row opens a dashboard scoped to that namespace.
 ## Consequences
 
 - The Namespaces list counts as an open view of Pods, the replica workloads and pod metrics, so it watches and polls
-  them while it shows, in either watch mode, as the dashboard does.
-- Rows keep only metadata and Table cells today. The problem rules and summed requests need a few typed fields from
-  each pod and workload (phase, waiting reasons, readiness, resource requests, replica status), kept per row and not
-  the whole object.
-- Lists do not remember their sort today. This adds a remembered sort, per cluster and kind, to `state.toml`, which
-  every list can use.
+  them while it shows, in either watch mode, as the dashboard does. The overview also needs Events, ResourceQuotas
+  and LimitRanges.
+- Rows keep only metadata and Table cells today (lists ask for `includeObject=Metadata`). The problem rules and summed
+  requests need a few typed fields from each pod and workload (phase, waiting reasons, readiness, resource requests,
+  replica status). These kinds are asked for with `includeObject=Object`, and only the typed fields are kept per row,
+  not the whole object. That costs bandwidth on every list and watch event of these kinds, and some memory per row,
+  which the memory budgets and the kwok measurements must include.
+- Lists do not remember their sort today. This adds a remembered sort per cluster to `state.toml`, which every list
+  can use.
 - The dashboard's components take a namespace scope, so the cluster and namespace overviews share one
   implementation.
-- In a cluster set, the merged row and its set-scoped overview follow the set dashboard's card layout (UP-85).
+- In a cluster set, the merged row and its set-scoped overview follow the set dashboard's card layout.
+- This amends [ADR-0014](./0014-cluster-sets-and-combined-views.md): in the Namespaces list, a merged row stands for
+  several clusters' objects. Its child rows, and every other list's rows, still keep their cluster.

@@ -1,5 +1,8 @@
 # Views can combine a set of clusters into one table
 
+**Amended by [ADR-0020](./0020-namespace-columns-and-overview.md).** In the Namespaces list, same-named namespaces
+merge into one row with a child row per member.
+
 [ADR-0012](./0012-keep-recently-used-clusters-warm.md) keeps recently used clusters connected but shows one cluster
 at a time. Users who run the same workloads on several clusters (dev, staging, prod regions) need to answer "where
 is it broken?" without clicking through each cluster. Flint therefore lets the user combine **2 to 5 clusters** into

@@ -195,13 +195,16 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   cluster connects again or becomes active again, so rows never vanish under the cursor. Forbidden kinds and kinds
   without a watch are not in it; forbidden ones show a lock. `Navigation` still holds every listable kind, and each
   entry gains an in-use flag that the tree folds by; the open kind is never folded. In a cluster set, the set is the
-  union of the members'. In mode On view the tree is not folded and nothing is probed. Search and the palette find
-  every kind.
+  union of the members', and it folds only when every member is in mode All. In mode On view the tree is not folded
+  and nothing is probed. The resource switcher finds every kind.
 - **Flint-computed columns (planned, M3 and M4):** a few columns are computed by Flint and layered on the server's
-  Table. They are synthetic columns, built in `table.rs` beside Namespace and Age (`Column::synthetic`, with their own
-  `ColumnRole`), and filled from a few typed fields Flint keeps per row (replica status, pod phase and requests, the
-  controller owner uid), never the whole object. Replica workloads get one **Ready** column ("ready/desired", a
-  status dot, a rollout marker) in place of the server's Desired, Current and Ready
+  Table. They are synthetic columns, built in `table.rs` beside the synthetic Namespace column (`Column::synthetic`,
+  with their own `ColumnRole`). They are filled from a few typed fields Flint keeps per row: replica status and the
+  Progressing condition, pod phase, readiness and requests, and the controller owner uid. Rows have no status or spec
+  today, because lists ask for `includeObject=Metadata`; Pods and the replica workloads are asked for with
+  `includeObject=Object` instead, and the typed fields are extracted on arrival, never the whole object. Replica
+  workloads get one **Ready** column ("ready/desired", a status dot, a rollout marker) in place of the server's
+  replica count columns (Desired, Current and Ready, or each kind's equivalents)
   ([ADR-0021](./adr/0021-replica-ready-column.md)): the replaced server columns are kept in the layout with a
   priority above 0, so the **Wide** toggle (which shows `priority > 0` columns) puts them back beside Ready. The
   Namespaces list gets Problems, Pods, CPU and Memory ([ADR-0020](./adr/0020-namespace-columns-and-overview.md)).
@@ -223,7 +226,7 @@ from the Pods and replica workload stores as their snapshots change (problem rul
 from each metrics-server poll (usage summed by namespace). Requests are summed from each pod's typed requests.
 While the list or an overview is open it counts as an open view of those kinds and of pod metrics, in both watch
 modes. The overview (planned, M4) is the dashboard's components with a namespace scope, plus ResourceQuota and
-LimitRange use and a YAML tab; until it lands, a row opens the detail pane.
+LimitRange limits and a YAML tab; until it lands, a row opens the detail pane.
 
 ### Watch modes
 

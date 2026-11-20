@@ -8,11 +8,8 @@ by default.
 
 - **Ready column:** ReplicaSets, Deployments, StatefulSets, DaemonSets and ReplicationControllers replace the
   server's Desired, Current and Ready (and their kind's equivalents) with one Flint-computed **Ready** column:
-  "ready/desired" and a status dot.
-  - green: all ready;
-  - amber: some not ready;
-  - red: none ready, but some wanted;
-  - grey and dimmed: 0/0.
+  "ready/desired" and a status dot. The dot is green when all are ready, amber when some are not, and red when none
+  are but some are wanted. At 0/0 it is grey and the row is dimmed.
 - Each kind uses its own status fields. For DaemonSets, desired is the desired number scheduled. Current shows only
   when it differs from desired ("1/2 · 3 current"). Kind-specific details show on hover (for Deployments: up-to-date
   and available). The column sorts by health.
@@ -39,11 +36,18 @@ by default.
 
 ## Consequences
 
-- This is Flint's first change to the columns of a built-in kind's Table. ADR-0003's server Tables stay the source for
-  every other column, and Wide shows them all.
+- This amends [ADR-0003](./0003-generic-resource-views.md): it is Flint's first change to the columns of a built-in
+  kind's Table. Server Tables stay the source for every other column, and Wide shows them all.
 - The Ready column needs status fields the Table does not carry (updated replicas for StatefulSets, the Progressing
-  condition) and the controller owner of each ReplicaSet. Rows keep these as a few typed fields per row, not the
-  whole object. The resource diagram needs the owner uid too, so whichever lands first adds it.
+  condition). Lists ask for `includeObject=Metadata` today, which carries no status, so these kinds are asked for
+  with `includeObject=Object`, and only the typed fields are kept per row, not the whole object. That costs bandwidth
+  and some memory, which the memory budgets must include. The controller owner uid is in the metadata already; the
+  resource diagram needs it too, so whichever lands first keeps it.
+- "Current" is the number of pods that exist (`status.replicas`; for DaemonSets, the current number scheduled), not
+  a StatefulSet's `currentReplicas`, which counts pods at the old revision.
+- A StatefulSet with a rolling-update partition, or a StatefulSet or DaemonSet with the `OnDelete` strategy, keeps
+  fewer pods updated than desired on purpose. Its cell shows no spinner and says "partitioned" or "on delete" on
+  hover.
 - Of the three kinds, only Deployments report a Progressing condition, so only they can show a stuck rollout.
   StatefulSets and DaemonSets show the rolling-out marker without a deadline.
 - `state.toml` gains the old-revisions toggle per cluster.

@@ -1,7 +1,6 @@
 # The resource tree shows the kinds in use and folds the rest
 
-The resource tree lists every kind discovery returns. A typical cluster serves 60 to 100 kinds, and most of them have
-no objects: Replication Controllers, Pod Templates, CSI Storage Capacities, a dozen CRD groups an operator installed.
+The resource tree lists every listable kind discovery returns. Most of them have no objects on a typical cluster: Replication Controllers, Pod Templates, CSI Storage Capacities, a dozen CRD groups an operator installed.
 The kinds the user works with are lost among them. Flint therefore shows only the kinds **in use**, and folds the
 others into a row they can open.
 
@@ -21,8 +20,8 @@ others into a row they can open.
 - **Only in watch-everything mode** ([ADR-0008](./0008-watch-everything-on-active-cluster.md)): there, the watches
   already hold every kind's objects, so the answer costs no API calls. In the opt-in "on view" mode the full tree shows
   as today, and Flint makes no extra calls to find out which kinds are in use.
-- **No counts** appear next to kind names.
-- **Search still finds everything:** hidden kinds stay reachable from the command palette and the resource switcher.
+- **No counts** appear next to kind names. A cluster set's `2/3` badge (which members serve a kind) stays.
+- **Search still finds everything:** hidden kinds stay reachable from the resource switcher (Cmd-P) and search.
 
 ## Considered Options
 
@@ -49,10 +48,13 @@ others into a row they can open.
 
 - The navigation model gains an in-use state per entry, derived from the watch caches, and the "… N more" and
   "… N empty groups" rows. Discovery still builds the full tree; folding is a view over it.
-- Kinds that can be listed but not watched have no cache to answer from. They are not in the in-use set, so they fold
-  under "N more" like forbidden kinds, without a lock.
-- A kind listed namespace by namespace (namespace-limited access) is in use when any of the namespaces Flint can list
-  has an object of it.
+- Kinds that can be listed but not watched (PodMetrics and NodeMetrics, for example) have no cache to answer from.
+  They are not in the in-use set, so they fold under "N more" like forbidden kinds, without a lock.
+- A kind listed namespace by namespace (namespace-limited access) only has objects from the namespaces Flint lists,
+  which follow the namespace filter. For these kinds alone, in use depends on the filter.
+- The Overview entry at the top of the tree ([ADR-0017](./0017-cluster-dashboards.md)) never folds.
+- A cluster set folds its tree only when every member is in watch mode All. If any member is in On view mode, the set
+  shows the full tree.
 - `state.toml` gains the expanded "… N more" rows per cluster.
 - On-view mode keeps today's full tree. A user who switches modes sees the tree change, which the mode setting's
   description says.
