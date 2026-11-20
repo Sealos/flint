@@ -101,8 +101,14 @@ pub enum LogState {
     Streaming,
     /// The stream (or a workload's pod watch) failed or ended while the container may log
     /// again; it is reopened after a backoff, without repeating lines already shown. A
-    /// workload's streams keep running meanwhile. `error` is safe to show.
-    Reconnecting { error: Option<String>, attempt: u32 },
+    /// workload's streams keep running meanwhile. `error` is safe to show. `back_off`: the pod's
+    /// status says the container is waiting in `CrashLoopBackOff`, so the wait is the kubelet's
+    /// restart back-off rather than a broken connection.
+    Reconnecting {
+        error: Option<String>,
+        attempt: u32,
+        back_off: bool,
+    },
     /// Nothing more will come: all lines were read (not following, or the previous instance),
     /// the container finished, its pod was deleted, or an error retrying cannot fix. `error`
     /// is safe to show. `pod_deleted`: a single-pod session ended because its pod was deleted
@@ -112,6 +118,24 @@ pub enum LogState {
         error: Option<String>,
         pod_deleted: bool,
     },
+}
+
+/// How an ended session's `error` starts when the kubelet could not read the previous
+/// instance's log (it answers with one line, "unable to retrieve container logs for …", early
+/// in a restart). The kubelet's line follows after `": "`.
+pub const PREVIOUS_NOT_AVAILABLE: &str = "the previous instance's logs are not available yet";
+
+impl LogState {
+    /// The kubelet's words, when the session ended because the previous instance's log is not
+    /// available (yet): see [`PREVIOUS_NOT_AVAILABLE`].
+    pub fn previous_not_available(&self) -> Option<&str> {
+        match self {
+            LogState::Ended { error: Some(e), .. } => e
+                .strip_prefix(PREVIOUS_NOT_AVAILABLE)
+                .map(|rest| rest.trim_start_matches(": ")),
+            _ => None,
+        }
+    }
 }
 
 /// What a front end shows of a session. Immutable and shared.
@@ -591,7 +615,8 @@ mod tests {
             broken.state,
             LogState::Reconnecting {
                 error: Some("still down".into()),
-                attempt: 2
+                attempt: 2,
+                back_off: false,
             }
         );
         let snapshot = run.until(|s| s.lines.end_id() == 5).await;

@@ -165,7 +165,7 @@ pub fn state_text(state: &LogState) -> (Tone, String) {
     match state {
         LogState::Connecting => (Tone::Muted, "Connecting…".to_owned()),
         LogState::Streaming => (Tone::Live, "Streaming".to_owned()),
-        LogState::Reconnecting { error, attempt } => (
+        LogState::Reconnecting { error, attempt, .. } => (
             Tone::Warning,
             match error {
                 Some(e) => format!("Reconnecting (attempt {attempt}): {e}"),
@@ -523,14 +523,16 @@ mod tests {
         assert_eq!(
             state_text(&LogState::Reconnecting {
                 error: Some("EOF".into()),
-                attempt: 3
+                attempt: 3,
+                back_off: false,
             }),
             (Tone::Warning, "Reconnecting (attempt 3): EOF".into())
         );
         assert_eq!(
             state_text(&LogState::Reconnecting {
                 error: None,
-                attempt: 1
+                attempt: 1,
+                back_off: false,
             })
             .1,
             "Reconnecting (attempt 1)"

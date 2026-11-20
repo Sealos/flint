@@ -226,6 +226,7 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
             LogState::Reconnecting {
                 error: Some("unexpected EOF".into()),
                 attempt: 2,
+                back_off: false,
             },
             false,
             0,

@@ -18,8 +18,11 @@ use k8s_openapi::jiff::Timestamp;
 use tokio::time::Sleep;
 
 use super::line::{LineSource, LogLine};
-use super::session::{LogOptions, LogSince, LogState, LogTarget};
-use super::source::{AfterEnd, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines};
+use super::session::{LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE};
+use super::source::{
+    AfterEnd, CRASH_LOOP, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines,
+    is_unavailable_notice,
+};
 
 /// Reconnect delays: `first`, doubling up to `max`.
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +124,9 @@ pub(crate) struct Stream {
     terminating: bool,
     /// An open succeeded once: the pod existed, so a later 404 means it was deleted.
     opened: bool,
+    /// The current open has delivered no line yet: a first line that is the kubelet's "unable to
+    /// retrieve container logs" is its answer, not the container's log.
+    fresh: bool,
     deadline: Option<Pin<Box<Sleep>>>,
     /// The stream ended on an error about the cluster rather than this container.
     cluster_error: bool,
@@ -164,6 +170,7 @@ impl Stream {
             deleted: false,
             terminating: false,
             opened: false,
+            fresh: false,
             deadline: None,
             cluster_error: false,
         };
@@ -242,12 +249,27 @@ impl Stream {
     pub fn handle(&mut self, step: Step, out: &mut dyn FnMut(LogLine)) -> bool {
         self.changed = false;
         let next = match step {
+            // The kubelet could not read the log: for the previous instance that is all there
+            // is (until the restart settles); the current one is tried again.
+            Step::Line(Ok(raw)) if self.fresh && is_unavailable_notice(&raw.text) => {
+                self.fresh = false;
+                let notice = raw.text.trim_end().to_owned();
+                if self.draining {
+                    self.drained()
+                } else if self.options.previous {
+                    self.end(Some(format!("{PREVIOUS_NOT_AVAILABLE}: {notice}")))
+                } else {
+                    self.retry(Some(LogError::retry(notice)))
+                }
+            }
             Step::Line(Ok(raw)) => {
+                self.fresh = false;
                 self.push(raw, out);
                 return false;
             }
             Step::Opened(Ok(lines)) => {
                 self.opened = true;
+                self.fresh = true;
                 self.set_state(LogState::Streaming);
                 Phase::Read(lines)
             }
@@ -295,6 +317,7 @@ impl Stream {
                 Phase::CheckEnd(self.source.after_end(&self.target, uid))
             }
             Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(None),
+            Step::AfterEnd(Ok(AfterEnd::BackOff)) => self.wait(None, true),
             Step::AfterEnd(Ok(AfterEnd::Terminating)) => {
                 self.terminating = self.member.is_none();
                 self.retry(None)
@@ -426,8 +449,17 @@ impl Stream {
         }
     }
 
-    /// Waits before reopening the stream.
+    /// Waits before reopening the stream. An error that names `CrashLoopBackOff` is the
+    /// kubelet's back-off.
     fn retry(&mut self, error: Option<LogError>) -> Phase {
+        let back_off = error
+            .as_ref()
+            .is_some_and(|e| e.message.contains(CRASH_LOOP));
+        self.wait(error, back_off)
+    }
+
+    /// Waits before reopening the stream; `back_off`: the container waits in `CrashLoopBackOff`.
+    fn wait(&mut self, error: Option<LogError>, back_off: bool) -> Phase {
         self.attempts += 1;
         let delay = self.backoff.delay(self.attempts);
         if let Some(e) = &error {
@@ -436,6 +468,7 @@ impl Stream {
         self.set_state(LogState::Reconnecting {
             error: error.map(|e| e.message),
             attempt: self.attempts,
+            back_off,
         });
         Phase::Wait(Box::pin(tokio::time::sleep(delay)))
     }
@@ -672,6 +705,78 @@ mod tests {
             }
         );
         assert_eq!(*plain.uids.lock().unwrap(), [None]);
+    }
+
+    /// A stream reading the previous instance (`previous`) or following the current one.
+    fn previous_stream(lines: &[&str], previous: bool) -> Stream {
+        let mut s = stream_on(fixed(lines, true), None);
+        s.options.previous = previous;
+        s
+    }
+
+    // covers UP-40: the kubelet's "unable to retrieve container logs" answer, sent as the log's
+    // only line while a container restarts, ends a previous-instance session with a reason
+    // instead of showing as line 1; for the current instance it is tried again.
+    #[tokio::test(start_paused = true)]
+    async fn the_kubelets_unavailable_answer_is_not_a_line() {
+        let notice = "unable to retrieve container logs for containerd://c54f232e5b";
+        let mut previous = previous_stream(&[notice], true);
+        assert!(drain(&mut previous).await.is_empty());
+        assert_eq!(
+            previous.state().previous_not_available(),
+            Some(notice),
+            "{:?}",
+            previous.state()
+        );
+        assert!(previous.is_done());
+
+        let mut current = previous_stream(&[notice], false);
+        assert!(drain(&mut current).await.is_empty());
+        assert!(matches!(
+            current.state(),
+            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false } if e == notice
+        ));
+
+        // Only as the first line of a read: later, the same words are the container's.
+        let mut logged = previous_stream(&["2024-05-01T12:00:00Z hello", notice], true);
+        assert_eq!(drain(&mut logged).await.len(), 2);
+        assert_eq!(logged.state().previous_not_available(), None);
+    }
+
+    // covers UP-40: a container in CrashLoopBackOff is waited for as the kubelet's back-off.
+    #[tokio::test(start_paused = true)]
+    async fn a_crash_loop_waits_as_a_back_off() {
+        let mut s = stream(&[], None);
+        drain(&mut s).await;
+        s.handle(Step::AfterEnd(Ok(AfterEnd::BackOff)), &mut |_| {});
+        assert_eq!(
+            s.state(),
+            &LogState::Reconnecting {
+                error: None,
+                attempt: 1,
+                back_off: true
+            }
+        );
+        let mut starting = stream(&[], None);
+        starting.handle(
+            Step::Opened(Err(LogError::retry(
+                "BadRequest: container \"app\" in pod \"p\" is waiting to start: CrashLoopBackOff",
+            ))),
+            &mut |_| {},
+        );
+        assert!(matches!(
+            starting.state(),
+            LogState::Reconnecting { back_off: true, .. }
+        ));
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Restarts)), &mut |_| {});
+        assert!(matches!(
+            s.state(),
+            LogState::Reconnecting {
+                back_off: false,
+                attempt: 2,
+                ..
+            }
+        ));
     }
 
     // covers UP-40

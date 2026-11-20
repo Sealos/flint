@@ -273,6 +273,7 @@ impl WorkloadFeed {
         self.state = LogState::Reconnecting {
             error: error.map(|e| e.message),
             attempt: self.attempts,
+            back_off: false,
         };
         self.watch = Watch::Wait(Box::pin(tokio::time::sleep(delay)));
     }
@@ -1051,6 +1052,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Reconnecting {
+                back_off: false,
                 error: Some("watch reset".into()),
                 attempt: 1
             }

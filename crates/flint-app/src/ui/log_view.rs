@@ -902,7 +902,7 @@ impl LogView {
                     None,
                 ),
                 LogState::Streaming => (false, theme.muted_foreground, "Reading…", None),
-                LogState::Reconnecting { error, attempt } => (
+                LogState::Reconnecting { error, attempt, .. } => (
                     true,
                     theme.warning,
                     "Reconnecting…",
