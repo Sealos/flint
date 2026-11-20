@@ -686,6 +686,10 @@ impl CommandPalette {
     }
 
     fn move_by(&mut self, step: isize, cx: &mut Context<Self>) {
+        // With no rows to move through, nothing was chosen: a kept item stays kept.
+        if self.rows.is_empty() {
+            return;
+        }
         self.selected = palette_model::step(self.selected, self.rows.len(), step);
         self.chosen = true;
         self.kept = None;
