@@ -1,0 +1,299 @@
+//! View tests for the AI scope in the Expose to AI dialog and the Edit AI Scope dialog
+//! (UP-14): the pickers are fed from discovery and the cluster's namespaces, what is checked is
+//! written with the exposure in one change, and the sidebar's AI tag opens the scope again.
+
+use flint_core::settings::AiScope;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{AppContext as _, TestAppContext};
+use serde_json::{Value, json};
+
+use super::super::{expose_dialog, scope_dialog};
+use crate::ui::registry::ActionError;
+use crate::ui::support_tests::{TestWorkspace, WAIT, open_workspace, standard_sections};
+
+async fn wait_for_dialog(cx: &mut TestAppContext, t: &TestWorkspace, open: bool) {
+    cx.wait_for(t.window, WAIT, move |window, cx| {
+        gpui_kit::component::WindowExt::has_active_dialog(window, cx) == open
+    })
+    .await;
+}
+
+/// Clicks `id` and draws a frame, so what the click changed is on screen.
+fn click(cx: &mut TestAppContext, t: &TestWorkspace, id: &'static str) {
+    t.click(cx, id);
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn scope_of(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<AiScope> {
+    t.model.read_with(cx, |m, _| {
+        m.clusters
+            .iter()
+            .find(|c| c.info.name == "alpha")
+            .and_then(|c| m.ai_scope(c))
+    })
+}
+
+async fn wait_for_scope(cx: &mut TestAppContext, t: &TestWorkspace, wanted: AiScope) {
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let m = model.read(cx);
+        m.clusters
+            .iter()
+            .find(|c| c.info.name == "alpha")
+            .and_then(|c| m.ai_scope(c))
+            == Some(wanted.clone())
+    })
+    .await;
+}
+
+fn scope(namespaces: &[&str], kinds: &[&str]) -> AiScope {
+    AiScope::new(
+        namespaces.iter().map(|s| (*s).to_owned()).collect(),
+        kinds.iter().map(|s| (*s).to_owned()).collect(),
+    )
+}
+
+// covers UP-14: exposing offers the cluster's namespaces and kinds; what is checked is written
+// with the exposure. The AI tag then says what agents may read and opens Edit AI Scope, whose
+// pickers show the scope; clearing it exposes everything again, in one rewrite of the entry.
+#[gpui_kit::test]
+async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, standard_sections()).await;
+    t.workspace.update(cx, |ws, _| {
+        ws.namespaces = vec!["demo".into(), "shop".into()];
+    });
+
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert_eq!(
+        t.label(cx, "expose-description"),
+        Some(expose_dialog("alpha", &t.server, None).text)
+    );
+    for id in [
+        "scope-ns-all",
+        "scope-ns-demo",
+        "scope-ns-shop",
+        "scope-kind-all",
+        "scope-kind-pods",
+        "scope-kind-deployments.apps",
+        "scope-kind-nodes",
+    ] {
+        assert!(t.find(cx, id).is_some(), "{id}");
+    }
+    assert!(t.find(cx, "scope-cluster-wide-note").is_none());
+    click(cx, &t, "scope-ns-shop");
+    assert!(t.find(cx, "scope-cluster-wide-note").is_some());
+    click(cx, &t, "scope-kind-pods");
+    click(cx, &t, "scope-kind-nodes");
+    click(cx, &t, "scope-kind-pods");
+    click(cx, &t, "scope-kind-deployments.apps");
+    // Nothing is written before confirming.
+    assert!(!t.settings_toml().contains("alpha"));
+    t.click(cx, "ok");
+    wait_for_scope(cx, &t, scope(&["shop"], &["deployments.apps", "nodes"])).await;
+    wait_for_dialog(cx, &t, false).await;
+    let toml = t.settings_toml();
+    assert!(
+        toml.contains("namespaces = [\"shop\"]") && toml.contains(&t.server),
+        "{toml}"
+    );
+
+    // The AI tag says what agents may read, and opens the scope again with it checked.
+    let tip = t.description(cx, "ai-scope-alpha").unwrap_or_default();
+    assert!(
+        tip.contains("namespaces shop; kinds deployments.apps, nodes"),
+        "{tip}"
+    );
+    assert_eq!(t.label(cx, "ai-scope-alpha").as_deref(), Some("AI·"));
+    t.click(cx, "ai-scope-alpha");
+    wait_for_dialog(cx, &t, true).await;
+    let saved = scope(&["shop"], &["deployments.apps", "nodes"]);
+    assert_eq!(
+        t.label(cx, "scope-description"),
+        Some(scope_dialog("alpha", &t.server, &saved).text)
+    );
+    assert_eq!(t.label(cx, "ok").as_deref(), Some("Save"));
+    // Escape keeps the scope.
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    assert_eq!(scope_of(cx, &t), Some(saved));
+
+    // Clearing both pickers exposes everything again.
+    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    click(cx, &t, "scope-ns-all");
+    click(cx, &t, "scope-kind-all");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, AiScope::default()).await;
+    let toml = t.settings_toml();
+    assert!(
+        !toml.contains("namespaces") && toml.contains("alpha"),
+        "{toml}"
+    );
+    assert_eq!(t.label(cx, "ai-scope-alpha").as_deref(), Some("AI"));
+}
+
+// covers UP-14: only an exposed cluster has a scope to edit; a cluster that is not connected
+// still shows its saved scope in the pickers, with a word on how to list more.
+#[gpui_kit::test]
+async fn edit_ai_scope_needs_an_exposed_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    assert!(matches!(
+        t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"})),
+        Err(ActionError::Rejected { .. })
+    ));
+    assert!(t.find(cx, "ai-scope-alpha").is_none());
+    let server = t.server.clone();
+    t.model.update(cx, |m, _| {
+        m.expose_to_ai("alpha".into(), server, scope(&["shop"], &["pods"]))
+    });
+    wait_for_scope(cx, &t, scope(&["shop"], &["pods"])).await;
+    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    for id in ["scope-ns-shop", "scope-kind-pods"] {
+        assert!(t.find(cx, id).is_some(), "{id}");
+    }
+    assert!(t.find(cx, "scope-ns-demo").is_none());
+}
+
+// covers UP-14: a namespace can be typed by name (a cluster that is not the active one, or
+// whose namespaces cannot be listed); Enter in the field adds it without closing the dialog.
+#[gpui_kit::test]
+async fn a_namespace_can_be_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert!(t.find(cx, "scope-ns-empty").is_some());
+    click(cx, &t, "scope-ns-add");
+    t.type_text(cx, " billing ");
+    t.press(cx, "enter");
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        t.has_dialog(cx),
+        "Enter in the field adds, it does not confirm"
+    );
+    assert!(t.find(cx, "scope-ns-billing").is_some());
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["billing"], &[])).await;
+}
+
+// covers UP-14: exposing a re-pointed context again starts from the scope it had, so one click
+// never widens it; saving a scope never exposes a cluster hidden while the dialog was open.
+#[gpui_kit::test]
+async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "[[ai_exposed_clusters]]\ncontext = \"alpha\"\nserver = \"https://10.0.0.1:6443\"\n\
+         namespaces = [\"shop\"]\nkinds = [\"pods\"]\n",
+    )
+    .unwrap();
+    let t = crate::ui::support_tests::open_workspace_with(
+        cx,
+        dir.path(),
+        crate::ui::support_tests::alpha_and_beta,
+    )
+    .await;
+    assert_eq!(scope_of(cx, &t), None, "re-pointed: not exposed");
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["shop"], &["pods"])).await;
+
+    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    t.model.update(cx, |m, _| m.hide_from_ai("alpha".into()));
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.ai_exposed_clusters.is_empty()
+    })
+    .await;
+    click(cx, &t, "scope-ns-all");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).last_error.is_some()
+    })
+    .await;
+    assert!(
+        t.model
+            .read_with(cx, |m, _| m.settings.ai_exposed_clusters.is_empty())
+    );
+    assert!(!t.settings_toml().contains("alpha"));
+}
+
+// covers UP-14: confirming with a namespace still typed in the field adds it first; one that is
+// not a namespace name keeps the dialog open, saying why, and exposes nothing.
+#[gpui_kit::test]
+async fn text_left_in_the_namespace_field_is_never_dropped(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    click(cx, &t, "scope-ns-add");
+    t.type_text(cx, "Not/A Namespace");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(t.has_dialog(cx), "kept open");
+    let error = t.label(cx, "scope-ns-error").unwrap_or_default();
+    assert!(error.contains("is not a namespace name"), "{error}");
+    assert_eq!(scope_of(cx, &t), None, "nothing exposed");
+
+    // Fixed, and confirmed without pressing Enter: the name is added first.
+    click(cx, &t, "scope-ns-add");
+    t.press(cx, "secondary-a");
+    t.type_text(cx, "shop");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["shop"], &[])).await;
+}
+
+// covers UP-14: Edit AI Scope saves only if the scope on disk is still the one it opened with.
+#[gpui_kit::test]
+async fn a_scope_changed_on_disk_is_not_overwritten(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let server = t.server.clone();
+    t.model.update(cx, |m, _| {
+        m.expose_to_ai("alpha".into(), server, scope(&["shop"], &[]))
+    });
+    wait_for_scope(cx, &t, scope(&["shop"], &[])).await;
+    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    // Meanwhile, another change of the scope lands (by hand, or another Flint).
+    let server = t.server.clone();
+    t.model.update(cx, |m, _| {
+        m.expose_to_ai("alpha".into(), server, scope(&["billing"], &[]))
+    });
+    wait_for_scope(cx, &t, scope(&["billing"], &[])).await;
+    click(cx, &t, "scope-ns-all");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).last_error.is_some()
+    })
+    .await;
+    let error = t.model.read_with(cx, |m, _| m.last_error.clone()).unwrap();
+    assert!(
+        error.contains("changed while it was being edited"),
+        "{error}"
+    );
+    assert_eq!(scope_of(cx, &t), Some(scope(&["billing"], &[])));
+}

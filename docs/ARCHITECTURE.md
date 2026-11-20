@@ -705,7 +705,7 @@ settings the same way the app does, and serves these read-only tools:
 
 | Tool | Returns |
 |---|---|
-| `list_clusters` | Clusters marked Expose to AI: name, server, and whether a connection works |
+| `list_clusters` | Clusters marked Expose to AI: name, server, whether a connection works, and the scope when one is set |
 | `list_resource_kinds` | Kinds found by discovery for a cluster, CRDs included |
 | `list_resources` | Objects of a kind as Table rows (the `kubectl get -o wide` columns, CRD printer columns included), with namespace and label selector filters |
 | `get_resource` | One object as YAML |
@@ -728,10 +728,48 @@ Rules:
   server's, naming only what the caller sent. Discovery likewise leaves out any resource whose group, version or
   plural is not a valid single path segment. RBAC names that are not DNS-1123 and use other characters (spaces, `+`, `~`, non-ASCII)
   cannot be read this way.
-- **Scope (planned, M5.5, #67):** an exposed cluster will also be able to list the namespaces and kinds an agent may
-  read ([ADR-0013](./adr/0013-agent-trust-model.md)). Empty will mean everything. Requests outside the scope will fail
-  like an unexposed cluster. With a namespace scope, cluster-scoped kinds will be hidden unless the kinds scope names
-  them. Not built yet: today an exposed cluster is readable in full.
+- **Scope (#67):** an exposed cluster's entry may list the namespaces and kinds an agent may read
+  ([ADR-0013](./adr/0013-agent-trust-model.md)): `namespaces` and `kinds` (kind ids, `pods`, `deployments.apps`) on
+  its `ai_exposed_clusters` entry (`settings::AiExposure`, `settings::AiScope`). Missing or empty means everything,
+  so entries written before scopes load unchanged. The file is refused (nothing is exposed) rather than read as
+  everything when an entry has a key it does not know (`namespace` for `namespaces`; the error names it), when a list
+  names only blank entries, or when two entries name the same context and server (the first would decide). A Flint
+  older than this reads a scoped entry as the whole cluster: an agent configured with an old `flint mcp` binary is
+  not limited. The policy (`flint-mcp`'s `policy.rs`) applies it to every tool, after the names are checked (above),
+  so a name that is not valid gets the same not-found scoped or not:
+  - `list_clusters` reports a cluster's scope, so the agent asks within it, and its default namespace only when
+    the scope allows it;
+  - `list_resource_kinds` lists only kinds in scope; with a namespace scope, cluster-scoped kinds (nodes, namespaces,
+    CRDs) only when the kinds scope names them;
+  - `list_resources` and `get_resource` resolve kinds among those in scope only, and check the namespace; a list
+    across all namespaces on a namespace-scoped cluster lists each namespace of the scope in turn, with no continue
+    token (the agent pages one namespace at a time; a server token could name objects outside the scope); when the
+    namespaces' pages come with different columns, every row falls back to the plain layout (name, namespace, age);
+  - `get_events` follows the namespace scope the same way, and drops events about objects of kinds out of scope
+    (looked up in discovery by Kind and group; a kind discovery does not list is dropped on a scoped cluster); an
+    `object_kind` out of scope fails before anything is fetched, and `truncated` counts only events in scope. On a
+    scoped cluster, events are read only this way: the event kinds (`events`, `events.events.k8s.io`) are out of
+    scope for `list_resources` and `get_resource`, even when named, since an event in an allowed namespace can be
+    about a node or a Secret the scope hides;
+  - `get_pod_logs` needs pods and the pod's namespace in scope.
+
+  Anything outside the scope, including a kind that does not exist on a scoped cluster, fails with the very error of
+  a cluster that is not exposed (`policy::out_of_scope`), so an agent cannot tell what exists beyond its scope. The
+  app edits the scope in the Expose to AI dialog and in Edit AI Scope (`workspace::EditAiScope`, from the sidebar's
+  "AI" badge, which reads "AI·" when the cluster is scoped, or the palette). Both show pickers
+  (`ui/scope_picker.rs`): the cluster's listable kinds from discovery and, for the active cluster, its namespaces,
+  plus whatever the scope already names, and a field to add a namespace by name (for another cluster, or one whose
+  namespaces cannot be listed). Exposing writes the entry and its scope in one rewrite of `settings.toml`
+  (`Command::SetAiExposed`, which, as before, writes nothing if the context moved since the dialog opened); exposing
+  a re-pointed context again starts from the scope its old entry had. Edit AI Scope saves through
+  `Command::SetAiScope` (`settings::set_ai_scope`), which changes the lists of an entry the file still holds for that
+  context and server, with the scope the dialog opened with: it never exposes a cluster hidden while the dialog was
+  open, nor overwrites a scope changed on disk meanwhile (it says to open the dialog again). A namespace still typed
+  in the field is added on confirming; text that is not a namespace name keeps the dialog open, saying why. The
+  kind picker does not offer the event kinds: events follow the namespaces and kinds chosen.
+  - What a scope cannot hide: text in objects the agent may read can still name things outside it, such as the node
+    a pod runs on (`spec.nodeName`, a scheduling event's message). Naming `namespaces` in the kinds scope shows every
+    namespace's name.
 - **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept. The
   items of a `SecretList`, which carry no `kind`, and whatever is read as a Secret are redacted the same way.
   `metadata.managedFields` is removed from all output.

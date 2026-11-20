@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flint_core::settings::{AiExposureState, TrustState};
+use flint_core::settings::{AiExposureState, AiScope, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
     Event, Protection, Settings, WatchMode,
@@ -127,12 +127,38 @@ impl ClustersModel {
         self.core.send(command);
     }
 
-    /// Exposes `cluster` at `server`, the URL the user confirmed.
-    pub fn expose_to_ai(&mut self, cluster: ClusterId, server: String) {
+    /// Exposes `cluster` at `server`, the URL the user confirmed, limited to `scope`
+    /// (ADR-0013). For a cluster exposed already, this rewrites its entry with the new scope.
+    pub fn expose_to_ai(&mut self, cluster: ClusterId, server: String, scope: AiScope) {
         self.send(Command::SetAiExposed {
             cluster,
             server: Some(server),
+            scope,
         });
+    }
+
+    /// Changes what AI agents may read of `cluster`, exposed at `server`, from `from` (the scope
+    /// the dialog opened with) to `scope`. Never exposes it: if it was hidden or re-pointed
+    /// meanwhile, or its scope changed on disk, nothing is written.
+    pub fn set_ai_scope(
+        &mut self,
+        cluster: ClusterId,
+        server: String,
+        from: AiScope,
+        scope: AiScope,
+    ) {
+        self.send(Command::SetAiScope {
+            cluster,
+            server,
+            from,
+            scope,
+        });
+    }
+
+    /// What AI agents may read of `cluster`, if it is exposed at the server it points at now.
+    pub fn ai_scope(&self, cluster: &ClusterSummary) -> Option<AiScope> {
+        self.settings
+            .ai_scope(&cluster.info.name, cluster.info.server.as_deref())
     }
 
     /// Sets the global watch mode (`cluster: None`), or a cluster's override (`mode: None`
@@ -166,6 +192,7 @@ impl ClustersModel {
         self.send(Command::SetAiExposed {
             cluster,
             server: None,
+            scope: AiScope::default(),
         });
     }
 

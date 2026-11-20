@@ -24,6 +24,12 @@ See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP client
   or has the same name in another `KUBECONFIG`, is not exposed until you expose it again. The list is read again on
   every call, so a change in the app applies to the next call without restarting the agent. A call naming any other
   cluster fails as if it did not exist.
+- **Only the namespaces and kinds you choose.** The Expose to AI dialog (and Edit AI Scope, from the "AI" badge or the
+  palette) can limit a cluster to some namespaces and kinds. With namespaces chosen, cluster-wide kinds such as nodes
+  are hidden unless you check them. Lists across all namespaces, events and pod logs stay inside the scope, and a
+  request outside it fails exactly as for a cluster that is not exposed, so an agent cannot probe what else exists.
+  Text the agent may read can still name things outside the scope (the node a pod runs on), and an older `flint mcp`
+  binary ignores scopes, so point agents at the Flint you configure.
 - **Read-only.** The tools list clusters, resource kinds, objects, events, and pod logs, and nothing else: no tool
   creates, changes, or deletes anything, and there is no exec or port-forward.
 - **Credentials redacted.** Secret values are always redacted. In pod logs, event messages, other message fields
@@ -75,7 +81,7 @@ As their documentation describes them in November 2026:
 
 | | Flint (`flint mcp`) | [Lens MCP Server](https://docs.lenshq.io/k8slens/mcp-server/) | [kubernetes-mcp-server](https://github.com/containers/kubernetes-mcp-server) |
 |---|---|---|---|
-| Which clusters | Only those you expose, one by one, each tied to its API server URL | Every cluster Lens knows | The contexts in its kubeconfig |
+| Which clusters | Only those you expose, one by one, each tied to its API server URL, optionally limited to some namespaces and kinds | Every cluster Lens knows | The contexts in its kubeconfig |
 | Writes | None: no tools for them | Its `kubectl` tool refuses writes; editors and Helm dialogs it fills in apply changes after you confirm; some tools change Lens itself (port forwards, settings) | Writes allowed, including delete and pod exec, unless its `read_only` or `disable_destructive` setting is on |
 | Credential redaction in results | Secret values, and credentials in logs, events, messages and container arguments | Not described | Not for tool results (only its own log notifications); Secrets can be denied by configuration |
 
@@ -285,6 +291,8 @@ watch_mode = "all"                # or "on_view"
 # [[ai_exposed_clusters]]
 # context = "kind-flint-dev"
 # server = "https://127.0.0.1:6443"
+# namespaces = ["shop"]          # optional: only these namespaces (empty or missing: all)
+# kinds = ["pods", "deployments.apps"]  # optional: only these kinds (empty or missing: all)
 
 # Clusters Flint may change (and open shells in) without asking, written by Trust This Cluster in
 # the sidebar's lock menu. Pinned to the server like exposure: a re-pointed context is protected

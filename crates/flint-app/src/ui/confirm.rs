@@ -40,6 +40,22 @@ pub fn open(
     dialog: DialogText,
     on_ok: impl Fn(&mut Window, &mut App) + 'static,
 ) {
+    open_with(window, cx, dialog, None, move |window, cx| {
+        on_ok(window, cx);
+        true
+    });
+}
+
+/// [`open`], with `content` (a view of its own, such as pickers) drawn under the text, and an
+/// `on_ok` that may keep the dialog open (`false`), when the content says why it cannot be
+/// confirmed yet.
+pub fn open_with(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    content: Option<AnyView>,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
     #[cfg(any(test, feature = "automation"))]
     remember(window, dialog.clone(), cx);
     let on_ok = Rc::new(on_ok);
@@ -63,6 +79,7 @@ pub fn open(
                     .id(dialog.id)
                     .aria_label(dialog.text.clone())
                     .child(dialog.text.clone())
+                    .when_some(content.clone(), |this, content| this.child(content))
                     .when_some(default_cancel.as_ref(), |this, focus| {
                         this.track_focus(focus).key_context(DEFAULT_CANCEL)
                     })
@@ -75,10 +92,7 @@ pub fn open(
                 this.keyboard(false)
                     .footer(default_cancel_footer(&dialog, focus))
             })
-            .on_ok(move |_, window, cx| {
-                on_ok(window, cx);
-                true
-            })
+            .on_ok(move |_, window, cx| on_ok(window, cx))
     });
     // The dialog took focus as it opened: hand it on to the description.
     if let Some(focus) = focus {

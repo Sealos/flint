@@ -30,6 +30,17 @@ pub enum SettingsError {
     Serialize(#[from] toml::ser::Error),
     #[error("neither FLINT_CONFIG_DIR nor HOME is set")]
     NoConfigDir,
+    /// The file parses but says something Flint will not guess at.
+    #[error("invalid {path}: {reason}")]
+    Invalid { path: PathBuf, reason: String },
+    /// A scope change for a cluster that is no longer exposed at that server.
+    #[error("\"{context}\" is no longer exposed to AI agents at that server")]
+    NotExposed { context: String },
+    /// A scope change made from a scope that has changed on disk since.
+    #[error(
+        "the AI scope of \"{context}\" changed while it was being edited; open Edit AI Scope again"
+    )]
+    ScopeChanged { context: String },
 }
 
 /// Which kinds are watched while a cluster is active (ADR-0008).
@@ -78,8 +89,105 @@ impl ClusterPin {
     }
 }
 
-/// One cluster the user exposed to AI agents (ADR-0009), pinned to its server.
-pub type AiExposure = ClusterPin;
+/// One cluster the user exposed to AI agents (ADR-0009), pinned to its server like a
+/// [`ClusterPin`], and what agents may read of it (ADR-0013). An entry written before scopes
+/// existed has neither list, and exposes the whole cluster as it did.
+///
+/// Unknown keys are refused (`namespace` for `namespaces`): a misspelt scope would otherwise be
+/// ignored and expose the whole cluster, so the file is treated as unreadable instead.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiExposure {
+    pub context: String,
+    pub server: String,
+    /// The namespaces agents may read. Empty: every namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespaces: Vec<String>,
+    /// The kinds agents may read, as kind ids (`pods`, `deployments.apps`). Empty: every kind
+    /// (but with a namespace scope, cluster-scoped kinds only when named here).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+}
+
+impl AiExposure {
+    /// The whole cluster exposed at `server`.
+    pub fn new(context: impl Into<String>, server: impl Into<String>) -> Self {
+        Self {
+            context: context.into(),
+            server: server.into(),
+            ..Self::default()
+        }
+    }
+
+    /// What agents may read of the cluster.
+    pub fn scope(&self) -> AiScope {
+        AiScope::new(self.namespaces.clone(), self.kinds.clone())
+    }
+
+    fn pin(&self) -> ClusterPin {
+        ClusterPin::new(&self.context, &self.server)
+    }
+}
+
+/// What agents may read of an exposed cluster (ADR-0013): namespaces and kinds. Empty lists
+/// mean everything. With a namespace scope, cluster-scoped kinds are readable only when the
+/// kinds scope names them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AiScope {
+    /// Sorted, without repeats or empty names.
+    pub namespaces: Vec<String>,
+    /// Kind ids (`pods`, `deployments.apps`), lowercase, sorted, without repeats.
+    pub kinds: Vec<String>,
+}
+
+impl AiScope {
+    /// A scope of `namespaces` and `kinds`, cleaned up: names trimmed, kinds lowercased,
+    /// empty ones and repeats dropped, both sorted.
+    pub fn new(namespaces: Vec<String>, kinds: Vec<String>) -> Self {
+        let clean = |names: Vec<String>, lower: bool| {
+            let mut names: Vec<String> = names
+                .into_iter()
+                .map(|n| {
+                    let n = n.trim();
+                    if lower {
+                        n.to_lowercase()
+                    } else {
+                        n.to_owned()
+                    }
+                })
+                .filter(|n| !n.is_empty())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        Self {
+            namespaces: clean(namespaces, false),
+            kinds: clean(kinds, true),
+        }
+    }
+
+    /// Everything: no namespace or kind limit.
+    pub fn is_everything(&self) -> bool {
+        self.namespaces.is_empty() && self.kinds.is_empty()
+    }
+
+    /// Whether agents may read objects in `namespace`.
+    pub fn allows_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.is_empty() || self.namespaces.iter().any(|n| n == namespace)
+    }
+
+    /// Whether agents may read the kind with id `kind` (`pods`, `deployments.apps`), which is
+    /// `namespaced` or cluster-scoped. A cluster-scoped kind under a namespace scope must be
+    /// named in the kinds scope.
+    pub fn allows_kind(&self, kind: &str, namespaced: bool) -> bool {
+        let named = self.kinds.iter().any(|k| k.eq_ignore_ascii_case(kind));
+        if !namespaced && !self.namespaces.is_empty() {
+            return named;
+        }
+        self.kinds.is_empty() || named
+    }
+}
 
 /// One cluster the user trusts (ADR-0015): unlocked across restarts, pinned to its server.
 pub type TrustedCluster = ClusterPin;
@@ -124,13 +232,13 @@ impl TrustState {
 /// Where `context`, now at `server`, stands in a list of pins: `None` when the list does not
 /// name it, `Some(Ok(()))` when a pin matches, `Some(Err(pinned))` when it names the context
 /// only at another server (`pinned`). A context with no server never matches.
-fn pin_state(
-    pins: &[ClusterPin],
+fn pin_state<'a>(
+    pins: impl IntoIterator<Item = std::borrow::Cow<'a, ClusterPin>>,
     context: &str,
     server: Option<&str>,
 ) -> Option<Result<(), String>> {
     let mut changed = None;
-    for pin in pins.iter().filter(|p| p.context == context) {
+    for pin in pins.into_iter().filter(|p| p.context == context) {
         if server.is_some_and(|s| pin.matches(context, s)) {
             return Some(Ok(()));
         }
@@ -231,17 +339,41 @@ impl Settings {
     /// Whether `context`, currently pointing at `server`, is exposed to AI agents. A context with
     /// no server (its cluster entry is missing) is never exposed.
     pub fn ai_exposure(&self, context: &str, server: Option<&str>) -> AiExposureState {
-        match pin_state(&self.ai_exposed_clusters, context, server) {
+        let pins = self
+            .ai_exposed_clusters
+            .iter()
+            .map(|e| std::borrow::Cow::Owned(e.pin()));
+        match pin_state(pins, context, server) {
             Some(Ok(())) => AiExposureState::Exposed,
             Some(Err(exposed_server)) => AiExposureState::ServerChanged { exposed_server },
             None => AiExposureState::Hidden,
         }
     }
 
+    /// The scope saved for `context` at whatever server it was exposed at: what a re-pointed
+    /// context's entry still says, to start from when exposing it again.
+    pub fn ai_scope_saved(&self, context: &str) -> Option<AiScope> {
+        self.ai_exposed_clusters
+            .iter()
+            .find(|e| e.context == context)
+            .map(AiExposure::scope)
+    }
+
+    /// What agents may read of `context`, if it is exposed at `server` (ADR-0013). `None` when it
+    /// is not exposed there.
+    pub fn ai_scope(&self, context: &str, server: Option<&str>) -> Option<AiScope> {
+        let server = server?;
+        self.ai_exposed_clusters
+            .iter()
+            .find(|e| e.pin().matches(context, server))
+            .map(AiExposure::scope)
+    }
+
     /// Whether `context`, currently pointing at `server`, is trusted (ADR-0015). A context with
     /// no server (its cluster entry is missing) is never trusted.
     pub fn trust(&self, context: &str, server: Option<&str>) -> TrustState {
-        match pin_state(&self.trusted_clusters, context, server) {
+        let pins = self.trusted_clusters.iter().map(std::borrow::Cow::Borrowed);
+        match pin_state(pins, context, server) {
             Some(Ok(())) => TrustState::Trusted,
             Some(Err(trusted_server)) => TrustState::ServerChanged { trusted_server },
             None => TrustState::NotTrusted,
@@ -374,6 +506,7 @@ fn config_dir_from(
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
     let settings = load_toml(&path)?;
+    validate(&settings, &path)?;
     // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
     // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
     if let Ok(text) = std::fs::read_to_string(&path)
@@ -386,6 +519,46 @@ pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
         }
     }
     Ok(settings)
+}
+
+/// Refuses what parses but cannot be taken at its word: a scope list (`namespaces`, `kinds`)
+/// that names only blank entries. It was clearly meant to limit the cluster, and read as empty
+/// it would expose everything, so the whole file is treated as unreadable instead.
+fn validate(settings: &Settings, path: &Path) -> Result<(), SettingsError> {
+    // Two entries for one context and server: the first one found would decide, and an
+    // unscoped copy could undo a scope.
+    let entries = &settings.ai_exposed_clusters;
+    let duplicate = entries.iter().enumerate().find_map(|(i, e)| {
+        entries[..i]
+            .iter()
+            .any(|other| other.pin().matches(&e.context, &e.server))
+            .then_some(e)
+    });
+    if let Some(e) = duplicate {
+        return Err(SettingsError::Invalid {
+            path: path.to_owned(),
+            reason: format!(
+                "\"{}\" is listed twice in ai_exposed_clusters for the same server; keep one entry",
+                e.context
+            ),
+        });
+    }
+    let blank = |names: &[String]| !names.is_empty() && names.iter().all(|n| n.trim().is_empty());
+    match settings
+        .ai_exposed_clusters
+        .iter()
+        .find(|e| blank(&e.namespaces) || blank(&e.kinds))
+    {
+        Some(entry) => Err(SettingsError::Invalid {
+            path: path.to_owned(),
+            reason: format!(
+                "the AI scope of \"{}\" lists only blank names; remove the list to expose \
+                 everything, or name what agents may read",
+                entry.context
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The top-level keys of [`Settings`].
@@ -470,8 +643,84 @@ pub fn set_ai_exposed(
     dir: &Path,
     context: &str,
     server: Option<&str>,
+    scope: &AiScope,
 ) -> Result<Settings, SettingsError> {
-    set_pin(dir, "ai_exposed_clusters", context, server)
+    edit_settings(dir, |table, path| {
+        let mut current: Vec<AiExposure> = match table.get("ai_exposed_clusters") {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(|source| SettingsError::Parse {
+                    path: path.to_owned(),
+                    source,
+                })?,
+            None => Vec::new(),
+        };
+        current.retain(|e| e.context != context);
+        if let Some(server) = server {
+            current.push(AiExposure {
+                context: context.to_owned(),
+                server: server.to_owned(),
+                namespaces: scope.namespaces.clone(),
+                kinds: scope.kinds.clone(),
+            });
+        }
+        current.sort();
+        table.insert(
+            "ai_exposed_clusters".into(),
+            toml::Value::try_from(&current)?,
+        );
+        Ok(())
+    })
+}
+
+/// Changes what agents may read of `context`, exposed at `server`, from `from` (the scope the
+/// user started editing) to `scope`, and writes `settings.toml`. Unlike [`set_ai_exposed`], it
+/// never exposes anything: if the file, as read for this write, no longer exposes the context
+/// at that server (hidden or re-pointed meanwhile, by hand or by another Flint), nothing is
+/// written and [`SettingsError::NotExposed`] says so; if its scope there is no longer `from`,
+/// [`SettingsError::ScopeChanged`].
+pub fn set_ai_scope(
+    dir: &Path,
+    context: &str,
+    server: &str,
+    from: &AiScope,
+    scope: &AiScope,
+) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, path| {
+        let mut current: Vec<AiExposure> = match table.get("ai_exposed_clusters") {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(|source| SettingsError::Parse {
+                    path: path.to_owned(),
+                    source,
+                })?,
+            None => Vec::new(),
+        };
+        let Some(entry) = current
+            .iter_mut()
+            .find(|e| e.pin().matches(context, server))
+        else {
+            return Err(SettingsError::NotExposed {
+                context: context.to_owned(),
+            });
+        };
+        // Edited from `from`: a change on disk since (by hand, or another Flint) would be
+        // overwritten unseen.
+        if entry.scope() != *from {
+            return Err(SettingsError::ScopeChanged {
+                context: context.to_owned(),
+            });
+        }
+        entry.namespaces = scope.namespaces.clone();
+        entry.kinds = scope.kinds.clone();
+        table.insert(
+            "ai_exposed_clusters".into(),
+            toml::Value::try_from(&current)?,
+        );
+        Ok(())
+    })
 }
 
 /// Trusts `context` at `server` (`Some`), or stops trusting it (`None`), and writes
@@ -603,6 +852,7 @@ fn edit_settings(
         path: path.clone(),
         source,
     })?;
+    validate(&settings, &path)?;
     write_atomic(&path, &text)?;
     Ok(settings)
 }
@@ -904,15 +1154,15 @@ mod tests {
             "watch_mode = \"on_view\"\nfuture = { a = 1 }\n",
         )
         .unwrap();
-        let s = set_ai_exposed(dir.path(), "a", Some("https://a")).unwrap();
+        let s = set_ai_exposed(dir.path(), "a", Some("https://a"), &AiScope::default()).unwrap();
         assert!(s.ai_exposure("a", Some("https://a")).is_exposed());
-        set_ai_exposed(dir.path(), "b", Some("https://b")).unwrap();
+        set_ai_exposed(dir.path(), "b", Some("https://b"), &AiScope::default()).unwrap();
         // Re-exposing at a new server replaces the old entry.
-        let s = set_ai_exposed(dir.path(), "b", Some("https://b2")).unwrap();
+        let s = set_ai_exposed(dir.path(), "b", Some("https://b2"), &AiScope::default()).unwrap();
         assert_eq!(s.ai_exposed_clusters.len(), 2);
         assert!(s.ai_exposure("b", Some("https://b2")).is_exposed());
         assert!(!s.ai_exposure("b", Some("https://b")).is_exposed());
-        let s = set_ai_exposed(dir.path(), "a", None).unwrap();
+        let s = set_ai_exposed(dir.path(), "a", None, &AiScope::default()).unwrap();
         assert_eq!(
             s.ai_exposure("a", Some("https://a")),
             AiExposureState::Hidden
@@ -924,6 +1174,231 @@ mod tests {
         assert_eq!(loaded.watch_mode, WatchMode::OnView);
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(raw.contains("future"));
+    }
+
+    // covers UP-14: entries written before scopes existed load as the whole cluster; scoped
+    // ones keep their lists, cleaned up; the scope is written back atomically with the pin.
+    #[test]
+    fn exposure_scopes_load_old_entries_and_round_trip() {
+        let old: Settings = toml::from_str(
+            "ai_exposed_clusters = [{ context = \"dev\", server = \"https://dev\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            old.ai_scope("dev", Some("https://dev")),
+            Some(AiScope::default())
+        );
+        assert!(
+            old.ai_scope("dev", Some("https://dev"))
+                .unwrap()
+                .is_everything()
+        );
+        assert_eq!(old.ai_scope("dev", Some("https://other")), None);
+        assert_eq!(old.ai_scope("dev", None), None);
+
+        let scoped: Settings = toml::from_str(
+            r#"
+            [[ai_exposed_clusters]]
+            context = "prod"
+            server = "https://prod"
+            namespaces = ["shop", "billing"]
+            kinds = ["Pods", "deployments.apps"]
+            "#,
+        )
+        .unwrap();
+        let scope = scoped.ai_scope("prod", Some("https://prod/")).unwrap();
+        assert_eq!(scope.namespaces, ["billing", "shop"]);
+        assert_eq!(scope.kinds, ["deployments.apps", "pods"]);
+        assert!(
+            scoped
+                .ai_exposure("prod", Some("https://prod"))
+                .is_exposed()
+        );
+        assert!(
+            toml::from_str::<Settings>(
+                "ai_exposed_clusters = [{ context = \"a\", server = \"s\", namespaces = \"x\" }]"
+            )
+            .is_err()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "future = 1\n").unwrap();
+        let wanted = AiScope::new(
+            vec![" shop ".into(), "shop".into(), "".into()],
+            vec!["PODS".into()],
+        );
+        let s = set_ai_exposed(dir.path(), "prod", Some("https://prod"), &wanted).unwrap();
+        assert_eq!(
+            s.ai_scope("prod", Some("https://prod")),
+            Some(wanted.clone())
+        );
+        assert_eq!(wanted.namespaces, ["shop"]);
+        assert_eq!(wanted.kinds, ["pods"]);
+        // Clearing the scope exposes everything again, and the empty lists are not written.
+        let s = set_ai_exposed(
+            dir.path(),
+            "prod",
+            Some("https://prod"),
+            &AiScope::default(),
+        )
+        .unwrap();
+        assert!(
+            s.ai_scope("prod", Some("https://prod"))
+                .unwrap()
+                .is_everything()
+        );
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(
+            !raw.contains("namespaces") && raw.contains("future"),
+            "{raw}"
+        );
+        assert_eq!(load_settings(dir.path()).unwrap(), s);
+    }
+
+    // covers UP-14: a scope list of only blank names was meant to limit the cluster; read as
+    // empty it would expose everything, so the file is refused (and nothing is exposed).
+    #[test]
+    fn a_scope_of_blank_names_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for list in ["namespaces = [\"\"]", "kinds = [\"  \"]"] {
+            std::fs::write(
+                dir.path().join(SETTINGS_FILE),
+                format!(
+                    "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\n{list}\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    load_settings(dir.path()),
+                    Err(SettingsError::Invalid { .. })
+                ),
+                "{list}"
+            );
+            let (fallback, error) = load_settings_or_fallback(dir.path());
+            assert!(error.is_some() && fallback.ai_exposed_clusters.is_empty());
+        }
+        // A blank name beside real ones is just dropped.
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\nnamespaces = [\"\", \"shop\"]\n",
+        )
+        .unwrap();
+        let s = load_settings(dir.path()).unwrap();
+        assert_eq!(
+            s.ai_scope("prod", Some("https://p")).unwrap().namespaces,
+            ["shop"]
+        );
+    }
+
+    // covers UP-14: a misspelt scope key, or two entries for one context and server, make the
+    // file invalid (nothing exposed) rather than exposing the whole cluster; the error names
+    // what is wrong.
+    #[test]
+    fn misspelt_scope_keys_and_duplicate_entries_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\nnamespace = [\"shop\"]\n",
+        )
+        .unwrap();
+        let error = load_settings(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("namespace"), "{error}");
+        assert!(
+            load_settings_or_fallback(dir.path())
+                .0
+                .ai_exposed_clusters
+                .is_empty()
+        );
+
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\n\
+             namespaces = [\"shop\"]\n\
+             [[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p/\"\n",
+        )
+        .unwrap();
+        let error = load_settings(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("listed twice") && error.contains("prod"),
+            "{error}"
+        );
+        // The same context at two servers is not a duplicate.
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "[[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://p\"\n\
+             [[ai_exposed_clusters]]\ncontext = \"prod\"\nserver = \"https://q\"\n",
+        )
+        .unwrap();
+        assert!(load_settings(dir.path()).is_ok());
+    }
+
+    // covers UP-14: changing a scope never exposes a cluster that was hidden or re-pointed
+    // meanwhile; a re-pointed context's old scope is kept to start from.
+    #[test]
+    fn a_scope_change_needs_the_exposure_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let shop = AiScope::new(vec!["shop".into()], Vec::new());
+        assert!(matches!(
+            set_ai_scope(dir.path(), "prod", "https://p", &AiScope::default(), &shop),
+            Err(SettingsError::NotExposed { .. })
+        ));
+        assert!(!dir.path().join(SETTINGS_FILE).exists());
+        set_ai_exposed(dir.path(), "prod", Some("https://p"), &AiScope::default()).unwrap();
+        let s = set_ai_scope(dir.path(), "prod", "https://p/", &AiScope::default(), &shop).unwrap();
+        // Edited from a scope that changed on disk since: refused, nothing written.
+        assert!(matches!(
+            set_ai_scope(
+                dir.path(),
+                "prod",
+                "https://p",
+                &AiScope::default(),
+                &AiScope::default()
+            ),
+            Err(SettingsError::ScopeChanged { .. })
+        ));
+        assert_eq!(
+            load_settings(dir.path())
+                .unwrap()
+                .ai_scope("prod", Some("https://p")),
+            Some(shop.clone())
+        );
+        assert_eq!(s.ai_scope("prod", Some("https://p")), Some(shop.clone()));
+        assert!(matches!(
+            set_ai_scope(
+                dir.path(),
+                "prod",
+                "https://elsewhere",
+                &shop,
+                &AiScope::default()
+            ),
+            Err(SettingsError::NotExposed { .. })
+        ));
+        assert_eq!(s.ai_scope_saved("prod"), Some(shop.clone()));
+        assert_eq!(s.ai_scope("prod", Some("https://elsewhere")), None);
+        assert_eq!(s.ai_scope_saved("other"), None);
+    }
+
+    // covers UP-14: what a scope lets agents read.
+    #[test]
+    fn scopes_allow_named_namespaces_and_kinds() {
+        let everything = AiScope::default();
+        assert!(everything.allows_namespace("any"));
+        assert!(everything.allows_kind("nodes", false));
+        let kinds = AiScope::new(Vec::new(), vec!["pods".into(), "nodes".into()]);
+        assert!(kinds.allows_namespace("any"));
+        assert!(kinds.allows_kind("pods", true) && kinds.allows_kind("nodes", false));
+        assert!(!kinds.allows_kind("secrets", true));
+        let namespaces = AiScope::new(vec!["shop".into()], Vec::new());
+        assert!(namespaces.allows_namespace("shop") && !namespaces.allows_namespace("kube-system"));
+        assert!(namespaces.allows_kind("secrets", true));
+        // Cluster-scoped kinds are hidden under a namespace scope unless named.
+        assert!(!namespaces.allows_kind("nodes", false));
+        assert!(!namespaces.allows_kind("namespaces", false));
+        let both = AiScope::new(vec!["shop".into()], vec!["pods".into(), "nodes".into()]);
+        assert!(both.allows_kind("nodes", false) && both.allows_kind("pods", true));
+        assert!(!both.allows_kind("customresourcedefinitions.apiextensions.k8s.io", false));
+        assert!(!both.allows_kind("services", true));
     }
 
     // covers UP-55: trust is pinned to the context and its server, like AI exposure.
@@ -1053,7 +1528,7 @@ mod tests {
             "protect_local_clusters = true\nfuture = 1\n",
         )
         .unwrap();
-        set_ai_exposed(dir.path(), "a", Some("https://a")).unwrap();
+        set_ai_exposed(dir.path(), "a", Some("https://a"), &AiScope::default()).unwrap();
         let s = set_trusted(dir.path(), "a", Some("https://a")).unwrap();
         assert!(s.trust("a", Some("https://a")).is_trusted());
         let s = set_trusted(dir.path(), "a", Some("https://a2")).unwrap();

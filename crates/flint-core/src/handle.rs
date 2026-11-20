@@ -76,12 +76,26 @@ pub enum Command {
     /// Make a cluster the active one, connecting it if it is not connected. Selecting a cluster
     /// whose connection failed retries it.
     Activate(ClusterId),
-    /// Expose a cluster to AI agents at `server` (`Some`), or hide it (`None`), in
-    /// `settings.toml`. `server` is the URL the user confirmed; if the context no longer points
-    /// there, nothing is written and an error is reported.
+    /// Expose a cluster to AI agents at `server` (`Some`), limited to `scope` (ADR-0013), or hide
+    /// it (`None`), in `settings.toml`. `server` is the URL the user confirmed; if the context
+    /// no longer points there, nothing is written and an error is reported. Exposing an exposed
+    /// cluster again rewrites its entry with the new scope in one write.
     SetAiExposed {
         cluster: ClusterId,
         server: Option<String>,
+        scope: crate::settings::AiScope,
+    },
+    /// Change what agents may read of a cluster exposed at `server` to `scope` (Edit AI Scope),
+    /// in `settings.toml`. Never exposes anything: if the context no longer points at
+    /// `server`, or the file no longer exposes it there (hidden meanwhile), nothing is written
+    /// and an error is reported.
+    SetAiScope {
+        cluster: ClusterId,
+        server: String,
+        /// The scope the user started editing: if it changed on disk since, nothing is
+        /// written.
+        from: crate::settings::AiScope,
+        scope: crate::settings::AiScope,
     },
     /// Trust a cluster at `server` (`Some`), or stop trusting it (`None`), in `settings.toml`
     /// (ADR-0015). As with [`Command::SetAiExposed`], `server` is the URL the user confirmed; if
