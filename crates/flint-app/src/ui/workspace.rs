@@ -868,11 +868,16 @@ impl Workspace {
         let Some(cluster) = self.cluster.clone() else {
             return;
         };
-        if self
+        if let Some(list) = self
             .list
             .as_ref()
-            .is_some_and(|l| *l.read(cx).kind() == entry.id)
+            .filter(|l| *l.read(cx).kind() == entry.id)
         {
+            // Open already: it takes focus, as a new one would (Enter on it in the
+            // navigation).
+            let focus = list.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+            release_unfocused_input(window, cx);
             return;
         }
         if remember {

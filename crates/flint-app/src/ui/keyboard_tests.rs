@@ -412,3 +412,19 @@ async fn the_lock_stays_reachable_from_the_sidebar(cx: &mut TestAppContext) {
     .await;
     assert!(t.has_dialog(cx), "Unlock asks first, naming the server");
 }
+
+// covers UP-33: Enter on the kind already open in the navigation puts focus in its list, as
+// opening it did.
+#[gpui_kit::test]
+async fn enter_on_the_open_kind_focuses_its_list(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.focus_workspace(cx);
+    t.press(cx, "tab");
+    t.press(cx, "tab");
+    assert_eq!(focus(cx, &t), Focus::Navigation);
+    assert_eq!(nav_cursor(&nav(cx, &t)).as_deref(), Some("kind:pods"));
+    t.press(cx, "enter");
+    assert_eq!(focus(cx, &t), Focus::List);
+}
