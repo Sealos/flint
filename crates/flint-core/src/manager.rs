@@ -290,9 +290,11 @@ impl ClusterManager {
     ) {
         let mut internal_rx = self.internal_rx.take().expect("run is called once");
         self.emit_settings();
+        // Watching first, so a change after the first reads (an agent's call landing meanwhile)
+        // is noticed.
+        self.rebuild_watcher();
         self.reload_activity().await;
         self.reload_kubeconfig().await;
-        self.rebuild_watcher();
         loop {
             tokio::select! {
                 command = commands.recv() => match command {

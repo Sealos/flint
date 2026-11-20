@@ -866,9 +866,14 @@ Rules:
   The returned content is never recorded. At 1 MiB the file is renamed to `agent-activity.1.jsonl` (replacing the one
   before) and a new one starts. Writers hold an exclusive `flock` on `agent-activity.lock` while they check, rotate
   and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice; a write that
-  fails is logged and does not fail the call. Text fields hold what the agent wrote, so each is cut at 253 bytes:
-  an agent cannot flush the log with a few huge names. A context re-pointed at another server is another cluster:
-  its activity tab shows the calls on the server it was opened for. The core watches both files beside `settings.toml` and sends
+  fails is logged and does not fail the call. The files are the owner's only (0600: they name clusters and objects),
+  and a line cut off before its newline is ended before the next record, so it costs only itself. Text fields hold
+  what the agent wrote, so each is cut at 253 bytes: an agent cannot flush the log with a few huge names. Each record
+  also has stable keys (FNV-1a) of the full context and server, which the app matches by. The server is the one the
+  call's own settings and kubeconfig resolved. A call the router answers without running its tool (an unknown tool,
+  arguments that do not fit) is recorded as failed, with what its arguments name. A context re-pointed at another
+  server is another cluster: its activity tab shows the calls on the server it was opened for, newest first, and
+  offers Edit AI Scope only while the context still points there. The core watches both files beside `settings.toml` and sends
   the log to the app (`Event::AgentActivity`) at start and whenever it changes. The cluster's "AI" badge, or Show
   Agent Activity, opens a dock tab with the cluster's calls, newest first, and Edit AI Scope.
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events

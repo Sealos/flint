@@ -27,6 +27,8 @@ fn record(at_ms: i64, cluster: &str, tool: &str) -> ActivityRecord {
         bytes: 2048,
         truncated: false,
         outcome: Outcome::Ok,
+        cluster_key: Some(flint_core::activity::cluster_key(cluster)),
+        server_key: None,
     }
 }
 
@@ -40,7 +42,7 @@ fn set_activity(cx: &mut TestAppContext, t: &TestWorkspace, records: Vec<Activit
 
 /// The labels of the activity tab's rows, top to bottom; the first is checked as drawn.
 fn row_labels(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
-    let rows = t.workspace.read_with(cx, |ws, cx| {
+    let rows: Vec<String> = t.workspace.read_with(cx, |ws, cx| {
         let dock = ws.dock.read(cx);
         dock.tab_ids()
             .into_iter()
@@ -50,7 +52,7 @@ fn row_labels(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
                 }
                 _ => None,
             })
-            .unwrap_or_else(Vec::new)
+            .unwrap_or_default()
     });
     if let Some(first) = rows.first() {
         assert_eq!(t.label(cx, ("activity-row", 0usize)).as_ref(), Some(first));
@@ -125,6 +127,22 @@ async fn the_ai_tag_shows_what_agents_asked_for(cx: &mut TestAppContext) {
         gpui_kit::component::WindowExt::has_active_dialog(window, cx)
     })
     .await;
+    t.press(cx, "escape");
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        !gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+    })
+    .await;
+
+    // The context now points at another server: this tab is for the old one, so it offers no
+    // scope to edit (that would be the new server's).
+    t.model.update(cx, |m, cx| {
+        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "alpha") {
+            c.info.server = Some("https://moved.example:6443".into());
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(t.find(cx, "activity-edit-scope").is_none());
 }
 
 // covers UP-16: any context has an activity view, exposed or not (a cluster hidden again still

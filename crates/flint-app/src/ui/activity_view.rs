@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use flint_core::ClusterId;
-use flint_core::activity::{ActivityRecord, Outcome};
+use flint_core::activity::{self, ActivityRecord, Outcome};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -59,16 +60,23 @@ pub fn rows(
     now: Timestamp,
 ) -> Vec<ActivityRow> {
     let today = now.to_zoned(tz.clone()).date();
-    let server = server.map(same_server);
-    records
+    // By key: the names in a record may be cut.
+    let cluster = activity::cluster_key(cluster);
+    let server = server.map(activity::server_key);
+    let mut mine: Vec<(usize, &ActivityRecord)> = records
         .iter()
-        .rev()
-        .filter(|r| r.cluster.as_deref() == Some(cluster))
-        .filter(|r| match (&r.server, &server) {
-            (Some(at), Some(server)) => same_server(at) == *server,
+        .enumerate()
+        .filter(|(_, r)| r.cluster_key.as_ref() == Some(&cluster))
+        .filter(|(_, r)| match (&r.server_key, &server) {
+            (Some(at), Some(server)) => at == server,
             _ => true,
         })
-        .map(|r| ActivityRow {
+        .collect();
+    // Newest first; calls in the same millisecond (several `flint mcp` processes) in the order
+    // they were written, last first.
+    mine.sort_by_key(|(ix, r)| std::cmp::Reverse((r.at_ms, *ix)));
+    mine.into_iter()
+        .map(|(_, r)| ActivityRow {
             time: time(r.at_ms, tz, today),
             tool: r.tool.clone(),
             target: target(r),
@@ -76,13 +84,6 @@ pub fn rows(
             outcome: r.outcome,
         })
         .collect()
-}
-
-/// A server URL as records hold it (without credentials) and without a trailing slash.
-fn same_server(url: &str) -> String {
-    flint_core::redact::server_url(url)
-        .trim_end_matches('/')
-        .to_owned()
 }
 
 fn time(at_ms: i64, tz: &TimeZone, today: jiff::civil::Date) -> String {
@@ -249,13 +250,20 @@ impl ActivityView {
                                 .child(row.time.clone()),
                         )
                         .child(div().w(px(140.)).flex_none().child(row.tool.clone()))
-                        .child(
+                        .child({
+                            // Names may be cut in the cell, and in the log at 253 bytes (with
+                            // how much was left out): the tooltip has what the log has.
+                            let target = row.target.clone();
                             div()
+                                .id(("activity-target", ix))
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .child(row.target.clone()),
-                        )
+                                .child(target.clone())
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(target.clone()).build(window, cx)
+                                })
+                        })
                         .child(
                             div()
                                 .flex_none()
@@ -308,12 +316,18 @@ impl Render for ActivityView {
             1 => "1 call".to_owned(),
             n => format!("{n} calls"),
         };
+        // Only while the context still points at the server this tab is for: the scope is the
+        // exposure's at the server the context points at now.
         let exposed = {
             let model = self.model.read(cx);
             model
                 .clusters
                 .iter()
                 .find(|c| c.info.name == self.cluster)
+                .filter(|c| {
+                    c.info.server.as_deref().map(activity::server_key)
+                        == self.server.as_deref().map(activity::server_key)
+                })
                 .and_then(|c| model.ai_scope(c))
                 .is_some()
         };
@@ -375,7 +389,7 @@ impl Render for ActivityView {
 
 #[cfg(test)]
 mod tests {
-    use flint_core::activity::{ActivityRecord, Outcome};
+    use flint_core::activity::{self, ActivityRecord, Outcome};
     use jiff::Timestamp;
     use jiff::tz::TimeZone;
 
@@ -395,6 +409,8 @@ mod tests {
             bytes: 5120,
             truncated: true,
             outcome: Outcome::Ok,
+            cluster_key: Some(activity::cluster_key(cluster)),
+            server_key: Some(activity::server_key("https://prod:6443")),
         }
     }
 
@@ -418,6 +434,7 @@ mod tests {
         let clusters = ActivityRecord {
             tool: "list_clusters".into(),
             cluster: None,
+            cluster_key: None,
             ..record(today, "prod")
         };
         let records = [
@@ -447,6 +464,7 @@ mod tests {
         let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
         let at = |server: Option<&str>| ActivityRecord {
             server: server.map(str::to_owned),
+            server_key: server.map(activity::server_key),
             ..record(now.as_millisecond(), "prod")
         };
         let records = [
@@ -458,6 +476,37 @@ mod tests {
         assert_eq!(count(Some("https://prod:6443")), 2);
         assert_eq!(count(Some("https://old:6443/")), 2);
         assert_eq!(count(None), 3);
+    }
+
+    // covers UP-16: newest first by time, calls in the same millisecond last-written first; a
+    // context whose name was cut in the log still finds its calls (by key).
+    #[test]
+    fn rows_sort_by_time_and_match_by_key() {
+        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let ms = now.as_millisecond();
+        let call = |at: i64, tool: &str| ActivityRecord {
+            tool: tool.into(),
+            ..record(at, "prod")
+        };
+        let records = [
+            call(ms - 10, "b"),
+            call(ms - 20, "a"),
+            call(ms, "c"),
+            call(ms, "d"),
+        ];
+        let tools: Vec<String> = rows(&records, "prod", None, &TimeZone::UTC, now)
+            .into_iter()
+            .map(|r| r.tool)
+            .collect();
+        assert_eq!(tools, ["d", "c", "b", "a"]);
+
+        let long = "p".repeat(400);
+        let cut = ActivityRecord {
+            cluster: Some(format!("{}…(+147 bytes)", &long[..253])),
+            cluster_key: Some(activity::cluster_key(&long)),
+            ..record(ms, "prod")
+        };
+        assert_eq!(rows(&[cut], &long, None, &TimeZone::UTC, now).len(), 1);
     }
 
     #[test]

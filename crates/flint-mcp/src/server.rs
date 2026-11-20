@@ -198,10 +198,17 @@ impl FlintMcp {
         } else {
             (None, false)
         };
+        // The server `client` found for this call's cluster, from the call's own settings and
+        // kubeconfig: none for a call that names no cluster or one not exposed.
+        let server = named
+            .cluster
+            .as_ref()
+            .and_then(|_| CALL.try_with(|c| c.borrow().server.clone()).ok().flatten());
+        let _ = CALL.try_with(|c| c.borrow_mut().recorded = true);
         self.record(activity::ActivityRecord {
             at_ms: activity::now_ms(),
             tool: tool.to_owned(),
-            server: None,
+            server,
             cluster: named.cluster,
             kind: named.kind,
             namespace: named.namespace,
@@ -211,6 +218,8 @@ impl FlintMcp {
             bytes: text.len() as u64,
             truncated,
             outcome,
+            cluster_key: None,
+            server_key: None,
         })
         .await;
         let content = vec![ContentBlock::text(text)];
@@ -221,29 +230,47 @@ impl FlintMcp {
         })
     }
 
-    /// Appends `record` to the activity log, with the server its cluster is exposed with. A
-    /// failure to write is logged and does not fail the call.
-    async fn record(&self, mut record: activity::ActivityRecord) {
+    /// Appends `record` to the activity log. A failure to write is logged and does not fail the
+    /// call.
+    async fn record(&self, record: activity::ActivityRecord) {
         let dir = self.inner.config_dir.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            if let Some(cluster) = &record.cluster {
-                record.server = settings::load_settings(&dir)
-                    .ok()
-                    .and_then(|s| {
-                        s.ai_exposed_clusters
-                            .into_iter()
-                            .find(|e| &e.context == cluster)
-                    })
-                    .map(|e| flint_core::redact::server_url(&e.server));
-            }
-            activity::append(&dir, &record)
-        })
-        .await;
+        let written = tokio::task::spawn_blocking(move || activity::append(&dir, &record)).await;
         match written {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "cannot write the agent activity log"),
             Err(e) => tracing::warn!(error = %e, "cannot write the agent activity log"),
         }
+    }
+}
+
+/// What one tool call learned on its way, for its record.
+#[derive(Default)]
+struct CallNote {
+    /// The API server of the cluster the call reads, once [`FlintMcp::client`] found it exposed
+    /// (without credentials).
+    server: Option<String>,
+    /// Its tool recorded it ([`FlintMcp::finish`]).
+    recorded: bool,
+}
+
+tokio::task_local! {
+    /// The current tool call's note. Each call gets its own ([`ServerHandler::call_tool`]).
+    static CALL: std::cell::RefCell<CallNote>;
+}
+
+/// What a call's raw arguments name, for a call rejected before its tool ran: only string
+/// values, under the names the tools use. [`activity::append`] caps their length.
+fn named_in(arguments: Option<&serde_json::Map<String, Value>>) -> Named {
+    let text = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| arguments?.get(*k)?.as_str().map(str::to_owned))
+    };
+    Named {
+        cluster: text(&["cluster"]),
+        kind: text(&["kind", "object_kind"]),
+        namespace: text(&["namespace"]),
+        name: text(&["name", "pod", "object_name"]),
+        container: text(&["container"]),
     }
 }
 
@@ -480,7 +507,56 @@ impl FlintMcp {
     name = "flint",
     instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
-impl ServerHandler for FlintMcp {}
+impl ServerHandler for FlintMcp {
+    /// Every call, with its own `CALL` note. A call the router answers without running its
+    /// tool (an unknown tool, arguments that do not fit the tool's schema) is recorded here, as
+    /// failed, with what its arguments name; the others are recorded by their tool
+    /// (`FlintMcp::finish`).
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let tool = request.name.to_string();
+        let named = named_in(request.arguments.as_ref());
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let (result, recorded) = CALL
+            .scope(std::cell::RefCell::default(), async {
+                let result = self.tool_router.call(call).await;
+                (result, CALL.with(|c| c.borrow().recorded))
+            })
+            .await;
+        if !recorded {
+            let bytes = match &result {
+                Ok(rmcp::model::CallToolResponse::Complete(done)) => done
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.len()))
+                    .sum(),
+                Ok(_) => 0,
+                Err(error) => error.message.len(),
+            };
+            self.record(activity::ActivityRecord {
+                at_ms: activity::now_ms(),
+                tool,
+                server: None,
+                cluster: named.cluster,
+                kind: named.kind,
+                namespace: named.namespace,
+                name: named.name,
+                container: named.container,
+                items: None,
+                bytes: bytes as u64,
+                truncated: false,
+                outcome: activity::Outcome::Failed,
+                cluster_key: None,
+                server_key: None,
+            })
+            .await;
+        }
+        result
+    }
+}
 
 /// Settings and kubeconfig as of this call.
 struct CallContext {
@@ -521,6 +597,10 @@ impl FlintMcp {
     /// context's kubeconfig entries change.
     async fn client(&self, ctx: &CallContext, name: &str) -> Result<Conn, ToolError> {
         let info = policy::exposed_cluster(&ctx.settings, &ctx.kubeconfig, name)?;
+        // The server this call's settings expose the cluster at: what its record names.
+        let _ = CALL.try_with(|c| {
+            c.borrow_mut().server = info.server.as_deref().map(flint_core::redact::server_url);
+        });
         let scope = policy::cluster_scope(&ctx.settings, info);
         let fingerprint = cluster::context_fingerprint(&ctx.kubeconfig.merged, &info.name)
             .ok_or_else(|| ToolError::new(format!("cluster \"{name}\" not found")))?;

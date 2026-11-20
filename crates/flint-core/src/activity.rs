@@ -10,6 +10,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,35 @@ pub struct ActivityRecord {
     #[serde(default)]
     pub truncated: bool,
     pub outcome: Outcome,
+    /// [`cluster_key`] of the full `cluster`, set by [`append`]: what the app matches a context
+    /// by, since `cluster` may be cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_key: Option<String>,
+    /// [`server_key`] of the full `server`, set by [`append`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_key: Option<String>,
+}
+
+/// A stable key for a context name (FNV-1a, 64 bits, in hex): the same in every Flint version.
+pub fn cluster_key(context: &str) -> String {
+    fnv1a(context.as_bytes())
+}
+
+/// A stable key for an API server URL, as [`cluster_key`]: without credentials and a trailing
+/// slash, so the server a context points at and the one recorded match.
+pub fn server_key(url: &str) -> String {
+    fnv1a(
+        crate::redact::server_url(url)
+            .trim_end_matches('/')
+            .as_bytes(),
+    )
+}
+
+fn fnv1a(bytes: &[u8]) -> String {
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, b| {
+        (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{hash:016x}")
 }
 
 /// Appends `record` to the log in `config_dir`, rotating it first if it would grow past
@@ -88,9 +118,48 @@ pub fn append(config_dir: &Path, record: &ActivityRecord) -> std::io::Result<()>
     let size = std::fs::metadata(&path).map_or(0, |m| m.len());
     if size > 0 && size + line.len() as u64 > MAX_FILE_BYTES {
         std::fs::rename(&path, config_dir.join(PREVIOUS_FILE))?;
+        owner_only(&config_dir.join(PREVIOUS_FILE))?;
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .mode(OWNER_ONLY)
+        .open(&path)?;
+    // A log written before (or by hand) may be readable by others: it names clusters and
+    // objects. Rotation keeps the mode.
+    owner_only(&path)?;
+    // A write cut off before its newline (a crash, a full disk) would join this record to it,
+    // losing both: end it first. Its fragment is then one line that does not parse.
+    if ends_unterminated(&mut file)? {
+        line.insert(0, b'\n');
+    }
     file.write_all(&line)
+}
+
+/// Read and write for the owner only.
+const OWNER_ONLY: u32 = 0o600;
+
+/// Sets `path` to [`OWNER_ONLY`] unless it already is.
+fn owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o777 != OWNER_ONLY {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY))?;
+    }
+    Ok(())
+}
+
+/// Whether `file` is not empty and its last byte is not a newline.
+fn ends_unterminated(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// `record` with each text field cut at [`MAX_FIELD_BYTES`], saying how much was left out.
@@ -107,6 +176,14 @@ fn capped(record: &ActivityRecord) -> ActivityRecord {
     };
     let cap_opt = |text: &Option<String>| text.as_ref().map(cap);
     ActivityRecord {
+        cluster_key: record
+            .cluster_key
+            .clone()
+            .or_else(|| record.cluster.as_deref().map(cluster_key)),
+        server_key: record
+            .server_key
+            .clone()
+            .or_else(|| record.server.as_deref().map(server_key)),
         tool: cap(&record.tool),
         cluster: cap_opt(&record.cluster),
         server: cap_opt(&record.server),
@@ -149,13 +226,25 @@ pub fn read(config_dir: &Path) -> Vec<ActivityRecord> {
         .flat_map(|bytes| {
             bytes
                 .split(|b| *b == b'\n')
-                .filter_map(|line| serde_json::from_slice(line).ok())
+                .filter_map(|line| serde_json::from_slice::<ActivityRecord>(line).ok())
+                .map(keyed)
                 .collect::<Vec<_>>()
         })
         .collect();
     let extra = records.len().saturating_sub(MAX_RECORDS);
     records.drain(..extra);
     records
+}
+
+/// `record` with its keys, computed from its fields when it has none (an older line).
+fn keyed(mut record: ActivityRecord) -> ActivityRecord {
+    if record.cluster_key.is_none() {
+        record.cluster_key = record.cluster.as_deref().map(cluster_key);
+    }
+    if record.server_key.is_none() {
+        record.server_key = record.server.as_deref().map(server_key);
+    }
+    record
 }
 
 /// Now, in Unix milliseconds.
@@ -183,6 +272,8 @@ mod tests {
             bytes: 1200,
             truncated: false,
             outcome: Outcome::Ok,
+            cluster_key: Some(cluster_key("prod")),
+            server_key: Some(server_key("https://prod:6443")),
         }
     }
 
@@ -205,13 +296,22 @@ mod tests {
         append(dir.path(), &denied).unwrap();
         let text = std::fs::read_to_string(dir.path().join(ACTIVITY_FILE)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
+        let keys = format!(
+            r#""cluster_key":"{}","server_key":"{}""#,
+            cluster_key("prod"),
+            server_key("https://prod:6443")
+        );
         assert_eq!(
             lines[0],
-            r#"{"at_ms":1700000000001,"tool":"get_resource","cluster":"prod","server":"https://prod:6443","kind":"pods","namespace":"web","name":"web-1","items":1,"bytes":1200,"truncated":false,"outcome":"ok"}"#
+            format!(
+                r#"{{"at_ms":1700000000001,"tool":"get_resource","cluster":"prod","server":"https://prod:6443","kind":"pods","namespace":"web","name":"web-1","items":1,"bytes":1200,"truncated":false,"outcome":"ok",{keys}}}"#
+            )
         );
         assert_eq!(
             lines[1],
-            r#"{"at_ms":1700000000002,"tool":"list_resources","cluster":"prod","server":"https://prod:6443","kind":"secrets","bytes":80,"truncated":false,"outcome":"denied"}"#
+            format!(
+                r#"{{"at_ms":1700000000002,"tool":"list_resources","cluster":"prod","server":"https://prod:6443","kind":"secrets","bytes":80,"truncated":false,"outcome":"denied",{keys}}}"#
+            )
         );
         assert_eq!(read(dir.path()), [record(1), denied]);
     }
@@ -306,6 +406,66 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), records.len(), "no record written twice");
+    }
+
+    // covers UP-16: the log is the owner's only (it names clusters and objects), including a log
+    // written before with another mode, and the file it rotates into.
+    #[test]
+    fn the_log_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACTIVITY_FILE);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        append(dir.path(), &record(1)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append(dir.path(), &record(2)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        let big = "x".repeat(MAX_FILE_BYTES as usize);
+        std::fs::write(&path, format!("{big}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append(dir.path(), &record(3)).unwrap();
+        assert_eq!(mode(&dir.path().join(PREVIOUS_FILE)), 0o600);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    // covers UP-16: a record cut off before its newline costs only itself: the next one starts
+    // on a line of its own.
+    #[test]
+    fn an_unterminated_line_does_not_swallow_the_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &record(1)).unwrap();
+        let path = dir.path().join(ACTIVITY_FILE);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(r#"{"at_ms":17000"#);
+        std::fs::write(&path, text).unwrap();
+        append(dir.path(), &record(2)).unwrap();
+        assert_eq!(read(dir.path()), [record(1), record(2)]);
+    }
+
+    // covers UP-16: a cut context or server still matches: the keys are of the full names.
+    #[test]
+    fn keys_are_of_the_full_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "c".repeat(400);
+        let server = format!("https://{}:6443/", "s".repeat(300));
+        let mut wide = record(1);
+        wide.cluster = Some(long.clone());
+        wide.server = Some(server.clone());
+        wide.cluster_key = None;
+        wide.server_key = None;
+        append(dir.path(), &wide).unwrap();
+        let read = read(dir.path());
+        assert_ne!(read[0].cluster.as_deref(), Some(long.as_str()));
+        assert_eq!(read[0].cluster_key, Some(cluster_key(&long)));
+        assert_eq!(
+            read[0].server_key,
+            Some(server_key(server.trim_end_matches('/')))
+        );
+        assert_ne!(cluster_key("a"), cluster_key("b"));
+        // FNV-1a's published values: the keys never change between Flint versions.
+        assert_eq!(cluster_key(""), "cbf29ce484222325");
+        assert_eq!(cluster_key("a"), "af63dc4c8601ec8c");
     }
 
     #[test]

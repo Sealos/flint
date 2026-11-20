@@ -115,6 +115,13 @@ impl Server {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let msg = self.exchange(method, params);
+        assert!(msg.get("error").is_none(), "{method} failed: {msg}");
+        msg["result"].clone()
+    }
+
+    /// Sends a request and returns the whole response, error or result.
+    fn exchange(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -126,8 +133,7 @@ impl Server {
             let msg: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|e| panic!("stdout must carry only JSON-RPC ({e}): {line}"));
             if msg["id"] == json!(id) {
-                assert!(msg.get("error").is_none(), "{method} failed: {msg}");
-                return msg["result"].clone();
+                return msg;
             }
         }
     }
@@ -296,6 +302,13 @@ fn every_call_is_recorded_in_the_activity_log() {
         json!({"cluster": "dev", "kind": "pods", "namespace": "web", "name": "web-0"}),
     );
     assert!(failed);
+    // Rejected before the tool runs (no `pod`): still recorded, with what the arguments name.
+    let rejected = server.exchange(
+        "tools/call",
+        json!({"name": "get_pod_logs", "arguments": {"cluster": "dev", "namespace": "web"}}),
+    );
+    let refused = rejected.get("error").is_some() || rejected["result"]["isError"] == json!(true);
+    assert!(refused, "{rejected}");
     drop(server);
 
     let records = flint_core::activity::read(&config_dir);
@@ -342,6 +355,15 @@ fn every_call_is_recorded_in_the_activity_log() {
                 Some("pods"),
                 Some("web"),
                 Some("web-0"),
+                None,
+                Failed
+            ),
+            (
+                "get_pod_logs",
+                Some("dev"),
+                None,
+                Some("web"),
+                None,
                 None,
                 Failed
             ),
