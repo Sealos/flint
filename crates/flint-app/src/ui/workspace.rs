@@ -1070,8 +1070,7 @@ impl Workspace {
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
-                is_active,
-                ring,
+                (is_active, ring),
                 exposure,
                 protection,
                 settings_ok,
@@ -1150,8 +1149,8 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        is_active: bool,
-        ring: bool,
+        // Whether it is the active cluster, and whether the sidebar's cursor is on it.
+        (is_active, ring): (bool, bool),
         exposure: AiExposureState,
         (protection, trust): (Protection, TrustState),
         settings_ok: bool,
