@@ -310,10 +310,13 @@ pub struct ShownLine {
 /// `line` as shown with `view`: its search matches (in the prefix too, when the query searches
 /// sources and the prefix is shown), and at most `max_bytes` of its text (on a character
 /// boundary). A line without a timestamp gets blanks in its place, so the text lines up.
+/// `found` are the matches in the line's whole text when already known (a regular expression's,
+/// found off the UI thread); `None` matches it here.
 pub fn shown_line(
     line: &LogLine,
     view: LineView<'_>,
     query: &SearchMatcher,
+    found: Option<&[Range<usize>]>,
     max_bytes: Option<usize>,
 ) -> ShownLine {
     let mut text = String::new();
@@ -326,20 +329,23 @@ pub fn shown_line(
             // Matched against the full `pod/container`, as the search does, then placed on the
             // short label drawn: a match inside it is marked there, one in the part the label
             // leaves out marks the whole label.
+            // Only the whole label then, so no two ranges overlap.
             let label = source.label();
-            let found = query.match_ranges(label);
             let at = label.find(short.as_str());
+            let mut inside = Vec::new();
             let mut whole = false;
-            for r in found {
+            for r in query.match_ranges(label) {
                 match at {
                     Some(k) if r.start >= k && r.end <= k + short.len() => {
-                        matches.push(r.start - k + 1..r.end - k + 1);
+                        inside.push(r.start - k + 1..r.end - k + 1);
                     }
                     _ => whole = true,
                 }
             }
             if whole {
                 matches.push(1..1 + short.len());
+            } else {
+                matches.extend(inside);
             }
         }
         text.push_str(&short);
@@ -372,10 +378,13 @@ pub fn shown_line(
     text.push_str(body);
     // Matched against the whole line, as the search does (`error$` must not match where the
     // drawn text is cut), then clipped to what is drawn.
+    let found = match found {
+        Some(found) => std::borrow::Cow::Borrowed(found),
+        None => std::borrow::Cow::Owned(query.match_ranges(&line.text)),
+    };
     matches.extend(
-        query
-            .match_ranges(&line.text)
-            .into_iter()
+        found
+            .iter()
             .filter(|r| r.start < body.len())
             .map(|r| r.start + prefix..r.end.min(body.len()) + prefix),
     );
@@ -1030,7 +1039,7 @@ mod tests {
             labels: &labels,
             tz: &TimeZone::UTC,
         };
-        shown_line(line, view, &query.matcher(), max)
+        shown_line(line, view, &query.matcher(), None, max)
     }
 
     // covers UP-48: highlights come from the whole line, as the search matches it, then are
@@ -1518,7 +1527,7 @@ mod tests {
             sources: true,
             ..SearchQuery::new("cd27k")
         };
-        let shown = shown_line(&line, view, &query.matcher(), None);
+        let shown = shown_line(&line, view, &query.matcher(), None, None);
         let pad = labels.width() - "79db669d5-cd27k".len();
         assert_eq!(
             shown.text,
@@ -1532,7 +1541,7 @@ mod tests {
             sources: true,
             ..SearchQuery::new("api-79db")
         };
-        let shown = shown_line(&line, view, &query.matcher(), None);
+        let shown = shown_line(&line, view, &query.matcher(), None, None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "79db669d5-cd27k");
         // The three drawn parts carry their own runs.
         assert_eq!(
@@ -1544,6 +1553,14 @@ mod tests {
             ]
         );
         assert!(parts_in(&line_parts(&shown), shown.prefix..shown.text.len()).is_empty());
+        // Both a left-out part and the label shown match: the whole label, once.
+        let query = SearchQuery {
+            sources: true,
+            regex: true,
+            ..SearchQuery::new("api|cd27k")
+        };
+        let shown = shown_line(&line, view, &query.matcher(), Some(&[]), None);
+        assert_eq!(shown.matches, vec![1..16_usize]);
     }
 
     // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.

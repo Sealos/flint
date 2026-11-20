@@ -84,9 +84,7 @@ impl LogFilter {
     /// Pass snapshots of one session only, in order.
     pub fn update(&mut self, lines: &LogLines) {
         let first = lines.first_id();
-        let drop = self.rows.partition_point(|id| *id < first);
-        self.rows.drain(..drop);
-        self.before.retain(|id| *id >= first);
+        self.evict(first);
         // Lines were evicted before they were scanned (a long pause): context does not reach
         // across the gap.
         if first > self.scanned_to {
@@ -111,6 +109,15 @@ impl LogFilter {
             }
         }
         self.scanned_to = self.scanned_to.max(lines.end_id());
+    }
+
+    /// Drops the rows before `first` (evicted from the buffer) without scanning anything, and
+    /// says how many went: a view keeps its list to the lines present between scans.
+    pub fn evict(&mut self, first: LineId) -> usize {
+        let drop = self.rows.partition_point(|id| *id < first);
+        self.rows.drain(..drop);
+        self.before.retain(|id| *id >= first);
+        drop
     }
 
     /// How many lines of `lines` the next [`LogFilter::update`] would scan.
@@ -187,6 +194,18 @@ mod tests {
         filter.update(&lines.view());
         assert_eq!(*filter.rows().back().unwrap(), 13);
         assert_eq!(filter.pending(&lines.view()), 0);
+    }
+
+    // covers UP-48: rows of evicted lines go without a scan, the rest stay.
+    #[test]
+    fn evicting_drops_only_the_rows_before_the_first_line() {
+        let lines = buffer(&["GET /a", "b", "GET /c", "d", "GET /e"], 100);
+        let mut filter = LogFilter::new(matching("get", 0));
+        filter.update(&lines.view());
+        assert_eq!(filter.evict(3), 2);
+        assert_eq!(rows(&filter), [4]);
+        assert_eq!(filter.evict(3), 0);
+        assert_eq!(filter.pending(&lines.view()), 0, "nothing to scan again");
     }
 
     // covers UP-48

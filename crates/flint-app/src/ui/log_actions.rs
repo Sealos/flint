@@ -2,6 +2,8 @@
 //! workspace's guards share with them. The toolbar's buttons, the save menu and clicks on lines
 //! dispatch these actions.
 
+use std::sync::Arc;
+
 use flint_core::{LineId, LineSelection};
 use gpui_kit::*;
 
@@ -14,6 +16,16 @@ use super::super::registry::{
 };
 use super::{LogView, log_model};
 use crate::ui::log_model::Tone;
+
+/// What [`LogView::shown_matches`] was found from: when any of it changes, it is found again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) struct ShownMatchesKey {
+    search: u64,
+    matches: (usize, Option<LineId>, Option<LineId>),
+    filter: u64,
+    rows: (usize, Option<LineId>, Option<LineId>),
+    first: LineId,
+}
 
 impl LogView {
     /// Every log action and its handler, for [`Bind`].
@@ -161,13 +173,57 @@ impl LogView {
         self.selected_rows() > 0
     }
 
-    /// How many selected lines are shown: what copy and save would write.
+    /// How many selected lines are shown: what copy and save would write. Counted from where
+    /// the selection's ends fall among the rows, without listing them.
     pub(in crate::ui) fn selected_rows(&self) -> u64 {
         match self.selection {
             None => 0,
-            Some(s) if self.is_filtered() => self.rows_between(s.start(), s.end()).len() as u64,
+            Some(s) if self.is_filtered() => self.rows_count_between(s.start(), s.end()) as u64,
             Some(s) => s.present_len(&self.snapshot.lines),
         }
+    }
+
+    /// The matches among the rows shown in a filtered tab, oldest first. Found again only when
+    /// the search's matches or the rows changed, in one walk over both (they are sorted), so a
+    /// redraw does not go over every match.
+    pub(in crate::ui) fn shown_matches(&self) -> Arc<[LineId]> {
+        let rows = self.filter_rows();
+        let matches = self.search.matches();
+        let key = ShownMatchesKey {
+            search: self.search_generation,
+            matches: (
+                matches.len(),
+                matches.front().copied(),
+                matches.back().copied(),
+            ),
+            filter: self.filter_generation,
+            rows: rows.map_or((0, None, None), |r| {
+                (r.len(), r.front().copied(), r.back().copied())
+            }),
+            first: self.snapshot.lines.first_id(),
+        };
+        if let Some((cached, shown)) = &*self.shown_matches.borrow()
+            && *cached == key
+        {
+            return shown.clone();
+        }
+        let shown: Arc<[LineId]> = match rows {
+            None => Arc::from([]),
+            Some(rows) => {
+                let mut rows = rows.iter().peekable();
+                matches
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        while rows.next_if(|row| **row < *id).is_some() {}
+                        rows.peek().is_some_and(|row| **row == *id)
+                            && self.snapshot.lines.contains(*id)
+                    })
+                    .collect()
+            }
+        };
+        *self.shown_matches.borrow_mut() = Some((key, shown.clone()));
+        shown
     }
 
     /// Whether a line shown matches the search, counting lines that arrived since the last
@@ -180,11 +236,7 @@ impl LogView {
         match self.filter_rows() {
             None => self.search.has_match_in(&self.snapshot.lines),
             // Filtered: a match among the rows shown.
-            Some(_) => self
-                .search
-                .matches()
-                .iter()
-                .any(|id| self.row_index(*id).is_some()),
+            Some(_) => !self.shown_matches().is_empty(),
         }
     }
 
@@ -206,17 +258,11 @@ impl LogView {
             });
             return (self.search.count_in(lines), at);
         }
-        let mut count = 0;
-        let mut at = None;
-        for id in self.search.matches() {
-            if self.row_index(*id).is_some() {
-                if Some(*id) == self.current_match {
-                    at = Some(count);
-                }
-                count += 1;
-            }
-        }
-        (count, at)
+        let shown = self.shown_matches();
+        let at = self
+            .current_match
+            .and_then(|id| shown.binary_search(&id).ok());
+        (shown.len(), at)
     }
 
     /// [`SelectLine`] and [`DragSelection`] take a line shown now.
@@ -311,15 +357,30 @@ impl LogView {
                 self.search.prev_before(at)
             }
         };
-        let mut at = step(from).or_else(|| step(None));
-        for _ in 0..self.search.count() {
-            let id = at?;
-            if self.row_index(id).is_some() {
-                return Some(id);
+        if !self.is_filtered() {
+            // Over matches already evicted.
+            let mut at = step(from).or_else(|| step(None));
+            for _ in 0..self.search.count() {
+                let id = at?;
+                if self.row_index(id).is_some() {
+                    return Some(id);
+                }
+                at = step(Some(id)).or_else(|| step(None));
             }
-            at = step(Some(id)).or_else(|| step(None));
+            return None;
         }
-        None
+        // Filtered: the next match among the rows shown, wrapping around.
+        let shown = self.shown_matches();
+        let next = match (from, forward) {
+            (Some(at), true) => shown.get(shown.partition_point(|id| *id <= at)),
+            (Some(at), false) => shown
+                .partition_point(|id| *id < at)
+                .checked_sub(1)
+                .and_then(|ix| shown.get(ix)),
+            (None, _) => None,
+        };
+        next.or(if forward { shown.first() } else { shown.last() })
+            .copied()
     }
 
     fn go_to_match(&mut self, id: Option<LineId>, cx: &mut Context<Self>) {

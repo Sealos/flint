@@ -128,13 +128,15 @@ impl LogView {
             let Ok(lines) = this.read_with(cx, |view, _| view.snapshot.lines.clone()) else {
                 return;
             };
-            let filter = core
+            let mut filter = core
                 .filter_logs(LogFilter::with_matcher(spec, matcher), lines)
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
+                // Lines evicted while it scanned are not shown.
+                filter.evict(view.snapshot.lines.first_id());
                 view.list.reset(filter.rows().len());
                 view.filter = Some(filter);
                 view.filtering = false;
@@ -175,11 +177,12 @@ impl LogView {
         let behind = filter.clone();
         let lines = self.snapshot.lines.clone();
         self._catch_up = cx.spawn(async move |this, cx| {
-            let caught_up = core.filter_logs(behind, lines).await;
+            let mut caught_up = core.filter_logs(behind, lines).await;
             let _ = this.update(cx, |view, cx| {
                 if view.filter_generation != generation {
                     return;
                 }
+                caught_up.evict(view.snapshot.lines.first_id());
                 view.catching_up = false;
                 let shown = view.shown_rows();
                 view.filter = Some(caught_up);
@@ -222,6 +225,22 @@ impl LogView {
             let end = self.list.item_count();
             self.list.splice(end..end, appended);
         }
+    }
+
+    /// How many rows are shown between `from` and `to` (line ids, inclusive), without listing
+    /// them.
+    pub(super) fn rows_count_between(&self, from: LineId, to: LineId) -> usize {
+        let (from, to) = (
+            from.min(to),
+            from.max(to)
+                .min(self.snapshot.lines.end_id().saturating_sub(1)),
+        );
+        let from = from.max(self.snapshot.lines.first_id());
+        self.filter_rows().map_or(0, |rows| {
+            let start = rows.partition_point(|id| *id < from);
+            let end = rows.partition_point(|id| *id <= to);
+            end.saturating_sub(start)
+        })
     }
 
     /// The rows shown between `from` and `to` (line ids, inclusive): what a copy or save of a

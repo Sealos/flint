@@ -143,6 +143,11 @@ pub struct LogView {
     /// Why the regular expression matches nothing, if it does not compile.
     regex_error: Option<String>,
     search: LogSearch,
+    /// A regular expression's matches in the lines drawn, found off the UI thread.
+    highlights: highlight::Highlights,
+    /// The matches among the rows shown in a filtered tab, kept until the search or the rows
+    /// change ([`LogView::shown_matches`]).
+    shown_matches: std::cell::RefCell<Option<(actions::ShownMatchesKey, Arc<[LineId]>)>>,
     /// Bumped with every query, so a slow first scan of an old query is dropped.
     search_generation: u64,
     /// A scan of `search` runs on the core's threads: the first of `query`, or a long
@@ -255,6 +260,8 @@ impl LogView {
             regex: false,
             regex_error: None,
             search: LogSearch::default(),
+            highlights: Default::default(),
+            shown_matches: Default::default(),
             search_generation: 0,
             searching: false,
             current_match: None,
@@ -327,9 +334,16 @@ impl LogView {
     pub fn set_snapshot(&mut self, snapshot: Arc<LogSnapshot>, cx: &mut Context<Self>) {
         let old = &self.snapshot.lines;
         let new = &snapshot.lines;
-        // A filtered list follows its rows instead ([`LogView::update_filter`]).
-        let change = if self.filter.is_some() {
-            ListChange::Unchanged
+        // A filtered list follows its rows instead ([`LogView::catch_up_filter`]); rows of
+        // lines that left the buffer go at once, so the list never starts with a missing row.
+        let change = if let Some(filter) = &mut self.filter {
+            match filter.evict(new.first_id()) {
+                0 => ListChange::Unchanged,
+                evicted => ListChange::Splice {
+                    evicted,
+                    appended: 0,
+                },
+            }
         } else {
             log_model::list_change(old.first_id()..old.end_id(), new.first_id()..new.end_id())
         };
@@ -416,6 +430,12 @@ impl LogView {
         self.current_match = None;
         self.search_generation += 1;
         self.query_pending = !query.text.is_empty();
+        self.highlights.clear();
+        // A filter of the old query on its way is dropped; what is shown stays until the new
+        // one lands.
+        if self.matching_only && self.query_pending {
+            self.refilter(None, cx);
+        }
         if query.text.is_empty() {
             self.use_matcher(SearchMatcher::default(), cx);
             self.searching = false;
@@ -446,6 +466,7 @@ impl LogView {
         self.regex_error = matcher.error().map(str::to_owned);
         self.search = LogSearch::with_matcher(self.query.clone(), matcher.clone());
         self.matcher = matcher;
+        self.highlights.clear();
         // The matching lines shown follow the search.
         if self.matching_only {
             self.refilter(None, cx);
@@ -824,15 +845,20 @@ impl LogView {
     }
 
     fn render_line(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let Some((id, line)) = self
+        let Some(id) = self
             .row_id(ix)
-            .and_then(|id| self.snapshot.lines.get(id).map(|line| (id, line)))
+            .filter(|id| self.snapshot.lines.contains(*id))
         else {
             return div().into_any_element();
         };
+        let found = self.text_matches(id, cx);
+        let theme = cx.theme();
+        let Some(line) = self.snapshot.lines.get(id) else {
+            return div().into_any_element();
+        };
         let max = (!self.wrap).then_some(log_model::UNWRAPPED_MAX_BYTES);
-        let shown = log_model::shown_line(line, self.line_view(), &self.matcher, max);
+        let shown =
+            log_model::shown_line(line, self.line_view(), &self.matcher, found.as_deref(), max);
         let selected = self.selection.is_some_and(|s| s.contains(id));
         let color = match line.severity {
             Severity::Error => theme.danger,
@@ -1160,8 +1186,23 @@ impl LogView {
                                     .when(self.regex_error.is_some(), |el| {
                                         el.text_color(theme.danger)
                                     })
+                                    // With the toggles folded away the toolbar is tight:
+                                    // the short form, with the reason on hover.
+                                    .when_some(
+                                        self.regex_error.clone().filter(|_| !fit.toggles),
+                                        |el, error| {
+                                            el.tooltip(move |window, cx| {
+                                                Tooltip::new(format!("Invalid regex: {error}"))
+                                                    .build(window, cx)
+                                            })
+                                        },
+                                    )
                                     .child(if let Some(error) = &self.regex_error {
-                                        format!("Invalid regex: {error}")
+                                        if fit.toggles {
+                                            format!("Invalid regex: {error}")
+                                        } else {
+                                            "Invalid regex".to_owned()
+                                        }
                                     } else if self.searching {
                                         "Searching…".to_owned()
                                     } else {
@@ -1835,6 +1876,9 @@ mod actions;
 
 #[path = "log_filter.rs"]
 mod filter;
+
+#[path = "log_highlight.rs"]
+mod highlight;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "log_state.rs"]

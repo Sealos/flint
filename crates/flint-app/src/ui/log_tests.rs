@@ -418,7 +418,7 @@ async fn search_highlights_counts_and_moves_between_matches(cx: &mut TestAppCont
             [4, 9, 14, 19]
         );
         let line = v.snapshot.lines.get(9).unwrap();
-        let shown = crate::ui::log_model::shown_line(line, v.line_view(), &v.matcher, None);
+        let shown = crate::ui::log_model::shown_line(line, v.line_view(), &v.matcher, None, None);
         assert_eq!(&shown.text[shown.matches[0].clone()], "ERROR");
         assert_eq!(line.severity, flint_core::Severity::Error);
     });
@@ -560,7 +560,7 @@ async fn timestamps_and_wrap_toggle_without_reloading(cx: &mut TestAppContext) {
     let shown = |cx: &mut TestAppContext| {
         view.read_with(cx, |v, _| {
             let line = v.snapshot.lines.get(4).unwrap();
-            crate::ui::log_model::shown_line(line, v.line_view(), &v.matcher, None).text
+            crate::ui::log_model::shown_line(line, v.line_view(), &v.matcher, None, None).text
         })
     };
     assert_eq!(shown(cx), "ERROR line 4");
@@ -2286,4 +2286,109 @@ async fn a_filter_that_hides_everything_saves_and_copies_nothing(cx: &mut TestAp
     .await;
     assert_eq!(view.read_with(cx, |v, _| v.shown_match_count()), (2, None));
     assert_eq!(view.read_with(cx, |v, _| v.view_state().search.matches), 2);
+}
+
+// covers UP-48: a query changed while Matching filters drops the old query's filter at once;
+// the rows shown stay until the new one lands.
+#[gpui_kit::test]
+async fn a_new_query_drops_the_old_filter_on_its_way(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(1_000);
+    feed(cx, &view, lines.push(0, 20).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleMatchingOnly",
+        serde_json::Value::Null,
+    );
+    view.update(cx, |v, cx| v.set_query("line 1".into(), cx));
+    until_rows(cx, window, &view, 11).await;
+    let generation = view.read_with(cx, |v, _| v.filter_generation);
+    view.update(cx, |v, cx| v.set_query("error".into(), cx));
+    view.read_with(cx, |v, _| {
+        assert!(v.filtering, "the old filter is no longer what is coming");
+        assert!(v.filter_generation > generation);
+        assert_eq!(v.row_count(), 11, "the rows shown stay meanwhile");
+    });
+    until_rows(cx, window, &view, 4).await;
+    assert_eq!(rows(cx, &view), [4, 9, 14, 19]);
+}
+
+// covers UP-48: rows of lines that left the buffer go with the snapshot, before any catch-up,
+// so the first row is always a line shown.
+#[gpui_kit::test]
+async fn evicted_rows_go_with_the_snapshot(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(10);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    draw(cx, window);
+    run(
+        cx,
+        window,
+        "logs::ToggleErrorsOnly",
+        serde_json::Value::Null,
+    );
+    until_rows(cx, window, &view, 2).await;
+    // Lines 0 to 4 leave the buffer; line 9 is the only row left until the tab is drawn.
+    let snapshot = lines.push(10, 15).streaming();
+    view.update(cx, |v, cx| {
+        v.set_snapshot(snapshot, cx);
+        assert_eq!(v.row_count(), 1);
+        assert_eq!(v.row_id(0), Some(9));
+        assert_eq!(v.list.item_count(), 1);
+    });
+    draw(cx, window);
+    assert_eq!(rows(cx, &view), [9, 14]);
+}
+
+// covers UP-48: a regular expression's highlights are found off the UI thread, against the
+// whole line, and drawn once found.
+#[gpui_kit::test]
+async fn regex_highlights_are_found_off_the_ui_thread(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
+    view.update(cx, |v, cx| v.set_query(r"line \d$".into(), cx));
+    cx.wait_for(window, WAIT, |_, cx| {
+        let v = view.read(cx);
+        !v.searching && v.highlights.found(4).is_some()
+    })
+    .await;
+    view.read_with(cx, |v, _| {
+        // "ERROR line 4": the match is at the end of the whole line.
+        assert_eq!(
+            v.highlights.found(4),
+            Some(&[std::ops::Range { start: 6, end: 12 }][..])
+        );
+    });
+}
+
+// covers UP-48: with the toggles in the More menu, an invalid regex reads "Invalid regex",
+// with the reason on hover, so a long reason does not crowd the toolbar.
+#[gpui_kit::test]
+async fn a_compact_toolbar_says_invalid_regex_briefly(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open_sized(cx, core, request(), 700.);
+    let mut lines = Feed::new(100);
+    feed(cx, &view, lines.push(0, 10).streaming());
+    run(cx, window, "logs::ToggleRegex", serde_json::Value::Null);
+    view.update(cx, |v, cx| v.set_query("(unclosed".into(), cx));
+    cx.wait_for(window, WAIT, |window, cx| {
+        view.read(cx).regex_error.is_some()
+            && window
+                .try_find("log-matches")
+                .is_some_and(|el| f32::from(el.bounds().size.width) > 0.)
+    })
+    .await;
+    let width = cx
+        .update_window(window, |_, window, _| {
+            f32::from(window.try_find("log-matches").unwrap().bounds().size.width)
+        })
+        .unwrap();
+    assert!(width < 120., "{width}");
 }

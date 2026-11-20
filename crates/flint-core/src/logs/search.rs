@@ -142,6 +142,12 @@ impl SearchMatcher {
         }
     }
 
+    /// Whether the query is a regular expression (that compiled): matching a long line can
+    /// take a while, so a view finds its highlights off the UI thread.
+    pub fn is_regex(&self) -> bool {
+        matches!(self.find, Find::Regex(_))
+    }
+
     /// Whether the query also matches a workload line's source.
     pub fn covers_sources(&self) -> bool {
         self.sources
