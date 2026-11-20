@@ -1495,3 +1495,67 @@ async fn a_stalled_events_request_returns_the_object_after_the_deadline() {
     // Timing out dropped the events request.
     until_in_flight(&server, 0, GIVEN_UP, "the timed-out events request").await;
 }
+
+// covers UP-06 (#255): a reader that never reads holds a bounded queue while the core reloads
+// kubeconfig and rediscovers the cluster again and again (each confirmed against the server, not
+// through that reader), and what it then reads is the latest: the last list, and discovery of
+// the slot that list names.
+#[tokio::test]
+async fn an_unread_event_queue_stays_bounded_through_reloads_and_discoveries() {
+    let server = FakeApiServer::start().await.unwrap();
+    let core = Core::start(&server, None).await;
+    let events = core.handle.events();
+    let kubeconfig = core._dir.path().join("kubeconfig");
+    let discoveries = || {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/api" || r.path == "/apis")
+            .count()
+    };
+    let runs = 8;
+    for n in 0..runs {
+        // A new namespace changes the context: a new slot, connected and discovered again.
+        server
+            .write_kubeconfig(&kubeconfig, Some(&format!("ns-{n}")))
+            .unwrap();
+        let before = discoveries();
+        core.handle.send(Command::ReloadKubeconfig);
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if discoveries() > before && core.handle.discovery(CONTEXT).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rediscovered");
+    }
+    // The list, the active cluster, its connection (both phases), its discovery, settings and
+    // the activity log at most: not one per run.
+    assert!(events.len() <= 7, "{} events queued", events.len());
+    let mut generation = None;
+    let mut discovered = None;
+    while !events.is_empty() {
+        match events.recv().await.unwrap() {
+            Event::ClustersChanged(snapshot) => {
+                let summary = &snapshot.clusters[0];
+                assert_eq!(summary.info.namespace.as_deref(), Some("ns-7"));
+                generation = Some(summary.generation);
+            }
+            Event::DiscoveryChanged {
+                generation: of,
+                discovery,
+                ..
+            } => discovered = Some((of, discovery.is_some())),
+            _ => {}
+        }
+    }
+    let generation = generation.expect("the list");
+    assert_eq!(
+        discovered,
+        Some((generation, true)),
+        "the last slot's discovery"
+    );
+}

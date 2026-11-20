@@ -304,7 +304,7 @@ impl Workspace {
     /// when that changes.
     fn switcher_scope(&self, cx: &App) -> (SwitcherScope, Vec<NavEntry>, SwitcherKey) {
         let model = self.model.read(cx);
-        let discovered = self.cluster.as_ref().and_then(|c| model.discovery.get(c));
+        let discovered = self.cluster.as_ref().and_then(|c| model.discovered(c));
         let entries: Vec<NavEntry> = discovered
             .and_then(|d| d.discovery.as_ref())
             .map(|d| {

@@ -459,7 +459,7 @@ impl Dock {
     /// their context again and ends them itself.
     pub fn check_servers(
         &mut self,
-        server_of: impl Fn(&str) -> Option<Option<String>>,
+        server_of: impl Fn(&str) -> Option<(Option<String>, u64)>,
         cx: &mut Context<Self>,
     ) {
         for ix in 0..self.tabs.len() {
@@ -467,10 +467,10 @@ impl Dock {
             if tab.repointed {
                 continue;
             }
-            let Some(now) = server_of(&tab.cluster.context) else {
+            let Some((server, generation)) = server_of(&tab.cluster.context) else {
                 continue;
             };
-            if tab.cluster.is_at(now.as_deref()) {
+            if tab.cluster.is_at(server.as_deref(), Some(generation)) {
                 continue;
             }
             tab.repointed = true;

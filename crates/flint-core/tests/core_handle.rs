@@ -348,67 +348,91 @@ async fn events_nobody_reads_stay_bounded() {
     );
 }
 
-// covers UP-06: a context re-pointed and pointed back (or removed and added back) before the
-// front end reads starts over in the core; whatever lists the reader skipped, a reset of its
-// discovery is queued, so no old server's kinds are kept.
+/// The generation of each context in the latest list `events` holds, draining it.
+async fn latest_generations(events: &flint_core::events::Events) -> Vec<(String, u64)> {
+    let mut latest = Vec::new();
+    while !events.is_empty() {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            latest = snapshot
+                .clusters
+                .iter()
+                .map(|c| (c.info.name.clone(), c.generation))
+                .collect();
+        }
+    }
+    latest
+}
+
+// covers UP-06: a context re-pointed and pointed back, or removed and added back, before the
+// front end reads, starts over in the core: the latest list gives it a newer generation, so a
+// reader that skipped the lists in between still knows its discovery and sessions are stale. One
+// left alone keeps its generation.
 #[tokio::test]
-async fn a_context_that_starts_over_resets_its_discovery() {
+async fn a_context_that_starts_over_has_a_new_generation() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one", "two"])).unwrap();
+    std::fs::write(
+        dir.path().join("kubeconfig"),
+        kubeconfig(&["one", "two", "three"]),
+    )
+    .unwrap();
     let core = start(dir.path(), true);
     let events = core.events();
-    next_clusters(&events).await;
+    let first = loop {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            break snapshot
+                .clusters
+                .iter()
+                .map(|c| (c.info.name.clone(), c.generation))
+                .collect::<Vec<_>>();
+        }
+    };
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let elsewhere = kubeconfig(&["one", "two"]).replace("127.0.0.1:1", "127.0.0.1:2");
-    for text in [elsewhere, kubeconfig(&["one"]), kubeconfig(&["one", "two"])] {
+    let elsewhere = kubeconfig(&["one", "two", "three"]).replace("127.0.0.1:1", "127.0.0.1:2");
+    for text in [
+        elsewhere,
+        kubeconfig(&["one", "three"]),
+        kubeconfig(&["one", "two", "three"]),
+    ] {
         std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
-    let mut read = Vec::new();
-    while !events.is_empty() {
-        read.push(match events.recv().await.unwrap() {
-            Event::ClustersChanged(_) => "clusters".to_owned(),
-            Event::DiscoveryChanged {
-                cluster,
-                discovery: None,
-                error: None,
-            } => format!("reset {cluster}"),
-            other => format!("{other:?}").chars().take(20).collect(),
-        });
+    let last = latest_generations(&events).await;
+    let of = |list: &[(String, u64)], name: &str| {
+        list.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, g)| *g)
+            .expect(name)
+    };
+    // Every context was re-pointed and back; two was also removed and added back.
+    for name in ["one", "two", "three"] {
+        assert!(
+            of(&last, name) > of(&first, name),
+            "{name}: {first:?} -> {last:?}"
+        );
     }
-    // Each reset is the last word on its cluster's discovery (nothing of the old slot follows).
-    for reset in ["reset one", "reset two"] {
-        assert!(read.iter().any(|e| e == reset), "{read:?}");
-    }
-    assert!(read.iter().any(|e| e == "clusters"), "{read:?}");
 }
 
-// covers UP-06: the only context, removed and added back, starts over: its discovery is reset
-// (it is not taken for the first load).
+// covers UP-06: the only context, removed and added back, starts over: a newer generation.
 #[tokio::test]
 async fn the_only_context_removed_and_added_back_starts_over() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
     let core = start(dir.path(), true);
     let events = core.events();
-    next_clusters(&events).await;
+    let mut first = None;
+    while first.is_none() {
+        if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+            first = snapshot.clusters.first().map(|c| c.generation);
+        }
+    }
     tokio::time::sleep(Duration::from_millis(500)).await;
     for text in [kubeconfig(&[]), kubeconfig(&["one"])] {
         std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
-    let mut reset = false;
-    while !events.is_empty() {
-        if let Event::DiscoveryChanged {
-            cluster,
-            discovery: None,
-            error: None,
-        } = events.recv().await.unwrap()
-        {
-            reset |= cluster == "one";
-        }
-    }
-    assert!(reset, "the context that came back starts over");
+    let last = latest_generations(&events).await;
+    assert_eq!(last.len(), 1);
+    assert!(last[0].1 > first.unwrap(), "{last:?}");
 }
 
 // covers UP-06: once the front end drops its stream, the core stops queueing events for it;

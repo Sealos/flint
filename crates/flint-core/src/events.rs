@@ -139,6 +139,17 @@ impl EventSender {
     /// Queues `event`, replacing the queued one of its kind (and cluster). Never blocks. Does
     /// nothing once every reader is gone.
     pub(crate) fn send(&self, event: Event) {
+        // The contexts a new list keeps, gathered before the lock that readers wait on.
+        let kept: Option<std::collections::HashSet<ClusterId>> = match &event {
+            Event::ClustersChanged(snapshot) => Some(
+                snapshot
+                    .clusters
+                    .iter()
+                    .map(|c| c.info.name.clone())
+                    .collect(),
+            ),
+            _ => None,
+        };
         let mut guard = self.0.pending();
         if guard.had_reader && guard.readers == 0 {
             return;
@@ -167,11 +178,9 @@ impl EventSender {
         // A context the new list no longer has: its queued connection and discovery events go
         // (the reader forgets a context that left the list anyway), so contexts that come and go
         // under new names do not pile up.
-        if let Event::ClustersChanged(snapshot) = &event {
-            let kept =
-                |context: &ClusterId| snapshot.clusters.iter().any(|c| &c.info.name == context);
+        if let Some(kept) = &kept {
             let gone = |key: &Key| match key {
-                Key::Connection(context, _) | Key::Discovery(context) => !kept(context),
+                Key::Connection(context, _) | Key::Discovery(context) => !kept.contains(context),
                 _ => false,
             };
             pending.order.retain(|k| !gone(k));

@@ -143,6 +143,7 @@ fn snapshot(contexts: &[String]) -> Event {
                 source: std::path::PathBuf::new(),
             },
             state: ConnectionState::Disconnected,
+            generation: 1,
         })
         .collect();
     Event::ClustersChanged(Arc::new(crate::handle::ClustersSnapshot {
@@ -162,6 +163,7 @@ async fn contexts_that_left_the_list_leave_the_queue() {
         sender.send(connection(&name, ConnectionState::Connecting));
         sender.send(Event::DiscoveryChanged {
             cluster: name,
+            generation: 1,
             discovery: None,
             error: None,
         });

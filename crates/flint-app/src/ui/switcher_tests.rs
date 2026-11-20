@@ -419,6 +419,7 @@ async fn says_why_kinds_or_objects_are_missing(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: None,
             error: Some("the server is unreachable".into()),
         },
@@ -743,6 +744,7 @@ async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "beta".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
             ))),
@@ -808,6 +810,7 @@ async fn kinds_arrive_in_an_open_switcher(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
             ))),
@@ -892,6 +895,7 @@ async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: None,
             error: Some("unreachable".into()),
         },
@@ -909,6 +913,7 @@ async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
             ))),
@@ -945,6 +950,7 @@ async fn a_renamed_kind_lists_anew(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 sections,
             ))),
@@ -1074,6 +1080,7 @@ async fn the_chosen_item_survives_a_rename(cx: &mut TestAppContext) {
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 sections,
             ))),
@@ -1128,6 +1135,7 @@ async fn an_index_read_for_an_earlier_scope_is_dropped(cx: &mut TestAppContext) 
         cx,
         flint_core::Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 sections,
             ))),

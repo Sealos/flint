@@ -217,6 +217,11 @@ pub enum ConnectionState {
 pub struct ClusterSummary {
     pub info: ContextInfo,
     pub state: ConnectionState,
+    /// The core's slot for the context: a new one (re-pointed or otherwise changed, back after
+    /// being removed) has a higher generation. What came from an older one (its discovery, a
+    /// session opened on it) belongs to a cluster that is gone, whatever lists a front end skipped
+    /// (#255).
+    pub generation: u64,
 }
 
 /// The full cluster list. Sent whole whenever kubeconfig is (re)loaded.
@@ -247,11 +252,12 @@ pub enum Event {
         error: Option<String>,
     },
     /// Discovery ran for a cluster: at connect, and again when its CRDs change. On failure,
-    /// `error` is set and `discovery` holds the previous result, if any. With neither, the
-    /// cluster started over (re-pointed, or back after being removed) and has not been
-    /// discovered: forget what was discovered of it.
+    /// `error` is set and `discovery` holds the previous result, if any.
     DiscoveryChanged {
         cluster: ClusterId,
+        /// The generation of the slot it was discovered for ([`ClusterSummary::generation`]):
+        /// one for an older slot is stale.
+        generation: u64,
         discovery: Option<Arc<ClusterDiscovery>>,
         error: Option<String>,
     },

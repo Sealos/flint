@@ -1182,35 +1182,21 @@ async fn a_burst_of_changes_ends_on_the_latest_state(cx: &mut TestAppContext) {
     assert_eq!(names, ["alpha", "beta"]);
 }
 
-// covers UP-06: a cluster that started over in the core (re-pointed, or back after being
-// removed) forgets what was discovered of it, however many cluster lists the app skipped.
+// covers UP-06 (#255): when the active cluster starts over in the core (a newer generation:
+// re-pointed, even and back), its open view closes as on a switch, so nothing stays open from
+// the old catalog, and its old discovery is not used.
 #[gpui_kit::test]
-async fn a_cluster_that_starts_over_forgets_its_discovery(cx: &mut TestAppContext) {
-    use flint_core::Event;
+async fn a_cluster_that_starts_over_closes_its_views(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.feed(
-        cx,
-        Event::DiscoveryChanged {
-            cluster: "alpha".into(),
-            discovery: None,
-            error: Some("discovery failed".into()),
-        },
-    );
-    assert!(
-        t.model
-            .read_with(cx, |m, _| m.discovery.contains_key("alpha"))
-    );
-    t.feed(
-        cx,
-        Event::DiscoveryChanged {
-            cluster: "alpha".into(),
-            discovery: None,
-            error: None,
-        },
-    );
-    assert!(
-        t.model
-            .read_with(cx, |m, _| !m.discovery.contains_key("alpha"))
-    );
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    assert!(t.list(cx).is_some());
+    t.model.update(cx, |m, cx| {
+        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "alpha") {
+            c.generation += 1;
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(t.list(cx).is_none(), "the old slot's view closed");
 }

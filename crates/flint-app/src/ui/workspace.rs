@@ -185,6 +185,10 @@ pub struct Workspace {
     nav: Entity<NavPanel>,
     /// The cluster the main area shows: the active one.
     cluster: Option<ClusterId>,
+    /// The generation of `cluster`'s slot the views are of: a new one (the context started over
+    /// in the core, re-pointed or back after being removed) closes them, as a switch does, so
+    /// nothing is restored from the old catalog (#255).
+    generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
     detail: Option<Entity<DetailView>>,
     /// The bottom dock. It does not change with the active cluster.
@@ -337,6 +341,7 @@ impl Workspace {
             ui_state,
             nav,
             cluster: None,
+            generation: None,
             list: None,
             detail: None,
             dock,
@@ -658,7 +663,8 @@ impl Workspace {
         let server = self
             .cluster_summary(context, cx)
             .and_then(|c| c.info.server.as_deref());
-        TabCluster::new(context, server)
+        let generation = self.cluster_summary(context, cx).map(|c| c.generation);
+        TabCluster::new(context, server).at_generation(generation)
     }
 
     /// Tells the dock kubeconfig's contexts (its chips tell alike names apart), and ends the
@@ -676,12 +682,12 @@ impl Workspace {
         if self.dock.read(cx).tab_count() == 0 {
             return;
         }
-        let servers: HashMap<String, Option<String>> = self
+        let servers: HashMap<String, (Option<String>, u64)> = self
             .model
             .read(cx)
             .clusters
             .iter()
-            .map(|c| (c.info.name.clone(), c.info.server.clone()))
+            .map(|c| (c.info.name.clone(), (c.info.server.clone(), c.generation)))
             .collect();
         self.dock.update(cx, |dock, cx| {
             dock.check_servers(|context| servers.get(context).cloned(), cx)
@@ -743,10 +749,12 @@ impl Workspace {
             .is_some_and(|c| matches!(c.state, ConnectionState::Failed(_)));
         let discovered = active
             .as_ref()
-            .and_then(|c| model.discovery.get(c))
+            .and_then(|c| model.discovered(c))
             .cloned()
             .unwrap_or_default();
-        if active != self.cluster {
+        let generation = model.active_cluster().map(|c| c.generation);
+        if active != self.cluster || generation != self.generation {
+            self.generation = generation;
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
             self.cluster = active.clone();

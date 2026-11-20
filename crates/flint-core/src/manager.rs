@@ -50,6 +50,10 @@ pub(crate) struct Cluster {
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
+    /// The slot's generation, from the manager-wide counter: a new slot (a new context, one
+    /// re-pointed or otherwise changed, one back after being removed) has a new one. Front ends
+    /// tell a cluster that started over by it, whatever lists they skipped (#255).
+    generation: u64,
     /// Kept while the cluster is not active (ADR-0008).
     discovery: Option<Arc<ClusterDiscovery>>,
     discovering: bool,
@@ -99,6 +103,7 @@ impl Cluster {
             state: ConnectionState::Disconnected,
             client: None,
             attempt: 0,
+            generation: 0,
             discovery: None,
             discovering: false,
             rediscover: false,
@@ -135,6 +140,7 @@ impl Cluster {
         ClusterSummary {
             info: self.info.clone(),
             state: self.state.clone(),
+            generation: self.generation,
         }
     }
 }
@@ -222,8 +228,8 @@ pub(crate) struct ClusterManager {
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: Option<mpsc::UnboundedReceiver<Internal>>,
     kubeconfig: Arc<LoadedKubeconfig>,
-    /// Kubeconfig was loaded at least once: contexts that come later are new to the front end.
-    kubeconfig_loaded: bool,
+    /// The last slot generation handed out ([`Cluster::generation`]).
+    generation: u64,
     /// Every context's history across kubeconfig loads, which sessions are pinned to.
     contexts: ContextHistory,
     /// The kubeconfig files for the current settings: the base files plus `kubeconfig_paths`.
@@ -283,7 +289,7 @@ impl ClusterManager {
             internal_tx,
             internal_rx: Some(internal_rx),
             kubeconfig: Arc::default(),
-            kubeconfig_loaded: false,
+            generation: 0,
             contexts: ContextHistory::default(),
             kubeconfig_paths,
             clusters: Vec::new(),
@@ -911,8 +917,10 @@ impl ClusterManager {
                     None
                 };
                 let discovery = slot.discovery.clone();
+                let generation = slot.generation;
                 self.emit(Event::DiscoveryChanged {
                     cluster: cluster.clone(),
+                    generation,
                     discovery,
                     error,
                 });
@@ -1162,6 +1170,12 @@ impl ClusterManager {
         }
     }
 
+    /// A new slot generation.
+    fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
     async fn reload_kubeconfig(&mut self) {
         let paths = self.kubeconfig_paths.clone();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -1201,11 +1215,6 @@ impl ClusterManager {
             .map(|c| (c.info.name.clone(), c))
             .collect();
         let mut changed_active = false;
-        // Contexts that start over with a fresh slot (re-pointed, or back after being removed):
-        // their discovery is reset after the list goes out (#255).
-        let first_load = !self.kubeconfig_loaded;
-        self.kubeconfig_loaded = true;
-        let mut reset = Vec::new();
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
             let slot = match old.remove(&info.name) {
@@ -1226,14 +1235,14 @@ impl ClusterManager {
                         Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
                     fresh.namespace_filter = old.namespace_filter.clone();
                     fresh.update_scope();
-                    reset.push(info.name.clone());
+                    fresh.generation = self.next_generation();
                     fresh
                 }
                 None => {
-                    if !first_load {
-                        reset.push(info.name.clone());
-                    }
-                    Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config)
+                    let mut fresh =
+                        Cluster::new(info.clone(), fingerprint, &self.hubs, &self.engine_config);
+                    fresh.generation = self.next_generation();
+                    fresh
                 }
             };
             self.clusters.push(slot);
@@ -1253,15 +1262,6 @@ impl ClusterManager {
             paths: path_exist,
         };
         self.emit(Event::ClustersChanged(Arc::new(snapshot)));
-        // After the list, so it replaces any discovery of the old slot still queued, and the
-        // reader forgets it however many lists it skipped.
-        for cluster in reset {
-            self.emit(Event::DiscoveryChanged {
-                cluster,
-                discovery: None,
-                error: None,
-            });
-        }
 
         if let Some(active) = self.active.clone() {
             if old.contains_key(&active) {
