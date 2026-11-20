@@ -631,3 +631,4 @@ app tests get cheap runners.
 
 Tests never touch real clusters. Cluster tests and e2e tests require `FLINT_TEST_KUBECONFIG` or the fake server, and
 always set a scratch `FLINT_CONFIG_DIR`. The automation channel refuses to run without one.
+
