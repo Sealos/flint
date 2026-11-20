@@ -86,6 +86,18 @@ pub fn selection_edge(color: Hsla, inset: Pixels) -> Div {
         .bg(color)
 }
 
+/// A small status dot: filled with `color`, or a ring of it where `filled` is false (the nav's
+/// loading kinds, an idle cluster). Callers add their own spacing, `flex_none` in a row that may
+/// shrink, and a larger size where they want one.
+pub fn status_dot(color: Hsla, filled: bool) -> Div {
+    let dot = div().size_1p5().rounded_full();
+    if filled {
+        dot.bg(color)
+    } else {
+        dot.border_1().border_color(color)
+    }
+}
+
 /// The background of a search match in a log line: a tint of the warning color, as editors
 /// mark matches, so it never reads as the (accent) selection.
 pub fn log_match(theme: &Theme) -> Hsla {
@@ -178,13 +190,88 @@ pub(super) mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
     use super::{
         THEMES, chrome, log_current_line, log_current_match, log_match, log_source_colors, resolve,
-        themes,
+        status_dot, themes,
     };
     use crate::ui::accent::{ACCENT, CANDIDATES};
     use flint_core::Appearance;
     use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, try_parse_color};
-    use gpui_kit::{Hsla, Rgba, WindowAppearance};
+    use gpui_kit::{Hsla, InteractiveElement as _, Rgba, Styled as _, WindowAppearance, div, hsla};
     use std::rc::Rc;
+
+    // Each status dot draws exactly as the hand-built circle it replaced: the nav's dot and
+    // ring, the list's, the log and shell tabs' and the dock tab's state dots, the detail
+    // pane's condition rows, and the cluster row's dot.
+    #[test]
+    fn status_dots_draw_as_the_circles_they_replaced() {
+        let color = hsla(0.4, 0.6, 0.5, 1.);
+        // The nav's dot and ring.
+        assert_eq!(
+            status_dot(color, true).mx_1().flex_none().style(),
+            div()
+                .size_1p5()
+                .mx_1()
+                .flex_none()
+                .rounded_full()
+                .bg(color)
+                .style()
+        );
+        assert_eq!(
+            status_dot(color, false).mx_1().flex_none().style(),
+            div()
+                .size_1p5()
+                .mx_1()
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(color)
+                .style()
+        );
+        // The list's sync state.
+        assert_eq!(
+            status_dot(color, true).style(),
+            div().size_1p5().rounded_full().bg(color).style()
+        );
+        // The log and shell tabs' state, the dock tab's dot and the detail pane's conditions.
+        assert_eq!(
+            status_dot(color, true).flex_none().style(),
+            div()
+                .size_1p5()
+                .flex_none()
+                .rounded_full()
+                .bg(color)
+                .style()
+        );
+        // The cluster row: larger, filled or a ring.
+        assert_eq!(
+            status_dot(color, true).id("d").size_2().flex_none().style(),
+            div()
+                .id("d")
+                .size_2()
+                .flex_none()
+                .rounded_full()
+                .bg(color)
+                .style()
+        );
+        assert_eq!(
+            status_dot(color, false)
+                .id("d")
+                .size_2()
+                .flex_none()
+                .style(),
+            div()
+                .id("d")
+                .size_2()
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(color)
+                .style()
+        );
+        assert_ne!(
+            status_dot(color, true).style(),
+            status_dot(color, false).style()
+        );
+    }
 
     const LIGHT_NAME: &str = "Flint Light";
     const DARK_NAME: &str = "Flint Dark";

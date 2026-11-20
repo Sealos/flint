@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use flint_core::settings::AiExposure;
-use flint_core::{ConnectionState, ServerVersion, Settings};
+use flint_core::{ConnectionState, SafeErrorText, ServerVersion, Settings};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::json;
@@ -200,4 +200,46 @@ async fn no_contexts_explains_where_flint_looked(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert_eq!(main, Main::NoContexts);
+}
+
+// The automation state names each cluster's connection with fixed words the e2e tests read.
+#[gpui_kit::test]
+async fn the_state_names_each_connection(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let connected = ConnectionState::Connected(ServerVersion {
+        git_version: "v1.31.0".into(),
+        platform: "linux/arm64".into(),
+    });
+    let failed = ConnectionState::Failed(SafeErrorText::reduced("connection refused"));
+    for (alpha, beta, want) in [
+        (
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            [("disconnected", None), ("connecting", None)],
+        ),
+        (
+            connected,
+            failed,
+            [("connected", None), ("failed", Some("connection refused"))],
+        ),
+    ] {
+        t.model.update(cx, |model, cx| {
+            for cluster in &mut model.clusters {
+                cluster.state = match cluster.info.name.as_str() {
+                    "alpha" => alpha.clone(),
+                    "beta" => beta.clone(),
+                    _ => continue,
+                };
+            }
+            cx.notify();
+        });
+        render(cx, &t);
+        let s = state(cx, &t);
+        let got = ["alpha", "beta"].map(|name| {
+            let c = s.clusters.iter().find(|c| c.name == name).unwrap();
+            (c.connection, c.error.clone())
+        });
+        assert_eq!(got, want.map(|(c, e)| (c, e.map(str::to_owned))));
+    }
 }

@@ -1058,18 +1058,17 @@ impl Workspace {
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
         // Filled while live (or failing, or connecting); a ring while idle: connected, but not
         // watched.
-        let dot = div()
+        let (color, filled) = match presence {
+            Presence::NotConnected => (theme.muted_foreground.opacity(0.4), true),
+            Presence::Connecting => (theme.warning, true),
+            Presence::Live => (theme.success, true),
+            Presence::Idle => (theme.success, false),
+            Presence::Failed => (theme.danger, true),
+        };
+        let dot = super::theme::status_dot(color, filled)
             .id(SharedString::from(format!("cluster-dot-{name}")))
             .size_2()
             .flex_none()
-            .rounded_full()
-            .map(|el| match presence {
-                Presence::NotConnected => el.bg(theme.muted_foreground.opacity(0.4)),
-                Presence::Connecting => el.bg(theme.warning),
-                Presence::Live => el.bg(theme.success),
-                Presence::Idle => el.border_1().border_color(theme.success),
-                Presence::Failed => el.bg(theme.danger),
-            })
             .test_support();
 
         let tooltip = hover_text.clone();
@@ -1405,10 +1404,7 @@ impl Workspace {
     fn render_watch_mode(&self, cluster: &str, cx: &Context<Self>) -> impl IntoElement {
         let settings = self.model.read(cx).settings.clone();
         let effective = settings.watch_mode_for(cluster);
-        let label = match effective {
-            WatchMode::All => "Live: all kinds",
-            WatchMode::OnView => "Live: open views only",
-        };
+        let label = watch_mode_label(effective);
         let model = self.model.clone();
         let cluster = cluster.to_owned();
         let settings_ok = self.model.read(cx).settings_error.is_none();
@@ -1809,6 +1805,14 @@ fn mode_name(mode: WatchMode) -> &'static str {
     }
 }
 
+/// The watch mode button's label: "Live: all kinds" or "Live: open views only".
+fn watch_mode_label(mode: WatchMode) -> &'static str {
+    match mode {
+        WatchMode::All => "Live: all kinds",
+        WatchMode::OnView => "Live: open views only",
+    }
+}
+
 /// "All namespaces", "demo", or "3 namespaces".
 pub fn namespace_summary(filter: &[String]) -> String {
     match filter {
@@ -1965,7 +1969,11 @@ mod view_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, MIN_LIST_WIDTH, layout, namespace_summary, no_contexts_text};
+    use super::{
+        Layout, MIN_LIST_WIDTH, layout, mode_name, namespace_summary, no_contexts_text,
+        watch_mode_label,
+    };
+    use flint_core::WatchMode;
     use flint_core::settings::PaneWidths;
 
     fn list_width(widths: Layout, window: f32) -> f32 {
@@ -2052,6 +2060,17 @@ mod tests {
         assert_eq!(namespace_summary(&[]), "All namespaces");
         assert_eq!(namespace_summary(&["demo".into()]), "demo");
         assert_eq!(namespace_summary(&["a".into(), "b".into()]), "2 namespaces");
+    }
+
+    // The button and the automation state both read this label; it names the mode as the
+    // menu does.
+    #[test]
+    fn watch_mode_labels_name_the_mode() {
+        assert_eq!(watch_mode_label(WatchMode::All), "Live: all kinds");
+        assert_eq!(watch_mode_label(WatchMode::OnView), "Live: open views only");
+        for mode in [WatchMode::All, WatchMode::OnView] {
+            assert_eq!(watch_mode_label(mode), format!("Live: {}", mode_name(mode)));
+        }
     }
 
     // covers UP-02: the empty state names where Flint looked and what to do, without local

@@ -946,7 +946,7 @@ impl LogView {
                             .max_w(px(300.))
                             .overflow_hidden()
                             .text_color(state_color)
-                            .child(div().size_1p5().flex_none().rounded_full().bg(state_color))
+                            .child(super::theme::status_dot(state_color, true).flex_none())
                             .child(
                                 div()
                                     .id("log-state-text")

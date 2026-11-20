@@ -2017,6 +2017,19 @@ pub mod tests {
         assert_ne!(ArgKind::Bool, ArgKind::Text);
     }
 
+    // The shell tab's Copy and Paste tooltips show their bindings' hints (`terminal_view`):
+    // Cmd-C and Cmd-V on macOS, Ctrl-Shift-C and Ctrl-Shift-V elsewhere.
+    #[test]
+    fn terminal_copy_and_paste_hints_follow_their_bindings() {
+        let (copy, paste) = if cfg!(target_os = "macos") {
+            ("⌘C", "⌘V")
+        } else {
+            ("Ctrl+Shift+C", "Ctrl+Shift+V")
+        };
+        assert_eq!(key_hint(super::TERMINAL_COPY[0]), copy);
+        assert_eq!(key_hint(super::TERMINAL_PASTE[0]), paste);
+    }
+
     #[test]
     fn key_hints_use_the_platform_modifier() {
         let hint = key_hint("secondary-shift-g");

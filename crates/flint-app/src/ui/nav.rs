@@ -19,6 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::registry::{self, OpenView, RetryConnection, ToggleNavSection};
+use super::theme::status_dot;
 
 /// Which sections are open, per cluster. Sections the user never toggled follow
 /// [`collapsed_by_default`].
@@ -257,23 +258,16 @@ fn same_discovery(a: &Option<Arc<ClusterDiscovery>>, b: &Option<Arc<ClusterDisco
 }
 
 fn ring(color: Hsla) -> AnyElement {
-    div()
-        .size_1p5()
+    status_dot(color, false)
         .mx_1()
         .flex_none()
-        .rounded_full()
-        .border_1()
-        .border_color(color)
         .into_any_element()
 }
 
 fn dot(color: Hsla) -> AnyElement {
-    div()
-        .size_1p5()
+    status_dot(color, true)
         .mx_1()
         .flex_none()
-        .rounded_full()
-        .bg(color)
         .into_any_element()
 }
 

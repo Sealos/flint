@@ -39,6 +39,18 @@ use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
 use super::{Pane, Workspace, confirm_expose, expose_dialog};
 
+/// A guard: the view `$view` returns (`log`, `shell`, `detail` or `list_wide`) is open and,
+/// given `$check`, passes it. It expands to a closure that captures nothing, so it is the plain
+/// `fn` the registry's [`Guards`] takes.
+macro_rules! view_open {
+    ($view:ident) => {
+        |ws: &Workspace, cx: &App| $view(ws, cx).is_some()
+    };
+    ($view:ident, $check:expr) => {
+        |ws: &Workspace, cx: &App| $view(ws, cx).is_some_and($check)
+    };
+}
+
 impl Workspace {
     /// Every workspace action and its handler, for [`Bind`].
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
@@ -144,46 +156,35 @@ impl Workspace {
                 |ws, a, cx| ws.nav.read(cx).check_section(a),
             )
             // The list's.
-            .when::<SelectPrev>(|ws, cx| list_wide(ws, cx).is_some())
-            .when::<SelectNext>(|ws, cx| list_wide(ws, cx).is_some())
-            .when::<SelectFirst>(|ws, cx| list_wide(ws, cx).is_some())
-            .when::<SelectLast>(|ws, cx| list_wide(ws, cx).is_some())
-            .when::<CloseDetail>(|ws, cx| list_wide(ws, cx).is_some())
-            .when::<FocusFilter>(|ws, cx| list_wide(ws, cx).is_some())
+            .when::<SelectPrev>(view_open!(list_wide))
+            .when::<SelectNext>(view_open!(list_wide))
+            .when::<SelectFirst>(view_open!(list_wide))
+            .when::<SelectLast>(view_open!(list_wide))
+            .when::<CloseDetail>(view_open!(list_wide))
+            .when::<FocusFilter>(view_open!(list_wide))
             .when::<ToggleWide>(|ws, cx| list_wide(ws, cx) == Some(true))
-            .add::<SelectRow>(
-                |ws, cx| list_wide(ws, cx).is_some(),
-                |ws, a, cx| match &ws.list {
-                    Some(l) => l.read(cx).check_select_row(a),
-                    None => Err(ActionError::unavailable::<SelectRow>()),
-                },
-            )
-            .add::<SortBy>(
-                |ws, cx| list_wide(ws, cx).is_some(),
-                |ws, a, cx| match &ws.list {
-                    Some(l) => l.read(cx).check_sort(a),
-                    None => Err(ActionError::unavailable::<SortBy>()),
-                },
-            )
-            // The detail pane's.
-            .when::<Refresh>(|ws, _| ws.detail.is_some())
-            .when::<Close>(|ws, _| ws.detail.is_some())
-            .when::<ShowOverview>(|ws, _| ws.detail.is_some())
-            .when::<ShowYaml>(|ws, _| ws.detail.is_some())
-            .when::<ToggleLabels>(|ws, _| ws.detail.is_some())
-            .when::<ToggleAnnotations>(|ws, _| ws.detail.is_some())
-            .when::<ToggleManagedFields>(|ws, cx| {
-                ws.detail
-                    .as_ref()
-                    .is_some_and(|d| d.read(cx).has_managed_fields())
+            .add::<SelectRow>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_select_row(a),
+                None => Err(ActionError::unavailable::<SelectRow>()),
             })
-            .add::<ToggleSecretValue>(
-                |ws, cx| ws.detail.as_ref().is_some_and(|d| d.read(cx).is_secret()),
-                |ws, a, cx| match &ws.detail {
-                    Some(d) => d.read(cx).check_secret_key(a),
+            .add::<SortBy>(view_open!(list_wide), |ws, a, cx| match &ws.list {
+                Some(l) => l.read(cx).check_sort(a),
+                None => Err(ActionError::unavailable::<SortBy>()),
+            })
+            // The detail pane's.
+            .when::<Refresh>(view_open!(detail))
+            .when::<Close>(view_open!(detail))
+            .when::<ShowOverview>(view_open!(detail))
+            .when::<ShowYaml>(view_open!(detail))
+            .when::<ToggleLabels>(view_open!(detail))
+            .when::<ToggleAnnotations>(view_open!(detail))
+            .when::<ToggleManagedFields>(view_open!(detail, DetailView::has_managed_fields))
+            .add::<ToggleSecretValue>(view_open!(detail, DetailView::is_secret), |ws, a, cx| {
+                match detail(ws, cx) {
+                    Some(d) => d.check_secret_key(a),
                     None => Err(ActionError::unavailable::<ToggleSecretValue>()),
-                },
-            )
+                }
+            })
             // Logs and Shell act on the selected row, which the detail pane shows (UP-47).
             .when::<OpenLogs>(|ws, cx| {
                 ws.sessions_open_here(cx)
@@ -255,66 +256,55 @@ impl Workspace {
             )
             .add::<SetDockHeight>(|_, _| true, |_, a, _| check_dock_height(a))
             // The active shell tab's.
-            .when::<CopyText>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::has_selection))
-            .when::<PasteText>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::is_live))
-            .when::<ScrollPageUp>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::can_scroll_back))
-            .when::<ScrollToTop>(|ws, cx| shell(ws, cx).is_some_and(TerminalView::can_scroll_back))
-            .when::<ScrollPageDown>(|ws, cx| {
-                shell(ws, cx).is_some_and(TerminalView::is_scrolled_back)
+            .when::<CopyText>(view_open!(shell, TerminalView::has_selection))
+            .when::<PasteText>(view_open!(shell, TerminalView::is_live))
+            .when::<ScrollPageUp>(view_open!(shell, TerminalView::can_scroll_back))
+            .when::<ScrollToTop>(view_open!(shell, TerminalView::can_scroll_back))
+            .when::<ScrollPageDown>(view_open!(shell, TerminalView::is_scrolled_back))
+            .when::<ScrollToBottom>(view_open!(shell, TerminalView::is_scrolled_back))
+            .add::<SelectText>(view_open!(shell), |ws, a, cx| match shell(ws, cx) {
+                Some(t) => t.check_cells(a),
+                None => Err(ActionError::unavailable::<SelectText>()),
             })
-            .when::<ScrollToBottom>(|ws, cx| {
-                shell(ws, cx).is_some_and(TerminalView::is_scrolled_back)
-            })
-            .add::<SelectText>(
-                |ws, cx| shell(ws, cx).is_some(),
-                |ws, a, cx| match shell(ws, cx) {
-                    Some(t) => t.check_cells(a),
-                    None => Err(ActionError::unavailable::<SelectText>()),
-                },
-            )
             // The active log tab's.
-            .when::<TogglePause>(|ws, cx| log(ws, cx).is_some_and(LogView::can_pause))
-            .when::<JumpToEnd>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<JumpToStart>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<ToggleTimestamps>(|ws, cx| log(ws, cx).is_some())
-            .when::<ToggleWrap>(|ws, cx| log(ws, cx).is_some())
-            .when::<ToggleSources>(|ws, cx| log(ws, cx).is_some_and(LogView::is_workload))
-            .when::<FocusSearch>(|ws, cx| log(ws, cx).is_some())
-            .when::<NextMatch>(|ws, cx| log(ws, cx).is_some_and(LogView::has_matches))
-            .when::<PrevMatch>(|ws, cx| log(ws, cx).is_some_and(LogView::has_matches))
-            .when::<SelectPrevLine>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<SelectNextLine>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<ExtendSelectionUp>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<ExtendSelectionDown>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<SelectAllLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
-            .when::<ClearSelection>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
-            .when::<LeaveSearch>(|ws, cx| log(ws, cx).is_some())
-            .when::<CopyLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
-            .when::<SaveLogs>(|ws, cx| {
-                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::All).is_ok())
-            })
-            .when::<SaveMatchingLines>(|ws, cx| {
-                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::Matches).is_ok())
-            })
-            .when::<SaveSelectedLines>(|ws, cx| {
-                log(ws, cx).is_some_and(|l| l.check_save(SaveScope::Selection).is_ok())
-            })
-            .add::<SaveLines>(
-                |ws, cx| log(ws, cx).is_some_and(LogView::has_lines),
-                |ws, a, cx| match log(ws, cx) {
+            .when::<TogglePause>(view_open!(log, LogView::can_pause))
+            .when::<JumpToEnd>(view_open!(log, LogView::has_lines))
+            .when::<JumpToStart>(view_open!(log, LogView::has_lines))
+            .when::<ToggleTimestamps>(view_open!(log))
+            .when::<ToggleWrap>(view_open!(log))
+            .when::<ToggleSources>(view_open!(log, LogView::is_workload))
+            .when::<FocusSearch>(view_open!(log))
+            .when::<NextMatch>(view_open!(log, LogView::has_matches))
+            .when::<PrevMatch>(view_open!(log, LogView::has_matches))
+            .when::<SelectPrevLine>(view_open!(log, LogView::has_lines))
+            .when::<SelectNextLine>(view_open!(log, LogView::has_lines))
+            .when::<ExtendSelectionUp>(view_open!(log, LogView::has_lines))
+            .when::<ExtendSelectionDown>(view_open!(log, LogView::has_lines))
+            .when::<SelectAllLines>(view_open!(log, LogView::has_lines))
+            .when::<ClearSelection>(view_open!(log, LogView::has_selection))
+            .when::<LeaveSearch>(view_open!(log))
+            .when::<CopyLines>(view_open!(log, LogView::has_selection))
+            .when::<SaveLogs>(view_open!(log, |l| l.check_save(SaveScope::All).is_ok()))
+            .when::<SaveMatchingLines>(view_open!(log, |l| l
+                .check_save(SaveScope::Matches)
+                .is_ok()))
+            .when::<SaveSelectedLines>(view_open!(log, |l| l
+                .check_save(SaveScope::Selection)
+                .is_ok()))
+            .add::<SaveLines>(view_open!(log, LogView::has_lines), |ws, a, cx| {
+                match log(ws, cx) {
                     Some(l) => l.check_save(a.lines),
                     None => Err(ActionError::unavailable::<SaveLines>()),
-                },
-            )
-            .add::<SelectLine>(
-                |ws, cx| log(ws, cx).is_some_and(LogView::has_lines),
-                |ws, a, cx| match log(ws, cx) {
+                }
+            })
+            .add::<SelectLine>(view_open!(log, LogView::has_lines), |ws, a, cx| {
+                match log(ws, cx) {
                     Some(l) => l.check_line::<SelectLine>(a.line),
                     None => Err(ActionError::unavailable::<SelectLine>()),
-                },
-            )
+                }
+            })
             .add::<DragSelection>(
-                |ws, cx| log(ws, cx).is_some_and(LogView::has_selection),
+                view_open!(log, LogView::has_selection),
                 |ws, a, cx| match log(ws, cx) {
                     Some(l) => l.check_line::<DragSelection>(a.line),
                     None => Err(ActionError::unavailable::<DragSelection>()),
