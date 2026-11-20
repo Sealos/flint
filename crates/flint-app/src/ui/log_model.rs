@@ -70,10 +70,53 @@ pub fn short_time(ts: Timestamp, tz: &TimeZone) -> String {
     )
 }
 
-/// `ts` in full, for a tooltip: as the server wrote it (UTC), then in local time.
+/// `ts` in full, for a tooltip: as the server wrote it (UTC), then in the shown time zone, named
+/// by its abbreviation and offset.
 pub fn full_time(ts: Timestamp, tz: &TimeZone) -> String {
     let local = ts.to_zoned(tz.clone());
-    format!("{ts}\n{} local", local.strftime("%Y-%m-%d %H:%M:%S%.f %:z"))
+    format!("{ts}\n{}", local.strftime("%Y-%m-%d %H:%M:%S%.f %:z %Z"))
+}
+
+/// The day (and UTC offset) a timestamp falls on in `tz`: a line whose day differs from the line
+/// before shows a dated separator, so a tail that spans days, or a fall-back hour that repeats,
+/// reads unambiguously.
+pub fn day_of(ts: Timestamp, tz: &TimeZone) -> (jiff::civil::Date, i32) {
+    let local = ts.to_zoned(tz.clone());
+    (local.date(), local.offset().seconds())
+}
+
+/// The separator above the first line of a day: `Friday 20 November 2026 · CET (UTC+01:00)`.
+pub fn day_label(ts: Timestamp, tz: &TimeZone) -> String {
+    let local = ts.to_zoned(tz.clone());
+    local.strftime("%A %-d %B %Y · %Z (UTC%:z)").to_string()
+}
+
+/// The dated separator to draw above `line`, when timestamps are shown: above the first line
+/// shown (`prev` is `None`), and wherever the day or the UTC offset changes from the line
+/// before. Lines without a timestamp never start a day.
+pub fn day_separator(prev: Option<&LogLine>, line: &LogLine, tz: &TimeZone) -> Option<String> {
+    let ts = line.timestamp?;
+    match prev.map(|p| p.timestamp) {
+        Some(Some(before)) if day_of(before, tz) == day_of(ts, tz) => None,
+        // The line before has no timestamp: no day to compare with.
+        Some(None) => None,
+        _ => Some(day_label(ts, tz)),
+    }
+}
+
+/// The time zone timestamps show in, and its name for the toolbar: the system's, or UTC said as
+/// such when the system's cannot be read.
+pub fn system_zone() -> (TimeZone, String) {
+    match TimeZone::try_system() {
+        Ok(tz) => {
+            let name = tz.iana_name().unwrap_or("the system time zone").to_owned();
+            (tz, format!("local time ({name})"))
+        }
+        Err(_) => (
+            TimeZone::UTC,
+            "UTC (the system time zone could not be read)".to_owned(),
+        ),
+    }
 }
 
 /// The short pod prefixes of a workload session: each pod by the part of its name after the
@@ -102,6 +145,14 @@ impl SourceLabels {
         let mut changed = false;
         for stream in &status.streams {
             let source = &stream.source;
+            // Most snapshots repeat what is known: look before allocating a key.
+            if self
+                .pods
+                .get(source.pod())
+                .is_some_and(|label| label.containers.contains(source.container()))
+            {
+                continue;
+            }
             let next = self.pods.len();
             let pod = self.pods.entry(source.pod().into()).or_insert_with(|| {
                 changed = true;
@@ -294,11 +345,15 @@ pub enum Part {
     Match,
 }
 
-/// The styled runs of `shown` inside `segment` (the prefix, the timestamp or the text), with
-/// ranges relative to the segment: what one of the line's three drawn parts highlights.
-pub fn parts_in(shown: &ShownLine, segment: Range<usize>) -> Vec<(Range<usize>, Part)> {
-    line_parts(shown)
-        .into_iter()
+/// The styled runs `parts` (of [`line_parts`]) inside `segment` (the prefix, the timestamp or the
+/// text), with ranges relative to the segment: what one of the line's three drawn parts highlights.
+pub fn parts_in(
+    parts: &[(Range<usize>, Part)],
+    segment: Range<usize>,
+) -> Vec<(Range<usize>, Part)> {
+    parts
+        .iter()
+        .cloned()
         .filter_map(|(range, part)| {
             let start = range.start.max(segment.start);
             let end = range.end.min(segment.end);
@@ -351,6 +406,20 @@ pub struct Explained {
     pub detail: Option<String>,
 }
 
+/// Words of a failure to reach a server.
+const NETWORK: &[&str] = &[
+    "connection refused",
+    "could not resolve",
+    "tls handshake",
+    "connection reset",
+    "dropped",
+    "unreachable",
+    "timed out",
+    "could not reach",
+    "no route to host",
+    "i/o timeout",
+];
+
 /// Says what a log session's `error` means. `pod`: the session reads one pod (else a
 /// workload's pods).
 pub fn explain(error: &str, pod: bool) -> Explained {
@@ -370,18 +439,21 @@ pub fn explain(error: &str, pod: bool) -> Explained {
             "credentials rejected",
             "The API server rejected your credentials.",
         )
-    } else if has(&[
-        "connection refused",
-        "could not resolve",
-        "tls handshake",
-        "connection reset",
-        "dropped",
-        "unreachable",
-        "timed out",
-        "could not reach",
-        "no route to host",
-    ]) {
+    } else if (lower.starts_with("internalerror") || has(&[":10250/", ":10250\""])) && has(NETWORK)
+    {
+        // The API server answered, but could not reach the kubelet it proxies the log from.
+        (
+            "can't reach the node",
+            if pod {
+                "Can't reach the node running this pod."
+            } else {
+                "Can't reach the node running one of these pods."
+            },
+        )
+    } else if has(NETWORK) {
         ("can't reach the API server", "Can't reach the API server.")
+    } else if has(&["previous terminated container"]) {
+        ("not available", PREVIOUS_NOT_AVAILABLE)
     } else if lower.starts_with("notfound") || has(&["not found"]) {
         (
             "not found",
@@ -442,7 +514,7 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
                 StatusText {
                     tone: Tone::Warning,
                     text: match ex.short {
-                        "error" => format!("Reconnecting (attempt {attempt})"),
+                        "error" => format!("Reconnecting (attempt {attempt}) · {}", gist(e)),
                         short => format!("Reconnecting (attempt {attempt}) · {short}"),
                     },
                     tooltip: Some(tooltip),
@@ -454,7 +526,7 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
             let kubelet = state.previous_not_available().unwrap_or_default();
             StatusText {
                 tone: Tone::Warning,
-                text: "Ended · not available yet".to_owned(),
+                text: "Ended · not available".to_owned(),
                 tooltip: Some(format!("{PREVIOUS_NOT_AVAILABLE}\n{kubelet}")),
             }
         }
@@ -474,11 +546,28 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
     }
 }
 
+/// Most characters of an unrecognised error the status line shows.
+const GIST_CHARS: usize = 40;
+
+/// An error the status line cannot say in plain words, cut short: its first line, at most
+/// [`GIST_CHARS`] characters (the whole is in the tooltip).
+fn gist(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= GIST_CHARS {
+        line.to_owned()
+    } else {
+        let cut: String = line.chars().take(GIST_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
 /// What a crash-looping container's tab says while the kubelet waits to restart it.
 pub const BACK_OFF: &str = "Waiting for the container to restart (back-off)";
 
-/// What a previous-instance tab says when the kubelet could not read that log yet.
-pub const PREVIOUS_NOT_AVAILABLE: &str = "The previous instance's logs aren't available yet.";
+/// What a previous-instance tab says when that log could not be read: the container may still
+/// be restarting, or may have been removed (garbage-collected, or its node restarted).
+pub const PREVIOUS_NOT_AVAILABLE: &str =
+    "The previous instance's logs aren't available (the container may have been removed).";
 
 /// Whether the session is over: nothing more will come, so pausing means nothing.
 pub fn has_ended(state: &LogState) -> bool {
@@ -881,9 +970,15 @@ mod tests {
             attempt: 3,
             back_off,
         };
+        // An error without plain words keeps a short form in sight.
         assert_eq!(
             text(reconnecting(Some("EOF"), false)),
-            (Tone::Warning, "Reconnecting (attempt 3)".into())
+            (Tone::Warning, "Reconnecting (attempt 3) · EOF".into())
+        );
+        let long = "the log stream broke: an unexpected and rather long reason given by kube";
+        assert_eq!(
+            text(reconnecting(Some(long), false)).1,
+            "Reconnecting (attempt 3) · the log stream broke: an unexpected and…"
         );
         let refused = "connection refused by https://127.0.0.1:6443; is the API server running, \
                        and is the port right?";
@@ -929,7 +1024,7 @@ mod tests {
         );
         assert_eq!(
             text(previous),
-            (Tone::Warning, "Ended · not available yet".into())
+            (Tone::Warning, "Ended · not available".into())
         );
         assert_eq!(pause_text(0, false), "Paused");
         assert_eq!(pause_text(1, true), "Paused while selecting · 1 new line");
@@ -990,6 +1085,20 @@ mod tests {
             "credentials rejected"
         );
         assert_eq!(explain("boom", true).headline, "Couldn't read the logs.");
+        // The API server answered, but its proxy to the pod's kubelet failed: the node is the
+        // one out of reach.
+        let dead_node = "InternalError: Get \"https://10.0.1.5:10250/containerLogs/demo/p/app?follow=true\": \
+                         dial tcp 10.0.1.5:10250: connect: connection refused";
+        let ex = explain(dead_node, true);
+        assert_eq!(ex.headline, "Can't reach the node running this pod.");
+        assert_eq!(ex.short, "can't reach the node");
+        assert_eq!(ex.detail.as_deref(), Some(dead_node));
+        let proxied = "Get \"https://10.0.1.5:10250/containerLogs/demo/p/app\": dial tcp \
+                       10.0.1.5:10250: i/o timeout";
+        assert_eq!(explain(proxied, true).short, "can't reach the node");
+        // The previous container is gone, the pod is not.
+        let previous = "BadRequest: previous terminated container \"app\" in pod \"p\" not found";
+        assert_eq!(explain(previous, true).headline, PREVIOUS_NOT_AVAILABLE);
     }
 
     // covers UP-43: timestamps show as fixed-width local time to the millisecond.
@@ -1005,6 +1114,12 @@ mod tests {
         assert_eq!(short_time(whole, &TimeZone::UTC).len(), TIME_WIDTH);
         let full = full_time(ts, &plus_one);
         assert!(
+            !full.contains("local"),
+            "the zone is named, not assumed: {full}"
+        );
+        // The fallback when the system's zone cannot be read is UTC, and says so.
+        assert!(full_time(ts, &TimeZone::UTC).ends_with("+00:00 UTC"));
+        assert!(
             full.starts_with("2026-11-20T02:20:46.939958268Z\n"),
             "{full}"
         );
@@ -1013,6 +1128,43 @@ mod tests {
         let bare = LogLine::parse("no stamp", false);
         let shown = show(&bare, ts_on(), &SearchQuery::default(), None);
         assert_eq!(shown.text, format!("{} no stamp", " ".repeat(TIME_WIDTH)));
+    }
+
+    // covers UP-43: the view shows no date in a line, so a dated separator starts each day, and
+    // the hour a fall-back repeats, where the UTC offset changes.
+    #[test]
+    fn a_dated_separator_starts_each_day_and_offset() {
+        let rome = TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        let line = |text: &str| LogLine::parse(text, false);
+        let first = line("2026-11-19T22:59:00Z a");
+        let same_day = line("2026-11-19T22:59:30Z b");
+        let next_day = line("2026-11-19T23:00:00Z c");
+        let bare = line("no timestamp");
+        assert_eq!(
+            day_separator(None, &first, &rome).as_deref(),
+            Some("Thursday 19 November 2026 · CET (UTC+01:00)")
+        );
+        assert_eq!(day_separator(Some(&first), &same_day, &rome), None);
+        assert_eq!(
+            day_separator(Some(&same_day), &next_day, &rome).as_deref(),
+            Some("Friday 20 November 2026 · CET (UTC+01:00)")
+        );
+        // In UTC the same two lines share a day.
+        assert_eq!(
+            day_separator(Some(&same_day), &next_day, &TimeZone::UTC),
+            None
+        );
+        assert_eq!(day_separator(Some(&first), &bare, &rome), None);
+        assert_eq!(day_separator(Some(&bare), &next_day, &rome), None);
+        // The fall-back hour: 02:30 shows twice on 25 October 2026; the second starts anew.
+        let summer = line("2026-10-25T00:30:00Z d");
+        let winter = line("2026-10-25T01:30:00Z e");
+        assert_eq!(short_time(summer.timestamp.unwrap(), &rome), "02:30:00.000");
+        assert_eq!(short_time(winter.timestamp.unwrap(), &rome), "02:30:00.000");
+        assert_eq!(
+            day_separator(Some(&summer), &winter, &rome).as_deref(),
+            Some("Sunday 25 October 2026 · CET (UTC+01:00)")
+        );
     }
 
     fn ts_on() -> LineFormat {
@@ -1114,14 +1266,14 @@ mod tests {
         assert_eq!(&shown.text[shown.matches[0].clone()], "79db669d5-cd27k");
         // The three drawn parts carry their own runs.
         assert_eq!(
-            parts_in(&shown, 0..shown.source),
+            parts_in(&line_parts(&shown), 0..shown.source),
             [
                 (0..1, Part::Source),
                 (1..16, Part::Match),
                 (16..shown.source, Part::Source)
             ]
         );
-        assert!(parts_in(&shown, shown.prefix..shown.text.len()).is_empty());
+        assert!(parts_in(&line_parts(&shown), shown.prefix..shown.text.len()).is_empty());
     }
 
     // covers UP-40: the toolbar stays one row, giving up parts as the tab narrows.

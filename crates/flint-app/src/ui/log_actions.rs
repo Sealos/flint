@@ -38,9 +38,8 @@ impl LogView {
             })
             .bind::<ToggleTimestamps>(|view, _, _, cx| {
                 view.timestamps = !view.timestamps;
-                if view.wrap {
-                    view.list.remeasure();
-                }
+                // Day separators come and go with timestamps, so rows change height.
+                view.list.remeasure();
                 cx.notify();
             })
             .bind::<ToggleSources>(|view, _, _, cx| {

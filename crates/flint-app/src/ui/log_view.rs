@@ -138,8 +138,11 @@ pub struct LogView {
     _note_timer: Task<()>,
     /// Short pod prefixes and their colours (workload sessions).
     labels: SourceLabels,
-    /// The time zone timestamps show in: the system's.
+    /// The time zone timestamps show in: the system's, else UTC.
     tz: TimeZone,
+    /// What the timestamps toggle calls that zone: "local time (Europe/Rome)", or UTC said as
+    /// such when the system's could not be read.
+    tz_name: String,
     /// Tracks the tab's bounds, so the toolbar knows how much fits.
     bounds: ScrollHandle,
     /// The width the toolbar was laid out for; it is known only after layout, so a change
@@ -192,6 +195,7 @@ impl LogView {
                 },
             );
         let snapshot = session.peek();
+        let (tz, tz_name) = log_model::system_zone();
         LogView {
             request,
             core,
@@ -217,7 +221,8 @@ impl LogView {
             note: None,
             _note_timer: Task::ready(()),
             labels: SourceLabels::default(),
-            tz: TimeZone::try_system().unwrap_or(TimeZone::UTC),
+            tz,
+            tz_name,
             bounds: ScrollHandle::new(),
             laid_out_width: None,
             focus: cx.focus_handle(),
@@ -296,6 +301,10 @@ impl LogView {
             ListChange::Splice { evicted, appended } => {
                 if evicted > 0 {
                     self.list.splice(0..evicted, 0);
+                    // The new first line may gain a day separator.
+                    if self.timestamps && self.list.item_count() > 0 {
+                        self.list.remeasure_items(0..1);
+                    }
                 }
                 if appended > 0 {
                     let end = self.list.item_count();
@@ -699,18 +708,34 @@ impl LogView {
             .color
             .map_or(theme.info, |c| palette[c % palette.len()]);
         let style = |part| Self::highlight(part, current, source_color, theme);
-        let segment = |range: std::ops::Range<usize>| {
-            let highlights = log_model::parts_in(&shown, range.clone())
+        // The runs once, then the text split into its three parts without copying it again.
+        let parts = log_model::line_parts(&shown);
+        let runs = |range: std::ops::Range<usize>| {
+            log_model::parts_in(&parts, range)
                 .into_iter()
-                .map(|(r, part)| (r, style(part)));
-            StyledText::new(shown.text[range].to_owned()).with_highlights(highlights)
+                .map(|(r, part)| (r, style(part)))
+                .collect::<Vec<_>>()
         };
-        let source = line.source.clone().filter(|_| shown.source > 0);
-        let timestamp = (shown.prefix > shown.source)
-            .then_some(line.timestamp)
+        let (source_runs, time_runs, body_runs) = (
+            runs(0..shown.source),
+            runs(shown.source..shown.prefix),
+            runs(shown.prefix..shown.text.len()),
+        );
+        let mut text = shown.text;
+        let body = text.split_off(shown.prefix);
+        let time = text.split_off(shown.source);
+        let (source_text, has_source, has_time) =
+            (text, shown.source > 0, shown.prefix > shown.source);
+        let source = line.source.clone().filter(|_| has_source);
+        let timestamp = has_time.then_some(line.timestamp).flatten();
+        let day = has_time
+            .then(|| {
+                let prev = ix.checked_sub(1).and_then(|p| self.snapshot.lines.at(p));
+                log_model::day_separator(prev.map(|(_, l)| l), line, &self.tz)
+            })
             .flatten();
         let tz = self.tz.clone();
-        h_flex()
+        let row = h_flex()
             .id(("log-line", id as usize))
             .w_full()
             .px_2()
@@ -738,13 +763,13 @@ impl LogView {
                 }
             })
             // The prefix and the timestamp keep their width; wrapped text hangs past them.
-            .when(shown.source > 0, |el| {
+            .when(has_source, |el| {
                 el.child(
                     div()
                         .id(("log-source", id as usize))
                         .flex_none()
                         .whitespace_nowrap()
-                        .child(segment(0..shown.source))
+                        .child(StyledText::new(source_text).with_highlights(source_runs))
                         .when_some(source, |el, source| {
                             el.tooltip(move |window, cx| {
                                 Tooltip::new(format!(
@@ -757,13 +782,13 @@ impl LogView {
                         }),
                 )
             })
-            .when(shown.prefix > shown.source, |el| {
+            .when(has_time, |el| {
                 el.child(
                     div()
                         .id(("log-time", id as usize))
                         .flex_none()
                         .whitespace_nowrap()
-                        .child(segment(shown.source..shown.prefix))
+                        .child(StyledText::new(time).with_highlights(time_runs))
                         .when_some(timestamp, |el, ts| {
                             el.tooltip(move |window, cx| {
                                 Tooltip::new(log_model::full_time(ts, &tz)).build(window, cx)
@@ -777,7 +802,7 @@ impl LogView {
                     .flex_1()
                     .min_w_0()
                     .when(!self.wrap, |el| el.truncate())
-                    .child(segment(shown.prefix..shown.text.len())),
+                    .child(StyledText::new(body).with_highlights(body_runs)),
             )
             .when(shown.cut, |el| {
                 el.child(
@@ -795,8 +820,28 @@ impl LogView {
                         }),
                 )
             })
-            .test_support()
-            .into_any_element()
+            .test_support();
+        match day {
+            None => row.into_any_element(),
+            Some(day) => v_flex()
+                .w_full()
+                .child(
+                    div()
+                        .id(("log-day", id as usize))
+                        .h(px(LINE_HEIGHT))
+                        .px_2()
+                        .flex_none()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_color(theme.muted_foreground)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(day)
+                        .test_support(),
+                )
+                .child(row)
+                .into_any_element(),
+        }
     }
 
     /// The toolbar: one row at any width ([`log_model::toolbar_fit`]). The status has its own
@@ -879,121 +924,139 @@ impl LogView {
             .border_color(theme.border)
             .text_xs()
             .whitespace_nowrap()
-            // The status slot: the state, and the pause, cut to fit.
+            // Everything but the controls: it gives way (and is cut) first, so the controls,
+            // "⋯" included, stay on screen.
             .child(
                 h_flex()
-                    .id("log-state")
-                    .gap_1()
-                    .flex_shrink(1.)
-                    .min_w(px(56.))
-                    .max_w(px(300.))
+                    .id("log-main")
+                    .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
-                    .text_color(state_color)
-                    .child(div().size_1p5().flex_none().rounded_full().bg(state_color))
+                    .gap_x_1p5()
+                    // The status slot: the state, and the pause, cut to fit.
                     .child(
-                        div()
-                            .flex_shrink(0.)
-                            .min_w_0()
-                            .truncate()
-                            .child(status.text),
+                        h_flex()
+                            .id("log-state")
+                            .gap_1()
+                            .flex_shrink(1.)
+                            .min_w(px(56.))
+                            .max_w(px(300.))
+                            .overflow_hidden()
+                            .text_color(state_color)
+                            .child(div().size_1p5().flex_none().rounded_full().bg(state_color))
+                            .child(
+                                div()
+                                    .id("log-state-text")
+                                    .flex_shrink(1.)
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(status.text)
+                                    .test_support(),
+                            )
+                            .when_some(pause_text, |el, text| {
+                                el.child(
+                                    div()
+                                        .id("log-paused")
+                                        .flex_shrink(0.5)
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.warning)
+                                        .child(format!("· {text}"))
+                                        .test_support(),
+                                )
+                            })
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tooltip.clone()).build(window, cx)
+                            })
+                            .test_support(),
                     )
-                    .when_some(pause_text, |el, text| {
+                    .when(fit.counts, |el| {
                         el.child(
                             div()
-                                .id("log-paused")
-                                .min_w_0()
-                                .truncate()
-                                .text_color(theme.warning)
-                                .child(format!("· {text}"))
+                                .id("log-count")
+                                .flex_none()
+                                .font_features(super::list::tabular_figures())
+                                .text_color(theme.muted_foreground)
+                                .child(count)
                                 .test_support(),
                         )
+                        .when_some(
+                            self.snapshot.pods.clone(),
+                            |el, pods| {
+                                el.child(
+                                    div()
+                                        .id("log-streams")
+                                        .min_w_0()
+                                        .flex_shrink(1.)
+                                        .truncate()
+                                        .text_color(if pods.failed() > 0 {
+                                            theme.warning
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(log_model::streams_text(&pods))
+                                        .test_support(),
+                                )
+                            },
+                        )
                     })
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .test_support(),
-            )
-            .when(fit.counts, |el| {
-                el.child(
-                    div()
-                        .id("log-count")
-                        .flex_none()
-                        .font_features(super::list::tabular_figures())
-                        .text_color(theme.muted_foreground)
-                        .child(count)
-                        .test_support(),
-                )
-                .when_some(self.snapshot.pods.clone(), |el, pods| {
-                    el.child(
-                        div()
-                            .id("log-streams")
-                            .min_w_0()
-                            .flex_shrink(1.)
-                            .truncate()
-                            .text_color(if pods.failed() > 0 {
-                                theme.warning
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .child(log_model::streams_text(&pods))
-                            .test_support(),
-                    )
-                })
-            })
-            .child(div().flex_1())
-            .child(
-                div()
-                    .w(px(220.))
-                    .min_w(px(72.))
-                    .flex_shrink(1000.)
-                    .overflow_hidden()
+                    .child(div().flex_1())
                     .child(
-                        Input::new(&self.search_input)
-                            .id("log-search")
-                            .xsmall()
-                            .cleanable(true)
-                            .prefix(Icon::new(IconName::Search).xsmall()),
-                    ),
-            )
-            .when(has_query, |el| {
-                el.when(fit.match_count, |el| {
-                    el.child(
                         div()
-                            .id("log-matches")
-                            .flex_none()
-                            .font_features(super::list::tabular_figures())
-                            .text_color(theme.muted_foreground)
-                            .child(if self.searching {
-                                "Searching…".to_owned()
-                            } else {
-                                log_model::match_text(&self.search, self.current_match)
-                            })
-                            .test_support(),
+                            .w(px(220.))
+                            .min_w(px(72.))
+                            .flex_shrink(1000.)
+                            .overflow_hidden()
+                            .child(
+                                Input::new(&self.search_input)
+                                    .id("log-search")
+                                    .xsmall()
+                                    .cleanable(true)
+                                    .prefix(Icon::new(IconName::Search).xsmall()),
+                            ),
                     )
-                })
-                .child(
-                    Button::new("log-prev-match")
-                        .icon(IconName::ChevronUp)
-                        .xsmall()
-                        .ghost()
-                        .disabled(!has_matches)
-                        .tooltip(format!(
-                            "Previous match ({})",
-                            registry::key_hint("secondary-shift-g")
-                        ))
-                        .on_click(registry::on_click(PrevMatch)),
-                )
-                .child(
-                    Button::new("log-next-match")
-                        .icon(IconName::ChevronDown)
-                        .xsmall()
-                        .ghost()
-                        .disabled(!has_matches)
-                        .tooltip(format!(
-                            "Next match ({})",
-                            registry::key_hint("secondary-g")
-                        ))
-                        .on_click(registry::on_click(NextMatch)),
-                )
-            })
+                    .when(has_query, |el| {
+                        el.when(fit.match_count, |el| {
+                            el.child(
+                                div()
+                                    .id("log-matches")
+                                    .flex_none()
+                                    .font_features(super::list::tabular_figures())
+                                    .text_color(theme.muted_foreground)
+                                    .child(if self.searching {
+                                        "Searching…".to_owned()
+                                    } else {
+                                        log_model::match_text(&self.search, self.current_match)
+                                    })
+                                    .test_support(),
+                            )
+                        })
+                        .child(
+                            Button::new("log-prev-match")
+                                .icon(IconName::ChevronUp)
+                                .xsmall()
+                                .ghost()
+                                .disabled(!has_matches)
+                                .tooltip(format!(
+                                    "Previous match ({})",
+                                    registry::key_hint("secondary-shift-g")
+                                ))
+                                .on_click(registry::on_click(PrevMatch)),
+                        )
+                        .child(
+                            Button::new("log-next-match")
+                                .icon(IconName::ChevronDown)
+                                .xsmall()
+                                .ghost()
+                                .disabled(!has_matches)
+                                .tooltip(format!(
+                                    "Next match ({})",
+                                    registry::key_hint("secondary-g")
+                                ))
+                                .on_click(registry::on_click(NextMatch)),
+                        )
+                    }),
+            )
             // The controls: one group that never wraps.
             .child(
                 h_flex()
@@ -1007,7 +1070,10 @@ impl LogView {
                                 .ghost()
                                 .label("Timestamps")
                                 .selected(timestamps)
-                                .tooltip("Show or hide timestamps (T)")
+                                .tooltip(format!(
+                                    "Show or hide timestamps (T), shown in {}",
+                                    self.tz_name
+                                ))
                                 .on_click(registry::on_click(ToggleTimestamps)),
                         )
                         .when(workload, |el| {
@@ -1050,13 +1116,16 @@ impl LogView {
                         )
                     })
                     .when(!following && has_lines, |el| {
-                        el.child(
-                            div()
-                                .id("log-not-following")
-                                .text_color(theme.muted_foreground)
-                                .child("Not following")
-                                .test_support(),
-                        )
+                        // Only a live, followed read has anything to follow.
+                        el.when(self.follows() && !ended, |el| {
+                            el.child(
+                                div()
+                                    .id("log-not-following")
+                                    .text_color(theme.muted_foreground)
+                                    .child("Not following")
+                                    .test_support(),
+                            )
+                        })
                         .child(
                             Button::new("log-jump")
                                 .icon(IconName::ArrowDown)

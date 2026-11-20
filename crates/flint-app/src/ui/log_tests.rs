@@ -1141,3 +1141,178 @@ async fn timestamps_line_up_and_the_current_match_stands_out(cx: &mut TestAppCon
         assert!(current.font_weight.is_some() && current.underline.is_some());
     });
 }
+
+/// The entries of the open popup menu.
+fn menu_entries(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> {
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| {
+        let menu = window.within("popup-menu");
+        (0usize..)
+            .map_while(|ix| menu.try_find(ix))
+            .map(|item| item.label().unwrap_or_default().to_owned())
+            .collect()
+    })
+    .unwrap()
+}
+
+// covers UP-40: a long status (a crash loop's back-off, a reconnect's error) is cut inside its
+// slot, with an ellipsis, rather than clipped by the slot's edge.
+#[gpui_kit::test]
+async fn a_long_status_is_cut_inside_its_slot(cx: &mut TestAppContext) {
+    for state in [
+        LogState::Reconnecting {
+            error: None,
+            attempt: 4,
+            back_off: true,
+        },
+        LogState::Reconnecting {
+            error: Some("the log stream broke: an unexpected and long reason".into()),
+            attempt: 12,
+            back_off: false,
+        },
+    ] {
+        let (core, _dir) = core();
+        let (window, view) = open_sized(cx, core, request(), 470.);
+        let mut lines = Feed::new(100);
+        feed(cx, &view, lines.push(0, 10).snapshot(state, true, 53));
+        view.update(cx, |v, _| v.user_paused = true);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("log-paused").is_some() && window.try_find("log-state-text").is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, _| {
+            let slot = window.find("log-state").bounds();
+            let text = window.find("log-state-text").bounds();
+            assert!(
+                text.origin.x + text.size.width <= slot.origin.x + slot.size.width + px(0.5),
+                "the status text fits its slot: {text:?} in {slot:?}"
+            );
+            let paused = window.find("log-paused").bounds();
+            assert!(f32::from(paused.size.width) > 0.);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+// covers UP-46: in a very narrow tab, "⋯" is the last control to go: it stays on screen and
+// holds Save. "Not following" is said only while a followed stream runs.
+#[gpui_kit::test]
+async fn the_overflow_menu_stays_reachable_and_holds_save(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open_sized(cx, core, workload_request(), 320.);
+    let mut buffer = LogBuffer::new(1000);
+    for n in 0..100 {
+        let mut line = LogLine::parse(&format!("2024-05-01T12:00:00Z GET /{n}"), false);
+        line.source = Some(Arc::new(LineSource::new("api-79db669d5-cd27k", "api")));
+        buffer.push(line);
+    }
+    let snapshot = |state| {
+        Arc::new(LogSnapshot {
+            lines: buffer.view(),
+            state,
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: None,
+        })
+    };
+    feed(cx, &view, snapshot(LogState::Streaming));
+    view.update(cx, |v, cx| v.set_query("GET".into(), cx));
+    cx.wait_for(window, WAIT, |window, cx| {
+        !view.read(cx).searching && window.try_find(line_id(99)).is_some()
+    })
+    .await;
+    press(cx, window, "home");
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-not-following").is_some() && window.try_find("log-more").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, _| {
+        let more = window.find("log-more").bounds();
+        assert!(
+            f32::from(more.origin.x + more.size.width) <= 320.,
+            "⋯ on screen: {more:?}"
+        );
+        assert!(f32::from(more.size.width) > 0.);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| window.click("log-more", cx))
+        .unwrap();
+    let entries = menu_entries(cx, window);
+    assert!(
+        entries.iter().any(|e| e == "Save All Lines…"),
+        "{entries:?}"
+    );
+    press(cx, window, "escape");
+
+    // An ended stream has nothing to follow.
+    feed(
+        cx,
+        &view,
+        snapshot(LogState::Ended {
+            error: None,
+            pod_deleted: false,
+        }),
+    );
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-not-following").is_none() && window.try_find("log-jump").is_some()
+    })
+    .await;
+}
+
+// covers UP-43: with timestamps shown, a dated separator starts the lines and each new day;
+// the toggle's tooltip names the zone.
+#[gpui_kit::test]
+async fn a_dated_separator_starts_each_day(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut buffer = LogBuffer::new(100);
+    for text in [
+        "2026-11-19T23:59:58Z a",
+        "2026-11-19T23:59:59Z b",
+        "2026-11-20T00:00:00Z c",
+    ] {
+        buffer.push(LogLine::parse(text, false));
+    }
+    feed(
+        cx,
+        &view,
+        Arc::new(LogSnapshot {
+            lines: buffer.view(),
+            state: LogState::Streaming,
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: None,
+        }),
+    );
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(2)).is_some()
+    })
+    .await;
+    assert!(
+        cx.update_window(window, |_, window, _| window
+            .try_find(("log-day", 0usize))
+            .is_none())
+            .unwrap(),
+        "no dates without timestamps"
+    );
+    press(cx, window, "t");
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(("log-day", 0usize)).is_some()
+            && window.try_find(("log-day", 2usize)).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find(("log-day", 1usize)).is_none());
+        // The separator sits above its line.
+        let day = window.find(("log-day", 2usize)).bounds();
+        let line = window.find(line_id(2)).bounds();
+        assert!(day.origin.y < line.origin.y);
+    })
+    .unwrap();
+    assert!(view.read_with(cx, |v, _| !v.tz_name.is_empty()));
+}

@@ -2142,18 +2142,33 @@ pub mod tests {
                     spec.name
                 );
             }
-            // Plain keys never fire while typing in a field, unless they are meant for the
-            // field itself (Esc in the log search, which the field passes on).
-            if spec.keys.iter().any(|k| !k.contains('-'))
-                && spec.key_context != Some(super::LOG_SEARCH)
-            {
+            for key in spec.keys {
                 assert!(
-                    spec.key_context.is_some_and(|c| c.contains("!Input")),
-                    "{} binds a plain key outside the text-field guard",
+                    plain_key_allowed(key, spec.key_context),
+                    "{} binds the plain key {key} outside the text-field guard",
                     spec.name
                 );
             }
         }
+    }
+
+    /// Plain keys never fire while typing in a field, except Esc meant for the log search field
+    /// itself (which the field passes on). Keys with a modifier are not plain.
+    fn plain_key_allowed(key: &str, context: Option<&str>) -> bool {
+        key.contains('-')
+            || context.is_some_and(|c| c.contains("!Input"))
+            || (key == "escape" && context == Some(super::LOG_SEARCH))
+    }
+
+    #[test]
+    fn only_esc_may_reach_the_log_search_field() {
+        let search = Some(super::LOG_SEARCH);
+        assert!(plain_key_allowed("escape", search));
+        assert!(!plain_key_allowed("t", search));
+        assert!(!plain_key_allowed("enter", search));
+        assert!(plain_key_allowed("secondary-f", search));
+        assert!(plain_key_allowed("t", Some("LogView && !Input")));
+        assert!(!plain_key_allowed("escape", Some("Workspace")));
     }
 
     // covers UP-41: on Linux, `secondary-` app shortcuts become Ctrl ones. Every one that is
