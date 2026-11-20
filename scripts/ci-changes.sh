@@ -7,7 +7,8 @@
 #   scripts/ci-changes.sh --stdin                 paths from stdin, one per line (self-test)
 #
 # Groups (the jobs each one gates are named in ci.yml and lint.yml):
-#   rust      Rust sources, manifests, the lockfile, the shared GPUI action: build, test, clippy, docs
+#   rust      Rust sources, manifests, the lockfile, toolchain and lint config, the shared GPUI
+#             action: build, test, clippy, docs
 #   app       crates/flint-app: the app's UI lint scripts
 #   appimage  rust, or the AppImage packaging and smoke scripts
 #   macos     rust, or the release-binary automation check the macOS job runs
@@ -54,7 +55,9 @@ case "${1:-}" in
     echo "usage: $0 <base-sha> <head-sha> | --all | --stdin" >&2
     exit 2
     ;;
-  *) paths=$(git diff --name-only "$1...${2:?head sha}") ;;
+  # --no-renames lists a moved file's old path too (moving a file out of crates/ still breaks the
+  # build); quotePath=false keeps non-ASCII paths unquoted so the patterns below match them.
+  *) paths=$(git -c core.quotePath=false diff --name-only --no-renames "$1...${2:?head sha}") ;;
 esac
 
 while IFS= read -r path; do
@@ -65,7 +68,8 @@ while IFS= read -r path; do
       ;;
   esac
   case "$path" in
-    crates/* | Cargo.toml | Cargo.lock | .github/actions/*)
+    crates/* | Cargo.toml | Cargo.lock | .github/actions/* | .cargo/* | rust-toolchain | \
+      rust-toolchain.toml | rustfmt.toml | .rustfmt.toml | clippy.toml | .clippy.toml)
       turn_on rust appimage macos
       ;;
   esac

@@ -30,6 +30,30 @@ expect "rust app appimage macos deps scripts workflows" .github/workflows/ci.yml
 expect "rust app appimage macos deps scripts workflows" docs/TESTING.md scripts/ci-changes.sh
 expect "" ""
 
+expect "rust appimage macos" rust-toolchain.toml
+expect "rust appimage macos" .cargo/config.toml
+
+# The git path: a file moved out of crates/ and a non-ASCII name must still count as Rust changes.
+script="$PWD/scripts/ci-changes.sh"
+repo=$(mktemp -d)
+trap 'rm -rf "$repo"' EXIT
+(
+  cd "$repo"
+  git init -q
+  git config user.email ci@example.invalid
+  git config user.name ci
+  mkdir -p crates/a docs
+  echo 'pub fn x() {}' >crates/a/x.rs
+  git add . && git commit -qm base
+  git mv crates/a/x.rs docs/x.rs
+  echo '// é' >"crates/a/café.rs"
+  git add . && git commit -qm change
+)
+got=$(cd "$repo" && "$script" HEAD~1 HEAD | grep -E '^rust=' || true)
+[ "$got" = rust=true ] || { echo "FAIL: rename out of crates/ + non-ASCII path -> '$got', want rust=true"; fail=1; }
+moved=$(cd "$repo" && git -c core.quotePath=false diff --name-only --no-renames HEAD~1 HEAD | grep -c '^crates/' || true)
+[ "$moved" = 2 ] || { echo "FAIL: expected the old path and the non-ASCII path under crates/, got $moved"; fail=1; }
+
 all=$(scripts/ci-changes.sh --all | grep -c '=true')
 [ "$all" = 7 ] || { echo "FAIL: --all turned on $all groups, want 7"; fail=1; }
 
