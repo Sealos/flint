@@ -53,6 +53,9 @@ pub struct LoadedKubeconfig {
     /// Files that exist but could not be read or parsed. They are skipped, like kubectl's
     /// behavior for a missing file, but reported so the UI can show them.
     pub errors: Vec<(PathBuf, String)>,
+    /// The context names each file that loaded defines, in file order, including the ones an
+    /// earlier file shadows.
+    pub defines: Vec<(PathBuf, Vec<String>)>,
 }
 
 impl LoadedKubeconfig {
@@ -154,6 +157,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     let mut merged = Kubeconfig::default();
     let mut contexts = Vec::new();
     let mut errors = Vec::new();
+    let mut defines = Vec::new();
     for path in paths {
         if !path.exists() {
             continue;
@@ -170,6 +174,10 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         dedupe_by_name(&mut config.clusters, |c| &c.name);
         dedupe_by_name(&mut config.auth_infos, |u| &u.name);
         dedupe_by_name(&mut config.contexts, |c| &c.name);
+        defines.push((
+            path.clone(),
+            config.contexts.iter().map(|c| c.name.clone()).collect(),
+        ));
         let known: HashSet<String> = merged.contexts.iter().map(|c| c.name.clone()).collect();
         let new_contexts: Vec<NamedContext> = config
             .contexts
@@ -215,6 +223,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         contexts,
         paths: paths.to_vec(),
         errors,
+        defines,
     }
 }
 
@@ -262,6 +271,36 @@ mod tests {
             s += &format!("- name: {name}\n  context:\n    cluster: {cluster}\n    user: {user}\n");
         }
         s
+    }
+
+    // covers UP-06: what each file defines is kept, shadowed names included, so a removal
+    // can be told apart from a file that failed to load.
+    #[test]
+    fn each_loaded_file_lists_what_it_defines() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write(
+            dir.path(),
+            "a",
+            &config(&[("main", "c", "u")], &[("c", "https://a")]),
+        );
+        let b = write(
+            dir.path(),
+            "b",
+            &config(
+                &[("main", "c", "u"), ("other", "c", "u")],
+                &[("c", "https://b")],
+            ),
+        );
+        let broken = write(dir.path(), "broken", "contexts: [");
+        let loaded = load(&[a.clone(), broken, b.clone()]);
+        assert_eq!(loaded.errors.len(), 1);
+        assert_eq!(
+            loaded.defines,
+            vec![
+                (a, vec!["main".to_owned()]),
+                (b, vec!["main".to_owned(), "other".to_owned()]),
+            ]
+        );
     }
 
     // covers UP-01, UP-02
