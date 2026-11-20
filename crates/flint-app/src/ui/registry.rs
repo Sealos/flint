@@ -197,9 +197,7 @@ actions!(
         /// Save the selected lines to a file.
         SaveSelectedLines,
         /// Esc in the log search field: clear the search, or (when empty) go back to the lines.
-        LeaveSearch,
-        /// Open the log again from the start.
-        ReloadLogs
+        LeaveSearch
     ]
 );
 
@@ -1747,11 +1745,6 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Logs, S::Logs)
         .keys(&["escape"], Some(LOG_SEARCH))
         .hidden(),
-        Spec::unit::<ReloadLogs>(
-            "Reload Logs",
-            "Open the log again from the start, after it ended.",
-        )
-        .of(C::Logs, S::Logs),
         Spec::unit::<CopyLines>(
             "Copy Selected Lines",
             "Copy the selected lines as shown, without redaction.",

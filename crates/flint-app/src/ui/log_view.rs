@@ -54,8 +54,8 @@ use super::dock::{DockItem, TabKey, TabStatus};
 use super::log_model::{self, ListChange, SourceLabels, Tone};
 use super::notice::notice;
 use super::registry::{
-    self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, ReloadLogs, SaveLines,
-    SaveScope, SelectLine, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
+    self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
+    SelectLine, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
 
@@ -252,27 +252,6 @@ impl LogView {
             }
         });
         (session, pump)
-    }
-
-    /// Opens the session again from the start ([`ReloadLogs`]): the lines, selection and search
-    /// matches go; the view toggles and the search text stay.
-    pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
-        let (session, pump) = Self::open_session(&self.core, &self.request, cx);
-        self.session = session;
-        self._pump = pump;
-        self.snapshot = Arc::new(LogSnapshot {
-            lines: Default::default(),
-            ..(*self.session.peek()).clone()
-        });
-        self.list.reset(0);
-        self.list.set_follow_mode(FollowMode::Tail);
-        self.user_paused = false;
-        self.selection_paused = false;
-        self.end_selection();
-        self.current_match = None;
-        self.search.update(&self.snapshot.lines);
-        self.clear_note();
-        cx.notify();
     }
 
     #[cfg(test)]
@@ -1299,7 +1278,6 @@ impl LogView {
     /// What to show instead of lines, while there are none.
     fn render_empty(&self, theme: &Theme) -> AnyElement {
         let pod = !self.is_workload();
-        let mut retry = false;
         let (spinner, color, text, detail): (bool, Hsla, String, Option<String>) = match &self
             .snapshot
             .state
@@ -1340,18 +1318,15 @@ impl LogView {
             ),
             state @ LogState::Ended { error: Some(e), .. } => {
                 match state.previous_not_available() {
-                    Some(kubelet) => {
-                        retry = true;
-                        (
-                            false,
-                            theme.warning,
-                            log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
-                            Some(format!(
-                                "The container may still be restarting. {} said: {kubelet}",
-                                log_model::previous_speaker(kubelet)
-                            )),
-                        )
-                    }
+                    Some(kubelet) => (
+                        false,
+                        theme.warning,
+                        log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
+                        Some(format!(
+                            "The container may still be restarting. {} said: {kubelet}",
+                            log_model::previous_speaker(kubelet)
+                        )),
+                    ),
                     None => {
                         let explained = log_model::explain(e, pod);
                         (false, theme.danger, explained.headline, explained.detail)
@@ -1396,19 +1371,7 @@ impl LogView {
                         .test_support(),
                 )
             })
-            .when(retry, |el| {
-                el.child(
-                    Button::new("log-retry")
-                        .small()
-                        .label("Try Again")
-                        .tooltip("Read the previous instance's logs again")
-                        .on_click(registry::on_click(ReloadLogs)),
-                )
-            })
-            // Not for a deleted pod: there is nothing to reconnect to.
-            .when(!retry && self.can_restart(), |el| {
-                el.child(reconnect_button())
-            })
+            .when(self.can_restart(), |el| el.child(reconnect_button()))
             .test_support()
             .into_any_element()
     }

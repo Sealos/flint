@@ -25,10 +25,10 @@ use super::super::registry::{
     Forward, ForwardCurrent, Guards, HideFromAi, JumpToEnd, JumpToStart, LeaveSearch, NextMatch,
     NextTab, OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs,
     OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
-    Refresh, ReloadLogs, RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines,
-    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
-    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
+    Refresh, RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope,
+    SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
+    SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
+    SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
     ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
     ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection, TogglePause,
     ToggleSecretValue, ToggleSources, ToggleTimestamps, ToggleWide, ToggleWrap,
@@ -285,7 +285,6 @@ impl Workspace {
             .when::<SelectAllLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_lines))
             .when::<ClearSelection>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
             .when::<LeaveSearch>(|ws, cx| log(ws, cx).is_some())
-            .when::<ReloadLogs>(|ws, cx| log(ws, cx).is_some_and(LogView::has_ended))
             .when::<CopyLines>(|ws, cx| log(ws, cx).is_some_and(LogView::has_selection))
             .when::<SaveLogs>(|ws, cx| {
                 log(ws, cx).is_some_and(|l| l.check_save(SaveScope::All).is_ok())

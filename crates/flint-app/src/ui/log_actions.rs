@@ -8,7 +8,7 @@ use gpui_kit::*;
 use super::super::registry::{
     ActionError, Bind, ClearSelection, CopyLines, DragSelection, ExtendSelectionDown,
     ExtendSelectionUp, FocusSearch, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, OnView,
-    PrevMatch, ReloadLogs, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
+    PrevMatch, SaveLines, SaveLogs, SaveMatchingLines, SaveScope, SaveSelectedLines,
     SelectAllLines, SelectLine, SelectNextLine, SelectPrevLine, TogglePause, ToggleSources,
     ToggleTimestamps, ToggleWrap,
 };
@@ -86,7 +86,6 @@ impl LogView {
                 }
             })
             .bind::<LeaveSearch>(Self::leave_search)
-            .bind::<ReloadLogs>(|view, _, _, cx| view.reload(cx))
             .bind::<CopyLines>(Self::copy_lines)
             .bind::<SaveLogs>(|view, _, window, cx| {
                 if view.check_save(SaveScope::All).is_ok() {

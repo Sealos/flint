@@ -269,8 +269,9 @@ nor very long lines (up to 64 KiB each) can grow memory without bound. Search ru
     failure "Can't reach the API server.", and an API server error proxying to an unreachable kubelet (an
     `InternalError`, or a `:10250` address) "Can't reach the node running this pod.") over the server's text,
     which wraps; the status says only a few words, or a short form of an error it has no words for. A
-    previous-instance tab whose log could not be read says the container may have been removed, with Try Again
-    (`ReloadLogs`).
+    previous-instance tab whose log could not be read says the container may have been removed. Reading the logs
+    again is always Reconnect (`dock::ReconnectLogs`, ⌘R): a new tab beside the ended one, which keeps what it
+    showed; never for a deleted pod (`DockItem::can_restart`).
   - **Lines:** a shown timestamp is `HH:MM:SS.mmm` in the system's time zone (UTC, said as such in the toggle's
     tooltip, when it cannot be read), muted and fixed-width. A dated separator row (inside the line's list item)
     starts the first timestamped line shown and each line that moves the day or UTC offset on from the latest of the

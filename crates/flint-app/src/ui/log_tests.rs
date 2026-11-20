@@ -1015,10 +1015,10 @@ async fn an_ended_stream_has_no_pause(cx: &mut TestAppContext) {
 }
 
 // covers UP-40: a 403 says so in plain words once, with the server's text under it, and the
-// status stays short; a previous instance whose log the kubelet could not read yet says that,
-// with Try Again, instead of showing the kubelet's answer as a line.
+// status stays short; a previous instance whose log could not be read says that, with
+// Reconnect, instead of showing the kubelet's answer as a line.
 #[gpui_kit::test]
-async fn errors_are_said_in_plain_words_with_a_retry_for_previous_logs(cx: &mut TestAppContext) {
+async fn errors_are_said_in_plain_words_with_reconnect(cx: &mut TestAppContext) {
     let (core, _dir) = core();
     let (window, view) = open_sized(cx, core.clone(), request(), 470.);
     let mut lines = Feed::new(100);
@@ -1051,6 +1051,13 @@ async fn errors_are_said_in_plain_words_with_a_retry_for_previous_logs(cx: &mut 
         crate::ui::log_model::state_text(&v.snapshot.state, true).text
     });
     assert_eq!(status, "Ended · no permission");
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("log-reconnect").is_some(),
+            "Reconnect in the banner"
+        );
+    })
+    .unwrap();
 
     let previous = LogRequest {
         previous: true,
@@ -1074,20 +1081,17 @@ async fn errors_are_said_in_plain_words_with_a_retry_for_previous_logs(cx: &mut 
         ),
     );
     cx.wait_for(window, WAIT, |window, _| {
-        window.try_find("log-retry").is_some() && window.try_find("log-empty-detail").is_some()
+        window.try_find("log-reconnect").is_some() && window.try_find("log-empty-detail").is_some()
     })
     .await;
-    assert!(view.read_with(cx, |v, _| v.has_ended()));
-    cx.update_window(window, |_, window, cx| window.click("log-retry", cx))
-        .unwrap();
-    cx.run_until_parked();
-    view.read_with(cx, |v, _| {
-        assert_eq!(
-            v.snapshot.state.previous_not_available(),
-            None,
-            "Try Again opened the log again"
-        );
-    });
+    assert!(view.read_with(cx, |v, _| v.has_ended() && v.can_restart()));
+    assert!(
+        cx.update_window(window, |_, window, _| window
+            .try_find("log-retry")
+            .is_none())
+            .unwrap(),
+        "one way to read the logs again: Reconnect"
+    );
 }
 
 // covers UP-43: shown timestamps are one width, so the text lines up; the current match is

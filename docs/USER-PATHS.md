@@ -242,7 +242,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   to restart (back-off) or ended, and why in plain words (no permission, can't reach the API server) with the
   server's text under them; an unreachable node is told apart from an unreachable API server. Once a stream has
   ended there is nothing to pause. A previous instance whose log cannot be read says so (the container may have
-  been removed), with Try Again, instead of showing the kubelet's answer as a line. The toolbar
+  been removed), with Reconnect, instead of showing the kubelet's answer as a line. The toolbar
   stays one row in a narrow dock (the toggles and Save move into a "⋯" menu), and one notice line at a time shows
   under it. Esc in the search field clears the search, then returns to the lines; Esc in the lines clears the
   selection and never closes the detail pane. Memory stays bounded on chatty pods.
