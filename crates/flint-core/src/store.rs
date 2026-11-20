@@ -148,6 +148,17 @@ pub(crate) struct Store {
     interner: Interner,
 }
 
+/// The interned strings a row uses: its namespace, label keys and values, and text cells.
+fn row_strings(row: &Row) -> impl Iterator<Item = &Arc<str>> {
+    row.namespace
+        .iter()
+        .chain(row.labels.iter().flat_map(|(k, v)| [k, v]))
+        .chain(row.cells.iter().filter_map(|cell| match cell {
+            crate::table::Cell::Text(s) => Some(s),
+            _ => None,
+        }))
+}
+
 /// What [`Store::apply`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Applied {
@@ -188,7 +199,12 @@ impl Store {
             if self.pending_layout.is_some() {
                 self.layout = self.pending_layout.take();
             }
-            self.interner.prune();
+            // Snapshots published before (the hub's, a view's still on screen) hold the old
+            // rows' strings, so a prune by reference count would keep them. Keep exactly what
+            // the new rows use: the old strings go when their last holder lets go, whenever
+            // that is, with no further events needed.
+            self.interner
+                .keep_only(self.rows.values().flat_map(|row| row_strings(row)));
         }
     }
 
@@ -314,6 +330,11 @@ impl Store {
     pub fn get(&self, uid: &str) -> Option<&Arc<Row>> {
         self.rows.get(uid)
     }
+
+    #[cfg(test)]
+    pub fn interned(&self) -> usize {
+        self.interner.len()
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +362,103 @@ mod tests {
         assert!(store.apply_changed(obj(&[("u1", "b", "x", "Running")], "4"), true, 0));
         assert!(!store.apply_changed(obj(&[("u1", "b", "x", "Running")], "4"), true, 0));
         assert_eq!(store.len(), 1);
+    }
+
+    // covers UP-20: hours of pod churn on a watch that never relists keep the interner bounded
+    // (#257).
+    #[test]
+    fn churn_without_a_relist_keeps_the_interner_bounded() {
+        let mut store = Store::new(true);
+        for i in 0..50 {
+            let uid = format!("live-{i}");
+            let name = format!("web-{i}");
+            let status = format!("live-status-{i}");
+            store.apply(obj(&[(&uid, "demo", &name, &status)], "1"), false, 0);
+        }
+        let live = store.interned();
+        // Each new pod has a unique status (as it would a unique IP), and is deleted again.
+        for i in 0..40_000 {
+            let uid = format!("u{i}");
+            let name = format!("job-{i}");
+            let status = format!("ip-10-0-{}-{}", i / 256, i % 256);
+            let rv = i.to_string();
+            store.apply(obj(&[(&uid, "demo", &name, &status)], &rv), false, 0);
+            store.apply(obj(&[(&uid, "demo", &name, &status)], &rv), true, 0);
+            assert!(
+                store.interned() < 2 * live + 4096,
+                "{} strings after {i} pods, {live} live",
+                store.interned()
+            );
+        }
+        assert_eq!(store.len(), 50);
+    }
+
+    // covers UP-20, UP-27: a relist that finds a big scale-down, while a view still holds the
+    // old snapshot past the next publish, keeps none of the old strings once the view lets go,
+    // with no further events (#257).
+    #[test]
+    fn relisted_strings_go_when_their_last_holder_lets_go() {
+        let mut store = Store::new(true);
+        for i in 0..5_000 {
+            let uid = format!("old-{i}");
+            let status = format!("old-status-{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "1"), false, 0);
+        }
+        // A list on screen holds the snapshot from before the relist.
+        let on_screen = store.snapshot(KindSnapshot::default());
+        // One of the old rows' statuses (cells: name, namespace, ready, status).
+        let old: Arc<str> = match &on_screen.rows[0].cells[3] {
+            crate::table::Cell::Text(s) => s.clone(),
+            other => panic!("a status cell, not {other:?}"),
+        };
+        assert!(old.starts_with("old-status-"), "{old}");
+        store.begin_resync();
+        store.apply(obj(&[("new", "demo", "new", "Running")], "2"), false, 0);
+        store.finish_resync();
+        // The store keeps only what its rows use, though the old strings are still held.
+        assert!(store.interned() < 10, "{}", store.interned());
+        // The hub publishes the new rows; the view keeps the old snapshot a while longer.
+        let published = store.snapshot(KindSnapshot::default());
+        assert_eq!(published.rows.len(), 1);
+        assert_eq!(Arc::strong_count(&old), 2, "the view's row and this test");
+        // The view lets go: nothing else holds the old string, with no event after it.
+        drop(on_screen);
+        assert_eq!(Arc::strong_count(&old), 1, "only this test");
+    }
+
+    // covers UP-20, UP-27: a burst after a relist, before the old snapshot is replaced, does
+    // not keep the old strings or raise the next prune's threshold (#257).
+    #[test]
+    fn a_burst_before_the_next_publish_keeps_no_relisted_strings() {
+        let mut store = Store::new(true);
+        for i in 0..5_000 {
+            let uid = format!("old-{i}");
+            let status = format!("old-status-{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "1"), false, 0);
+        }
+        let old = store.snapshot(KindSnapshot::default());
+        store.begin_resync();
+        store.apply(obj(&[("new", "demo", "new", "Running")], "2"), false, 0);
+        store.finish_resync();
+        // Pods come and go faster than the next publish.
+        for i in 0..4_096 {
+            let uid = format!("u{i}");
+            let status = format!("s{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "3"), false, 0);
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "3"), true, 0);
+        }
+        let held = store.snapshot(KindSnapshot::default());
+        drop(old);
+        assert!(store.interned() < 100, "{}", store.interned());
+        assert_eq!(held.rows.len(), 1);
+        // The next automatic prune comes after PRUNE_MIN new strings, not after 5,000 more.
+        for i in 0..4_096 {
+            let uid = format!("v{i}");
+            let status = format!("t{i}");
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "4"), false, 0);
+            store.apply(obj(&[(&uid, "demo", &uid, &status)], "4"), true, 0);
+        }
+        assert!(store.interned() < 100, "{}", store.interned());
     }
 
     // covers UP-27
