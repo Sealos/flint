@@ -28,25 +28,26 @@ pub fn has_wide_columns(columns: &[Column]) -> bool {
 }
 
 /// The index in `columns` of the column `spec` sorts by, looked up by key among the columns
-/// shown (`-o wide` ones only with `show_wide`): a remembered sort on a wide column waits until
-/// Wide is on again, rather than sorting by a column nobody sees.
-pub fn sort_column(columns: &[Column], spec: Option<&SortSpec>, show_wide: bool) -> Option<usize> {
+/// drawn (`drawn`, indexes into `columns`): a remembered sort on a column that is not drawn (a
+/// wide column with Wide off, or one a narrow pane leaves out) is suspended until it shows
+/// again, rather than sorting by a column nobody sees.
+pub fn sort_column(columns: &[Column], spec: Option<&SortSpec>, drawn: &[usize]) -> Option<usize> {
     let spec = spec?;
-    visible_columns(columns, show_wide)
-        .into_iter()
+    drawn
+        .iter()
+        .copied()
         .find(|&i| columns[i].key() == spec.column)
 }
 
-/// The sort for `compute_view`: `spec`'s column looked up by key in `columns`. `None` when
-/// nothing is sorted, or the column no longer exists (a remembered sort on a CRD column since
-/// removed) or is a wide column while Wide is off, which keeps the snapshot order: namespace,
-/// then name.
+/// The sort for `compute_view`: `spec`'s column looked up by key among the `drawn` columns.
+/// `None` when nothing is sorted, or the column no longer exists (a remembered sort on a CRD
+/// column since removed) or is not drawn, which keeps the snapshot order: namespace, then name.
 pub fn resolve_sort(
     columns: &[Column],
     spec: Option<&SortSpec>,
-    show_wide: bool,
+    drawn: &[usize],
 ) -> Option<SortBy> {
-    let column = sort_column(columns, spec, show_wide)?;
+    let column = sort_column(columns, spec, drawn)?;
     let spec = spec?;
     Some(SortBy {
         column,
@@ -473,6 +474,11 @@ mod tests {
         }
     }
 
+    /// Every column of `columns` drawn.
+    fn all(columns: &[Column]) -> Vec<usize> {
+        (0..columns.len()).collect()
+    }
+
     fn pod_columns() -> Vec<Column> {
         vec![
             col("Name", 0, ColumnRole::Name, ColumnType::String),
@@ -526,7 +532,7 @@ mod tests {
         };
         let columns = pod_columns();
         assert_eq!(
-            resolve_sort(&columns, Some(&spec), false),
+            resolve_sort(&columns, Some(&spec), &all(&columns)),
             Some(SortBy {
                 column: 3,
                 descending: true
@@ -536,7 +542,7 @@ mod tests {
         let mut changed = columns.clone();
         changed.insert(2, col("Phase", 0, ColumnRole::Value, ColumnType::String));
         assert_eq!(
-            resolve_sort(&changed, Some(&spec), false),
+            resolve_sort(&changed, Some(&spec), &all(&changed)),
             Some(SortBy {
                 column: 4,
                 descending: true
@@ -544,8 +550,8 @@ mod tests {
         );
         // The column is gone: back to the default order rather than sorting by a stranger.
         changed.retain(|c| &*c.name != "Restarts");
-        assert_eq!(resolve_sort(&changed, Some(&spec), false), None);
-        assert_eq!(resolve_sort(&columns, None, false), None);
+        assert_eq!(resolve_sort(&changed, Some(&spec), &all(&changed)), None);
+        assert_eq!(resolve_sort(&columns, None, &all(&columns)), None);
     }
 
     // covers UP-20, UP-21
@@ -556,8 +562,15 @@ mod tests {
             column: "server:Node".into(),
             descending: false,
         };
-        assert_eq!(sort_column(&columns, Some(&node), false), None);
-        assert_eq!(sort_column(&columns, Some(&node), true), Some(6));
+        let narrow = visible_columns(&columns, false);
+        assert_eq!(sort_column(&columns, Some(&node), &narrow), None);
+        let wide = visible_columns(&columns, true);
+        assert_eq!(sort_column(&columns, Some(&node), &wide), Some(6));
+        // Wide is on, but a narrow pane leaves Node out: suspended too.
+        let (fitted, dropped) = fit_columns(&columns, |_| 100., true, Some(650.));
+        assert_eq!(dropped, 1);
+        let fitted: Vec<usize> = fitted.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(sort_column(&columns, Some(&node), &fitted), None);
     }
 
     // covers UP-21
@@ -574,8 +587,11 @@ mod tests {
             column: "server:Namespace".into(),
             descending: false,
         };
-        assert_eq!(sort_column(&columns, Some(&flint), false), Some(1));
-        assert_eq!(sort_column(&columns, Some(&server), false), Some(7));
+        assert_eq!(sort_column(&columns, Some(&flint), &all(&columns)), Some(1));
+        assert_eq!(
+            sort_column(&columns, Some(&server), &all(&columns)),
+            Some(7)
+        );
     }
 
     #[test]

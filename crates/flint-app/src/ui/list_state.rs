@@ -16,11 +16,7 @@ use super::{ResourceList, cell_text, limited_text, list_model};
 impl ResourceList {
     /// The sort in effect, if its column is in the snapshot drawn: its header and direction.
     fn sort_shown(&self) -> Option<(&str, bool)> {
-        let col = list_model::sort_column(
-            &self.shown.columns,
-            self.query.sort.as_ref(),
-            self.show_wide,
-        )?;
+        let col = self.drawn_sort_column()?;
         let descending = self.query.sort.as_ref()?.descending;
         Some((&self.shown.columns[col].name, descending))
     }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use flint_core::settings::{ListSort, STATE_FILE};
 use flint_core::{Cell, Column, ColumnRole, ColumnType, KindId, KindSnapshot, Row, SyncState};
 use gpui_kit::TestAppContext;
-use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use serde_json::{Value, json};
 
 use super::support_tests::{TestWorkspace, WAIT, objects, open_workspace, pods};
@@ -292,4 +292,56 @@ async fn a_saved_sort_on_a_wide_column_waits_for_wide(cx: &mut TestAppContext) {
         ),
     )
     .await;
+}
+
+// covers UP-20, UP-21: Wide is on, but the pane is too narrow for Node.
+#[gpui_kit::test]
+async fn a_saved_sort_waits_while_a_narrow_pane_leaves_its_column_out(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(STATE_FILE),
+        "[list_sorts.alpha]\npods = { column = \"server:Node\" }\n",
+    )
+    .unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, super::support_tests::standard_sections())
+        .await;
+    t.open_kind(cx, "pods", pods_with_nodes()).await;
+    t.dispatch(cx, "resource_list::ToggleWide", Value::Null)
+        .unwrap();
+    let applied = (
+        sorted("Node", false),
+        vec!["web".into(), "db".into(), "api".into()],
+    );
+    expect_rows(cx, &t, applied.clone()).await;
+
+    // Narrow: Node is left out, and so is its sort; the preference stays saved.
+    cx.simulate_window_resize(
+        t.window,
+        gpui_kit::size(gpui_kit::px(560.), gpui_kit::px(700.)),
+    );
+    cx.run_until_parked();
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("sort-Node").is_none()
+    })
+    .await;
+    expect_rows(
+        cx,
+        &t,
+        (None, vec!["db".into(), "api".into(), "web".into()]),
+    )
+    .await;
+    assert!(
+        std::fs::read_to_string(dir.path().join(STATE_FILE))
+            .unwrap()
+            .contains("server:Node")
+    );
+
+    // Wide enough again: sorted by Node.
+    cx.simulate_window_resize(
+        t.window,
+        gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(700.)),
+    );
+    cx.run_until_parked();
+    expect_rows(cx, &t, applied).await;
 }

@@ -126,6 +126,9 @@ pub struct ResourceList {
     /// The pane width this frame was laid out for. The width is known only after layout, so
     /// when it changed, the next frame draws again with the new one.
     laid_out_width: Option<f32>,
+    /// Whether the last recompute applied the sort: its column was drawn then. When that
+    /// changes with the layout (Wide toggled, the pane resized), the rows are sorted again.
+    sort_drawn: bool,
     focus: FocusHandle,
     filter: Entity<InputState>,
     /// A row's context menu, for kinds that have one (pods and workloads: UP-47).
@@ -218,6 +221,7 @@ impl ResourceList {
             drawn: Vec::new(),
             dropped_wide: 0,
             laid_out_width: None,
+            sort_drawn: false,
             focus: cx.focus_handle(),
             filter,
             row_menu: None,
@@ -345,9 +349,10 @@ impl ResourceList {
             sort: list_model::resolve_sort(
                 &snapshot.columns,
                 self.query.sort.as_ref(),
-                self.show_wide,
+                &self.drawn_in(&snapshot.columns),
             ),
         };
+        self.sort_drawn = query.sort.is_some();
         let view = self.core.compute_view(snapshot.clone(), query);
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
@@ -392,6 +397,7 @@ impl ResourceList {
         let (drawn, dropped) = self.layout(self.laid_out_width);
         self.drawn = drawn;
         self.dropped_wide = dropped;
+        self.resort_if_drawn_changed(cx);
         match &mut self.selected {
             None => self.selected_ix = None,
             Some(selected) if Some(&selected.uid) == uid.as_ref() => {
@@ -498,6 +504,39 @@ impl ResourceList {
         cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
         cx.notify();
+    }
+
+    /// The columns of `columns` (the newest snapshot's) that are drawn now, matched by key: the
+    /// ones a sort may apply to. Before the first layout, the columns the Wide setting shows.
+    fn drawn_in(&self, columns: &[flint_core::Column]) -> Vec<usize> {
+        if self.drawn.is_empty() {
+            return list_model::visible_columns(columns, self.show_wide);
+        }
+        let keys: Vec<String> = self
+            .drawn
+            .iter()
+            .map(|&(col, _)| self.shown.columns[col].key())
+            .collect();
+        (0..columns.len())
+            .filter(|&i| keys.contains(&columns[i].key()))
+            .collect()
+    }
+
+    /// The drawn column the sort applies to, if it is drawn.
+    pub(super) fn drawn_sort_column(&self) -> Option<usize> {
+        let drawn: Vec<usize> = self.drawn.iter().map(|&(col, _)| col).collect();
+        list_model::sort_column(&self.shown.columns, self.query.sort.as_ref(), &drawn)
+    }
+
+    /// Sorts again when the sort's column came into view or left it with the layout, so a
+    /// remembered sort is suspended while its column is not drawn and applies when it is.
+    fn resort_if_drawn_changed(&mut self, cx: &mut Context<Self>) {
+        if self.query.sort.is_some()
+            && !self.drawn.is_empty()
+            && self.drawn_sort_column().is_some() != self.sort_drawn
+        {
+            self.recompute(cx);
+        }
     }
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
@@ -664,11 +703,7 @@ impl ResourceList {
             .border_color(theme.border)
             .text_xs()
             .font_semibold();
-        let sorted_col = list_model::sort_column(
-            &self.shown.columns,
-            self.query.sort.as_ref(),
-            self.show_wide,
-        );
+        let sorted_col = self.drawn_sort_column();
         for &(col, width) in &self.drawn {
             let column = &self.shown.columns[col];
             let name = column.name.to_string();
@@ -682,7 +717,9 @@ impl ResourceList {
                 format!("{name}\n{}", column.description)
             };
             // By key: a header shared by two columns sorts the one clicked.
-            let click_key = column.key();
+            let click = SortBy {
+                column: column.key(),
+            };
             header = header.child(
                 h_flex()
                     .id(SharedString::from(header_id(&self.shown.columns, col)))
@@ -708,7 +745,7 @@ impl ResourceList {
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .on_click(registry::on_click(SortBy { column: click_key }))
+                    .on_click(registry::on_click(click))
                     .test_support(),
             );
         }
@@ -1029,6 +1066,7 @@ impl Render for ResourceList {
         let (drawn, dropped) = self.layout(available);
         self.drawn = drawn;
         self.dropped_wide = dropped;
+        self.resort_if_drawn_changed(cx);
         let total_width: f32 = self.drawn.iter().map(|(_, w)| w).sum();
 
         let cx: &Context<Self> = cx;
