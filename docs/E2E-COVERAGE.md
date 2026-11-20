@@ -47,12 +47,12 @@ tests are `#[ignore]`d and CI does not run them yet: #117 adds them to the `maco
 | 31 | U, ui | — (#29) | not built | #132 |
 | 32 | ui | `theme.rs` contrast tests (U); `ui/appearance_tests.rs` (V); screenshots in both themes from every app e2e test | — | — |
 | 33 | ui | `ui/list_tests.rs::clicking_and_arrows_select_rows` (V) | sidebar keys (not built yet), Enter, quit in the app | #132 |
-| 40 | K, ui | ~40 tagged in `logs/` (U); `logs_cluster.rs::follows_a_chatty_pod…`, `picks_a_container_and_reads_the_previous_instance` (K); `ui/log_tests.rs` (V, buffer fed directly) | **the app on a real stream** | #122 (needs #119, #120) |
+| 40 | K, ui | ~40 tagged in `logs/` (U); `logs_cluster.rs::follows_a_chatty_pod…`, `picks_a_container_and_reads_the_previous_instance` (K); `e2e/core.rs::a_pod_log_streams_resumes_without_repeats_and_ends_with_its_pod` (F); `ui/log_tests.rs` (V, buffer fed directly) | **the app on a real stream** | #122 (needs #119) |
 | 41 | U, K, ui | 19 in `exec.rs` (U); `exec_cluster.rs::shell_into_a_container` (K, bash and sh images); `ui/terminal_tests.rs` (V, `FakeExec`) | **the app over a real exec websocket** | #123 (kind smoke first, needs #119; CI on the fake needs #121) |
 | 42 | ui | `ui/workspace_tests.rs::the_dock_toggles_and_remembers_its_height`, `logs_open_in_the_dock_and_outlive_a_cluster_switch` (V); `ui/dock_tests.rs` leak tests (V) | stream closed on tab close, height across a relaunch | #124 |
 | 43 | U, K, ui | `logs/line.rs::severity_follows_the_whole_word_rules` (U); `logs_cluster.rs::follows_a_chatty_pod…` (K, asserts severity and timestamps, untagged); `ui/log_tests.rs::timestamps_and_wrap_toggle_without_reloading` (V) | "without reloading" unchecked at the HTTP level | #122 |
 | 44 | ui | `ui/log_tests.rs::selecting_pauses_and_copies_the_lines_as_shown` (V) | — (view layer is right) | — |
-| 45 | U, K, ui | 33 tagged in `logs/` (U); `logs_cluster.rs::follows_a_deployments_pods_as_they_scale_and_get_replaced` (K); `ui/log_tests.rs::a_workload_tab_shows_sources_and_stream_counts` (V) | no entry point yet (#63); no app test with pod churn | #125 |
+| 45 | U, K, ui | 33 tagged in `logs/` (U); `logs_cluster.rs::follows_a_deployments_pods_as_they_scale_and_get_replaced` (K); `e2e/core.rs::a_workload_log_follows_its_pods_through_churn` (F); `ui/log_tests.rs::a_workload_tab_shows_sources_and_stream_counts` (V) | no entry point yet (#63); no app test with pod churn | #125 |
 | 46 | U, ui | `ui/log_tests.rs::save_writes_matches_as_shown_to_the_chosen_file`, `a_narrow_toolbar_keeps_save_reachable` (V) | — (the native save panel can't be automated; view layer is right) | — |
 
 ## M3 and later
