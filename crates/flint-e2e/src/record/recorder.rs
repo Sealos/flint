@@ -271,7 +271,7 @@ fn check_leaks(files: &BTreeMap<PathBuf, String>) -> Result<()> {
 
 /// Refuses to record into `out` unless it is the committed fixtures directory `fixtures`
 /// (replaced as a whole, as always) or a directory that does not exist yet or is empty:
-/// [`install`] swaps the destination out whole, so anything else in it would be lost.
+/// installing swaps the destination out whole, so anything else in it would be lost.
 pub fn check_destination(out: &Path, fixtures: &Path) -> Result<()> {
     let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
