@@ -6,28 +6,61 @@ with [GPUI](https://www.gpui.rs/) so it starts fast, stays light on memory, and 
 It also ships a read-only [MCP](https://modelcontextprotocol.io/) server, `flint mcp`, so AI agents can inspect the
 clusters you choose to expose.
 
-Status: early development (milestone M2). The app lists your kubeconfig contexts, connects to the one you select,
-and browses every kind it serves, CRDs included: live lists with the `kubectl get` columns, a namespace and text
-filter, and a detail view with metadata, conditions, events and read-only YAML. A bottom dock holds pod and workload
-logs (follow, search, timestamps, previous logs, save to a file) and shells into containers; open them from a row's
-context menu, the detail pane or the keyboard. It has a light and a dark theme that follow the system (View >
-Appearance, or the `appearance` setting, overrides it). Shells open on any cluster without asking, production included; protected clusters arrive in M3.
+## Status
+
+Flint is in early development.
+
+**Works today:**
+
+- Your kubeconfig contexts in a sidebar; Flint connects to the one you select and checks its health.
+- Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
+  columns, a namespace and text filter, and a detail view with metadata, conditions, events and read-only YAML.
+- A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
+  containers. Open them from a row's context menu, the detail pane or the keyboard. Shells open on any cluster
+  without asking, production included, until protected clusters arrive.
+- Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
+- A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
+- Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64).
+
+**Coming next:**
+
+- A command palette and a resource switcher.
+- Log filters (matching lines only, regex, errors only) and time ranges.
+- Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain; protected clusters.
+- Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
+- Port-forwarding and Helm releases.
+- Cluster sets and warm clusters for instant switching, AI log analysis, and a tighter MCP server (scope by
+  namespace and kind, redacted credentials, an activity log).
+- A signed and notarized app with a Homebrew cask.
 
 ## Install from a release
 
-Each [release](https://github.com/Sealos/flint/releases) has `Flint.app` in a disk image,
-`flint-vX.Y.Z-macos-universal.dmg`, for Apple Silicon and Intel Macs on macOS 13 or later. Releases after v0.2.0 have
-it; replace `vX.Y.Z` with the newest tag on the releases page.
+Download from the [latest release](https://github.com/Sealos/flint/releases/latest), or with `gh release download`,
+which takes the latest release when given no tag. Run the commands below in an empty directory, so each pattern
+matches only the files you just downloaded.
 
-1. Download the DMG from the releases page (or with
-   `gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-macos-universal.dmg*'`). To check it, run
-   `shasum -a 256 -c flint-vX.Y.Z-macos-universal.dmg.sha256` next to it.
+### macOS app (DMG)
+
+Releases after v0.2.0 have `Flint.app` in a disk image, `flint-vX.Y.Z-macos-universal.dmg`, for Apple Silicon and
+Intel Macs on macOS 13 or later. v0.2.0 itself has the [command-line archive](#macos-command-line-archive) and the
+AppImages only.
+
+1. Download the DMG from the latest release, or with `gh`, and check it:
+
+   ```sh
+   gh release download -R Sealos/flint --pattern 'flint-*-macos-universal.dmg*'
+   shasum -a 256 -c flint-*-macos-universal.dmg.sha256
+   ```
+
+   If `gh` finds no matching asset, the latest release is still v0.2.0: use the
+   [command-line archive](#macos-command-line-archive) instead.
+
 2. Open the DMG and drag **Flint** onto **Applications**, then eject the DMG.
 3. Open Flint from Applications, Launchpad or Spotlight.
 
-**First launch.** Until M6 the app is **not signed with a Developer ID or notarized** (it carries an ad-hoc signature
-only), so macOS refuses to open a copy downloaded with a browser the first time. Allow it once per downloaded version,
-either way:
+**First launch.** Until the first signed release the app is **not signed with a Developer ID or notarized** (it
+carries an ad-hoc signature only), so macOS refuses to open a copy downloaded with a browser the first time. Allow it
+once per downloaded version, either way:
 
 - open Flint once, dismiss the warning (**Done**, not Move to Trash), then open **System Settings > Privacy &
   Security**, scroll to the message about Flint, click **Open Anyway**, and confirm; or
@@ -64,9 +97,9 @@ Each release also has the same universal binary without the app bundle, `flint-v
 from a terminal and it opens the Flint window:
 
 ```sh
-gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-macos-universal.tar.gz*'
-shasum -a 256 -c flint-vX.Y.Z-macos-universal.tar.gz.sha256
-tar -xzf flint-vX.Y.Z-macos-universal.tar.gz
+gh release download -R Sealos/flint --pattern 'flint-*-macos-universal.tar.gz*'
+shasum -a 256 -c flint-*-macos-universal.tar.gz.sha256
+tar -xzf flint-*-macos-universal.tar.gz
 sudo install -m 755 flint/flint /usr/local/bin/flint
 flint --version
 flint                                   # opens the window
@@ -74,21 +107,18 @@ flint                                   # opens the window
 
 Downloaded with `gh` or `curl`, it runs as is. Downloaded with a browser, macOS blocks the first run: remove the
 quarantine flag with `xattr -d com.apple.quarantine /usr/local/bin/flint`, or open **System Settings > Privacy &
-Security** and choose **Open Anyway**. Releases are marked pre-release until 1.0, so the releases page has no "Latest"
-badge yet.
+Security** and choose **Open Anyway**.
 
 ### Linux (AppImage)
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later). Releases after v0.1.1 have it; replace
-`vX.Y.Z` with the newest tag on the releases page.
+needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
 
 ```sh
-gh release download vX.Y.Z -R Sealos/flint -p 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
-sha256sum -c flint-vX.Y.Z-linux-x86_64.AppImage.sha256
-chmod +x flint-vX.Y.Z-linux-x86_64.AppImage
-install -D flint-vX.Y.Z-linux-x86_64.AppImage ~/.local/bin/flint
+gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
+sha256sum -c flint-*-linux-x86_64.AppImage.sha256
+install -D -m 755 flint-*-linux-x86_64.AppImage ~/.local/bin/flint
 flint --version
 flint                                   # opens the window
 ```
@@ -262,8 +292,8 @@ next to a cluster in the sidebar, which asks you to confirm the context and its 
 badge). Nothing is exposed by default. An exposure is tied to the context's API server URL, so a context that is
 re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
 Large outputs are cut short. Only Secret values are redacted: everything else an agent reads, including ConfigMaps,
-`env` values in pod specs, and (until M5.5) pod logs and event messages, is sent as the cluster returns it. Only
-expose clusters whose contents, logs and events you are willing to send to your AI provider.
+`env` values in pod specs, and, until log redaction ships (#68), pod logs and event messages, is sent as the cluster
+returns it. Only expose clusters whose contents, logs and events you are willing to send to your AI provider.
 
 Register it with Claude Code by `/usr/local/bin/flint`: the link into `Flint.app` (see
 [Install from a release](#install-from-a-release)) or the binary from the command-line archive. The path stays the same
@@ -306,9 +336,9 @@ format, for example `feat(mcp): …` or `fix(core): …`.
    `flint-vX.Y.Z-linux-aarch64.AppImage`. Each file comes with its SHA-256 checksum.
 4. Once every upload has succeeded, a `publish` job publishes the release and checks that all eight files are on it.
 
-Until M6, release binaries are **unsigned** (the app only ad-hoc signed) and marked as pre-release. macOS blocks the
-first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)).
-AppImages stay unsigned.
+Until the first signed release, release binaries are **unsigned** (the app only ad-hoc signed). macOS blocks the
+first launch of a browser download until you allow it ([Install from a release](#install-from-a-release)). AppImages
+stay unsigned.
 
 After every published release:
 
