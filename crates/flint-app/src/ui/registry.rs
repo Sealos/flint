@@ -146,7 +146,11 @@ actions!(
         /// Show the dock's next tab.
         NextTab,
         /// Show the dock's previous tab.
-        PrevTab
+        PrevTab,
+        /// Open the active log tab's stream again once it ended or failed, in the same tab.
+        ReconnectLogs,
+        /// Start a new shell in the active shell tab once its shell exited or failed.
+        RestartShell
     ]
 );
 actions!(
@@ -1619,6 +1623,20 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<PrevTab>("Previous Dock Tab", "Show the dock's previous tab.")
             .of(C::View, S::Dock)
             .keys(&["ctrl-shift-tab"], Some(DOCK)),
+        Spec::unit::<ReconnectLogs>(
+            "Reconnect Logs",
+            "Open the active log tab's stream again once it ended or failed, in the same tab, on \
+             the API server its context points at now.",
+        )
+        .of(C::Logs, S::Dock)
+        .keys(&["secondary-r"], Some(DOCK)),
+        Spec::unit::<RestartShell>(
+            "Restart Shell",
+            "Start a new shell in the active shell tab once its shell exited or failed, in the \
+             same tab, on the API server its context points at now.",
+        )
+        .of(C::Terminal, S::Dock)
+        .keys(&["secondary-r"], Some(DOCK)),
         Spec::with_args::<ActivateTab>("Show Dock Tab…", "Show a dock tab by its id.", TAB)
             .of(C::View, S::Dock)
             .hidden(),

@@ -31,9 +31,10 @@ use super::dock_model::{self, TabCluster};
 use super::log_view::{LogRequest, LogView};
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
-    ToggleDock,
+    ReconnectLogs, RestartShell, ToggleDock,
 };
-use super::terminal_view::{ShellKey, TerminalView};
+use super::terminal_model::ShellRequest;
+use super::terminal_view::TerminalView;
 
 /// The dock's height before the user drags it.
 pub const DEFAULT_HEIGHT: f32 = 280.;
@@ -56,11 +57,23 @@ pub fn dock_height(saved: Option<u32>, window_height: f32) -> f32 {
         .clamp(MIN_HEIGHT, max)
 }
 
-/// What identifies a tab's session: opening a tab with the key of an open one shows that one.
+/// What a tab's session reads or runs. With the tab's [`TabCluster`] it identifies the tab:
+/// opening a request on the same cluster shows the open tab while it answers for it
+/// ([`dock_model::reopens`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TabKey {
     Logs(LogRequest),
-    Shell(ShellKey),
+    Shell(ShellRequest),
+}
+
+impl TabKey {
+    /// The context the session runs on.
+    pub fn context(&self) -> &str {
+        match self {
+            TabKey::Logs(request) => &request.cluster,
+            TabKey::Shell(request) => &request.cluster,
+        }
+    }
 }
 
 /// What the dock needs from a tab's view.
@@ -109,6 +122,14 @@ struct Tab {
     _observe: Subscription,
 }
 
+/// Redraws the tab bar when tab `id`'s view changes its title or status.
+fn observe(tab: &DockTab, id: u64, cx: &mut Context<Dock>) -> Subscription {
+    match tab {
+        DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+        DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
+    }
+}
+
 /// What the tab bar shows of a tab.
 fn tab_shown(tab: &DockTab, cx: &App) -> (SharedString, TabStatus) {
     let item = tab.item(cx);
@@ -119,6 +140,9 @@ pub enum DockEvent {
     /// The dock hid (or closed its last tab) while it had focus: focus should go back to the
     /// main area.
     Blurred,
+    /// Reconnect Logs or Restart Shell asked for tab `0`'s session to start again: the
+    /// workspace builds the new session ([`Dock::replace`]).
+    Restart(u64),
 }
 
 impl EventEmitter<DockEvent> for Dock {}
@@ -202,8 +226,62 @@ impl Dock {
     pub fn find(&self, key: &TabKey, cluster: &TabCluster, cx: &App) -> Option<u64> {
         self.tabs
             .iter()
-            .find(|t| t.cluster == *cluster && t.tab.item(cx).tab_key() == *key)
+            .find(|t| {
+                if t.cluster != *cluster || t.repointed {
+                    return false;
+                }
+                let item = t.tab.item(cx);
+                let reads_to_end = matches!(key, TabKey::Logs(request) if request.previous);
+                item.tab_key() == *key && dock_model::reopens(item.tab_status(), reads_to_end)
+            })
             .map(|t| t.id)
+    }
+
+    /// The tab Reconnect Logs (`logs`) or Restart Shell acts on: the tab shown, if it is a log
+    /// tab (a shell tab) whose session ended or failed.
+    pub fn restartable(&self, logs: bool, cx: &App) -> Option<u64> {
+        let id = self.active.filter(|_| self.visible)?;
+        let tab = self.tab(id)?;
+        let kind = matches!(
+            (tab, logs),
+            (DockTab::Logs(_), true) | (DockTab::Shell(_), false)
+        );
+        let ended = matches!(
+            tab.item(cx).tab_status(),
+            TabStatus::Ended | TabStatus::Failed
+        );
+        (kind && ended).then_some(id)
+    }
+
+    /// Replaces tab `id`'s session with a new one built by `build`, in the same place and under
+    /// the same id, now on `cluster` (Reconnect Logs, Restart Shell). The old view is dropped,
+    /// which ends its session.
+    pub fn replace(
+        &mut self,
+        id: u64,
+        cluster: TabCluster,
+        build: impl FnOnce(&mut Window, &mut Context<Self>) -> DockTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let had_focus = self.focus.contains_focused(window, cx);
+        let tab = build(window, cx);
+        let shown = tab_shown(&tab, cx);
+        self.tabs[ix] = Tab {
+            id,
+            _observe: observe(&tab, id, cx),
+            tab,
+            cluster,
+            repointed: false,
+            shown,
+        };
+        if self.active == Some(id) && had_focus {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
     }
 
     /// Tab `id`'s title and cluster, as its accessible label names them.
@@ -282,18 +360,14 @@ impl Dock {
         let tab = build(window, cx);
         let id = self.next_id;
         self.next_id += 1;
-        let observe = match &tab {
-            DockTab::Logs(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
-            DockTab::Shell(view) => cx.observe(view, move |dock, _, cx| dock.tab_changed(id, cx)),
-        };
         let shown = tab_shown(&tab, cx);
         self.tabs.push(Tab {
             id,
+            _observe: observe(&tab, id, cx),
             tab,
             cluster,
             repointed: false,
             shown,
-            _observe: observe,
         });
         if self.active.is_none() {
             self.active = Some(id);
@@ -417,6 +491,15 @@ impl Dock {
                     Ok(()) => dock.activate(action.tab, window, cx),
                     Err(e) => tracing::warn!("{e}"),
                 }
+            })
+            .bind::<ReconnectLogs>(|dock, _, _, cx| match dock.restartable(true, cx) {
+                Some(id) => cx.emit(DockEvent::Restart(id)),
+                // Not ours (a running tab, or a shell): let Cmd-R reach Restart Shell or Refresh.
+                None => cx.propagate(),
+            })
+            .bind::<RestartShell>(|dock, _, _, cx| match dock.restartable(false, cx) {
+                Some(id) => cx.emit(DockEvent::Restart(id)),
+                None => cx.propagate(),
             })
             .bind::<CloseTab>(|dock, action, window, cx| {
                 match dock.check_tab::<CloseTab>(action.tab) {

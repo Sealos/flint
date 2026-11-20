@@ -9,7 +9,7 @@
 use flint_core::exec::fake::FakeExec;
 use flint_core::terminal::TerminalSize;
 use flint_core::{CoreConfig, CoreHandle, ExecState, LogSubject, LogTarget, Settings};
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds,
     WindowOptions, px, size,
@@ -119,10 +119,7 @@ fn open_shell_in(
         .update_window(window, |_, window, cx| {
             dock.update(cx, |dock, cx| {
                 let request = shell_request_in(pod);
-                let key = TabKey::Shell(super::terminal_view::ShellKey {
-                    request: request.clone(),
-                    ended: None,
-                });
+                let key = TabKey::Shell(request.clone());
                 dock.open(
                     key,
                     TabCluster::new("test", None),
@@ -273,7 +270,11 @@ async fn tabs_name_their_cluster(cx: &mut TestAppContext) {
         Some("Shell: web-1 · app on test")
     );
     cx.update_window(window, |_, window, _| {
-        assert!(window.try_find(("dock-tab-cluster", shell as usize)).is_some());
+        assert!(
+            window
+                .try_find(("dock-tab-cluster", shell as usize))
+                .is_some()
+        );
         assert!(window.try_find("terminal-cluster").is_some());
     })
     .unwrap();
@@ -307,10 +308,7 @@ async fn a_shell_ends_when_its_context_is_re_pointed(cx: &mut TestAppContext) {
     .unwrap();
     let found = dock.read_with(cx, |d, cx| {
         d.find(
-            &TabKey::Shell(super::terminal_view::ShellKey {
-                request: shell_request(),
-                ended: None,
-            }),
+            &TabKey::Shell(shell_request()),
             &TabCluster::new("test", None),
             cx,
         )
@@ -393,7 +391,10 @@ async fn an_empty_dock_says_how_to_open_a_tab(cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, _| {
         assert!(window.try_find("dock-empty").is_some());
         assert!(window.try_find("dock-tabs").is_none(), "no empty tab strip");
-        assert!(window.try_find("dock-hide").is_some(), "it can still be hidden");
+        assert!(
+            window.try_find("dock-hide").is_some(),
+            "it can still be hidden"
+        );
         let texts: Vec<String> = gpui_kit::base::test_support::texts(window)
             .into_iter()
             .map(|t| t.text().to_owned())
@@ -404,4 +405,121 @@ async fn an_empty_dock_says_how_to_open_a_tab(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+/// Records the dock's restart requests.
+fn record_restarts(
+    cx: &mut TestAppContext,
+    dock: &Entity<Dock>,
+) -> (
+    std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+    gpui_kit::Subscription,
+) {
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<u64>>> = Default::default();
+    let record = seen.clone();
+    let subscription = cx.update(|cx| {
+        cx.subscribe(dock, move |_, event: &super::dock::DockEvent, _| {
+            if let super::dock::DockEvent::Restart(id) = event {
+                record.borrow_mut().push(*id);
+            }
+        })
+    });
+    (seen, subscription)
+}
+
+fn dispatch(cx: &mut TestAppContext, window: AnyWindowHandle, name: &str) {
+    cx.update_window(window, |_, window, cx| {
+        registry::dispatch(name, json!(null), window, cx)
+    })
+    .unwrap()
+    .unwrap();
+    draw(cx, window);
+}
+
+// covers UP-42, UP-45: a failed log tab no longer answers for its request (opening the logs
+// again opens a fresh tab), offers Reconnect, and Reconnect starts the stream again in the same
+// tab, under the same id.
+#[gpui_kit::test]
+async fn a_failed_log_tab_reconnects_in_place(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, dock) = open_dock(cx);
+    let (restarts, _subscription) = record_restarts(cx, &dock);
+    let id = open_logs(cx, window, &dock, &core);
+    let status = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |d, cx| d.tab(id).unwrap().item(cx).tab_status())
+    };
+    cx.wait_for(window, super::support_tests::WAIT, |_, cx| {
+        dock.read(cx).tab(id).unwrap().item(cx).tab_status() == super::dock::TabStatus::Failed
+    })
+    .await;
+    draw(cx, window);
+    let found = dock.read_with(cx, |d, cx| {
+        d.find(
+            &TabKey::Logs(log_request()),
+            &TabCluster::new("test", None),
+            cx,
+        )
+    });
+    assert_eq!(found, None, "Logs opens a fresh tab");
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("log-reconnect").is_some());
+    })
+    .unwrap();
+
+    dispatch(cx, window, "dock::ReconnectLogs");
+    assert_eq!(*restarts.borrow(), [id]);
+    let old = match dock.read_with(cx, |d, _| d.tab(id).cloned()).unwrap() {
+        DockTab::Logs(view) => view.downgrade(),
+        DockTab::Shell(_) => panic!("a log tab"),
+    };
+    let core2 = core.clone();
+    cx.update_window(window, |_, window, cx| {
+        dock.update(cx, |dock, cx| {
+            dock.replace(
+                id,
+                TabCluster::new("test", None),
+                |window, cx| {
+                    DockTab::Logs(cx.new(|cx| LogView::new(core2, log_request(), window, cx)))
+                },
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    draw(cx, window);
+    assert_eq!(
+        dock.read_with(cx, |d, _| d.tab_ids()),
+        [id],
+        "same place, same id"
+    );
+    assert!(old.upgrade().is_none(), "the old session is dropped");
+    assert_ne!(status(cx), super::dock::TabStatus::Live);
+}
+
+// covers UP-41: an exited shell offers Restart Shell, which asks for a new session in the same
+// tab; a running one does not.
+#[gpui_kit::test]
+async fn an_exited_shell_asks_to_restart(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let (restarts, _subscription) = record_restarts(cx, &dock);
+    let (id, mut fake) = open_shell(cx, window, &dock);
+    let restartable = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |d, cx| {
+            (d.restartable(false, cx), d.restartable(true, cx))
+        })
+    };
+    assert_eq!(restartable(cx), (None, None), "it runs");
+    fake.set_state(ExecState::Exited { code: Some(0) });
+    draw(cx, window);
+    assert_eq!(restartable(cx), (Some(id), None));
+    dispatch(cx, window, "dock::RestartShell");
+    assert_eq!(*restarts.borrow(), [id]);
+    // Cmd-R from the tab does the same on macOS (on Linux, Ctrl-R belongs to the shell).
+    if cfg!(target_os = "macos") {
+        cx.update_window(window, |_, window, cx| window.press("secondary-r", cx))
+            .unwrap();
+        draw(cx, window);
+        assert_eq!(*restarts.borrow(), [id, id]);
+    }
 }

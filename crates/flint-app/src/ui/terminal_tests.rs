@@ -351,11 +351,10 @@ async fn an_exited_shell_shows_its_code_and_keeps_its_screen(cx: &mut TestAppCon
         shell.view.read_with(cx, |v, _| v.tab_status()),
         TabStatus::Live
     );
-    // While it runs, its tab answers for its container (Shell shows it instead of a new one).
+    // Its tab answers for its container (the dock shows it instead of a new one while it
+    // runs; see `dock_model::reopens`).
     let running = shell.view.read_with(cx, |v, _| v.tab_key());
-    assert!(
-        matches!(running, TabKey::Shell(ref key) if key.ended.is_none() && key.request == request())
-    );
+    assert!(matches!(running, TabKey::Shell(ref key) if *key == request()));
     shell.print(cx, b"$ exit 3\r\n");
     shell.fake.set_state(ExecState::Exited { code: Some(3) });
     shell.settle(cx);
@@ -388,12 +387,11 @@ async fn an_exited_shell_shows_its_code_and_keeps_its_screen(cx: &mut TestAppCon
         Some("exit 3")
     );
 
-    // An ended shell's tab no longer answers for its container: Shell opens a new one.
-    let key = shell.view.read_with(cx, |v, _| v.tab_key());
-    let TabKey::Shell(key) = key else {
-        panic!("a shell key")
-    };
-    assert!(key.ended.is_some());
+    // An ended shell offers to start again, in the same tab.
+    cx.update_window(shell.window, |_, window, _| {
+        assert!(window.try_find("terminal-restart").is_some());
+    })
+    .unwrap();
 
     shell
         .fake

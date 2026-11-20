@@ -32,6 +32,18 @@ impl TabStatus {
     }
 }
 
+/// Whether an open tab in `status` answers for its request, so opening the request again shows
+/// it: while its session starts, runs or retries, and once a read that ends on its own (previous
+/// logs) has ended. A tab that failed, or a stream or shell that ended, keeps its output, and
+/// opening the request again opens a fresh tab beside it.
+pub fn reopens(status: TabStatus, reads_to_end: bool) -> bool {
+    match status {
+        TabStatus::Starting | TabStatus::Live | TabStatus::Retrying => true,
+        TabStatus::Ended => reads_to_end,
+        TabStatus::Failed => false,
+    }
+}
+
 /// The cluster a tab's session runs on: the kubeconfig context and the API server it pointed at
 /// when the tab opened. Like an AI exposure (ADR-0009) and a trusted cluster (ADR-0015), a tab is
 /// pinned to both, so a context re-pointed at another server is another cluster: opening the
@@ -106,6 +118,20 @@ mod tests {
         assert!(!tab.is_at(None));
         assert_ne!(tab, TabCluster::new("prod", Some("https://10.0.0.2:6443")));
         assert!(TabCluster::new("x", None).is_at(None));
+    }
+
+    // covers UP-42: opening a request again shows its tab while the session lives; an ended
+    // or failed one opens a fresh tab (previous logs, read to their end, are shown again).
+    #[test]
+    fn only_live_tabs_answer_for_their_request() {
+        use TabStatus::*;
+        for status in [Starting, Live, Retrying] {
+            assert!(reopens(status, false), "{status:?}");
+        }
+        assert!(!reopens(Ended, false));
+        assert!(reopens(Ended, true));
+        assert!(!reopens(Failed, false));
+        assert!(!reopens(Failed, true));
     }
 
     // covers UP-42: tabs name their cluster in its short form, and long titles keep both ends.

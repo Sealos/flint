@@ -755,7 +755,10 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
         &t,
         Ok(vec![workload_pod("web-c", true, &["app", "proxy"])]),
     );
-    assert_eq!(dock_tabs(cx, &t).0, ["Shell: web-c · app", "Shell: web-c · proxy"]);
+    assert_eq!(
+        dock_tabs(cx, &t).0,
+        ["Shell: web-c · app", "Shell: web-c · proxy"]
+    );
     // One the pod lacks is refused at once.
     assert_eq!(
         dispatch(

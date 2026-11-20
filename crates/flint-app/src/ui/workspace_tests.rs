@@ -619,7 +619,10 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     ));
     t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
     cx.run_until_parked();
-    assert_eq!(dock_tabs(cx, &t), (true, vec!["Shell: web · app".to_owned()]));
+    assert_eq!(
+        dock_tabs(cx, &t),
+        (true, vec!["Shell: web · app".to_owned()])
+    );
     let first = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
     });
@@ -642,7 +645,11 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     cx.run_until_parked();
     assert_eq!(
         dock_tabs(cx, &t).1,
-        ["Shell: web · app", "Shell: web · app", "Shell: web · sidecar"]
+        [
+            "Shell: web · app",
+            "Shell: web · app",
+            "Shell: web · sidecar"
+        ]
     );
     let shell = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
@@ -683,8 +690,49 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     t.dispatch(cx, "dock::CloseTab", json!({ "tab": id }))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(dock_tabs(cx, &t).1, ["Shell: web · app", "Shell: web · app"]);
+    assert_eq!(
+        dock_tabs(cx, &t).1,
+        ["Shell: web · app", "Shell: web · app"]
+    );
     assert!(shell.upgrade().is_none(), "closing a tab ends its session");
+}
+
+// covers UP-41: Restart Shell starts a new shell in the failed tab, in its place and under its
+// id, on the server the context points at now; the old session is dropped.
+#[gpui_kit::test]
+async fn a_failed_shell_restarts_in_its_tab(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    let (id, first) = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        (
+            dock.active_id().unwrap(),
+            dock.active_terminal().unwrap().downgrade(),
+        )
+    });
+    let failed = first.upgrade().unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        failed.read(cx).tab_status() == TabStatus::Failed
+    })
+    .await;
+    assert_eq!(
+        t.dispatch(cx, "dock::ReconnectLogs", Value::Null),
+        Err(ActionError::NotAvailable("dock::ReconnectLogs".into())),
+        "a shell tab"
+    );
+    t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
+    cx.run_until_parked();
+    let (ids, now) = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        (dock.tab_ids(), dock.active_terminal().unwrap().downgrade())
+    });
+    assert_eq!(ids, [id], "the same tab");
+    assert!(first.upgrade().is_none(), "the old session is dropped");
+    assert_ne!(now.entity_id(), first.entity_id(), "a new session");
 }
 
 // covers UP-42: Cmd-J shows and hides the dock, and its height is kept in state.toml.

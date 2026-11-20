@@ -28,3 +28,37 @@ pub fn notice(
         .child(div().line_clamp(2).child(text))
         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
 }
+
+/// A [`notice`] with a control at its end (a Reconnect or Restart button).
+pub fn notice_with(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    color: Hsla,
+    control: impl IntoElement,
+) -> Stateful<Div> {
+    let text: SharedString = text.into();
+    let full = text.clone();
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .flex_none()
+        .text_xs()
+        .text_color(color)
+        .bg(color.opacity(0.08))
+        .border_b_1()
+        .border_color(color.opacity(0.3))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .line_clamp(2)
+                .child(text)
+                .id("notice-text")
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)),
+        )
+        .child(div().flex_none().child(control))
+}

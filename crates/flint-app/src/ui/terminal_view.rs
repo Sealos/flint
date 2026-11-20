@@ -29,7 +29,6 @@ use std::cell::Cell as StdCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use flint_core::terminal::{Cell, CursorShape, SelectionKind, Side, TermMode, TerminalSize};
@@ -45,11 +44,12 @@ use gpui_kit::*;
 use super::dock::{DockItem, TabKey, TabStatus, cluster_chip};
 use super::log_model::Tone;
 use super::log_view::Note;
-use super::notice::notice;
-use super::registry::{self, CopyText, PasteText, ScrollToBottom};
+use super::notice::{notice, notice_with};
+use super::registry::{self, CopyText, PasteText, RestartShell, ScrollToBottom};
 use super::terminal_keys::{self, ALT_IS_META};
 use super::terminal_model::{
-    self, CellSize, PADDING, Segment, ShellRequest, WheelLines, cell_at, row_segments, spans,
+    self, CellSize, CursorLook, PADDING, Segment, ShellRequest, WheelLines, cell_at, cursor_look,
+    row_segments, spans,
 };
 use super::terminal_palette::{CellStyle, TerminalPalette, cell_style};
 
@@ -58,9 +58,6 @@ use super::terminal_palette::{CellStyle, TerminalPalette, cell_style};
 pub const RESIZE_DELAY: Duration = Duration::from_millis(80);
 /// How long the bell flashes the screen.
 const BELL_FLASH: Duration = Duration::from_millis(150);
-
-/// Numbers shell tabs, so a tab whose command ended has a key of its own (see `tab_key`).
-static SERIAL: AtomicU64 = AtomicU64::new(1);
 
 /// Where the grid was laid out in the last frame: what turns a pointer into a cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,7 +103,6 @@ struct Press {
 
 pub struct TerminalView {
     request: ShellRequest,
-    serial: u64,
     /// Dropping the view drops the session, which ends the command.
     session: ExecSession,
     /// The snapshot drawn.
@@ -162,7 +158,6 @@ impl TerminalView {
             cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
         ];
         TerminalView {
-            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             size: session.request().size,
             snapshot: session.peek(),
             session,
@@ -537,10 +532,7 @@ impl TerminalView {
     fn render_notes(&self, theme: &Theme) -> Vec<AnyElement> {
         let mut notes = Vec::new();
         let ended = match &self.snapshot.state {
-            _ if self.ended.is_some() => self
-                .ended
-                .clone()
-                .map(|why| (theme.warning, why)),
+            _ if self.ended.is_some() => self.ended.clone().map(|why| (theme.warning, why)),
             flint_core::ExecState::Exited { code } => Some((
                 theme.muted_foreground,
                 match code {
@@ -558,8 +550,17 @@ impl TerminalView {
             _ => None,
         };
         if let Some((color, text)) = ended {
+            let restart = Button::new("terminal-restart")
+                .xsmall()
+                .label("Restart shell")
+                .tab_stop(false)
+                .tooltip(format!(
+                    "Start a new shell in this tab ({})",
+                    registry::key_hint("secondary-r")
+                ))
+                .on_click(registry::on_click(RestartShell));
             notes.push(
-                notice("terminal-ended", text, color)
+                notice_with("terminal-ended", text, color, restart)
                     .test_support()
                     .into_any_element(),
             );
@@ -590,6 +591,7 @@ impl TerminalView {
             font: font(theme.mono_font_family.clone()),
             font_size: theme.mono_font_size,
             focused: self.focus.is_focused(window),
+            live: self.is_live(),
             marked: self.marked.clone(),
             bell: self.bell.then(|| theme.foreground.opacity(0.06)),
         }
@@ -605,21 +607,9 @@ fn tone_color(tone: Tone, theme: &Theme) -> Hsla {
     }
 }
 
-/// A shell tab's key in the dock. While the command runs, opening a shell in the same container
-/// shows this tab; once it ended, the tab's serial makes the key its own, so opening one again
-/// starts a new shell beside the finished one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ShellKey {
-    pub request: ShellRequest,
-    pub ended: Option<u64>,
-}
-
 impl DockItem for TerminalView {
     fn tab_key(&self) -> TabKey {
-        TabKey::Shell(ShellKey {
-            request: self.request.clone(),
-            ended: (!self.is_live()).then_some(self.serial),
-        })
+        TabKey::Shell(self.request.clone())
     }
 
     fn tab_title(&self) -> SharedString {
@@ -737,6 +727,8 @@ struct GridFrame {
     font: Font,
     font_size: Pixels,
     focused: bool,
+    /// The command still runs: an ended session draws no cursor.
+    live: bool,
     marked: Option<String>,
     /// The bell's flash over the screen, while it shows.
     bell: Option<Hsla>,
@@ -868,7 +860,8 @@ fn paint_segment(
 }
 
 /// The cursor: a block (with its character in the cursor's text color), a beam or an
-/// underline; hollow while the tab does not have focus.
+/// underline; hollow while the tab does not have focus, and gone once the session ended
+/// ([`cursor_look`]).
 fn paint_cursor(
     frame: &GridFrame,
     grid: &GridLayout,
@@ -919,9 +912,11 @@ fn paint_cursor(
         );
         return;
     }
-    let solid = frame.focused;
-    match shape {
-        CursorShape::Block if solid => {
+    let Some(look) = cursor_look(shape, frame.focused, frame.live) else {
+        return;
+    };
+    match look {
+        CursorLook::Block => {
             window.paint_quad(fill(bounds, color));
             if cell.c != ' ' && !cell_style(cell, &frame.palette).hidden {
                 let mut text = String::from(cell.c);
@@ -948,19 +943,18 @@ fn paint_cursor(
                 );
             }
         }
-        CursorShape::Block | CursorShape::HollowBlock => {
+        CursorLook::Hollow => {
             window.paint_quad(outline(bounds, color, BorderStyle::Solid));
         }
-        CursorShape::Beam => {
+        CursorLook::Beam { faded } => {
             bounds.size.width = px(2.);
-            window.paint_quad(fill(bounds, color.opacity(if solid { 1. } else { 0.5 })));
+            window.paint_quad(fill(bounds, color.opacity(if faded { 0.5 } else { 1. })));
         }
-        CursorShape::Underline => {
+        CursorLook::Underline { faded } => {
             bounds.origin.y += bounds.size.height - px(2.);
             bounds.size.height = px(2.);
-            window.paint_quad(fill(bounds, color.opacity(if solid { 1. } else { 0.5 })));
+            window.paint_quad(fill(bounds, color.opacity(if faded { 0.5 } else { 1. })));
         }
-        CursorShape::Hidden => {}
     }
 }
 

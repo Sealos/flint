@@ -3,7 +3,7 @@
 //! splits into runs of text to shape, and the state's wording. No GPUI types, so all of it is
 //! testable without a window; the view (`terminal_view.rs`) draws with them.
 
-use flint_core::terminal::{Cell, CellFlags, SelectionKind, Side, TerminalSize};
+use flint_core::terminal::{Cell, CellFlags, CursorShape, SelectionKind, Side, TerminalSize};
 use flint_core::{ClusterId, ExecRequest, ExecState};
 
 use super::log_model::Tone;
@@ -137,6 +137,37 @@ impl WheelLines {
 
     pub fn reset(&mut self) {
         self.remainder = 0.;
+    }
+}
+
+/// How the cursor is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorLook {
+    /// A filled block, its character in the cursor's text color.
+    Block,
+    /// A block's outline.
+    Hollow,
+    Beam {
+        faded: bool,
+    },
+    Underline {
+        faded: bool,
+    },
+}
+
+/// The cursor for the program's `shape`: solid while the tab has focus, a hollow block or a
+/// faded beam or underline without it, and none once the session ended (nothing more can be
+/// typed, so a cursor would only suggest otherwise).
+pub fn cursor_look(shape: CursorShape, focused: bool, live: bool) -> Option<CursorLook> {
+    if !live {
+        return None;
+    }
+    match shape {
+        CursorShape::Block if focused => Some(CursorLook::Block),
+        CursorShape::Block | CursorShape::HollowBlock => Some(CursorLook::Hollow),
+        CursorShape::Beam => Some(CursorLook::Beam { faded: !focused }),
+        CursorShape::Underline => Some(CursorLook::Underline { faded: !focused }),
+        CursorShape::Hidden => None,
     }
 }
 
@@ -318,6 +349,21 @@ mod tests {
         // Off the grid: clamped to the nearest edge cell.
         assert_eq!(cell_at(-5., -5., CELL, size), (0, 0, Side::Left));
         assert_eq!(cell_at(500., 500., CELL, size), (4, 9, Side::Right));
+    }
+
+    #[test]
+    fn the_cursor_follows_focus_and_goes_once_the_session_ends() {
+        use CursorShape::*;
+        assert_eq!(cursor_look(Block, true, true), Some(CursorLook::Block));
+        assert_eq!(cursor_look(Block, false, true), Some(CursorLook::Hollow));
+        assert_eq!(
+            cursor_look(Beam, false, true),
+            Some(CursorLook::Beam { faded: true })
+        );
+        assert_eq!(cursor_look(Hidden, true, true), None);
+        for shape in [Block, HollowBlock, Beam, Underline] {
+            assert_eq!(cursor_look(shape, true, false), None, "{shape:?}");
+        }
     }
 
     #[test]

@@ -42,10 +42,10 @@ use gpui_kit::*;
 
 use super::dock::{DockItem, TabKey, TabStatus};
 use super::log_model::{self, ListChange, Tone};
-use super::notice::notice;
+use super::notice::{notice, notice_with};
 use super::registry::{
-    self, DragSelection, JumpToEnd, NextMatch, PrevMatch, SaveLines, SaveScope, SelectLine,
-    TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
+    self, DragSelection, JumpToEnd, NextMatch, PrevMatch, ReconnectLogs, SaveLines, SaveScope,
+    SelectLine, TogglePause, ToggleSources, ToggleTimestamps, ToggleWrap,
 };
 use super::theme;
 
@@ -860,20 +860,20 @@ impl LogView {
                     .into_any_element(),
             );
         }
-        // A failure only: a deleted pod's end shows in the status ("Ended · pod deleted").
-        if let LogState::Ended {
-            error: Some(error), ..
-        } = &self.snapshot.state
+        // A failure, or a followed stream that stopped on its own; a deleted pod's end shows in
+        // the status ("Ended · pod deleted").
+        if let LogState::Ended { error, pod_deleted } = &self.snapshot.state
             && !self.snapshot.lines.is_empty()
+            && (error.is_some() || !(self.request.previous || *pod_deleted))
         {
+            let (text, color) = match error {
+                Some(error) => (format!("The stream ended: {error}"), theme.danger),
+                None => ("The stream ended.".to_owned(), theme.muted_foreground),
+            };
             notes.push(
-                notice(
-                    "log-ended",
-                    format!("The stream ended: {error}"),
-                    theme.danger,
-                )
-                .test_support()
-                .into_any_element(),
+                notice_with("log-ended", text, color, reconnect_button())
+                    .test_support()
+                    .into_any_element(),
             );
         }
         if let Some(note) = &self.note {
@@ -952,9 +952,33 @@ impl LogView {
                         .child(detail),
                 )
             })
+            // Not for a deleted pod: there is nothing to reconnect to.
+            .when(
+                matches!(
+                    self.snapshot.state,
+                    LogState::Ended {
+                        pod_deleted: false,
+                        ..
+                    }
+                ),
+                |el| el.child(reconnect_button()),
+            )
             .test_support()
             .into_any_element()
     }
+}
+
+/// Reconnect Logs, in an ended or failed tab's banner.
+fn reconnect_button() -> Button {
+    Button::new("log-reconnect")
+        .xsmall()
+        .label("Reconnect")
+        .tab_stop(false)
+        .tooltip(format!(
+            "Open the logs again in this tab ({})",
+            registry::key_hint("secondary-r")
+        ))
+        .on_click(registry::on_click(ReconnectLogs))
 }
 
 impl DockItem for LogView {

@@ -43,7 +43,7 @@ use super::registry::{
 use super::row_menu;
 use super::startup::StartupView;
 use super::terminal_model::ShellRequest;
-use super::terminal_view::{ShellKey, TerminalView};
+use super::terminal_view::TerminalView;
 use super::theme;
 use super::ui_state::{self, UiState};
 use flint_core::display;
@@ -283,6 +283,7 @@ impl Workspace {
         let dock = cx.new(Dock::new);
         let on_dock = cx.subscribe_in(&dock, window, |this, _, event, window, cx| match event {
             DockEvent::Blurred => this.reclaim_focus(window, cx),
+            DockEvent::Restart(id) => this.restart_tab(*id, window, cx),
         });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -490,6 +491,43 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Starts tab `id`'s ended session again in the same tab (Reconnect Logs, Restart Shell):
+    /// on the server its context points at now, refused, saying why, while the cluster is not
+    /// connected.
+    fn restart_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
+            return;
+        };
+        let what = match &key {
+            TabKey::Logs(_) => "Logs",
+            TabKey::Shell(_) => "Shell",
+        };
+        if let Some(reason) = self.sessions_blocked(key.context(), cx) {
+            self.refuse(format!("{what}: {reason}"), cx);
+            return;
+        }
+        self.clear_action_error(cx);
+        let cluster = self.tab_cluster(key.context(), cx);
+        let core = self.model.read(cx).core().clone();
+        self.dock.update(cx, |dock, cx| {
+            dock.replace(
+                id,
+                cluster,
+                move |window, cx| match key {
+                    TabKey::Logs(request) => {
+                        DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx)))
+                    }
+                    TabKey::Shell(request) => {
+                        let session = core.exec(request.exec_request(Default::default()));
+                        DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+    }
+
     /// Says why Logs or Shell did not open, over the dock, for [`ACTION_ERROR_SHOWN`].
     pub(in crate::ui) fn refuse(&mut self, why: String, cx: &mut Context<Self>) {
         tracing::warn!("{why}");
@@ -532,12 +570,8 @@ impl Workspace {
         }
         let core = self.model.read(cx).core().clone();
         let cluster = self.tab_cluster(&request.cluster, cx);
-        let key = TabKey::Shell(ShellKey {
-            request: request.clone(),
-            ended: None,
-        });
         self.open_tab(
-            key,
+            TabKey::Shell(request.clone()),
             cluster,
             |window, cx| {
                 let session = core.exec(request.exec_request(Default::default()));
