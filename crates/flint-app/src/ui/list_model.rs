@@ -125,6 +125,17 @@ const SAMPLE_ROWS: usize = 2_000;
 /// `compute_view`.
 pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<usize> {
     let step = (rows.len() / SAMPLE_ROWS).max(1);
+    // Sampled in snapshot order, not display order: a sort must not change which rows are
+    // measured, or it could widen a column, push it out of a narrow pane and so suspend itself.
+    let stable;
+    let rows = if step > 1 {
+        let mut sorted = rows.to_vec();
+        sorted.sort_unstable();
+        stable = sorted;
+        &stable[..]
+    } else {
+        rows
+    };
     snapshot
         .columns
         .iter()
@@ -634,6 +645,37 @@ mod tests {
             labels: Box::new([]),
             cells: Box::new([Cell::Name, Cell::Namespace, Cell::Text(ready.into())]),
         })
+    }
+
+    // covers UP-20, UP-21
+    #[test]
+    fn sampled_widths_do_not_depend_on_the_display_order() {
+        let columns: Arc<[Column]> = pod_columns()[..3].to_vec().into();
+        // Three times the rows sampled, so every third is measured; the long Ready cells are on
+        // the rows in between.
+        let rows: Vec<Arc<Row>> = (0..(SAMPLE_ROWS * 3))
+            .map(|i| {
+                let ready = if i % 3 == 1 {
+                    "x".repeat(40)
+                } else {
+                    "1/1".into()
+                };
+                row(&format!("pod-{i:05}"), &ready)
+            })
+            .collect();
+        let snapshot = KindSnapshot {
+            columns,
+            rows,
+            ..Default::default()
+        };
+        let in_order: Vec<u32> = (0..snapshot.rows.len() as u32).collect();
+        // A sort that brings the long cells to where the sample falls.
+        let mut sorted = in_order.clone();
+        sorted.sort_by_key(|&i| (i % 3 != 1, i));
+        assert_eq!(
+            measure_columns(&snapshot, &sorted, 10),
+            measure_columns(&snapshot, &in_order, 10)
+        );
     }
 
     // covers UP-20, UP-21
