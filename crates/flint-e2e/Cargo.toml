@@ -30,6 +30,7 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
 base64.workspace = true
+tokio-tungstenite.workspace = true
 anyhow.workspace = true
 # Scratch config directories for the app and the MCP server.
 tempfile.workspace = true

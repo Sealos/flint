@@ -14,6 +14,14 @@
 //! [`FakeApiServer::crash_container`], [`FakeApiServer::delete_pod`],
 //! [`FakeApiServer::replace_pod`]) with the watch events a cluster sends.
 //!
+//! Exec (`exec`) upgrades to the WebSocket kube speaks and runs a scripted shell (`shell`): a
+//! bash or busybox prompt that echoes, runs `echo`, `exit N`, `stty size`, `seq` and `yes`, and
+//! reports exit codes and missing commands as a real cluster does. Tests read what the client
+//! sent ([`FakeExec::stdin`], [`FakeExec::resizes`]), print, end or break sessions
+//! ([`FakeApiServer::last_exec`], [`FakeApiServer::wait_for_exec_sessions`]), say which
+//! containers lack bash ([`FakeApiServer::set_exec_image`]), and refuse upgrades
+//! ([`Fault::refuse_upgrade`]).
+//!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {
 //! use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
@@ -35,6 +43,7 @@
 //! ```
 
 pub mod clock;
+mod exec;
 mod faults;
 pub mod fixtures;
 pub mod kubeconfig;
@@ -45,10 +54,12 @@ mod route;
 mod row;
 mod selector;
 mod server;
+mod shell;
 mod state;
 mod tls;
 mod watch;
 
+pub use exec::{ExecEnd, ExecImage, ExecRuntime, FakeExec, TtySize, V4, V5};
 pub use faults::{Effect, Fault};
 pub use fixtures::{Fixtures, Gvr};
 pub use kubeconfig::CONTEXT;

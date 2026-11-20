@@ -16,6 +16,10 @@ pub enum Effect {
     Delay(Duration),
     /// The connection is closed without a response.
     DropConnection,
+    /// A WebSocket upgrade (an exec) is answered with a plain 200 instead of a 101, as a proxy
+    /// that does not pass upgrades on answers it. Other requests pass the fault by, and do not
+    /// count against [`Fault::times`].
+    RefuseUpgrade,
 }
 
 /// A fault: an effect, which requests it applies to, and how often.
@@ -62,6 +66,11 @@ impl Fault {
         Fault::new(Effect::DropConnection)
     }
 
+    /// Answers WebSocket upgrades with a plain 200 ([`Effect::RefuseUpgrade`]).
+    pub fn refuse_upgrade() -> Self {
+        Fault::new(Effect::RefuseUpgrade)
+    }
+
     /// Only requests about this resource.
     pub fn on(mut self, gvr: &Gvr) -> Self {
         self.resource = Some(gvr.clone());
@@ -92,7 +101,7 @@ impl Fault {
         self
     }
 
-    /// Only requests for this subresource (`log`), such as one pod's log with
+    /// Only requests for this subresource (`log`, `exec`), such as one pod's log with
     /// [`Fault::named`]. Without it, a fault on a resource also matches its subresources.
     pub fn subresource(mut self, subresource: &str) -> Self {
         self.subresource = Some(subresource.to_owned());
@@ -145,9 +154,13 @@ impl Faults {
         self.0.clear();
     }
 
-    /// The effect for a request, counting it against the fault's limit.
-    pub fn take(&mut self, verb: Verb, route: &Route) -> Option<Effect> {
-        let fault = self.0.iter_mut().find(|f| f.matches(verb, route))?;
+    /// The effect for a request, counting it against the fault's limit. A refused upgrade only
+    /// matches (and counts) a WebSocket `upgrade` request.
+    pub fn take(&mut self, verb: Verb, route: &Route, upgrade: bool) -> Option<Effect> {
+        let fault = self
+            .0
+            .iter_mut()
+            .find(|f| f.matches(verb, route) && (upgrade || f.effect != Effect::RefuseUpgrade))?;
         if let Some(n) = &mut fault.remaining {
             *n -= 1;
         }
@@ -223,6 +236,9 @@ mod tests {
             &Route::parse("/api/v1/namespaces/demo/pods/web-2/log")
         ));
         assert!(Fault::status(500).on(&pods).matches(Verb::Get, &log));
+        let exec = Route::parse("/api/v1/namespaces/demo/pods/web-1/exec");
+        let refuse = Fault::refuse_upgrade().on(&pods).subresource("exec");
+        assert!(refuse.matches(Verb::Get, &exec) && !refuse.matches(Verb::Get, &log));
         assert_eq!(
             Fault::delay(Duration::from_secs(1)).effect(),
             &Effect::Delay(Duration::from_secs(1))
@@ -236,12 +252,23 @@ mod tests {
         faults.add(Fault::drop_connection().times(1));
         faults.add(Fault::forbidden());
         assert_eq!(
-            faults.take(Verb::List, &route),
+            faults.take(Verb::List, &route, false),
             Some(Effect::DropConnection)
         );
-        assert_eq!(faults.take(Verb::List, &route), Some(Effect::Forbidden));
+        assert_eq!(
+            faults.take(Verb::List, &route, false),
+            Some(Effect::Forbidden)
+        );
         faults.clear();
-        assert_eq!(faults.take(Verb::List, &route), None);
+        assert_eq!(faults.take(Verb::List, &route, false), None);
+        // A refused upgrade waits for an upgrade, other requests pass it by.
+        faults.add(Fault::refuse_upgrade().times(1));
+        assert_eq!(faults.take(Verb::List, &route, false), None);
+        assert_eq!(
+            faults.take(Verb::Get, &route, true),
+            Some(Effect::RefuseUpgrade)
+        );
+        assert_eq!(faults.take(Verb::Get, &route, true), None);
     }
 
     #[test]
@@ -259,6 +286,16 @@ mod tests {
         assert_eq!(
             msg,
             "pods \"web-1\" is forbidden: User \"flint-e2e\" cannot get resource \"pods/log\" \
+             in API group \"\" in the namespace \"demo\""
+        );
+        // Recorded on kind: a WebSocket exec is authorized as `get` on `pods/exec`.
+        let msg = forbidden_message(
+            Verb::Get,
+            &Route::parse("/api/v1/namespaces/demo/pods/shell/exec"),
+        );
+        assert_eq!(
+            msg,
+            "pods \"shell\" is forbidden: User \"flint-e2e\" cannot get resource \"pods/exec\" \
              in API group \"\" in the namespace \"demo\""
         );
         let msg = forbidden_message(Verb::Watch, &Route::parse("/api/v1/namespaces/demo/pods"));

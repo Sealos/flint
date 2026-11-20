@@ -56,6 +56,8 @@ bytes = "1.12.2"
 tokio-rustls = { version = "0.26.6", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 base64 = "0.22.1"
+# The server side of the fake exec WebSocket: the same tokio-tungstenite kube's client uses.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 # Generates the fake server's throwaway CA and certificate at test time (github.com/rustls/rcgen).
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 
