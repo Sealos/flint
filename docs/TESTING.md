@@ -409,7 +409,9 @@ namespaces left by other tests are not.
 - **Driving logs:** a `ContainerLog::new(ns, pod)` (`.container(c)`, `.previous()`) names a log. `append_log`
   writes lines stamped now, each strictly after the last line written now, and pushes them to open streams;
   `append_log_at` stamps them at a given time (to script lines sharing a second for resume tests) and leaves "now"
-  alone. `set_log` / `set_container_log` replace a log. `end_log_streams` ends open streams cleanly (EOF, the pod
+  alone. `set_log` / `set_container_log` replace a log; `set_log_notice` replaces one with the kubelet's
+  `unable to retrieve container logs for …` line: its whole answer, without a timestamp, whatever the options, and
+  the response ends. `end_log_streams` ends open streams cleanly (EOF, the pod
   stays, so Flint reconnects from its last timestamp); `drop_log_streams` breaks them. `limitBytes` cuts at exactly
   that many bytes (even inside a character) and ends the stream. `open_log_streams()` counts open followed streams (a
   stream closes when its client goes away) and `wait_for_log_streams(n, within)` waits until exactly `n` are open,
@@ -424,7 +426,8 @@ namespaces left by other tests are not.
     keeps its uid (`MODIFIED`).
   - `crash_container` stops a container (exit 1): its streams end and, until `start_container` starts the next
     instance, a log request reads the stopped one, as the kubelet serves it. `start_container` then keeps that log
-    as the previous one, with one more restart. `restart_container` does both at once.
+    as the previous one, with one more restart. `restart_container` does both at once. `back_off_container` puts a stopped container in
+    CrashLoopBackOff, as the kubelet does: a log request reads the stopped instance again until it starts.
   - `delete_pod` deletes gracefully: `MODIFIED` with a `deletionTimestamp` (Terminating), then the containers stop
     (exit 0, a terminal phase), their streams end and the pod and its logs stay readable until `finish_delete`
     sends `DELETED`. `force_delete_pod` skips Terminating. `replace_pod` deletes and finishes the old pod, then adds
@@ -551,10 +554,9 @@ runner images, so pixel diffs would be flaky.
 ## E2E coverage plan
 
 Which tests cover each user path today, and what is missing, is in [`E2E-COVERAGE.md`](./E2E-COVERAGE.md). In
-short: with #100, M0 and M1 have app e2e tests for every automatable path. M2 is tested only below the app. Core tests
-read real streams on kind, and view tests feed the log buffer or a `FakeExec` directly. So no test has the real app
-reading a real log or exec stream, apart from `up_40_read_pod_logs`'s smoke (a row's menu, a streamed line, the
-stream closed with its tab). The automation `state` reports the dock since #119. The fake API server answers exec
+short: with #100, M0 and M1 have app e2e tests for every automatable path. In M2 the app reads real log streams from
+the fake server in `tests/app/m2.rs` (UP-40, UP-43, UP-45: #122, #125). Shells are tested only below the app: core
+tests run real exec on kind, and view tests feed a `FakeExec`, so no test has the real app reading a real exec stream. The automation `state` reports the dock since #119. The fake API server answers exec
 with 404 and writes with 405. (Its logs stream since #120.)
 
 The Mac mini session owns the harness and macOS CI (#40, #100, #42, #117). Harness and fake-server work is in

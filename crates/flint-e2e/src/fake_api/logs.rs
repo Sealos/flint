@@ -335,6 +335,9 @@ struct Entry {
     at: Timestamp,
     /// Without its newline.
     text: String,
+    /// A notice the kubelet writes in place of the log ([`Logs::set_notice`]): sent as is,
+    /// without a timestamp, whatever the request's options.
+    notice: bool,
 }
 
 /// A container's instances. `None`: never written, so a few canned lines stand in.
@@ -391,13 +394,13 @@ fn render(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     for entry in entries {
-        if since.is_some_and(|since| entry.at < since) {
+        if !entry.notice && since.is_some_and(|since| entry.at < since) {
             continue;
         }
         if *remaining == Some(0) {
             break;
         }
-        let mut line = if timestamps {
+        let mut line = if timestamps && !entry.notice {
             format!("{} {}\n", format_timestamp(entry.at), entry.text)
         } else {
             format!("{}\n", entry.text)
@@ -446,6 +449,7 @@ impl Logs {
                     .checked_sub(Duration::from_secs(4 - n))
                     .unwrap_or(Timestamp::UNIX_EPOCH),
                 text: format!("fake {what} line {n} of {namespace}/{pod}"),
+                notice: false,
             })
             .collect()
     }
@@ -481,6 +485,7 @@ impl Logs {
             .map(|line| Entry {
                 at: self.stamp(at),
                 text: line.to_owned(),
+                notice: false,
             })
             .collect()
     }
@@ -496,6 +501,12 @@ impl Logs {
         let now = self.clock.now_precise();
         let since = query.since(now);
         let entries = self.entries(key, instance.previous);
+        // The kubelet's notice is its whole answer: no options apply, and nothing follows.
+        if let Some(notice) = entries.iter().find(|e| e.notice) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let _ = tx.send(Ok(Bytes::from(format!("{}\n", notice.text))));
+            return rx;
+        }
         let from = match query.tail_lines {
             Some(n) => entries
                 .len()
@@ -524,6 +535,19 @@ impl Logs {
     pub fn set(&mut self, key: &Key, previous: bool, text: &str) {
         let lines = self.lines(text, None);
         *self.entries(key, previous) = lines;
+    }
+
+    /// Replaces an instance's log with one line the kubelet writes instead of it when it cannot
+    /// read the log (`unable to retrieve container logs for containerd://…`): sent as is, with
+    /// no timestamp, whatever the "since" time, `tailLines` and `limitBytes`, and the response
+    /// ends after it, also when following.
+    pub fn set_notice(&mut self, key: &Key, previous: bool, notice: &str) {
+        let at = self.stamp(None);
+        *self.entries(key, previous) = vec![Entry {
+            at,
+            text: notice.to_owned(),
+            notice: true,
+        }];
     }
 
     /// Appends lines to the current instance (at `at`, or now) and sends them to its open
@@ -858,6 +882,38 @@ mod tests {
         assert_eq!(read(&mut logs, "limitBytes=5"), "a\nb\nc");
         let stamped = read(&mut logs, "timestamps=true&tailLines=1");
         assert_eq!(stamped, "1970-01-01T00:01:42.000000000Z e\n");
+    }
+
+    #[test]
+    fn a_kubelet_notice_is_sent_without_a_timestamp() {
+        let mut logs = logs();
+        let k = key("app");
+        let notice = "unable to retrieve container logs for containerd://0123";
+        logs.set_notice(&k, true, notice);
+        let previous = Instance {
+            previous: true,
+            running: false,
+        };
+        let since = "timestamps=true&sinceTime=2099-01-01T00:00:00Z";
+        let (text, end) = drain(&mut logs.open(&k, previous, &query(since)));
+        assert_eq!(text, format!("{notice}\n"));
+        assert_eq!(end, Some(true));
+        // The current instance is untouched.
+        let (text, _) = drain(&mut logs.open(&k, running(), &query("")));
+        assert!(text.starts_with("fake log line 1"), "{text}");
+
+        // On the current instance it ends a followed response too, and neither `tailLines` nor
+        // `limitBytes` cut it.
+        logs.set_notice(&k, false, notice);
+        for options in ["follow=true", "follow=true&tailLines=0", "limitBytes=5"] {
+            let (text, end) = drain(&mut logs.open(&k, running(), &query(options)));
+            assert_eq!(
+                (text.as_str(), end),
+                (format!("{notice}\n").as_str(), Some(true)),
+                "{options}"
+            );
+        }
+        assert_eq!(logs.open_streams(None), 0, "nothing follows a notice");
     }
 
     #[test]

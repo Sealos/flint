@@ -44,6 +44,16 @@ impl FakeApiServer {
         lock(&self.inner.logs).set(&key, log.previous, text);
     }
 
+    /// Replaces a container's log (its current or previous instance) with the one line the
+    /// kubelet answers when it cannot read it, such as `unable to retrieve container logs for
+    /// containerd://…` (the container was removed): sent as is, without a timestamp, even when
+    /// the request asks for timestamps. Open streams are not told.
+    pub fn set_log_notice(&self, log: &ContainerLog, notice: &str) {
+        let state = lock(&self.inner.state);
+        let key = FakeApiServer::log_key(&state, log);
+        lock(&self.inner.logs).set_notice(&key, log.previous, notice);
+    }
+
     /// Appends the lines of `text` to a container's current log, stamped now (in order, never
     /// two alike), and sends them to its open followed streams. Returns how many streams got
     /// them. Panics for a previous instance: it is not written to any more.
@@ -186,6 +196,21 @@ impl FakeApiServer {
         object.stop(container, 1, &self.inner.clock.fixture_now());
         let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
         lock(&self.inner.logs).end(&key);
+        self.apply_pod(&mut state, "MODIFIED", object)
+    }
+
+    /// A container [`FakeApiServer::crash_container`] stopped goes into CrashLoopBackOff, as
+    /// the kubelet puts it: `waiting` with that reason, the stopped instance in
+    /// `lastState.terminated`. Until [`FakeApiServer::start_container`] starts the next
+    /// instance, a log request reads the stopped one again, with or without `previous`, and
+    /// ends. Pod watches get `MODIFIED`. Returns how many were open. Panics unless the container
+    /// stopped.
+    pub fn back_off_container(&self, namespace: &str, pod: &str, container: &str) -> usize {
+        let mut state = lock(&self.inner.state);
+        let mut object = self.held_pod(&state, namespace, pod);
+        object.back_off(container);
+        let key = (namespace.to_owned(), pod.to_owned(), container.to_owned());
+        lock(&self.inner.logs).rotate(&key);
         self.apply_pod(&mut state, "MODIFIED", object)
     }
 
