@@ -1185,27 +1185,7 @@ impl ClusterManager {
             .collect();
         let settings_path = self.config.config_dir.join(settings::SETTINGS_FILE);
         let settings_files: HashSet<PathBuf> = watch_names(&settings_path).into_iter().collect();
-        let dirs: HashSet<PathBuf> = kube_files
-            .iter()
-            .chain(&settings_files)
-            .filter_map(|f| f.parent().map(Path::to_path_buf))
-            .collect();
-
-        // A directory that does not exist yet cannot be watched: watch its nearest existing
-        // ancestor instead, and rebuild the watcher once a directory on the way is created.
-        let mut watch_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut pending: HashSet<PathBuf> = HashSet::new();
-        for dir in &dirs {
-            match missing_dirs(dir) {
-                Some((ancestor, missing)) => {
-                    watch_dirs.insert(ancestor);
-                    pending.extend(missing);
-                }
-                None => {
-                    watch_dirs.insert(dir.clone());
-                }
-            }
-        }
+        let (watch_dirs, pending) = watch_plan(kube_files.iter().chain(&settings_files));
 
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Changed>();
         let (kube_watched, settings_watched) = (kube_files.clone(), settings_files.clone());
@@ -1215,12 +1195,7 @@ impl ClusterManager {
                 if matches!(event.kind, EventKind::Access(_)) {
                     return;
                 }
-                let rearm = event.paths.iter().any(|p| pending.contains(p));
-                let changed = Changed {
-                    kubeconfig: rearm || event.paths.iter().any(|p| kube_watched.contains(p)),
-                    settings: event.paths.iter().any(|p| settings_watched.contains(p)),
-                    rearm,
-                };
+                let changed = classify(&event.paths, &pending, &kube_watched, &settings_watched);
                 if changed.kubeconfig || changed.settings {
                     let _ = raw_tx.send(changed);
                 }
@@ -1243,12 +1218,58 @@ impl ClusterManager {
         let settings_dir_watched = settings_files
             .iter()
             .filter_map(|f| f.parent())
-            .any(|d| watched_dirs.contains(d));
+            .any(|d| watched_dirs.contains(&resolved(d)));
         tokio::spawn(debounce(raw_rx, self.internal_tx.clone()));
         Some(FileWatcher {
             _watcher: watcher,
             settings_dir_watched,
         })
+    }
+}
+
+/// `dir` resolved (symlinks, `..`), or as given if it cannot be.
+fn resolved(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// The directories to watch so `files` are noticed, each once by its resolved name (inotify
+/// merges a directory's aliases into one watch, and removing one alias's watch would remove
+/// the other's), and the missing directories whose creation means the watcher is rebuilt. A
+/// directory that does not exist yet cannot be watched: its nearest existing ancestor is.
+fn watch_plan<'a>(
+    files: impl Iterator<Item = &'a PathBuf>,
+) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    let dirs: HashSet<&Path> = files.filter_map(|f| f.parent()).collect();
+    let mut watch_dirs = HashSet::new();
+    let mut pending = HashSet::new();
+    for dir in dirs {
+        match missing_dirs(dir) {
+            Some((ancestor, missing)) => {
+                watch_dirs.insert(resolved(&ancestor));
+                pending.extend(missing);
+            }
+            None => {
+                watch_dirs.insert(resolved(dir));
+            }
+        }
+    }
+    (watch_dirs, pending)
+}
+
+/// What an event on `paths` changed. A missing directory that appeared (`pending`) may
+/// already hold kubeconfig files or `settings.toml` (a symlink's target directory restored
+/// with the file in it), so both are read again, besides rebuilding the watcher.
+fn classify(
+    paths: &[PathBuf],
+    pending: &HashSet<PathBuf>,
+    kube: &HashSet<PathBuf>,
+    settings: &HashSet<PathBuf>,
+) -> Changed {
+    let rearm = paths.iter().any(|p| pending.contains(p));
+    Changed {
+        kubeconfig: rearm || paths.iter().any(|p| kube.contains(p)),
+        settings: rearm || paths.iter().any(|p| settings.contains(p)),
+        rearm,
     }
 }
 
@@ -1887,6 +1908,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    // covers UP-06: a directory named with `..` and by its resolved name is watched once, by
+    // the resolved name, so on Linux one inotify watch serves both and none is lost.
+    #[test]
+    fn watched_directories_are_resolved_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(real.join("kube")).unwrap();
+        std::fs::create_dir(real.join("other")).unwrap();
+        let files = [
+            real.join("kube/config"),
+            real.join("other/../kube/extra"),
+            dir.path().join("kube/third"),
+            // Missing: watched at its nearest ancestor, resolved too.
+            real.join("other/../gone/deeper/config"),
+        ];
+        let (watch, pending) = watch_plan(files.iter());
+        assert_eq!(
+            watch,
+            HashSet::from([real.join("kube"), real.clone()]),
+            "{watch:?}"
+        );
+        assert!(pending.contains(&real.join("other/../gone")), "{pending:?}");
+    }
+
+    // covers UP-12: a missing directory that appears (a symlink's target directory restored
+    // with settings.toml in it) reloads the settings too, not only kubeconfig.
+    #[test]
+    fn a_directory_that_appears_reloads_settings_and_kubeconfig() {
+        let pending = HashSet::from([PathBuf::from("/cfg/dotfiles")]);
+        let kube = HashSet::from([PathBuf::from("/k/config")]);
+        let settings = HashSet::from([PathBuf::from("/cfg/dotfiles/flint.toml")]);
+        let changed = classify(
+            &[PathBuf::from("/cfg/dotfiles")],
+            &pending,
+            &kube,
+            &settings,
+        );
+        assert!(changed.rearm && changed.settings && changed.kubeconfig);
+        let changed = classify(&[PathBuf::from("/k/config")], &pending, &kube, &settings);
+        assert!(!changed.rearm && !changed.settings && changed.kubeconfig);
+        let changed = classify(
+            &[PathBuf::from("/cfg/dotfiles/flint.toml")],
+            &pending,
+            &kube,
+            &settings,
+        );
+        assert!(!changed.rearm && changed.settings && !changed.kubeconfig);
     }
 
     // covers UP-12: settings.toml as a symlink to a file that is gone is watched at its
