@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.3.0](https://github.com/Sealos/flint/compare/v0.2.1...v0.3.0) (2026-11-20)
+
+
+### Features
+
+* **app:** resource switcher, pane keys and go back ([#244](https://github.com/Sealos/flint/issues/244)) ([dec65e1](https://github.com/Sealos/flint/commit/dec65e16bdd53487b543254427acfb52b7715c90))
+* **logs:** show only matching lines, an errors-only view and context lines ([#291](https://github.com/Sealos/flint/issues/291)) ([fd7b8a6](https://github.com/Sealos/flint/commit/fd7b8a686c3052881347a813b599e717ffb1cc1e))
+* **mcp:** a GPUI-free `flint-mcp` for Linux (x86_64 and aarch64), attached to each release ([#306](https://github.com/Sealos/flint/issues/306)) ([1593367](https://github.com/Sealos/flint/commit/1593367)), closes [#275](https://github.com/Sealos/flint/issues/275)
+* **mcp:** limit an exposed cluster to chosen namespaces and kinds ([#241](https://github.com/Sealos/flint/issues/241)) ([7bc7c7f](https://github.com/Sealos/flint/commit/7bc7c7f2fa8804a4996998248d0281cf6acb8042))
+* **mcp:** record every agent call and show it per cluster ([#286](https://github.com/Sealos/flint/issues/286)) ([b4e4d7d](https://github.com/Sealos/flint/commit/b4e4d7de754e21086e8c618fb5180c2ab2306ea6)), closes [#69](https://github.com/Sealos/flint/issues/69)
+* write a rotated log file, and ask for it in the bug template ([#312](https://github.com/Sealos/flint/issues/312)) ([d476ae8](https://github.com/Sealos/flint/commit/d476ae81636e41ff2f602fad555c7bd3ca5adcf7))
+
+
+### Bug Fixes
+
+* **app:** esc leaves the list filter, and go back skips the current place ([#317](https://github.com/Sealos/flint/issues/317)) ([c9c4949](https://github.com/Sealos/flint/commit/c9c49498efbe3bba187e33dcc363692cdf2c7bfa))
+* **core:** ask for no events once a detail read's deadline is spent ([#284](https://github.com/Sealos/flint/issues/284)) ([cdcb39a](https://github.com/Sealos/flint/commit/cdcb39a73cbbbb5f9a3918b4f1f6f9761fec6a61))
+* **core:** cancel the detail fetch when its pane closes ([#281](https://github.com/Sealos/flint/issues/281)) ([669be33](https://github.com/Sealos/flint/commit/669be335e0dc04754455449487b905fdfdf5e10a)), closes [#258](https://github.com/Sealos/flint/issues/258)
+* **core:** context pin follow-ups for exec and log sessions ([#303](https://github.com/Sealos/flint/issues/303)) ([fba19ad](https://github.com/Sealos/flint/commit/fba19ad0f54148b21e85e858d18a4f16fcc2b08b))
+* **core:** end an exec session when its context is re-pointed to another server ([#290](https://github.com/Sealos/flint/issues/290)) ([57dcb41](https://github.com/Sealos/flint/commit/57dcb41ca1675a0c22db6ac15968daa5ef2c8505)), closes [#260](https://github.com/Sealos/flint/issues/260)
+* **core:** exec plugin terminal edge cases after [#283](https://github.com/Sealos/flint/issues/283) ([#293](https://github.com/Sealos/flint/issues/293)) ([d7528a3](https://github.com/Sealos/flint/commit/d7528a37272bfdde234d0240fbdc5b636502a94c)), closes [#288](https://github.com/Sealos/flint/issues/288)
+* **core:** keep exec plugin queue order, skip the login cooldown when the plugin never started ([#318](https://github.com/Sealos/flint/issues/318)) ([1e63ec5](https://github.com/Sealos/flint/commit/1e63ec518ec604c0f9b302ea492ce395b777fb1d))
+* **core:** keep pruning the watch interner during steady churn ([#282](https://github.com/Sealos/flint/issues/282)) ([e599423](https://github.com/Sealos/flint/commit/e599423787471dc86522ecba226b26bf1c915f22)), closes [#257](https://github.com/Sealos/flint/issues/257)
+* **core:** kill exec auth plugins that outlive the connect timeout ([#283](https://github.com/Sealos/flint/issues/283)) ([cf2098d](https://github.com/Sealos/flint/commit/cf2098de9185880930699e2b3c6000e02607f77b)), closes [#253](https://github.com/Sealos/flint/issues/253)
+* **core:** read the kubelet's refusal only when launching an exec, from a plain 500 ([#289](https://github.com/Sealos/flint/issues/289)) ([31b0346](https://github.com/Sealos/flint/commit/31b034679e01e2c05186a6fcf3255d010d99dd64)), closes [#262](https://github.com/Sealos/flint/issues/262)
+* **core:** show the kubelet's reason when a shell can't open in a stopped container ([#287](https://github.com/Sealos/flint/issues/287)) ([c70b7ad](https://github.com/Sealos/flint/commit/c70b7add4300dcc235b3d952333a5862b4862d6c)), closes [#262](https://github.com/Sealos/flint/issues/262)
+* **logs:** plan again when a log tab closes ([#302](https://github.com/Sealos/flint/issues/302)) ([99da87a](https://github.com/Sealos/flint/commit/99da87a6a30c7140a87f489da260dec2a248aa35))
+* **mcp:** agent activity log follow-ups ([#304](https://github.com/Sealos/flint/issues/304)) ([f147af3](https://github.com/Sealos/flint/commit/f147af36cf2c50516c2fc285b50c5189067338c2))
+
+
+### Performance
+
+* **core:** bound the core event queue ([#299](https://github.com/Sealos/flint/issues/299)) ([37c3f1f](https://github.com/Sealos/flint/commit/37c3f1f831c3a6b3b5c5003a10c0035c149f70f5))
+* **core:** budget queued exec input bytes ([#294](https://github.com/Sealos/flint/issues/294)) ([904fbe3](https://github.com/Sealos/flint/commit/904fbe3ed515ab667fed889e7e67e4a997749061))
+* **core:** keep a relist's strings without rehashing every row ([#300](https://github.com/Sealos/flint/issues/300)) ([0082f90](https://github.com/Sealos/flint/commit/0082f904004799cff31be1e671816ffd243221a3)), closes [#295](https://github.com/Sealos/flint/issues/295)
+* **core:** shrink the interner after small scale-downs, and drop superseded rows' strings ([#305](https://github.com/Sealos/flint/issues/305)) ([ba3699e](https://github.com/Sealos/flint/commit/ba3699ed8e8c9531ca270765fa4cafc7edc5e79a))
+* **logs:** share one memory budget across open log tabs ([#285](https://github.com/Sealos/flint/issues/285)) ([ef7ae9f](https://github.com/Sealos/flint/commit/ef7ae9f07ecfac0b931434fab6a1d6e1ae36ca74)), closes [#254](https://github.com/Sealos/flint/issues/254)
+* **mcp:** bound in-flight tool calls and queued replies ([#292](https://github.com/Sealos/flint/issues/292)) ([b597113](https://github.com/Sealos/flint/commit/b597113e63d0e17f0b18dab1c7083051dead6474))
+
 ## [0.2.1](https://github.com/Sealos/flint/compare/v0.2.0...v0.2.1) (2026-11-20)
 
 
