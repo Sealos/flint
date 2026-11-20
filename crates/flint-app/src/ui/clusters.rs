@@ -30,8 +30,12 @@ pub struct ClustersModel {
     /// The last error not tied to a cluster connection (for example a settings write). Cleared
     /// when the user issues the next command; if that one fails, its error replaces it.
     pub last_error: Option<String>,
-    /// The latest discovery result per cluster, and why the last discovery failed, if it did.
+    /// The latest discovery result per cluster, and why the last discovery failed, if it did:
+    /// only for the cluster's current slot ([`ClusterSummary::generation`]).
     pub discovery: HashMap<ClusterId, Discovered>,
+    /// Discovery of a slot newer than the cluster list the model has (the core's queue can put
+    /// the list behind it, #255): used once the list catches up.
+    ahead: HashMap<ClusterId, Discovered>,
     /// The agent activity log, every cluster's, oldest first (UP-16).
     pub agent_activity: Arc<Vec<ActivityRecord>>,
     /// The cluster to activate once kubeconfig is loaded (`FLINT_CLUSTER`). Taken on first load.
@@ -67,6 +71,7 @@ impl ClustersModel {
             settings_error: None,
             last_error: None,
             discovery: HashMap::new(),
+            ahead: HashMap::new(),
             agent_activity: Arc::default(),
             startup_cluster,
             _events: task,
@@ -76,7 +81,12 @@ impl ClustersModel {
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::ClustersChanged(snapshot) => {
-                replace_clusters(&mut self.discovery, &mut self.clusters, &snapshot.clusters);
+                replace_clusters(
+                    &mut self.discovery,
+                    &mut self.ahead,
+                    &mut self.clusters,
+                    &snapshot.clusters,
+                );
                 self.kubeconfig_errors = snapshot.errors.clone();
                 self.kubeconfig_paths = snapshot.paths.clone();
                 self.loaded = true;
@@ -106,11 +116,31 @@ impl ClustersModel {
             }
             Event::DiscoveryChanged {
                 cluster,
+                generation,
                 discovery,
                 error,
             } => {
-                self.discovery
-                    .insert(cluster, Discovered { discovery, error });
+                let found = Discovered {
+                    discovery,
+                    error,
+                    generation,
+                };
+                let current = self
+                    .clusters
+                    .iter()
+                    .find(|c| c.info.name == cluster)
+                    .map(|c| c.generation);
+                match current {
+                    // An older slot's: stale.
+                    Some(current) if generation < current => {}
+                    // A newer slot's than the list the model has: kept for when it comes.
+                    Some(current) if generation > current => {
+                        self.ahead.insert(cluster, found);
+                    }
+                    _ => {
+                        self.discovery.insert(cluster, found);
+                    }
+                }
             }
             Event::AgentActivity(records) => self.agent_activity = records,
             Event::Error(message) => {
@@ -119,6 +149,18 @@ impl ClustersModel {
             }
         }
         cx.notify();
+    }
+
+    /// What was discovered of `cluster`'s current slot: nothing for an older one.
+    pub fn discovered(&self, cluster: &str) -> Option<&Discovered> {
+        let generation = self
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .map(|c| c.generation);
+        self.discovery
+            .get(cluster)
+            .filter(|d| generation.is_none_or(|g| g == d.generation))
     }
 
     pub fn activate(&mut self, cluster: ClusterId) {
@@ -271,41 +313,44 @@ impl ClustersModel {
 pub struct Discovered {
     pub discovery: Option<Arc<ClusterDiscovery>>,
     pub error: Option<String>,
+    /// The generation of the slot it is for ([`ClusterSummary::generation`]).
+    pub generation: u64,
 }
 
-/// Drops the discovery of contexts that left kubeconfig (`before` -> `now`), or that now point at
-/// another API server under the same name: the core dropped their slots (a re-pointed context
-/// starts over and is discovered again), and the model would otherwise keep every such context's
-/// kinds for as long as the app runs, or show the old server's kinds for the new one. (Other
-/// changes to a context, such as its user, start it over in the core too; its kinds come from the
-/// same server, so they are kept until it is discovered again.)
-fn forget_removed(
+/// Keeps the discovery of each cluster's current slot only: a context that left kubeconfig, or
+/// started over in the core (a new generation: re-pointed, changed, back after being removed),
+/// loses what was discovered of its old slot. Generations, not a comparison with the list
+/// before, so it holds however many lists the model skipped (#255). Discovery that came ahead of
+/// its list is used once the list has its slot.
+fn forget_stale(
     discovery: &mut HashMap<ClusterId, Discovered>,
-    before: &[ClusterSummary],
+    ahead: &mut HashMap<ClusterId, Discovered>,
     now: &[ClusterSummary],
 ) {
-    let server = |clusters: &[ClusterSummary], id: &str| {
-        clusters
-            .iter()
-            .find(|c| c.info.name == id)
-            .map(|c| c.info.server.clone())
-    };
-    discovery.retain(|id, _| match (server(before, id), server(now, id)) {
-        (_, None) => false,
-        (Some(was), Some(is)) => was == is,
-        // Discovered before the cluster list arrived: keep it.
-        (None, Some(_)) => true,
-    });
+    let generation = |id: &str| now.iter().find(|c| c.info.name == id).map(|c| c.generation);
+    discovery.retain(|id, d| generation(id) == Some(d.generation));
+    ahead.retain(|id, d| generation(id).is_some_and(|g| d.generation >= g));
+    let caught_up: Vec<ClusterId> = ahead
+        .iter()
+        .filter(|(id, d)| generation(id) == Some(d.generation))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in caught_up {
+        if let Some(d) = ahead.remove(&id) {
+            discovery.insert(id, d);
+        }
+    }
 }
 
-/// Replaces the cluster list with `now`, first forgetting the discovery its changes make stale
-/// ([`forget_removed`]). One step, so the old list is always the one compared against.
+/// Replaces the cluster list with `now`, keeping only the discovery of its slots
+/// ([`forget_stale`]).
 fn replace_clusters(
     discovery: &mut HashMap<ClusterId, Discovered>,
+    ahead: &mut HashMap<ClusterId, Discovered>,
     clusters: &mut Vec<ClusterSummary>,
     now: &[ClusterSummary],
 ) {
-    forget_removed(discovery, clusters, now);
+    forget_stale(discovery, ahead, now);
     *clusters = now.to_vec();
 }
 
@@ -383,7 +428,7 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
     use super::{
-        Discovered, Presence, forget_removed, replace_clusters, startup_cluster, state_name,
+        Discovered, Presence, forget_stale, replace_clusters, startup_cluster, state_name,
     };
     use flint_core::kubeconfig::ContextInfo;
     use flint_core::{ClusterSummary, ConnectionState, ServerVersion};
@@ -402,58 +447,67 @@ mod tests {
                 source: PathBuf::from("/k"),
             },
             state: ConnectionState::Disconnected,
+            generation: 1,
         }
     }
 
+    fn at(name: &str, generation: u64) -> ClusterSummary {
+        ClusterSummary {
+            generation,
+            ..cluster(name)
+        }
+    }
+
+    fn found(generation: u64) -> Discovered {
+        Discovered {
+            generation,
+            ..Discovered::default()
+        }
+    }
+
+    // covers UP-06: what a list keeps is decided by generations: a context gone, or one whose slot
+    // is newer (re-pointed, changed, back after being removed, even at the same server), loses
+    // what was discovered of its old slot.
     #[test]
-    fn removed_and_re_pointed_contexts_lose_their_discovery() {
-        let mut discovery: HashMap<String, Discovered> = ["kept", "removed", "re-pointed"]
-            .into_iter()
-            .map(|name| (name.to_owned(), Discovered::default()))
-            .collect();
-        let at = |name: &str, server: &str| {
-            let mut c = cluster(name);
-            c.info.server = Some(server.into());
-            c
-        };
-        let before = [
-            at("kept", "https://a"),
-            at("removed", "https://b"),
-            at("re-pointed", "https://c"),
-        ];
-        let now = [
-            at("kept", "https://a"),
-            at("re-pointed", "https://elsewhere"),
-            at("new", "https://d"),
-        ];
-        forget_removed(&mut discovery, &before, &now);
+    fn only_the_current_slots_discovery_is_kept() {
+        let mut discovery: HashMap<String, Discovered> = [
+            ("kept", found(1)),
+            ("removed", found(1)),
+            ("started-over", found(1)),
+        ]
+        .into_iter()
+        .map(|(name, d)| (name.to_owned(), d))
+        .collect();
+        let mut ahead = HashMap::new();
+        forget_stale(
+            &mut discovery,
+            &mut ahead,
+            &[at("kept", 1), at("started-over", 2), at("new", 3)],
+        );
         let mut left: Vec<&str> = discovery.keys().map(String::as_str).collect();
         left.sort();
         assert_eq!(left, ["kept"]);
     }
 
-    // Reloads one after another, as `ClustersChanged` applies them: each compares against the
-    // list the previous one left.
+    // covers UP-06: discovery of a slot newer than the list the model has (the queue put the list
+    // behind it) is held, then used once the list catches up; a list that skipped a slot in
+    // between (A to B and back) still drops the oldest.
     #[test]
-    fn each_reload_forgets_against_the_list_before_it() {
-        let at = |name: &str, server: &str| {
-            let mut c = cluster(name);
-            c.info.server = Some(server.into());
-            c
-        };
+    fn discovery_ahead_of_its_list_waits_for_it() {
         let mut discovery: HashMap<String, Discovered> = HashMap::new();
+        let mut ahead: HashMap<String, Discovered> = HashMap::new();
         let mut clusters = Vec::new();
-        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://one")]);
-        discovery.insert("a".into(), Discovered::default());
-        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://one")]);
-        assert!(discovery.contains_key("a"), "an unchanged reload keeps it");
-        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://two")]);
-        assert!(discovery.is_empty(), "a re-pointed context is forgotten");
-        assert_eq!(clusters[0].info.server.as_deref(), Some("https://two"));
-        discovery.insert("a".into(), Discovered::default());
-        replace_clusters(&mut discovery, &mut clusters, &[]);
+        replace_clusters(&mut discovery, &mut ahead, &mut clusters, &[at("a", 1)]);
+        discovery.insert("a".into(), found(1));
+        ahead.insert("a".into(), found(3));
+        replace_clusters(&mut discovery, &mut ahead, &mut clusters, &[at("a", 2)]);
+        assert!(discovery.is_empty(), "the old slot's kinds go");
+        assert!(ahead.contains_key("a"), "a newer slot's wait");
+        replace_clusters(&mut discovery, &mut ahead, &mut clusters, &[at("a", 3)]);
+        assert_eq!(discovery["a"].generation, 3);
+        assert!(ahead.is_empty());
+        replace_clusters(&mut discovery, &mut ahead, &mut clusters, &[]);
         assert!(discovery.is_empty(), "a removed context is forgotten");
-        assert!(clusters.is_empty());
     }
 
     // covers UP-03, UP-91

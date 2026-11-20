@@ -1242,6 +1242,7 @@ async fn an_open_step_follows_its_data(cx: &mut TestAppContext) {
         cx,
         Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(Arc::new(crate::ui::support_tests::discovery(
                 crate::ui::support_tests::standard_sections(),
             ))),
@@ -1343,6 +1344,7 @@ async fn a_refresh_selects_an_exact_match_that_arrives(cx: &mut TestAppContext) 
         cx,
         Event::DiscoveryChanged {
             cluster: "alpha".into(),
+            generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(Arc::new(discovery(vec![section(
                 "Custom",
                 SectionKind::BuiltIn,

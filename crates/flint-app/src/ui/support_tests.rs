@@ -33,6 +33,9 @@ use super::registry::{self, ActionError};
 use super::ui_state::UiState;
 use super::workspace::Workspace;
 
+/// In a `DiscoveryChanged` given to [`TestWorkspace::feed`]: the cluster's current slot.
+pub const CURRENT_GENERATION: u64 = u64::MAX;
+
 /// How long a test waits for the UI to settle. Waiting advances the executor's clock in 10 ms
 /// steps; it never sleeps.
 pub const WAIT: Duration = Duration::from_secs(10);
@@ -319,6 +322,29 @@ impl TestWorkspace {
 
     /// Feeds `event` to the model as if the core sent it.
     pub fn feed(&self, cx: &mut TestAppContext, event: Event) {
+        // A discovery fed for [`CURRENT_GENERATION`] is for the cluster's current slot.
+        let event = match event {
+            Event::DiscoveryChanged {
+                cluster,
+                generation: CURRENT_GENERATION,
+                discovery,
+                error,
+            } => {
+                let generation = self.model.read_with(cx, |m, _| {
+                    m.clusters
+                        .iter()
+                        .find(|c| c.info.name == cluster)
+                        .map_or(0, |c| c.generation)
+                });
+                Event::DiscoveryChanged {
+                    cluster,
+                    generation,
+                    discovery,
+                    error,
+                }
+            }
+            other => other,
+        };
         self.model.update(cx, |model, cx| model.feed(event, cx));
         cx.run_until_parked();
     }
@@ -398,6 +424,7 @@ impl TestWorkspace {
             cx,
             Event::DiscoveryChanged {
                 cluster: "alpha".into(),
+                generation: crate::ui::support_tests::CURRENT_GENERATION,
                 discovery: Some(Arc::new(discovery(sections))),
                 error: None,
             },
@@ -804,11 +831,17 @@ pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
         "stub discovery must list Pods in the navigation"
     );
     t.model.update(cx, |model, cx| {
+        let generation = model
+            .clusters
+            .iter()
+            .find(|c| c.info.name == "alpha")
+            .map_or(0, |c| c.generation);
         model.discovery.insert(
             "alpha".into(),
             Discovered {
                 discovery: Some(Arc::new(discovery)),
                 error: None,
+                generation,
             },
         );
         cx.notify();
