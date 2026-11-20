@@ -1036,7 +1036,7 @@ async fn a_shell_gets_a_bash_prompt_echoes_typing_and_resizes() {
     );
 
     // Enter is a carriage return; the echo and the output reach the screen.
-    shell.write(b"echo hi\r".to_vec());
+    shell.write(b"echo hi\r".to_vec()).unwrap();
     fake.wait_for_stdin(b"echo hi\r", WAIT).await.unwrap();
     until_exec(&mut shell, "the echo", |s| {
         has_line(s, &format!("{prompt} echo hi")) && has_line(s, "hi")
@@ -1052,15 +1052,15 @@ async fn a_shell_gets_a_bash_prompt_echoes_typing_and_resizes() {
             height: 30
         }
     );
-    shell.write(b"stty size\r".to_vec());
+    shell.write(b"stty size\r".to_vec()).unwrap();
     until_exec(&mut shell, "the new size", |s| has_line(s, "30 100")).await;
 
     // bash turned bracketed paste on, so a paste arrives bracketed; Ctrl-C drops the line.
-    shell.paste("echo a\necho b");
+    shell.paste("echo a\necho b").unwrap();
     fake.wait_for_stdin(b"\x1b[200~echo a\necho b\x1b[201~", WAIT)
         .await
         .unwrap();
-    shell.write(vec![0x03]);
+    shell.write(vec![0x03]).unwrap();
     fake.wait_for_stdin(b"\x1b[201~\x03", WAIT).await.unwrap();
     // Output the test pushes shows too.
     assert!(fake.print("\r\npushed by the test\r\n"));
@@ -1101,7 +1101,7 @@ async fn a_container_without_bash_falls_back_to_sh() {
         .wait_for_stdin(b"\x1b[1;5R", WAIT)
         .await
         .unwrap();
-    shell.write(b"echo from-sh\r".to_vec());
+    shell.write(b"echo from-sh\r".to_vec()).unwrap();
     until_exec(&mut shell, "the echo", |s| has_line(s, "from-sh")).await;
     assert_eq!(server.open_exec_sessions(), 1);
 }
@@ -1114,9 +1114,9 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
     until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
     server.wait_for_exec_sessions(1, WAIT).await.unwrap();
-    shell.write(b"echo bye\r".to_vec());
+    shell.write(b"echo bye\r".to_vec()).unwrap();
     until_exec(&mut shell, "the echo", |s| has_line(s, "bye")).await;
-    shell.write(b"exit 3\r".to_vec());
+    shell.write(b"exit 3\r".to_vec()).unwrap();
     let snap = until_exec(&mut shell, "the exit", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: Some(3) });
     assert!(has_line(&snap, "bye") && has_line(&snap, "exit"));
@@ -1127,8 +1127,8 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     // (inputs are handled in order), and says no program takes input any more: that is the
     // check that can fail. The screen and stdin checks below only document the outcome (Flint
     // doesn't echo locally, and the fake has closed the session).
-    shell.write(b"echo late\r".to_vec());
-    assert!(!shell.paste_if_bracketed("x").await);
+    shell.write(b"echo late\r".to_vec()).unwrap();
+    assert!(!shell.paste_if_bracketed("x").unwrap().await);
     let snap = shell.latest();
     assert!(
         !snap.terminal.text().contains("late"),
@@ -1140,7 +1140,7 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     // Ctrl-D on an empty line ends bash with the last status.
     let mut shell = core.handle.exec(ExecRequest::shell(CONTEXT, "demo", WEB));
     until_exec(&mut shell, "bash", |s| s.state == running("bash")).await;
-    shell.write(vec![0x04]);
+    shell.write(vec![0x04]).unwrap();
     let snap = until_exec(&mut shell, "the exit", |s| s.state.is_finished()).await;
     assert_eq!(snap.state, ExecState::Exited { code: Some(0) });
     assert!(server.last_exec_stdin().ends_with(&[0x04]));

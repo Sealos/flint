@@ -5,7 +5,9 @@
 //! The screen is a real [`TerminalModel`], and resizes, scrolling and selections apply to it as
 //! in a live session, so snapshots and [`ExecSession::selection_text`] behave the same. Nothing
 //! runs on its own: the test calls [`FakeExec::pump`] to take in what the view sent, and each
-//! change publishes a snapshot at once (there is no frame pacing).
+//! change publishes a snapshot at once (there is no frame pacing). Until it does, keystrokes
+//! and pastes wait, held against the session's input budget as in a live session whose
+//! command is not reading them, so a test can fill it.
 
 use std::sync::Arc;
 
@@ -20,6 +22,7 @@ pub struct FakeExec {
     resizes: Vec<TerminalSize>,
     scrolls: Vec<i32>,
     closed: bool,
+    input_not_replayed: bool,
 }
 
 impl FakeExec {
@@ -33,6 +36,7 @@ impl FakeExec {
             resizes: Vec::new(),
             scrolls: Vec::new(),
             closed: false,
+            input_not_replayed: false,
         };
         (session, fake)
     }
@@ -45,6 +49,7 @@ impl FakeExec {
         let snapshot = Arc::new(ExecSnapshot {
             state: self.state.clone(),
             terminal: self.channels.model.snapshot(),
+            input_not_replayed: self.input_not_replayed,
         });
         self.channels.out.send_replace(snapshot);
     }
@@ -52,6 +57,13 @@ impl FakeExec {
     /// Moves the session to `state`.
     pub fn set_state(&mut self, state: ExecState) {
         self.state = state;
+        self.publish();
+    }
+
+    /// Says, as a live session does, that what was typed while the first shell was tried was
+    /// not kept for the shell that started ([`ExecSnapshot::input_not_replayed`]).
+    pub fn input_not_replayed(&mut self) {
+        self.input_not_replayed = true;
         self.publish();
     }
 
@@ -63,22 +75,29 @@ impl FakeExec {
     }
 
     /// Takes in everything the session's handle sent since the last call, as a live session
-    /// would: keystrokes and pastes are recorded (pastes encoded as they would be sent), and
-    /// resizes, scrolling and selections change the screen. Publishes a snapshot.
+    /// would: keystrokes and pastes are recorded (pastes encoded as they would be sent), giving
+    /// their bytes back to the budget, and resizes, scrolling and selections change the
+    /// screen. Resizes come first, the newest only, as a live session takes them. Publishes a
+    /// snapshot.
     pub fn pump(&mut self) {
         let finished = self.state.is_finished();
+        if self.channels.size.has_changed().unwrap_or(false) {
+            let size = *self.channels.size.borrow_and_update();
+            self.resizes.push(size);
+            self.model().resize(size);
+        }
         while let Ok(input) = self.channels.inputs.try_recv() {
             match input {
-                Input::Write(bytes) if !finished => {
+                Input::Write(bytes, _) if !finished => {
                     self.written.extend(bytes);
                     self.model().scroll_to_bottom();
                 }
-                Input::Paste(text) if !finished => {
+                Input::Paste(text, _) if !finished => {
                     let bytes = self.channels.model.paste_bytes(&text);
                     self.written.extend(bytes);
                     self.model().scroll_to_bottom();
                 }
-                Input::PasteIfBracketed(text, reply) => {
+                Input::PasteIfBracketed(text, _, reply) => {
                     let bracketed = !finished && self.channels.model.bracketed_paste();
                     if bracketed {
                         let bytes = self.channels.model.paste_bytes(&text);
@@ -87,7 +106,7 @@ impl FakeExec {
                     }
                     let _ = reply.send(bracketed);
                 }
-                Input::Write(_) | Input::Paste(_) => {}
+                Input::Write(..) | Input::Paste(..) => {}
                 Input::Resize(size) => {
                     self.resizes.push(size);
                     self.model().resize(size);
@@ -110,11 +129,13 @@ impl FakeExec {
                 Input::SelectionText(reply) => {
                     let _ = reply.send(self.channels.model.selection_text());
                 }
-                Input::Close => {
-                    self.closed = true;
-                    self.state = ExecState::Closed;
-                }
+                // The session sends neither through the queue.
+                Input::Close => {}
             }
+        }
+        if *self.channels.close.borrow() && !self.closed {
+            self.closed = true;
+            self.state = ExecState::Closed;
         }
         self.publish();
     }
@@ -169,8 +190,8 @@ mod tests {
         fake.print(b"hello world");
         assert_eq!(session.peek().terminal.row_text(0), "hello world");
 
-        session.write(b"ls\r".to_vec());
-        session.paste("a\nb");
+        session.write(b"ls\r".to_vec()).unwrap();
+        session.paste("a\nb").unwrap();
         session.resize(TerminalSize::new(30, 6));
         session.scroll(3);
         fake.pump();
@@ -188,10 +209,25 @@ mod tests {
     }
 
     #[test]
+    fn unpumped_input_holds_the_budget_until_taken_in() {
+        let (session, mut fake) = open();
+        fake.set_state(ExecState::Running {
+            command: vec!["bash".into()],
+        });
+        let paste = "x".repeat(super::super::INPUT_BUDGET / 2);
+        session.paste(paste.clone()).unwrap();
+        let refused = session.paste(paste.clone()).unwrap_err();
+        assert_eq!(refused.queued, session.queued_input());
+        fake.pump();
+        assert_eq!(session.queued_input(), 0);
+        session.paste(paste).unwrap();
+    }
+
+    #[test]
     fn a_finished_session_drops_keystrokes_and_dropping_the_handle_closes_it() {
         let (session, mut fake) = open();
         fake.set_state(ExecState::Exited { code: Some(0) });
-        session.write(b"x".to_vec());
+        session.write(b"x".to_vec()).unwrap();
         fake.pump();
         assert!(fake.written().is_empty());
         assert_eq!(fake.snapshot().state, ExecState::Exited { code: Some(0) });
