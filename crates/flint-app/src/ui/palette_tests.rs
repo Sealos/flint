@@ -490,18 +490,27 @@ async fn a_closed_palette_is_released(cx: &mut TestAppContext) {
 
 #[test]
 fn arguments_are_parsed_by_kind() {
-    assert_eq!(arg_value(ArgKind::Text, " app=web "), Ok(json!("app=web")));
-    assert_eq!(arg_value(ArgKind::Number, "240"), Ok(json!(240)));
-    assert_eq!(arg_value(ArgKind::Number, "1.5"), Ok(json!(1.5)));
-    assert!(arg_value(ArgKind::Number, "wide").is_err());
-    assert_eq!(arg_value(ArgKind::Bool, "Yes"), Ok(json!(true)));
-    assert_eq!(arg_value(ArgKind::Bool, "false"), Ok(json!(false)));
-    assert!(arg_value(ArgKind::Bool, "maybe").is_err());
     assert_eq!(
-        arg_value(ArgKind::List, "a, b,,c"),
+        arg_value(ArgKind::Text, " app=web ", true),
+        Ok(json!("app=web"))
+    );
+    assert_eq!(arg_value(ArgKind::Number, "240", true), Ok(json!(240)));
+    assert_eq!(arg_value(ArgKind::Number, "1.5", true), Ok(json!(1.5)));
+    assert!(arg_value(ArgKind::Number, "wide", true).is_err());
+    assert_eq!(arg_value(ArgKind::Bool, "Yes", true), Ok(json!(true)));
+    assert_eq!(arg_value(ArgKind::Bool, "false", true), Ok(json!(false)));
+    assert!(arg_value(ArgKind::Bool, "maybe", true).is_err());
+    assert_eq!(
+        arg_value(ArgKind::List, "a, b,,c", true),
         Ok(json!(["a", "b", "c"]))
     );
-    assert!(arg_value(ArgKind::Namespace, "  ").is_err());
+    assert!(arg_value(ArgKind::Namespace, "  ", true).is_err());
+    // A value picked from a list is taken as it is: a context may be named "prod ".
+    assert_eq!(
+        arg_value(ArgKind::Cluster, "prod ", false),
+        Ok(json!("prod "))
+    );
+    assert_eq!(arg_value(ArgKind::Text, " a ", false), Ok(json!(" a ")));
 }
 
 #[test]
@@ -873,4 +882,262 @@ async fn edit_copy_and_paste_work_in_a_shell_tab(cx: &mut TestAppContext) {
     t.dispatch(cx, "input::Paste", Value::Null).unwrap();
     shell.pump();
     assert_eq!(shell.written(), b"echo one");
+}
+
+/// Opens the palette's argument step of the action found by `query`.
+async fn ask(cx: &mut TestAppContext, t: &TestWorkspace, query: &str) -> PaletteState {
+    open_palette(cx, t).await;
+    t.type_text(cx, query);
+    t.press(cx, "enter");
+    let palette = shown(cx, t);
+    assert!(palette.argument.is_some(), "{query}: {palette:?}");
+    palette
+}
+
+// A listed value equal to the text typed, ignoring case, comes first and is selected.
+#[gpui_kit::test]
+async fn an_exact_match_comes_first(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    t.workspace.update(cx, |ws, _| {
+        ws.set_namespaces_for_tests(vec!["a-bc".into(), "abc".into()])
+    });
+    ask(cx, &t, "add namespace").await;
+    t.type_text(cx, "ABC");
+    let palette = shown(cx, &t);
+    assert_eq!(
+        labels(&palette),
+        ["abc", "a-bc"],
+        "no typed row: it is listed"
+    );
+    assert_eq!(palette.selected, Some(0));
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let filter = t
+        .workspace
+        .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()));
+    assert_eq!(filter, ["abc"]);
+}
+
+// A click on an action that takes arguments leaves focus in the field for the next step.
+#[gpui_kit::test]
+async fn a_click_keeps_typing_in_the_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_palette(cx, &t).await;
+    t.type_text(cx, "select cluster");
+    assert_eq!(selected(&shown(cx, &t)), "Select Cluster…");
+    t.click(cx, ("palette-row", 0usize));
+    let (palette, focus) = state(cx, &t);
+    assert_eq!(palette.unwrap().argument.as_deref(), Some("cluster"));
+    assert_eq!(focus, Focus::Palette);
+    t.type_text(cx, "bet");
+    assert_eq!(labels(&shown(cx, &t)), ["beta"]);
+}
+
+// A refusal at the last step keeps the earlier picks, so Enter again retries with them.
+#[gpui_kit::test]
+async fn a_refusal_keeps_the_earlier_picks(cx: &mut TestAppContext) {
+    use flint_core::{ConnectionState, Event, ServerVersion};
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.connect_alpha(cx, crate::ui::support_tests::standard_sections())
+        .await;
+    ask(cx, &t, "label selector").await;
+    t.type_text(cx, "demo");
+    t.press(cx, "enter");
+    t.type_text(cx, "app=web");
+    // Alpha disconnects before Enter: logs cannot open there now.
+    t.feed(
+        cx,
+        Event::ConnectionChanged {
+            cluster: "alpha".into(),
+            state: ConnectionState::Disconnected,
+        },
+    );
+    t.press(cx, "enter");
+    let palette = shown(cx, &t);
+    assert_eq!(
+        palette.error.as_deref(),
+        Some("Not available here any more")
+    );
+    assert_eq!(
+        palette.step.as_deref(),
+        Some("Open Logs by Label Selector… · demo")
+    );
+    t.feed(
+        cx,
+        Event::ConnectionChanged {
+            cluster: "alpha".into(),
+            state: ConnectionState::Connected(ServerVersion {
+                git_version: "v1.33.1".into(),
+                platform: "linux/arm64".into(),
+            }),
+        },
+    );
+    t.type_text(cx, "");
+    t.press(cx, "enter");
+    assert!(palette_closed(cx, &t));
+    let dock = t.workspace.read_with(cx, |ws, _| ws.dock_view());
+    assert_eq!(dock.read_with(cx, |d, _| d.tab_count()), 1);
+}
+
+/// Shows pod `web` with an init container, `app` running and `sidecar` waiting.
+async fn show_pod_with_init(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.dispatch(
+        cx,
+        "resource_list::SelectRow",
+        json!({"namespace": "demo", "name": "web"}),
+    )
+    .unwrap();
+    let detail = t.detail(cx).expect("the detail pane is open");
+    let pod = flint_core::ObjectDetail {
+        object: json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web"},
+            "spec": {
+                "initContainers": [{"name": "setup"}],
+                "containers": [{"name": "app"}, {"name": "sidecar"}]
+            },
+            "status": {
+                "initContainerStatuses": [
+                    {"name": "setup", "restartCount": 0, "state": {"terminated": {"exitCode": 0}}}
+                ],
+                "containerStatuses": [
+                    {"name": "app", "restartCount": 0, "state": {"running": {}}},
+                    {"name": "sidecar", "restartCount": 2,
+                     "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+                ]
+            }
+        }),
+        yaml: String::new(),
+        managed_fields: None,
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    };
+    cx.update_window(t.window, |_, window, cx| {
+        detail.update(cx, |d, cx| d.show_fetched(pod, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+// Open Container Shell… offers only the running app containers a shell can open in; Open
+// Container Logs… every container, init ones included.
+#[gpui_kit::test]
+async fn shells_offer_only_running_app_containers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    show_pod_with_init(cx, &t).await;
+    let palette = ask(cx, &t, "open container shell").await;
+    assert_eq!(labels(&palette), ["app"]);
+    assert_eq!(palette.rows[0].detail.as_deref(), Some("default"));
+    t.press(cx, "escape");
+    t.press(cx, "escape");
+    let palette = ask(cx, &t, "open container logs").await;
+    let all = labels(&palette);
+    assert!(
+        all.contains(&"setup") && all.contains(&"sidecar"),
+        "{all:?}"
+    );
+}
+
+// A value picked from the list is used as it is, spaces included.
+#[gpui_kit::test]
+async fn a_picked_value_is_not_trimmed(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::{kubeconfig_yaml, open_workspace_with};
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let kubeconfig = dir.join("kubeconfig");
+        std::fs::write(
+            &kubeconfig,
+            kubeconfig_yaml(&[("prod ", &servers.silent), ("prod", &servers.refused)]),
+        )
+        .unwrap();
+        vec![kubeconfig]
+    })
+    .await;
+    ask(cx, &t, "select cluster").await;
+    let palette = shown(cx, &t);
+    let ix = palette
+        .rows
+        .iter()
+        .position(|r| r.label == "prod " || r.detail.as_deref() == Some("prod "))
+        .expect("prod  is listed");
+    t.click(cx, ("palette-row", ix));
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).shown_cluster() == Some("prod ")
+    })
+    .await;
+}
+
+/// Opens pods `pod-00` to `pod-29`, so list rows lie under the palette and below it.
+async fn open_many_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let names: Vec<String> = (0..30).map(|i| format!("pod-{i:02}")).collect();
+    let rows: Vec<(&str, &str, i64)> = names.iter().map(|n| ("demo", n.as_str(), 0)).collect();
+    t.open_pods(cx, &rows).await;
+}
+
+// The panel is as tall as its content, and pointer events stop at it: a click on it reaches
+// no row behind it and keeps focus in the field; a click on a row below it is outside, and
+// closes it, also while it asks for an argument.
+#[gpui_kit::test]
+async fn the_panel_takes_its_own_clicks_only(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_many_pods(cx, &t).await;
+    open_palette(cx, &t).await;
+    let panel = t.find(cx, "command-palette").expect("drawn").bounds();
+    let height = cx
+        .update_window(t.window, |_, window, _| window.viewport_size().height)
+        .unwrap();
+    assert!(
+        panel.bottom() < height - gpui_kit::px(100.),
+        "{panel:?} in a window {height:?} tall"
+    );
+    // The footer lies over the list's rows.
+    t.click(cx, "palette-footer");
+    assert_eq!(t.selected(cx), None, "the click stayed in the panel");
+    assert!(palette(cx, &t).is_some());
+
+    // During an argument step, a click on a row below the panel closes it, rather than going
+    // back a step.
+    assert_eq!(state(cx, &t).1, Focus::Palette);
+    t.type_text(cx, "select cluster");
+    t.press(cx, "enter");
+    assert!(shown(cx, &t).argument.is_some());
+    let below = t.find(cx, "row-uid-pod-25").expect("drawn").bounds();
+    assert!(below.top() > panel.bottom(), "{below:?} under {panel:?}");
+    t.click(cx, "row-uid-pod-25");
+    assert!(palette_closed(cx, &t));
+}
+
+// The shortcut shown is the one that fires from where the palette came from: in a log tab,
+// Cmd-R is Refresh Object while the tab has nothing to reconnect.
+#[gpui_kit::test]
+async fn shortcuts_are_the_ones_that_fire_there(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 0)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    assert_eq!(state(cx, &t).1, Focus::Log);
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    let refresh = palette
+        .rows
+        .iter()
+        .find(|r| r.label == "Refresh Object")
+        .expect("listed");
+    assert_eq!(
+        refresh.shortcut.as_deref(),
+        Some(registry::key_hint("secondary-r").as_str())
+    );
+    assert!(!labels(&palette).contains(&"Reconnect Logs"));
 }

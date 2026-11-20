@@ -24,8 +24,8 @@ use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
 use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, PaletteEvent};
 use super::super::registry::{
-    About, ActionError, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection, Close,
-    CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
+    About, ActionError, ActionSpec, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection,
+    Close, CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
     DefaultWatchOpenViewsOnly, DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp,
     FocusFilter, FocusSearch, Forward, ForwardCurrent, Guards, Hide, HideFromAi, HideOthers,
     JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
@@ -343,13 +343,16 @@ impl Workspace {
             return;
         }
         let previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        // Read while `previous` still has focus: the palette takes it next.
+        let contexts = window.context_stack();
         let this = cx.weak_entity();
-        let choices: ChoiceSource = Rc::new(move |arg, cx| match this.upgrade() {
-            Some(ws) => ws.read(cx).palette_choices(arg, cx),
+        let choices: ChoiceSource = Rc::new(move |spec, arg, cx| match this.upgrade() {
+            Some(ws) => ws.read(cx).palette_choices(spec, arg, cx),
             None => ArgInput::Text,
         });
-        let palette =
-            cx.new(|cx| CommandPalette::new(previous, self.focus.clone(), choices, window, cx));
+        let palette = cx.new(|cx| {
+            CommandPalette::new(previous, self.focus.clone(), contexts, choices, window, cx)
+        });
         let dismissed = cx.subscribe_in(
             &palette,
             window,
@@ -373,7 +376,12 @@ impl Workspace {
 
     /// What the palette offers for an argument of an action: the values it can take now, or
     /// text to type.
-    pub(in crate::ui) fn palette_choices(&self, arg: &Arg, cx: &App) -> ArgInput {
+    pub(in crate::ui) fn palette_choices(
+        &self,
+        spec: &ActionSpec,
+        arg: &Arg,
+        cx: &App,
+    ) -> ArgInput {
         let model = self.model.read(cx);
         let choices = |items: Vec<Choice>| ArgInput::Choices { items, free: false };
         match arg.kind {
@@ -427,6 +435,26 @@ impl Workspace {
                     .map(Choice::plain)
                     .collect(),
             ),
+            // A shell opens only in a running app container of the pod a shell would use (a
+            // workload's first ready pod), as the detail pane's picker offers.
+            ArgKind::Container if spec.name == OpenContainerShell::name_for_type() => {
+                let target = detail(self, cx).and_then(|d| d.shell_pod());
+                choices(
+                    target
+                        .map(|pod| {
+                            pod.containers
+                                .iter()
+                                .filter(|c| !pod.not_running.contains(c))
+                                .map(|c| Choice {
+                                    value: c.clone(),
+                                    label: c.clone(),
+                                    detail: (*c == pod.default).then(|| "default".to_owned()),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            }
             ArgKind::Container => choices(
                 detail(self, cx)
                     .map(|d| d.log_containers())

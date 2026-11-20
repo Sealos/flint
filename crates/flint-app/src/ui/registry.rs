@@ -699,17 +699,54 @@ impl ActionSpec {
         self.own_hint(keymap.bindings_for_action(&*action), cx)
     }
 
-    /// [`ActionSpec::shortcut`] as it works from `focus`: only bindings whose key context
-    /// applies there. In a log tab, Copy's Cmd-C (a text field's) is not shown, since the key
-    /// copies lines there.
-    pub fn shortcut_in(&self, focus: &FocusHandle, window: &Window, cx: &App) -> Option<String> {
+    /// [`ActionSpec::shortcut`] as it works from `focus`, whose key contexts are `contexts`
+    /// (outermost first, as [`Window::context_stack`] gives them while it has focus): the
+    /// action's own binding that fires there. A key bound to something else in a deeper context
+    /// takes it only while that other action would run: Cmd-R in a log tab is Refresh Object
+    /// while the tab has nothing to reconnect. In a log tab, Copy's Cmd-C (a text field's) is not
+    /// shown, since its context does not apply.
+    pub fn shortcut_in(
+        &self,
+        contexts: &[KeyContext],
+        focus: &FocusHandle,
+        window: &Window,
+        cx: &App,
+    ) -> Option<String> {
         let action = (self.probe)();
-        self.own_hint(window.bindings_for_action_in(&*action, focus).iter(), cx)
+        let own_context = self
+            .key_context
+            .map(|c| KeyBindingContextPredicate::parse(c).expect("static key context parses"));
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let own: Vec<KeyBinding> = keymap
+            .bindings_for_action(&*action)
+            .filter(|b| b.predicate().as_deref() == own_context.as_ref())
+            .cloned()
+            .collect();
+        let is_own = |b: &KeyBinding| {
+            b.action().partial_eq(&*action) && b.predicate().as_deref() == own_context.as_ref()
+        };
+        // The latest added first: it wins over the defaults. Of the bindings for its keys
+        // there, in precedence order, the first that would take the key decides.
+        let fires = own.iter().rev().find(|binding| {
+            let (candidates, _) = keymap.bindings_for_input(binding.keystrokes(), contexts);
+            candidates
+                .iter()
+                .find(|c| is_own(c) || would_run(c.action(), focus, window, cx))
+                .is_some_and(&is_own)
+        })?;
+        self.own_hint(std::iter::once(fires), cx)
     }
 
-    /// Whether one of the action's own keys is bound where `focus` is.
-    pub fn bound_in(&self, focus: &FocusHandle, window: &Window, cx: &App) -> bool {
-        self.shortcut_in(focus, window, cx).is_some()
+    /// Whether one of the action's own keys fires it from `focus` ([`ActionSpec::shortcut_in`]).
+    pub fn bound_in(
+        &self,
+        contexts: &[KeyContext],
+        focus: &FocusHandle,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.shortcut_in(contexts, focus, window, cx).is_some()
     }
 
     /// The last of `bindings` that is one of the action's own keys, as the OS writes it.
@@ -730,6 +767,19 @@ impl ActionSpec {
                     .join(" ")
             })
             .rfind(|hint| own.contains(hint))
+    }
+}
+
+/// Whether `action`, bound to a key, would take it from `focus`: a key bound to nothing (a shell
+/// tab's own keys) always does; a registered action while it is available; another while
+/// something there handles it.
+fn would_run(action: &dyn Action, focus: &FocusHandle, window: &Window, cx: &App) -> bool {
+    if action.as_any().is::<NoAction>() {
+        return true;
+    }
+    match spec_of(action) {
+        Some(spec) => spec.is_available_in(focus, window, cx),
+        None => window.is_action_available_in(action, focus),
     }
 }
 

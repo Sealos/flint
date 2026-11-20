@@ -73,7 +73,7 @@ pub enum ArgInput {
 
 /// Where the palette gets an argument's choices: the workspace, which knows the clusters,
 /// namespaces, kinds, columns and containers.
-pub type ChoiceSource = Rc<dyn Fn(&Arg, &App) -> ArgInput>;
+pub type ChoiceSource = Rc<dyn Fn(&ActionSpec, &Arg, &App) -> ArgInput>;
 
 /// What the palette tells its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +128,8 @@ enum Row {
 }
 
 pub struct CommandPalette {
-    /// The palette's own node: focus leaving it (in an active window) closes the palette.
+    /// The search field's focus: it leaving (in an active window) closes the palette, and the
+    /// palette's controls dispatch from it.
     focus: FocusHandle,
     query: Entity<InputState>,
     /// The query as last matched.
@@ -141,6 +142,9 @@ pub struct CommandPalette {
     /// The workspace's focus target, used instead of `previous` once that is no longer drawn
     /// (a menu that closed as the palette took focus).
     fallback: FocusHandle,
+    /// The key contexts at `previous` when the palette opened (outermost first), for the
+    /// shortcuts that fire there.
+    contexts: Vec<KeyContext>,
     choices: ChoiceSource,
     /// The actions listed, filled in by [`CommandPalette::load`].
     entries: Vec<Entry>,
@@ -159,12 +163,14 @@ impl EventEmitter<PaletteEvent> for CommandPalette {}
 
 impl CommandPalette {
     /// A palette over the actions available from `previous` (or, once that is no longer drawn,
-    /// from `fallback`), with arguments' choices from `choices`. Its list is empty until
+    /// from `fallback`), with `contexts` the key contexts at `previous` (read while it still has
+    /// focus) and arguments' choices from `choices`. Its list is empty until
     /// [`CommandPalette::load`]: listing reads the guards, which read the workspace, so the
     /// workspace loads it once its own update is done.
     pub fn new(
         previous: FocusHandle,
         fallback: FocusHandle,
+        contexts: Vec<KeyContext>,
         choices: ChoiceSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -175,7 +181,9 @@ impl CommandPalette {
                 this.refilter(cx);
             }
         });
-        let focus = cx.focus_handle();
+        // The field's own: the panel tracks no focus of its own, so a click on it (a row, the
+        // footer) leaves focus in the field.
+        let focus = query.focus_handle(cx);
         // Focus moving elsewhere in the window closes it. The window going to the background
         // (Cmd-Tab, Hide) does not, as with a dialog: focus is back in the field on return.
         let on_leave = cx.on_focus_out(&focus, window, |_, _, window, cx| {
@@ -191,6 +199,7 @@ impl CommandPalette {
             action_query: String::new(),
             previous,
             fallback,
+            contexts,
             choices,
             entries: Vec::new(),
             step: Step::Actions,
@@ -219,12 +228,23 @@ impl CommandPalette {
     /// there. Must not run while the workspace is being updated (the guards read it).
     pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let origin = self.origin(window);
+        // From the workspace's target, the contexts down to the workspace's own.
+        let contexts: Vec<KeyContext> = if origin == self.previous {
+            self.contexts.clone()
+        } else {
+            let end = self
+                .contexts
+                .iter()
+                .position(|c| c.contains(registry::WORKSPACE))
+                .map_or(0, |i| i + 1);
+            self.contexts[..end].to_vec()
+        };
         let palette = ToggleCommandPalette::name_for_type();
         // Copy is handled everywhere (gpui-component's root copies selected text), so the Edit
         // actions are listed only where they act: in a text field, where their keys are bound,
         // or in a shell tab, which handles Copy and Paste itself.
         let bound = |name: &str| {
-            registry::find(name).is_some_and(|spec| spec.bound_in(&origin, window, cx))
+            registry::find(name).is_some_and(|spec| spec.bound_in(&contexts, &origin, window, cx))
         };
         // Cut is bound only in a text field, Paste Terminal Text only in a shell tab.
         let in_field = bound(input::Cut::name_for_type());
@@ -242,7 +262,7 @@ impl CommandPalette {
             .map(|spec| Entry {
                 spec,
                 shortcut: spec
-                    .shortcut_in(&origin, window, cx)
+                    .shortcut_in(&contexts, &origin, window, cx)
                     .map(SharedString::from),
             })
             .collect();
@@ -276,6 +296,8 @@ impl CommandPalette {
         self.query.update(cx, |q, cx| {
             q.set_value(text, window, cx);
             q.set_placeholder(placeholder, window, cx);
+            // A click on a row took focus off the field: each step starts typed into.
+            q.focus(window, cx);
         });
         self.refilter(cx);
     }
@@ -298,12 +320,32 @@ impl CommandPalette {
                 let offer_typed = !typed.is_empty()
                     && match input {
                         ArgInput::Choices { items, free } => {
-                            *free && !items.iter().any(|c| c.value == typed)
+                            *free
+                                && !items
+                                    .iter()
+                                    .any(|c| c.value.to_lowercase() == typed.to_lowercase())
                         }
                         ArgInput::Text => true,
                     };
-                // What was typed comes first when it may be used as is: Enter on "kube" takes
-                // "kube", not "kube-system".
+                let mut hits = hits;
+                // A listed value equal to what was typed (ignoring case) comes first: with
+                // `abc` and `a-bc` listed, Enter on "abc" takes `abc`.
+                if let ArgInput::Choices { items, .. } = input {
+                    let exact = |i: usize| {
+                        let c = &items[i];
+                        c.value.to_lowercase() == typed.to_lowercase()
+                            || c.label.to_lowercase() == typed.to_lowercase()
+                    };
+                    if let Some(at) = hits
+                        .iter()
+                        .position(|h| !typed.is_empty() && exact(h.index))
+                    {
+                        let hit = hits.remove(at);
+                        hits.insert(0, hit);
+                    }
+                }
+                // Else what was typed comes first when it may be used as is: Enter on "kube"
+                // takes "kube", not "kube-system".
                 offer_typed
                     .then(|| Row::Typed(typed.to_owned()))
                     .into_iter()
@@ -372,15 +414,17 @@ impl CommandPalette {
                 },
                 row,
             ) => {
-                let (text, shown) = match (row, &*input) {
-                    (Row::Choice { index, .. }, ArgInput::Choices { items, .. }) => {
-                        (items[index].value.clone(), items[index].label.clone())
-                    }
-                    (Row::Typed(text), _) => (text.clone(), text),
+                let (text, shown, typed) = match (row, &*input) {
+                    (Row::Choice { index, .. }, ArgInput::Choices { items, .. }) => (
+                        items[index].value.clone(),
+                        items[index].label.clone(),
+                        false,
+                    ),
+                    (Row::Typed(text), _) => (text.clone(), text, true),
                     _ => return,
                 };
                 let (spec, at) = (*spec, *arg);
-                let value = match arg_value(spec.args[at].kind, &text) {
+                let value = match arg_value(spec.args[at].kind, &text, typed) {
                     Ok(value) => value,
                     Err(why) => {
                         self.error = Some(why);
@@ -388,8 +432,10 @@ impl CommandPalette {
                         return;
                     }
                 };
-                let mut args = std::mem::take(args);
-                let mut picked = std::mem::take(picked);
+                // Copies: until the action runs, this step keeps its picks, so a refusal at the
+                // last step can be retried with the earlier ones.
+                let mut args = args.clone();
+                let mut picked = picked.clone();
                 args.insert(spec.args[at].name.to_owned(), value);
                 picked.push((at, shown));
                 self.ask(spec, at + 1, args, picked, window, cx);
@@ -413,7 +459,7 @@ impl CommandPalette {
             self.run(spec, Value::Object(args), window, cx);
             return;
         };
-        let input = (self.choices)(&spec.args[arg], cx);
+        let input = (self.choices)(spec, &spec.args[arg], cx);
         self.candidates = match &input {
             ArgInput::Choices { items, .. } => items
                 .iter()
@@ -764,9 +810,10 @@ fn nothing_to_pick(kind: ArgKind, free: bool) -> SharedString {
     }
 }
 
-/// `text` as the JSON value an argument of `kind` takes.
-fn arg_value(kind: ArgKind, text: &str) -> Result<Value, String> {
-    let text = text.trim();
+/// `text` as the JSON value an argument of `kind` takes. Typed text loses its surrounding
+/// spaces; a value picked from a list is taken as it is (a context may be named `prod `).
+fn arg_value(kind: ArgKind, text: &str, typed: bool) -> Result<Value, String> {
+    let text = if typed { text.trim() } else { text };
     if text.is_empty() {
         return Err("Type a value first".to_owned());
     }
@@ -834,7 +881,6 @@ impl Render for CommandPalette {
         let root = v_flex()
             .id("command-palette")
             .key_context(registry::PALETTE)
-            .track_focus(&self.focus)
             .w(px(WIDTH))
             .max_w_full()
             .bg(theme.popover)
@@ -845,8 +891,11 @@ impl Render for CommandPalette {
             .shadow_lg()
             .overflow_hidden()
             .text_sm()
-            // A press outside closes it, as Esc does.
-            .on_mouse_down_out(registry::on_click_in(self.focus.clone(), PaletteDismiss))
+            // Pointer events stop at the panel, so nothing behind it gets them.
+            .occlude()
+            // A press outside closes it, also while it asks for an argument (only Esc and
+            // Backspace go back a step), and goes on to what it pressed.
+            .on_mouse_down_out(registry::on_click_passing(ToggleCommandPalette))
             .when_some(heading, |el, label| {
                 el.child(
                     div()
@@ -898,7 +947,9 @@ impl Render for CommandPalette {
                         .test_support(),
                 )
             });
-        Self::bind_actions(OnView::new(root, cx)).into_element()
+        Self::bind_actions(OnView::new(root, cx))
+            .into_element()
+            .test_support()
     }
 }
 

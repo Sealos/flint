@@ -721,27 +721,33 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   a text field's key context (`Input`), so a shell tab keeps Cmd-C and Cmd-V for itself (and Linux shells keep Ctrl-C,
   Ctrl-V, Ctrl-X and Ctrl-A, which are in `TERMINAL_PASSTHROUGH`). Hide has no key on Linux, where Ctrl-H is a
   shell's backspace.
-- **Command palette (Cmd-Shift-P, `ui/palette.rs`):** a fuzzy search over every action that is available where
-  focus was when it opened: `registry::available_in(previous_focus)`, palette-visible actions only, through the
-  registry's guards, so it never offers what would do nothing. Each row shows the label, the category and the
-  shortcut that works there (`ActionSpec::shortcut_in`, only bindings whose key context applies at that focus), in a
-  column of its own so the categories line up. Typing filters (a subsequence match, ignoring case, that prefers word
-  starts and runs, `palette_model.rs`); the arrows or Ctrl-N and Ctrl-P move the selection; Enter or a click runs
-  it; Esc or a click outside closes it and gives focus back. With no query, recently run actions come first (for the
-  app session); with one, the closer match wins and recency only breaks ties.
+- **Command palette (Cmd-Shift-P, `ui/palette.rs`):** a fuzzy search over every action that is available where focus
+  was when it opened: `registry::available_in(previous_focus)`, palette-visible actions only, through the registry's
+  guards, so it never offers what would do nothing. Each row shows the label, the category and the shortcut that fires
+  there (`ActionSpec::shortcut_in`: of the bindings for its keys at that focus's key contexts, in precedence order,
+  the first whose action would run; Cmd-R in a log tab is Refresh Object while the tab has nothing to reconnect), in a
+  column of its own so the categories line up. Typing filters (a subsequence match, ignoring case as Unicode lower
+  case does, that prefers word starts and runs, `palette_model.rs`); the arrows or Ctrl-N and Ctrl-P move the
+  selection; Enter or a click runs it; Esc or a click outside closes it and gives focus back. The panel is as tall as
+  its content and takes the pointer events over it, so nothing behind it gets them. With no query, recently run
+  actions come first (for the app session); with one, the closer match wins and recency only breaks ties.
   - Where from: the focus before the palette opened, while it is still drawn in the workspace; once it is not (a
     menu that closed behind the palette), the workspace's focus target, as `registry::perform` uses. GPUI would
     otherwise treat the stale focus as the window's root, where Flint's actions are refused and App ones lost.
   - Running: the palette checks the action from there (`registry::check_in`), gives focus back, closes, and
     dispatches it there (`registry::dispatch_in`), exactly as its key would. A refusal (the guard's reason) stays
     in the palette's footer instead of closing it.
-  - Arguments: an action that takes them (Select Cluster…, Open Kind…, Sort by Column…, Open Logs by Label
-    Selector…, the namespace and container ones) asks for each required one in turn: a list of the clusters,
-    namespaces, kinds the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label
-    selector). Where a typed value is allowed (a namespace not listed, a selector), the text typed is the first row
-    and selected unless it equals a listed value. An empty pick list says so ("No clusters", "No containers").
-    Optional arguments keep their defaults. The heading shows the action and the picks so far; Esc, or Backspace in
-    the empty field, goes back a step keeping the earlier picks, and back to the actions with the query that found it.
+  - Arguments: an action that takes them (Select Cluster…, Open Kind…, Sort by Column…, Open Logs by Label Selector…,
+    the namespace and container ones) asks for each required one in turn: a list of the clusters, namespaces, kinds
+    the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label selector). A listed
+    value equal to the text typed (ignoring case) comes first; else, where a typed value is allowed (a namespace not
+    listed, a selector), the text typed is the first row and selected. Typed text is trimmed, a picked value never is.
+    Open Container Shell… offers only the running app containers a shell can open in (a workload's first ready pod's),
+    Open Container Logs… every container. An empty pick list says so ("No clusters", "No containers"). Optional
+    arguments keep their defaults. Each step starts with focus in the field, also after a click on a row. The heading
+    shows the action and the picks so far; Esc, or Backspace in the empty field, goes back a step keeping the earlier
+    picks, and back to the actions with the query that found it; a click outside closes the palette. A refusal at the
+    last step keeps the earlier picks, so Enter retries with them.
   - The Edit actions are listed only where they act: in a text field, or in a shell tab, which handles Edit > Copy and
     Edit > Paste with its own copy and paste (the paste checks included). gpui-component's root handles Copy for text
     selected anywhere, so availability alone would list it everywhere.

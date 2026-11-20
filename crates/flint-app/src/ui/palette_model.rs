@@ -46,28 +46,34 @@ pub fn fuzzy(query: &str, text: &str) -> Option<Score> {
         return None;
     }
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let n = chars.len();
+    let word_start = |k: usize| {
+        let c = chars[k].1;
+        match k.checked_sub(1).map(|p| chars[p].1) {
+            None => true,
+            Some(prev) => {
+                !prev.is_alphanumeric()
+                    || (prev.is_lowercase() && c.is_uppercase())
+                    || (prev.is_alphabetic() != c.is_alphabetic())
+            }
+        }
+    };
+    // The text in lower case, as the query is: a character may lower to several ("İ" to "i̇"),
+    // each remembering the character it came from (its index in `chars`).
+    let mut lower: Vec<char> = Vec::with_capacity(chars.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(chars.len());
+    let mut starts: Vec<bool> = Vec::with_capacity(chars.len());
+    for (k, &(_, c)) in chars.iter().enumerate() {
+        for (i, l) in c.to_lowercase().enumerate() {
+            lower.push(l);
+            origin.push(k);
+            starts.push(i == 0 && word_start(k));
+        }
+    }
+    let n = lower.len();
     let m = query.len();
     if m > n {
         return None;
     }
-    let lower: Vec<char> = chars
-        .iter()
-        .map(|&(_, c)| c.to_lowercase().next().unwrap_or(c))
-        .collect();
-    let starts: Vec<bool> = (0..n)
-        .map(|j| {
-            let c = chars[j].1;
-            match j.checked_sub(1).map(|p| chars[p].1) {
-                None => true,
-                Some(prev) => {
-                    !prev.is_alphanumeric()
-                        || (prev.is_lowercase() && c.is_uppercase())
-                        || (prev.is_alphabetic() != c.is_alphabetic())
-                }
-            }
-        })
-        .collect();
     let bonus = |j: usize| MATCH + if starts[j] { WORD_START } else { 0 };
 
     // best[i][j]: the best score matching query[..=i] with query[i] at text position j, and
@@ -127,7 +133,7 @@ pub fn fuzzy(query: &str, text: &str) -> Option<Score> {
     Some(Score {
         points,
         ranges: merge(positions.iter().map(|&p| {
-            let (at, c) = chars[p];
+            let (at, c) = chars[origin[p]];
             at..at + c.len_utf8()
         })),
     })
@@ -162,6 +168,8 @@ fn merge(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
     let mut merged: Vec<Range<usize>> = Vec::new();
     for range in ranges {
         match merged.last_mut() {
+            // Two lowered characters of one character ("İ") give its range twice.
+            Some(last) if last.end == range.end => {}
             Some(last) if last.end == range.start => last.end = range.end,
             _ => merged.push(range),
         }
@@ -291,6 +299,19 @@ mod tests {
         assert_eq!(fuzzy("sb", "SortBy").unwrap().ranges, [0..1, 4..5]);
         // Multi-byte characters keep their whole width.
         assert_eq!(fuzzy("é", "Café").unwrap().ranges, vec![3..5_usize]);
+    }
+
+    // Case folds as Unicode lower case says, on both sides: "İ" lowers to two characters.
+    #[test]
+    fn unicode_case_folds_on_both_sides() {
+        let score = fuzzy("İs", "İstanbul").expect("matches");
+        assert_eq!(score.ranges, vec![0..3_usize]);
+        assert!(fuzzy("is", "İstanbul").is_some());
+        assert!(fuzzy("ÉCOLE", "école").is_some());
+        assert!(
+            fuzzy("straße", "STRASSE").is_none(),
+            "lower case only, no full folding"
+        );
     }
 
     #[test]

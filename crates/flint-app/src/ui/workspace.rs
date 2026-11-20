@@ -1926,6 +1926,8 @@ impl Render for Workspace {
                         .size_full()
                         .flex()
                         .justify_center()
+                        // As tall as its content: a click below it is outside it.
+                        .items_start()
                         .pt(px(56.))
                         .px_4()
                         .child(palette.clone()),
