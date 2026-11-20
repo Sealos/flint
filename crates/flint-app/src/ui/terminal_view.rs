@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use flint_core::terminal::{Cell, CursorShape, SelectionKind, Side, TermMode, TerminalSize};
-use flint_core::{ExecSession, ExecSnapshot};
+use flint_core::{ExecSession, ExecSnapshot, display};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tooltip::Tooltip;
@@ -42,7 +42,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::dock::{DockItem, TabKey, TabStatus};
+use super::dock::{DockItem, TabKey, TabStatus, cluster_chip};
 use super::log_model::Tone;
 use super::log_view::Note;
 use super::notice::notice;
@@ -127,6 +127,8 @@ pub struct TerminalView {
     /// The bell rang a moment ago.
     bell: bool,
     note: Option<Note>,
+    /// Why the tab ended the session itself ([`TerminalView::end`]).
+    ended: Option<String>,
     focus: FocusHandle,
     _pump: Task<()>,
     _resize: Task<()>,
@@ -174,6 +176,7 @@ impl TerminalView {
             marked: None,
             bell: false,
             note: None,
+            ended: None,
             focus,
             _pump: pump,
             _resize: Task::ready(()),
@@ -227,9 +230,17 @@ impl TerminalView {
         });
     }
 
+    /// Ends the session, saying why in the tab (its context was re-pointed at another server).
+    pub fn end(&mut self, why: String, cx: &mut Context<Self>) {
+        self.session.close();
+        self.ended = Some(why);
+        self.marked = None;
+        cx.notify();
+    }
+
     /// Whether the command still runs (or starts), so keystrokes reach it.
     pub fn is_live(&self) -> bool {
-        !self.snapshot.state.is_finished()
+        self.ended.is_none() && !self.snapshot.state.is_finished()
     }
 
     pub fn has_selection(&self) -> bool {
@@ -431,7 +442,10 @@ impl TerminalView {
     }
 
     fn render_toolbar(&self, theme: &Theme) -> impl IntoElement {
-        let (tone, state) = terminal_model::state_text(&self.snapshot.state);
+        let (tone, state) = match &self.ended {
+            Some(_) => (Tone::Warning, "Ended: the context changed".to_owned()),
+            None => terminal_model::state_text(&self.snapshot.state),
+        };
         let color = tone_color(tone, theme);
         let full_state = state.clone();
         let title = self.snapshot.terminal.title.clone();
@@ -460,6 +474,13 @@ impl TerminalView {
                     .tooltip(move |window, cx| Tooltip::new(full_state.clone()).build(window, cx))
                     .test_support(),
             )
+            // Which cluster the shell runs on, beside its state (the tab says it too).
+            .child(cluster_chip(
+                "terminal-cluster",
+                display::short_name(&self.request.cluster),
+                self.ended.is_some(),
+                theme,
+            ))
             .when_some(title, |el, title| {
                 el.child(
                     div()
@@ -516,6 +537,10 @@ impl TerminalView {
     fn render_notes(&self, theme: &Theme) -> Vec<AnyElement> {
         let mut notes = Vec::new();
         let ended = match &self.snapshot.state {
+            _ if self.ended.is_some() => self
+                .ended
+                .clone()
+                .map(|why| (theme.warning, why)),
             flint_core::ExecState::Exited { code } => Some((
                 theme.muted_foreground,
                 match code {
@@ -607,6 +632,9 @@ impl DockItem for TerminalView {
 
     fn tab_status(&self) -> TabStatus {
         use flint_core::ExecState as S;
+        if self.ended.is_some() {
+            return TabStatus::Ended;
+        }
         match &self.snapshot.state {
             S::Connecting => TabStatus::Starting,
             S::Running { .. } => TabStatus::Live,

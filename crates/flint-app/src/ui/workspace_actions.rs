@@ -327,7 +327,7 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
-    fn cluster_summary<'a>(&self, name: &str, cx: &'a App) -> Option<&'a ClusterSummary> {
+    pub(super) fn cluster_summary<'a>(&self, name: &str, cx: &'a App) -> Option<&'a ClusterSummary> {
         self.model
             .read(cx)
             .clusters

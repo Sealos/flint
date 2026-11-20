@@ -25,6 +25,8 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, Theme, h_fle
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+pub use super::dock_model::TabStatus;
+use super::dock_model::{self, TabCluster};
 use super::log_view::{LogRequest, LogView};
 use super::registry::{
     self, ActionError, ActivateTab, Bind, CloseActiveTab, CloseTab, NextTab, OnView, PrevTab,
@@ -56,16 +58,6 @@ pub fn dock_height(saved: Option<u32>, window_height: f32) -> f32 {
 pub enum TabKey {
     Logs(LogRequest),
     Shell(ShellKey),
-}
-
-/// How a tab's session is doing, shown as a dot on the tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TabStatus {
-    Starting,
-    Live,
-    Retrying,
-    Ended,
-    Failed,
 }
 
 /// What the dock needs from a tab's view.
@@ -104,6 +96,10 @@ impl DockTab {
 struct Tab {
     id: u64,
     tab: DockTab,
+    /// The cluster its session runs on: part of its identity, and drawn beside its title.
+    cluster: TabCluster,
+    /// Its context was re-pointed at another server since it opened.
+    repointed: bool,
     /// The title and status drawn, so the tab bar redraws only when they change, not for every
     /// snapshot of a chatty session.
     shown: (SharedString, TabStatus),
@@ -185,12 +181,49 @@ impl Dock {
         }
     }
 
-    /// The id of the tab whose session `key` names.
-    pub fn find(&self, key: &TabKey, cx: &App) -> Option<u64> {
+    /// The id of the tab whose session `key` names on `cluster` (its context and server).
+    pub fn find(&self, key: &TabKey, cluster: &TabCluster, cx: &App) -> Option<u64> {
         self.tabs
             .iter()
-            .find(|t| t.tab.item(cx).tab_key() == *key)
+            .find(|t| t.cluster == *cluster && t.tab.item(cx).tab_key() == *key)
             .map(|t| t.id)
+    }
+
+    /// Tab `id`'s title and cluster, as its accessible label names them.
+    #[cfg(test)]
+    pub fn full_title(&self, id: u64, cx: &App) -> Option<String> {
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        let title = tab.tab.item(cx).tab_title();
+        Some(dock_model::full_title(&title, &tab.cluster))
+    }
+
+    /// Ends the shells whose context now points at another API server than when they opened
+    /// (`server_of` gives a context's server now, `None` for a context that is gone, which is
+    /// left alone). A shell stays connected to the server it started on; its tab would
+    /// otherwise claim the context's new cluster. Log tabs are left to the core, which checks
+    /// their context again and ends them itself.
+    pub fn check_servers(
+        &mut self,
+        server_of: impl Fn(&str) -> Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        for tab in &mut self.tabs {
+            if tab.repointed {
+                continue;
+            }
+            let Some(now) = server_of(&tab.cluster.context) else {
+                continue;
+            };
+            if tab.cluster.is_at(now.as_deref()) {
+                continue;
+            }
+            tab.repointed = true;
+            if let DockTab::Shell(view) = &tab.tab {
+                let note = dock_model::repointed_note(&tab.cluster.context);
+                view.update(cx, |view, cx| view.end(note, cx));
+            }
+            cx.notify();
+        }
     }
 
     /// [`ActivateTab`] and [`CloseTab`] take the id of an open tab.
@@ -206,11 +239,12 @@ impl Dock {
     pub fn open(
         &mut self,
         key: TabKey,
+        cluster: TabCluster,
         build: impl FnOnce(&mut Window, &mut Context<Self>) -> DockTab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> u64 {
-        let id = self.add(key, build, window, cx);
+        let id = self.add(key, cluster, build, window, cx);
         self.activate(id, window, cx);
         id
     }
@@ -220,11 +254,12 @@ impl Dock {
     pub fn add(
         &mut self,
         key: TabKey,
+        cluster: TabCluster,
         build: impl FnOnce(&mut Window, &mut Context<Self>) -> DockTab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> u64 {
-        if let Some(id) = self.find(&key, cx) {
+        if let Some(id) = self.find(&key, &cluster, cx) {
             return id;
         }
         let tab = build(window, cx);
@@ -238,6 +273,8 @@ impl Dock {
         self.tabs.push(Tab {
             id,
             tab,
+            cluster,
+            repointed: false,
             shown,
             _observe: observe,
         });
@@ -372,7 +409,15 @@ impl Dock {
     fn render_tab(&self, tab: &Tab, theme: &Theme, cx: &App) -> AnyElement {
         let item = tab.tab.item(cx);
         let active = self.active == Some(tab.id);
-        let tooltip = item.tab_tooltip();
+        let title = item.tab_title();
+        let label = dock_model::full_title(&title, &tab.cluster);
+        let mut tooltip = item.tab_tooltip().to_string();
+        if let Some(server) = &tab.cluster.server {
+            tooltip.push_str(&format!(" ({})", flint_core::redact::server_url(server)));
+        }
+        if tab.repointed {
+            tooltip.push_str("\nIts context now points at a different API server.");
+        }
         let dot = match item.tab_status() {
             TabStatus::Starting | TabStatus::Ended => theme.muted_foreground,
             TabStatus::Live => theme.success,
@@ -392,6 +437,7 @@ impl Dock {
             .border_color(theme.border)
             .cursor_pointer()
             .relative()
+            .aria_label(label)
             .map(|el| {
                 if active {
                     el.bg(theme.tab_active)
@@ -414,12 +460,19 @@ impl Dock {
             })
             .on_click(registry::on_click(ActivateTab { tab: id }))
             .child(div().size_1p5().flex_none().rounded_full().bg(dot))
+            // The cluster first: a shell on production must not pass for one on a dev cluster.
+            .child(cluster_chip(
+                ("dock-tab-cluster", id as usize),
+                tab.cluster.label(),
+                tab.repointed,
+                theme,
+            ))
             .child(
                 div()
-                    .max_w(px(240.))
-                    .truncate()
+                    .flex_none()
+                    .whitespace_nowrap()
                     .font_family(theme.mono_font_family.clone())
-                    .child(item.tab_title()),
+                    .child(dock_model::shown_title(&title)),
             )
             .child(
                 Button::new(("dock-tab-close", id as usize))
@@ -434,6 +487,32 @@ impl Dock {
             .test_support()
             .into_any_element()
     }
+}
+
+/// The cluster a session runs on, as a small outlined label: on a dock tab and in a shell's
+/// toolbar. Struck through in the warning color once its context points elsewhere.
+pub fn cluster_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    repointed: bool,
+    theme: &Theme,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border)
+        .whitespace_nowrap()
+        .text_color(if repointed {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        })
+        .when(repointed, |el| el.line_through())
+        .child(label.into())
+        .test_support()
 }
 
 impl Render for Dock {

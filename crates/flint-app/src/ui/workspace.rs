@@ -2,6 +2,7 @@
 //! with a header (breadcrumb, namespace filter, watch mode), the resource list, and the detail
 //! pane, above the bottom dock (log tabs, which outlive cluster switches).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use gpui_kit::*;
 use super::clusters::{ClustersModel, Presence, state_label};
 use super::detail::{DetailEvent, DetailTab, DetailView, ObjectRef, TakeFocus};
 use super::dock::{self, Dock, DockEvent, DockTab, TabKey};
+use super::dock_model::TabCluster;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
 use super::nav::NavPanel;
@@ -449,8 +451,10 @@ impl Workspace {
             return;
         }
         let core = self.model.read(cx).core().clone();
+        let cluster = self.tab_cluster(&request.cluster, cx);
         self.open_tab(
             TabKey::Logs(request.clone()),
+            cluster,
             |window, cx| DockTab::Logs(cx.new(|cx| LogView::new(core, request, window, cx))),
             focus,
             window,
@@ -464,6 +468,7 @@ impl Workspace {
     fn open_tab(
         &mut self,
         key: TabKey,
+        cluster: TabCluster,
         build: impl FnOnce(&mut Window, &mut Context<Dock>) -> DockTab,
         focus: bool,
         window: &mut Window,
@@ -474,9 +479,9 @@ impl Workspace {
         let in_dock = kept.is_some() && self.dock.read(cx).has_focus(window, cx);
         self.dock.update(cx, |dock, cx| {
             if in_dock {
-                dock.add(key, build, window, cx)
+                dock.add(key, cluster, build, window, cx)
             } else {
-                dock.open(key, build, window, cx)
+                dock.open(key, cluster, build, window, cx)
             }
         });
         if let Some(kept) = kept.filter(|_| !in_dock) {
@@ -526,12 +531,14 @@ impl Workspace {
             return;
         }
         let core = self.model.read(cx).core().clone();
+        let cluster = self.tab_cluster(&request.cluster, cx);
         let key = TabKey::Shell(ShellKey {
             request: request.clone(),
             ended: None,
         });
         self.open_tab(
             key,
+            cluster,
             |window, cx| {
                 let session = core.exec(request.exec_request(Default::default()));
                 DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
@@ -542,9 +549,36 @@ impl Workspace {
         );
     }
 
+    /// The cluster a session opened on `context` now runs on: the context and its server.
+    fn tab_cluster(&self, context: &str, cx: &App) -> TabCluster {
+        let server = self
+            .cluster_summary(context, cx)
+            .and_then(|c| c.info.server.as_deref());
+        TabCluster::new(context, server)
+    }
+
+    /// Ends the shells whose context was re-pointed at another server (see
+    /// [`Dock::check_servers`]).
+    fn check_dock_servers(&mut self, cx: &mut Context<Self>) {
+        if self.dock.read(cx).tab_count() == 0 {
+            return;
+        }
+        let servers: HashMap<String, Option<String>> = self
+            .model
+            .read(cx)
+            .clusters
+            .iter()
+            .map(|c| (c.info.name.clone(), c.info.server.clone()))
+            .collect();
+        self.dock.update(cx, |dock, cx| {
+            dock.check_servers(|context| servers.get(context).cloned(), cx)
+        });
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_dock_servers(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
         let core = model.core().clone();

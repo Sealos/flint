@@ -35,11 +35,11 @@ impl ShellRequest {
         request
     }
 
-    /// `web-1 · app`, the tab's title after the prompt sign.
+    /// `Shell: web-1 · app`, the tab's title: the pod and container, as a log tab names them.
     pub fn title(&self) -> String {
         match &self.container {
-            Some(container) => format!("$ {} · {container}", self.pod),
-            None => format!("$ {}", self.pod),
+            Some(container) => format!("Shell: {} · {container}", self.pod),
+            None => format!("Shell: {}", self.pod),
         }
     }
 
@@ -273,7 +273,7 @@ mod tests {
             pod: "web-1".into(),
             container: Some("app".into()),
         };
-        assert_eq!(request.title(), "$ web-1 · app");
+        assert_eq!(request.title(), "Shell: web-1 · app");
         assert_eq!(
             request.tooltip(),
             "Shell in demo/web-1, container app\non kind"
@@ -286,7 +286,7 @@ mod tests {
             container: None,
             ..request
         };
-        assert_eq!(any.title(), "$ web-1");
+        assert_eq!(any.title(), "Shell: web-1");
         assert_eq!(any.exec_request(TerminalSize::default()).container, None);
     }
 

@@ -541,6 +541,56 @@ async fn logs_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCont
     .await;
 }
 
+// covers UP-42: a tab is pinned to its context and the API server it pointed at. Once the
+// context is re-pointed, Logs opens a new tab on the new server instead of showing the old
+// server's, and each tab names its cluster.
+#[gpui_kit::test]
+async fn tabs_are_pinned_to_their_server(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "web", 1)]).await;
+    show_pod(cx, &t, "web").await;
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    let labels = |cx: &mut TestAppContext| {
+        t.workspace.read_with(cx, |ws, cx| {
+            let dock = ws.dock.read(cx);
+            dock.tab_ids()
+                .into_iter()
+                .map(|id| dock.full_title(id, cx).unwrap())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(labels(cx), ["web · app on alpha"]);
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(labels(cx).len(), 1, "the same server: the same tab");
+
+    // `alpha` now points at another server (as after editing kubeconfig).
+    t.model.update(cx, |model, cx| {
+        let alpha = model
+            .clusters
+            .iter_mut()
+            .find(|c| c.info.name == "alpha")
+            .unwrap();
+        alpha.info.server = Some("https://10.0.0.9:6443".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    t.focus_workspace(cx);
+    t.dispatch(cx, "detail::OpenLogs", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(labels(cx), ["web · app on alpha", "web · app on alpha"]);
+    let active = t.workspace.read_with(cx, |ws, cx| {
+        let dock = ws.dock.read(cx);
+        dock.tab_ids()
+            .iter()
+            .position(|id| Some(*id) == dock.active_id())
+    });
+    assert_eq!(active, Some(1), "the new server's tab is shown");
+}
+
 // covers UP-41, UP-42: Shell in the detail pane opens a shell tab in the dock (or shows the open
 // one), with a container picker; the tab keeps running across a cluster switch, its actions
 // are forwarded from the workspace, and closing it ends the session.
@@ -569,7 +619,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     ));
     t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
     cx.run_until_parked();
-    assert_eq!(dock_tabs(cx, &t), (true, vec!["$ web · app".to_owned()]));
+    assert_eq!(dock_tabs(cx, &t), (true, vec!["Shell: web · app".to_owned()]));
     let first = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
     });
@@ -592,7 +642,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     cx.run_until_parked();
     assert_eq!(
         dock_tabs(cx, &t).1,
-        ["$ web · app", "$ web · app", "$ web · sidecar"]
+        ["Shell: web · app", "Shell: web · app", "Shell: web · sidecar"]
     );
     let shell = t.workspace.read_with(cx, |ws, cx| {
         ws.dock.read(cx).active_terminal().unwrap().downgrade()
@@ -633,7 +683,7 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     t.dispatch(cx, "dock::CloseTab", json!({ "tab": id }))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(dock_tabs(cx, &t).1, ["$ web · app", "$ web · app"]);
+    assert_eq!(dock_tabs(cx, &t).1, ["Shell: web · app", "Shell: web · app"]);
     assert!(shell.upgrade().is_none(), "closing a tab ends its session");
 }
 

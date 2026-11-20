@@ -612,7 +612,7 @@ async fn a_workload_tab_shows_sources_and_stream_counts(cx: &mut TestAppContext)
     let (window, view) = open_request(cx, core, workload_request());
     assert_eq!(
         view.read_with(cx, |v, _| v.tab_title()),
-        "deployment/web".to_owned()
+        "web (Deployment)".to_owned()
     );
     let mut buffer = LogBuffer::new(100);
     for (pod, text) in [

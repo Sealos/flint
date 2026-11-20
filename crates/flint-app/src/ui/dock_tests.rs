@@ -17,6 +17,7 @@ use gpui_kit::{
 use serde_json::json;
 
 use super::dock::{Dock, DockTab, TabKey};
+use super::dock_model::TabCluster;
 use super::log_view::{LogRequest, LogView};
 use super::registry;
 use super::terminal_model::ShellRequest;
@@ -109,6 +110,7 @@ fn open_shell(
                 });
                 dock.open(
                     key,
+                    TabCluster::new("test", None),
                     |window, cx| {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     },
@@ -140,6 +142,7 @@ fn open_logs(
             dock.update(cx, |dock, cx| {
                 dock.open(
                     TabKey::Logs(log_request()),
+                    TabCluster::new("test", None),
                     |window, cx| {
                         DockTab::Logs(cx.new(|cx| LogView::new(core, log_request(), window, cx)))
                     },
@@ -206,7 +209,7 @@ async fn the_dock_leaks_nothing_once_its_tabs_close(cx: &mut TestAppContext) {
             .map(|id| d.tab(id).unwrap().item(cx).tab_title().to_string())
             .collect::<Vec<_>>()
     });
-    assert_eq!(titles, ["web-1 · app", "$ web-1 · app"]);
+    assert_eq!(titles, ["web-1 · app", "Shell: web-1 · app"]);
     for action in ["dock::PrevTab", "dock::NextTab"] {
         cx.update_window(window, |_, window, cx| {
             registry::dispatch(action, json!(null), window, cx)
@@ -226,4 +229,76 @@ async fn the_dock_leaks_nothing_once_its_tabs_close(cx: &mut TestAppContext) {
     close(cx, window, logs);
     cx.update(|cx| cx.assert_no_new_leaks(&snapshot));
     assert!(!dock.read_with(cx, |d, _| d.is_visible()));
+}
+
+/// Tab `id`'s accessible label, as drawn.
+fn tab_label(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) -> Option<String> {
+    cx.update_window(window, |_, window, _| {
+        window
+            .try_find(("dock-tab", id as usize))
+            .and_then(|tab| tab.label().map(str::to_owned))
+    })
+    .unwrap()
+}
+
+// covers UP-41, UP-42: a tab names the cluster its session runs on, and so does a shell's
+// toolbar, so a shell on one cluster never passes for one on another.
+#[gpui_kit::test]
+async fn tabs_name_their_cluster(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, dock) = open_dock(cx);
+    let logs = open_logs(cx, window, &dock, &core);
+    let (shell, _fake) = open_shell(cx, window, &dock);
+    assert_eq!(
+        tab_label(cx, window, logs).as_deref(),
+        Some("web-1 · app on test")
+    );
+    assert_eq!(
+        tab_label(cx, window, shell).as_deref(),
+        Some("Shell: web-1 · app on test")
+    );
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find(("dock-tab-cluster", shell as usize)).is_some());
+        assert!(window.try_find("terminal-cluster").is_some());
+    })
+    .unwrap();
+}
+
+// covers UP-41: a shell whose context is re-pointed at another API server ends, says why, and
+// no longer answers for its container; a context that is gone, or unchanged, leaves it alone.
+#[gpui_kit::test]
+async fn a_shell_ends_when_its_context_is_re_pointed(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let (shell, mut fake) = open_shell(cx, window, &dock);
+    let status = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |d, cx| d.tab(shell).unwrap().item(cx).tab_status())
+    };
+    dock.update(cx, |d, cx| d.check_servers(|_| None, cx));
+    dock.update(cx, |d, cx| d.check_servers(|_| Some(None), cx));
+    draw(cx, window);
+    assert_eq!(status(cx), super::dock::TabStatus::Live);
+    assert!(!fake.is_closed());
+
+    dock.update(cx, |d, cx| {
+        d.check_servers(|_| Some(Some("https://10.0.0.9:6443".into())), cx)
+    });
+    draw(cx, window);
+    fake.pump();
+    assert!(fake.is_closed(), "the session ends");
+    assert_eq!(status(cx), super::dock::TabStatus::Ended);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("terminal-ended").is_some());
+    })
+    .unwrap();
+    let found = dock.read_with(cx, |d, cx| {
+        d.find(
+            &TabKey::Shell(super::terminal_view::ShellKey {
+                request: shell_request(),
+                ended: None,
+            }),
+            &TabCluster::new("test", None),
+            cx,
+        )
+    });
+    assert_eq!(found, None, "Shell opens a new tab");
 }
