@@ -1431,6 +1431,7 @@ mod tests {
                 contexts,
                 paths: vec![file],
                 errors: Vec::new(),
+                defines: Vec::new(),
             }
         }
 

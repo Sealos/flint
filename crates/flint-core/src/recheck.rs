@@ -117,7 +117,10 @@ struct Record {
 ///   a provisional definition is pinned stale, and its first check ends it
 ///   ([`Change::Unconfirmed`]): it never moves to the confirmed server.
 ///
-/// A failed file ranked below a context's file cannot change it, so it masks nothing.
+/// A failed file ranked below a context's file cannot change which definition wins, so it
+/// masks nothing by rank. It masks a removal only if it defined the context too (a shadowed
+/// definition) when it last loaded: removing the winning one then leaves its own, unknown for
+/// now. A failure in a file never known to define the context masks nothing.
 ///
 /// What a load shows but cannot confirm never replaces confirmed history. A context first seen
 /// that way (a file before it already unreadable at startup) is recorded as unconfirmed, with
@@ -126,6 +129,8 @@ struct Record {
 #[derive(Debug, Default)]
 pub(crate) struct ContextHistory {
     records: HashMap<String, Record>,
+    /// The context names each file defined when it last loaded, shadowed ones included.
+    defines: HashMap<PathBuf, HashSet<String>>,
     /// The last generation handed out; generations are unique across contexts.
     last: u64,
 }
@@ -141,6 +146,23 @@ impl ContextHistory {
         let masked = |path: &Path, or_at: bool| match (first_failed, rank(path)) {
             (Some(failed), Some(at)) => failed < at || (or_at && failed == at),
             _ => false,
+        };
+        // What each file defines, as of its last load. A file that no longer exists defines
+        // nothing; a failed one keeps what it defined last.
+        let failed: Vec<&Path> = loaded.errors.iter().map(|(p, _)| p.as_path()).collect();
+        self.defines
+            .retain(|path, _| failed.contains(&path.as_path()));
+        for (path, names) in &loaded.defines {
+            self.defines
+                .insert(path.clone(), names.iter().cloned().collect());
+        }
+        // A failed file known to define `name` (shadowed, when it last loaded) may define it
+        // still. A failed file that never loaded is unknown, and masks only by rank.
+        let defines = &self.defines;
+        let known_in_failed = |name: &str| {
+            failed
+                .iter()
+                .any(|f| defines.get(*f).is_some_and(|names| names.contains(name)))
         };
         let mut seen = HashSet::new();
         for info in &loaded.contexts {
@@ -186,7 +208,11 @@ impl ContextHistory {
             }
         }
         for (name, r) in &mut self.records {
-            if r.present && !seen.contains(name.as_str()) && !masked(&r.source, true) {
+            if r.present
+                && !seen.contains(name.as_str())
+                && !masked(&r.source, true)
+                && !known_in_failed(name)
+            {
                 self.last += 1;
                 r.present = false;
                 r.generation = self.last;
@@ -301,7 +327,25 @@ mod tests {
 
     /// A load of the files `a`, `b` and `c`, in that order: each context with its server and
     /// the file that won it, and the files that failed to load.
+    /// What each file that loaded defines is taken from `contexts` (no shadowed names); see
+    /// [`load_shadowing`] for those.
     fn load(contexts: &[(&str, Option<&str>, &str)], failed: &[&str]) -> LoadedKubeconfig {
+        let defines = ["a", "b", "c"]
+            .into_iter()
+            .filter(|f| !failed.contains(f))
+            .map(|f| {
+                let names = contexts.iter().filter(|c| c.2 == f).map(|c| c.0.to_owned());
+                (PathBuf::from(f), names.collect())
+            })
+            .collect();
+        load_shadowing(contexts, failed, defines)
+    }
+
+    fn load_shadowing(
+        contexts: &[(&str, Option<&str>, &str)],
+        failed: &[&str],
+        defines: Vec<(PathBuf, Vec<String>)>,
+    ) -> LoadedKubeconfig {
         let contexts = contexts
             .iter()
             .map(|&(name, server, file)| crate::kubeconfig::ContextInfo {
@@ -322,6 +366,7 @@ mod tests {
                 .iter()
                 .map(|f| (PathBuf::from(f), "did not parse".to_owned()))
                 .collect(),
+            defines,
         }
     }
 
@@ -492,6 +537,52 @@ mod tests {
         h.record(&load(&[("main", STAGING, "c")], &["a"]));
         h.record(&load(&[], &["a"]));
         assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
+    }
+
+    // covers UP-06: `main` in `a` shadows a `main` on the same server in `c`. When `a` drops it
+    // while `c` can't be read, `c` may still define it: not a removal. A file that failed but
+    // never defined it masks nothing.
+    #[test]
+    fn a_shadowed_definition_in_a_failed_file_masks_a_removal() {
+        let both = |main_in_a: bool| {
+            let a = if main_in_a {
+                vec!["main".to_owned()]
+            } else {
+                vec![]
+            };
+            vec![
+                (PathBuf::from("a"), a),
+                (PathBuf::from("b"), vec!["other".to_owned()]),
+                (PathBuf::from("c"), vec!["main".to_owned()]),
+            ]
+        };
+        let mut h = ContextHistory::default();
+        h.record(&load_shadowing(
+            &[("main", STAGING, "a"), ("other", PROD, "b")],
+            &[],
+            both(true),
+        ));
+        let pin = h.pin("main", STAGING);
+        let mut without_c = both(false);
+        without_c.pop();
+        h.record(&load_shadowing(&[("other", PROD, "b")], &["c"], without_c));
+        assert_eq!(h.check(Pinned::Shell, "main", &pin), None);
+
+        // `b` failing instead, which never defined `main`, masks nothing.
+        let mut h = ContextHistory::default();
+        h.record(&load_shadowing(
+            &[("main", STAGING, "a"), ("other", PROD, "b")],
+            &[],
+            both(true),
+        ));
+        let pin = h.pin("main", STAGING);
+        // `a` and `c` both drop it.
+        let dropped = vec![(PathBuf::from("a"), vec![]), (PathBuf::from("c"), vec![])];
+        h.record(&load_shadowing(&[], &["b"], dropped));
+        assert_eq!(
+            h.check(Pinned::Shell, "main", &pin),
+            Some(reason(Pinned::Shell, "main", Change::Removed))
+        );
     }
 
     /// Polls `recheck` once; a check it starts takes the next of `answers`.

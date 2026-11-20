@@ -1916,6 +1916,29 @@ mod tests {
         );
     }
 
+    // covers UP-06: both files define `dev` on the same server. The first drops it while the
+    // second, whose `dev` it shadowed, is caught half-written: the second may still define it,
+    // so no session ends.
+    #[tokio::test]
+    async fn a_shadowed_definition_in_a_half_written_file_ends_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &yaml).await;
+        let pin = manager.contexts.pin_confirmed("dev");
+        let without_dev = "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\n";
+        std::fs::write(dir.path().join("second"), &yaml[..yaml.len() / 2]).unwrap();
+        rewrite_file(&mut manager, &dir.path().join("first"), without_dev).await;
+        assert_eq!(
+            manager.kubeconfig.errors.len(),
+            1,
+            "the second file is broken"
+        );
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+        // Back as it was: `dev` from the second file, on the same server.
+        rewrite_file(&mut manager, &dir.path().join("second"), &yaml).await;
+        assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+    }
+
     // covers UP-06: while the first file defining `dev` is caught half-written, the second
     // file's `dev`, on another server, shows instead. Sessions on the first go on and are
     // never handed the fallback's client, and nothing changed once the file is back.
