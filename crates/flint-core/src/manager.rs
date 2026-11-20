@@ -467,17 +467,26 @@ impl ClusterManager {
                 };
                 let target = cluster::Target::of(&self.kubeconfig.merged, &cluster);
                 tokio::spawn(async move {
-                    let result = read::object_detail_at(
+                    let mut reply = reply;
+                    let read = read::object_detail_at(
                         &client,
                         &info,
                         namespace.as_deref(),
                         &name,
                         &target,
-                    )
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| e.for_target(&target).summary().to_string());
-                    let _ = reply.send(result);
+                        read::DETAIL_TIMEOUT,
+                    );
+                    // A closed pane drops the receiver: stop the read (and its HTTP requests)
+                    // rather than keep the object alive until the server answers.
+                    tokio::select! {
+                        result = read => {
+                            let result = result
+                                .map(Arc::new)
+                                .map_err(|e| e.for_target(&target).summary().to_string());
+                            let _ = reply.send(result);
+                        }
+                        () = reply.closed() => {}
+                    }
                 });
             }
         }

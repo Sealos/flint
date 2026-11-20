@@ -104,6 +104,11 @@ impl std::fmt::Display for KindId {
     }
 }
 
+/// How long one detail read may take: the object, then the events about it. A server that
+/// accepts the request and never answers would otherwise hold the read, and the object it
+/// already fetched, for good (kube sets no read timeout).
+pub const DETAIL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long each discovery request may take. A server that does not answer fails discovery
 /// after this, instead of after kube's 30 s connection timeout.
 pub const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -630,26 +635,44 @@ pub async fn object_detail(
     namespace: Option<&str>,
     name: &str,
 ) -> Result<ObjectDetail, ClusterError> {
+    object_detail_within(client, kind, namespace, name, DETAIL_TIMEOUT).await
+}
+
+/// [`object_detail`] within `deadline` instead of [`DETAIL_TIMEOUT`].
+pub async fn object_detail_within(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+    name: &str,
+    deadline: Duration,
+) -> Result<ObjectDetail, ClusterError> {
     object_detail_at(
         client,
         kind,
         namespace,
         name,
         &crate::cluster::Target::default(),
+        deadline,
     )
     .await
 }
 
-/// [`object_detail`], with `events_error` naming `target`'s server, as safe to show
-/// ([`ClusterError::summary`]).
+/// [`object_detail_within`], with `events_error` naming `target`'s server, as safe to show
+/// ([`ClusterError::summary`]). The object and its events share `deadline`: an object that does
+/// not arrive in time is a timeout error; events that do not are an `events_error`, and the
+/// object is still returned.
 pub(crate) async fn object_detail_at(
     client: &Client,
     kind: &KindInfo,
     namespace: Option<&str>,
     name: &str,
     target: &crate::cluster::Target,
+    deadline: Duration,
 ) -> Result<ObjectDetail, ClusterError> {
-    let object = get(client, kind, namespace, name).await?;
+    let started = tokio::time::Instant::now();
+    let object = tokio::time::timeout(deadline, get(client, kind, namespace, name))
+        .await
+        .map_err(|_| ClusterError::timeout(deadline, None))??;
     let uid = object.metadata.uid.clone();
     let mut value = serde_json::to_value(&object)
         .map_err(|e| ClusterError::Kube(format!("cannot serialize the object: {e}")))?;
@@ -666,18 +689,18 @@ pub(crate) async fn object_detail_at(
     let (events, events_truncated, events_error) = match uid {
         Some(uid) => {
             let selector = format!("involvedObject.uid={uid}");
-            let found = events(
-                client,
-                &EventQuery {
-                    // Events about cluster-scoped objects (nodes) are in some namespace
-                    // ("default" usually), so those are searched in all of them.
-                    namespace: object.metadata.namespace.clone(),
-                    involved: None,
-                    field_selector: Some(selector),
-                    fetch_limit: Some(DETAIL_EVENTS),
-                },
-            )
-            .await;
+            let query = EventQuery {
+                // Events about cluster-scoped objects (nodes) are in some namespace
+                // ("default" usually), so those are searched in all of them.
+                namespace: object.metadata.namespace.clone(),
+                involved: None,
+                field_selector: Some(selector),
+                fetch_limit: Some(DETAIL_EVENTS),
+            };
+            let left = deadline.saturating_sub(started.elapsed());
+            let found = tokio::time::timeout(left, events(client, &query))
+                .await
+                .unwrap_or_else(|_| Err(ClusterError::timeout(deadline, None)));
             match found {
                 Ok((events, truncated)) => (events, truncated, None),
                 // Many roles may read an object but not list events: still show the object.

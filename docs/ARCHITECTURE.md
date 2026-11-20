@@ -133,6 +133,10 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   and its log stream, watch or shell reconnects or ends instead of waiting forever. There is no read timeout: it would
   end healthy streams that are only quiet. kube has no hook for this, so `cluster::build_client` builds kube's client
   stack itself with a keepalive connector.
+- **Detail reads** (the object and the events about it, for the detail pane) have a deadline of their own
+  (`read::DETAIL_TIMEOUT`, 30 s): events that do not arrive in time leave the object shown with why they are missing.
+  The read stops when the pane that asked for it closes or moves to another row (its reply is dropped), so stepping
+  through rows on a stalled server does not leave reads, their connections and the objects they hold behind (#258).
 - One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view.
 - The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
   with their watches running in the background, so switching to them is instant. The least recently used is made
