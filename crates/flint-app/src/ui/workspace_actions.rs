@@ -17,6 +17,7 @@ use gpui_kit::*;
 
 use std::rc::Rc;
 
+use super::super::clusters::ClustersModel;
 use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::Dock;
@@ -835,15 +836,21 @@ impl Workspace {
             Ok((server, previous)) => {
                 let model = self.model.clone();
                 let dialog = expose_dialog(&action.cluster, &server, previous.as_deref());
-                let picker = self.scope_picker(&action.cluster, &AiScope::default(), cx);
+                // A re-pointed context starts from what agents could read at its old server, so
+                // exposing it again never widens it unseen.
+                let saved = previous
+                    .and_then(|_| self.model.read(cx).settings.ai_scope_saved(&action.cluster))
+                    .unwrap_or_default();
+                let picker = self.scope_picker(&action.cluster, &saved, window, cx);
+                let target = (action.cluster.clone(), server);
                 confirm_expose(
                     window,
                     cx,
                     model,
-                    action.cluster.clone(),
-                    server,
+                    target,
                     dialog,
                     picker,
+                    ClustersModel::expose_to_ai,
                 );
             }
             Err(e) => tracing::warn!("{e}"),
@@ -880,15 +887,17 @@ impl Workspace {
             Ok((server, scope)) => {
                 let model = self.model.clone();
                 let dialog = scope_dialog(&action.cluster, &server, &scope);
-                let picker = self.scope_picker(&action.cluster, &scope, cx);
+                let picker = self.scope_picker(&action.cluster, &scope, window, cx);
+                let target = (action.cluster.clone(), server);
+                // Changes the scope only: never exposes a cluster hidden meanwhile.
                 confirm_expose(
                     window,
                     cx,
                     model,
-                    action.cluster.clone(),
-                    server,
+                    target,
                     dialog,
                     picker,
+                    ClustersModel::set_ai_scope,
                 );
             }
             Err(e) => tracing::warn!("{e}"),
@@ -901,6 +910,7 @@ impl Workspace {
         &self,
         cluster: &str,
         scope: &AiScope,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ScopePicker> {
         let kinds = self
@@ -917,7 +927,7 @@ impl Workspace {
         let scope = scope.clone();
         cx.new(|cx| {
             let kinds = kinds.as_ref().map_or(&[][..], |d| d.kinds.as_slice());
-            ScopePicker::new(&namespaces, kinds, &scope, cx)
+            ScopePicker::new(&namespaces, kinds, &scope, window, cx)
         })
     }
 

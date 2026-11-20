@@ -20,8 +20,12 @@ fn scope(namespaces: &[&str], kinds: &[&str]) -> AiScope {
 fn the_pickers_offer_discovery_and_the_scope(cx: &mut TestAppContext) {
     let kinds = discovery(standard_sections()).kinds;
     let saved = scope(&["gone"], &["pods", "gizmos.example.org"]);
-    let picker = cx.new(|cx| ScopePicker::new(&["shop".into(), "demo".into()], &kinds, &saved, cx));
-    picker.read_with(cx, |p, _| {
+    cx.update(gpui_kit::init);
+    let window = cx.add_empty_window();
+    let picker = window.update(|window, cx| {
+        cx.new(|cx| ScopePicker::new(&["shop".into(), "demo".into()], &kinds, &saved, window, cx))
+    });
+    picker.read_with(window, |p, _| {
         let (namespaces, kinds) = p.offered();
         assert_eq!(namespaces, ["demo", "gone", "shop"]);
         let ids: Vec<&str> = kinds.iter().map(|k| k.id.as_str()).collect();

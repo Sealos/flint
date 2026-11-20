@@ -163,3 +163,75 @@ async fn edit_ai_scope_needs_an_exposed_cluster(cx: &mut TestAppContext) {
     }
     assert!(t.find(cx, "scope-ns-demo").is_none());
 }
+
+// covers UP-14: a namespace can be typed by name (a cluster that is not the active one, or
+// whose namespaces cannot be listed); Enter in the field adds it without closing the dialog.
+#[gpui_kit::test]
+async fn a_namespace_can_be_typed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert!(t.find(cx, "scope-ns-empty").is_some());
+    click(cx, &t, "scope-ns-add");
+    t.type_text(cx, " billing ");
+    t.press(cx, "enter");
+    cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        t.has_dialog(cx),
+        "Enter in the field adds, it does not confirm"
+    );
+    assert!(t.find(cx, "scope-ns-billing").is_some());
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["billing"], &[])).await;
+}
+
+// covers UP-14: exposing a re-pointed context again starts from the scope it had, so one click
+// never widens it; saving a scope never exposes a cluster hidden while the dialog was open.
+#[gpui_kit::test]
+async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("settings.toml"),
+        "[[ai_exposed_clusters]]\ncontext = \"alpha\"\nserver = \"https://10.0.0.1:6443\"\n\
+         namespaces = [\"shop\"]\nkinds = [\"pods\"]\n",
+    )
+    .unwrap();
+    let t = crate::ui::support_tests::open_workspace_with(
+        cx,
+        dir.path(),
+        crate::ui::support_tests::alpha_and_beta,
+    )
+    .await;
+    assert_eq!(scope_of(cx, &t), None, "re-pointed: not exposed");
+    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_scope(cx, &t, scope(&["shop"], &["pods"])).await;
+
+    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    t.model.update(cx, |m, _| m.hide_from_ai("alpha".into()));
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.ai_exposed_clusters.is_empty()
+    })
+    .await;
+    click(cx, &t, "scope-ns-all");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).last_error.is_some()
+    })
+    .await;
+    assert!(
+        t.model
+            .read_with(cx, |m, _| m.settings.ai_exposed_clusters.is_empty())
+    );
+    assert!(!t.settings_toml().contains("alpha"));
+}

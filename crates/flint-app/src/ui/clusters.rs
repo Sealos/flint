@@ -137,6 +137,16 @@ impl ClustersModel {
         });
     }
 
+    /// Changes what AI agents may read of `cluster`, exposed at `server`, to `scope`. Never
+    /// exposes it: if it was hidden or re-pointed meanwhile, nothing is written.
+    pub fn set_ai_scope(&mut self, cluster: ClusterId, server: String, scope: AiScope) {
+        self.send(Command::SetAiScope {
+            cluster,
+            server,
+            scope,
+        });
+    }
+
     /// What AI agents may read of `cluster`, if it is exposed at the server it points at now.
     pub fn ai_scope(&self, cluster: &ClusterSummary) -> Option<AiScope> {
         self.settings

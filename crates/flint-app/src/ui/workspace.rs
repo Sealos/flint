@@ -1932,25 +1932,23 @@ fn trust_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogTe
     }
 }
 
-/// Asks before exposing a cluster to AI agents, naming the context and the server it points at.
 /// Asks before exposing a cluster to AI agents (or before changing what they may read of an
 /// exposed one), naming the context and the server it points at, with the scope pickers under
-/// the text. Confirming writes the entry and its scope in one change.
+/// the text. Confirming runs `save` with the context, the server and the scope checked: one
+/// write of the entry and its scope.
 fn confirm_expose(
     window: &mut Window,
     cx: &mut App,
     model: Entity<ClustersModel>,
-    context: String,
-    server: String,
+    (context, server): (String, String),
     dialog: DialogText,
     picker: Entity<ScopePicker>,
+    save: fn(&mut ClustersModel, String, String, AiScope),
 ) {
     let content = picker.clone().into();
     confirm::open_with(window, cx, dialog, Some(content), move |_, cx| {
         let scope = picker.read(cx).scope();
-        model.update(cx, |m, _| {
-            m.expose_to_ai(context.clone(), server.clone(), scope)
-        });
+        model.update(cx, |m, _| save(m, context.clone(), server.clone(), scope));
     });
 }
 
@@ -1986,7 +1984,8 @@ fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogT
     );
     if let Some(previous) = previous {
         text.push_str(&format!(
-            "\n\nThis context was exposed at {previous}, which is a different server."
+            "\n\nThis context was exposed at {previous}, which is a different server. What \
+             agents could read there is checked below."
         ));
     }
     DialogText {

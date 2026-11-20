@@ -13,7 +13,8 @@ use flint_core::KindInfo;
 use flint_core::settings::AiScope;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::input::{self, Input, InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -52,7 +53,11 @@ pub struct ScopePicker {
     kinds: Vec<KindChoice>,
     selected_namespaces: BTreeSet<String>,
     selected_kinds: BTreeSet<String>,
+    /// A namespace typed by name: for a cluster whose namespaces are not listed here (not the
+    /// active one, or one whose namespaces cannot be listed).
+    input: Entity<InputState>,
     focus: FocusHandle,
+    _input: Subscription,
 }
 
 impl ScopePicker {
@@ -62,6 +67,7 @@ impl ScopePicker {
         namespaces: &[String],
         kinds: &[KindInfo],
         scope: &AiScope,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut offered: BTreeSet<String> = namespaces.iter().cloned().collect();
@@ -81,13 +87,36 @@ impl ScopePicker {
             }
         }
         choices.sort_by_key(|c| c.label.to_lowercase());
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Add a namespace by name…"));
+        let on_input = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let namespace = input.read(cx).value().trim().to_owned();
+                this.add_namespace(namespace);
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+                cx.notify();
+            }
+        });
         ScopePicker {
             namespaces: offered.into_iter().collect(),
             kinds: choices,
             selected_namespaces: scope.namespaces.iter().cloned().collect(),
             selected_kinds: scope.kinds.iter().cloned().collect(),
+            input,
             focus: cx.focus_handle(),
+            _input: on_input,
         }
+    }
+
+    /// Offers `namespace` and checks it (a name typed in the field).
+    fn add_namespace(&mut self, namespace: String) {
+        if namespace.is_empty() {
+            return;
+        }
+        if let Err(at) = self.namespaces.binary_search(&namespace) {
+            self.namespaces.insert(at, namespace.clone());
+        }
+        self.selected_namespaces.insert(namespace);
     }
 
     /// The scope checked now.
@@ -212,6 +241,13 @@ impl Render for ScopePicker {
                     .on_click(registry::on_click_in(focus.clone(), ScopeAllNamespaces)),
             )
             .child(
+                div()
+                    // A single-line field passes Enter on once it has added the name; the
+                    // dialog would take it as Confirm. Enter in the field only adds.
+                    .on_action(|_: &input::Enter, _, _| {})
+                    .child(Input::new(&self.input).id("scope-ns-add").small()),
+            )
+            .child(
                 v_flex()
                     .id("scope-ns-list")
                     .max_h(px(150.))
@@ -220,7 +256,8 @@ impl Render for ScopePicker {
                     .when(self.namespaces.is_empty(), |el| {
                         el.child(Self::empty(
                             "scope-ns-empty",
-                            "Select the cluster in Flint to list its namespaces here.",
+                            "Type a namespace above, or select the cluster in Flint to list its \
+                             namespaces here.",
                             cx,
                         ))
                     })
