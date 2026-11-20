@@ -1026,6 +1026,11 @@ impl DockItem for LogView {
     fn tab_focus(&self) -> FocusHandle {
         self.focus.clone()
     }
+
+    /// Not a deleted pod's: there is nothing to reconnect to.
+    fn can_restart(&self) -> bool {
+        matches!(self.snapshot.state, LogState::Ended { pod_deleted, .. } if !pod_deleted)
+    }
 }
 
 impl Render for LogView {

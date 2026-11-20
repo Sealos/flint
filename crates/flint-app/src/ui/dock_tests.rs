@@ -438,10 +438,10 @@ fn dispatch(cx: &mut TestAppContext, window: AnyWindowHandle, name: &str) {
 }
 
 // covers UP-42, UP-45: a failed log tab no longer answers for its request (opening the logs
-// again opens a fresh tab), offers Reconnect, and Reconnect starts the stream again in the same
-// tab, under the same id.
+// again opens a fresh tab), offers Reconnect, and Reconnect starts the stream again in a new
+// tab beside it, which is shown; the failed tab keeps its lines until it is closed.
 #[gpui_kit::test]
-async fn a_failed_log_tab_reconnects_in_place(cx: &mut TestAppContext) {
+async fn a_failed_log_tab_reconnects_beside_itself(cx: &mut TestAppContext) {
     let (core, _dir) = core();
     let (window, dock) = open_dock(cx);
     let (restarts, _subscription) = record_restarts(cx, &dock);
@@ -473,29 +473,67 @@ async fn a_failed_log_tab_reconnects_in_place(cx: &mut TestAppContext) {
         DockTab::Logs(view) => view.downgrade(),
         DockTab::Shell(_) => panic!("a log tab"),
     };
+    let (other, _) = open_shell_in(cx, window, &dock, "web-9");
+    activate(cx, window, id);
     let core2 = core.clone();
-    cx.update_window(window, |_, window, cx| {
-        dock.update(cx, |dock, cx| {
-            dock.replace(
-                id,
-                TabCluster::new("test", None),
-                |window, cx| {
-                    DockTab::Logs(cx.new(|cx| LogView::new(core2, log_request(), window, cx)))
-                },
-                window,
-                cx,
-            )
+    let new = cx
+        .update_window(window, |_, window, cx| {
+            dock.update(cx, |dock, cx| {
+                dock.open_beside(
+                    id,
+                    TabCluster::new("test", None),
+                    |window, cx| {
+                        DockTab::Logs(cx.new(|cx| LogView::new(core2, log_request(), window, cx)))
+                    },
+                    window,
+                    cx,
+                )
+            })
         })
-    })
-    .unwrap();
+        .unwrap()
+        .unwrap();
     draw(cx, window);
     assert_eq!(
         dock.read_with(cx, |d, _| d.tab_ids()),
-        [id],
-        "same place, same id"
+        [id, new, other],
+        "right after the ended tab"
     );
-    assert!(old.upgrade().is_none(), "the old session is dropped");
-    assert_ne!(status(cx), super::dock::TabStatus::Live);
+    assert_eq!(dock.read_with(cx, |d, _| d.active_id()), Some(new));
+    assert!(old.upgrade().is_some(), "the ended tab keeps its output");
+    assert_eq!(status(cx), super::dock::TabStatus::Failed);
+}
+
+// covers UP-45: a deleted pod's ended log tab offers no Reconnect, by key, palette or button:
+// there is nothing to reconnect to.
+#[gpui_kit::test]
+async fn a_deleted_pods_log_tab_does_not_reconnect(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, dock) = open_dock(cx);
+    let (restarts, _subscription) = record_restarts(cx, &dock);
+    let id = open_logs(cx, window, &dock, &core);
+    let DockTab::Logs(view) = dock.read_with(cx, |d, _| d.tab(id).cloned()).unwrap() else {
+        panic!("a log tab")
+    };
+    view.update(cx, |view, cx| {
+        view.stop_streaming();
+        let snapshot = flint_core::LogSnapshot {
+            state: flint_core::LogState::Ended {
+                error: None,
+                pod_deleted: true,
+            },
+            ..(**view.snapshot()).clone()
+        };
+        view.set_snapshot(std::sync::Arc::new(snapshot), cx);
+    });
+    draw(cx, window);
+    assert_eq!(dock.read_with(cx, |d, cx| d.restartable(true, cx)), None);
+    cx.update_window(window, |_, window, cx| {
+        let _ = registry::dispatch("dock::ReconnectLogs", json!(null), window, cx);
+        assert!(window.try_find("log-reconnect").is_none());
+    })
+    .unwrap();
+    draw(cx, window);
+    assert!(restarts.borrow().is_empty());
 }
 
 // covers UP-41: an exited shell offers Restart Shell, which asks for a new session in the same

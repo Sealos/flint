@@ -697,10 +697,10 @@ async fn shells_open_in_the_dock_and_outlive_a_cluster_switch(cx: &mut TestAppCo
     assert!(shell.upgrade().is_none(), "closing a tab ends its session");
 }
 
-// covers UP-41: Restart Shell starts a new shell in the failed tab, in its place and under its
-// id, on the server the context points at now; the old session is dropped.
+// covers UP-41: Restart Shell starts a new shell in a tab beside the failed one and shows it,
+// on the server the context points at now; the failed tab keeps its output.
 #[gpui_kit::test]
-async fn a_failed_shell_restarts_in_its_tab(cx: &mut TestAppContext) {
+async fn a_failed_shell_restarts_beside_itself(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     t.open_pods(cx, &[("demo", "web", 1)]).await;
@@ -726,12 +726,18 @@ async fn a_failed_shell_restarts_in_its_tab(cx: &mut TestAppContext) {
     );
     t.dispatch(cx, "dock::RestartShell", Value::Null).unwrap();
     cx.run_until_parked();
-    let (ids, now) = t.workspace.read_with(cx, |ws, cx| {
+    let (ids, active, now) = t.workspace.read_with(cx, |ws, cx| {
         let dock = ws.dock.read(cx);
-        (dock.tab_ids(), dock.active_terminal().unwrap().downgrade())
+        (
+            dock.tab_ids(),
+            dock.active_id(),
+            dock.active_terminal().unwrap().downgrade(),
+        )
     });
-    assert_eq!(ids, [id], "the same tab");
-    assert!(first.upgrade().is_none(), "the old session is dropped");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], id, "the failed tab stays");
+    assert_eq!(active, Some(ids[1]), "the new shell is shown, beside it");
+    assert!(first.upgrade().is_some(), "the failed tab keeps its output");
     assert_ne!(now.entity_id(), first.entity_id(), "a new session");
 }
 

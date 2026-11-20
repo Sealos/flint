@@ -491,9 +491,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Starts tab `id`'s ended session again in the same tab (Reconnect Logs, Restart Shell):
-    /// on the server its context points at now, refused, saying why, while the cluster is not
-    /// connected.
+    /// Starts tab `id`'s ended session again (Reconnect Logs, Restart Shell) in a new tab beside
+    /// it, keeping the ended one's output: on the server its context points at now, refused,
+    /// saying why, while the cluster is not connected.
     fn restart_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.dock.read(cx).tab(id).map(|t| t.item(cx).tab_key()) else {
             return;
@@ -510,7 +510,7 @@ impl Workspace {
         let cluster = self.tab_cluster(key.context(), cx);
         let core = self.model.read(cx).core().clone();
         self.dock.update(cx, |dock, cx| {
-            dock.replace(
+            dock.open_beside(
                 id,
                 cluster,
                 move |window, cx| match key {

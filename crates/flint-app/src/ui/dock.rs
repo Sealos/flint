@@ -87,6 +87,11 @@ pub trait DockItem {
     fn tab_status(&self) -> TabStatus;
     /// Focused when the tab is shown.
     fn tab_focus(&self) -> FocusHandle;
+    /// Whether Reconnect Logs or Restart Shell can start its session again: once it ended or
+    /// failed.
+    fn can_restart(&self) -> bool {
+        matches!(self.tab_status(), TabStatus::Ended | TabStatus::Failed)
+    }
 }
 
 /// A tab's view, by kind.
@@ -144,7 +149,7 @@ pub enum DockEvent {
     /// main area.
     Blurred,
     /// Reconnect Logs or Restart Shell asked for tab `0`'s session to start again: the
-    /// workspace builds the new session ([`Dock::replace`]).
+    /// workspace builds the new session, in a tab beside it ([`Dock::open_beside`]).
     Restart(u64),
 }
 
@@ -249,42 +254,39 @@ impl Dock {
             (tab, logs),
             (DockTab::Logs(_), true) | (DockTab::Shell(_), false)
         );
-        let ended = matches!(
-            tab.item(cx).tab_status(),
-            TabStatus::Ended | TabStatus::Failed
-        );
-        (kind && ended).then_some(id)
+        (kind && tab.item(cx).can_restart()).then_some(id)
     }
 
-    /// Replaces tab `id`'s session with a new one built by `build`, in the same place and under
-    /// the same id, now on `cluster` (Reconnect Logs, Restart Shell). The old view is dropped,
-    /// which ends its session.
-    pub fn replace(
+    /// Opens a new session built by `build`, on `cluster`, in a tab right after tab `id`, and
+    /// shows it (Reconnect Logs, Restart Shell). The ended tab stays, with its lines or
+    /// scrollback, until it is closed: starting again never discards output. Returns the new
+    /// tab's id.
+    pub fn open_beside(
         &mut self,
         id: u64,
         cluster: TabCluster,
         build: impl FnOnce(&mut Window, &mut Context<Self>) -> DockTab,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(ix) = self.tabs.iter().position(|t| t.id == id) else {
-            return;
-        };
-        let had_focus = self.focus.contains_focused(window, cx);
+    ) -> Option<u64> {
+        let ix = self.tabs.iter().position(|t| t.id == id)?;
         let tab = build(window, cx);
+        let new = self.next_id;
+        self.next_id += 1;
         let shown = tab_shown(&tab, cx);
-        self.tabs[ix] = Tab {
-            id,
-            _observe: observe(&tab, id, cx),
-            tab,
-            cluster,
-            repointed: false,
-            shown,
-        };
-        if self.active == Some(id) && had_focus {
-            self.focus_active(window, cx);
-        }
-        cx.notify();
+        self.tabs.insert(
+            ix + 1,
+            Tab {
+                id: new,
+                _observe: observe(&tab, new, cx),
+                tab,
+                cluster,
+                repointed: false,
+                shown,
+            },
+        );
+        self.activate(new, window, cx);
+        Some(new)
     }
 
     /// Tab `id`'s title and cluster, as its accessible label names them.
