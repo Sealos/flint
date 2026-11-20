@@ -718,3 +718,103 @@ async fn an_object_missing_only_from_an_old_list_opens(cx: &mut TestAppContext) 
     t.feed_list(cx, fresh).await;
     assert_eq!(t.selected(cx), None, "the cleared pick stayed armed");
 }
+
+// covers UP-31: another cluster becoming active while the switcher is open lists that
+// cluster anew, keeping what was typed: the first cluster's rows do not stay to be opened on
+// it. An Enter listed on a cluster no longer active is refused.
+#[gpui_kit::test]
+async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    let _stored = alpha_with_objects(cx, &t).await;
+    open_switcher(cx, &t).await;
+    t.type_text(cx, "web");
+    let before = shown(cx, &t);
+    assert_eq!(labels(&before), ["demo/web", "demo/web-7d9f"]);
+    assert_eq!(before.rows[0].cluster.as_deref(), Some("alpha"));
+    // beta becomes active, and serves the same kinds.
+    t.dispatch(
+        cx,
+        "workspace::SelectCluster",
+        serde_json::json!({"cluster": "beta"}),
+    )
+    .unwrap();
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "beta".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                standard_sections(),
+            ))),
+            error: None,
+        },
+    );
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace.read(cx).shown_cluster() == Some("beta")
+    })
+    .await;
+    let after = shown(cx, &t);
+    assert_eq!(after.mode, "resources");
+    assert_eq!(after.query, "web", "what was typed is kept");
+    assert!(
+        after
+            .rows
+            .iter()
+            .all(|r| r.cluster.as_deref() == Some("beta")),
+        "{after:?}"
+    );
+    assert!(labels(&after).iter().all(|l| !l.contains("web-7d9f")));
+    // An Enter from alpha's rows, arriving now: refused, nothing opens on beta.
+    t.focus_workspace(cx);
+    let refused = t.dispatch(
+        cx,
+        "workspace::OpenObject",
+        serde_json::json!({
+            "kind": "pods", "namespace": "demo", "name": "web-7d9f",
+            "cluster": "alpha", "server": t.server,
+        }),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(crate::ui::registry::ActionError::Rejected { .. })
+        ),
+        "{refused:?}"
+    );
+    assert!(t.list(cx).is_none());
+    let refused = t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "pods", "cluster": "alpha", "server": t.server}),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+// covers UP-31: the switcher opened before discovery lists the kinds once it arrives, with
+// what was typed kept.
+#[gpui_kit::test]
+async fn kinds_arrive_in_an_open_switcher(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.activate(cx, "alpha").await;
+    open_switcher(cx, &t).await;
+    assert_eq!(
+        shown(cx, &t).footer.as_deref(),
+        Some("No kinds (discovery has not finished)")
+    );
+    t.type_text(cx, "pods");
+    t.feed(
+        cx,
+        flint_core::Event::DiscoveryChanged {
+            cluster: "alpha".into(),
+            discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
+                standard_sections(),
+            ))),
+            error: None,
+        },
+    );
+    let switcher = shown(cx, &t);
+    assert_eq!(switcher.query, "pods");
+    assert_eq!(labels(&switcher)[0], "Pods");
+}

@@ -288,8 +288,10 @@ impl NavPanel {
                 el.text_color(theme.muted_foreground.opacity(0.6))
             })
             .when(listable, |el| {
-                el.cursor_pointer()
-                    .on_click(registry::on_click(OpenView { kind: open }))
+                el.cursor_pointer().on_click(registry::on_click(OpenView {
+                    kind: open,
+                    ..Default::default()
+                }))
             })
             // The open kind is marked with the accent, as selections are.
             .relative()

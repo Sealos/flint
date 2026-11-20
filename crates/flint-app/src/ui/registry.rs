@@ -330,6 +330,13 @@ pub struct UntrustCluster {
 #[serde(deny_unknown_fields)]
 pub struct OpenView {
     pub kind: String,
+    /// Only if this is still the active cluster (its context name), as the resource switcher
+    /// listed it; refused otherwise.
+    #[serde(default)]
+    pub cluster: Option<String>,
+    /// With `cluster`: and its context still points at this API server.
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 /// Open the list of a kind on the active cluster with one of its objects selected, and its
@@ -342,6 +349,11 @@ pub struct OpenObject {
     #[serde(default)]
     pub namespace: Option<String>,
     pub name: String,
+    /// Only if this is still the active cluster, as for [`OpenView`].
+    #[serde(default)]
+    pub cluster: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 /// Open or close a navigation section, by its title.
@@ -2653,7 +2665,8 @@ pub mod tests {
         assert_eq!(
             action.as_any().downcast_ref::<OpenView>(),
             Some(&OpenView {
-                kind: "pods".into()
+                kind: "pods".into(),
+                ..Default::default()
             })
         );
         let select = find("resource_list::SelectRow").unwrap();

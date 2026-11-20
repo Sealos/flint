@@ -192,6 +192,8 @@ pub struct Workspace {
     palette: Option<(Entity<CommandPalette>, Subscription)>,
     /// Reads the objects in memory for the resource switcher.
     _switcher: Task<()>,
+    /// What the open switcher was built from, to list anew when it changes.
+    switcher_key: Option<keys::SwitcherKey>,
     /// The cluster sidebar's own focus, for its keys (UP-33).
     sidebar_focus: FocusHandle,
     /// Scrolls the cluster rows, so the keyboard cursor's row is brought into view.
@@ -261,6 +263,7 @@ impl Workspace {
             NavEvent::Open(kind) => {
                 let open = OpenView {
                     kind: kind.to_string(),
+                    ..Default::default()
                 };
                 this.open_view(&open, window, cx);
             }
@@ -338,6 +341,7 @@ impl Workspace {
             dock,
             palette: None,
             _switcher: Task::ready(()),
+            switcher_key: None,
             sidebar_focus: cx.focus_handle(),
             sidebar_cursor: None,
             sidebar_scroll: ScrollHandle::new(),
@@ -771,6 +775,8 @@ impl Workspace {
                 cx,
             )
         });
+        // An open switcher follows the active cluster and its discovery.
+        self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
             return;
         };

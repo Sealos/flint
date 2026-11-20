@@ -161,6 +161,9 @@ enum Row {
 pub struct SwitcherScope {
     /// The active cluster, as the rows name it; `None` with no cluster active.
     pub cluster: Option<SharedString>,
+    /// The active cluster's context name and API server: an Enter passes them on, so the
+    /// workspace refuses it once another cluster (or server) is active.
+    pub cluster_id: Option<(String, Option<String>)>,
     /// The kinds, at first; the objects come through [`CommandPalette::set_index`].
     pub index: Index,
     /// The objects are being read from the stores.
@@ -175,6 +178,7 @@ pub struct SwitcherScope {
 struct Resources {
     /// The active cluster, as the rows name it; `None` with no cluster active.
     cluster: Option<SharedString>,
+    cluster_id: Option<(String, Option<String>)>,
     index: Arc<Index>,
     /// The objects are still being read from the stores.
     loading: bool,
@@ -183,6 +187,21 @@ struct Resources {
     search: Search,
     /// How many items the query matched, listed or not.
     matched: usize,
+}
+
+impl Resources {
+    fn of(scope: SwitcherScope) -> Self {
+        Resources {
+            cluster: scope.cluster,
+            cluster_id: scope.cluster_id,
+            index: Arc::new(scope.index),
+            loading: scope.loading,
+            discovery_failed: scope.discovery_failed,
+            on_view: scope.on_view,
+            search: Search::default(),
+            matched: 0,
+        }
+    }
 }
 
 pub struct CommandPalette {
@@ -272,15 +291,7 @@ impl CommandPalette {
             window,
             cx,
         );
-        palette.resources = Some(Resources {
-            cluster: scope.cluster,
-            index: Arc::new(scope.index),
-            loading: scope.loading,
-            discovery_failed: scope.discovery_failed,
-            on_view: scope.on_view,
-            search: Search::default(),
-            matched: 0,
-        });
+        palette.resources = Some(Resources::of(scope));
         palette.step = Step::Resources;
         palette.set_query(String::new(), SEARCH_RESOURCES.to_owned(), window, cx);
         palette
@@ -328,6 +339,16 @@ impl CommandPalette {
         self.chosen = at.is_some();
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
+    }
+
+    /// The switcher over another scope (another cluster became active, or its discovery
+    /// arrived): what it lists starts over, with what was typed kept.
+    pub fn rescope(&mut self, scope: SwitcherScope, cx: &mut Context<Self>) {
+        if self.resources.is_none() {
+            return;
+        }
+        self.resources = Some(Resources::of(scope));
+        self.refilter(cx);
     }
 
     /// What the palette searches.
@@ -668,10 +689,19 @@ impl CommandPalette {
                 };
                 let item = &resources.index.items[item as usize];
                 let kind = resources.index.kind_of(item).id.to_string();
+                // The cluster the row was listed on: refused if another is active by now.
+                let (cluster, server) = match &resources.cluster_id {
+                    Some((cluster, server)) => (Some(cluster.as_str()), server.as_deref()),
+                    None => (None, None),
+                };
                 let (name, args) = match &item.object {
                     None => (
                         OpenView::name_for_type(),
-                        serde_json::json!({ "kind": kind }),
+                        serde_json::json!({
+                            "kind": kind,
+                            "cluster": cluster,
+                            "server": server,
+                        }),
                     ),
                     Some(object) => (
                         OpenObject::name_for_type(),
@@ -679,6 +709,8 @@ impl CommandPalette {
                             "kind": kind,
                             "namespace": object.namespace.as_deref(),
                             "name": &*object.name,
+                            "cluster": cluster,
+                            "server": server,
                         }),
                     ),
                 };

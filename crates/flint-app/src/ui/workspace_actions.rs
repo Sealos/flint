@@ -771,6 +771,7 @@ impl Workspace {
     }
 
     fn check_open_view(&self, action: &OpenView, cx: &App) -> Result<(), ActionError> {
+        self.check_listed_on::<OpenView>(action.cluster.as_deref(), action.server.as_deref(), cx)?;
         match self.nav_entry(&action.kind, cx) {
             Some(_) => Ok(()),
             None => Err(ActionError::rejected::<OpenView>(format!(
@@ -967,6 +968,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(e) = self.check_listed_on::<OpenView>(
+            action.cluster.as_deref(),
+            action.server.as_deref(),
+            cx,
+        ) {
+            tracing::warn!("{e}");
+            return;
+        }
         match self.nav_entry(&action.kind, cx) {
             Some(entry) => self.open_kind(&entry, window, cx),
             None => tracing::warn!("{}", self.check_open_view(action, cx).unwrap_err()),

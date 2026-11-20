@@ -227,6 +227,11 @@ impl Workspace {
         if action.name.trim().is_empty() {
             return Err(ActionError::rejected::<OpenObject>("empty object name"));
         }
+        self.check_listed_on::<OpenObject>(
+            action.cluster.as_deref(),
+            action.server.as_deref(),
+            cx,
+        )?;
         match self.nav_entry(&action.kind, cx) {
             Some(_) => Ok(()),
             None => Err(ActionError::rejected::<OpenObject>(format!(
@@ -281,20 +286,13 @@ impl Workspace {
         self.toggle_palette_in(Mode::Resources, window, cx);
     }
 
-    /// The resource switcher, from `previous`: the active cluster's kinds at once, and the
-    /// objects its watches hold once read off the UI thread. Nothing here reaches the API
-    /// server: the core reads its stores without subscribing (`CoreHandle::stored_snapshots`).
-    pub(super) fn new_switcher(
-        &mut self,
-        previous: FocusHandle,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<CommandPalette> {
+    /// What the resource switcher lists now: the active cluster and its listable kinds (the
+    /// objects come later, [`Workspace::load_switcher`]), and what it was built from, to see
+    /// when that changes.
+    fn switcher_scope(&self, cx: &App) -> (SwitcherScope, Vec<NavEntry>, SwitcherKey) {
         let model = self.model.read(cx);
-        let entries: Vec<NavEntry> = self
-            .cluster
-            .as_ref()
-            .and_then(|c| model.discovery.get(c))
+        let discovered = self.cluster.as_ref().and_then(|c| model.discovery.get(c));
+        let entries: Vec<NavEntry> = discovered
             .and_then(|d| d.discovery.as_ref())
             .map(|d| {
                 d.navigation
@@ -304,34 +302,53 @@ impl Workspace {
                     .collect()
             })
             .unwrap_or_default();
-        let core = model.core().clone();
-        let discovery_failed = self
-            .cluster
-            .as_ref()
-            .and_then(|c| model.discovery.get(c))
-            .is_some_and(|d| d.discovery.is_none() && d.error.is_some());
+        let discovery_failed =
+            discovered.is_some_and(|d| d.discovery.is_none() && d.error.is_some());
         let on_view = self
             .cluster
             .as_deref()
             .is_some_and(|c| model.settings.watch_mode_for(c) == WatchMode::OnView);
-        let cluster = self.cluster.clone();
-        let label = cluster
-            .as_deref()
-            .map(|c| SharedString::from(display::short_name(c).to_string()));
-        let index = Index::new(&entries, &[]);
-        let loading = cluster.is_some() && !entries.is_empty();
-        let fallback = self.focus.clone();
-        let scope = SwitcherScope {
-            cluster: label,
-            index,
-            loading,
+        let cluster_id = self.cluster.as_ref().map(|c| {
+            let server = model
+                .clusters
+                .iter()
+                .find(|s| s.info.name == *c)
+                .and_then(|s| s.info.server.clone());
+            (c.to_string(), server)
+        });
+        let key = SwitcherKey {
+            cluster: cluster_id.clone(),
+            kinds: entries.iter().map(|e| e.id.clone()).collect(),
             discovery_failed,
             on_view,
         };
-        let palette = cx.new(|cx| CommandPalette::switcher(previous, fallback, scope, window, cx));
-        self._switcher = match cluster.filter(|_| loading) {
+        let scope = SwitcherScope {
+            cluster: self
+                .cluster
+                .as_deref()
+                .map(|c| SharedString::from(display::short_name(c).to_string())),
+            cluster_id,
+            index: Index::new(&entries, &[]),
+            loading: self.cluster.is_some() && !entries.is_empty(),
+            discovery_failed,
+            on_view,
+        };
+        (scope, entries, key)
+    }
+
+    /// Reads the objects in memory for `palette`, the switcher, off the UI thread. Nothing here
+    /// reaches the API server: the core reads its stores without subscribing
+    /// (`CoreHandle::stored_snapshots`).
+    fn load_switcher(
+        &mut self,
+        palette: &Entity<CommandPalette>,
+        entries: Vec<NavEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let cluster = self.cluster.clone().filter(|_| !entries.is_empty());
+        self._switcher = match cluster {
             Some(cluster) => {
-                let stored = core.stored_snapshots(&cluster);
+                let stored = self.model.read(cx).core().stored_snapshots(&cluster);
                 let palette = palette.downgrade();
                 cx.spawn(async move |_, cx| {
                     let snapshots = stored.await;
@@ -343,8 +360,75 @@ impl Workspace {
             }
             None => Task::ready(()),
         };
+    }
+
+    /// The resource switcher, from `previous`: the active cluster's kinds at once, and the
+    /// objects its watches hold once read.
+    pub(super) fn new_switcher(
+        &mut self,
+        previous: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<CommandPalette> {
+        let (scope, entries, key) = self.switcher_scope(cx);
+        let fallback = self.focus.clone();
+        let palette = cx.new(|cx| CommandPalette::switcher(previous, fallback, scope, window, cx));
+        self.load_switcher(&palette, entries, cx);
+        self.switcher_key = Some(key);
         palette
     }
+
+    /// Keeps an open switcher on what is active: when another cluster becomes active, or the
+    /// active one's discovery arrives (or fails, or its watch mode changes), it lists anew,
+    /// with what was typed kept. Rows of the cluster before never stay to be opened on the new
+    /// one.
+    pub(super) fn refresh_switcher(&mut self, cx: &mut Context<Self>) {
+        let Some((palette, _)) = &self.palette else {
+            return;
+        };
+        let palette = palette.clone();
+        if palette.read(cx).mode() != Mode::Resources {
+            return;
+        }
+        let (scope, entries, key) = self.switcher_scope(cx);
+        if self.switcher_key.as_ref() == Some(&key) {
+            return;
+        }
+        palette.update(cx, |p, cx| p.rescope(scope, cx));
+        self.load_switcher(&palette, entries, cx);
+        self.switcher_key = Some(key);
+    }
+
+    /// [`OpenView`] and [`OpenObject`] from the switcher name the cluster their row was listed
+    /// on: refused once another cluster, or another API server, is active.
+    pub(super) fn check_listed_on<A: Action>(
+        &self,
+        cluster: Option<&str>,
+        server: Option<&str>,
+        cx: &App,
+    ) -> Result<(), ActionError> {
+        let Some(cluster) = cluster else {
+            return Ok(());
+        };
+        let active_server = self
+            .cluster_summary(cluster, cx)
+            .and_then(|c| c.info.server.as_deref());
+        if self.cluster.as_deref() != Some(cluster) || active_server != server {
+            return Err(ActionError::rejected::<A>(format!(
+                "listed on {cluster}, which is not the active cluster any more"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// What an open switcher was built from: when it changes, the switcher lists anew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ui) struct SwitcherKey {
+    cluster: Option<(String, Option<String>)>,
+    kinds: Vec<KindId>,
+    discovery_failed: bool,
+    on_view: bool,
 }
 
 #[cfg(test)]
