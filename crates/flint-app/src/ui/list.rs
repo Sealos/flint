@@ -129,6 +129,13 @@ pub struct ResourceList {
     /// Whether the last recompute applied the sort: its column was drawn then. When that
     /// changes with the layout (Wide toggled, the pane resized), the rows are sorted again.
     sort_drawn: bool,
+    /// Tests: each filter-and-sort job waits for a permit from here before it finishes
+    /// ([`ResourceList::hold_computes`]).
+    #[cfg(test)]
+    compute_gate: Option<async_channel::Receiver<()>>,
+    /// Tests: how many filter-and-sort jobs have come back (applied or dropped).
+    #[cfg(test)]
+    computes_done: usize,
     focus: FocusHandle,
     filter: Entity<InputState>,
     /// A row's context menu, for kinds that have one (pods and workloads: UP-47).
@@ -222,6 +229,10 @@ impl ResourceList {
             dropped_wide: 0,
             laid_out_width: None,
             sort_drawn: false,
+            #[cfg(test)]
+            compute_gate: None,
+            #[cfg(test)]
+            computes_done: 0,
             focus: cx.focus_handle(),
             filter,
             row_menu: None,
@@ -264,6 +275,21 @@ impl ResourceList {
     #[cfg(test)]
     pub fn shown(&self) -> (&Arc<KindSnapshot>, usize) {
         (&self.shown, self.rows.len())
+    }
+
+    /// Holds every filter-and-sort job started from now on until the test sends a permit on the
+    /// returned sender, one job per permit, so a test can act while a job is pending.
+    #[cfg(test)]
+    pub fn hold_computes(&mut self) -> async_channel::Sender<()> {
+        let (permits, gate) = async_channel::unbounded();
+        self.compute_gate = Some(gate);
+        permits
+    }
+
+    /// How many filter-and-sort jobs have come back, applied or dropped, for tests.
+    #[cfg(test)]
+    pub fn computes_done(&self) -> usize {
+        self.computes_done
     }
 
     /// Drops the core subscription, so a test can feed snapshots by hand.
@@ -359,7 +385,13 @@ impl ResourceList {
         let restart = std::mem::take(&mut self.remeasure);
         let namespaces = self.query.namespaces.clone();
         let job_snapshot = snapshot.clone();
+        #[cfg(test)]
+        let gate = self.compute_gate.clone();
         let job = cx.background_spawn(async move {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.recv().await;
+            }
             let rows = view.await;
             let widths = list_model::measure_columns(&job_snapshot, &rows, unix_now());
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
@@ -373,6 +405,10 @@ impl ResourceList {
             let (rows, widths, scoped, uid, position) = job.await;
             let _ = this.update(cx, |list, cx| {
                 list.computing = false;
+                #[cfg(test)]
+                {
+                    list.computes_done += 1;
+                }
                 // Sorted for a layout that has changed since (Wide toggled, the pane resized, the
                 // sort clicked): drawing these rows under the new header would show one order
                 // with the other's arrow. Sort again for the layout now.

@@ -431,10 +431,13 @@ async fn rows_and_their_sort_arrow_always_agree(cx: &mut TestAppContext) {
     let default = (None, vec!["db".into(), "api".into(), "web".into()]);
     expect_rows(cx, &t, by_node.clone()).await;
 
-    // A new snapshot is sorted by Node while the pane narrows and leaves Node out: the rows
-    // sorted for the old layout are dropped, not shown under the new header. Every state that
-    // shows the new snapshot, one task at a time, is one of the two.
+    // A new snapshot is sorted by Node while the pane narrows and leaves Node out. The sort is
+    // held until the narrow layout is drawn, then the jobs are let through one at a time: the
+    // rows sorted for the old layout are dropped, never shown under the new header.
     let list = t.list(cx).unwrap();
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    let done = |cx: &mut TestAppContext| list.read_with(cx, |list, _| list.computes_done());
+    let before = done(cx);
     let newer = Arc::new(KindSnapshot {
         version: 2,
         ..(*pods_with_nodes()).clone()
@@ -444,18 +447,17 @@ async fn rows_and_their_sort_arrow_always_agree(cx: &mut TestAppContext) {
         t.window,
         gpui_kit::size(gpui_kit::px(560.), gpui_kit::px(700.)),
     );
-    // The narrow layout is drawn (twice: the width is known after the first layout) before the
-    // sort started above finishes.
+    // Drawn twice: the width is known after the first layout.
     for _ in 0..2 {
         cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
             .unwrap();
+        cx.run_until_parked();
     }
-    assert_eq!(
-        list.read_with(cx, |list, _| list.shown().0.version),
-        1,
-        "the sort is still running"
-    );
-    let mut seen = Vec::new();
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.try_find("sort-Node").is_none()
+    })
+    .await;
+    assert_eq!(done(cx), before, "the sort is held");
     let state = |cx: &mut TestAppContext| {
         list.read_with(cx, |list, _| {
             let version = list.shown().0.version;
@@ -464,15 +466,26 @@ async fn rows_and_their_sort_arrow_always_agree(cx: &mut TestAppContext) {
             (version, (state.sort, rows))
         })
     };
-    while cx.executor().tick() {
-        let (version, state) = state(cx);
+    // The new snapshot's states, after each job comes back, until it is drawn sorted for the
+    // narrow layout.
+    let mut seen = Vec::new();
+    for job in 1..=5 {
+        permits.try_send(()).unwrap();
+        let list = list.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            list.read(cx).computes_done() >= before + job
+        })
+        .await;
+        cx.run_until_parked();
+        let (version, shown) = state(cx);
         if version == 2 {
-            seen.push(state);
+            seen.push(shown.clone());
+            if shown == default {
+                break;
+            }
         }
     }
-    cx.run_until_parked();
-    expect_rows(cx, &t, default.clone()).await;
-    assert!(!seen.is_empty());
+    assert_eq!(seen.last(), Some(&default), "seen: {seen:?}");
     for state in &seen {
         assert!(*state == by_node || *state == default, "drawn: {state:?}");
     }
