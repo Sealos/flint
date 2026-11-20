@@ -785,20 +785,26 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     in the palette's footer instead of closing it.
   - Arguments: an action that takes them (Select Cluster…, Open Kind…, Sort by Column…, Open Logs by Label Selector…,
     the namespace and container ones) asks for each required one in turn: a list of the clusters, namespaces, kinds
-    the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label selector). A listed
-    value equal to the text typed (ignoring case) comes first; else, where a typed value is allowed (a namespace not
-    listed, a selector), the text typed is the first row and selected. Typed text is trimmed, a picked value never is.
-    Open Container Shell… offers only the running app containers a shell can open in (a workload's first ready pod's),
-    Open Container Logs… every container. An empty pick list says so ("No clusters", "No containers"). Optional
-    arguments keep their defaults. Each step starts with focus in the field, also after a click on a row. The heading
-    shows the action and the picks so far; Esc, or Backspace in the empty field, goes back a step keeping the earlier
-    picks, and back to the actions with the query that found it; a click outside closes the palette. A refusal at the
-    last step keeps the earlier picks, so Enter retries with them.
+    the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label selector). Values
+    equal to the text typed come first: a stored value as typed, then ignoring case, then a shown label (so contexts
+    `cluster/prod` and an EKS ARN shown as `cluster/prod` do not collide, nor `ABC` and `abc`), and the action always
+    gets the stored value; else, where a typed value is allowed (a namespace not listed, a selector), the text typed
+    is the first row and selected. Typed text is trimmed, a picked value never is. Open Container Shell… offers only
+    the running app containers a shell can open in (a workload's first ready pod's), Open Container Logs… every
+    container. An empty pick list says so ("No clusters", "No containers"). Optional arguments keep their defaults.
+    Each step starts with focus in the field, also after a click on a row. The heading shows the action and the picks
+    so far; Esc, or Backspace in the empty field, goes back a step keeping the earlier picks, and back to the actions
+    with the query that found it; a click outside closes the palette. A refusal at the last step keeps the earlier
+    picks, so Enter retries with them. An open step's choices follow the data it lists (the clusters, discovery, the
+    namespaces, the shown pod), keeping the query and the selected value: the palette observes the models already in
+    memory, and fetches nothing.
   - The Edit actions are listed only where they act: in a text field, or in a shell tab, which handles Edit > Copy and
     Edit > Paste with its own copy and paste (the paste checks included). gpui-component's root handles Copy for text
     selected anywhere, so availability alone would list it everywhere.
   - The window going to the background (Cmd-Tab, Hide) keeps the palette open, as a dialog stays; focus moving
     elsewhere in the window closes it.
+  - Opening it dismisses an open context menu or drop-down, as Esc would, so none stays drawn over it. When the menu
+    gives focus back, the palette runs from there; else from the workspace.
   - Speed: matching runs when the query changes, never while drawing, over labels prepared when the palette opens,
     with a cheap subsequence pass before the scoring; the rows are a virtual list, so long argument lists (thousands
     of namespaces) stay within a frame per keystroke.

@@ -302,6 +302,57 @@ impl CommandPalette {
         self.refilter(cx);
     }
 
+    /// Refreshes the asked argument's choices when `entity` changes (the clusters, discovery,
+    /// namespaces, the shown pod), so an open step does not keep a stale list.
+    pub fn watch<T: 'static>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) {
+        let watch = cx.observe(entity, |this, _, cx| this.refresh_choices(cx));
+        self._subscriptions.push(watch);
+    }
+
+    /// Asks the source again for the current step's choices; when they changed, lists the new
+    /// ones for the same query, keeping the selected row where it is still listed.
+    fn refresh_choices(&mut self, cx: &mut Context<Self>) {
+        let Step::Argument {
+            spec, arg, input, ..
+        } = &self.step
+        else {
+            return;
+        };
+        let fresh = (self.choices)(spec, &spec.args[*arg], cx);
+        if fresh == *input {
+            return;
+        }
+        let kept = match (self.rows.get(self.selected), input) {
+            (Some(Row::Choice { index, .. }), ArgInput::Choices { items, .. }) => {
+                Some(Ok(items[*index].value.clone()))
+            }
+            (Some(Row::Typed(text)), _) => Some(Err(text.clone())),
+            _ => None,
+        };
+        self.candidates = candidates_of(&fresh);
+        if let Step::Argument { input, .. } = &mut self.step {
+            *input = fresh;
+        }
+        let error = self.error.take();
+        self.refilter(cx);
+        self.error = error;
+        let Step::Argument { input, .. } = &self.step else {
+            return;
+        };
+        let at = self.rows.iter().position(|row| match (row, &kept, input) {
+            (Row::Choice { index, .. }, Some(Ok(value)), ArgInput::Choices { items, .. }) => {
+                items[*index].value == *value
+            }
+            (Row::Typed(text), Some(Err(kept)), _) => text == kept,
+            _ => false,
+        });
+        if let Some(at) = at {
+            self.selected = at;
+            self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+    }
+
     /// Matches the query against the current step's candidates, and selects the first row.
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().to_string();
@@ -328,21 +379,14 @@ impl CommandPalette {
                         ArgInput::Text => true,
                     };
                 let mut hits = hits;
-                // A listed value equal to what was typed (ignoring case) comes first: with
-                // `abc` and `a-bc` listed, Enter on "abc" takes `abc`.
-                if let ArgInput::Choices { items, .. } = input {
-                    let exact = |i: usize| {
-                        let c = &items[i];
-                        c.value.to_lowercase() == typed.to_lowercase()
-                            || c.label.to_lowercase() == typed.to_lowercase()
-                    };
-                    if let Some(at) = hits
-                        .iter()
-                        .position(|h| !typed.is_empty() && exact(h.index))
-                    {
-                        let hit = hits.remove(at);
-                        hits.insert(0, hit);
-                    }
+                // Listed values equal to what was typed come first, the stored value before
+                // what is shown for it: with contexts `cluster/prod` and an EKS ARN shown as
+                // `cluster/prod`, Enter on "cluster/prod" takes the context of that name. The
+                // sort is stable, so the rest keep their fuzzy order.
+                if let ArgInput::Choices { items, .. } = input
+                    && !typed.is_empty()
+                {
+                    hits.sort_by_key(|h| exactness(typed, &items[h.index]));
                 }
                 // Else what was typed comes first when it may be used as is: Enter on "kube"
                 // takes "kube", not "kube-system".
@@ -460,17 +504,7 @@ impl CommandPalette {
             return;
         };
         let input = (self.choices)(spec, &spec.args[arg], cx);
-        self.candidates = match &input {
-            ArgInput::Choices { items, .. } => items
-                .iter()
-                .map(|c| Candidate {
-                    label: c.label.clone(),
-                    alt: (c.value != c.label).then(|| c.value.clone()),
-                    recent: None,
-                })
-                .collect(),
-            ArgInput::Text => Vec::new(),
-        };
+        self.candidates = candidates_of(&input);
         self.step = Step::Argument {
             spec,
             arg,
@@ -790,6 +824,40 @@ struct RowTexts {
         expect(dead_code, reason = "for the automation state")
     )]
     action: Option<&'static str>,
+}
+
+/// What the query is matched against for an argument: each choice's label, and its stored
+/// value too where that differs.
+fn candidates_of(input: &ArgInput) -> Vec<Candidate> {
+    match input {
+        ArgInput::Choices { items, .. } => items
+            .iter()
+            .map(|c| Candidate {
+                label: c.label.clone(),
+                alt: (c.value != c.label).then(|| c.value.clone()),
+                recent: None,
+            })
+            .collect(),
+        ArgInput::Text => Vec::new(),
+    }
+}
+
+/// How exactly `choice` is what was `typed`, best first: its stored value as typed, the value
+/// ignoring case, the label as typed, the label ignoring case, then neither. Case counts first,
+/// so contexts `ABC` and `abc` do not collide.
+fn exactness(typed: &str, choice: &Choice) -> u8 {
+    let folded = typed.to_lowercase();
+    if choice.value == typed {
+        0
+    } else if choice.value.to_lowercase() == folded {
+        1
+    } else if choice.label == typed {
+        2
+    } else if choice.label.to_lowercase() == folded {
+        3
+    } else {
+        4
+    }
 }
 
 /// The first required argument of `spec` from `from` on.

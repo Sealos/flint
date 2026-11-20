@@ -11,6 +11,7 @@ use flint_core::settings::AiExposureState;
 use flint_core::{
     ClusterSummary, ConnectionState, LogSubject, NavEntry, PodSet, WatchMode, WorkloadTarget,
 };
+use gpui_kit::base::actions::Cancel;
 use gpui_kit::*;
 
 use std::rc::Rc;
@@ -342,9 +343,29 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
-        // Read while `previous` still has focus: the palette takes it next.
-        let contexts = window.context_stack();
+        // An open context menu or drop-down would stay drawn over the palette and could take a
+        // click meant for it: dismiss it first, as Esc would. A menu that knows where focus was
+        // gives it back, and the palette runs its actions from there; else (focus still on the
+        // closed menu) from the workspace.
+        let mut previous = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        let mut contexts = window.context_stack();
+        if contexts.iter().any(|c| c.contains(POPUP_MENU)) {
+            previous.dispatch_action(&Cancel, window, cx);
+            match window.focused(cx) {
+                Some(back) if back != previous => {
+                    previous = back;
+                    contexts = window.context_stack();
+                }
+                _ => {
+                    previous = self.focus.clone();
+                    let end = contexts
+                        .iter()
+                        .position(|c| c.contains(super::super::registry::WORKSPACE))
+                        .map_or(0, |i| i + 1);
+                    contexts.truncate(end);
+                }
+            }
+        }
         let this = cx.weak_entity();
         let choices: ChoiceSource = Rc::new(move |spec, arg, cx| match this.upgrade() {
             Some(ws) => ws.read(cx).palette_choices(spec, arg, cx),
@@ -366,6 +387,18 @@ impl Workspace {
                 }
             },
         );
+        // An open step's choices follow the clusters, discovery, the namespaces and the shown
+        // pod; nothing new is fetched for it.
+        let model = self.model.clone();
+        let workspace = cx.entity();
+        let shown = self.detail.clone();
+        palette.update(cx, |palette, cx| {
+            palette.watch(&model, cx);
+            palette.watch(&workspace, cx);
+            if let Some(detail) = &shown {
+                palette.watch(detail, cx);
+            }
+        });
         self.palette = Some((palette.clone(), dismissed));
         // Listing reads the guards, which read this workspace: once this update is done.
         window.defer(cx, move |window, cx| {
@@ -849,6 +882,9 @@ fn check_dock_height(action: &SetDockHeight) -> Result<(), ActionError> {
         ))
     }
 }
+
+/// The key context gpui-component's context menus and drop-downs draw their entries in.
+const POPUP_MENU: &str = "PopupMenu";
 
 /// What About Flint says.
 pub(in crate::ui) fn about_dialog() -> DialogText {
