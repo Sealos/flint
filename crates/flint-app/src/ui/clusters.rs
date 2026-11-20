@@ -75,6 +75,7 @@ impl ClustersModel {
                 self.clusters = snapshot.clusters.clone();
                 self.kubeconfig_errors = snapshot.errors.clone();
                 self.kubeconfig_paths = snapshot.paths.clone();
+                forget_removed(&mut self.discovery, &self.clusters);
                 self.loaded = true;
                 if let Some(requested) = self.startup_cluster.take() {
                     match startup_cluster(&requested, &self.clusters) {
@@ -187,6 +188,12 @@ pub struct Discovered {
     pub error: Option<String>,
 }
 
+/// Drops the discovery of contexts no longer in kubeconfig: the core dropped them too, and the
+/// model would otherwise keep every removed context's kinds for as long as the app runs.
+fn forget_removed(discovery: &mut HashMap<ClusterId, Discovered>, clusters: &[ClusterSummary]) {
+    discovery.retain(|id, _| clusters.iter().any(|c| c.info.name == *id));
+}
+
 /// The cluster `FLINT_CLUSTER` selects: the context with exactly that name, or none.
 pub fn startup_cluster(requested: &str, clusters: &[ClusterSummary]) -> Option<ClusterId> {
     clusters
@@ -248,9 +255,10 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
-    use super::{Presence, startup_cluster};
+    use super::{Discovered, Presence, forget_removed, startup_cluster};
     use flint_core::kubeconfig::ContextInfo;
     use flint_core::{ClusterSummary, ConnectionState, ServerVersion};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn cluster(name: &str) -> ClusterSummary {
@@ -265,6 +273,18 @@ mod tests {
             },
             state: ConnectionState::Disconnected,
         }
+    }
+
+    #[test]
+    fn removed_contexts_lose_their_discovery() {
+        let mut discovery: HashMap<String, Discovered> = ["kept", "removed"]
+            .into_iter()
+            .map(|name| (name.to_owned(), Discovered::default()))
+            .collect();
+        forget_removed(&mut discovery, &[cluster("kept"), cluster("new")]);
+        let mut left: Vec<&str> = discovery.keys().map(String::as_str).collect();
+        left.sort();
+        assert_eq!(left, ["kept"]);
     }
 
     // covers UP-03, UP-91
