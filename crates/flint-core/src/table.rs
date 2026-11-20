@@ -528,10 +528,13 @@ impl Interner {
         let before = self.set.len();
         self.set.retain(|_, last| *last == relist);
         self.kept = self.set.len();
-        // After a big drop (a kind scaled down, however small), give the table back too: when
-        // the relist let go of at least as many strings as it kept, and the table is well
-        // over what is left.
-        if before - self.kept >= self.kept && self.set.capacity() > 4 * self.kept.max(16) {
+        // After a big drop (a kind scaled down), give the table back too, as a prune does. Below
+        // PRUNE_MIN strings that rule never fires, so a small table is also given back when the
+        // relist let go of at least as many strings as it kept: steady polling, which keeps
+        // most of them, does not shrink and regrow it.
+        let cap = self.set.capacity();
+        let dropped_half = before - self.kept >= self.kept;
+        if cap > 4 * self.kept.max(PRUNE_MIN) || (dropped_half && cap > 4 * self.kept.max(16)) {
             self.set.shrink_to_fit();
         }
         self.inserts = 0;
@@ -1183,6 +1186,31 @@ pub(crate) mod tests {
         }
         interner.keep_relisted();
         assert_eq!(interner.set.capacity(), kept);
+    }
+
+    // covers UP-20: a kind scaled down in steps, each keeping more than half its strings, still
+    // gives the table back once it is well over what is left.
+    #[test]
+    fn a_gradual_scale_down_gives_the_table_back() {
+        let mut interner = Interner::default();
+        let n = 16 * PRUNE_MIN;
+        interner.begin_relist();
+        let rows: Vec<Arc<str>> = (0..n).map(|i| interner.intern(&format!("s-{i}"))).collect();
+        let big = interner.set.capacity();
+        for keep in [n * 6 / 10, n * 4 / 10, n * 3 / 10, n * 2 / 10, n * 3 / 20] {
+            interner.begin_relist();
+            for s in &rows[..keep] {
+                interner.intern(s);
+            }
+            interner.keep_relisted();
+            assert_eq!(interner.len(), keep);
+        }
+        assert!(
+            interner.set.capacity() <= 4 * interner.len().max(PRUNE_MIN),
+            "{} of {big}",
+            interner.set.capacity()
+        );
+        assert!(interner.set.capacity() < big);
     }
 
     // covers UP-20
