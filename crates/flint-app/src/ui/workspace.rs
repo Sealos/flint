@@ -39,13 +39,13 @@ use super::focus::release_unfocused_input;
 use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
-use super::nav::NavPanel;
+use super::nav::{NavEvent, NavPanel};
 use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
-    LockCluster, RetryConnection, SelectCluster, ShowAgentActivity, ShowAllNamespaces,
-    ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
-    WatchAllKinds, WatchOpenViewsOnly,
+    LockCluster, OnView, OpenView, RetryConnection, SelectCluster, ShowAgentActivity,
+    ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster,
+    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::row_menu;
 use super::scope_picker::{self, ScopePicker};
@@ -189,8 +189,21 @@ pub struct Workspace {
     detail: Option<Entity<DetailView>>,
     /// The bottom dock. It does not change with the active cluster.
     dock: Entity<Dock>,
-    /// The command palette, while it is open.
+    /// The command palette (or the resource switcher), while it is open.
     palette: Option<(Entity<CommandPalette>, Subscription)>,
+    /// Reads the objects in memory for the resource switcher.
+    _switcher: Task<()>,
+    /// What the open switcher was built from, to list anew when it changes.
+    switcher_key: Option<keys::SwitcherKey>,
+    /// The cluster sidebar's own focus, for its keys (UP-33).
+    sidebar_focus: FocusHandle,
+    /// Scrolls the cluster rows, so the keyboard cursor's row is brought into view.
+    sidebar_scroll: ScrollHandle,
+    /// The sidebar's keyboard cursor, once the arrows (or a click) moved it
+    /// ([`Workspace::sidebar_cursor`]).
+    sidebar_cursor: Option<String>,
+    /// The places shown before on the active cluster, for Go Back.
+    history: keys::History,
     /// Namespace names of the active cluster, for the namespace filter.
     namespaces: Vec<String>,
     /// Whether the user may list namespaces (`Failed` when not), for the namespace filter.
@@ -245,7 +258,17 @@ impl Workspace {
             this.sync(window, cx);
             cx.notify();
         });
-        let nav = cx.new(|_| NavPanel::new());
+        let nav = cx.new(NavPanel::new);
+        // Enter on a kind in the navigation opens it, as a click on it does.
+        let on_nav = cx.subscribe_in(&nav, window, |this, _, event, window, cx| match event {
+            NavEvent::Open(kind) => {
+                let open = OpenView {
+                    kind: kind.to_string(),
+                    ..Default::default()
+                };
+                this.open_view(&open, window, cx);
+            }
+        });
         // Quitting right after a drag (or another change) still saves state.toml.
         let on_quit = cx.on_app_quit(|this: &mut Self, _| {
             let save = this.ui_state.set_panes(this.panes);
@@ -318,6 +341,12 @@ impl Workspace {
             detail: None,
             dock,
             palette: None,
+            _switcher: Task::ready(()),
+            switcher_key: None,
+            sidebar_focus: cx.focus_handle(),
+            sidebar_cursor: None,
+            sidebar_scroll: ScrollHandle::new(),
+            history: keys::History::default(),
             namespaces: Vec::new(),
             namespaces_state: SyncState::Idle,
             namespace_input,
@@ -340,6 +369,7 @@ impl Workspace {
                 on_quit,
                 on_focus_lost,
                 on_dock,
+                on_nav,
             ],
         };
         this.show_appearance(window, cx);
@@ -720,6 +750,7 @@ impl Workspace {
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
             self.cluster = active.clone();
+            self.forget_places();
             self.close_list(cx);
             // Its filter or YAML, if one had focus that has moved on (to a dock tab, say): focus
             // may never come back through `reclaim_focus`, nor a list open here. One that still
@@ -749,6 +780,8 @@ impl Workspace {
                 cx,
             )
         });
+        // An open switcher follows the active cluster and its discovery.
+        self.refresh_switcher(cx);
         let (Some(cluster), Some(discovery)) = (active, discovered.discovery) else {
             return;
         };
@@ -777,7 +810,7 @@ impl Workspace {
                 }
             };
             if let Some(entry) = entry {
-                self.open_kind(&entry, window, cx);
+                self.restore_kind(&entry, window, cx);
                 if let (Some(list), Some(name)) = (&self.list, view.name) {
                     list.update(cx, |list, cx| {
                         list.select_when_listed(view.namespace, name, cx)
@@ -791,7 +824,7 @@ impl Workspace {
             .cloned()
         {
             // The kind last open on this cluster, also after a restart.
-            self.open_kind(&entry, window, cx);
+            self.restore_kind(&entry, window, cx);
         }
     }
 
@@ -834,15 +867,51 @@ impl Workspace {
     }
 
     fn open_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_kind(entry, true, true, window, cx);
+    }
+
+    /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
+    /// at the user's asking: it takes focus only if the palette or the switcher is not open,
+    /// so they stay open with what was typed.
+    fn restore_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let take_focus = self.palette.is_none();
+        self.show_kind(entry, true, take_focus, window, cx);
+    }
+
+    /// Opens `entry`'s list (unless it is open), with focus when `take_focus`. With `remember`, Go Back can
+    /// return to the list and object shown before.
+    fn show_kind(
+        &mut self,
+        entry: &NavEntry,
+        remember: bool,
+        take_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(cluster) = self.cluster.clone() else {
             return;
         };
-        if self
+        if let Some(list) = self
             .list
             .as_ref()
-            .is_some_and(|l| *l.read(cx).kind() == entry.id)
+            .filter(|l| *l.read(cx).kind() == entry.id)
         {
+            // Open already: it takes focus, as a new one would (Enter on it in the
+            // navigation).
+            if take_focus {
+                let focus = list.read(cx).focus_handle().clone();
+                window.focus(&focus, cx);
+                release_unfocused_input(window, cx);
+            }
             return;
+        }
+        if remember {
+            let next = keys::Place {
+                kind: entry.id.clone(),
+                object: None,
+                seen: None,
+            };
+            self.remember_place(&next, cx);
         }
         self.close_list(cx);
         let core = self.model.read(cx).core().clone();
@@ -859,8 +928,10 @@ impl Workspace {
             list.update(cx, |list, _| list.set_row_menu(menu));
         }
         self._list_subscriptions = vec![cx.subscribe_in(&list, window, Self::on_list_event)];
-        let focus = list.read(cx).focus_handle().clone();
-        window.focus(&focus, cx);
+        if take_focus {
+            let focus = list.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        }
         // The closed list's filter, if it had focus.
         release_unfocused_input(window, cx);
         self.list = Some(list);
@@ -996,12 +1067,23 @@ impl Workspace {
         &self,
         widths: &Layout,
         theme: &Theme,
+        focused: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let model = self.model.read(cx);
         let active = model.active.clone();
 
-        let mut list = v_flex().gap_px().px_1p5().py_1();
+        // Scrolls by itself, so the keyboard cursor can bring a cluster row into view
+        // (`Workspace::move_sidebar_cursor`): its rows are its children.
+        let mut list = v_flex()
+            .id("cluster-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .gap_px()
+            .px_1p5()
+            .py_1();
         if let Some(error) = &model.settings_error {
             list = list.child(sidebar_error(
                 "settings-error",
@@ -1021,14 +1103,17 @@ impl Workspace {
         } else if model.clusters.is_empty() {
             list = list.child(empty_state(model, theme));
         }
+        // The keyboard cursor shows only while the sidebar has focus.
+        let cursor = focused.then(|| self.sidebar_cursor(cx)).flatten();
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
             let protection = (model.protection(cluster), model.trust(cluster));
+            let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
-                is_active,
+                (is_active, ring),
                 exposure,
                 protection,
                 settings_ok,
@@ -1066,7 +1151,12 @@ impl Workspace {
             );
         }
 
-        v_flex()
+        let sidebar = v_flex()
+            .id("cluster-sidebar")
+            .key_context(registry::SIDEBAR)
+            .track_focus(&self.sidebar_focus);
+        Self::bind_sidebar_actions(OnView::new(sidebar, cx))
+            .into_element()
             .w(px(widths.clusters))
             .h_full()
             .flex_none()
@@ -1085,13 +1175,7 @@ impl Workspace {
                     .text_color(theme.muted_foreground)
                     .child("CLUSTERS"),
             )
-            .child(
-                div()
-                    .id("cluster-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .child(list),
-            )
+            .child(list)
             .child(pane_handle(
                 "clusters-edge",
                 Pane::Clusters,
@@ -1102,7 +1186,8 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        is_active: bool,
+        // Whether it is the active cluster, and whether the sidebar's cursor is on it.
+        (is_active, ring): (bool, bool),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
         settings_ok: bool,
@@ -1179,6 +1264,10 @@ impl Workspace {
                 ))
             })
             .when(!is_active, |el| el.hover(|el| el.bg(theme.list_hover)))
+            // The keyboard cursor, while the sidebar has focus.
+            // Every row has the border, so the ring moving shifts nothing.
+            .border_1()
+            .border_color(super::theme::cursor_ring(theme, ring))
             .tooltip(move |window, cx| Tooltip::new(hover_text.clone()).build(window, cx))
             .on_click(registry::on_click(SelectCluster {
                 cluster: name.clone(),
@@ -2254,7 +2343,7 @@ impl Render for Workspace {
                 let height = f32::from(bottom - e.event.position.y);
                 this.resize_dock(height, f32::from(e.bounds.size.height), cx);
             }))
-            .child(self.render_sidebar(&widths, theme, cx))
+            .child(self.render_sidebar(&widths, theme, self.sidebar_focus.is_focused(window), cx))
             .when(has_cluster, |el| {
                 el.child(self.render_nav_column(widths.navigation, theme))
             })
@@ -2369,6 +2458,13 @@ fn takes_focus(focus: &TakeFocus, window: &Window, cx: &App) -> bool {
 
 #[path = "workspace_actions.rs"]
 mod actions;
+
+#[path = "workspace_keys.rs"]
+mod keys;
+
+#[cfg(test)]
+#[path = "keyboard_tests.rs"]
+mod keyboard_tests;
 
 #[cfg(test)]
 #[path = "leak_tests.rs"]

@@ -19,13 +19,13 @@
 //! Changes are published as snapshots at most every `publish_interval`, and only while someone
 //! listens.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 
@@ -307,6 +307,22 @@ impl Engine {
         })
     }
 
+    /// Answers one-off reads of the rows ([`Hub::peek`]) with a snapshot nobody keeps.
+    fn answer_peeks(&self) {
+        if !self.hub.has_peeks() {
+            return;
+        }
+        self.hub.answer_peeks(self.epoch, || {
+            self.store.snapshot(KindSnapshot {
+                cluster: self.cluster.clone(),
+                kind: self.id.clone(),
+                state: self.state.clone(),
+                feed: self.feed,
+                ..Default::default()
+            })
+        });
+    }
+
     fn publish(&mut self) {
         if self.audience() == 0 {
             return;
@@ -334,7 +350,10 @@ impl Engine {
             tokio::select! {
                 biased;
                 _ = sleep_until_opt(deadline) => self.publish(),
-                _ = hub.wake.notified() => self.dirty = true,
+                _ = hub.wake.notified() => {
+                    self.dirty = true;
+                    self.answer_peeks();
+                }
                 out = &mut fut => return out,
             }
         }
@@ -361,6 +380,7 @@ impl Engine {
                 _ = hub.wake.notified() => {
                     self.dirty = true;
                     self.publish();
+                    self.answer_peeks();
                 }
             }
         }
@@ -783,9 +803,12 @@ impl Engine {
             }
             // Rows are merged only for subscribers; status displays need the state alone.
             let listening = self.hub.listeners() > 0;
-            let merged = merge_lanes(&lanes, &reason, self.kind.namespaced, listening);
+            let merged = merge_lanes(&lanes, &reason, self.kind.namespaced, listening, None);
             self.set_state(merged.state.clone());
             self.set_feed(merged.feed);
+            if self.hub.has_peeks() {
+                self.answer_namespaced_peeks(&lanes, &reason).await;
+            }
             if listening {
                 // At most one snapshot per interval, however many lanes change.
                 if let Some(at) = published {
@@ -828,6 +851,32 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Answers one-off reads of the merged rows ([`Hub::peek`]). The lanes publish only while
+    /// the merged list has subscribers, so each lane is asked for its current rows the same
+    /// way, and the answers are merged. Nothing is published and the state is not touched: a
+    /// read must not change what status displays show. While it waits for the lanes (at most
+    /// [`LANE_PEEK_WAIT`]), this task follows no scope change and publishes nothing; the lanes
+    /// keep watching meanwhile.
+    async fn answer_namespaced_peeks(&self, lanes: &BTreeMap<String, Lane>, reason: &str) {
+        let asked: Vec<(String, oneshot::Receiver<Arc<KindSnapshot>>)> = lanes
+            .iter()
+            .map(|(ns, lane)| (ns.clone(), lane.hub.peek()))
+            .collect();
+        let deadline = Instant::now() + LANE_PEEK_WAIT;
+        let mut answers = HashMap::new();
+        for (ns, rx) in asked {
+            if let Ok(Ok(snapshot)) = tokio::time::timeout_at(deadline, rx).await {
+                answers.insert(ns, snapshot);
+            }
+        }
+        let merged = merge_lanes(lanes, reason, self.kind.namespaced, true, Some(&answers));
+        self.hub.answer_peeks(self.epoch, || KindSnapshot {
+            cluster: self.cluster.clone(),
+            kind: self.id.clone(),
+            ..merged
+        });
     }
 
     fn start_lane(&self, namespace: String, changed: Arc<Notify>) -> Lane {
@@ -878,11 +927,17 @@ impl Drop for Lane {
 /// Lanes whose list was refused are left out and named in the limit. The state is the least
 /// ready of the other lanes; with no lane left, the list failed, and says how to pick
 /// namespaces.
+/// How long a namespace-limited list waits for its lanes' rows to answer a one-off read.
+const LANE_PEEK_WAIT: Duration = Duration::from_millis(250);
+
+/// `answers`: the lanes' rows as they answered a one-off read, used instead of their published
+/// snapshots (a lane missing from them counts by its state alone).
 fn merge_lanes(
     lanes: &BTreeMap<String, Lane>,
     reason: &str,
     namespaced: bool,
     with_rows: bool,
+    answers: Option<&HashMap<String, Arc<KindSnapshot>>>,
 ) -> KindSnapshot {
     struct View<'a> {
         ns: &'a String,
@@ -892,21 +947,31 @@ fn merge_lanes(
         /// snapshots) when rows are not merged.
         state: SyncState,
         feed: Feed,
+        /// The revision of the lane's rows merged in.
+        revision: u64,
     }
     let views: Vec<View> = lanes
         .iter()
         .map(|(ns, lane)| {
             // With rows, the state that came with them, so they agree; without, the hub's.
-            let snap = with_rows.then(|| lane.rx.borrow().clone());
+            let snap = match answers {
+                Some(answers) => answers.get(ns).cloned(),
+                None => with_rows.then(|| lane.rx.borrow().clone()),
+            };
             let (state, feed) = match &snap {
                 Some(s) => (s.state.clone(), s.feed),
                 None => (lane.hub.state(), lane.hub.feed()),
+            };
+            let revision = match &snap {
+                Some(s) => s.revision,
+                None => lane.rx.borrow().revision,
             };
             View {
                 ns,
                 snap,
                 state,
                 feed,
+                revision,
             }
         })
         .collect();
@@ -978,6 +1043,7 @@ fn merge_lanes(
             listed: open.iter().map(|v| v.ns.clone()).collect(),
             denied: denied.iter().map(|v| v.ns.clone()).collect(),
             reason: reason.to_owned(),
+            revisions: open.iter().map(|v| v.revision).collect(),
         })),
         ..Default::default()
     }
@@ -1025,6 +1091,8 @@ mod tests {
                 .collect(),
             state,
             format: ListFormat::Table,
+            // A revision of its own per namespace, as its store would give.
+            revision: u64::from(ns.as_bytes()[0]),
             ..Default::default()
         };
         hub.take_over(snapshot);
@@ -1064,7 +1132,7 @@ mod tests {
             "c".to_owned(),
             lane(SyncState::Failed { error: "no".into() }, &[], &cols, "c"),
         );
-        let merged = merge_lanes(&lanes, "forbidden", true, true);
+        let merged = merge_lanes(&lanes, "forbidden", true, true, None);
         assert_eq!(names(&merged), ["x", "z", "y"]);
         assert_eq!(merged.state, SyncState::Synced);
         let limit = merged.limited_to.unwrap();
@@ -1072,11 +1140,16 @@ mod tests {
             (limit.listed.clone(), limit.denied.clone()),
             (vec!["a".to_owned(), "b".to_owned()], vec!["c".to_owned()])
         );
+        // Each listed namespace says which of its lists was merged in.
+        let lane_revision = |ns: &str| lanes[ns].rx.borrow().revision;
+        assert_eq!(limit.revisions, [lane_revision("a"), lane_revision("b")]);
+        assert_eq!(limit.revision_of("b"), Some(lane_revision("b")));
+        assert_eq!(limit.revision_of("c"), None, "denied");
 
         // The least ready lane decides the state.
         lanes.insert("d".to_owned(), lane(SyncState::Loading, &[], &cols, "d"));
         assert_eq!(
-            merge_lanes(&lanes, "forbidden", true, true).state,
+            merge_lanes(&lanes, "forbidden", true, true, None).state,
             SyncState::Loading
         );
     }
@@ -1084,7 +1157,7 @@ mod tests {
     // covers UP-21
     #[tokio::test]
     async fn without_lanes_the_list_fails_and_says_how_to_pick_namespaces() {
-        let merged = merge_lanes(&BTreeMap::new(), "forbidden", true, true);
+        let merged = merge_lanes(&BTreeMap::new(), "forbidden", true, true, None);
         let SyncState::Failed { error } = merged.state else {
             panic!("failed expected");
         };

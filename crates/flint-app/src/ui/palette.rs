@@ -9,9 +9,17 @@
 //! Matching runs when the query changes ([`palette_model`]), never while drawing, and the rows
 //! are a virtual list, so it stays quick with every action listed and with long argument lists
 //! (thousands of namespaces).
+//!
+//! The same view is the resource switcher (Cmd-P, UP-31) in [`Mode::Resources`]: a fuzzy
+//! search over the active cluster's kinds and the objects its watches hold in memory
+//! ([`super::switcher_model`]), never the network. Enter on a kind runs Open Kind…
+//! ([`OpenView`]); on an object, [`OpenObject`], which opens its list with it selected and
+//! its details shown. The objects arrive a moment after it opens (the workspace reads the
+//! stores off the UI thread); until then it lists the kinds.
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::{self, Input, InputEvent, InputState};
@@ -22,10 +30,11 @@ use serde_json::{Map, Value};
 
 use super::palette_model::{self, Candidate, Recents};
 use super::registry::{
-    self, ActionError, ActionSpec, Arg, ArgKind, Bind, OnView, PaletteBack, PaletteConfirm,
-    PaletteDismiss, PaletteDown, PalettePick, PaletteUp, PasteText, Scope, ToggleCommandPalette,
-    Visibility,
+    self, ActionError, ActionSpec, Arg, ArgKind, Bind, OnView, OpenObject, OpenView, PaletteBack,
+    PaletteConfirm, PaletteDismiss, PaletteDown, PalettePick, PaletteUp, PasteText, Scope,
+    ToggleCommandPalette, ToggleResourceSwitcher, Visibility,
 };
+use super::switcher_model::{Index, Search};
 
 /// A row's height, in points: dense, as the lists are.
 const ROW_HEIGHT: f32 = 26.;
@@ -37,6 +46,19 @@ const WIDTH: f32 = 560.;
 const SHORTCUT_WIDTH: f32 = 64.;
 /// The field's placeholder while it lists actions.
 const SEARCH: &str = "Search actions…";
+/// The field's placeholder in the resource switcher.
+const SEARCH_RESOURCES: &str = "Go to a kind or object…";
+/// The cluster column's width in the resource switcher.
+const CLUSTER_WIDTH: f32 = 120.;
+
+/// What the palette searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The actions available where focus was (Cmd-Shift-P).
+    Actions,
+    /// The active cluster's kinds and the objects in memory (Cmd-P).
+    Resources,
+}
 
 /// One value an argument can take, as the palette lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +121,8 @@ struct Entry {
 enum Step {
     /// Which action.
     Actions,
+    /// Which kind or object (the resource switcher).
+    Resources,
     /// The argument `spec.args[arg]` of `spec`, with the ones given so far in `args`, and for
     /// each earlier step the argument it asked for and the text shown for its pick.
     Argument {
@@ -125,6 +149,63 @@ enum Row {
     },
     /// The text typed, as the argument's value.
     Typed(String),
+    /// A kind or an object, by its index in the switcher's [`Index`], with the text's matched
+    /// bytes.
+    Resource {
+        item: u32,
+        ranges: Vec<Range<usize>>,
+    },
+}
+
+/// What the resource switcher opens on, from the workspace.
+pub struct SwitcherScope {
+    /// The active cluster, as the rows name it; `None` with no cluster active.
+    pub cluster: Option<SharedString>,
+    /// The active cluster's context name and API server: an Enter passes them on, so the
+    /// workspace refuses it once another cluster (or server) is active.
+    pub cluster_id: Option<(String, Option<String>)>,
+    /// The kinds, at first; the objects come through [`CommandPalette::set_index`].
+    pub index: Index,
+    /// The objects are being read from the stores.
+    pub loading: bool,
+    /// The cluster's discovery failed: no kinds are coming.
+    pub discovery_failed: bool,
+    /// The cluster watches only the kinds open in a view.
+    pub on_view: bool,
+}
+
+/// A switcher item by what it is, not by its row: its kind, and the object (`None` for the
+/// kind itself).
+type ItemId = (flint_core::KindId, Option<super::switcher_model::Object>);
+
+/// What the resource switcher searches.
+struct Resources {
+    /// The active cluster, as the rows name it; `None` with no cluster active.
+    cluster: Option<SharedString>,
+    cluster_id: Option<(String, Option<String>)>,
+    index: Arc<Index>,
+    /// The objects are still being read from the stores.
+    loading: bool,
+    discovery_failed: bool,
+    on_view: bool,
+    search: Search,
+    /// How many items the query matched, listed or not.
+    matched: usize,
+}
+
+impl Resources {
+    fn of(scope: SwitcherScope) -> Self {
+        Resources {
+            cluster: scope.cluster,
+            cluster_id: scope.cluster_id,
+            index: Arc::new(scope.index),
+            loading: scope.loading,
+            discovery_failed: scope.discovery_failed,
+            on_view: scope.on_view,
+            search: Search::default(),
+            matched: 0,
+        }
+    }
 }
 
 pub struct CommandPalette {
@@ -158,6 +239,14 @@ pub struct CommandPalette {
     /// The selection was moved with the arrows, so a refreshed list keeps it; else the best
     /// row (row 0) is selected again.
     chosen: bool,
+    /// The switcher's item the user moved to, kept across a rescope until the objects arrive
+    /// and it is listed again.
+    kept: Option<ItemId>,
+    /// See [`CommandPalette::scope_generation`].
+    scope_generation: u64,
+    mode: Mode,
+    /// The resource switcher's index and search, in [`Mode::Resources`].
+    resources: Option<Resources>,
     /// Why the last Enter did nothing (a selector that does not parse, a cluster that went away).
     error: Option<String>,
     scroll: UniformListScrollHandle,
@@ -180,9 +269,152 @@ impl CommandPalette {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(
+            previous,
+            fallback,
+            contexts,
+            choices,
+            Mode::Actions,
+            window,
+            cx,
+        )
+    }
+
+    /// The resource switcher over `scope`. Enter runs Open Kind… or Open Object… from
+    /// `previous` (or `fallback`), as the palette runs any action. The objects come later,
+    /// through [`CommandPalette::set_index`].
+    pub fn switcher(
+        previous: FocusHandle,
+        fallback: FocusHandle,
+        scope: SwitcherScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let choices: ChoiceSource = Rc::new(|_, _, _| ArgInput::Text);
+        let mut palette = Self::build(
+            previous,
+            fallback,
+            Vec::new(),
+            choices,
+            Mode::Resources,
+            window,
+            cx,
+        );
+        palette.resources = Some(Resources::of(scope));
+        palette.step = Step::Resources;
+        palette.set_query(String::new(), SEARCH_RESOURCES.to_owned(), window, cx);
+        palette
+    }
+
+    /// The switcher's index once the objects in memory are read: the search starts over on
+    /// it, with what was typed.
+    ///
+    /// `scope` is [`CommandPalette::scope_generation`] when the objects were asked for: an
+    /// index read for an earlier scope (another cluster, kinds since renamed) is dropped.
+    pub fn set_index(&mut self, index: Arc<Index>, scope: u64, cx: &mut Context<Self>) {
+        if scope != self.scope_generation {
+            return;
+        }
+        // The item the user moved to with the arrows, by what it is: its row may move as
+        // objects arrive. A selection nobody moved goes to the best row, which may be new (the
+        // rule live refreshes follow).
+        let kept = self.chosen_item().or_else(|| self.kept.take());
+        let Some(resources) = &mut self.resources else {
+            return;
+        };
+        resources.index = index;
+        resources.loading = false;
+        resources.search = Search::default();
+        self.refilter(cx);
+        // The objects are in: an item not listed now is gone, or filtered out.
+        if let Some(kept) = kept {
+            self.select_item(&kept);
+        }
+    }
+
+    /// The switcher over another scope (another cluster became active, or its discovery
+    /// arrived): what it lists starts over, with what was typed kept. On the same cluster, the
+    /// item the user moved to stays selected, once listed again (the objects come later).
+    pub fn rescope(&mut self, scope: SwitcherScope, cx: &mut Context<Self>) {
+        let Some(resources) = &self.resources else {
+            return;
+        };
+        let same_cluster = resources.cluster_id == scope.cluster_id;
+        let kept = self
+            .chosen_item()
+            .or_else(|| self.kept.take())
+            .filter(|_| same_cluster);
+        self.resources = Some(Resources::of(scope));
+        self.scope_generation += 1;
+        self.refilter(cx);
+        if let Some(kept) = kept
+            && !self.select_item(&kept)
+        {
+            // Not listed until the objects arrive (`set_index`).
+            self.kept = Some(kept);
+        }
+    }
+
+    /// What the selected row is, when the user moved to it.
+    fn chosen_item(&self) -> Option<ItemId> {
+        let (Some(Row::Resource { item, .. }), Some(resources)) = (
+            self.rows.get(self.selected).filter(|_| self.chosen),
+            &self.resources,
+        ) else {
+            return None;
+        };
+        let item = &resources.index.items[*item as usize];
+        Some((
+            resources.index.kind_of(item).id.clone(),
+            item.object.clone(),
+        ))
+    }
+
+    /// Selects the row of `item`, as the user chose it, if it is listed; otherwise the first
+    /// row stays selected. Whether it was listed.
+    fn select_item(&mut self, (kind, object): &ItemId) -> bool {
+        let Some(resources) = &self.resources else {
+            return false;
+        };
+        let at = self.rows.iter().position(|row| match row {
+            Row::Resource { item, .. } => {
+                let item = &resources.index.items[*item as usize];
+                resources.index.kind_of(item).id == *kind && item.object == *object
+            }
+            _ => false,
+        });
+        self.selected = at.unwrap_or(0);
+        self.chosen = at.is_some();
+        self.scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
+        at.is_some()
+    }
+
+    /// Counts the switcher's scopes ([`CommandPalette::rescope`]), so the objects read for
+    /// one are not shown in another.
+    pub fn scope_generation(&self) -> u64 {
+        self.scope_generation
+    }
+
+    /// What the palette searches.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    fn build(
+        previous: FocusHandle,
+        fallback: FocusHandle,
+        contexts: Vec<KeyContext>,
+        choices: ChoiceSource,
+        mode: Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH));
         let on_query = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
+                // Typing chooses anew.
+                this.kept = None;
                 this.refilter(cx);
             }
         });
@@ -213,6 +445,10 @@ impl CommandPalette {
             rows_version: 0,
             selected: 0,
             chosen: false,
+            kept: None,
+            scope_generation: 0,
+            mode,
+            resources: None,
             error: None,
             scroll: UniformListScrollHandle::new(),
             _subscriptions: vec![on_query, on_leave],
@@ -365,8 +601,29 @@ impl CommandPalette {
     /// Matches the query against the current step's candidates, and selects the first row.
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().to_string();
-        let hits = palette_model::rank(&query, &self.candidates);
         self.query_text = query.clone();
+        if let (Step::Resources, Some(resources)) = (&self.step, &mut self.resources) {
+            let found = resources.search.run(&resources.index, &query);
+            resources.matched = found.matched;
+            self.rows = found
+                .hits
+                .into_iter()
+                .map(|h| Row::Resource {
+                    item: h.item,
+                    ranges: h.ranges,
+                })
+                .collect();
+            // A click drawn on the rows before is told apart (`PalettePick::rows`), so it
+            // cannot open the object now in its place.
+            self.rows_version += 1;
+            self.selected = 0;
+            self.chosen = false;
+            self.error = None;
+            self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+            return;
+        }
+        let hits = palette_model::rank(&query, &self.candidates);
         self.rows = match &self.step {
             Step::Actions => hits
                 .into_iter()
@@ -418,6 +675,7 @@ impl CommandPalette {
                     }))
                     .collect()
             }
+            Step::Resources => Vec::new(),
         };
         self.rows_version += 1;
         self.selected = 0;
@@ -428,8 +686,13 @@ impl CommandPalette {
     }
 
     fn move_by(&mut self, step: isize, cx: &mut Context<Self>) {
+        // With no rows to move through, nothing was chosen: a kept item stays kept.
+        if self.rows.is_empty() {
+            return;
+        }
         self.selected = palette_model::step(self.selected, self.rows.len(), step);
         self.chosen = true;
+        self.kept = None;
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         cx.notify();
@@ -471,7 +734,42 @@ impl CommandPalette {
                     self.action_query = self.query_text.clone();
                     self.ask(spec, 0, Map::new(), Vec::new(), window, cx);
                 } else {
-                    self.run(spec, Value::Null, window, cx);
+                    self.run(spec, Value::Null, true, window, cx);
+                }
+            }
+            (Step::Resources, Row::Resource { item, .. }) => {
+                let Some(resources) = &self.resources else {
+                    return;
+                };
+                let item = &resources.index.items[item as usize];
+                let kind = resources.index.kind_of(item).id.to_string();
+                // The cluster the row was listed on: refused if another is active by now.
+                let (cluster, server) = match &resources.cluster_id {
+                    Some((cluster, server)) => (Some(cluster.as_str()), server.as_deref()),
+                    None => (None, None),
+                };
+                let (name, args) = match &item.object {
+                    None => (
+                        OpenView::name_for_type(),
+                        serde_json::json!({
+                            "kind": kind,
+                            "cluster": cluster,
+                            "server": server,
+                        }),
+                    ),
+                    Some(object) => (
+                        OpenObject::name_for_type(),
+                        serde_json::json!({
+                            "kind": kind,
+                            "namespace": object.namespace.as_deref(),
+                            "name": &*object.name,
+                            "cluster": cluster,
+                            "server": server,
+                        }),
+                    ),
+                };
+                if let Some(spec) = registry::find(name) {
+                    self.run(spec, args, false, window, cx);
                 }
             }
             (
@@ -526,7 +824,7 @@ impl CommandPalette {
         cx: &mut Context<Self>,
     ) {
         let Some(arg) = next_required(spec, from) else {
-            self.run(spec, Value::Object(args), window, cx);
+            self.run(spec, Value::Object(args), true, window, cx);
             return;
         };
         let input = (self.choices)(spec, &spec.args[arg], cx);
@@ -568,11 +866,14 @@ impl CommandPalette {
     }
 
     /// Builds the action, checks it from where the palette came from, and runs it there once
-    /// the palette has closed and given focus back. A refusal stays in the palette.
+    /// the palette has closed and given focus back. A refusal stays in the palette. With
+    /// `remember`, the action goes first among the recent ones (not for the switcher's
+    /// Open Kind… and Open Object…).
     fn run(
         &mut self,
         spec: &'static ActionSpec,
         args: Value,
+        remember: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -590,7 +891,9 @@ impl CommandPalette {
             cx.notify();
             return;
         }
-        cx.default_global::<RecentActions>().0.used(spec.name);
+        if remember {
+            cx.default_global::<RecentActions>().0.used(spec.name);
+        }
         window.focus(&origin, cx);
         cx.emit(PaletteEvent::Dismissed);
         // After this update, so a handler that reads the palette's owner finds it closed.
@@ -643,6 +946,8 @@ impl CommandPalette {
                     detail: Some(entry.spec.category.name().into()),
                     shortcut: entry.shortcut.clone(),
                     action: Some(entry.spec.name),
+                    kind: None,
+                    cluster: None,
                 }
             }
             (
@@ -659,6 +964,8 @@ impl CommandPalette {
                     detail: choice.detail.clone().map(SharedString::from),
                     shortcut: None,
                     action: None,
+                    kind: None,
+                    cluster: None,
                 }
             }
             (Row::Typed(text), _) => RowTexts {
@@ -667,7 +974,30 @@ impl CommandPalette {
                 detail: Some("typed".into()),
                 shortcut: None,
                 action: None,
+                kind: None,
+                cluster: None,
             },
+            (Row::Resource { item, ranges }, Step::Resources) => {
+                let resources = self.resources.as_ref()?;
+                let item = resources.index.items.get(*item as usize)?;
+                let kind = resources.index.kind_of(item);
+                RowTexts {
+                    label: item.text.to_string().into(),
+                    ranges: ranges.clone(),
+                    // An object says its kind; a kind, that it is one, and how many of its
+                    // objects are in memory.
+                    detail: Some(match (&item.object, kind.in_memory) {
+                        (Some(_), _) => kind.label.clone().into(),
+                        (None, _) if resources.loading => "Kind".into(),
+                        (None, Some(n)) => format!("Kind · {n} in memory").into(),
+                        (None, None) => "Kind · not loaded".into(),
+                    }),
+                    shortcut: None,
+                    action: None,
+                    kind: Some(kind.id.to_string()),
+                    cluster: resources.cluster.clone(),
+                }
+            }
             _ => return None,
         })
     }
@@ -685,6 +1015,7 @@ impl CommandPalette {
             ..Default::default()
         };
         let actions = matches!(self.step, Step::Actions);
+        let resources = matches!(self.step, Step::Resources);
         range
             .filter_map(|ix| {
                 let texts = self.row_texts(ix)?;
@@ -735,6 +1066,20 @@ impl CommandPalette {
                                     .child(detail),
                             )
                         })
+                        // The switcher's rows name their cluster, in a column of its own.
+                        .when(resources, |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .w(px(CLUSTER_WIDTH))
+                                    .flex()
+                                    .justify_end()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .children(texts.cluster.clone()),
+                            )
+                        })
                         // Every action row has the column, keyed or not, so categories line up.
                         .when(actions, |el| {
                             el.child(
@@ -760,6 +1105,9 @@ impl CommandPalette {
     fn footer(&self) -> Option<(SharedString, bool)> {
         if let Some(error) = &self.error {
             return Some((error.clone().into(), true));
+        }
+        if let (Step::Resources, Some(resources)) = (&self.step, &self.resources) {
+            return Some((resources_footer(resources, self.rows.len()), false));
         }
         match (&self.step, self.rows.get(self.selected)) {
             (Step::Actions, Some(Row::Action { entry, .. })) => {
@@ -798,9 +1146,13 @@ impl CommandPalette {
                 Some(self.heading()),
                 Some(spec.args[*arg].name.to_owned()),
             ),
-            Step::Actions => (None, None, None),
+            Step::Actions | Step::Resources => (None, None, None),
         };
         PaletteState {
+            mode: match self.mode {
+                Mode::Actions => "actions",
+                Mode::Resources => "resources",
+            },
             query: self.query_text.clone(),
             action,
             step,
@@ -812,11 +1164,19 @@ impl CommandPalette {
                     action: t.action.map(str::to_owned),
                     detail: t.detail.map(|d| d.to_string()),
                     shortcut: t.shortcut.map(|s| s.to_string()),
+                    kind: t.kind,
+                    cluster: t.cluster.map(|c| c.to_string()),
                 })
                 .collect(),
             total: self.rows.len(),
             selected: (!self.rows.is_empty()).then_some(self.selected),
             footer: self.footer().map(|(text, _)| text.to_string()),
+            note: match (&self.step, &self.resources) {
+                (Step::Resources, Some(resources)) => {
+                    resources_note(resources).map(|n| n.to_string())
+                }
+                _ => None,
+            },
             error: self.error.clone(),
         }
     }
@@ -836,7 +1196,7 @@ impl CommandPalette {
                 .chain(picked.iter().map(|(_, shown)| shown.as_str()))
                 .collect::<Vec<_>>()
                 .join(" · "),
-            Step::Actions => String::new(),
+            Step::Actions | Step::Resources => String::new(),
         }
     }
 }
@@ -853,6 +1213,57 @@ struct RowTexts {
         expect(dead_code, reason = "for the automation state")
     )]
     action: Option<&'static str>,
+    /// The kind's id, on a switcher row.
+    #[cfg_attr(
+        not(any(test, feature = "automation")),
+        expect(dead_code, reason = "for the automation state")
+    )]
+    kind: Option<String>,
+    /// The cluster, on a switcher row.
+    cluster: Option<SharedString>,
+}
+
+/// The switcher's line under the rows: what it searches, or why nothing is listed.
+/// The switcher's second line in On view mode, where most kinds have no objects in memory.
+const ON_VIEW_NOTE: &str = "Only kinds being watched list their objects; open a kind to load them.";
+
+/// The switcher's note under its footer, if any.
+fn resources_note(resources: &Resources) -> Option<SharedString> {
+    (resources.on_view && resources.cluster.is_some()).then(|| ON_VIEW_NOTE.into())
+}
+
+fn resources_footer(resources: &Resources, rows: usize) -> SharedString {
+    let index = &resources.index;
+    if resources.cluster.is_none() {
+        return "No cluster is active; select one first".into();
+    }
+    if rows == 0 {
+        return if index.items.is_empty() && resources.loading {
+            "Reading the objects in memory…".into()
+        } else if index.items.is_empty() && resources.discovery_failed {
+            "No kinds: discovery failed".into()
+        } else if index.items.is_empty() {
+            "No kinds (discovery has not finished)".into()
+        } else {
+            "Nothing matches".into()
+        };
+    }
+    if resources.loading {
+        return "Kinds only so far; reading the objects in memory…".into();
+    }
+    if resources.matched > rows {
+        return format!(
+            "The best {rows} of {} matches; type more to narrow them",
+            resources.matched
+        )
+        .into();
+    }
+    format!(
+        "{} kinds and {} objects in memory",
+        index.kinds.len(),
+        index.objects
+    )
+    .into()
 }
 
 /// What the query is matched against for an argument: each choice's label, and its stored
@@ -974,9 +1385,13 @@ impl Render for CommandPalette {
         let list_height = rows.min(ROWS_SHOWN) as f32 * ROW_HEIGHT;
         let heading = match &self.step {
             Step::Argument { .. } => Some(SharedString::from(self.heading())),
-            Step::Actions => None,
+            Step::Actions | Step::Resources => None,
         };
         let footer = self.footer();
+        let note = match (&self.step, &self.resources) {
+            (Step::Resources, Some(resources)) => resources_note(resources),
+            _ => None,
+        };
         let root = v_flex()
             .id("command-palette")
             .key_context(registry::PALETTE)
@@ -993,8 +1408,16 @@ impl Render for CommandPalette {
             // Pointer events stop at the panel, so nothing behind it gets them.
             .occlude()
             // A press outside closes it, also while it asks for an argument (only Esc and
-            // Backspace go back a step), and goes on to what it pressed.
-            .on_mouse_down_out(registry::on_click_passing(ToggleCommandPalette))
+            // Backspace go back a step), and goes on to what it pressed. Its own mode's toggle,
+            // which closes it: the other mode's would switch to it.
+            .map(|el| match self.mode {
+                Mode::Actions => {
+                    el.on_mouse_down_out(registry::on_click_passing(ToggleCommandPalette))
+                }
+                Mode::Resources => {
+                    el.on_mouse_down_out(registry::on_click_passing(ToggleResourceSwitcher))
+                }
+            })
             .when_some(heading, |el, label| {
                 el.child(
                     div()
@@ -1045,6 +1468,20 @@ impl Render for CommandPalette {
                         .child(text)
                         .test_support(),
                 )
+            })
+            .when_some(note, |el, note| {
+                el.child(
+                    div()
+                        .id("palette-note")
+                        .aria_label(note.clone())
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(note)
+                        .test_support(),
+                )
             });
         Self::bind_actions(OnView::new(root, cx))
             .into_element()
@@ -1055,3 +1492,7 @@ impl Render for CommandPalette {
 #[cfg(test)]
 #[path = "palette_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "switcher_tests.rs"]
+mod switcher_tests;

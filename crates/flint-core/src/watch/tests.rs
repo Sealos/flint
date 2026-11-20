@@ -669,6 +669,65 @@ async fn a_namespace_limited_user_gets_the_namespaces_they_may_list_merged() {
     task.abort();
 }
 
+// covers UP-31: a one-off read of a namespace-limited list nobody subscribes to gets every
+// lane's current rows, and leaves the list's state (what status displays show) as it was.
+#[tokio::test(start_paused = true)]
+async fn a_peek_of_a_namespace_limited_list_reads_every_lane() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", forbidden());
+    }
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "x", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods/b",
+        pod_table(&[("u2", "b", "y", "Running")], true, "20"),
+    );
+    let (_scope_tx, scope) = tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(vec![
+        "a".to_owned(),
+        "b".to_owned(),
+    ]));
+    let hub = Arc::new(Hub::new("c".into(), pods().id()));
+    let epoch = hub.take_over(KindSnapshot::default());
+    let engine = engine::Engine::new(
+        "c".into(),
+        pods(),
+        fake.clone(),
+        hub.clone(),
+        epoch,
+        config(),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    )
+    .with_scope(Some(scope));
+    let task = tokio::spawn(engine.run(Feed::Watch));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while hub.state() != SyncState::Synced {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both namespaces list");
+    assert_eq!(hub.listeners(), 0);
+
+    let answer = tokio::time::timeout(Duration::from_secs(1), hub.peek())
+        .await
+        .expect("answered")
+        .expect("answered");
+    assert_eq!(names(&answer), ["x", "y"], "both namespaces' rows");
+    assert_eq!(answer.state, SyncState::Synced);
+    assert_eq!(hub.state(), SyncState::Synced);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        hub.state(),
+        SyncState::Synced,
+        "the read left the state alone"
+    );
+    assert!(hub.latest().rows.is_empty(), "nothing published");
+    task.abort();
+}
+
 // covers UP-27
 #[tokio::test(start_paused = true)]
 async fn a_namespace_limited_list_goes_back_to_all_namespaces_when_allowed_again() {
@@ -884,6 +943,65 @@ async fn nothing_is_built_while_nobody_listens() {
     hub.wake.notify_one();
     let snap = until(&mut rx, |s| s.state == SyncState::Synced).await;
     assert_eq!(names(&snap), ["a"]);
+    task.abort();
+}
+
+// covers UP-31: the resource switcher reads a watch's rows from memory. The watch nobody
+// subscribes to builds them from its store when woken; nothing is listed or watched again.
+#[tokio::test(start_paused = true)]
+async fn stored_rows_are_read_without_another_request() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(
+            &[
+                ("u1", "demo", "a", "Running"),
+                ("u2", "demo", "b", "Running"),
+            ],
+            true,
+            "10",
+        ),
+    );
+    let registry = HubRegistry::default();
+    let hub = registry.get_or_create("c", &pods().id());
+    let epoch = hub.take_over(KindSnapshot::default());
+    let engine = engine::Engine::new(
+        "c".into(),
+        pods(),
+        fake.clone(),
+        hub.clone(),
+        epoch,
+        config(),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    );
+    let task = tokio::spawn(engine.run(Feed::Watch));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while registry.states("c") != [(pods().id(), SyncState::Synced)] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watch lists");
+    assert_eq!(hub.latest().rows.len(), 0, "nothing published while unread");
+    let (lists, watches) = (fake.list_calls("pods"), fake.watch_requests("pods").len());
+
+    let stored = registry.stored("c", Duration::from_secs(1)).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(names(&stored[0]), ["a", "b"]);
+    // Read again: built anew (a new version), but the same rows (the same revision).
+    let again = registry.stored("c", Duration::from_secs(1)).await;
+    assert_ne!(again[0].version, stored[0].version);
+    assert_eq!(again[0].revision, stored[0].revision);
+    assert!(stored[0].revision > 0);
+    assert_eq!(fake.list_calls("pods"), lists, "no list");
+    assert_eq!(fake.watch_requests("pods").len(), watches, "no watch");
+    assert_eq!(hub.listeners(), 0, "the call let go of the hub");
+    // Nothing stays built in the hub: it still holds no rows, as before the read.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        hub.latest().rows.is_empty(),
+        "the rows were left in the hub"
+    );
     task.abort();
 }
 

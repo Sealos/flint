@@ -14,7 +14,7 @@ const CONSECUTIVE: i32 = 20;
 /// Points lost per character skipped between two matches, and before the first.
 const GAP: i32 = 1;
 /// Points lost when the query matched only the second haystack (the category and the label).
-const ALT_PENALTY: i32 = 24;
+pub const ALT_PENALTY: i32 = 24;
 /// How many actions the palette remembers as recently run.
 pub const RECENTS: usize = 16;
 
@@ -29,114 +29,301 @@ pub struct Score {
 /// Matches `query` against `text` as a subsequence, ignoring case and the query's spaces:
 /// "opl" matches "Open Logs". `None` when it does not match. Prefers characters that start
 /// words and runs of consecutive characters, so "ol" finds the "O" and "L" of "Open Logs".
+/// [`Matcher`] does the same for many texts.
+#[cfg(test)]
 pub fn fuzzy(query: &str, text: &str) -> Option<Score> {
-    let query: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    if query.is_empty() {
-        return Some(Score {
-            points: 0,
-            ranges: Vec::new(),
-        });
+    Matcher::new(query).score(text)
+}
+
+/// A query prepared once for matching many texts: lowercased, without spaces, with the
+/// scoring's buffers kept between texts, so ranking thousands of candidates per keystroke does
+/// not allocate per candidate.
+#[derive(Debug, Default, Clone)]
+pub struct Matcher {
+    query: Vec<char>,
+    /// The query as bytes, when it is ASCII: for [`Matcher::quick_points`].
+    ascii: Option<Vec<u8>>,
+    chars: Vec<(usize, char)>,
+    lower: Vec<char>,
+    /// For each character of `lower`, the character of the text it came from.
+    origin: Vec<usize>,
+    starts: Vec<bool>,
+    best: Vec<i32>,
+    from: Vec<usize>,
+}
+
+/// No score: a cell of the scoring table that no match reaches.
+const NONE: i32 = i32::MIN / 2;
+
+impl Matcher {
+    pub fn new(query: &str) -> Self {
+        let query: Vec<char> = query
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        Matcher {
+            ascii: query
+                .iter()
+                .all(char::is_ascii)
+                .then(|| query.iter().map(|&c| c as u8).collect()),
+            query,
+            ..Default::default()
+        }
     }
-    // Most candidates do not match at all: a cheap pass rules them out before the scoring.
-    if !is_subsequence(&query, text) {
-        return None;
+
+    /// Whether nothing (or only spaces) was typed: everything matches.
+    pub fn is_empty(&self) -> bool {
+        self.query.is_empty()
     }
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let word_start = |k: usize| {
-        let c = chars[k].1;
-        match k.checked_sub(1).map(|p| chars[p].1) {
-            None => true,
-            Some(prev) => {
-                !prev.is_alphanumeric()
-                    || (prev.is_lowercase() && c.is_uppercase())
-                    || (prev.is_alphabetic() != c.is_alphabetic())
+
+    /// Whether this query is `earlier` with more typed after it: every text it matches,
+    /// `earlier` matched too, so a search can go on from `earlier`'s matches.
+    pub fn extends(&self, earlier: &Matcher) -> bool {
+        self.query.starts_with(&earlier.query)
+    }
+
+    /// How many characters of the query, from its start, appear in order in `text`.
+    pub fn prefix_len(&self, text: &str) -> usize {
+        let mut taken = 0;
+        for c in text.chars().flat_map(char::to_lowercase) {
+            if taken < self.query.len() && self.query[taken] == c {
+                taken += 1;
             }
         }
-    };
-    // The text in lower case, as the query is: a character may lower to several ("İ" to "i̇"),
-    // each remembering the character it came from (its index in `chars`).
-    let mut lower: Vec<char> = Vec::with_capacity(chars.len());
-    let mut origin: Vec<usize> = Vec::with_capacity(chars.len());
-    let mut starts: Vec<bool> = Vec::with_capacity(chars.len());
-    for (k, &(_, c)) in chars.iter().enumerate() {
-        for (i, l) in c.to_lowercase().enumerate() {
-            lower.push(l);
-            origin.push(k);
-            starts.push(i == 0 && word_start(k));
-        }
+        taken
     }
-    let n = lower.len();
-    let m = query.len();
-    if m > n {
-        return None;
-    }
-    let bonus = |j: usize| MATCH + if starts[j] { WORD_START } else { 0 };
 
-    // best[i][j]: the best score matching query[..=i] with query[i] at text position j, and
-    // where query[i - 1] was matched (for reading the positions back).
-    const NONE: i32 = i32::MIN / 2;
-    let mut best = vec![vec![NONE; n]; m];
-    let mut from = vec![vec![usize::MAX; n]; m];
-    for j in 0..n {
-        if lower[j] == query[0] {
-            best[0][j] = bonus(j) - GAP * j as i32;
+    /// Whether the query after its first `taken` characters appears in order in `text`.
+    pub fn matches_rest(&self, taken: usize, text: &str) -> bool {
+        self.query
+            .get(taken..)
+            .is_none_or(|rest| rest.is_empty() || is_subsequence(rest, text))
+    }
+
+    /// The score of `text` and the bytes matched, for highlighting; `None` when it does not
+    /// match.
+    pub fn score(&mut self, text: &str) -> Option<Score> {
+        self.run(text, true)
+    }
+
+    /// The score alone, without the matched bytes: cheaper, for ranking.
+    pub fn points(&mut self, text: &str) -> Option<i32> {
+        self.run(text, false).map(|s| s.points)
+    }
+
+    /// A quick score for ranking very many texts: the points of one good match rather than the
+    /// best one ([`Matcher::points`]), found in linear time without allocating. It finds where
+    /// the leftmost match ends, then goes back from there taking each character as late as it
+    /// can (the shortest window, as fzf's first algorithm does), and scores those positions as
+    /// [`Matcher::points`] scores any. Never more than [`Matcher::points`]; `None` exactly when
+    /// that is `None`.
+    pub fn quick_points(&mut self, text: &str) -> Option<i32> {
+        self.quick_points_of(text, text.is_ascii())
+    }
+
+    /// [`Matcher::quick_points`] for a text already known to be ASCII (`ascii`) or not.
+    pub fn quick_points_of(&mut self, text: &str, ascii: bool) -> Option<i32> {
+        self.quick_match(text, ascii).map(|(points, _)| points)
+    }
+
+    /// [`Matcher::quick_points_of`], with the byte where the match it scored starts.
+    pub fn quick_match(&mut self, text: &str, ascii: bool) -> Option<(i32, usize)> {
+        let query = match &self.ascii {
+            _ if self.query.is_empty() => return Some((0, 0)),
+            Some(query) if ascii => query,
+            _ => {
+                return self
+                    .score(text)
+                    .map(|s| (s.points, s.ranges.first().map_or(0, |r| r.start)));
+            }
+        };
+        let bytes = text.as_bytes();
+        let last = query.len() - 1;
+        // Leftmost match: where it ends. Plain loops: this runs for every object per keystroke.
+        let mut q = 0;
+        let mut i = 0;
+        let end = loop {
+            if i == bytes.len() {
+                return None;
+            }
+            if bytes[i].to_ascii_lowercase() == query[q] {
+                if q == last {
+                    break i;
+                }
+                q += 1;
+            }
+            i += 1;
+        };
+        // Back from the end, taking each character as late as it can be: the shortest window
+        // ending there. Scored on the way, as the full scoring scores any positions.
+        let mut points = 0;
+        let mut next = end;
+        let mut q = last;
+        let mut j = end;
+        loop {
+            if bytes[j].to_ascii_lowercase() == query[q] {
+                points += MATCH + if starts_word(bytes, j) { WORD_START } else { 0 };
+                if q < last {
+                    points += if j + 1 == next {
+                        CONSECUTIVE
+                    } else {
+                        -GAP * (next - j - 1) as i32
+                    };
+                }
+                next = j;
+                if q == 0 {
+                    return Some((points - GAP * j as i32, j));
+                }
+                q -= 1;
+            }
+            j -= 1;
         }
     }
-    for i in 1..m {
-        // The best of best[i - 1][k] + GAP * k over k < j - 1 (a gap before j), as j moves on.
-        let mut gapped: (i32, usize) = (NONE, usize::MAX);
-        for j in i..n {
-            if j >= 2 {
-                let k = j - 2;
-                if best[i - 1][k] > NONE {
-                    let value = best[i - 1][k] + GAP * k as i32;
-                    if value > gapped.0 {
-                        gapped = (value, k);
+
+    fn run(&mut self, text: &str, with_ranges: bool) -> Option<Score> {
+        if self.query.is_empty() {
+            return Some(Score {
+                points: 0,
+                ranges: Vec::new(),
+            });
+        }
+        // Most candidates do not match at all: a cheap pass rules them out before the scoring.
+        if !is_subsequence(&self.query, text) {
+            return None;
+        }
+        let Matcher {
+            query,
+            ascii: _,
+            chars,
+            lower,
+            origin,
+            starts,
+            best,
+            from,
+        } = self;
+        chars.clear();
+        chars.extend(text.char_indices());
+        let word_start = |k: usize| {
+            let c = chars[k].1;
+            match k.checked_sub(1).map(|p| chars[p].1) {
+                None => true,
+                Some(prev) => {
+                    !prev.is_alphanumeric()
+                        || (prev.is_lowercase() && c.is_uppercase())
+                        || (prev.is_alphabetic() != c.is_alphabetic())
+                }
+            }
+        };
+        // The text in lower case, as the query is: a character may lower to several ("İ" to
+        // "i̇"), each remembering the character it came from (its index in `chars`).
+        lower.clear();
+        origin.clear();
+        starts.clear();
+        for (k, &(_, c)) in chars.iter().enumerate() {
+            for (i, l) in c.to_lowercase().enumerate() {
+                lower.push(l);
+                origin.push(k);
+                starts.push(i == 0 && word_start(k));
+            }
+        }
+        let n = lower.len();
+        let m = query.len();
+        if m > n {
+            return None;
+        }
+        let bonus = |j: usize| MATCH + if starts[j] { WORD_START } else { 0 };
+
+        // best[i * n + j]: the best score matching query[..=i] with query[i] at text position
+        // j; from[i * n + j]: where query[i - 1] was matched (for reading the positions back).
+        best.clear();
+        best.resize(m * n, NONE);
+        if with_ranges {
+            from.clear();
+            from.resize(m * n, usize::MAX);
+        }
+        for j in 0..n {
+            if lower[j] == query[0] {
+                best[j] = bonus(j) - GAP * j as i32;
+            }
+        }
+        for (i, &wanted) in query.iter().enumerate().skip(1) {
+            let (row, prev) = (i * n, (i - 1) * n);
+            // The best of best[i - 1][k] + GAP * k over k < j - 1 (a gap before j), as j
+            // moves on.
+            let mut gapped: (i32, usize) = (NONE, usize::MAX);
+            for j in i..n {
+                if j >= 2 {
+                    let k = j - 2;
+                    if best[prev + k] > NONE {
+                        let value = best[prev + k] + GAP * k as i32;
+                        if value > gapped.0 {
+                            gapped = (value, k);
+                        }
+                    }
+                }
+                if lower[j] != wanted {
+                    continue;
+                }
+                let mut score = NONE;
+                let mut parent = usize::MAX;
+                if best[prev + j - 1] > NONE {
+                    score = best[prev + j - 1] + CONSECUTIVE;
+                    parent = j - 1;
+                }
+                if gapped.0 > NONE {
+                    let value = gapped.0 - GAP * (j as i32 - 1);
+                    if value > score {
+                        score = value;
+                        parent = gapped.1;
+                    }
+                }
+                if parent != usize::MAX {
+                    best[row + j] = score + bonus(j);
+                    if with_ranges {
+                        from[row + j] = parent;
                     }
                 }
             }
-            if lower[j] != query[i] {
-                continue;
-            }
-            let mut score = NONE;
-            let mut parent = usize::MAX;
-            if best[i - 1][j - 1] > NONE {
-                score = best[i - 1][j - 1] + CONSECUTIVE;
-                parent = j - 1;
-            }
-            if gapped.0 > NONE {
-                let value = gapped.0 - GAP * (j as i32 - 1);
-                if value > score {
-                    score = value;
-                    parent = gapped.1;
-                }
-            }
-            if parent != usize::MAX {
-                best[i][j] = score + bonus(j);
-                from[i][j] = parent;
-            }
+        }
+        let last = (m - 1) * n;
+        let (mut j, points) = (0..n)
+            .filter(|&j| best[last + j] > NONE)
+            .map(|j| (j, best[last + j]))
+            .max_by_key(|&(j, points)| (points, std::cmp::Reverse(j)))?;
+        if !with_ranges {
+            return Some(Score {
+                points,
+                ranges: Vec::new(),
+            });
+        }
+        let mut positions = vec![j; m];
+        for i in (1..m).rev() {
+            j = from[i * n + j];
+            positions[i - 1] = j;
+        }
+        Some(Score {
+            points,
+            ranges: merge(positions.iter().map(|&p| {
+                let (at, c) = chars[origin[p]];
+                at..at + c.len_utf8()
+            })),
+        })
+    }
+}
+
+/// Whether the byte at `j` of ASCII `text` starts a word, as [`Matcher::score`] decides it for
+/// characters.
+fn starts_word(text: &[u8], j: usize) -> bool {
+    match j.checked_sub(1).map(|p| text[p]) {
+        None => true,
+        Some(prev) => {
+            let c = text[j];
+            !prev.is_ascii_alphanumeric()
+                || (prev.is_ascii_lowercase() && c.is_ascii_uppercase())
+                || (prev.is_ascii_alphabetic() != c.is_ascii_alphabetic())
         }
     }
-    let (mut j, points) = (0..n)
-        .filter(|&j| best[m - 1][j] > NONE)
-        .map(|j| (j, best[m - 1][j]))
-        .max_by_key(|&(j, points)| (points, std::cmp::Reverse(j)))?;
-    let mut positions = vec![j; m];
-    for i in (1..m).rev() {
-        j = from[i][j];
-        positions[i - 1] = j;
-    }
-    Some(Score {
-        points,
-        ranges: merge(positions.iter().map(|&p| {
-            let (at, c) = chars[origin[p]];
-            at..at + c.len_utf8()
-        })),
-    })
 }
 
 /// Whether the lowercase `query` appears in order in `text`, ignoring case. Byte by byte for
@@ -209,15 +396,16 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             })
             .collect();
     }
+    let mut matcher = Matcher::new(query);
     let mut scored: Vec<(i32, usize, Hit)> = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
-            let (points, ranges) = match fuzzy(query, &c.label) {
+            let (points, ranges) = match matcher.score(&c.label) {
                 Some(score) => (score.points, score.ranges),
                 None => {
-                    let alt = fuzzy(query, c.alt.as_deref()?)?;
-                    (alt.points - ALT_PENALTY, Vec::new())
+                    let alt = matcher.points(c.alt.as_deref()?)?;
+                    (alt - ALT_PENALTY, Vec::new())
                 }
             };
             Some((
@@ -259,7 +447,7 @@ pub fn step(selected: usize, count: usize, step: isize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, Recents, fuzzy, rank, step};
+    use super::{Candidate, Matcher, Recents, fuzzy, rank, step};
 
     fn candidates(labels: &[&str]) -> Vec<Candidate> {
         labels
@@ -405,6 +593,60 @@ mod tests {
         }
         assert_eq!(recents.rank("0"), None);
         assert_eq!(recents.rank(&(super::RECENTS + 3).to_string()), Some(0));
+    }
+
+    // The switcher (UP-31) prepares the query once and scores many texts with it.
+    #[test]
+    fn a_prepared_query_scores_like_fuzzy_and_extends_earlier_ones() {
+        let mut matcher = Matcher::new("Op L");
+        for text in [
+            "Open Logs",
+            "Toggle Pause",
+            "Café",
+            "Open Previous Logs",
+            "o",
+        ] {
+            let once = fuzzy("opl", text);
+            assert_eq!(matcher.score(text), once, "{text}");
+            assert_eq!(matcher.points(text), once.as_ref().map(|s| s.points));
+        }
+        assert!(Matcher::new("open").extends(&Matcher::new("op")));
+        assert!(Matcher::new("op").extends(&Matcher::new("")));
+        assert!(!Matcher::new("op").extends(&Matcher::new("open")));
+        assert!(!Matcher::new("ox").extends(&Matcher::new("op")));
+        // The quick score matches the same texts, and never beats the best alignment.
+        for query in ["opl", "ol", "logs", "sb", "o", "pause"] {
+            let mut matcher = Matcher::new(query);
+            for text in [
+                "Open Logs",
+                "Toggle Pause",
+                "SortBy",
+                "Open Previous Logs",
+                "Blowing",
+            ] {
+                let best = matcher.points(text);
+                let quick = matcher.quick_points(text);
+                assert_eq!(quick.is_some(), best.is_some(), "{query} in {text}");
+                assert!(quick <= best, "{query} in {text}: {quick:?} > {best:?}");
+            }
+        }
+        // A contiguous word start scores the same either way.
+        let mut logs = Matcher::new("logs");
+        assert_eq!(logs.quick_points("Open Logs"), logs.points("Open Logs"));
+        // A query split over two texts: what the first takes, the rest in the second.
+        let pods_web = Matcher::new("pods web");
+        assert_eq!(pods_web.prefix_len("Pods"), 4);
+        assert!(pods_web.matches_rest(4, "demo/web-1"));
+        assert!(!pods_web.matches_rest(3, "demo/web-1"));
+        assert!(pods_web.matches_rest(7, ""));
+        assert_eq!(pods_web.prefix_len("Nodes"), 0);
+        // Not ASCII: the full scoring.
+        assert_eq!(
+            Matcher::new("é").quick_points("Café"),
+            Matcher::new("é").points("Café")
+        );
+        assert!(Matcher::new("  ").is_empty());
+        assert_eq!(Matcher::new("").quick_points("anything"), Some(0));
     }
 
     #[test]

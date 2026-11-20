@@ -66,6 +66,9 @@ actions!(
     [
         /// Open the command palette, or close it when it is open.
         ToggleCommandPalette,
+        /// Open the resource switcher (the palette over the active cluster's kinds and the
+        /// objects in memory), or close it when it is open.
+        ToggleResourceSwitcher,
         /// Move the palette's selection up.
         PaletteUp,
         /// Move the palette's selection down.
@@ -96,7 +99,40 @@ actions!(
         /// Make "all kinds" the default watch mode.
         DefaultWatchAllKinds,
         /// Make "open views only" the default watch mode.
-        DefaultWatchOpenViewsOnly
+        DefaultWatchOpenViewsOnly,
+        /// Go back to the kind and object shown before.
+        GoBack,
+        /// Move focus to the next pane: clusters, navigation, list, detail, dock.
+        FocusNextPane,
+        /// Move focus to the previous pane.
+        FocusPreviousPane
+    ]
+);
+actions!(
+    sidebar,
+    [
+        /// Move the cluster sidebar's selection up.
+        SelectPreviousCluster,
+        /// Move the cluster sidebar's selection down.
+        SelectNextCluster,
+        /// Make the cluster selected in the sidebar the active one, and connect to it.
+        ActivateSelectedCluster
+    ]
+);
+actions!(
+    navigation,
+    [
+        /// Move the navigation's selection up.
+        SelectPreviousKind,
+        /// Move the navigation's selection down.
+        SelectNextKind,
+        /// Open the kind selected in the navigation, or open or close the selected section.
+        OpenSelectedKind,
+        /// Open the selected section of the navigation.
+        ExpandSection,
+        /// Close the selected section, or the section of the selected kind (and select the
+        /// section).
+        CollapseSection
     ]
 );
 actions!(
@@ -338,6 +374,30 @@ pub struct UntrustCluster {
 #[serde(deny_unknown_fields)]
 pub struct OpenView {
     pub kind: String,
+    /// Only if this is still the active cluster (its context name), as the resource switcher
+    /// listed it; refused otherwise.
+    #[serde(default)]
+    pub cluster: Option<String>,
+    /// With `cluster`: and its context still points at this API server.
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// Open the list of a kind on the active cluster with one of its objects selected, and its
+/// details shown. `kind` is matched as for [`OpenView`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct OpenObject {
+    pub kind: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    pub name: String,
+    /// Only if this is still the active cluster, as for [`OpenView`].
+    #[serde(default)]
+    pub cluster: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 /// Open or close a navigation section, by its title.
@@ -548,6 +608,8 @@ pub enum Scope {
     App,
     /// The main window.
     Workspace,
+    /// The cluster sidebar.
+    Sidebar,
     /// The resource navigation of the active cluster.
     Navigation,
     /// The open resource list.
@@ -1459,6 +1521,14 @@ pub const PALETTE: &str = "CommandPalette";
 const PALETTE_INPUT: &str = "CommandPalette > Input";
 /// A focused text field, where gpui-component handles Cut, Copy, Paste and Select All.
 const TEXT_FIELD: &str = "Input";
+/// The cluster sidebar's key context, while it has focus.
+pub const SIDEBAR: &str = "ClusterSidebar";
+/// Plain keys in the cluster sidebar: deeper than the workspace's, so they win there.
+const SIDEBAR_PLAIN: &str = "ClusterSidebar && !Input";
+/// The navigation's key context, while it has focus.
+pub const NAVIGATION: &str = "Navigation";
+/// Plain keys in the navigation: deeper than the workspace's, so they win there.
+const NAVIGATION_PLAIN: &str = "Navigation && !Input";
 
 fn build_unit<A: Action + Default>(args: Value) -> Result<Box<dyn Action>, String> {
     match args {
@@ -1594,6 +1664,20 @@ const NAMESPACES: &[Arg] = &[arg(
     "namespace names; empty for all",
     ArgKind::List,
 )];
+const OBJECT: &[Arg] = &[
+    arg(
+        "kind",
+        "plural or plural.group: pods, deployments.apps",
+        ArgKind::Kind,
+    ),
+    Arg {
+        name: "namespace",
+        description: "namespace; leave out for cluster-scoped kinds",
+        required: false,
+        kind: ArgKind::Namespace,
+    },
+    arg("name", "object name", ArgKind::Text),
+];
 const ROW: &[Arg] = &[
     Arg {
         name: "namespace",
@@ -1712,6 +1796,14 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::Flint, S::Workspace)
         .keys(&["secondary-shift-p"], Some(WORKSPACE)),
+        // Cmd-P, as in VS Code and Zed. On Linux, Ctrl-P: a shell tab passes it to the shell,
+        // and in the palette's field it moves the selection up.
+        Spec::unit::<ToggleResourceSwitcher>(
+            "Go to Resource",
+            "Search the active cluster's kinds and the objects in memory, and open one.",
+        )
+        .of(C::View, S::Workspace)
+        .keys(&["secondary-p"], Some(WORKSPACE)),
         Spec::unit::<Hide>("Hide Flint", "Hide Flint's windows.")
             .of(C::Flint, S::App)
             .keys(HIDE, None),
@@ -1777,6 +1869,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),
+        // The sidebar's keys, while it has focus (UP-33).
+        Spec::unit::<SelectPreviousCluster>(
+            "Select Previous Cluster",
+            "Move the cluster sidebar's selection up.",
+        )
+        .of(C::Cluster, S::Sidebar)
+        .keys(&["up"], Some(SIDEBAR_PLAIN)),
+        Spec::unit::<SelectNextCluster>(
+            "Select Next Cluster",
+            "Move the cluster sidebar's selection down.",
+        )
+        .of(C::Cluster, S::Sidebar)
+        .keys(&["down"], Some(SIDEBAR_PLAIN)),
+        Spec::unit::<ActivateSelectedCluster>(
+            "Connect to Selected Cluster",
+            "Make the cluster selected in the sidebar the active one, and connect to it.",
+        )
+        .of(C::Cluster, S::Sidebar)
+        .keys(&["enter"], Some(SIDEBAR_PLAIN)),
         Spec::with_args::<ExposeToAi>(
             "Expose Cluster to AI…",
             "Let Flint's MCP server read a cluster, after a confirmation naming its server.",
@@ -1897,6 +2008,55 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         )
         .of(C::View, S::Navigation)
         .hidden(),
+        // The navigation's keys, while it has focus (UP-33).
+        Spec::unit::<SelectPreviousKind>(
+            "Select Previous Kind",
+            "Move the navigation's selection up.",
+        )
+        .of(C::View, S::Navigation)
+        .keys(&["up"], Some(NAVIGATION_PLAIN)),
+        Spec::unit::<SelectNextKind>("Select Next Kind", "Move the navigation's selection down.")
+            .of(C::View, S::Navigation)
+            .keys(&["down"], Some(NAVIGATION_PLAIN)),
+        Spec::unit::<OpenSelectedKind>(
+            "Open Selected Kind",
+            "Open the kind selected in the navigation, or open or close the selected section.",
+        )
+        .of(C::View, S::Navigation)
+        .keys(&["enter"], Some(NAVIGATION_PLAIN)),
+        Spec::unit::<ExpandSection>("Expand Section", "Open the selected navigation section.")
+            .of(C::View, S::Navigation)
+            .keys(&["right"], Some(NAVIGATION_PLAIN)),
+        Spec::unit::<CollapseSection>(
+            "Collapse Section",
+            "Close the selected navigation section, or the section of the selected kind.",
+        )
+        .of(C::View, S::Navigation)
+        .keys(&["left"], Some(NAVIGATION_PLAIN)),
+        Spec::with_args::<OpenObject>(
+            "Open Object…",
+            "Open a kind's list with one of its objects selected and its details shown.",
+            OBJECT,
+        )
+        .of(C::View, S::Workspace)
+        .hidden(),
+        Spec::unit::<GoBack>("Go Back", "Go back to the kind and object shown before.")
+            .of(C::View, S::Workspace)
+            .keys(&["secondary-["], Some(WORKSPACE)),
+        // Tab and Shift-Tab, outside text fields: a field keeps them for moving between
+        // controls, and a shell tab sends them to the shell.
+        Spec::unit::<FocusNextPane>(
+            "Focus Next Pane",
+            "Move focus to the next pane: clusters, navigation, list, detail, dock.",
+        )
+        .of(C::View, S::Workspace)
+        .keys(&["tab"], Some(PLAIN)),
+        Spec::unit::<FocusPreviousPane>(
+            "Focus Previous Pane",
+            "Move focus to the previous pane: dock, detail, list, navigation, clusters.",
+        )
+        .of(C::View, S::Workspace)
+        .keys(&["shift-tab"], Some(PLAIN)),
         Spec::with_args::<SetPaneWidth>(
             "Set Pane Width…",
             "Resize the clusters, navigation or detail pane.",
@@ -2593,7 +2753,8 @@ pub mod tests {
         assert_eq!(
             action.as_any().downcast_ref::<OpenView>(),
             Some(&OpenView {
-                kind: "pods".into()
+                kind: "pods".into(),
+                ..Default::default()
             })
         );
         let select = find("resource_list::SelectRow").unwrap();

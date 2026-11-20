@@ -2,6 +2,11 @@
 //! aggregated APIs grouped by API group, then the remaining built-ins ("Other"), each kind with
 //! a subtle marker of its watch state. Every section but Workloads starts collapsed, so custom
 //! resources are reachable without scrolling past every built-in kind.
+//!
+//! It takes focus (Tab, or a click) and is used from the keyboard too (UP-33): the arrows move a
+//! cursor over the section headers and the kinds of open sections, Enter opens a kind or opens
+//! and closes a section, Right opens a section and Left closes it. The cursor shows with the
+//! theme's focus ring while the navigation has focus.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +85,20 @@ pub fn marker(state: &SyncState) -> Option<Marker> {
 /// The height of a section header or kind row.
 const ROW_HEIGHT: f32 = 24.;
 
+/// A row the keyboard cursor can be on: a section header, by title, or a kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavRow {
+    Section(String),
+    Kind(KindId),
+}
+
+/// What the navigation asks of the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavEvent {
+    /// Open this kind's list, as clicking it does.
+    Open(KindId),
+}
+
 pub struct NavPanel {
     cluster: Option<ClusterId>,
     discovery: Option<Arc<ClusterDiscovery>>,
@@ -91,11 +110,22 @@ pub struct NavPanel {
     scroll_to_selected: bool,
     /// The cluster's connection failed, so no discovery is coming.
     connection_failed: bool,
+    focus: FocusHandle,
+    /// The keyboard cursor, once the arrows moved it; until then (or once its row is hidden)
+    /// it is on the open kind, else the first row ([`NavPanel::cursor`]).
+    cursor: Option<NavRow>,
+    /// Bring the cursor's row into view on the next frame.
+    scroll_to_cursor: bool,
 }
 
+impl EventEmitter<NavEvent> for NavPanel {}
+
 impl NavPanel {
-    pub fn new() -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         NavPanel {
+            focus: cx.focus_handle(),
+            cursor: None,
+            scroll_to_cursor: false,
             cluster: None,
             discovery: None,
             error: None,
@@ -119,6 +149,7 @@ impl NavPanel {
         if self.cluster != cluster {
             self.states.clear();
             self.selected = None;
+            self.cursor = None;
         }
         let changed = self.cluster != cluster
             || self.error != error
@@ -156,11 +187,59 @@ impl NavPanel {
                 .reveal(&discovery.navigation.sections, kind);
         }
         self.scroll_to_selected = self.selected != kind;
+        // The cursor follows the open kind, however it was opened.
+        if let Some(kind) = &kind {
+            self.cursor = Some(NavRow::Kind(kind.clone()));
+        }
         self.selected = kind;
         cx.notify();
     }
 
-    fn render_entry(&self, entry: &NavEntry, theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
+    /// The navigation's own focus: Tab cycles to it, and its keys work while it has it.
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
+    }
+
+    /// The rows the cursor can be on, top to bottom: every section header, and the listable
+    /// kinds of the open sections.
+    pub(in crate::ui) fn rows(&self) -> Vec<NavRow> {
+        let (Some(cluster), Some(discovery)) = (&self.cluster, &self.discovery) else {
+            return Vec::new();
+        };
+        let collapsed = self.collapsed.get(cluster).cloned().unwrap_or_default();
+        let mut rows = Vec::new();
+        for section in &discovery.navigation.sections {
+            rows.push(NavRow::Section(section.title.clone()));
+            if !collapsed.is_collapsed(section) {
+                rows.extend(
+                    section
+                        .entries
+                        .iter()
+                        .filter(|e| e.listable)
+                        .map(|e| NavRow::Kind(e.id.clone())),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Where the cursor is: where the arrows left it while that row shows, else on the open
+    /// kind, else on the first row.
+    pub(in crate::ui) fn cursor(&self) -> Option<NavRow> {
+        let rows = self.rows();
+        self.cursor
+            .clone()
+            .filter(|c| rows.contains(c))
+            .or_else(|| {
+                self.selected
+                    .clone()
+                    .map(NavRow::Kind)
+                    .filter(|c| rows.contains(c))
+            })
+            .or_else(|| rows.first().cloned())
+    }
+
+    fn render_entry(&self, entry: &NavEntry, theme: &Theme, cursor: bool) -> AnyElement {
         let is_selected = self.selected.as_ref() == Some(&entry.id);
         let state = self.states.get(&entry.id);
         let mark = state.and_then(marker);
@@ -209,8 +288,10 @@ impl NavPanel {
                 el.text_color(theme.muted_foreground.opacity(0.6))
             })
             .when(listable, |el| {
-                el.cursor_pointer()
-                    .on_click(registry::on_click(OpenView { kind: open }))
+                el.cursor_pointer().on_click(registry::on_click(OpenView {
+                    kind: open,
+                    ..Default::default()
+                }))
             })
             // The open kind is marked with the accent, as selections are.
             .relative()
@@ -223,12 +304,18 @@ impl NavPanel {
             .when(!is_selected && listable, |el| {
                 el.hover(|el| el.bg(theme.list_hover))
             })
+            // The keyboard cursor, while the navigation has focus.
+            // Every row has the border, so the ring moving shifts nothing.
+            .border_1()
+            .border_color(super::theme::cursor_ring(theme, cursor))
             .child(
                 div()
+                    .id(SharedString::from(format!("nav-label-{}", entry.id)))
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(entry.label.clone()),
+                    .child(entry.label.clone())
+                    .test_support(),
             )
             .children(mark.map(|m| match m {
                 // Static, not a spinner: dozens of kinds load at once after activation, and
@@ -240,12 +327,6 @@ impl NavPanel {
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .test_support()
             .into_any_element()
-    }
-}
-
-impl Default for NavPanel {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -272,10 +353,13 @@ fn dot(color: Hsla) -> AnyElement {
 }
 
 impl Render for NavPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut selected_row = None;
+        let mut cursor_row = None;
+        let focused = self.focus.is_focused(window);
+        let cursor = if focused { self.cursor() } else { None };
         match (&self.cluster, &self.discovery) {
             (None, _) => {}
             (Some(_), None) => {
@@ -335,6 +419,10 @@ impl Render for NavPanel {
                     }
                     let is_collapsed = collapsed.is_collapsed(section);
                     let toggle_section = section.title.clone();
+                    let ring = cursor.as_ref() == Some(&NavRow::Section(section.title.clone()));
+                    if ring {
+                        cursor_row = Some(rows.len());
+                    }
                     rows.push(
                         (h_flex()
                             .id(("nav-section", i))
@@ -349,6 +437,8 @@ impl Render for NavPanel {
                             .font_semibold()
                             .text_color(theme.muted_foreground)
                             .hover(|el| el.bg(theme.list_hover))
+                            .border_1()
+                            .border_color(super::theme::cursor_ring(&theme, ring))
                             .child(
                                 Icon::new(if is_collapsed {
                                     IconName::ChevronRight
@@ -357,13 +447,19 @@ impl Render for NavPanel {
                                 })
                                 .xsmall(),
                             )
-                            .child(div().flex_1().min_w_0().truncate().child(
-                                if section.kind == SectionKind::ApiGroup {
-                                    section.title.clone()
-                                } else {
-                                    section.title.to_uppercase()
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .id(("nav-section-label", i))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(if section.kind == SectionKind::ApiGroup {
+                                        section.title.clone()
+                                    } else {
+                                        section.title.to_uppercase()
+                                    })
+                                    .test_support(),
+                            )
                             .when(is_collapsed, |el| {
                                 el.child(
                                     div()
@@ -382,7 +478,11 @@ impl Render for NavPanel {
                             if self.selected.as_ref() == Some(&entry.id) {
                                 selected_row = Some(rows.len());
                             }
-                            rows.push(self.render_entry(entry, &theme, cx));
+                            let ring = cursor.as_ref() == Some(&NavRow::Kind(entry.id.clone()));
+                            if ring {
+                                cursor_row = Some(rows.len());
+                            }
+                            rows.push(self.render_entry(entry, &theme, ring));
                         }
                     }
                 }
@@ -410,8 +510,15 @@ impl Render for NavPanel {
             self.scroll_to_selected = false;
             self.scroll.scroll_to_item(ix);
         }
+        // And the cursor's, once the arrows moved it.
+        if let Some(ix) = cursor_row.filter(|_| self.scroll_to_cursor) {
+            self.scroll_to_cursor = false;
+            self.scroll.scroll_to_item(ix);
+        }
         v_flex()
             .id("nav")
+            .key_context(registry::NAVIGATION)
+            .track_focus(&self.focus)
             .map(|el| Self::register_actions(el, cx))
             .track_scroll(&self.scroll)
             .size_full()

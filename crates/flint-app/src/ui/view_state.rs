@@ -48,6 +48,12 @@ pub struct AppState {
 pub enum Focus {
     /// Nothing inside the window's views (the workspace itself).
     Workspace,
+    /// The cluster sidebar.
+    Sidebar,
+    /// The resource navigation.
+    Navigation,
+    /// The detail pane, outside its YAML editor.
+    Detail,
     /// The resource list's rows.
     List,
     /// The list's text filter.
@@ -106,6 +112,8 @@ impl Banner {
 /// The open command palette: what was typed, what it asks for, and the rows it lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaletteState {
+    /// `actions` (Cmd-Shift-P) or `resources` (the resource switcher, Cmd-P).
+    pub mode: &'static str,
     pub query: String,
     /// The action whose argument it asks for, by name (`logs::OpenSelectorLogs`), or `null`
     /// while it lists actions.
@@ -125,6 +133,9 @@ pub struct PaletteState {
     pub footer: Option<String>,
     /// Why the last Enter did nothing, if it did nothing.
     pub error: Option<String>,
+    /// A second line under the footer: in the resource switcher in On view mode, that only the
+    /// kinds being watched list their objects.
+    pub note: Option<String>,
 }
 
 /// At most this many palette rows are in the state.
@@ -136,10 +147,15 @@ pub struct PaletteRowState {
     pub label: String,
     /// An action row's action, by name.
     pub action: Option<String>,
-    /// The action's category, a choice's detail, or `typed` for the text typed.
+    /// The action's category, a choice's detail, `typed` for the text typed, or in the
+    /// resource switcher an object's kind (`Pods`) or `Kind` for a kind.
     pub detail: Option<String>,
     /// The action's key, as the OS writes it (`⇧⌘P`).
     pub shortcut: Option<String>,
+    /// In the resource switcher: the kind's id (`deployments.apps`).
+    pub kind: Option<String>,
+    /// In the resource switcher: the cluster, as the sidebar names it.
+    pub cluster: Option<String>,
 }
 
 /// An open dialog: what it says and the buttons it offers.
@@ -185,6 +201,9 @@ pub struct ClusterState {
     /// `protected`, `local` (on this machine), `unlocked` (for this session) or `trusted`
     /// (ADR-0015).
     pub protection: &'static str,
+    /// The sidebar's keyboard cursor is on it (shown with the focus ring while the sidebar
+    /// has focus).
+    pub cursor: bool,
 }
 
 /// What the main area shows.
@@ -238,6 +257,9 @@ pub struct NavSectionState {
     pub title: String,
     pub collapsed: bool,
     pub count: usize,
+    /// The navigation's keyboard cursor is on its header (shown with the focus ring while the
+    /// navigation has focus).
+    pub cursor: bool,
     /// The entries shown: empty while the section is collapsed.
     pub entries: Vec<NavEntryState>,
 }
@@ -248,6 +270,8 @@ pub struct NavEntryState {
     pub kind: String,
     pub label: String,
     pub selected: bool,
+    /// The navigation's keyboard cursor is on it.
+    pub cursor: bool,
     /// The watch-state marker: `loading`, `reconnecting` or `failed`.
     pub marker: Option<&'static str>,
 }

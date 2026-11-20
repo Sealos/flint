@@ -115,6 +115,15 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   change event per view per frame budget (about 100 ms). The view then reads the latest snapshot. Individual watch
   events are never forwarded to the UI one by one.
 - Snapshots are shared, read-only data (`Arc`). Views never hold locks on core state.
+- A watch nobody subscribes to builds no snapshots. `CoreHandle::stored_snapshots` reads the rows every watch of a
+  cluster holds without subscribing: a kind someone subscribes to gives what it last published, and any other is
+  asked for one snapshot (`Hub::peek`, a one-shot reply, answered within 300 ms or left out), which its watch task
+  builds from its store and keeps nowhere; a namespace-limited list asks each of its namespaces' watches the same
+  way and merges their answers, without touching its own state. A kind whose watch does not answer in time (busy
+  relisting) shows its kind row as "not loaded" rather than older rows. A read is not a subscriber: the hub still holds no rows afterwards, the
+  task publishes nothing, the kind keeps its place behind the per-cluster list limit, and the hub can be released
+  meanwhile. It never tells the manager, creates no hub and makes no request, so no watch starts in either mode.
+  The resource switcher uses it.
 
 ## Clusters
 
@@ -919,7 +928,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
   Flint, Hide Flint (Cmd-H), Hide Others (Option-Cmd-H), Show All and Quit; Edit has Cut, Copy, Paste and Select All,
   which the focused text field handles (the list filter, the namespace field, the log search, the palette), and
   Copy and Paste also a shell tab; View has
-  Show Command Palette and Appearance; Window has Close Dock Tab and Close Window. The Edit actions are bound only in
+  Show Command Palette, Go to Resource, Go Back and Appearance; Window has Close Dock Tab and Close Window. The Edit actions are bound only in
   a text field's key context (`Input`), so a shell tab keeps Cmd-C and Cmd-V for itself (and Linux shells keep Ctrl-C,
   Ctrl-V, Ctrl-X and Ctrl-A, which are in `TERMINAL_PASSTHROUGH`). Hide has no key on Linux, where Ctrl-H is a
   shell's backspace.
@@ -988,8 +997,77 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     bound in `CommandPalette > Input` so they win over the search field's arrows, Enter and Esc, and hidden from it.
   - A new control is not done until it is in the registry; a unit test per view checks that it binds every action
     of its scope.
-- **Resource switcher (Cmd-P):** fuzzy search over the kinds and objects of the active cluster, jumping straight to
-  a list or a detail view. It searches the in-memory stores, so it never makes network calls.
+- **Resource switcher (Cmd-P, Ctrl-P on Linux; a mode of the palette view, `switcher_model.rs`):** a fuzzy search
+  over the active cluster's listable kinds and the objects its watches hold in memory, jumping straight to a list or
+  a detail view. Rows show the namespace/name (or the kind's label), the kind and the cluster.
+  - Never the network: the objects come from `CoreHandle::stored_snapshots` (above), so a kind not watched now (On
+    view mode, or still loading) has no objects listed. Its kind is still listed, its row saying how many of its
+    objects are in memory or that they are not loaded; in On view mode a note under the footer says that only the
+    kinds being watched list their objects. A failed discovery is said as such.
+  - Off the render path: the kinds are listed at once, and the objects arrive a moment later, once the stores are
+    read and the index is built on a background thread. Each keystroke runs the search once: when the query only
+    grew, over the last query's matches; a subsequence pass rules out most objects, a linear-time score with no
+    allocation (`Matcher::quick_points`) ranks the rest, and only the best 200 get the palette's full scoring for
+    their order and highlights. The rows are a virtual list. A unit test types a name over 50,000 objects within
+    100 ms a keystroke in an unoptimized build (about 16-23 ms here).
+  - "pods web" finds the pod `web`: an object also matches its kind's label followed by its text, with less weight.
+  - The name counts most: the query being the whole name (the object's without its namespace, or the kind's label)
+    earns the most extra points, the name starting with it fewer, and the query found in the name alone a few (always
+    for a kind or a cluster-scoped object, whose text is the name; while ranking every object it is judged from
+    where the quick match starts, and the best 200 check the name itself), so
+    Deployment `demo/web` comes before ConfigMap `demo/web-cfg` for "web". Equal scores list the shorter text
+    first. While the objects arrive, and when the switcher lists anew on the same cluster (a kind renamed),
+    the selection stays on the item the user moved to once it is listed again, and a click drawn on the
+    rows before (`PalettePick`'s rows version, as in the palette) is dropped, so it cannot open the object now in
+    its row.
+  - Enter on a kind runs Open Kind… (`workspace::OpenView`); on an object, Open Object… (`workspace::OpenObject`,
+    hidden from the palette), which opens the kind's list with the object selected, so its details show. The
+    namespace filter is never changed for it: when the filter hides the object, its row is not listed, its details
+    still show, and the list says so (`list-filtered-out`). The selection shown before is cleared at once; when the
+    first current list lacks the object, the list says it no longer exists (`list-missing`) and stops waiting, so
+    one made later with the name is not selected. Only a list published after the list subscribed counts: the
+    first snapshot a subscription gets may be a watch's last publish from long before (a kind viewed earlier). Clearing the selection drops a pick still waited for. Both go through the registry from where focus
+    was, as the palette runs any action, and are not recorded as recent actions.
+  - An open switcher follows what is active: when another cluster (or API server) becomes active, or the
+    active cluster's discovery arrives or fails, or its watch mode changes, it lists anew with what was typed
+    kept; objects read for an earlier scope are dropped when they arrive late. An Enter names the cluster and
+    server its row was listed on, and Open Kind… and Open Object… refuse it
+    once another is active, so a row of one cluster never opens a same-named object on another.
+  - On a namespace-limited list, an object opened is judged gone only once its own namespace was listed anew:
+    the merged list says which rows of each namespace it holds (`NamespaceLimit::revisions`, each the
+    `KindSnapshot::revision` of that namespace's list), since it can be published again from a namespace's old
+    rows. A revision moves only when a list completes or a row changes, never on a republish of the same rows; a
+    quiet namespace is not proven gone until it is listed again, and the pick waits (clearing the selection drops
+    it). Go Back knows more: each remembered object carries the revision of the rows it was last seen in, so rows
+    newer than that without it prove it gone at once, even the rows the list opened again starts from (an object
+    deleted while another kind was shown).
+  - Cmd-Shift-P in the switcher swaps it for the palette, and Cmd-P back, keeping where focus was. On Linux, Ctrl-P
+    in the palette's field moves the selection up (its own key wins there), and a shell tab passes it to the shell.
+- **Panes and Go Back (UP-33, `workspace_keys.rs`):** the cluster sidebar (key context `ClusterSidebar`) and the
+  navigation (`Navigation`) take focus, by Tab or a click. Tab and Shift-Tab (`workspace::FocusNextPane`,
+  `FocusPreviousPane`, bound in `Workspace && !Input`) move focus through the panes shown: sidebar, navigation, list,
+  detail pane, the dock's shown tab, and around. A text field keeps Tab for moving between controls, and a shell tab
+  passes it to the shell.
+  - In the sidebar, the arrows move a cursor over the clusters (it starts on the active one) and Enter connects to the
+    one under it (`sidebar::*`). In the navigation, the arrows move over the section headers and the listable kinds
+    of open sections (starting on the open kind), Enter opens a kind (its list takes focus) or opens and closes a
+    section, Right opens a section and Left closes it, from a kind its own (`navigation::*`). These are bound on the
+    pane's own element, so they are available, and listed by the palette, only while it has focus; their keys are in
+    `ClusterSidebar && !Input` and `Navigation && !Input`, deeper than the list's arrows in `Workspace && !Input`.
+  - The list and the detail pane, which have no cursor of their own, show focus with a 1 px ring in the same
+    colour drawn over their edge while the pane itself has focus, so the layout does not move and clicks reach
+    the rows. The sidebar's cursor brings its cluster into view as it moves. Enter on the kind already open puts
+    focus in its list.
+  - The cursor shows as a 1 px border in the theme's `ring` color while its pane has focus; every row has the
+    border, transparent off the cursor, so the ring moving shifts nothing (nor a row's lock button). The lock
+    button is not a tab stop; from the sidebar, the palette's Unlock Cluster…, Lock Cluster Again…, Trust
+    Cluster… and Stop Trusting Cluster… reach it from the keyboard. A click, or a cluster or kind picked any
+    other way, moves it there.
+  - Go Back (Cmd-[, `workspace::GoBack`) returns to the kind and object shown before, with focus in the list:
+    opening another kind, or jumping from the switcher, remembers the list and its selected object (at most 50
+    places). It is available only while a remembered kind is still served; places of kinds no longer served are
+    skipped. It is per active cluster: switching clusters forgets them. In a text field Cmd-[ is the field's
+    (outdent).
 
 ## Settings and state
 

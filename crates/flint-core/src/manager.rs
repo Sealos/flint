@@ -773,9 +773,11 @@ impl ClusterManager {
         self.settings = Arc::new(settings);
         self.settings_error = error;
         self.log_budget.set_limit(self.settings.log_total_bytes());
-        self.emit_settings();
-        // The watch mode may have changed.
+        // The watch mode may have changed: start and stop the watches first, so a front end
+        // that reads the stores when it hears of the change (the resource switcher) finds
+        // them as the new settings have them.
         self.reconcile_all();
+        self.emit_settings();
         let paths = kubeconfig::paths_for_settings(
             &self.config.kubeconfig_base,
             &self.settings,

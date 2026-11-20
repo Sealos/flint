@@ -1,21 +1,106 @@
 //! The navigation's registered actions ([`crate::ui::registry`]), their handlers, and the
 //! checks the workspace's guards share with them. Opening a kind
-//! ([`crate::ui::registry::OpenView`]) belongs to the workspace, which owns the open list.
+//! ([`crate::ui::registry::OpenView`]) belongs to the workspace, which owns the open list: the
+//! keyboard's Enter on a kind asks it to ([`NavEvent::Open`]).
 
 use flint_core::NavSection;
 use gpui_kit::*;
 
-use super::super::registry::{ActionError, Bind, OnView, ToggleNavSection};
-use super::NavPanel;
+use super::super::registry::{
+    ActionError, Bind, CollapseSection, ExpandSection, OnView, OpenSelectedKind, SelectNextKind,
+    SelectPreviousKind, ToggleNavSection,
+};
+use super::{NavEvent, NavPanel, NavRow};
 
 impl NavPanel {
-    /// Every navigation action and its handler, for [`Bind`].
+    /// The navigation actions that work from anywhere in the window, and their handlers, for
+    /// [`Bind`]: the workspace forwards these.
     pub fn bind_actions<B: Bind<Self>>(bind: B) -> B {
         bind.bind::<ToggleNavSection>(Self::toggle_section)
     }
 
+    /// The keyboard cursor's actions: only while the navigation has focus, so they are bound
+    /// on its own element and not forwarded.
+    pub fn bind_cursor_actions<B: Bind<Self>>(bind: B) -> B {
+        bind.bind::<SelectPreviousKind>(|this, _, _, cx| this.move_cursor(-1, cx))
+            .bind::<SelectNextKind>(|this, _, _, cx| this.move_cursor(1, cx))
+            .bind::<OpenSelectedKind>(|this, _, _, cx| this.open_cursor(cx))
+            .bind::<ExpandSection>(|this, _, _, cx| this.expand_cursor(cx))
+            .bind::<CollapseSection>(|this, _, _, cx| this.collapse_cursor(cx))
+    }
+
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {
-        Self::bind_actions(OnView::new(element, cx)).into_element()
+        let element = Self::bind_actions(OnView::new(element, cx)).into_element();
+        Self::bind_cursor_actions(OnView::new(element, cx)).into_element()
+    }
+
+    /// Moves the cursor `step` rows, stopping at the first and the last row, as trees do.
+    fn move_cursor(&mut self, step: isize, cx: &mut Context<Self>) {
+        let rows = self.rows();
+        let Some(at) = self
+            .cursor()
+            .and_then(|c| rows.iter().position(|r| *r == c))
+        else {
+            return;
+        };
+        let next = (at as isize + step).clamp(0, rows.len() as isize - 1) as usize;
+        self.cursor = Some(rows[next].clone());
+        self.scroll_to_cursor = true;
+        cx.notify();
+    }
+
+    /// Enter: opens the kind under the cursor, or opens or closes its section.
+    fn open_cursor(&mut self, cx: &mut Context<Self>) {
+        match self.cursor() {
+            Some(NavRow::Kind(kind)) => cx.emit(NavEvent::Open(kind)),
+            Some(NavRow::Section(title)) => self.set_collapsed(&title, None, cx),
+            None => {}
+        }
+    }
+
+    /// Right: opens the section under the cursor.
+    fn expand_cursor(&mut self, cx: &mut Context<Self>) {
+        if let Some(NavRow::Section(title)) = self.cursor() {
+            self.set_collapsed(&title, Some(false), cx);
+        }
+    }
+
+    /// Left: closes the section under the cursor, or the section of the kind under it, which
+    /// the cursor moves to.
+    fn collapse_cursor(&mut self, cx: &mut Context<Self>) {
+        let title = match self.cursor() {
+            Some(NavRow::Section(title)) => title,
+            Some(NavRow::Kind(kind)) => match self.section_of(&kind) {
+                Some(section) => section.title.clone(),
+                None => return,
+            },
+            None => return,
+        };
+        self.cursor = Some(NavRow::Section(title.clone()));
+        self.scroll_to_cursor = true;
+        self.set_collapsed(&title, Some(true), cx);
+    }
+
+    /// Opens (`Some(false)`), closes (`Some(true)`) or toggles (`None`) the section `title`.
+    fn set_collapsed(&mut self, title: &str, collapsed: Option<bool>, cx: &mut Context<Self>) {
+        let (Some(cluster), Some(section)) = (self.cluster.clone(), self.section(title)) else {
+            return;
+        };
+        let section = section.clone();
+        let sections = self.collapsed.entry(cluster).or_default();
+        if collapsed.is_none_or(|c| c != sections.is_collapsed(&section)) {
+            sections.toggle(&section);
+            cx.notify();
+        }
+    }
+
+    fn section_of(&self, kind: &flint_core::KindId) -> Option<&NavSection> {
+        self.discovery
+            .as_ref()?
+            .navigation
+            .sections
+            .iter()
+            .find(|s| s.entries.iter().any(|e| e.id == *kind))
     }
 
     /// Whether the navigation shows sections (a cluster's discovery arrived).
@@ -93,7 +178,9 @@ mod tests {
 
     #[test]
     fn every_navigation_action_is_bound() {
-        assert_binds_scope(Scope::Navigation, NavPanel::bind_actions);
+        assert_binds_scope(Scope::Navigation, |names| {
+            NavPanel::bind_cursor_actions(NavPanel::bind_actions(names))
+        });
     }
 
     // ToggleNavSection opens and closes a section by title, as clicking its header does.
@@ -113,7 +200,7 @@ mod tests {
             },
             kinds: Vec::new(),
         };
-        let nav = cx.new(|_| NavPanel::new());
+        let nav = cx.new(NavPanel::new);
         nav.update(cx, |nav, cx| {
             nav.set_cluster(Some("a".into()), Some(Arc::new(discovery)), None, cx)
         });
@@ -182,7 +269,7 @@ mod tests {
                 cx,
                 |_, cx| {
                     cx.new(|cx| {
-                        let mut nav = NavPanel::new();
+                        let mut nav = NavPanel::new(cx);
                         nav.set_cluster(Some("a".into()), Some(discovery), None, cx);
                         nav
                     })

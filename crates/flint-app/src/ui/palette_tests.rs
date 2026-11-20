@@ -586,7 +586,15 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
         ]
     );
     assert_eq!(items("Edit"), ["Cut", "Copy", "Paste", "Select All"]);
-    assert_eq!(items("View"), ["Show Command Palette", "Appearance"]);
+    assert_eq!(
+        items("View"),
+        [
+            "Show Command Palette",
+            "Go to Resource",
+            "Go Back",
+            "Appearance"
+        ]
+    );
 }
 
 /// A pod `name` in `demo` with containers `app` and `sidecar`, selected and shown in the detail

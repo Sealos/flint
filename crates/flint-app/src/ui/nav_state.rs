@@ -1,7 +1,7 @@
 //! The navigation's part of the visible view tree ([`crate::ui::view_state`]).
 
 use super::super::view_state::{NavEntryState, NavSectionState, NavState, error_text};
-use super::{Marker, NavPanel, marker};
+use super::{Marker, NavPanel, NavRow, marker};
 
 impl NavPanel {
     /// The sections, and the entries of the open ones. `None` with no cluster active.
@@ -21,6 +21,7 @@ impl NavPanel {
             });
         };
         let collapsed = self.collapsed.get(cluster).cloned().unwrap_or_default();
+        let cursor = self.cursor();
         let sections = discovery
             .navigation
             .sections
@@ -31,6 +32,7 @@ impl NavPanel {
                     title: section.title.clone(),
                     collapsed: is_collapsed,
                     count: section.entries.len(),
+                    cursor: cursor == Some(NavRow::Section(section.title.clone())),
                     entries: if is_collapsed {
                         Vec::new()
                     } else {
@@ -41,6 +43,7 @@ impl NavPanel {
                                 kind: entry.id.to_string(),
                                 label: entry.label.clone(),
                                 selected: self.selected.as_ref() == Some(&entry.id),
+                                cursor: cursor == Some(NavRow::Kind(entry.id.clone())),
                                 marker: self
                                     .states
                                     .get(&entry.id)
@@ -82,7 +85,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn no_cluster_no_navigation(cx: &mut TestAppContext) {
-        let nav = cx.new(|_| NavPanel::new());
+        let nav = cx.new(NavPanel::new);
         assert_eq!(nav.read_with(cx, |nav, _| nav.view_state()), None);
         nav.update(cx, |nav, cx| {
             nav.set_cluster(Some("a".into()), None, None, cx)

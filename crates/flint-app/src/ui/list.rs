@@ -106,6 +106,25 @@ pub struct ResourceList {
     reveal_selected: bool,
     /// An object to select as soon as it is listed (`FLINT_VIEW`): namespace and name.
     pending_select: Option<(Option<String>, String)>,
+    /// The pending object is waited for only until the first current snapshot (the resource
+    /// switcher, Go Back), not for good (`FLINT_VIEW`).
+    pending_once: bool,
+    /// An object asked for ([`ResourceList::select_listed`]) that the list did not have: what
+    /// the list says about it, until another selection.
+    missing: Option<(Option<String>, String)>,
+    /// The version of the snapshot the subscription started with. That one may be a watch's
+    /// last publish from long ago (a kind viewed earlier keeps it), so an object is judged gone
+    /// only on a snapshot published since.
+    subscribed_version: u64,
+    /// For a namespace-limited list, which list of each namespace the subscription started
+    /// with: a merged list published since may still hold a namespace's old rows.
+    subscribed_lanes: Option<Arc<flint_core::NamespaceLimit>>,
+    /// The revision of the rows the pending object was last seen in (Go Back), if known: a
+    /// list newer than that without it proves it gone, also one the subscription started with.
+    pending_seen: Option<u64>,
+    /// The revision of the newest rows the selected object was seen in ([`rows_revision`]),
+    /// for Go Back.
+    selected_seen: Option<u64>,
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
@@ -161,6 +180,8 @@ impl ResourceList {
         let kind = entry.id.clone();
         let mut subscription = core.subscribe(&cluster, &kind);
         let latest = subscription.peek();
+        let subscribed_version = latest.version;
+        let subscribed_lanes = latest.limited_to.clone();
         let watch = cx.spawn(async move |this, cx| {
             while subscription.changed().await {
                 let snapshot = subscription.latest();
@@ -219,6 +240,12 @@ impl ResourceList {
             selected_gone: false,
             reveal_selected: false,
             pending_select: None,
+            pending_once: false,
+            missing: None,
+            subscribed_version,
+            subscribed_lanes,
+            pending_seen: None,
+            selected_seen: None,
             computing: false,
             dirty: false,
             remeasure: false,
@@ -312,6 +339,15 @@ impl ResourceList {
         if let Some((namespace, name)) = self.pending_select.take() {
             if find_row(&self.latest, namespace.as_deref(), &name).is_some() {
                 self.select_named(namespace.as_deref(), &name, cx);
+            } else if self.pending_once
+                && self.latest.state.is_current()
+                && self.listed_since_subscribed(namespace.as_deref())
+            {
+                // Listed in full since the list opened, and not there: it is gone. Stop
+                // waiting, so an object made later with the name is not selected out of the
+                // blue.
+                self.missing = Some((namespace, name));
+                cx.notify();
             } else {
                 self.pending_select = Some((namespace, name));
             }
@@ -336,15 +372,89 @@ impl ResourceList {
         name: String,
         cx: &mut Context<Self>,
     ) {
+        self.pending_once = false;
+        self.missing = None;
         self.pending_select = Some((namespace, name));
         let latest = self.latest.clone();
         self.set_snapshot(latest, cx);
+    }
+
+    /// Selects the object with `name` in `namespace` once the list is current, as a click
+    /// would: the resource switcher and Go Back. The selection shown before is cleared at once;
+    /// if the first current list lacks the object, the list says it no longer exists and stops
+    /// waiting.
+    ///
+    /// `seen`: the revision of the rows it was last seen in ([`ResourceList::selected_seen`]),
+    /// when known (Go Back): rows newer than that without it prove it gone, even if they are
+    /// the rows the list subscribed with.
+    pub fn select_listed(
+        &mut self,
+        namespace: Option<String>,
+        name: String,
+        seen: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|s| s.namespace != namespace || s.name != name)
+        {
+            self.clear_selection(cx);
+        }
+        self.missing = None;
+        self.pending_once = true;
+        self.pending_seen = seen;
+        self.pending_select = Some((namespace, name));
+        let latest = self.latest.clone();
+        self.set_snapshot(latest, cx);
+    }
+
+    /// Whether the newest snapshot lists `namespace` (or the whole kind) anew since the list
+    /// subscribed, so an object missing from it is gone. A namespace-limited list is merged
+    /// from one list per namespace, and may be published again from a namespace's old rows:
+    /// that namespace's own list must be newer.
+    fn listed_since_subscribed(&self, namespace: Option<&str>) -> bool {
+        if let Some(seen) = self.pending_seen {
+            return rows_revision(&self.latest, namespace).is_some_and(|now| now > seen);
+        }
+        if self.latest.version <= self.subscribed_version {
+            return false;
+        }
+        let (Some(limit), Some(namespace)) = (&self.latest.limited_to, namespace) else {
+            return true;
+        };
+        let Some(now) = limit.revision_of(namespace) else {
+            // Not a namespace this list covers: it cannot tell.
+            return false;
+        };
+        let then = self
+            .subscribed_lanes
+            .as_ref()
+            .and_then(|l| l.revision_of(namespace))
+            .unwrap_or(0);
+        now > then
+    }
+
+    /// What the list says about an object asked for that it does not have.
+    pub(in crate::ui) fn missing_text(&self) -> Option<String> {
+        let (namespace, name) = self.missing.as_ref()?;
+        Some(match namespace {
+            Some(ns) => format!("{name} no longer exists in {ns}."),
+            None => format!("{name} no longer exists."),
+        })
+    }
+
+    /// The revision of the newest rows the selected object was seen in, for Go Back.
+    pub(in crate::ui) fn selected_seen(&self) -> Option<u64> {
+        self.selected.as_ref().and(self.selected_seen)
     }
 
     fn select_named(&mut self, namespace: Option<&str>, name: &str, cx: &mut Context<Self>) {
         let Some(row) = find_row(&self.latest, namespace, name) else {
             return;
         };
+        self.missing = None;
+        self.selected_seen = rows_revision(&self.latest, namespace);
         let row = &self.latest.rows[row];
         self.selected = Some(Selected {
             uid: row.uid.clone(),
@@ -462,6 +572,8 @@ impl ResourceList {
                 match found {
                     Some(row) => {
                         self.selected_gone = false;
+                        self.selected_seen =
+                            rows_revision(&self.shown, selected.namespace.as_deref());
                         if row.resource_version != selected.resource_version {
                             selected.resource_version = row.resource_version.clone();
                             cx.emit(ListEvent::SelectedChanged);
@@ -493,9 +605,12 @@ impl ResourceList {
             namespace: row.namespace.as_deref().map(str::to_owned),
             resource_version: row.resource_version.clone(),
         };
+        let seen = rows_revision(&self.shown, selected.namespace.as_deref());
         window.focus(&self.focus, cx);
         // A user's choice wins over a startup selection still waiting for its object.
         self.pending_select = None;
+        self.missing = None;
+        self.selected_seen = seen;
         self.selected_ix = Some(ix);
         self.selected_gone = false;
         self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
@@ -514,6 +629,9 @@ impl ResourceList {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        // An object still waited for would be selected later, out of the blue.
+        self.pending_select = None;
+        self.missing = None;
         if self.selected.take().is_some() {
             self.selected_ix = None;
             cx.emit(ListEvent::Selected(None));
@@ -969,11 +1087,42 @@ impl ResourceList {
         }
     }
 
-    /// Banners over the rows: not current (reconnecting, failing), limited to some namespaces
-    /// by permissions, or without server columns.
+    /// What the list says when the selected object's namespace is outside the namespace
+    /// filter (opened from the resource switcher): its row is hidden, its details show.
+    pub(in crate::ui) fn filtered_out_text(&self) -> Option<String> {
+        let selected = self.selected.as_ref()?;
+        let namespace = selected.namespace.as_deref()?;
+        let filter = &self.query.namespaces;
+        if !self.namespaced || filter.is_empty() || filter.iter().any(|n| n == namespace) {
+            return None;
+        }
+        Some(format!(
+            "{} is in namespace {namespace}, outside the namespace filter, so its row is hidden; \
+             its details are shown.",
+            selected.name
+        ))
+    }
+
+    /// Banners over the rows: an object asked for that is gone, or whose row the namespace
+    /// filter hides; not current (reconnecting, failing), limited to some namespaces by
+    /// permissions, or without server columns.
     fn banners(&self, theme: &Theme) -> Vec<AnyElement> {
         let snapshot = &self.shown;
         let mut banners = Vec::new();
+        if let Some(text) = self.missing_text() {
+            banners.push(
+                notice("list-missing", text, theme.warning)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        if let Some(text) = self.filtered_out_text() {
+            banners.push(
+                notice("list-filtered-out", text, theme.info)
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
         if let Some(limit) = &snapshot.limited_to
             && !limit.listed.is_empty()
         {
@@ -1010,6 +1159,16 @@ impl ResourceList {
         }
         banners
     }
+}
+
+/// The revision of the rows of `snapshot` an object in `namespace` is in: that namespace's own
+/// list on a namespace-limited list, else the whole list's. `None` when no watch built it.
+fn rows_revision(snapshot: &KindSnapshot, namespace: Option<&str>) -> Option<u64> {
+    let revision = match (&snapshot.limited_to, namespace) {
+        (Some(limit), Some(namespace)) => limit.revision_of(namespace)?,
+        _ => snapshot.revision,
+    };
+    (revision > 0).then_some(revision)
 }
 
 /// "Showing Pods in 2 namespaces only (demo, team-a): you may not list Pods in all namespaces."
@@ -1161,6 +1320,8 @@ impl Render for ResourceList {
                 })
                 .into_any_element(),
         };
+        // The rows have focus (not the filter): ringed, as Tab between panes shows (UP-33).
+        let focused = self.focus.is_focused(window);
         v_flex()
             .id("resource-list")
             .key_context(CONTEXT)
@@ -1168,9 +1329,17 @@ impl Render for ResourceList {
             .map(|el| Self::register_actions(el, cx))
             .size_full()
             .min_w_0()
+            .relative()
             .child(self.render_toolbar(theme, cx))
             .children(self.banners(theme))
             .child(body)
+            .when(focused, |el| {
+                el.child(
+                    super::theme::pane_focus_ring(theme)
+                        .id("list-focus-ring")
+                        .test_support(),
+                )
+            })
     }
 }
 

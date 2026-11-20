@@ -249,6 +249,16 @@ pub enum Event {
     Error(String),
 }
 
+/// What [`CoreHandle::store_for_tests`] returns: keep it while the test reads the stores.
+#[cfg(any(test, feature = "test-support"))]
+pub struct StoredForTests(
+    #[expect(dead_code, reason = "held, not read")] watch::Receiver<Arc<KindSnapshot>>,
+);
+
+/// How long [`CoreHandle::stored_snapshots`] waits for the watches nobody subscribes to, to
+/// build their snapshots: a few of their 100 ms publish intervals.
+pub const STORED_WAIT: Duration = Duration::from_millis(300);
+
 /// Core work is mostly waiting on the network; blocking work (file reads, exec plugins) runs on
 /// tokio's separate blocking pool.
 const CORE_WORKER_THREADS: usize = 4;
@@ -383,6 +393,34 @@ impl CoreHandle {
     /// never waits on core work, so the UI thread may call it.
     pub fn sync_states(&self, cluster: &str) -> Vec<(KindId, SyncState)> {
         self.hubs.states(cluster)
+    }
+
+    /// The rows the watches of `cluster` hold in memory now, one snapshot per kind that has
+    /// listed, for a search over every object (the resource switcher). Never reaches the API
+    /// server and never starts a watch, in either watch mode: kinds not watched now are left
+    /// out. Answers within about [`STORED_WAIT`]. Works on any executor; dropping the future
+    /// stops the work.
+    pub fn stored_snapshots(
+        &self,
+        cluster: &str,
+    ) -> impl Future<Output = Vec<Arc<KindSnapshot>>> + Send + 'static {
+        let hubs = self.hubs.clone();
+        let cluster = cluster.to_owned();
+        let task = spawn_aborting(&self.runtime, async move {
+            hubs.stored(&cluster, STORED_WAIT).await
+        });
+        async move { task.await.unwrap_or_default() }
+    }
+
+    /// Puts `snapshot` in its kind's store as a watch would, for front-end tests of what reads
+    /// the stores without subscribing ([`CoreHandle::stored_snapshots`]). While the returned
+    /// value is kept, the kind counts as subscribed, so reading it does not wait for a watch
+    /// task to build a snapshot (there is none).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_for_tests(&self, snapshot: KindSnapshot) -> StoredForTests {
+        let hub = self.hubs.get_or_create(&snapshot.cluster, &snapshot.kind);
+        hub.take_over(snapshot);
+        StoredForTests(hub.subscribe())
     }
 
     /// Runs [`view::compute`] (namespace filter, text filter, sort) on the core's threads, so a
@@ -849,15 +887,22 @@ mod tests {
         .expect("hub released");
     }
 
-    // covers UP-44: opening or restarting a shell is a retry: it ends the rest of the cluster's
-    // exec auth plugin, as Retry does.
+    // covers UP-31: the stores are read through the hubs alone (`HubRegistry::stored`), which
+    // hold no channel to the manager, so no watch can start.
     #[tokio::test]
-    async fn a_shell_ends_the_rest_of_its_clusters_plugin() {
+    async fn stored_snapshots_read_without_subscribing() {
         let dir = tempfile::tempdir().unwrap();
         let core = start(dir.path());
-        let before = crate::auth_plugin::retry_epoch("shell-rest");
-        let _session = core.exec(crate::exec::ExecRequest::shell("shell-rest", "ns", "p"));
-        assert_eq!(crate::auth_plugin::retry_epoch("shell-rest"), before + 1);
+        assert!(core.stored_snapshots("nowhere").await.is_empty());
+        let _kept = core.store_for_tests(KindSnapshot {
+            cluster: "nowhere".into(),
+            kind: KindId::pods(),
+            state: SyncState::Synced,
+            ..Default::default()
+        });
+        let stored = core.stored_snapshots("nowhere").await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].kind, KindId::pods());
     }
 
     #[tokio::test]
@@ -871,6 +916,17 @@ mod tests {
         assert!(err.contains("not connected"), "{err}");
         assert!(core.discovery("nowhere").await.is_none());
         assert!(core.watched_kinds("nowhere").await.is_empty());
+    }
+
+    // covers UP-44: opening or restarting a shell is a retry: it ends the rest of the cluster's
+    // exec auth plugin, as Retry does.
+    #[tokio::test]
+    async fn a_shell_ends_the_rest_of_its_clusters_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = start(dir.path());
+        let before = crate::auth_plugin::retry_epoch("shell-rest");
+        let _session = core.exec(crate::exec::ExecRequest::shell("shell-rest", "ns", "p"));
+        assert_eq!(crate::auth_plugin::retry_epoch("shell-rest"), before + 1);
     }
 
     // covers UP-47: a pod list nobody waits for any more stops: dropping the future aborts

@@ -748,6 +748,12 @@ impl Dock {
         self.active.filter(|_| self.visible)
     }
 
+    /// The focus of the tab shown, if any: where Tab moves focus to in the dock (UP-33).
+    pub fn shown_tab_focus(&self, cx: &App) -> Option<FocusHandle> {
+        self.shown_tab()?;
+        Some(self.active_tab()?.item(cx).tab_focus())
+    }
+
     /// The dock's actions on the tab shown, for [`Bind`]: bound only while a tab is shown
     /// ([`Dock::shown_tab`]), so the Window menu's Close Dock Tab is disabled otherwise. Cmd-W
     /// then falls through to its lower-precedence binding, Close Window (#177).

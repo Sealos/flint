@@ -230,10 +230,17 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (matching and ranking), ui.
 
 ### UP-31 Jump to a resource
-- **When** I press Cmd-P and type part of a kind or object name.
-- **Then** results come from memory instantly, even with tens of thousands of objects, and Enter opens the list or the
-  object.
-- Tests: unit (fuzzy matching), ui.
+- **When** I press Cmd-P (Ctrl-P on Linux) and type part of a kind or object name, or a kind and a name ("pods web").
+- **Then** the kinds the active cluster serves and the objects Flint already holds in memory are listed, each row with
+  its kind, its namespace/name and its cluster; results come from memory instantly, even with tens of thousands of
+  objects, and searching never makes a request to the cluster. The arrows move the selection; Enter on a kind opens its
+  list, and on an object opens its kind's list with the object selected and its details shown; when the namespace
+  filter hides it, the filter is left as it is and the list says the object is filtered out; when it no longer
+  exists, the list says so. The exact name comes first ("web" finds the Deployment web before web-cfg). Each kind says
+  how many of its objects are in memory, and in On view mode the switcher says only watched kinds list their
+  objects. Esc closes it and puts focus back. Cmd-Shift-P swaps it for the command
+  palette and Cmd-P back. With nothing in memory yet it lists the kinds; with no cluster active it says to select one.
+- Tests: unit (fuzzy matching, 50,000 objects per keystroke, reading the stores without a request), ui.
 
 ### UP-32 Choose light or dark
 - **When** I set the appearance to Light, Dark or System.
@@ -242,7 +249,13 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: ui (screenshots of both themes).
 
 ### UP-33 Use the app from the keyboard
-- **Then** I can move through clusters and lists with the arrow keys, open with Enter, and quit with Cmd-Q.
+- **Then** I can move through clusters and lists with the arrow keys, open with Enter, and quit with Cmd-Q. Tab and
+  Shift-Tab move focus between the panes: the cluster sidebar, the navigation, the list, the detail pane and the
+  dock's tab (a text field and a shell keep Tab for themselves). The pane with focus shows its cursor with the focus
+  ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
+  navigation the arrows move over sections and kinds, Enter opens a kind (its list takes focus) or opens and closes a
+  section, Right opens a section and Left closes it (from a kind, its own section). Cmd-[ goes back to the kind and
+  object shown before, on the active cluster.
 - Tests: ui.
 
 ---

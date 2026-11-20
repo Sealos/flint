@@ -196,6 +196,8 @@ pub struct DetailView {
     /// The object's cluster is protected (ADR-0015), as the workspace says it: Shell is
     /// disabled, saying so, with Unlock beside it. Logs and browsing are not affected.
     protected: bool,
+    /// The pane's own focus, for Tab and Shift-Tab between panes (UP-33).
+    focus: FocusHandle,
     _fetch: Task<()>,
     _show_pods: Task<()>,
     _yaml: Task<()>,
@@ -243,6 +245,7 @@ impl DetailView {
             pending: None,
             sessions_blocked: None,
             protected: false,
+            focus: cx.focus_handle(),
             _fetch: Task::ready(()),
             _show_pods: Task::ready(()),
             _yaml: Task::ready(()),
@@ -250,6 +253,11 @@ impl DetailView {
         view.refresh(window, cx);
         view.list_pods_soon(cx);
         view
+    }
+
+    /// The pane's own focus, which Tab and Shift-Tab move to.
+    pub(in crate::ui) fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
     }
 
     /// Says why no session can open on the object's cluster now, or `None` once it can.
@@ -1401,8 +1409,10 @@ fn timestamp_age(text: &str, now: i64) -> Option<String> {
 }
 
 impl Render for DetailView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // The pane itself has focus (Tab between panes, UP-33): ringed.
+        let focused = self.focus.is_focused(window);
         let cx: &mut Context<Self> = cx;
         let content: AnyElement = match (&self.fetch, self.tab) {
             (Fetch::Loading, _) => h_flex()
@@ -1455,14 +1465,23 @@ impl Render for DetailView {
         };
         v_flex()
             .id("detail")
+            .track_focus(&self.focus)
             .map(|el| Self::register_actions(el, cx))
             .test_support()
             .size_full()
             .min_w_0()
             .bg(theme.background)
+            .relative()
             .child(self.render_header(&theme, cx))
             .children(self.render_notices(&theme))
             .child(content)
+            .when(focused, |el| {
+                el.child(
+                    super::theme::pane_focus_ring(&theme)
+                        .id("detail-focus-ring")
+                        .test_support(),
+                )
+            })
     }
 }
 

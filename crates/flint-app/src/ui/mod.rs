@@ -41,6 +41,7 @@ mod scope_picker;
 mod startup;
 #[cfg(test)]
 mod support_tests;
+mod switcher_model;
 mod terminal_keys;
 mod terminal_model;
 mod terminal_palette;
@@ -62,8 +63,8 @@ use gpui_kit::*;
 use clusters::ClustersModel;
 use gpui_kit::component::input;
 use registry::{
-    About, AppearanceDark, AppearanceLight, AppearanceSystem, CloseActiveTab, CloseWindow, Hide,
-    HideOthers, Quit, ShowAll, ToggleCommandPalette,
+    About, AppearanceDark, AppearanceLight, AppearanceSystem, CloseActiveTab, CloseWindow, GoBack,
+    Hide, HideOthers, Quit, ShowAll, ToggleCommandPalette, ToggleResourceSwitcher,
 };
 use ui_state::UiState;
 use workspace::Workspace;
@@ -243,13 +244,18 @@ fn edit_menu() -> Menu {
     ])
 }
 
-/// View: Show Command Palette, and Appearance.
+/// View: Show Command Palette, Go to Resource, Go Back, and Appearance.
 fn view_menu(appearance: Appearance) -> Menu {
     Menu::new("View").items([
         MenuItem::action(
             registry::label::<ToggleCommandPalette>(),
             ToggleCommandPalette,
         ),
+        MenuItem::action(
+            registry::label::<ToggleResourceSwitcher>(),
+            ToggleResourceSwitcher,
+        ),
+        MenuItem::action(registry::label::<GoBack>(), GoBack),
         MenuItem::separator(),
         MenuItem::submenu(appearance_menu(appearance)),
     ])
