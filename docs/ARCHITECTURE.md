@@ -607,7 +607,9 @@ opens in a tab in the bottom dock.
   anywhere in kube's chain, a missing exec plugin, a bad kubeconfig or a 401 is signing in ("Flint couldn't sign in
   to the cluster."); a failed WebSocket upgrade (a proxy answering 200, missing upgrade headers) has words of its own;
   a refused or timed-out connection is reaching the cluster; only the API server's own `Status` is the server's, and
-  only those are told apart by their words (no permission, pod or exec not found, container not running). A bare HTTP
+  only those are told apart by their words (no permission, pod or exec not found, container not running). A plain-text
+  body is never shown, except the kubelet's refusal of a stopped container before the upgrade, `container not found
+  ("<name>")`, matched exactly (a valid container name, at most 63 characters), which is the server's too. A bare HTTP
   code (a proxy's page, a wrong server path) and anything else read "The shell could not start." with the full text.
   After the end the screen stays scrollable and copyable. Closing the tab drops the session.
 - **Keys in a shell tab.** The tab's key context (`Terminal`) binds Tab, Shift-Tab, Esc, Return, Backspace, Delete,

@@ -38,10 +38,14 @@ impl<'a> ApiError<'a> {
     /// `"<reason>: <message>"` from the server's `Status` (just the message when it already
     /// starts with the reason, as RBAC's "forbidden: User …" does), or `None` when it says
     /// nothing [`status_meaning`] would not say better: no `Status` body, an empty one, or a 401
-    /// (whose `Status` only repeats "Unauthorized").
+    /// (whose `Status` only repeats "Unauthorized"). A body that is not a `Status` is never
+    /// shown, except a known kubelet phrase ([`kubelet_reason`]).
     pub fn explanation(&self) -> Option<String> {
-        if self.kind() == ApiErrorKind::Unauthorized || self.reason == UNPARSED_STATUS {
+        if self.kind() == ApiErrorKind::Unauthorized {
             return None;
+        }
+        if self.reason == UNPARSED_STATUS {
+            return kubelet_reason(self.message).map(str::to_owned);
         }
         let (reason, message) = (self.reason, self.message);
         let repeats_reason = message
@@ -60,6 +64,28 @@ impl<'a> ApiError<'a> {
 /// kube's `reason` when the error body was not a Kubernetes `Status` (it then puts the body,
 /// often a proxy's HTML page, in `message`).
 const UNPARSED_STATUS: &str = "Failed to parse error data";
+
+/// The longest container name Kubernetes accepts (a DNS-1123 label).
+const MAX_CONTAINER_NAME: usize = 63;
+
+/// `body`, a plain-text error body, when it is exactly one of the kubelet's short refusals:
+/// `container not found ("<name>")`, which it answers an exec in a container that is not
+/// running with, before any upgrade (`GetExec`, `pkg/kubelet/kubelet_pods.go`). The name must
+/// be a valid container name. Anything else is `None`: such a body can come from any proxy on
+/// the way and hold anything, so none of its text is shown.
+fn kubelet_reason(body: &str) -> Option<&str> {
+    let body = body.trim();
+    let name = body
+        .strip_prefix("container not found (\"")?
+        .strip_suffix("\")")?;
+    let valid = (1..=MAX_CONTAINER_NAME).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    valid.then_some(body)
+}
 
 /// Names the API server in a message when its URL is not known.
 const SOME_SERVER: &str = "the API server";
@@ -458,8 +484,64 @@ mod tests {
         );
         assert_eq!(api(401, "Unauthorized", "Unauthorized").explanation(), None);
         assert_eq!(api(502, UNPARSED_STATUS, "<html>").explanation(), None);
+        // The kubelet's refusal of a stopped container is plain text, kept as it is.
+        assert_eq!(
+            api(500, UNPARSED_STATUS, "container not found (\"job\")")
+                .explanation()
+                .as_deref(),
+            Some("container not found (\"job\")")
+        );
         assert_eq!(api(500, "", "").explanation(), None);
         assert_eq!(api(409, "", "x").explanation().as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn only_a_strict_kubelet_phrase_is_read_from_a_plain_body() {
+        let name63 = "a".repeat(MAX_CONTAINER_NAME);
+        let ok = format!("container not found (\"{name63}\")");
+        assert_eq!(kubelet_reason(&ok), Some(ok.as_str()));
+        assert_eq!(
+            kubelet_reason(" container not found (\"web-1\")\n"),
+            Some("container not found (\"web-1\")")
+        );
+        let name64 = "a".repeat(MAX_CONTAINER_NAME + 1);
+        for body in [
+            "",
+            "container not found",
+            "container not found (\"\")",
+            &format!("container not found (\"{name64}\")"),
+            "container not found (\"Job\")",
+            "container not found (\"-job\")",
+            "container not found (\"job-\")",
+            "container not found (\"job\") token=s3cr3t",
+            "token=s3cr3t container not found (\"job\")",
+            "container not found (\"a\"), password=s3cr3t (\"b\")",
+            "container not found (\"<script>\")",
+            "container not found (\"j\u{f6}b\")",
+            "<html>container not found (\"job\")</html>",
+        ] {
+            assert_eq!(kubelet_reason(body), None, "{body:?}");
+            assert_eq!(
+                ApiError {
+                    code: 500,
+                    reason: UNPARSED_STATUS,
+                    message: body,
+                }
+                .explanation(),
+                None,
+                "{body:?}"
+            );
+        }
+        // A 401 says nothing more, whatever its body.
+        assert_eq!(
+            ApiError {
+                code: 401,
+                reason: UNPARSED_STATUS,
+                message: "container not found (\"job\")",
+            }
+            .explanation(),
+            None
+        );
     }
 
     #[test]
