@@ -72,10 +72,10 @@ impl ClustersModel {
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::ClustersChanged(snapshot) => {
+                forget_removed(&mut self.discovery, &self.clusters, &snapshot.clusters);
                 self.clusters = snapshot.clusters.clone();
                 self.kubeconfig_errors = snapshot.errors.clone();
                 self.kubeconfig_paths = snapshot.paths.clone();
-                forget_removed(&mut self.discovery, &self.clusters);
                 self.loaded = true;
                 if let Some(requested) = self.startup_cluster.take() {
                     match startup_cluster(&requested, &self.clusters) {
@@ -188,10 +188,27 @@ pub struct Discovered {
     pub error: Option<String>,
 }
 
-/// Drops the discovery of contexts no longer in kubeconfig: the core dropped them too, and the
-/// model would otherwise keep every removed context's kinds for as long as the app runs.
-fn forget_removed(discovery: &mut HashMap<ClusterId, Discovered>, clusters: &[ClusterSummary]) {
-    discovery.retain(|id, _| clusters.iter().any(|c| c.info.name == *id));
+/// Drops the discovery of contexts that left kubeconfig (`before` -> `now`), or that now point at
+/// another API server under the same name: the core dropped them too (a re-pointed context starts
+/// over and is discovered again), and the model would otherwise keep every such context's kinds
+/// for as long as the app runs, or show the old server's kinds for the new one.
+fn forget_removed(
+    discovery: &mut HashMap<ClusterId, Discovered>,
+    before: &[ClusterSummary],
+    now: &[ClusterSummary],
+) {
+    let server = |clusters: &[ClusterSummary], id: &str| {
+        clusters
+            .iter()
+            .find(|c| c.info.name == id)
+            .map(|c| c.info.server.clone())
+    };
+    discovery.retain(|id, _| match (server(before, id), server(now, id)) {
+        (_, None) => false,
+        (Some(was), Some(is)) => was == is,
+        // Discovered before the cluster list arrived: keep it.
+        (None, Some(_)) => true,
+    });
 }
 
 /// The cluster `FLINT_CLUSTER` selects: the context with exactly that name, or none.
@@ -276,12 +293,27 @@ mod tests {
     }
 
     #[test]
-    fn removed_contexts_lose_their_discovery() {
-        let mut discovery: HashMap<String, Discovered> = ["kept", "removed"]
+    fn removed_and_re_pointed_contexts_lose_their_discovery() {
+        let mut discovery: HashMap<String, Discovered> = ["kept", "removed", "re-pointed"]
             .into_iter()
             .map(|name| (name.to_owned(), Discovered::default()))
             .collect();
-        forget_removed(&mut discovery, &[cluster("kept"), cluster("new")]);
+        let at = |name: &str, server: &str| {
+            let mut c = cluster(name);
+            c.info.server = Some(server.into());
+            c
+        };
+        let before = [
+            at("kept", "https://a"),
+            at("removed", "https://b"),
+            at("re-pointed", "https://c"),
+        ];
+        let now = [
+            at("kept", "https://a"),
+            at("re-pointed", "https://elsewhere"),
+            at("new", "https://d"),
+        ];
+        forget_removed(&mut discovery, &before, &now);
         let mut left: Vec<&str> = discovery.keys().map(String::as_str).collect();
         left.sort();
         assert_eq!(left, ["kept"]);
