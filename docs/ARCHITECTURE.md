@@ -946,6 +946,21 @@ Rules:
 - **Bounded output:** lists, events and logs have default and maximum sizes (for example 200 objects, 200 events
   and 500 log lines), and lists, objects and logs are also capped at 256 KiB. When
   output is cut short, the result says so, so a large cluster cannot flood an agent's context.
+- **Bounded work (`flint_mcp::Limits`, #252):** rmcp starts a task per request and per reply and limits neither, so
+  Flint does. At most 16 tool calls run at once and 48 more wait for a turn; past those a call is refused at once with
+  a tool error ("too many tool calls in flight"; retry). A running call holds its turn until it ends: when the client
+  cancels it (`notifications/cancelled`, which drops its Kubernetes requests, a connecting exec plugin included) or
+  after 60 s, with a timeout naming the cluster's server (redacted like every reply). A wrapping transport counts the
+  bytes of replies handed to it and not written yet, and the requests read and not answered: while the replies pass
+  8 MiB it reads nothing more, so a client that stops reading stdout gets nothing more run or answered (refusals and
+  replies to other requests included); a request read while 128 are unanswered is refused there at once, as is one
+  whose id is still in flight; notifications, a cancellation in particular, always pass. A request counts until its
+  reply reaches the transport, or, once cancelled, until nothing works on it (a tool call's handler has ended). When
+  the client closes its end, the stream ends only once every request read is answered. Clusters connect through the
+  per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
+  connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
+  as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
+  written in time is skipped and logged.
 - **stdout is the protocol channel:** all logging goes to stderr: warnings and errors by default, info with
   `--verbose`, or what `FLINT_LOG` (else `RUST_LOG`) says (`flint_core::bootstrap::log_filter`, shared with the
   app).
