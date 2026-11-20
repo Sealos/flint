@@ -721,11 +721,19 @@ Rules:
   user toggles exposure from the cluster sidebar. The list is read again on every call, and calls naming any other
   cluster fail as if it did not exist.
 - **Read-only:** there are no tools that create, change, or delete anything, and no exec or port-forward.
+- **Names:** object, pod, namespace and container names are validated as single path segments before any request
+  (DNS-1123 names, or for other objects letters, digits and `-._:@`; never `.`, `..`, `/`, `%`, `?` or `#`), so a
+  name cannot reach another API path. The check runs before discovery, so a name that fails sends no request at
+  all; it gets a not-found error (a bad container name, the server's "not valid for pod") shaped like the API
+  server's, naming only what the caller sent. Discovery likewise leaves out any resource whose group, version or
+  plural is not a valid single path segment. RBAC names that are not DNS-1123 and use other characters (spaces, `+`, `~`, non-ASCII)
+  cannot be read this way.
 - **Scope (planned, M5.5, #67):** an exposed cluster will also be able to list the namespaces and kinds an agent may
   read ([ADR-0013](./adr/0013-agent-trust-model.md)). Empty will mean everything. Requests outside the scope will fail
   like an unexposed cluster. With a namespace scope, cluster-scoped kinds will be hidden unless the kinds scope names
   them. Not built yet: today an exposed cluster is readable in full.
-- **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept.
+- **Redaction:** Secret `data` and `stringData` values are replaced with a marker, and only the keys are kept. The
+  items of a `SecretList`, which carry no `kind`, and whatever is read as a Secret are redacted the same way.
   `metadata.managedFields` is removed from all output.
   - **Credentials in text** ([ADR-0013](./adr/0013-agent-trust-model.md)): `flint_core::redact::redact_credentials`
     replaces each value that looks like a credential with `[REDACTED:<kind>]`, keeping the key, the scheme, the user

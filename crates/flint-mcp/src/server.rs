@@ -134,6 +134,28 @@ fn kind_error(e: ResolveKindError) -> ToolError {
     }
 }
 
+/// What the API server answers for an object that does not exist (`NotFound: pods "x" not
+/// found`), where `resource` is the plural, or the kind as the caller named it. A name or
+/// namespace that is not a single valid path segment gets this answer without any request, so
+/// it can never reach another path, and the caller learns nothing it would not from a missing
+/// object.
+fn not_found(resource: &str, name: &str) -> ToolError {
+    ToolError(format!("NotFound: {resource} {name:?} not found"))
+}
+
+/// Refuses a namespace that is not a DNS-1123 label, as [`not_found`] for the namespace.
+fn check_namespace(namespace: Option<&str>) -> Result<(), ToolError> {
+    match namespace {
+        Some(ns) if !policy::is_label_name(ns) => Err(not_found("namespaces", ns)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `kind` is core v1 Secret, whose values are never shown.
+fn is_secret_kind(kind: &KindInfo) -> bool {
+    kind.group().is_empty() && kind.kind() == "Secret"
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String, ToolError> {
     Ok(serde_json::to_string_pretty(value)?)
 }
@@ -376,14 +398,18 @@ impl FlintMcp {
         Ok(kinds.clone())
     }
 
+    /// The connection and the resolved kind. `check` runs once the cluster is known to be
+    /// exposed and before discovery, so a call it refuses sends no request at all.
     async fn resolve(
         &self,
         cluster: &str,
         kind: &str,
         api_version: Option<&str>,
+        check: impl FnOnce() -> Result<(), ToolError>,
     ) -> Result<(Conn, KindInfo), ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, cluster).await?;
+        check()?;
         let kinds = self.kinds(cluster, &conn).await?;
         let kind = read::resolve_kind(&kinds, kind, api_version)
             .map_err(kind_error)?
@@ -489,7 +515,9 @@ impl FlintMcp {
 
     async fn do_list_resources(&self, p: ListResourcesParams) -> Result<String, ToolError> {
         let (conn, kind) = self
-            .resolve(&p.cluster, &p.kind, p.api_version.as_deref())
+            .resolve(&p.cluster, &p.kind, p.api_version.as_deref(), || {
+                check_namespace(p.namespace.as_deref())
+            })
             .await?;
         if !kind.is_listable() {
             return Err(ToolError(format!("{} cannot be listed", kind.kind())));
@@ -508,7 +536,7 @@ impl FlintMcp {
         )
         .await
         .map_err(|e| conn.fail(e))?;
-        let is_secret = kind.group().is_empty() && kind.kind() == "Secret";
+        let is_secret = is_secret_kind(&kind);
         let (columns, rows, cut, redacted) =
             table_rows(&page, is_secret, table::unix_now(), policy::LIST_BYTES);
         let mut out = json!({
@@ -537,8 +565,19 @@ impl FlintMcp {
     }
 
     async fn do_get_resource(&self, p: GetResourceParams) -> Result<String, ToolError> {
+        // The name and namespace go into the request path: one segment each, or not found,
+        // checked before discovery, so the kind is named as the caller gave it.
         let (conn, kind) = self
-            .resolve(&p.cluster, &p.kind, p.api_version.as_deref())
+            .resolve(&p.cluster, &p.kind, p.api_version.as_deref(), || {
+                let bad_namespace = p
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|ns| !policy::is_label_name(ns));
+                if bad_namespace || !policy::is_object_name(&p.name) {
+                    return Err(not_found(&p.kind, &p.name));
+                }
+                Ok(())
+            })
             .await?;
         let object = read::get(&conn.client, &kind, p.namespace.as_deref(), &p.name)
             .await
@@ -548,7 +587,12 @@ impl FlintMcp {
             value["apiVersion"] = json!(kind.api_version());
             value["kind"] = json!(kind.kind());
         }
-        let redacted = policy::sanitize(&mut value);
+        // Redacted as a Secret by what was asked for, not only by what came back.
+        let redacted = if is_secret_kind(&kind) {
+            policy::sanitize_secret(&mut value)
+        } else {
+            policy::sanitize(&mut value)
+        };
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
         let mut out = String::new();
@@ -570,6 +614,7 @@ impl FlintMcp {
     async fn do_get_events(&self, p: GetEventsParams) -> Result<String, ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
+        check_namespace(p.namespace.as_deref())?;
         let limit = policy::EVENTS.clamp(p.limit) as usize;
         let involved = read::InvolvedObject {
             kind: p.object_kind.clone(),
@@ -622,6 +667,17 @@ impl FlintMcp {
     async fn do_get_pod_logs(&self, p: GetPodLogsParams) -> Result<String, ToolError> {
         let ctx = self.context().await?;
         let conn = self.client(&ctx, &p.cluster).await?;
+        // The namespace and pod go into the request path, the container into its query.
+        if !policy::is_label_name(&p.namespace) || !policy::is_pod_name(&p.pod) {
+            return Err(not_found("pods", &p.pod));
+        }
+        if let Some(c) = p.container.as_deref().filter(|c| !policy::is_label_name(c)) {
+            // As the API server words a container the pod does not have.
+            return Err(ToolError(format!(
+                "BadRequest: container {c:?} is not valid for pod {:?}",
+                p.pod
+            )));
+        }
         let lines = policy::LOG_LINES.clamp(p.tail_lines);
         // Ask for one extra line to learn whether older lines exist.
         let mut tail = i64::from(lines) + 1;

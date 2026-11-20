@@ -506,6 +506,153 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
     Ok(())
 }
 
+// covers UP-10, UP-15
+#[test]
+fn up_10_names_that_are_not_single_path_segments_are_never_sent() -> Result<()> {
+    let two = Two::start()?;
+    two.scratch
+        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    let encoded = "ZmxpbnQtZTJlLXBhdGgtc2VjcmV0";
+    two.a.set_object(
+        &two.a.gvr("secrets"),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "db", "namespace": "demo"},
+            "type": "Opaque",
+            "data": {"password": encoded}
+        }),
+    );
+    let mut mcp = two.mcp()?;
+
+    // Each bad call, with what it answers and the not-found answer it must match: `ns` or
+    // `pod`, with the name it quotes. Made first, on a cold discovery cache.
+    let get = |kind: &str, namespace: Option<&str>, name: &str| json!({"cluster": EXPOSED, "kind": kind, "namespace": namespace, "name": name});
+    let logs = |namespace: &str, pod: &str, container: Option<&str>| json!({"cluster": EXPOSED, "namespace": namespace, "pod": pod, "container": container});
+    let calls = [
+        (
+            "get_resource",
+            get("namespaces", None, "demo/secrets"),
+            "ns",
+            "demo/secrets",
+        ),
+        (
+            "get_resource",
+            get("namespaces", None, "demo%2Fsecrets"),
+            "ns",
+            "demo%2Fsecrets",
+        ),
+        (
+            "get_resource",
+            get("namespaces", None, "demo/secrets?x=1"),
+            "ns",
+            "demo/secrets?x=1",
+        ),
+        ("get_resource", get("namespaces", None, ".."), "ns", ".."),
+        (
+            "get_resource",
+            get("pods", Some("demo"), "x/../db"),
+            "pod",
+            "x/../db",
+        ),
+        (
+            "get_resource",
+            get("pods", Some("demo"), "web#frag"),
+            "pod",
+            "web#frag",
+        ),
+        (
+            "get_resource",
+            get("pods", Some("demo/secrets"), "db"),
+            "pod",
+            "db",
+        ),
+        ("get_resource", get("pods", Some(".."), "db"), "pod", "db"),
+        (
+            "get_pod_logs",
+            logs("demo", "db/../../secrets", None),
+            "pod",
+            "db/../../secrets",
+        ),
+        (
+            "get_pod_logs",
+            logs("demo/secrets", "db", None),
+            "pod",
+            "db",
+        ),
+        (
+            "get_pod_logs",
+            logs("demo", "%2E%2E", None),
+            "pod",
+            "%2E%2E",
+        ),
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": "demo/secrets"}),
+            "ns",
+            "demo/secrets",
+        ),
+        (
+            "get_events",
+            json!({"cluster": EXPOSED, "namespace": "../demo"}),
+            "ns",
+            "../demo",
+        ),
+    ];
+    let mut answers = Vec::new();
+    for (tool, args, _, _) in &calls {
+        let got = mcp.call(tool, args.clone())?;
+        assert!(got.is_error, "{args}: {}", got.text);
+        answers.push(got.text);
+    }
+    let nodes = mcp.call(
+        "get_resource",
+        get("nodes", None, "kind-control-plane/proxy/pods"),
+    )?;
+    assert!(nodes.is_error, "{}", nodes.text);
+    assert!(nodes.text.starts_with("NotFound: nodes "), "{}", nodes.text);
+    let container = mcp.call(
+        "get_pod_logs",
+        logs("demo", "web-69c6f74b8b-qv4xv", Some("web&follow=true")),
+    )?;
+    assert!(container.is_error, "{}", container.text);
+    assert_eq!(
+        container.text,
+        "BadRequest: container \"web&follow=true\" is not valid for pod \"web-69c6f74b8b-qv4xv\""
+    );
+    // Not one request reached the server, not even discovery.
+    assert!(two.a.arrivals().is_empty(), "{:?}", two.a.arrivals());
+
+    // What a missing object looks like, from the server itself.
+    let mut missing = |args: Value| -> Result<String> {
+        let got = mcp.call("get_resource", args)?;
+        assert!(got.is_error, "{}", got.text);
+        Ok(got.text)
+    };
+    let missing_ns = missing(get("namespaces", None, "nope"))?;
+    let missing_pod = missing(get("pods", Some("demo"), "nope"))?;
+    assert_eq!(missing_ns, "NotFound: namespaces \"nope\" not found");
+    assert_eq!(missing_pod, "NotFound: pods \"nope\" not found");
+    for ((tool, args, like, name), answer) in calls.iter().zip(&answers) {
+        let expected = if *like == "ns" {
+            &missing_ns
+        } else {
+            &missing_pod
+        };
+        assert_eq!(
+            answer,
+            &expected.replace("\"nope\"", &format!("{name:?}")),
+            "{tool} {args}"
+        );
+    }
+
+    // The Secret itself is still readable by name, redacted.
+    let secret = mcp.call("get_resource", get("secret", Some("demo"), "db"))?;
+    assert!(!secret.is_error, "{}", secret.text);
+    assert!(!secret.text.contains(encoded), "{}", secret.text);
+    Ok(())
+}
+
 fn names(list: &Value) -> Vec<String> {
     list["rows"]
         .as_array()
