@@ -1711,6 +1711,10 @@ impl Render for Workspace {
 #[path = "workspace_actions.rs"]
 mod actions;
 
+#[cfg(test)]
+#[path = "leak_tests.rs"]
+mod leak_tests;
+
 #[cfg(any(test, feature = "automation"))]
 #[path = "workspace_state.rs"]
 mod state;
