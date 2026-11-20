@@ -11,8 +11,10 @@ user can expose a production cluster and still know what an agent could see and 
    so an agent cannot probe what exists.
 2. **Redacted logs and events.** Pod logs and event messages pass through a shared redactor in `flint-core` before
    they reach an agent. It replaces values that look like credentials: bearer and basic auth headers, JWTs,
-   private key blocks, cloud access keys, and `password=`, `token=` and `secret=` style pairs. The result says how
-   many values were replaced. AI log analysis (ADR-0011) uses the same redactor.
+   private key blocks, cloud access keys, vendor tokens, passwords in URLs, and `password=`, `token=` and `secret=`
+   style pairs. The same applies to other message text an agent can read: list columns, status, condition and
+   container termination messages in objects, and container arguments. The result says how many values were
+   replaced. The app's own views are not redacted. AI log analysis (ADR-0011) uses the same redactor.
 3. **An agent activity log.** Every MCP call is recorded: when, which cluster, which tool, what it named (kind,
    namespace, object, container), how much came back, whether it was cut short or denied. Returned content is never
    recorded. The app shows the log per cluster.

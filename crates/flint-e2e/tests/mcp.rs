@@ -213,6 +213,134 @@ fn up_10_agent_inspects_a_cluster() -> Result<()> {
     Ok(())
 }
 
+// covers UP-15
+#[test]
+fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
+    let two = Two::start()?;
+    two.scratch
+        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    let pod = "web-69c6f74b8b-qv4xv";
+    let token = "s3cr3t-t0ken-value-0123";
+    // Built at run time, so the source holds no access key id.
+    let aws_key = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+    two.a.set_log(
+        "demo",
+        pod,
+        &format!(
+            "starting nginx\nGET /api Authorization: Bearer {token}\nusing key {aws_key} for s3\nlistening on :80\n"
+        ),
+    );
+    let events = two.a.gvr("events");
+    let message = "Failed to pull image: https://bot:hunter2@registry.example.com/web: denied";
+    // The row list_resources shows (with its Message column), then the object behind it.
+    let row = two
+        .a
+        .new_row(&events, Some("demo"), "web.pull", &[("Message", message)]);
+    two.a.set_row(&events, row);
+    two.a.set_object(
+        &events,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {"name": "web.pull", "namespace": "demo"},
+            "involvedObject": {"kind": "Pod", "name": pod, "namespace": "demo"},
+            "reason": "Failed",
+            "message": message,
+            "type": "Warning",
+            "count": 1,
+        }),
+    );
+    // A pod whose container arguments carry a password.
+    let pods = two.a.gvr("pods");
+    two.a.set_object(
+        &pods,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "api-0", "namespace": "demo"},
+            "spec": {"containers": [{
+                "name": "web",
+                "image": "nginx",
+                "command": ["/bin/web", "--db-url=postgres://app:hunter3@db/app"],
+                "args": ["--password", "hunter4", "--port", "80"],
+            }]},
+        }),
+    );
+    let mut mcp = two.mcp()?;
+
+    let logs = mcp.call_json(
+        "get_pod_logs",
+        json!({"cluster": EXPOSED, "namespace": "demo", "pod": pod}),
+    )?;
+    let log = logs["log"].as_str().unwrap_or_default();
+    assert_eq!(
+        log,
+        "starting nginx\nGET /api Authorization: Bearer [REDACTED:authorization]\n\
+         using key [REDACTED:aws-access-key-id] for s3\nlistening on :80\n",
+        "{logs}"
+    );
+    assert_eq!(logs["redacted"], 2, "{logs}");
+
+    let got = mcp.call_json(
+        "get_events",
+        json!({"cluster": EXPOSED, "namespace": "demo", "object_name": pod}),
+    )?;
+    let messages: Vec<&str> = got["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["message"].as_str())
+        .collect();
+    assert!(
+        messages.contains(
+            &"Failed to pull image: https://bot:[REDACTED:password]@registry.example.com/web: denied"
+        ),
+        "{got}"
+    );
+    assert_eq!(got["redacted"], 1, "{got}");
+
+    // The same message through the other ways an agent can read it.
+    let listed = mcp.call_json(
+        "list_resources",
+        json!({"cluster": EXPOSED, "kind": "events", "namespace": "demo"}),
+    )?;
+    let event = mcp.call(
+        "get_resource",
+        json!({"cluster": EXPOSED, "kind": "event", "namespace": "demo", "name": "web.pull"}),
+    )?;
+    assert!(!event.is_error, "{}", event.text);
+    assert!(event.text.starts_with("# redacted=1"), "{}", event.text);
+    let spec = mcp.call(
+        "get_resource",
+        json!({"cluster": EXPOSED, "kind": "pod", "namespace": "demo", "name": "api-0"}),
+    )?;
+    assert!(!spec.is_error, "{}", spec.text);
+    assert!(spec.text.starts_with("# redacted=2"), "{}", spec.text);
+    assert!(
+        spec.text
+            .contains("--db-url=postgres://app:[REDACTED:password]@db/app"),
+        "{}",
+        spec.text
+    );
+    assert!(spec.text.contains("--port"), "{}", spec.text);
+    for text in [
+        logs.to_string(),
+        got.to_string(),
+        listed.to_string(),
+        event.text,
+        spec.text,
+    ] {
+        for secret in [token, aws_key.as_str(), "hunter2", "hunter3", "hunter4"] {
+            assert!(!text.contains(secret), "{secret} reached the agent: {text}");
+        }
+    }
+    assert!(
+        listed.to_string().contains("[REDACTED:password]"),
+        "{listed}"
+    );
+    Ok(())
+}
+
 fn names(list: &Value) -> Vec<String> {
     list["rows"]
         .as_array()

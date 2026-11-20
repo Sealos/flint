@@ -321,9 +321,15 @@ objects, events, and pod logs, and nothing else. It only sees clusters you mark 
 next to a cluster in the sidebar, which asks you to confirm the context and its server; exposed clusters show an "AI"
 badge). Nothing is exposed by default. An exposure is tied to the context's API server URL, so a context that is
 re-pointed, or has the same name in another `KUBECONFIG`, is not exposed until you expose it again.
-Large outputs are cut short. Only Secret values are redacted: everything else an agent reads, including ConfigMaps,
-`env` values in pod specs, and, until log redaction ships (#68), pod logs and event messages, is sent as the cluster
-returns it. Only expose clusters whose contents, logs and events you are willing to send to your AI provider.
+Large outputs are cut short. Secret values are redacted. In pod logs, event messages, other message fields
+(status, conditions, container termination messages, and list columns) and container `args` and `command`, values
+that look like credentials are replaced with a marker such as `[REDACTED:password]`, and each result says how many
+were replaced: `Authorization` and bearer tokens, passwords in URLs, AWS, GCP, GitHub, GitLab, Slack, Stripe, OpenAI
+and Anthropic keys and tokens, Slack webhooks, Azure SAS signatures, JWTs, private key blocks, and the values of
+`password=`, `secret:`, `token=` and `api_key=` style pairs and flags.
+This is pattern matching, so a credential in an unusual format can still get through. Everything else, including
+ConfigMaps and `env` values in pod specs, is sent as the cluster returns it. Only expose clusters whose contents,
+logs and events you are willing to send to your AI provider. Flint's own log viewer and events show text as written.
 
 Register it with Claude Code by `/usr/local/bin/flint`: the link into `Flint.app` (see
 [Install from a release](#install-from-a-release)) or the binary from the command-line archive. The path stays the same

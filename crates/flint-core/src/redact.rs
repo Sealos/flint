@@ -5,6 +5,13 @@
 //! short allowlist: tools store whole objects in annotations (kubectl's last-applied
 //! configuration, kapp, Rancher), and those copies include the Secret's values. Each front end
 //! picks its own marker (the MCP server says `<redacted>`, the app shows dots).
+//!
+//! [`redact_credentials`] hides credential-shaped values in free text (pod logs, event
+//! messages). Only the MCP server uses it: the app shows a cluster's logs and events as they are.
+
+mod text;
+
+pub use text::{Redacted, credential_flag, redact_credentials};
 
 use serde_json::Value;
 

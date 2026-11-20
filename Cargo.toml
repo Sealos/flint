@@ -27,6 +27,9 @@ futures = { version = "0.3.34", default-features = false, features = ["std"] }
 libc = "0.2.191"
 # Already in the tree (through kube, tokio and GPUI); finds search matches in log lines.
 memchr = "2.8.3"
+# Already in the tree (through kube and GPUI); credential redaction for text served to agents.
+regex = "1.13.2"
+aho-corasick = "1.1.5"
 notify = "8.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
@@ -89,3 +92,8 @@ fdeflate = { opt-level = 3 }
 "miniz_oxide@0.8.9" = { opt-level = 3 }
 crc32fast = { opt-level = 3 }
 simd-adler32 = { opt-level = 3 }
+# Credential redaction of logs served to agents (`flint_core::redact`): a 10 MB log takes about
+# 0.05 s instead of 0.25 s in test builds.
+regex-automata = { opt-level = 3 }
+aho-corasick = { opt-level = 3 }
+memchr = { opt-level = 3 }
