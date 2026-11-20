@@ -281,39 +281,23 @@ pub struct Discovered {
     pub error: Option<String>,
 }
 
-/// Drops the discovery of contexts that left kubeconfig (`before` -> `now`), or that now point at
-/// another API server under the same name: the core dropped their slots (a re-pointed context
-/// starts over and is discovered again), and the model would otherwise keep every such context's
-/// kinds for as long as the app runs, or show the old server's kinds for the new one. (Other
-/// changes to a context, such as its user, start it over in the core too; its kinds come from the
-/// same server, so they are kept until it is discovered again.)
-fn forget_removed(
-    discovery: &mut HashMap<ClusterId, Discovered>,
-    before: &[ClusterSummary],
-    now: &[ClusterSummary],
-) {
-    let server = |clusters: &[ClusterSummary], id: &str| {
-        clusters
-            .iter()
-            .find(|c| c.info.name == id)
-            .map(|c| c.info.server.clone())
-    };
-    discovery.retain(|id, _| match (server(before, id), server(now, id)) {
-        (_, None) => false,
-        (Some(was), Some(is)) => was == is,
-        // Discovered before the cluster list arrived: keep it.
-        (None, Some(_)) => true,
-    });
+/// Drops the discovery of contexts that left kubeconfig: the model would otherwise keep every
+/// such context's kinds for as long as the app runs. A context that starts over in the core
+/// (re-pointed, or back after being removed) is not judged from the lists, which a reader may
+/// see only some of (#255): the core resets its discovery with an event of its own, after the
+/// list, and a discovery that comes after that is the new slot's and is kept.
+fn forget_removed(discovery: &mut HashMap<ClusterId, Discovered>, now: &[ClusterSummary]) {
+    discovery.retain(|id, _| now.iter().any(|c| &c.info.name == id));
 }
 
-/// Replaces the cluster list with `now`, first forgetting the discovery its changes make stale
-/// ([`forget_removed`]). One step, so the old list is always the one compared against.
+/// Replaces the cluster list with `now`, forgetting the discovery of contexts it no longer has
+/// ([`forget_removed`]).
 fn replace_clusters(
     discovery: &mut HashMap<ClusterId, Discovered>,
     clusters: &mut Vec<ClusterSummary>,
     now: &[ClusterSummary],
 ) {
-    forget_removed(discovery, clusters, now);
+    forget_removed(discovery, now);
     *clusters = now.to_vec();
 }
 
@@ -414,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_and_re_pointed_contexts_lose_their_discovery() {
+    fn removed_contexts_lose_their_discovery() {
         let mut discovery: HashMap<String, Discovered> = ["kept", "removed", "re-pointed"]
             .into_iter()
             .map(|name| (name.to_owned(), Discovered::default()))
@@ -424,26 +408,22 @@ mod tests {
             c.info.server = Some(server.into());
             c
         };
-        let before = [
-            at("kept", "https://a"),
-            at("removed", "https://b"),
-            at("re-pointed", "https://c"),
-        ];
         let now = [
             at("kept", "https://a"),
             at("re-pointed", "https://elsewhere"),
             at("new", "https://d"),
         ];
-        forget_removed(&mut discovery, &before, &now);
+        forget_removed(&mut discovery, &now);
         let mut left: Vec<&str> = discovery.keys().map(String::as_str).collect();
         left.sort();
-        assert_eq!(left, ["kept"]);
+        // A re-pointed context is the core's to reset (its own event), not the list's.
+        assert_eq!(left, ["kept", "re-pointed"]);
     }
 
-    // Reloads one after another, as `ClustersChanged` applies them: each compares against the
-    // list the previous one left.
+    // covers UP-06: a discovery that came after a re-pointing is the new server's, and a list
+    // read after it (the queue may have moved the list behind it, #255) keeps it.
     #[test]
-    fn each_reload_forgets_against_the_list_before_it() {
+    fn a_later_list_keeps_the_new_servers_discovery() {
         let at = |name: &str, server: &str| {
             let mut c = cluster(name);
             c.info.server = Some(server.into());
@@ -452,13 +432,11 @@ mod tests {
         let mut discovery: HashMap<String, Discovered> = HashMap::new();
         let mut clusters = Vec::new();
         replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://one")]);
+        // The new server's discovery, then the list that re-pointed it.
         discovery.insert("a".into(), Discovered::default());
-        replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://one")]);
-        assert!(discovery.contains_key("a"), "an unchanged reload keeps it");
         replace_clusters(&mut discovery, &mut clusters, &[at("a", "https://two")]);
-        assert!(discovery.is_empty(), "a re-pointed context is forgotten");
+        assert!(discovery.contains_key("a"), "the new server's kinds stay");
         assert_eq!(clusters[0].info.server.as_deref(), Some("https://two"));
-        discovery.insert("a".into(), Discovered::default());
         replace_clusters(&mut discovery, &mut clusters, &[]);
         assert!(discovery.is_empty(), "a removed context is forgotten");
         assert!(clusters.is_empty());

@@ -128,3 +128,44 @@ async fn each_connection_attempt_is_seen_starting() {
     sender.send(connection("b", ConnectionState::Connecting));
     assert_eq!(drain(&events).await, ["b Connecting"]);
 }
+
+fn snapshot(contexts: &[String]) -> Event {
+    let clusters = contexts
+        .iter()
+        .map(|name| crate::handle::ClusterSummary {
+            info: crate::kubeconfig::ContextInfo {
+                name: name.clone(),
+                cluster: None,
+                user: None,
+                namespace: None,
+                server: None,
+                proxy_url: None,
+                source: std::path::PathBuf::new(),
+            },
+            state: ConnectionState::Disconnected,
+        })
+        .collect();
+    Event::ClustersChanged(Arc::new(crate::handle::ClustersSnapshot {
+        clusters,
+        ..Default::default()
+    }))
+}
+
+// covers UP-06: contexts that come and go under new names (a cloud CLI writing a fresh one each
+// time) leave nothing queued once a list no longer has them.
+#[tokio::test]
+async fn contexts_that_left_the_list_leave_the_queue() {
+    let (sender, _events) = channel();
+    for n in 0..1000 {
+        let name = format!("ctx-{n}");
+        sender.send(snapshot(std::slice::from_ref(&name)));
+        sender.send(connection(&name, ConnectionState::Connecting));
+        sender.send(Event::DiscoveryChanged {
+            cluster: name,
+            discovery: None,
+            error: None,
+        });
+    }
+    // The list, and the last context's connection and discovery.
+    assert_eq!(sender.queued(), 3);
+}

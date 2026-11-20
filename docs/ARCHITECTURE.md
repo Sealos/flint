@@ -116,7 +116,11 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   starting and where it settled, and errors the last 64 (older ones are dropped, counted and logged). The order of
   what is left is the order of the last changes, so reading it ends where reading every event would. (A context
   that starts over in the core, re-pointed or back after being removed, gets a discovery reset after the list, so a
-  reader that skipped the lists in between still forgets its old kinds.) The reader owns
+  reader that skipped the lists in between still forgets its old kinds; the app forgets discovery only for contexts the
+  list no longer has, so a later list never drops a newer server's kinds. A list also takes the queued connection and
+  discovery events of contexts it no longer has, so contexts that come and go under new names do not pile up. Shells
+  and log sessions on a context re-pointed and put back between reads still end: the core checks their pin against
+  the context's history, not the events.) The reader owns
   the queue: `CoreHandle::events` hands out readers, and once every reader is dropped the core stops queueing.
 - Watches can change faster than the UI should redraw. The core marks the store as changed and sends at most one
   change event per view per frame budget (about 100 ms). The view then reads the latest snapshot. Individual watch

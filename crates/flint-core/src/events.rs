@@ -145,6 +145,7 @@ impl EventSender {
         }
         let pending = &mut *guard;
         let key = key(&event, &mut pending.next_error);
+        let mut dropped_errors = None;
         if let Key::Error(_) = key {
             if pending.errors == MAX_ERRORS {
                 if let Some(at) = pending
@@ -157,18 +158,31 @@ impl EventSender {
                     pending.errors -= 1;
                 }
                 pending.dropped_errors += 1;
-                tracing::warn!(
-                    dropped = pending.dropped_errors,
-                    "core errors not read in time; dropped the oldest"
-                );
+                dropped_errors = Some(pending.dropped_errors);
             }
             pending.errors += 1;
         } else if pending.events.contains_key(&key) {
             pending.order.retain(|k| k != &key);
         }
+        // A context the new list no longer has: its queued connection and discovery events go
+        // (the reader forgets a context that left the list anyway), so contexts that come and go
+        // under new names do not pile up.
+        if let Event::ClustersChanged(snapshot) = &event {
+            let kept =
+                |context: &ClusterId| snapshot.clusters.iter().any(|c| &c.info.name == context);
+            let gone = |key: &Key| match key {
+                Key::Connection(context, _) | Key::Discovery(context) => !kept(context),
+                _ => false,
+            };
+            pending.order.retain(|k| !gone(k));
+            pending.events.retain(|k, _| !gone(k));
+        }
         pending.order.push_back(key.clone());
         pending.events.insert(key, event);
         drop(guard);
+        if let Some(dropped) = dropped_errors {
+            tracing::warn!(dropped, "core errors not read in time; dropped the oldest");
+        }
         self.0.ready.notify_waiters();
     }
 

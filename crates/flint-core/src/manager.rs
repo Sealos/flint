@@ -222,6 +222,8 @@ pub(crate) struct ClusterManager {
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: Option<mpsc::UnboundedReceiver<Internal>>,
     kubeconfig: Arc<LoadedKubeconfig>,
+    /// Kubeconfig was loaded at least once: contexts that come later are new to the front end.
+    kubeconfig_loaded: bool,
     /// Every context's history across kubeconfig loads, which sessions are pinned to.
     contexts: ContextHistory,
     /// The kubeconfig files for the current settings: the base files plus `kubeconfig_paths`.
@@ -281,6 +283,7 @@ impl ClusterManager {
             internal_tx,
             internal_rx: Some(internal_rx),
             kubeconfig: Arc::default(),
+            kubeconfig_loaded: false,
             contexts: ContextHistory::default(),
             kubeconfig_paths,
             clusters: Vec::new(),
@@ -1200,7 +1203,8 @@ impl ClusterManager {
         let mut changed_active = false;
         // Contexts that start over with a fresh slot (re-pointed, or back after being removed):
         // their discovery is reset after the list goes out (#255).
-        let first_load = old.is_empty();
+        let first_load = !self.kubeconfig_loaded;
+        self.kubeconfig_loaded = true;
         let mut reset = Vec::new();
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);

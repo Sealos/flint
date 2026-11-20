@@ -306,7 +306,8 @@ async fn reports_the_agent_activity_log_as_it_grows() {
 async fn rewrite_kubeconfig(dir: &Path, times: usize, contexts: &[&str]) {
     for n in 0..times {
         let mut names: Vec<String> = contexts.iter().map(|c| (*c).to_owned()).collect();
-        names.push(format!("burst-{}", n % 3));
+        // A fresh name every time, as a cloud CLI writing a new context might.
+        names.push(format!("burst-{n}"));
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         std::fs::write(dir.join("kubeconfig"), kubeconfig(&names)).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -326,8 +327,9 @@ async fn events_nobody_reads_stay_bounded() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     rewrite_kubeconfig(dir.path(), 50, &["one", "two"]).await;
     // Clusters, settings, activity: one each, however many times they changed; and at most one
-    // discovery reset per context seen (one, two, burst-0..2).
-    assert!(events.len() <= 3 + 5, "{} events queued", events.len());
+    // discovery reset per context in the latest list (one, two, the last burst-n): the 50 others
+    // left the queue with the list.
+    assert!(events.len() <= 3 + 3, "{} events queued", events.len());
     let mut latest = None;
     while !events.is_empty() {
         if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
@@ -379,6 +381,34 @@ async fn a_context_that_starts_over_resets_its_discovery() {
         assert!(read.iter().any(|e| e == reset), "{read:?}");
     }
     assert!(read.iter().any(|e| e == "clusters"), "{read:?}");
+}
+
+// covers UP-06: the only context, removed and added back, starts over: its discovery is reset
+// (it is not taken for the first load).
+#[tokio::test]
+async fn the_only_context_removed_and_added_back_starts_over() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
+    let core = start(dir.path(), true);
+    let events = core.events();
+    next_clusters(&events).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for text in [kubeconfig(&[]), kubeconfig(&["one"])] {
+        std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let mut reset = false;
+    while !events.is_empty() {
+        if let Event::DiscoveryChanged {
+            cluster,
+            discovery: None,
+            error: None,
+        } = events.recv().await.unwrap()
+        {
+            reset |= cluster == "one";
+        }
+    }
+    assert!(reset, "the context that came back starts over");
 }
 
 // covers UP-06: once the front end drops its stream, the core stops queueing events for it;
