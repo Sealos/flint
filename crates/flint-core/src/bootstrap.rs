@@ -76,13 +76,15 @@ pub fn init_logging(verbose: bool) {
 }
 
 /// The log filter: `FLINT_LOG` if set, else `RUST_LOG`, else `info` when `verbose` and `warn`
-/// otherwise, so a plain run prints only warnings and errors. An empty or unparsable variable
-/// counts as unset. A variable wins over `verbose`: it says exactly what to log.
+/// otherwise, so a plain run prints only warnings and errors. A variable with no directive (empty,
+/// or only commas and spaces) or an unparsable one counts as unset: `EnvFilter` would drop the
+/// empty entries and hide everything. A variable wins over `verbose`: it says exactly what to
+/// log, and `off` turns logging off.
 pub fn log_filter(flint_log: Option<&str>, rust_log: Option<&str>, verbose: bool) -> EnvFilter {
     [flint_log, rust_log]
         .into_iter()
         .flatten()
-        .filter(|directives| !directives.trim().is_empty())
+        .filter(|directives| directives.split(',').any(|d| !d.trim().is_empty()))
         .find_map(|directives| EnvFilter::try_new(directives).ok())
         .unwrap_or_else(|| EnvFilter::new(if verbose { "info" } else { "warn" }))
 }
@@ -185,6 +187,26 @@ mod tests {
             max_level(Some("=bogus=["), Some("error"), true),
             LevelFilter::ERROR
         );
+    }
+
+    #[test]
+    fn filters_with_only_separators_count_as_unset() {
+        assert_eq!(max_level(Some(","), None, false), LevelFilter::WARN);
+        assert_eq!(max_level(Some(" , "), None, true), LevelFilter::INFO);
+        assert_eq!(
+            max_level(Some(","), Some("debug"), true),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(max_level(Some(" , "), Some(","), false), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn off_turns_logging_off() {
+        assert_eq!(
+            max_level(Some("off"), Some("debug"), true),
+            LevelFilter::OFF
+        );
+        assert_eq!(max_level(None, Some("off"), true), LevelFilter::OFF);
     }
 
     #[test]

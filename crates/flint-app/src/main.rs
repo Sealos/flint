@@ -26,6 +26,8 @@ environment:
                      on Linux: $XDG_CONFIG_HOME/flint, else ~/.config/flint
   FLINT_LOG          log filter, for example debug or flint_core=debug; overrides --verbose.
                      RUST_LOG is read when FLINT_LOG is unset, empty or invalid
+  SHELL              login shell Flint asks for your PATH, unless settings.toml sets path
+  PATH               used, plus the usual tool directories, when that login shell fails
 
 development and testing only:
   FLINT_CLUSTER      activate this kubeconfig context at startup, as a click would
@@ -196,6 +198,8 @@ mod tests {
                 "FLINT_CONFIG_DIR",
                 "FLINT_LOG",
                 "RUST_LOG",
+                "SHELL",
+                "PATH",
                 "FLINT_CLUSTER",
                 "FLINT_VIEW",
                 "FLINT_APPEARANCE",
@@ -210,7 +214,13 @@ mod tests {
                     "{aid} is not marked development-only"
                 );
             }
-            for setting in ["KUBECONFIG", "FLINT_CONFIG_DIR", "FLINT_LOG"] {
+            for setting in [
+                "KUBECONFIG",
+                "FLINT_CONFIG_DIR",
+                "FLINT_LOG",
+                "SHELL",
+                "  PATH ",
+            ] {
                 assert!(
                     text.find(setting).unwrap() < dev,
                     "{setting} is under development"
