@@ -163,20 +163,24 @@ pub fn server_url(url: &str) -> String {
 
 /// What may be shown of an exec auth plugin's command: the program's file name (`aws`), never
 /// its directory (which can name the user's home), arguments or environment. kubeconfig's
-/// `command` is a path, which may hold spaces: one that names a file is shown by its file name
-/// (`/opt/Cloud Tools/kubelogin` is `kubelogin`). Otherwise a command written with its arguments
-/// (`aws eks get-token`) keeps only the first word, so no argument shows, slashes and all.
+/// `command` is one program path, which may hold spaces: a command whose first word is a path is
+/// taken whole and shown by its file name (`/opt/Cloud Tools/kubelogin` is `kubelogin`), whether
+/// or not the file is there. A bare program written with arguments (`aws eks get-token`) keeps
+/// only its first word, so no argument shows, slashes and all.
 pub fn command_name(command: &str) -> String {
-    let path = std::path::Path::new(command.trim());
-    let program = if path.is_file() {
-        path
-    } else {
-        std::path::Path::new(command.split_whitespace().next().unwrap_or_default())
-    };
-    program.file_name().map_or_else(
-        || program.to_string_lossy().into_owned(),
-        |n| n.to_string_lossy().into_owned(),
-    )
+    let command = command.trim();
+    let first = command.split_whitespace().next().unwrap_or_default();
+    if !first.contains('/') {
+        return first.to_owned();
+    }
+    let file = std::path::Path::new(command)
+        .file_name()
+        .map_or_else(|| command.to_owned(), |n| n.to_string_lossy().into_owned());
+    // A path written with arguments after it (`/opt/bin/aws eks get-token`).
+    file.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -279,14 +283,12 @@ mod tests {
         assert_eq!(command_name("aws --token=abc/def"), "aws");
     }
 
-    // A plugin path with a space names the plugin, not a directory.
+    // A plugin path with a space names the plugin, not a directory, also when it is missing
+    // (the error that names it most).
     #[test]
     fn command_names_keep_a_path_with_spaces_whole() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = dir.path().join("Cloud Tools");
-        std::fs::create_dir(&tools).unwrap();
-        let plugin = tools.join("kubelogin");
-        std::fs::write(&plugin, "").unwrap();
-        assert_eq!(command_name(&plugin.display().to_string()), "kubelogin");
+        assert_eq!(command_name("/Users/John Smith/bin/kubelogin"), "kubelogin");
+        assert_eq!(command_name("/opt/Cloud Tools/kubelogin"), "kubelogin");
+        assert_eq!(command_name("./My Tools/plugin"), "plugin");
     }
 }

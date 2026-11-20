@@ -626,7 +626,9 @@ fn a_prompting_plugin_on_a_terminal_is_killed_and_the_terminal_returned() {
         eprintln!("skipped: no `script` to run a terminal with");
         return;
     };
-    // A run that stops (SIGTTOU) would never end: it fails here instead.
+    // A run that hangs fails here instead of never ending. (A write to the terminal that SIGTTOU
+    // would stop fails with EIO here instead: under `script` the test's process group is
+    // orphaned. Either way the test sees it.)
     let started = std::time::Instant::now();
     while run.try_wait().unwrap().is_none() {
         if started.elapsed() > Duration::from_secs(90) {
