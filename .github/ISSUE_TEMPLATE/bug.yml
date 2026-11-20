@@ -13,7 +13,7 @@ body:
     id: flint-version
     attributes:
       label: Flint version
-      description: Flint > About Flint, or run `/Applications/Flint.app/Contents/MacOS/flint --version`.
+      description: Run `--version` on the Flint you use, for example `flint --version`, `./flint-vX.Y.Z-linux-x86_64.AppImage --version`, or, for the DMG, `/Applications/Flint.app/Contents/MacOS/flint --version`.
       placeholder: "0.2.1"
     validations:
       required: true
@@ -39,14 +39,15 @@ body:
     id: auth
     attributes:
       label: How the cluster authenticates
-      description: The `users[].user.exec` plugin in your kubeconfig, if any.
+      description: The `users[].user.exec` plugin in your kubeconfig, if any. A legacy `auth-provider` entry counts as other.
       options:
         - EKS (aws eks get-token / aws-iam-authenticator)
         - GKE (gke-gcloud-auth-plugin)
         - AKS (kubelogin)
-        - Other exec plugin
+        - Other exec plugin or legacy auth-provider
         - Client certificate, token or basic auth
         - Not related to the cluster connection
+        - Other or unknown
     validations:
       required: true
   - type: textarea
@@ -55,7 +56,18 @@ body:
       label: Log output
       description: |
         Flint logs to stderr only for now, so an app opened from Finder or the Dock keeps no log file.
-        Start it from a terminal with more detail and paste what it prints:
-        `FLINT_LOG=debug /Applications/Flint.app/Contents/MacOS/flint`
+        Start the executable of your install from a terminal with more detail and paste what it prints:
+        `FLINT_LOG=debug flint` (DMG: `FLINT_LOG=debug /Applications/Flint.app/Contents/MacOS/flint`;
+        AppImage: `FLINT_LOG=debug ./flint-vX.Y.Z-linux-x86_64.AppImage`; source build: `FLINT_LOG=debug cargo run`).
         Remove anything private (cluster names, hostnames, tokens) first.
+      render: text
+  - type: textarea
+    id: mcp-logs
+    attributes:
+      label: Log output of the MCP server (only for bugs in an AI client)
+      description: |
+        Launching the app does not capture `flint mcp`, which your AI client starts itself. In the client's MCP
+        server entry for Flint, add `FLINT_LOG=debug` to its `env` (or `--verbose` to its `args`), then reproduce the
+        bug and copy the server's stderr from the client's MCP log (the client's settings or log viewer says where).
+        Remove anything private first.
       render: text
