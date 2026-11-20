@@ -7,5 +7,5 @@ pub mod recorder;
 pub mod shape;
 pub mod target;
 
-pub use recorder::{Summary, record};
+pub use recorder::{Summary, check_destination, record};
 pub use target::{DEV_CONTEXT, Target, check};

@@ -1,7 +1,7 @@
 //! Records the fake API server's fixtures from the kind dev cluster into
-//! `crates/flint-e2e/fixtures/` (or the directory given as the only argument). Run it through
-//! `scripts/record-fixtures.sh`. It refuses to run unless `KUBECONFIG` names the dev cluster's
-//! kubeconfig and its current context is `kind-flint-dev`.
+//! `crates/flint-e2e/fixtures/`, or into the directory given as the only argument, which must be
+//! new or empty. Run it through `scripts/record-fixtures.sh`. It refuses to run unless
+//! `KUBECONFIG` names the dev cluster's kubeconfig and its current context is `kind-flint-dev`.
 
 use std::path::PathBuf;
 
@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let out = std::env::args_os()
         .nth(1)
         .map_or_else(|| PathBuf::from(FIXTURES_DIR), PathBuf::from);
+    record::check_destination(&out, std::path::Path::new(FIXTURES_DIR))?;
     let client = flint_core::cluster::connect(&target.loaded.merged, record::DEV_CONTEXT)
         .await
         .context("connecting to the dev cluster")?;

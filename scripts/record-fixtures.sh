@@ -7,7 +7,8 @@
 #   KUBECONFIG=.dev/kubeconfig scripts/record-fixtures.sh [out-dir]
 #
 # With out-dir, the recording goes there instead (the nightly drift check records into a scratch
-# directory and compares it with the committed set: fixture-drift).
+# directory and compares it with the committed set: fixture-drift). It must be new or empty:
+# recording replaces the whole directory, and the recorder refuses one with anything in it.
 #
 # Refuses to run unless KUBECONFIG is set explicitly to one file whose current context is
 # kind-flint-dev (scripts/dev-cluster.sh up). Never reads ~/.kube/config.
