@@ -3,7 +3,7 @@
 //! and only into debug builds; release builds contain none of it.
 //!
 //! - [`setup`]: the checks before the app starts (a private scratch `FLINT_CONFIG_DIR` that is
-//!   not the real one, an explicit `KUBECONFIG`, a socket path macOS can bind).
+//!   not the real one, an explicit `KUBECONFIG`, a socket path the platform can bind).
 //! - [`socket`]: the socket at `FLINT_CONFIG_DIR/automation.sock` (mode 0600).
 //! - [`protocol`]: newline-delimited JSON requests and responses.
 //! - [`commands`]: runs each command through registered actions and keystrokes, never the core.

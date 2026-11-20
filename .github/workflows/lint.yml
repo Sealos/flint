@@ -55,6 +55,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/check-click-actions.sh
 
+  # The release jobs' automation check must fail closed: on a binary with the channel, an empty
+  # file, or anything that is not a Flint binary.
+  no-automation-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: scripts/check-no-automation-test.sh
+
   typos:
     runs-on: ubuntu-latest
     timeout-minutes: 10

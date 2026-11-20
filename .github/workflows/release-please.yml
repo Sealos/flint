@@ -80,6 +80,11 @@ jobs:
         run: cargo build --release --locked -p flint-app --target aarch64-apple-darwin
       - name: Build x86_64
         run: cargo build --release --locked -p flint-app --target x86_64-apple-darwin
+      # The test-only automation channel must not ship (docs/TESTING.md).
+      - name: No automation channel
+        run: |
+          scripts/check-no-automation.sh target/aarch64-apple-darwin/release/flint
+          scripts/check-no-automation.sh target/x86_64-apple-darwin/release/flint
       - name: Create universal binary
         run: |
           mkdir -p dist/flint
@@ -131,6 +136,9 @@ jobs:
           key: ${{ matrix.arch }}
       - name: Release build
         run: cargo build --release --locked -p flint-app
+      # On the ELF binary, before the AppImage compresses it (docs/TESTING.md).
+      - name: No automation channel
+        run: scripts/check-no-automation.sh ./target/release/flint
       - name: Package
         run: |
           scripts/package-appimage.sh target/release/flint "$VERSION" "${{ matrix.arch }}"

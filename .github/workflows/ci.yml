@@ -100,12 +100,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy
         run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
-      - name: Tests
+      - name: Clippy (automation channel)
+        run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
+      # One test run, as on macOS: the automation build compiles every test, the channel's too.
+      - name: Tests (with the automation channel)
         # GPUI's leak detector: view tests that check a closed view was released
         # (`assert_released`, `assert_no_new_leaks`) list each leaked handle on failure.
         env:
           GPUI_LEAK_DETECTION: "1"
-        run: cargo test -p flint-app --locked
+        run: cargo test -p flint-app --features automation --locked
 
   # The release build packaged as an AppImage, as release-please does, then run without FUSE:
   # `--version` and `mcp` through the AppImage. x86_64 only; the release also builds aarch64. On
@@ -124,6 +127,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Release build
         run: cargo build --release --locked -p flint-app
+      # On the ELF binary: the AppImage compresses it, so its strings cannot be searched.
+      - name: Release binary has no automation channel
+        run: scripts/check-no-automation.sh ./target/release/flint
       - name: Package
         run: |
           VERSION=$(./target/release/flint --version | cut -d' ' -f2)
@@ -173,8 +179,7 @@ jobs:
         run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
       # One test run: the automation build compiles every test, the channel's too. The plain
       # build is still checked by clippy above. With GPUI's leak detector, as on Linux: the
-      # channel's task lives as long as the app and must not keep the workspace alive. (The
-      # channel is macOS-only, so the Linux job cannot run this.)
+      # channel's task lives as long as the app and must not keep the workspace alive.
       - name: Tests (with the automation channel)
         env:
           GPUI_LEAK_DETECTION: "1"
@@ -194,14 +199,9 @@ jobs:
       - name: Release build
         run: cargo build --release --locked -p flint-app
       - run: ./target/release/flint --help
-      # The automation channel is test-only (docs/TESTING.md): its socket name and log lines
-      # must not be in what ships. The release binary is stripped, so look for its strings.
+      # The automation channel is test-only (docs/TESTING.md): it must not be in what ships.
       - name: Release binary has no automation channel
-        run: |
-          if strings -a ./target/release/flint | grep -E 'automation\.sock|automation channel|flint::ui::automation'; then
-            echo "::error::the release binary contains the automation channel"
-            exit 1
-          fi
+        run: scripts/check-no-automation.sh ./target/release/flint
       # The real app, driven over its automation socket, one test per user path, against the
       # fake API server. Failures fail the job; the screenshots are only uploaded. Last, so a
       # failure here does not hide the docs and release checks above. It needs only

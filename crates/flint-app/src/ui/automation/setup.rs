@@ -1,8 +1,8 @@
 //! Where the channel may live, checked before the app starts: a scratch config directory that is
 //! not the user's real one and that only the user can write, an explicit `KUBECONFIG` (or, without
 //! one, a scratch `HOME` with no `.kube/config`, so the app never falls back to the user's
-//! `~/.kube/config`), a socket path macOS can bind, and a screenshots directory. Any failure stops
-//! the app with a reason, so a test harness fails fast.
+//! `~/.kube/config`), a socket path the platform can bind, and a screenshots directory. Any
+//! failure stops the app with a reason, so a test harness fails fast.
 
 use std::ffi::OsString;
 use std::fs;
@@ -13,7 +13,11 @@ use std::path::{Path, PathBuf};
 /// The socket's file name in the config directory.
 pub const SOCKET_NAME: &str = "automation.sock";
 
-/// macOS's `sockaddr_un.sun_path` holds 104 bytes, the terminating NUL included.
+/// The longest socket path `bind` takes: `sockaddr_un.sun_path` holds 104 bytes on macOS and
+/// 108 on Linux, the terminating NUL included.
+#[cfg(target_os = "linux")]
+pub const MAX_SOCKET_PATH: usize = 107;
+#[cfg(not(target_os = "linux"))]
 pub const MAX_SOCKET_PATH: usize = 103;
 
 /// Overrides where screenshots go: an absolute, existing directory the harness owns.
@@ -88,8 +92,8 @@ pub fn prepare(env: &Env) -> Result<Places, String> {
     let length = socket.as_os_str().as_bytes().len();
     if length > MAX_SOCKET_PATH {
         return Err(format!(
-            "the socket path {} is {length} bytes; macOS allows {MAX_SOCKET_PATH}. Use a shorter \
-             FLINT_CONFIG_DIR",
+            "the socket path {} is {length} bytes; Unix sockets here allow {MAX_SOCKET_PATH}. Use \
+             a shorter FLINT_CONFIG_DIR",
             socket.display()
         ));
     }
@@ -310,7 +314,10 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let deep = scratch.path().join("x".repeat(110));
         let error = prepare(&env(&deep, home.path())).unwrap_err();
-        assert!(error.contains("macOS allows 103"), "{error}");
+        assert!(
+            error.contains(&format!("allow {MAX_SOCKET_PATH}")),
+            "{error}"
+        );
     }
 
     #[test]
