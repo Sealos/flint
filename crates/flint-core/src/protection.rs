@@ -244,6 +244,12 @@ pub enum WriteRefusal {
     Protected { cluster: String },
     #[error("\"{cluster}\" is not connected")]
     NotConnected { cluster: String },
+    /// The context shows another server than the one the session was asked for (its tab's).
+    #[error(
+        "\"{cluster}\" points at another server than this tab was opened for; open the shell \
+         again from the cluster as it is now"
+    )]
+    Moved { cluster: String },
     #[error("the core is not running")]
     Stopped,
 }

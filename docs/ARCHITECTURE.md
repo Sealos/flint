@@ -612,13 +612,32 @@ opens in a tab in the bottom dock.
   (16 ms; the first after a quiet spell at once). Keystrokes, pastes (bracketed when asked for), resizes, scrolling and
   selections go back through the session. The screen stays scrollable and selectable after the command exits.
 - **Pinned to its context.** A session is pinned to its context as it was when the cluster manager handed out the
-  client, read in the same step: the context's generation in the manager's `recheck::ContextHistory`. The generation
-  changes whenever a kubeconfig load gives the context another server, or a complete load (every file read) lacks
-  it, so a re-pointing undone by a later reload still counts. A file that fails to load (caught half-written) removes
-  nothing. While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`, shared with
-  log sessions, which are pinned the same way) whether the context changed since, never the server. A change ends it
-  with `ExecFailureKind::ContextChanged` and the reason, worded as a log session's (`recheck::reason`). Ending drops
-  the exec connection, as closing the session does, so no stream stays open on the old server.
+  client, read in the same step: the context's generation in the manager's `recheck::ContextHistory`, and the
+  server the client was built for. The generation changes with each confirmed change: a load gives the context
+  another server, or lacks it. A change undone by a later reload still counts.
+  - **What a load confirms.** The loader reads the kubeconfig files in order, and the first file that defines a name
+    wins. A file that fails to load (caught half-written) is skipped, and what it defines is unknown. A context
+    missing from a load is removed only if no failed file ranks at or above the file that defined it, and no
+    failed file defined it too (a shadowed definition) when it last loaded. A failure in a file never known to
+    define the context masks nothing. A context with another server is a confirmed change only if no failed file
+    ranks above the file it now comes from; otherwise it may be a later file's fallback, showing while the first
+    file is unreadable, and it stays provisional.
+  - **Provisional entries.** What a load cannot confirm never replaces confirmed history, its file included, even
+    on the same server. A context first seen that way (a file before it already unreadable at startup) is recorded
+    as unconfirmed; a load that confirms it on the same server keeps its sessions. Sessions on the confirmed
+    definition go on while a fallback shows. A session opened on the fallback (a shell, or a log tab, labelled with
+    the fallback's server) is pinned to that server, stale: its first check ends it with why, so it never moves to
+    the confirmed server once the first file loads again. A log tab passes the server it is labelled with
+    (`CoreHandle::open_logs_at`), so a request the core takes after the fallback went is still pinned to it. A log
+    session is never handed a client for another server than its pin. A shell does the same (`ExecRequest::at`): it is
+    refused before it starts if the context shows another server than its tab when the core takes the request. An unconfirmed entry follows the file it comes from on the same
+    server, so a failed file between masks its removal.
+  - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
+    shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
+    A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
+    another server, or, when it points where it did (removed and added back, say), changed since the session
+    opened. A log session opened on a removed context ends at once. Ending drops the exec connection, as closing
+    the session does, so no stream stays open on the old server.
 - **Input budget (#256).** A session holds at most 1 MiB of input (`exec::INPUT_BUDGET`) that the pod has not read:
   what waits for the session task, what is kept for the next shell while the first may turn out not to exist, and
   what waits for the pod's stdin. `ExecSession::write` and `paste` reserve their bytes with an atomic update (never
