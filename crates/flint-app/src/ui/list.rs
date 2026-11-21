@@ -49,9 +49,8 @@ pub const ROW_HEIGHT: f32 = 24.;
 thread_local! {
     static CELL_TOOLTIPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// How narrow Name and Namespace get in a tight list (characters), so status columns fit. The
-/// Namespace column keeps room for its header and the sort arrow, as measured.
-const SQUEEZED_NAME_CHARS: usize = 12;
+/// How narrow Namespace gets in a tight list (characters), so status columns fit. It keeps room
+/// for its header and the sort arrow, as measured. Name stops at [`list_model::NAME_MIN_CHARS`].
 const SQUEEZED_NAMESPACE_CHARS: usize = 11;
 
 /// The object a list has selected.
@@ -152,6 +151,9 @@ pub struct ResourceList {
     /// The pane width this frame was laid out for. The width is known only after layout, so
     /// when it changed, the next frame draws again with the new one.
     laid_out_width: Option<f32>,
+    /// Whether the rows on screen were computed for exactly one namespace. A newly chosen scope
+    /// does not count until its rows arrive: the old ones may still span several namespaces.
+    rows_in_one_namespace: bool,
     /// Whether the last recompute applied the sort: its column was drawn then. When that
     /// changes with the layout (Wide toggled, the pane resized), the rows are sorted again.
     sort_drawn: bool,
@@ -263,6 +265,7 @@ impl ResourceList {
             drawn: Vec::new(),
             dropped_wide: 0,
             laid_out_width: None,
+            rows_in_one_namespace: false,
             sort_drawn: false,
             #[cfg(test)]
             compute_gate: None,
@@ -508,6 +511,7 @@ impl ResourceList {
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
         let namespaces = self.query.namespaces.clone();
+        let one_namespace = namespaces.len() == 1;
         let job_snapshot = snapshot.clone();
         #[cfg(test)]
         let gate = self.compute_gate.clone();
@@ -549,6 +553,7 @@ impl ResourceList {
                 }
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
+                list.rows_in_one_namespace = one_namespace;
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
@@ -759,8 +764,8 @@ impl ResourceList {
     }
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
-    /// before the first layout). Wide columns that do not fit are left out; spare width goes to
-    /// the Name column first.
+    /// before the first layout). Wide columns that do not fit are left out, then Ready and
+    /// Namespace as [`list_model::shed_columns`] allows; spare width goes to the Name column.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
@@ -771,13 +776,23 @@ impl ResourceList {
             available,
         );
         if let Some(room) = available {
-            list_model::squeeze_identity(
+            let name_min = width(list_model::NAME_MIN_CHARS);
+            let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
+            let sort = self.query.sort.as_ref();
+            let rules = list_model::ShedRules {
+                ready_repeats_status: list_model::ready_repeats_status(self.kind.as_str()),
+                one_namespace: self.rows_in_one_namespace,
+            };
+            list_model::shed_columns(
                 &mut drawn,
                 columns,
                 room,
-                width(SQUEEZED_NAME_CHARS),
-                width(SQUEEZED_NAMESPACE_CHARS),
+                name_min,
+                namespace_min,
+                rules,
+                |i| sort.is_some_and(|s| columns[i].key() == s.column),
             );
+            list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
             if let Some(name) = columns.iter().position(|c| c.role == ColumnRole::Name) {
                 let wanted = width(self.widths.wanted(name, &columns[name]));
                 list_model::widen_name(&mut drawn, columns, room, wanted);
@@ -802,6 +817,10 @@ impl ResourceList {
         let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);
+        let namespace_hidden = !self
+            .drawn
+            .iter()
+            .any(|&(col, _)| self.shown.columns[col].role == ColumnRole::Namespace);
         let mut elements = Vec::with_capacity(range.len());
         for ix in range {
             let Some(&row_ix) = self.rows.get(ix) else {
@@ -860,6 +879,13 @@ impl ResourceList {
                         ..flags
                     },
                 );
+                // With its column hidden, the Name cell is where the namespace can be read.
+                let tooltip = match row.namespace.as_deref() {
+                    Some(namespace) if namespace_hidden && column.role == ColumnRole::Name => {
+                        Some(SharedString::from(format!("{namespace}/{}", row.name)))
+                    }
+                    _ => tooltip,
+                };
                 let cell = div()
                     .id(("cell", ix * ncols + col))
                     .h_full()
@@ -1418,17 +1444,17 @@ impl Render for ResourceList {
                         ),
                 )
                 // Visible whenever the columns are wider than the pane, so it is clear that
-                // more columns are to the right.
-                .when(available.is_some_and(|w| total_width > w), |el| {
-                    el.child(
-                        div().absolute().inset_0().child(
-                            Scrollbar::horizontal(&self.hscroll)
-                                .id("list-hscrollbar")
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
-                    )
-                })
+                // more columns are to the right. Always mounted: it hides itself using this
+                // frame's layout, while `available` is a frame old, and its state then lives
+                // and dies with the list instead of following pane resizes.
+                .child(
+                    div().absolute().inset_0().child(
+                        Scrollbar::horizontal(&self.hscroll)
+                            .id("list-hscrollbar")
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+                )
                 .into_any_element(),
         };
         // The rows have focus (not the filter): ringed, as Tab between panes shows (UP-33).

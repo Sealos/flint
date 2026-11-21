@@ -68,7 +68,7 @@ fn teardown_checks_fail_a_test_that_breaks_them() -> Result<()> {
     // The same steps through the harness's exceptions pass.
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
-    app.edit_kubeconfig(|| {
+    app.edit_kubeconfig([two.kubeconfig()], || {
         text.push_str("# changed again\n");
         write(&two.kubeconfig(), &text)
     })?;

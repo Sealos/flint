@@ -1,7 +1,36 @@
 //! Focus housekeeping for views that close others.
 
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::{App, Window};
+use gpui_kit::{App, FocusHandle, Window};
+
+/// Moves focus to the next (or previous) tab stop inside `scope`, wrapping around: the window's
+/// tab order is walked until it comes back inside. With no tab stop inside, focus stays.
+///
+/// Reads the last drawn frame, so a `scope` opened in this frame has no stops yet.
+pub fn cycle_focus_within(scope: &FocusHandle, forward: bool, window: &mut Window, cx: &mut App) {
+    let start = window.focused(cx);
+    let mut first = None;
+    loop {
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+        let now = window.focused(cx);
+        if now.as_ref().is_some_and(|f| f != scope) && scope.contains_focused(window, cx) {
+            return;
+        }
+        // Round the whole order, or nothing to move to.
+        if now.is_none() || now == start || now == first {
+            break;
+        }
+        first = first.or(now);
+    }
+    match start {
+        Some(start) => window.focus(&start, cx),
+        None => window.blur(cx),
+    }
+}
 
 /// Lets the window drop the text field it last saw focused, once focus has moved off it.
 ///
