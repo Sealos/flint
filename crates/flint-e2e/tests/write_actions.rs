@@ -81,6 +81,76 @@ impl Core {
     }
 }
 
+/// A core on a kubeconfig whose user entry is `user` (YAML, indented for it) and whose cluster
+/// trusts the server through the CA file `ca`, with the kubeconfig in `dir`.
+async fn core_with_user(
+    server: &FakeApiServer,
+    dir: tempfile::TempDir,
+    ca: &std::path::Path,
+    user: &str,
+) -> Core {
+    let kubeconfig = dir.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: {CONTEXT}\nclusters:\n- name: c\n  \
+             cluster:\n    server: {}\n    certificate-authority: {}\nusers:\n- name: u\n  \
+             user:\n{user}contexts:\n- name: {CONTEXT}\n  context:\n    cluster: c\n    user: \
+             u\n    namespace: demo\n",
+            server.url(),
+            ca.display(),
+        ),
+    )
+    .unwrap();
+    Core::start_on(dir, vec![kubeconfig], Settings::default()).await
+}
+
+/// A core whose user reads its token from a file, and that file's path and the CA file's.
+async fn core_with_token_file(server: &FakeApiServer) -> (Core, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let (token, ca) = (dir.path().join("token"), dir.path().join("ca"));
+    std::fs::write(&token, "reviewed").unwrap();
+    std::fs::write(&ca, server.ca_pem()).unwrap();
+    let user = format!("    tokenFile: {}\n", token.display());
+    let core = core_with_user(server, dir, &ca, &user).await;
+    (core, token, ca)
+}
+
+fn edit() -> WriteProposal {
+    WriteProposal::ApplyYaml {
+        yaml: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: act\nspec:\n  \
+               replicas: 3\n  template:\n    metadata: {}\n"
+            .to_owned(),
+    }
+}
+
+/// Starts a review of [`edit`] and returns once its `GET` is held on the server.
+async fn review_held_at_get(
+    core: &Core,
+    server: &FakeApiServer,
+) -> tokio::task::JoinHandle<Result<flint_core::write::WriteReview, WriteError>> {
+    server.inject(
+        Fault::delay(Duration::from_secs(2))
+            .on(&deployments())
+            .verb(Verb::Get)
+            .named("act")
+            .times(1),
+    );
+    let review = tokio::spawn(core.handle.review_write(workload_target(server), edit()));
+    tokio::time::timeout(WAIT, async {
+        while !server
+            .arrivals()
+            .iter()
+            .any(|r| r.method == http::Method::GET && r.path.ends_with("/act"))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the review's GET arrives");
+    review
+}
+
 fn deployments() -> Gvr {
     Gvr::new("apps", "v1", "deployments")
 }
@@ -238,6 +308,142 @@ async fn workload_actions_change_the_reviewed_object() {
         .await
         .unwrap();
     assert!(server.object(&deployments(), Some("demo"), "act").is_none());
+}
+
+// covers UP-54: an unchanged token file writes, and one rewritten before a review is the one that
+// review binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reviewed_write_goes_out_on_an_unchanged_token_file() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    core.act(workload_target(&server), WriteProposal::Scale { to: 3 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 3);
+
+    std::fs::write(&token, "rotated").unwrap();
+    core.act(workload_target(&server), WriteProposal::Scale { to: 4 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 4);
+}
+
+// covers UP-54: a token file rewritten while a confirmation is open refuses the write, and a new
+// review goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_file_changed_after_the_review_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    std::fs::write(&token, "another").unwrap();
+    let refused = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(refused.unwrap_err(), WriteError::CredentialChanged);
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+
+    core.act(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 5);
+}
+
+// covers UP-54: a token file rewritten during a review stops it before its dry run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_file_changed_during_a_review_gets_no_dry_run() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    let review = review_held_at_get(&core, &server).await;
+    std::fs::write(&token, "another").unwrap();
+    assert_eq!(
+        review.await.unwrap().unwrap_err(),
+        WriteError::CredentialChanged
+    );
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+}
+
+// covers UP-54: a token file that can no longer be read refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_token_file_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, token, _ca) = core_with_token_file(&server).await;
+
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    std::fs::remove_file(&token).unwrap();
+    let refused = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(refused.unwrap_err(), WriteError::CredentialUnreadable);
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+}
+
+// covers UP-54: a certificate file rewritten while a confirmation is open refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_file_changed_after_the_review_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let (core, _token, ca) = core_with_token_file(&server).await;
+
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await
+        .unwrap();
+    std::fs::write(&ca, format!("{}\n", server.ca_pem())).unwrap();
+    let refused = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(refused.unwrap_err(), WriteError::CredentialChanged);
+    assert!(server.writes().is_empty(), "{:?}", server.writes());
+}
+
+// covers UP-54: with an exec plugin, a server that can't say who the credential is gets no
+// change: the only request with a body is the identity check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_credential_without_an_identity_check_is_refused() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    std::fs::write(&ca, server.ca_pem()).unwrap();
+    let plugin = dir.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\nprintf '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+         \"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\"}}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let user = format!(
+        "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      \
+         interactiveMode: Never\n",
+        plugin.display()
+    );
+    let core = core_with_user(&server, dir, &ca, &user).await;
+
+    let refused = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await;
+    assert_eq!(refused.unwrap_err(), WriteError::IdentityUnavailable);
+    assert!(
+        server
+            .writes()
+            .iter()
+            .all(|w| w.path.ends_with("/selfsubjectreviews")),
+        "{:?}",
+        server.writes()
+    );
+    assert_eq!(live(&server)["spec"]["replicas"], 2);
 }
 
 // covers UP-53: scaling from zero goes through the scale subresource too, which omits the count.

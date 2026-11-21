@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::activity;
 use crate::cluster::{self, CONNECT_TIMEOUT, ClusterId, ServerVersion};
+use crate::credential::WriteCredential;
 use crate::discovery::ClusterDiscovery;
 use crate::handle::{
     ClusterSummary, ClustersSnapshot, Command, ConnectionState, CoreConfig, Event, Request,
@@ -48,6 +49,8 @@ pub(crate) struct Cluster {
     fingerprint: Option<u64>,
     state: ConnectionState,
     client: Option<ClusterClients>,
+    /// The credential `client`'s write client presents: set and cleared with it.
+    write_credential: Option<WriteCredential>,
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
@@ -103,6 +106,7 @@ impl Cluster {
             fingerprint,
             state: ConnectionState::Disconnected,
             client: None,
+            write_credential: None,
             attempt: 0,
             generation: 0,
             discovery: None,
@@ -158,7 +162,7 @@ enum Internal {
     Connected {
         cluster: ClusterId,
         attempt: u64,
-        result: Result<(ClusterClients, ServerVersion), cluster::SafeErrorText>,
+        result: Result<(cluster::GatedConnection, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
     Discovered {
@@ -516,6 +520,13 @@ impl ClusterManager {
                 reply,
             } => {
                 let _ = reply.send(self.shell_client(&cluster, server));
+            }
+            Request::BoundWriteClient {
+                cluster,
+                server,
+                reply,
+            } => {
+                let _ = reply.send(self.bound_write_client(&cluster, server));
             }
             Request::CheckWriteGate {
                 cluster,
@@ -877,18 +888,20 @@ impl ClusterManager {
                 }
                 let connected = result.is_ok();
                 match result {
-                    Ok((clients, version)) => {
+                    Ok((connection, version)) => {
                         slot.watches.set_source(Some(KubeSource::new(
-                            clients.read.clone(),
+                            connection.clients.read.clone(),
                             Some(&version),
                             target,
                         )));
-                        slot.client = Some(clients);
+                        slot.client = Some(connection.clients);
+                        slot.write_credential = Some(connection.credential);
                         slot.state = ConnectionState::Connected(version);
                     }
                     Err(message) => {
                         slot.watches.set_source(None);
                         slot.client = None;
+                        slot.write_credential = None;
                         slot.state = ConnectionState::Failed(message);
                     }
                 }
@@ -1138,6 +1151,23 @@ impl ClusterManager {
         self.write_client(cluster).map(|client| (client, pin))
     }
 
+    /// [`Self::shell_client`] for one request of a reviewed write, with the credential of the
+    /// connection the client belongs to.
+    fn bound_write_client(
+        &self,
+        cluster: &str,
+        server: Option<Option<String>>,
+    ) -> Result<crate::handle::BoundWriteClient, WriteRefusal> {
+        let (client, pin) = self.shell_client(cluster, server)?;
+        let credential = self
+            .cluster(cluster)
+            .and_then(|slot| slot.write_credential.clone())
+            .ok_or_else(|| WriteRefusal::NotConnected {
+                cluster: cluster.to_owned(),
+            })?;
+        Ok((client, pin, credential))
+    }
+
     /// The pin for a session opened on `cluster` now: to the server its slot shows (what a tab
     /// is labelled with), stale if that is not the confirmed one ([`ContextHistory::pin`]).
     fn session_pin(&self, cluster: &str) -> ContextPin {
@@ -1290,6 +1320,7 @@ impl ClusterManager {
         slot.attempt = attempt;
         slot.state = ConnectionState::Connecting;
         slot.client = None;
+        slot.write_credential = None;
         let cluster = id.to_owned();
         self.emit(Event::ConnectionChanged {
             cluster: cluster.clone(),

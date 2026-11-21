@@ -55,6 +55,10 @@ impl ActionGate for RequestGate {
                 WriteError::Refused(refusal) => ActionError::Refused(refusal),
                 WriteError::ConnectionChanged => ActionError::ConnectionChanged,
                 WriteError::KubeconfigUnreadable => ActionError::KubeconfigUnreadable,
+                refused @ (WriteError::CredentialChanged
+                | WriteError::CredentialUnreadable
+                | WriteError::IdentityUnverified
+                | WriteError::IdentityUnavailable) => ActionError::Credential(refused),
                 other => ActionError::Failed(other.to_string()),
             })
     }
@@ -279,6 +283,7 @@ impl From<ActionError> for WriteError {
             ActionError::Refused(refusal) => WriteError::Refused(refusal),
             ActionError::ConnectionChanged => WriteError::ConnectionChanged,
             ActionError::KubeconfigUnreadable => WriteError::KubeconfigUnreadable,
+            ActionError::Credential(refused) => refused,
             ActionError::Conflict(_) => WriteError::Conflict,
             ActionError::Gone(_) => WriteError::Gone,
             ActionError::Unsupported(message) => WriteError::Rejected(message),
@@ -314,6 +319,8 @@ pub(crate) enum ActionError {
     ConnectionChanged,
     /// A kubeconfig file that could define the context can't be read.
     KubeconfigUnreadable,
+    /// The credential is not the reviewed one, or could not be confirmed.
+    Credential(WriteError),
     /// The object changed since it was reviewed: review it again.
     Conflict(String),
     /// The object is gone.
