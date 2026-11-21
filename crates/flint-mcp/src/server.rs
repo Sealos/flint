@@ -302,11 +302,14 @@ tokio::task_local! {
 }
 
 /// What a call's raw arguments name, for a call rejected before its tool ran: only string
-/// values, under the names the tools use. [`activity::append`] caps their length.
+/// values without control characters, under the names the tools use. [`activity::append`] caps
+/// their length.
 fn named_in(arguments: Option<&serde_json::Map<String, Value>>) -> Named {
     let text = |keys: &[&str]| {
         keys.iter()
-            .find_map(|k| arguments?.get(*k)?.as_str().map(str::to_owned))
+            .find_map(|k| arguments?.get(*k)?.as_str())
+            .filter(|value| !value.chars().any(char::is_control))
+            .map(str::to_owned)
     };
     Named {
         cluster: text(&["cluster"]),
@@ -473,11 +476,14 @@ fn unsupported_arguments(
         .input_schema
         .get("properties")
         .and_then(Value::as_object);
-    let mut unsupported = arguments?
+    // One past what is shown, to say there are more: the work stays bounded by the schema.
+    let unsupported: Vec<&String> = arguments?
         .keys()
-        .filter(|name| !accepted.is_some_and(|a| a.contains_key(name.as_str())));
+        .filter(|name| !accepted.is_some_and(|a| a.contains_key(name.as_str())))
+        .take(UNSUPPORTED_NAMED + 1)
+        .collect();
     let named: Vec<String> = unsupported
-        .by_ref()
+        .iter()
         .take(UNSUPPORTED_NAMED)
         .map(|name| {
             if name.len() > UNSUPPORTED_NAME_BYTES {
@@ -485,9 +491,10 @@ fn unsupported_arguments(
             }
             // Whole, before it is cut: a rule can need what comes after the cut. On its own, so
             // a rule that takes the rest of the line cannot take the accepted arguments too.
-            let mut name = name.clone();
+            let mut name = (*name).clone();
             policy::redact_text(&mut name);
             let short: String = name.chars().take(UNSUPPORTED_NAME_CHARS).collect();
+            // Quoted with escapes: control characters never reach the reply.
             format!("{short:?}")
         })
         .collect();
@@ -495,9 +502,8 @@ fn unsupported_arguments(
         return None;
     }
     let mut names = named.join(", ");
-    let more = unsupported.count();
-    if more > 0 {
-        names.push_str(&format!(" and {more} more"));
+    if unsupported.len() > UNSUPPORTED_NAMED {
+        names.push_str(" and more");
     }
     let accepted: Vec<&str> = accepted
         .into_iter()
@@ -1832,11 +1838,26 @@ mod tests {
         }
         let text = unsupported_arguments(tool, Some(&many)).unwrap();
         assert!(text.len() < 500, "{text}");
-        assert!(text.ends_with(" and 3 more."), "{text}");
+        assert!(text.ends_with(" and more."), "{text}");
+        many.remove(many.keys().next().unwrap().clone().as_str());
+        many.remove(many.keys().next().unwrap().clone().as_str());
+        many.remove(many.keys().next().unwrap().clone().as_str());
+        let five = unsupported_arguments(tool, Some(&many)).unwrap();
+        assert!(!five.contains("and more"), "{five}");
 
-        let line = arguments(json!({"a\nb": 1}));
-        let text = unsupported_arguments(tool, Some(&line)).unwrap();
-        assert!(!text.contains('\n'), "{text}");
+        let control = arguments(json!({"a\nb\u{1b}[2J\u{7f}\u{202e}c": 1}));
+        let text = unsupported_arguments(tool, Some(&control)).unwrap();
+        assert!(
+            !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{text:?}"
+        );
+
+        // A value with control characters is not kept for the activity log.
+        let named = named_in(Some(&arguments(
+            json!({"cluster": "a\u{1b}[2Jb", "kind": "pods"}),
+        )));
+        assert_eq!(named.cluster, None);
+        assert_eq!(named.kind.as_deref(), Some("pods"));
 
         // A name past the limit is not read or echoed, not even its start.
         let huge = format!("hunter2{}", "x".repeat(UNSUPPORTED_NAME_BYTES));
