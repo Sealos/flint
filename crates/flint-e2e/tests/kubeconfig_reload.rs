@@ -63,6 +63,13 @@ async fn until_list(
     .unwrap_or_else(|_| panic!("{what}: never reached"));
 }
 
+/// Whether a notice names the context and says it was removed.
+fn removal_noticed(notices: &[String]) -> bool {
+    notices
+        .iter()
+        .any(|n| n.contains(CONTEXT) && n.contains("was removed"))
+}
+
 // covers UP-06
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_the_active_context_deselects_it_and_stops_its_watches() {
@@ -112,13 +119,16 @@ async fn removing_the_active_context_deselects_it_and_stops_its_watches() {
     assert!(!seen.active_cleared && seen.notices.is_empty());
 
     // Removing the active context deselects it with a notice and stops its watches.
-    write_kubeconfigs(&path, &[(&server, "another", None)]).unwrap();
+    // The replacement is renamed over the watched file, so a reload never sees it half written.
+    let replacement = dir.path().join("kubeconfig.next");
+    write_kubeconfigs(&replacement, &[(&server, "another", None)]).unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
     until_list(&events, &mut seen, "the context's removal", |names, _| {
         names == ["another"]
     })
     .await;
     tokio::time::timeout(WAIT, async {
-        while !(seen.active_cleared && !seen.notices.is_empty()) {
+        while !(seen.active_cleared && removal_noticed(&seen.notices)) {
             let event = events.recv().await.expect("core running");
             seen.record(event);
         }
@@ -126,7 +136,7 @@ async fn removing_the_active_context_deselects_it_and_stops_its_watches() {
     .await
     .expect("deselected with a notice");
     assert!(
-        seen.notices.iter().any(|n| n.contains(CONTEXT)),
+        removal_noticed(&seen.notices),
         "notices: {:?}",
         seen.notices
     );
