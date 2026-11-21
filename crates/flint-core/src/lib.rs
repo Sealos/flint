@@ -33,6 +33,7 @@ pub mod table;
 pub mod terminal;
 pub mod view;
 mod watch;
+pub mod write;
 
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{

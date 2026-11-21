@@ -632,7 +632,7 @@ impl CoreHandle {
     /// The client for an action that changes `cluster` or runs code in it, with the context's
     /// pin: refused while the cluster is protected (ADR-0015) or not connected.
     /// Never blocks.
-    fn write_client(
+    pub(crate) fn write_client(
         &self,
         cluster: &str,
         server: Option<Option<String>>,

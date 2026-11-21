@@ -544,7 +544,11 @@ pub struct ListPage {
     pub continue_token: Option<String>,
 }
 
-fn dynamic_api(client: &Client, kind: &KindInfo, namespace: Option<&str>) -> Api<DynamicObject> {
+pub(crate) fn dynamic_api(
+    client: &Client,
+    kind: &KindInfo,
+    namespace: Option<&str>,
+) -> Api<DynamicObject> {
     match namespace {
         Some(ns) if kind.namespaced => Api::namespaced_with(client.clone(), ns, &kind.resource),
         _ => Api::all_with(client.clone(), &kind.resource),
