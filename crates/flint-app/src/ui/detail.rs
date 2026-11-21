@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use flint_core::read::event_time;
 use flint_core::table::{human_duration, unix_now};
-use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, WorkloadKind};
+use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, SyncState, WorkloadKind};
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::Diff;
@@ -31,7 +31,7 @@ use super::list::tabular_figures;
 use super::log_view::LogRequest;
 use super::menu_fit::{fit_picker, picker_item};
 use super::menu_record;
-use super::notice::notice;
+use super::notice::{notice, notice_detail, notice_with};
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
     self, ApplyYamlEdit, BackToYamlEdit, CancelYamlEdit, Close, EditYaml, OpenContainerLogs,
@@ -76,10 +76,17 @@ struct Prepared {
     /// The YAML tab's text, rendered with `managed` (whether managedFields were shown).
     yaml: String,
     managed: bool,
+    /// When the fetch began: the copy is at least this recent.
+    fetched_at: jiff::Timestamp,
 }
 
 impl Prepared {
-    fn new(detail: Arc<ObjectDetail>, is_secret: bool, managed: bool) -> Self {
+    fn new(
+        detail: Arc<ObjectDetail>,
+        is_secret: bool,
+        managed: bool,
+        fetched_at: jiff::Timestamp,
+    ) -> Self {
         let overview = Arc::new(object::overview(&detail.object, is_secret));
         let yaml = object::render_yaml(&detail, is_secret, managed);
         Prepared {
@@ -87,6 +94,7 @@ impl Prepared {
             overview,
             yaml,
             managed,
+            fetched_at,
         }
     }
 }
@@ -172,6 +180,16 @@ pub struct DetailView {
     refetch: bool,
     /// The last fetch failed while an older copy is still shown.
     refresh_error: Option<String>,
+    /// Whether the copy shown can be presented as current, from the kind's sync state.
+    freshness: sync::Freshness,
+    /// When the copy shown was fetched.
+    fetched_at: Option<jiff::Timestamp>,
+    /// Automatic fetches made since the last success, which space out the next one.
+    error_retries: u32,
+    /// The kind was seen current while an automatic fetch could not start yet.
+    error_retry_due: bool,
+    /// Runs until another automatic fetch may start.
+    _error_retry_cooldown: Option<Task<()>>,
     /// The object disappeared from the list (deleted).
     gone: bool,
     revealed: HashSet<String>,
@@ -209,6 +227,9 @@ pub struct DetailView {
     /// The pane's own focus, for Tab and Shift-Tab between panes (UP-33).
     focus: FocusHandle,
     _fetch: Task<()>,
+    /// Follows the kind's sync state. The pane lives inside its list, which watches the same
+    /// kind, so this subscription starts no watch of its own.
+    _sync: Task<()>,
     _show_pods: Task<()>,
     _yaml: Task<()>,
 }
@@ -229,6 +250,19 @@ impl DetailView {
         });
         let is_secret = object.kind.as_str() == "secrets";
         let subject = Subject::of(&object.kind);
+        let mut subscription = core.subscribe(&object.cluster, &object.kind);
+        let freshness = sync::Freshness::new(subscription.latest().state.clone());
+        let follow_sync = cx.spawn_in(window, async move |this, cx| {
+            while subscription.changed().await {
+                let state = subscription.latest().state.clone();
+                let followed = this.update_in(cx, |view, window, cx| {
+                    view.sync_changed(state, window, cx);
+                });
+                if followed.is_err() {
+                    break;
+                }
+            }
+        });
         let mut view = DetailView {
             core,
             object,
@@ -239,6 +273,11 @@ impl DetailView {
             fetching: false,
             refetch: false,
             refresh_error: None,
+            freshness,
+            fetched_at: None,
+            error_retries: 0,
+            error_retry_due: false,
+            _error_retry_cooldown: None,
             gone: false,
             revealed: HashSet::new(),
             show_annotations: false,
@@ -259,6 +298,7 @@ impl DetailView {
             edit: None,
             focus: cx.focus_handle(),
             _fetch: Task::ready(()),
+            _sync: follow_sync,
             _show_pods: Task::ready(()),
             _yaml: Task::ready(()),
         };
@@ -333,13 +373,14 @@ impl DetailView {
             .fetch_object(&o.cluster, &o.kind, o.namespace.as_deref(), &o.name);
         let is_secret = self.is_secret;
         let managed = self.show_managed_fields;
+        let started = jiff::Timestamp::now();
         self._fetch = cx.spawn_in(window, async move |this, cx| {
             let result = fetch.await;
             // Reading the object and rendering YAML are not free for big objects: off the UI
             // thread.
             let prepared = cx
                 .background_spawn(async move {
-                    result.map(|detail| Prepared::new(detail, is_secret, managed))
+                    result.map(|detail| Prepared::new(detail, is_secret, managed, started))
                 })
                 .await;
             let _ = this.update_in(cx, |view, window, cx| {
@@ -356,10 +397,110 @@ impl DetailView {
                 }
                 if view.refetch {
                     view.refresh(window, cx);
+                } else if view.error_retry_due {
+                    view.retry_held_error(window, cx);
                 }
                 cx.notify();
             });
         });
+    }
+
+    /// The kind's sync state moved: redraw, and fetch again if the connection came back.
+    fn sync_changed(&mut self, state: SyncState, window: &mut Window, cx: &mut Context<Self>) {
+        if *self.freshness.state() != state {
+            if !state.is_current() {
+                self.error_retries = 0;
+            }
+            if self.freshness.update(state, self.holds_fetch_error()) {
+                self.refresh(window, cx);
+            }
+            cx.notify();
+        }
+        self.retry_held_error(window, cx);
+    }
+
+    fn holds_fetch_error(&self) -> bool {
+        !self.gone && (matches!(self.fetch, Fetch::Failed(_)) || self.refresh_error.is_some())
+    }
+
+    /// Fetches again if the pane holds an error while its kind is current. A subscription can
+    /// skip a brief outage, so the pane cannot rely on seeing the kind come back. Only the kind's
+    /// updates start this, and [`sync::error_retry_delay`] spaces it out on a lasting failure.
+    fn retry_held_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.gone || !self.freshness.state().is_current() {
+            self.error_retry_due = false;
+        } else if self.fetching {
+            self.error_retry_due = true;
+        } else if !self.holds_fetch_error() {
+            self.error_retry_due = false;
+        } else if self._error_retry_cooldown.is_some() {
+            self.error_retry_due = true;
+        } else {
+            self.error_retry_due = false;
+            let timer = cx
+                .background_executor()
+                .timer(sync::error_retry_delay(self.error_retries));
+            self.error_retries = self.error_retries.saturating_add(1);
+            self._error_retry_cooldown = Some(cx.spawn_in(window, async move |this, cx| {
+                timer.await;
+                let _ = this.update_in(cx, |view, window, cx| {
+                    view._error_retry_cooldown = None;
+                    if view.error_retry_due {
+                        view.retry_held_error(window, cx);
+                    }
+                });
+            }));
+            self.refresh(window, cx);
+        }
+    }
+
+    /// Whether to show the stale notice. A deleted object's own notice says what the copy is
+    /// once the connection is back, when "until it is fetched" could never come true.
+    fn shows_stale_notice(&self) -> bool {
+        self.freshness.is_stale()
+            && matches!(self.fetch, Fetch::Loaded { .. })
+            && !(self.gone && self.freshness.state().is_current())
+    }
+
+    /// `color`, or the muted colour while the copy shown may be out of date: a status from
+    /// before an outage must not read as the object's status now.
+    fn status_color(&self, color: Hsla, theme: &Theme) -> Hsla {
+        if self.freshness.is_stale() {
+            theme.muted_foreground
+        } else {
+            color
+        }
+    }
+
+    /// The moment ages are counted to: now, or when the copy was fetched if it may be stale.
+    fn age_reference(&self) -> i64 {
+        match self.fetched_at {
+            Some(at) if self.freshness.is_stale() => at.as_second(),
+            _ => unix_now(),
+        }
+    }
+
+    /// Fetches the object again, from an error.
+    fn render_retry(&self) -> Button {
+        Button::new("detail-retry")
+            .label("Retry")
+            .xsmall()
+            .disabled(self.fetching || self.gone)
+            .on_click(registry::on_click(Refresh))
+    }
+
+    /// The name now belongs to another object, so the one this pane is for was deleted. Its copy
+    /// stays, and the other object is neither shown nor available to an edit.
+    fn replaced(&mut self, cx: &mut Context<Self>) {
+        self.gone = true;
+        self.refetch = false;
+        self.error_retry_due = false;
+        self._error_retry_cooldown = None;
+        self.refresh_error = None;
+        if !matches!(self.fetch, Fetch::Loaded { .. }) {
+            self.fetch = Fetch::Failed(sync::REPLACED.to_owned());
+        }
+        self.run_pending(cx);
     }
 
     /// Shows a fetched object: what a fetch that succeeded ends with.
@@ -369,8 +510,18 @@ impl DetailView {
             overview,
             yaml,
             managed,
+            fetched_at,
         } = prepared;
+        if sync::is_other_object(&self.object, &detail.object) {
+            self.replaced(cx);
+            return;
+        }
         self.refresh_error = None;
+        self.error_retries = 0;
+        self.error_retry_due = false;
+        self._error_retry_cooldown = None;
+        self.fetched_at = Some(fetched_at);
+        self.freshness.fetched(self.refetch);
         // A re-render of the previous copy must not land after this one.
         self._yaml = Task::ready(());
         self.fetch = Fetch::Loaded { detail, overview };
@@ -454,7 +605,12 @@ impl DetailView {
         self._fetch = Task::ready(());
         self.fetching = false;
         self.refetch = false;
-        let prepared = Prepared::new(Arc::new(detail), self.is_secret, self.show_managed_fields);
+        let prepared = Prepared::new(
+            Arc::new(detail),
+            self.is_secret,
+            self.show_managed_fields,
+            jiff::Timestamp::now(),
+        );
         self.loaded(prepared, window, cx);
         cx.notify();
     }
@@ -872,11 +1028,22 @@ impl DetailView {
         if let Some(waiting) = self.waiting() {
             notices.push(notice("detail-pending", waiting, theme.info));
         }
+        if self.shows_stale_notice() {
+            notices.push(notice_detail(
+                "detail-stale",
+                self.freshness.headline(),
+                sync::last_updated(self.fetched_at),
+                theme.warning,
+                theme.muted_foreground,
+                div(),
+            ));
+        }
         if let Some(error) = &self.refresh_error {
-            notices.push(notice(
+            notices.push(notice_with(
                 "detail-refresh-error",
                 format!("Could not fetch the latest version: {error}"),
                 theme.danger,
+                self.render_retry(),
             ));
         }
         if self.is_secret && self.tab == DetailTab::Yaml {
@@ -1099,7 +1266,7 @@ impl DetailView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let now = unix_now();
+        let now = self.age_reference();
         let mut body = v_flex().gap_3().p_3().pb_6();
 
         // Metadata. Names and identifiers are monospace.
@@ -1192,11 +1359,14 @@ impl DetailView {
                 v_flex()
                     .gap_1()
                     .children(o.conditions.iter().enumerate().map(|(i, c)| {
-                        let color = match c.status.as_str() {
-                            "True" => theme.success,
-                            "False" => theme.danger,
-                            _ => theme.muted_foreground,
-                        };
+                        let color = self.status_color(
+                            match c.status.as_str() {
+                                "True" => theme.success,
+                                "False" => theme.danger,
+                                _ => theme.muted_foreground,
+                            },
+                            theme,
+                        );
                         let age = timestamp_age(&c.last_transition, now);
                         v_flex()
                             .id(("condition", i))
@@ -1279,7 +1449,7 @@ impl DetailView {
                             .child(
                                 div()
                                     .text_color(if warning {
-                                        theme.warning
+                                        self.status_color(theme.warning, theme)
                                     } else {
                                         theme.muted_foreground
                                     })
@@ -1629,6 +1799,7 @@ impl Render for DetailView {
                 .flex_1()
                 .p_4()
                 .gap_1()
+                .items_start()
                 .child(
                     div()
                         .text_sm()
@@ -1641,6 +1812,7 @@ impl Render for DetailView {
                         .text_color(theme.muted_foreground)
                         .child(error.clone()),
                 )
+                .child(self.render_retry())
                 .into_any_element(),
             (Fetch::Loaded { detail, overview }, DetailTab::Overview) => {
                 // Arc clones: the render borrows the shared data, it does not copy it.
@@ -1687,6 +1859,9 @@ mod edit;
 
 #[path = "detail_pods.rs"]
 mod pods;
+
+#[path = "detail_sync.rs"]
+mod sync;
 
 pub(in crate::ui) use actions::{
     Opening, PROTECTED_NOTE, ShellPod, protected_reason, reason, refused,
