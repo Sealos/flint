@@ -282,8 +282,10 @@ struct Control {
     statuses: Mutex<VecDeque<u16>>,
     /// PATCH requests wait while this is set, so a write stays running.
     hold: AtomicBool,
-    /// A drain's list of the node's pods fails.
+    /// A drain's list of the node's pods fails once it has cordoned the node.
     fail_pods: AtomicBool,
+    /// Set by that cordon.
+    pods_down: AtomicBool,
 }
 
 /// A small local API server: a Deployment `web` with 2 replicas and a Node `node-1`.
@@ -417,7 +419,7 @@ fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Val
                    "spec": {}}),
         ),
         ("GET", "/api/v1/pods")
-            if query.contains("fieldSelector") && control.fail_pods.load(Ordering::SeqCst) =>
+            if query.contains("fieldSelector") && control.pods_down.load(Ordering::SeqCst) =>
         {
             (
                 500,
@@ -427,6 +429,9 @@ fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Val
         }
         ("PATCH", WEB | WEB_SCALE | NODE) => {
             control.patches.fetch_add(1, Ordering::SeqCst);
+            if path == NODE && control.fail_pods.load(Ordering::SeqCst) {
+                control.pods_down.store(true, Ordering::SeqCst);
+            }
             while control.hold.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(2));
             }

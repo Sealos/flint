@@ -867,6 +867,9 @@ fn blocked_reason(reason: &BlockedReason) -> String {
         BlockedReason::Unmanaged => "no controller would recreate them".to_owned(),
         BlockedReason::LocalStorage => "their emptyDir data would be lost".to_owned(),
         BlockedReason::Changed => "they were replaced since they were listed".to_owned(),
+        BlockedReason::ManagedSinceReview => {
+            "their GitOps manager is not the one reviewed".to_owned()
+        }
         BlockedReason::Failed(why) => {
             format!(
                 "the eviction failed: {}",

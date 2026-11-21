@@ -5,9 +5,10 @@
 //! so a drain stops at its next request once its cluster is locked. Each action names the object
 //! the user reviewed by its uid (a `resourceVersion` would conflict with every status update of
 //! a live workload or node): a conflict comes back as [`ActionError::Conflict`], for the review
-//! to open again. Nothing here retries.
+//! to open again. Before an action runs, the live object is read again: another uid or GitOps
+//! manager than the review saw is a conflict too. Nothing here retries.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::{Duration, Instant};
 
@@ -20,10 +21,11 @@ use kube::{Client, ResourceExt as _};
 use serde_json::{Value, json};
 
 use crate::cluster::ClusterError;
+use crate::gitops::{self, Identity, ManagedBy};
 use crate::protection::WriteRefusal;
 use crate::read::KindInfo;
 use crate::write::{
-    RequestGate, ResourceChange, WriteError, WriteOutcome, WriteProposal, WriteTarget,
+    RequestGate, ResourceChange, WriteError, WriteOutcome, WriteProposal, WriteTarget, read_live,
 };
 
 /// How long one request of an action may take.
@@ -145,12 +147,70 @@ pub(crate) fn review(
     }
 }
 
-/// Runs a reviewed action on `target`.
+/// What a review saw, which the live objects must still say when the action runs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Reviewed {
+    pub(crate) managed: Option<ManagedBy>,
+    /// For a drain: the pods it would evict that a GitOps controller manages.
+    pub(crate) pods: Vec<ManagedPod>,
+}
+
+/// What the review of `change` to the live object `live` must remember.
+pub(crate) async fn reviewed(
+    gate: &mut impl ActionGate,
+    name: &str,
+    live: &Value,
+    change: &ResourceChange,
+) -> Result<Reviewed, WriteError> {
+    let pods = match drain_options(change) {
+        Some(options) => managed_pods(gate, name, &options).await?,
+        None => Vec::new(),
+    };
+    Ok(Reviewed {
+        managed: gitops::managed_by_object(live),
+        pods,
+    })
+}
+
+/// The options of a drain, if `change` is one.
+fn drain_options(change: &ResourceChange) -> Option<DrainOptions> {
+    match change {
+        ResourceChange::Drain {
+            delete_emptydir_data,
+            force,
+        } => Some(DrainOptions {
+            delete_emptydir_data: *delete_emptydir_data,
+            force: *force,
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
+/// Reads the live object once. Another uid or GitOps manager than the review saw is a conflict,
+/// and a failed read refuses the action.
+async fn recheck(
+    gate: &mut impl ActionGate,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    reviewed: &Reviewed,
+) -> Result<(), WriteError> {
+    let client = gate.client().await?;
+    let live = read_live(&client, kind, target).await?;
+    let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
+    if uid != target.uid.as_deref() || gitops::managed_by_object(&live) != reviewed.managed {
+        return Err(WriteError::Conflict);
+    }
+    Ok(())
+}
+
+/// Runs a reviewed action on `target`, once the live object still matches its review.
 pub(crate) async fn run(
     gate: &mut impl ActionGate,
     kind: &KindInfo,
     target: &WriteTarget,
     change: &ResourceChange,
+    reviewed: &Reviewed,
 ) -> Result<WriteOutcome, WriteError> {
     let object = ActionObject {
         resource: kind.resource.clone(),
@@ -165,6 +225,7 @@ pub(crate) async fn run(
         resource_version: None,
         drain,
     };
+    recheck(gate, kind, target, reviewed).await?;
     match change {
         ResourceChange::Delete => delete(gate, &object).await?,
         ResourceChange::Scale { from, to } => scale(gate, &object, *from, *to).await?,
@@ -178,8 +239,20 @@ pub(crate) async fn run(
             let options = DrainOptions {
                 delete_emptydir_data: *delete_emptydir_data,
                 force: *force,
+                warned: reviewed
+                    .pods
+                    .iter()
+                    .map(|pod| (pod.uid.clone(), pod.managed.clone()))
+                    .collect(),
                 ..Default::default()
             };
+            let now = managed_pods(gate, &object.name, &options).await?;
+            if now
+                .iter()
+                .any(|pod| options.warned.get(&pod.uid) != Some(&pod.managed))
+            {
+                return Err(WriteError::Conflict);
+            }
             let mut report = drain(gate, &object, &options).await;
             if !report.cordoned
                 && let Some(error) = report.stopped.take()
@@ -415,6 +488,8 @@ pub(crate) struct DrainOptions {
     pub(crate) delete_emptydir_data: bool,
     /// Evict pods no controller will recreate.
     pub(crate) force: bool,
+    /// The GitOps managers the review warned about, by pod uid.
+    pub(crate) warned: BTreeMap<String, ManagedBy>,
     /// How long to wait for evicted pods to terminate.
     pub(crate) wait: Duration,
     pub(crate) poll: Duration,
@@ -425,6 +500,7 @@ impl Default for DrainOptions {
         Self {
             delete_emptydir_data: false,
             force: false,
+            warned: BTreeMap::new(),
             wait: Duration::from_secs(60),
             poll: Duration::from_secs(1),
         }
@@ -436,6 +512,15 @@ impl Default for DrainOptions {
 pub struct PodName {
     pub namespace: String,
     pub name: String,
+}
+
+/// A pod a drain would evict, and the GitOps controller that manages it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ManagedPod {
+    pub pod: PodName,
+    pub managed: ManagedBy,
+    pub(crate) uid: String,
 }
 
 /// Why a drain left a pod on the node.
@@ -450,6 +535,8 @@ pub enum BlockedReason {
     LocalStorage,
     /// It was replaced since it was listed.
     Changed,
+    /// A GitOps controller's marker on it is not the one reviewed.
+    ManagedSinceReview,
     Failed(String),
 }
 
@@ -510,6 +597,83 @@ fn plan(pod: &Pod, options: &DrainOptions) -> PodPlan {
     PodPlan::Evict
 }
 
+/// Who manages `pod`, from its labels and annotations.
+fn pod_manager(pod: &Pod) -> Option<ManagedBy> {
+    let name = pod.name_any();
+    let namespace = pod.namespace();
+    let identity = Identity {
+        group: Some(""),
+        kind: "Pod",
+        namespace: namespace.as_deref(),
+        name: &name,
+    };
+    gitops::managed_by(&identity, |key| {
+        pod.labels()
+            .get(key)
+            .or_else(|| pod.annotations().get(key))
+            .map(String::as_str)
+    })
+}
+
+/// Whether a GitOps controller manages `pod` in a way the review did not warn about.
+fn is_unwarned(pod: &Pod, options: &DrainOptions) -> bool {
+    pod_manager(pod)
+        .is_some_and(|managed| options.warned.get(&pod.uid().unwrap_or_default()) != Some(&managed))
+}
+
+/// The pods on `node` a drain with `options` would evict that a GitOps controller manages.
+async fn managed_pods(
+    gate: &mut impl ActionGate,
+    node: &str,
+    options: &DrainOptions,
+) -> Result<Vec<ManagedPod>, ActionError> {
+    let client = gate.client().await?;
+    let params = ListParams::default().fields(&format!("spec.nodeName={node}"));
+    let pods = timed(Api::<Pod>::all(client).list(&params)).await?.items;
+    Ok(pods
+        .iter()
+        .filter(|pod| plan(pod, options) == PodPlan::Evict)
+        .filter_map(|pod| {
+            Some(ManagedPod {
+                managed: pod_manager(pod)?,
+                pod: pod_name(pod),
+                uid: pod.uid().unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+/// Reads `pod` just before its eviction: `false` if it is gone, and why to leave it if it is
+/// another pod now, or not what the review warned about.
+async fn still_evictable(
+    client: Client,
+    pod: &Pod,
+    options: &DrainOptions,
+) -> Result<bool, BlockedReason> {
+    let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
+    match timed(api.get_opt(&pod.name_any())).await {
+        Ok(None) => Ok(false),
+        Ok(Some(now)) if now.uid() != pod.uid() => Err(BlockedReason::Changed),
+        Ok(Some(now)) if is_unwarned(&now, options) => Err(BlockedReason::ManagedSinceReview),
+        Ok(Some(_)) => Ok(true),
+        Err(error) => Err(BlockedReason::Failed(WriteError::from(error).to_string())),
+    }
+}
+
+/// Ends a drain at `name`: it and `rest` were not tried.
+fn stop_at(
+    report: &mut DrainReport,
+    name: PodName,
+    rest: impl Iterator<Item = Pod>,
+    accepted: &[Pod],
+    error: ActionError,
+) {
+    report.remaining.push(name);
+    report.remaining.extend(rest.map(|pod| pod_name(&pod)));
+    report.terminating = sorted_names(accepted);
+    report.stopped = Some(error.into());
+}
+
 fn pod_name(pod: &Pod) -> PodName {
     PodName {
         namespace: pod.namespace().unwrap_or_default(),
@@ -564,6 +728,9 @@ pub(crate) async fn drain(
     let mut to_evict = Vec::new();
     for pod in pods {
         match plan(&pod, options) {
+            PodPlan::Evict if is_unwarned(&pod, options) => report
+                .blocked
+                .push((pod_name(&pod), BlockedReason::ManagedSinceReview)),
             PodPlan::Evict => to_evict.push(pod),
             PodPlan::Skip => report.skipped.push(pod_name(&pod)),
             PodPlan::Block(reason) => report.blocked.push((pod_name(&pod), reason)),
@@ -577,10 +744,22 @@ pub(crate) async fn drain(
         let client = match gate.client().await {
             Ok(client) => client,
             Err(error) => {
-                report.remaining.push(name);
-                report.remaining.extend(pods.map(|p| pod_name(&p)));
-                report.terminating = sorted_names(&accepted);
-                report.stopped = Some(error.into());
+                stop_at(&mut report, name, pods, &accepted, error);
+                return report;
+            }
+        };
+        match still_evictable(client, &pod, options).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(reason) => {
+                report.blocked.push((name, reason));
+                continue;
+            }
+        }
+        let client = match gate.client().await {
+            Ok(client) => client,
+            Err(error) => {
+                stop_at(&mut report, name, pods, &accepted, error);
                 return report;
             }
         };
@@ -714,15 +893,22 @@ mod tests {
         fake_slow(reply, Duration::ZERO)
     }
 
-    /// [`fake`], taking `slow` to answer a read of one pod.
+    /// [`fake`], taking `slow` to answer a read of one pod after its eviction.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test client answered in process, which reaches no server"
+    )]
     fn fake_slow(reply: Reply, slow: Duration) -> (Client, Arc<Mutex<Vec<Seen>>>) {
         let log: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let seen = log.clone();
         let service = tower::service_fn(move |request: Request<Body>| {
             let (seen, reply) = (seen.clone(), reply.clone());
             async move {
+                let path = request.uri().path().to_owned();
+                let evicted = format!("{path}/eviction");
                 if request.method() == http::Method::GET
-                    && request.uri().path().contains("/namespaces/demo/pods/")
+                    && path.contains("/namespaces/demo/pods/")
+                    && seen.lock().unwrap().iter().any(|s| s.path == evicted)
                 {
                     tokio::time::sleep(slow).await;
                 }
@@ -1166,16 +1352,28 @@ mod tests {
         pods: Vec<Value>,
         evict: impl Fn(&str) -> (u16, Value) + Send + Sync + 'static,
     ) -> Reply {
+        let tried = Mutex::new(BTreeSet::new());
         Arc::new(move |seen| match seen.method.as_str() {
             "PATCH" => (
                 200,
                 json!({"apiVersion": "v1", "kind": "Node",
                                     "metadata": {"name": "worker"}}),
             ),
-            "POST" => evict(evicted_pod(&seen.path).expect("an eviction")),
+            "POST" => {
+                let name = evicted_pod(&seen.path).expect("an eviction");
+                tried.lock().unwrap().insert(name.to_owned());
+                evict(name)
+            }
             _ if seen.path == "/api/v1/pods" => (200, pod_list(pods.clone())),
             _ if seen.path == "/api/v1/nodes/worker" => (200, node_object("uid-node")),
-            _ => (404, status(404, "NotFound")),
+            _ => {
+                let name = seen.path.rsplit('/').next().unwrap_or_default();
+                let listed = pods.iter().find(|p| p["metadata"]["name"] == name);
+                match listed {
+                    Some(pod) if !tried.lock().unwrap().contains(name) => (200, pod.clone()),
+                    _ => (404, status(404, "NotFound")),
+                }
+            }
         })
     }
 
@@ -1428,6 +1626,63 @@ mod tests {
         assert!(report.evicted.is_empty());
     }
 
+    // covers UP-51, UP-53: a pod is read just before its eviction. One whose GitOps manager was
+    // not reviewed stays, and so does one that cannot be read.
+    #[tokio::test]
+    async fn a_pod_is_rechecked_before_its_eviction() {
+        let listed = vec![
+            pod("marked", Some("ReplicaSet"), json!({})),
+            pod("unreadable", Some("ReplicaSet"), json!({})),
+            pod("plain", Some("ReplicaSet"), json!({})),
+        ];
+        let plain = listed[2].clone();
+        let reply: Reply = Arc::new(move |seen| match seen.method.as_str() {
+            "PATCH" => (200, node_object("uid-node")),
+            "POST" => accepted(),
+            _ if seen.path == "/api/v1/pods" => (200, pod_list(listed.clone())),
+            _ if seen.path == "/api/v1/nodes/worker" => (200, node_object("uid-node")),
+            _ if seen.path.ends_with("/marked") => (
+                200,
+                pod(
+                    "marked",
+                    Some("ReplicaSet"),
+                    json!({"metadata": {"labels": {"kustomize.toolkit.fluxcd.io/name": "apps"}}}),
+                ),
+            ),
+            _ if seen.path.ends_with("/unreadable") => (500, status(500, "InternalError")),
+            _ if seen.path.ends_with("/plain") => (200, plain.clone()),
+            _ => (404, status(404, "NotFound")),
+        });
+        let (client, log) = fake(reply);
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
+        assert_eq!(report.evicted, [named("plain")]);
+        assert_eq!(
+            report.blocked[0],
+            (named("marked"), BlockedReason::ManagedSinceReview)
+        );
+        assert!(
+            matches!(&report.blocked[1], (pod, BlockedReason::Failed(_)) if *pod == named("unreadable")),
+            "{:?}",
+            report.blocked
+        );
+        let seen = log.lock().unwrap();
+        let evictions: Vec<&str> = seen
+            .iter()
+            .filter(|s| s.method == "POST")
+            .map(|s| s.path.as_str())
+            .collect();
+        assert_eq!(evictions, ["/api/v1/namespaces/demo/pods/plain/eviction"]);
+        let at = |method: &str, path: &str| {
+            seen.iter()
+                .position(|s| s.method == method && s.path == path)
+                .unwrap()
+        };
+        assert!(
+            at("GET", "/api/v1/namespaces/demo/pods/plain")
+                < at("POST", "/api/v1/namespaces/demo/pods/plain/eviction")
+        );
+    }
+
     // covers UP-53: evicted pods still there when the wait ends are reported as terminating; a
     // new pod under the same name is not the one evicted.
     #[tokio::test]
@@ -1438,18 +1693,27 @@ mod tests {
         ];
         let reads = Arc::new(AtomicUsize::new(0));
         let counted = reads.clone();
+        let replaced = Arc::new(AtomicBool::new(false));
         let reply: Reply = Arc::new(move |seen| match seen.method.as_str() {
             "PATCH" => (
                 200,
                 json!({"apiVersion": "v1", "kind": "Node",
                                     "metadata": {"name": "worker"}}),
             ),
-            "POST" => accepted(),
+            "POST" => {
+                if seen.path.ends_with("/replaced/eviction") {
+                    replaced.store(true, Ordering::SeqCst);
+                }
+                accepted()
+            }
             _ if seen.path == "/api/v1/pods" => (200, pod_list(listed.clone())),
             _ if seen.path == "/api/v1/nodes/worker" => (200, node_object("uid-node")),
             _ if seen.path.ends_with("/slow") => {
                 counted.fetch_add(1, Ordering::SeqCst);
                 (200, pod("slow", Some("ReplicaSet"), json!({})))
+            }
+            _ if !replaced.load(Ordering::SeqCst) => {
+                (200, pod("replaced", Some("ReplicaSet"), json!({})))
             }
             _ => (
                 200,

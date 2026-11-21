@@ -117,12 +117,37 @@ fn action_lines(action: &WriteAction) -> Vec<String> {
     }
 }
 
+/// How many managed pods a drain's warning names.
+const WARNED_PODS: usize = 5;
+
+/// A drain's warning about `pods`, each already worded with what manages it.
+fn evicts_managed_text(pods: &[String]) -> String {
+    let count = match pods.len() {
+        1 => "1 pod".to_owned(),
+        n => format!("{n} pods"),
+    };
+    let mut named = pods[..pods.len().min(WARNED_PODS)].to_vec();
+    if pods.len() > WARNED_PODS {
+        named.push(format!("and {} more", pods.len() - WARNED_PODS));
+    }
+    format!(
+        "Evicts {count} managed by GitOps, which will likely be put back on the next sync: {}.",
+        named.join(", ")
+    )
+}
+
 /// What a warning says.
 fn warning_text(warning: &WriteWarning) -> String {
     match warning {
         WriteWarning::LikelyReverted(managed) => {
             format!("Managed by {managed}. This change will likely be reverted on the next sync.")
         }
+        WriteWarning::EvictsManaged(pods) => evicts_managed_text(
+            &pods
+                .iter()
+                .map(|p| format!("{}/{} ({})", p.pod.namespace, p.pod.name, p.managed))
+                .collect::<Vec<_>>(),
+        ),
         // A warning this version does not word must still stop and be read.
         _ => "Flint has a warning about this change that this version cannot describe.".to_owned(),
     }
@@ -131,6 +156,7 @@ fn warning_text(warning: &WriteWarning) -> String {
 /// The dialog for a change to `target`: what it does, warnings first, then exactly which object
 /// on which cluster. `shown` is what the cluster is called, with its real name if it has a
 /// custom one.
+#[cfg(test)]
 fn dialog_text(
     target: &WriteTarget,
     wording: Wording,
@@ -261,7 +287,8 @@ mod tests {
     use flint_core::write::ResourceChange;
 
     use super::{
-        Wording, change_lines, change_wording, dialog_text, dialog_text_saying, warning_text,
+        Wording, change_lines, change_wording, dialog_text, dialog_text_saying,
+        evicts_managed_text, warning_text,
     };
 
     const APPLY: Wording = Wording {
@@ -415,6 +442,22 @@ mod tests {
         let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in {text}"));
         assert!(at("Managed by") < at("Replicas: 1 to 2."));
         assert!(at("Replicas: 1 to 2.") < at("Context: "));
+    }
+
+    // covers UP-51, UP-53: a drain names the managed pods it would evict, up to a limit.
+    #[test]
+    fn a_drain_warning_names_the_managed_pods() {
+        let one = evicts_managed_text(&["demo/web (Flux: apps)".to_owned()]);
+        assert_eq!(
+            one,
+            "Evicts 1 pod managed by GitOps, which will likely be put back on the next sync: \
+             demo/web (Flux: apps)."
+        );
+        let many: Vec<String> = (0..7).map(|n| format!("demo/p{n} (Flux: apps)")).collect();
+        let text = evicts_managed_text(&many);
+        assert!(text.starts_with("Evicts 7 pods"), "{text}");
+        assert!(text.contains("p4") && !text.contains("p5"), "{text}");
+        assert!(text.ends_with("and 2 more."), "{text}");
     }
 
     // covers UP-51: a GitOps warning names what manages the object and says "likely", above

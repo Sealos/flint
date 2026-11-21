@@ -10,6 +10,8 @@
 //!   `resourceVersion`. A [`ReviewedEdit`] can only be made here, and is refused for any other
 //!   target.
 //! - A write is never retried: a conflict goes back to a new review.
+//! - A resource action rechecks the live object before it runs, and a different uid or GitOps
+//!   manager is a conflict.
 //!
 //! To add an action: a [`WriteProposal`] variant, a [`WriteAction`] variant, and an arm in
 //! `prepare` and in `execute`. Each request goes through `RequestGate::client`. The resource
@@ -31,7 +33,7 @@ use crate::read::{self, KindId, KindInfo};
 use crate::recheck::ContextPin;
 use crate::redact;
 use crate::write_actions;
-pub use crate::write_actions::{BlockedReason, DrainReport, PodName};
+pub use crate::write_actions::{BlockedReason, DrainReport, ManagedPod, PodName};
 
 /// How long one request of a write may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -99,6 +101,7 @@ pub enum WriteAction {
 pub struct ReviewedAction {
     bound: WriteTarget,
     change: ResourceChange,
+    reviewed: write_actions::Reviewed,
 }
 
 impl ReviewedAction {
@@ -139,6 +142,8 @@ pub struct WriteIntent {
 pub enum WriteWarning {
     /// A GitOps controller manages the object and will likely put it back on its next sync.
     LikelyReverted(ManagedBy),
+    /// A drain would evict these pods, which GitOps controllers manage.
+    EvictsManaged(Vec<ManagedPod>),
 }
 
 /// The result of [`CoreHandle::review_write`]: the only thing a confirmation renders.
@@ -301,8 +306,13 @@ impl CoreHandle {
             let client = gate.client().await?;
             let live = read_live(&client, &kind, &target).await?;
             let target = bound_to_live(target, &live)?;
-            let warnings = warnings_for(&live);
+            let mut warnings = warnings_for(&live);
             let action = prepare(&mut gate, &kind, &target, &live, proposal).await?;
+            if let WriteAction::Resource(action) = &action
+                && !action.reviewed.pods.is_empty()
+            {
+                warnings.push(WriteWarning::EvictsManaged(action.reviewed.pods.clone()));
+            }
             Ok(WriteReview {
                 target,
                 action,
@@ -336,7 +346,7 @@ async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, Wr
         .ok_or_else(|| WriteError::NotServed(target.kind.clone()))
 }
 
-async fn read_live(
+pub(crate) async fn read_live(
     client: &Client,
     kind: &KindInfo,
     target: &WriteTarget,
@@ -438,10 +448,15 @@ async fn prepare(
                 body,
             }))
         }
-        proposal => Ok(WriteAction::Resource(ReviewedAction {
-            bound: target.clone(),
-            change: write_actions::review(kind, live, proposal)?,
-        })),
+        proposal => {
+            let change = write_actions::review(kind, live, proposal)?;
+            let reviewed = write_actions::reviewed(gate, &target.name, live, &change).await?;
+            Ok(WriteAction::Resource(ReviewedAction {
+                bound: target.clone(),
+                change,
+                reviewed,
+            }))
+        }
     }
 }
 
@@ -460,7 +475,14 @@ async fn execute(
             })
         }
         WriteAction::Resource(action) => {
-            write_actions::run(gate, kind, &intent.target, action.change()).await
+            write_actions::run(
+                gate,
+                kind,
+                &intent.target,
+                action.change(),
+                &action.reviewed,
+            )
+            .await
         }
     }
 }
