@@ -300,8 +300,8 @@ pub fn shown_title(title: &str) -> String {
 }
 
 /// What the tab list says of a tab: its title, its cluster and its status.
-pub fn list_label(title: &str, cluster: &str, status: TabStatus) -> String {
-    format!("{} — {cluster} · {}", shown_title(title), status.word())
+pub fn list_label(title: &str, cluster: &str, status: &str) -> String {
+    format!("{} — {cluster} · {status}", shown_title(title))
 }
 
 /// What a tab's accessible label and full name say: its title and its cluster.
@@ -414,7 +414,7 @@ mod tests {
         assert!(shown.ends_with("istio-proxy"), "{shown}");
         assert_eq!(shown_title("web-1 · app"), "web-1 · app");
         assert_eq!(
-            list_label("Shell: web-1 · app", "kind-dev", TabStatus::Live),
+            list_label("Shell: web-1 · app", "kind-dev", TabStatus::Live.word()),
             "Shell: web-1 · app — kind-dev · live"
         );
         assert_eq!(

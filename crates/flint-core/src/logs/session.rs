@@ -89,6 +89,16 @@ impl Default for LogOptions {
     }
 }
 
+/// Why a container has no log to read yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerWait {
+    /// The pod is not on a node yet.
+    Unscheduled,
+    /// The container has not started: the `reason` of its status, when that is a plain word
+    /// (`ImagePullBackOff`, `ContainerCreating`).
+    NotStarted(Option<String>),
+}
+
 /// Where a session is.
 ///
 /// In a workload session this is the state of the session as a whole (resolving the workload
@@ -110,6 +120,9 @@ pub enum LogState {
         attempt: u32,
         back_off: bool,
     },
+    /// The container has not started, so there is no log yet and nothing is wrong with the
+    /// connection. Polled quietly until it starts.
+    Waiting { wait: ContainerWait },
     /// Nothing more will come: all lines were read (not following, or the previous instance),
     /// the container finished, its pod was deleted, or an error retrying cannot fix. `error`
     /// is safe to show. `pod_deleted`: a single-pod session ended because its pod was deleted

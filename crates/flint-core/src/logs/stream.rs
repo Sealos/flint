@@ -18,7 +18,9 @@ use k8s_openapi::jiff::Timestamp;
 use tokio::time::Sleep;
 
 use super::line::{LineSource, LogLine};
-use super::session::{LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE};
+use super::session::{
+    ContainerWait, LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE,
+};
 use super::source::{
     AfterEnd, CRASH_LOOP, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines,
     is_previous_missing, is_unavailable_notice,
@@ -177,6 +179,8 @@ pub(crate) struct Stream {
     /// The kubelet's "cannot read the log" answer, from the last read that got one instead of
     /// lines: the error a stream that then ends or waits reports. Cleared by a real line.
     notice: Option<String>,
+    /// The open that said the container has not started, while the pod's status is asked why.
+    starting: Option<LogError>,
     deadline: Option<Pin<Box<Sleep>>>,
     /// The stream ended on an error about the cluster rather than this container.
     cluster_error: bool,
@@ -221,6 +225,7 @@ impl Stream {
             opened: false,
             fresh: false,
             notice: None,
+            starting: None,
             deadline: None,
             cluster_error: false,
         };
@@ -298,6 +303,17 @@ impl Stream {
     /// changed.
     pub fn handle(&mut self, step: Step, out: &mut dyn FnMut(LogLine)) -> bool {
         self.changed = false;
+        let starting = if matches!(step, Step::AfterEnd(_)) {
+            self.starting.take()
+        } else {
+            None
+        };
+        let unscheduled = matches!(
+            self.state,
+            LogState::Waiting {
+                wait: ContainerWait::Unscheduled
+            }
+        );
         let next = match step {
             // The kubelet could not read the log. For the previous instance that is the end.
             // For the current one it is an end of stream like any other, with the kubelet's
@@ -363,6 +379,18 @@ impl Stream {
             Step::Opened(Err(e)) if self.options.previous && is_previous_missing(&e.message) => {
                 self.end(Some(format!("{PREVIOUS_NOT_AVAILABLE}: {}", e.message)))
             }
+            // A finished container that never started has nothing left to read.
+            Step::Opened(Err(e)) if self.draining && e.waits_for_start() => self.drained(),
+            // No log yet: the pod's status says why.
+            Step::Opened(Err(e)) if e.waits_for_start() => {
+                self.starting = Some(e);
+                self.check_pod()
+            }
+            // The server said it has not started, and the status adds nothing (not readable, or
+            // silent): that is still a wait, not a broken connection.
+            Step::AfterEnd(Err(_) | Ok(AfterEnd::Restarts)) if starting.is_some() => {
+                self.wait_for_container(ContainerWait::NotStarted(None))
+            }
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => {
                 self.end(Some(e.message))
             }
@@ -370,26 +398,29 @@ impl Stream {
                 self.retry(Some(e))
             }
             Step::Eof => self.at_end(),
+            // It left the unscheduled wait, where no log was opened: open it now.
+            Step::AfterEnd(Ok(AfterEnd::Restarts)) if unscheduled => self.reopen(),
             Step::AfterEnd(Ok(AfterEnd::Restarts)) => self.retry(self.notice_error()),
             Step::AfterEnd(Ok(AfterEnd::BackOff)) => self.wait(self.notice_error(), true),
+            Step::AfterEnd(Ok(AfterEnd::NotStarted(wait))) => self.wait_for_container(wait),
             Step::AfterEnd(Ok(AfterEnd::Terminating)) => {
                 self.terminating = self.member.is_none();
-                self.retry(self.notice_error())
+                let error = starting.or_else(|| self.notice_error());
+                self.retry(error)
             }
             Step::AfterEnd(Ok(end @ (AfterEnd::Finished | AfterEnd::Deleting))) => {
                 // Pods of a workload come and go; a deleted one ends its stream quietly.
                 self.deleted = end == AfterEnd::Deleting && self.member.is_none();
                 self.draining = true;
-                let request = self.resume_request();
-                Phase::Connect(self.source.open(&request))
+                self.reopen()
             }
             // Pods of a workload come and go; that is no error.
             Step::AfterEnd(Ok(AfterEnd::Gone)) if self.member.is_some() => self.end(None),
             Step::AfterEnd(Ok(AfterEnd::Gone)) => self.end_deleted(),
-            Step::Retry => {
-                let request = self.resume_request();
-                Phase::Connect(self.source.open(&request))
-            }
+            // An unscheduled pod's log answers with an empty stream: asking the status instead
+            // keeps the tab from flashing "Streaming" at each poll.
+            Step::Retry if unscheduled => self.check_pod(),
+            Step::Retry => self.reopen(),
         };
         self.phase = next;
         self.changed
@@ -411,6 +442,7 @@ impl Stream {
         }
         self.draining = false;
         self.deleted = false;
+        self.starting = None;
         self.retry.reset();
         self.set_state(LogState::Connecting);
         let request = self.resume_request();
@@ -544,9 +576,28 @@ impl Stream {
             let notice = self.notice.take();
             self.end(notice)
         } else {
-            let uid = self.member.as_ref().map(|m| m.uid.as_str());
-            Phase::CheckEnd(self.source.after_end(&self.target, uid))
+            self.check_pod()
         }
+    }
+
+    /// Asks the pod's status what became of the container.
+    fn check_pod(&self) -> Phase {
+        let uid = self.member.as_ref().map(|m| m.uid.as_str());
+        Phase::CheckEnd(self.source.after_end(&self.target, uid))
+    }
+
+    /// Opens the log again, from where it was left.
+    fn reopen(&mut self) -> Phase {
+        let request = self.resume_request();
+        Phase::Connect(self.source.open(&request))
+    }
+
+    /// Polls for a container that has not started. Counted for the delay, which grows, but
+    /// shown without an attempt: nothing is failing.
+    fn wait_for_container(&mut self, wait: ContainerWait) -> Phase {
+        let next = self.retry.fail(None, false);
+        self.set_state(LogState::Waiting { wait });
+        Phase::Wait(next.sleep)
     }
 
     /// The kubelet's answer as the error to wait with, if that is what the last read got.
@@ -906,7 +957,7 @@ mod tests {
             _: &LogTarget,
             _: Option<&str>,
         ) -> BoxFuture<'static, Result<AfterEnd, LogError>> {
-            let fate = self.fate;
+            let fate = self.fate.clone();
             async move { Ok(fate) }.boxed()
         }
     }
@@ -1043,6 +1094,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // covers UP-40: a container that has not started is a quiet wait with the pod's reason and no
+    // attempt counter, even if the status can't say why.
+    #[tokio::test(start_paused = true)]
+    async fn a_container_that_has_not_started_is_waited_for() {
+        let not_started = || {
+            Step::Opened(Err(LogError::retry(
+                "BadRequest: container \"app\" in pod \"p\" is waiting to start: image can't be \
+                 pulled",
+            )))
+        };
+        let waiting = |wait| LogState::Waiting { wait };
+        let mut s = stream(&[], None);
+        s.handle(not_started(), &mut |_| {});
+        assert!(matches!(s.phase, Phase::CheckEnd(_)), "asks the pod why");
+        let pull = ContainerWait::NotStarted(Some("ImagePullBackOff".into()));
+        s.handle(
+            Step::AfterEnd(Ok(AfterEnd::NotStarted(pull.clone()))),
+            &mut |_| {},
+        );
+        assert_eq!(s.state(), &waiting(pull));
+        assert!(matches!(s.phase, Phase::Wait(_)), "keeps polling");
+
+        for silent in [Ok(AfterEnd::Restarts), Err(LogError::retry("timed out"))] {
+            let mut s = stream(&[], None);
+            s.handle(not_started(), &mut |_| {});
+            s.handle(Step::AfterEnd(silent), &mut |_| {});
+            assert_eq!(s.state(), &waiting(ContainerWait::NotStarted(None)));
+        }
+
+        // Its pod finished without it ever starting: nothing is left to wait for.
+        let mut s = stream(&[], None);
+        s.handle(not_started(), &mut |_| {});
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Finished)), &mut |_| {});
+        s.handle(not_started(), &mut |_| {});
+        assert!(s.is_done());
+    }
+
+    // covers UP-40: an unscheduled pod's log is an empty stream, so while it waits the status is
+    // polled and the log is not opened, and the tab never flashes "Streaming".
+    #[tokio::test(start_paused = true)]
+    async fn an_unscheduled_pod_is_polled_by_its_status() {
+        let mut s = stream(&[], None);
+        drain(&mut s).await;
+        let unscheduled = || Step::AfterEnd(Ok(AfterEnd::NotStarted(ContainerWait::Unscheduled)));
+        s.handle(unscheduled(), &mut |_| {});
+        s.handle(Step::Retry, &mut |_| {});
+        assert!(matches!(s.phase, Phase::CheckEnd(_)), "no log opened");
+        s.handle(unscheduled(), &mut |_| {});
+        assert_eq!(
+            s.state(),
+            &LogState::Waiting {
+                wait: ContainerWait::Unscheduled
+            }
+        );
+        s.handle(Step::Retry, &mut |_| {});
+        s.handle(Step::AfterEnd(Ok(AfterEnd::Restarts)), &mut |_| {});
+        assert!(matches!(s.phase, Phase::Connect(_)), "it runs: read it");
     }
 
     /// The time left in a waiting stream's backoff.

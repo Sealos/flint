@@ -11,7 +11,7 @@ use kube::Client;
 use kube::api::{Api, LogParams};
 
 use super::line::MAX_LINE_BYTES;
-use super::session::{LogSince, LogTarget};
+use super::session::{ContainerWait, LogSince, LogTarget};
 use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{ClusterError, Target};
 
@@ -125,6 +125,14 @@ impl LogError {
         self.kind != ErrorKind::Retry
     }
 
+    /// The log endpoint says the container has not started, and not because it crash-loops
+    /// (which has its own wait).
+    pub(crate) fn waits_for_start(&self) -> bool {
+        self.kind == ErrorKind::Retry
+            && is_starting(&self.message)
+            && !self.message.contains(CRASH_LOOP)
+    }
+
     /// See [`ErrorKind::Cluster`].
     pub fn is_cluster(&self) -> bool {
         self.kind == ErrorKind::Cluster
@@ -166,13 +174,15 @@ fn is_starting(message: &str) -> bool {
 }
 
 /// What to do after a followed stream ended cleanly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AfterEnd {
     /// The container may run again (it restarts, or the pod is still running): reconnect.
     Restarts,
     /// As [`AfterEnd::Restarts`], but the pod's status says the container is waiting in
     /// `CrashLoopBackOff`: the kubelet restarts it after its back-off, which can take minutes.
     BackOff,
+    /// The container has not started: there is no log yet, for this reason.
+    NotStarted(ContainerWait),
     /// The container finished for good.
     Finished,
     /// The pod is being deleted (it has a `deletionTimestamp`) but the container has not
@@ -369,8 +379,35 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         // A failed init container is retried unless the pod never restarts anything.
         (Some(_), "Once") if pod_policy == "Never" => AfterEnd::Finished,
         _ if waiting_reason == Some(CRASH_LOOP) => AfterEnd::BackOff,
-        _ => AfterEnd::Restarts,
+        _ => not_started(pod, waiting_reason).map_or(AfterEnd::Restarts, AfterEnd::NotStarted),
     }
+}
+
+/// Why the container of `pod`, whose status gives `waiting_reason`, has not started, if it has
+/// not.
+fn not_started(pod: &Pod, waiting_reason: Option<&str>) -> Option<ContainerWait> {
+    let status = pod.status.as_ref();
+    let pending = status.and_then(|s| s.phase.as_deref()) == Some("Pending");
+    let unscheduled = status
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|c| c.type_ == "PodScheduled" && c.status == "False")
+        });
+    if pending && unscheduled {
+        return Some(ContainerWait::Unscheduled);
+    }
+    match waiting_reason {
+        Some(reason) => Some(ContainerWait::NotStarted(plain_reason(reason))),
+        None => pending.then_some(ContainerWait::NotStarted(None)),
+    }
+}
+
+/// `reason` if it is the one word a status reason should be. It is shown as it is.
+fn plain_reason(reason: &str) -> Option<String> {
+    ((1..=64).contains(&reason.len()) && reason.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| reason.to_owned())
 }
 
 /// The waiting reason of a container the kubelet restarts after a back-off.
@@ -641,6 +678,46 @@ mod tests {
         );
     }
 
+    // covers UP-40: a pod that cannot start says why, from its status.
+    #[test]
+    fn a_pod_that_has_not_started_says_why() {
+        let pending = |conditions: serde_json::Value, statuses: serde_json::Value| {
+            pod(json!({
+                "spec": {"restartPolicy": "Always", "containers": [{"name": "app"}]},
+                "status": {"phase": "Pending", "conditions": conditions,
+                           "containerStatuses": statuses},
+            }))
+        };
+        let waiting = |reason: &str| {
+            json!([{"name": "app", "image": "i", "imageID": "", "ready": false,
+                    "restartCount": 0, "state": {"waiting": {"reason": reason}}}])
+        };
+        let scheduled = |status: &str| json!([{"type": "PodScheduled", "status": status}]);
+        assert_eq!(
+            fate(Some(&pending(scheduled("False"), json!([]))), Some("app")),
+            AfterEnd::NotStarted(ContainerWait::Unscheduled)
+        );
+        assert_eq!(
+            fate(
+                Some(&pending(scheduled("True"), waiting("ImagePullBackOff"))),
+                Some("app")
+            ),
+            AfterEnd::NotStarted(ContainerWait::NotStarted(Some("ImagePullBackOff".into())))
+        );
+        assert_eq!(
+            fate(Some(&pending(scheduled("True"), json!([]))), Some("app")),
+            AfterEnd::NotStarted(ContainerWait::NotStarted(None))
+        );
+        // Shown as it is, so anything but one plain word is left out.
+        assert_eq!(
+            fate(
+                Some(&pending(scheduled("True"), waiting("not\nplain"))),
+                Some("app")
+            ),
+            AfterEnd::NotStarted(ContainerWait::NotStarted(None))
+        );
+    }
+
     // covers UP-40: a crash-looping container is waited for as the kubelet's back-off, not as a
     // broken connection; the kubelet's "unable to retrieve" answer is told apart from a line.
     #[test]
@@ -664,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             fate(Some(&waiting("ContainerCreating")), Some("app")),
-            AfterEnd::Restarts
+            AfterEnd::NotStarted(ContainerWait::NotStarted(Some("ContainerCreating".into())))
         );
         assert!(is_unavailable_notice(
             "unable to retrieve container logs for containerd://c54f232e5b"

@@ -69,7 +69,12 @@ impl PodSetStatus {
 
     /// Streams opening or waiting to reopen.
     pub fn connecting(&self) -> usize {
-        self.count(|s| matches!(s, LogState::Connecting | LogState::Reconnecting { .. }))
+        self.count(|s| {
+            matches!(
+                s,
+                LogState::Connecting | LogState::Reconnecting { .. } | LogState::Waiting { .. }
+            )
+        })
     }
 
     /// Streams that ended on an error.

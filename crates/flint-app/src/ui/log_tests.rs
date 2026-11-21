@@ -1289,6 +1289,64 @@ fn menu_entries(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String>
     .unwrap()
 }
 
+// covers UP-40: a pod that cannot start says why, with no attempt counter, and the tab list says
+// what the tab says.
+#[gpui_kit::test]
+async fn a_waiting_tab_says_why_and_the_list_says_the_same(cx: &mut TestAppContext) {
+    use flint_core::logs::ContainerWait;
+
+    let waiting = |wait| LogState::Waiting { wait };
+    let cases = [
+        (
+            waiting(ContainerWait::Unscheduled),
+            "Pod isn't scheduled yet",
+            TabStatus::Retrying,
+        ),
+        (
+            waiting(ContainerWait::NotStarted(Some("ImagePullBackOff".into()))),
+            "Container hasn't started: ImagePullBackOff",
+            TabStatus::Retrying,
+        ),
+        (
+            waiting(ContainerWait::NotStarted(None)),
+            "Container hasn't started",
+            TabStatus::Retrying,
+        ),
+        (
+            LogState::Reconnecting {
+                error: None,
+                attempt: 4,
+                back_off: true,
+            },
+            crate::ui::log_model::BACK_OFF,
+            TabStatus::Retrying,
+        ),
+        (
+            LogState::Ended {
+                error: Some("Forbidden: pods \"web\" is forbidden".into()),
+                pod_deleted: false,
+            },
+            "Ended · no permission",
+            TabStatus::Failed,
+        ),
+    ];
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(100);
+    for (state, text, status) in cases {
+        feed(cx, &view, lines.snapshot(state, false, 0));
+        draw(cx, window);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.status_state().1, text);
+            assert_eq!(v.tab_status(), status);
+            assert_eq!(v.tab_status_text(), text);
+            let listed =
+                crate::ui::dock_model::list_label("Logs: web", "dev", &v.tab_status_text());
+            assert_eq!(listed, format!("Logs: web — dev · {text}"));
+        });
+    }
+}
+
 // covers UP-40: a long status (a crash loop's back-off, a reconnect's error) is cut inside its
 // slot, with an ellipsis, rather than clipped by the slot's edge.
 #[gpui_kit::test]

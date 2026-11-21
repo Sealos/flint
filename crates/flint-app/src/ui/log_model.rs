@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use flint_core::logs::ContainerWait;
 use flint_core::{
     LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogState, LogSubject, PodSet,
     PodSetStatus, SearchQuery, WorkloadTarget,
@@ -546,6 +547,11 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
                 None => "The container is in CrashLoopBackOff: the kubelet restarts it after a delay that grows with each crash.".to_owned(),
             }),
         },
+        LogState::Waiting { wait } => StatusText {
+            tone: Tone::Warning,
+            text: wait_text(wait),
+            tooltip: Some(WAITING_DETAIL.to_owned()),
+        },
         LogState::Reconnecting { error, attempt, .. } => match error {
             Some(e) => {
                 let (ex, tooltip) = explained(e);
@@ -598,6 +604,18 @@ pub fn gist(error: &str) -> String {
         format!("{}…", cut.trim_end())
     }
 }
+
+/// What a tab says while its container has not started.
+pub fn wait_text(wait: &ContainerWait) -> String {
+    match wait {
+        ContainerWait::Unscheduled => "Pod isn't scheduled yet".to_owned(),
+        ContainerWait::NotStarted(Some(reason)) => format!("Container hasn't started: {reason}"),
+        ContainerWait::NotStarted(None) => "Container hasn't started".to_owned(),
+    }
+}
+
+/// The rest of what a tab says while its container has not started.
+pub const WAITING_DETAIL: &str = "Flint keeps checking. Its logs appear here once it starts.";
 
 /// What a crash-looping container's tab says while the kubelet waits to restart it.
 pub const BACK_OFF: &str = "Waiting for the container to restart (back-off)";
