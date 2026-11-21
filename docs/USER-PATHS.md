@@ -275,8 +275,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-33 Use the app from the keyboard
 - **Then** I can move through clusters and lists with the arrow keys, open with Enter, and quit with Cmd-Q. Tab and
   Shift-Tab move focus between the panes: the cluster sidebar, the navigation, the list, the detail pane and the
-  dock's tab (a text field and a shell keep Tab for themselves). The pane with focus shows its cursor with the focus
-  ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
+  dock's tab (a text field and a shell keep Tab for themselves). The header's namespace and watch-mode buttons are not
+  Tab stops; they work by mouse and from the command palette. The namespace picker takes focus as it opens, Tab,
+  Shift-Tab and the arrows go round its controls, and Esc closes it and returns focus to its button; a dialog closes
+  it. The pane with focus shows its cursor with the focus ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
   navigation the arrows move over sections and kinds, Enter opens a kind (its list takes focus) or opens and closes a
   section, Right opens a section and Left closes it (from a kind, its own section). In a list, Cmd-F moves to its text
   filter, and Esc, Enter or Down there moves back to the rows, keeping the filter. With nothing selected, Down also

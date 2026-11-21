@@ -46,7 +46,8 @@ use super::super::registry::{
     ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{
-    CordonNode, DeleteObject, DrainNode, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
+    CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
+    OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
 };
 use super::super::registry::{EditAiScope, ShowAgentActivity};
 use super::super::registry::{
@@ -133,6 +134,16 @@ impl Workspace {
             if this.cluster.is_some() {
                 this.set_namespace_filter(Vec::new(), cx)
             }
+        })
+        .bind::<OpenNamespaceFilter>(|this, _, _, cx| {
+            this.namespace_popover_open = true;
+            cx.notify();
+        })
+        .bind::<NamespacePickerNext>(|this, _, window, cx| {
+            this.move_in_namespace_picker(true, window, cx)
+        })
+        .bind::<NamespacePickerPrevious>(|this, _, window, cx| {
+            this.move_in_namespace_picker(false, window, cx)
         })
         .bind::<SetPaneWidth>(Self::set_pane_width)
         .bind::<OpenSelectorLogs>(Self::open_selector_logs)
@@ -234,6 +245,9 @@ impl Workspace {
                 |_, a, _| check_name::<AddNamespace>(&a.namespace),
             )
             .when::<ShowAllNamespaces>(|ws, _| ws.cluster.is_some())
+            .when::<OpenNamespaceFilter>(|ws, cx| ws.namespace_filter_shown(cx))
+            .when::<NamespacePickerNext>(|ws, _| ws.namespace_popover_open)
+            .when::<NamespacePickerPrevious>(|ws, _| ws.namespace_popover_open)
             .add::<SetPaneWidth>(|_, _| true, |ws, a, _| ws.check_pane_width(a))
             .add::<ToggleNavSection>(
                 |ws, cx| ws.nav.read(cx).has_sections(),
@@ -654,6 +668,24 @@ impl Workspace {
     /// Gives focus back after it left with a closed view (or a hidden dock): to the open list,
     /// or the workspace.
     pub(super) fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The picker's focused row left it (a namespace unchecked and not listed): it keeps focus,
+        // and hands it to its first control as it draws. After this draw, since a focus change
+        // during one schedules no frame.
+        if self.namespace_popover_open && self.namespace_filter_shown(cx) {
+            let lost = window.focused(cx);
+            cx.defer_in(window, move |this, window, cx| {
+                if window.focused(cx) != lost {
+                    return;
+                }
+                if this.namespace_popover_open {
+                    window.focus(&this.namespace_picker_focus, cx);
+                    release_unfocused_input(window, cx);
+                } else {
+                    this.reclaim_focus(window, cx);
+                }
+            });
+            return;
+        }
         let focus = match &self.list {
             Some(list) => list.read(cx).focus_handle().clone(),
             None => self.focus.clone(),
