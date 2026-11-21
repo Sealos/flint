@@ -466,10 +466,21 @@ impl FakeApiServer {
         panic!("the fake API server does not serve {gvr}{hint}");
     }
 
-    /// The listable resource with this plural (`"deployments"` is `apps/v1/deployments`; for
-    /// a plural in several groups the core group wins). Panics if there is none.
+    /// The listable resource with this plural, as this server's discovery lists it (`"deployments"`
+    /// is `apps/v1/deployments`; a hidden version gives way to the next one, and for a plural in
+    /// several groups the core group wins). Panics if there is none.
     pub fn gvr(&self, plural: &str) -> Gvr {
         let resources = &self.inner.fixtures.resources;
+        let hidden = &self.inner.options.hidden;
+        let served = resources
+            .iter()
+            .filter(|r| r.gvr.resource == plural && r.supports("list"))
+            .filter(|r| !hidden.contains(&r.gvr))
+            .min_by_key(|r| (!r.preferred, !r.gvr.group.is_empty()));
+        if let Some(r) = served {
+            return r.gvr.clone();
+        }
+        // Nothing left: name the hidden one, else suggest what was meant.
         match resources.by_plural(plural) {
             Some(r) => {
                 self.require(&r.gvr);
@@ -1094,12 +1105,13 @@ fn respond(
             "application/json",
             &variants::openapi_index(fixtures, &inner.options.hidden),
         )),
-        Route::OpenApiDocument(path) => fixtures
-            .openapi
-            .get(path)
-            .filter(|_| !variants::openapi_hidden(fixtures, &inner.options.hidden, path))
-            .map(|d| json_with(200, "application/json", d))
-            .ok_or_else(|| ApiError::not_found(format!("OpenAPI document {path} is not recorded"))),
+        Route::OpenApiDocument(path) => {
+            variants::openapi_document(fixtures, &inner.options.hidden, path)
+                .map(|d| json_with(200, "application/json", &d))
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("OpenAPI document {path} is not recorded"))
+                })
+        }
         Route::Collection { gvr, namespace } => {
             known(inner, gvr, namespace.as_deref()).and_then(|resource| {
                 let ns = namespace.as_deref();

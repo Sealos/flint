@@ -149,6 +149,7 @@ impl Encoder {
         row: &FakeRow,
         object: Option<&Value>,
     ) -> Bytes {
+        let mut columns = Value::Null;
         let mut object = if self.plain {
             object
                 .cloned()
@@ -162,9 +163,10 @@ impl Encoder {
                 !self.sent_columns,
             );
             self.sent_columns = true;
+            columns = state.columns(&self.gvr);
             table
         };
-        clock.rebase(&mut object);
+        clock.rebase_with_columns(&mut object, &columns);
         Encoder::line(ty, object)
     }
 

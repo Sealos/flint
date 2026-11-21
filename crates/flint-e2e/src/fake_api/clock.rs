@@ -181,8 +181,14 @@ impl Clock {
     /// Shifts every timestamp in a response from fixture time to the server's time, and renders
     /// `Age` cells of a Table from the rows' creation times.
     pub fn rebase(&self, value: &mut Value) {
+        self.rebase_with_columns(value, &Value::Null);
+    }
+
+    /// [`Clock::rebase`] for a Table whose own `columnDefinitions` may be omitted (later watch
+    /// events carry `null`): `columns` locates the `Age` column then, and the wire format stays.
+    pub fn rebase_with_columns(&self, value: &mut Value, columns: &Value) {
         map_timestamps(value, &|s| s + self.shift);
-        self.render_ages(value);
+        self.render_ages(value, columns);
         self.render_restarts(value);
     }
 
@@ -217,10 +223,11 @@ impl Clock {
         }
     }
 
-    fn render_ages(&self, value: &mut Value) {
+    fn render_ages(&self, value: &mut Value, fallback: &Value) {
         let age = value
             .get("columnDefinitions")
             .and_then(Value::as_array)
+            .or_else(|| fallback.as_array())
             .and_then(|c| c.iter().position(|c| c["name"] == "Age"));
         let (Some(age), Some(rows)) = (age, value.get_mut("rows").and_then(Value::as_array_mut))
         else {

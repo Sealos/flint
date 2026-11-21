@@ -105,6 +105,86 @@ pub(super) fn openapi_hidden(fixtures: &Fixtures, hidden: &[Gvr], path: &str) ->
     served.peek().is_some() && served.all(|r| hidden.contains(&r.gvr))
 }
 
+/// The OpenAPI document at `path` as this server serves it: without the paths of hidden
+/// resources, and without the schemas only those paths used (shared ones stay). `None` when
+/// the document is not recorded or [`openapi_hidden`].
+pub(super) fn openapi_document(fixtures: &Fixtures, hidden: &[Gvr], path: &str) -> Option<Value> {
+    let mut document = fixtures.openapi.get(path)?.clone();
+    if openapi_hidden(fixtures, hidden, path) {
+        return None;
+    }
+    let prefix = format!("/{path}/");
+    let hidden_plurals: Vec<&str> = hidden
+        .iter()
+        .filter(|g| {
+            let base = if g.group.is_empty() {
+                format!("/api/{}/", g.version)
+            } else {
+                format!("/apis/{}/{}/", g.group, g.version)
+            };
+            base == prefix
+        })
+        .map(|g| g.resource.as_str())
+        .collect();
+    if hidden_plurals.is_empty() {
+        return Some(document);
+    }
+    let paths = document.get_mut("paths").and_then(Value::as_object_mut)?;
+    paths.retain(|p, _| {
+        let rest: Vec<&str> = p.strip_prefix(&prefix).unwrap_or("").split('/').collect();
+        let mut rest = rest.as_slice();
+        if let ["watch", tail @ ..] = rest {
+            rest = tail;
+        }
+        if let ["namespaces", "{namespace}", tail @ ..] = rest {
+            if !tail.is_empty() {
+                rest = tail;
+            }
+        }
+        !rest.first().is_some_and(|r| hidden_plurals.contains(r))
+    });
+    prune_schemas(&mut document);
+    Some(document)
+}
+
+/// Drops the `components.schemas` no remaining path reaches through `$ref`.
+fn prune_schemas(document: &mut Value) {
+    fn refs(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, v) in map {
+                    match (key.as_str(), v.as_str()) {
+                        ("$ref", Some(target)) => {
+                            if let Some(name) = target.strip_prefix("#/components/schemas/") {
+                                found.push(name.to_owned());
+                            }
+                        }
+                        _ => refs(v, found),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|v| refs(v, found)),
+            _ => {}
+        }
+    }
+    let mut pending = Vec::new();
+    refs(&document["paths"], &mut pending);
+    let mut keep = std::collections::BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if keep.insert(name.clone()) {
+            if let Some(schema) = document.pointer(&format!("/components/schemas/{name}")) {
+                refs(schema, &mut pending);
+            }
+        }
+    }
+    if let Some(schemas) = document
+        .pointer_mut("/components/schemas")
+        .and_then(Value::as_object_mut)
+    {
+        schemas.retain(|name, _| keep.contains(name));
+    }
+}
+
 /// The OpenAPI index without the documents [`openapi_hidden`] removes.
 pub(super) fn openapi_index(fixtures: &Fixtures, hidden: &[Gvr]) -> Value {
     let mut index = fixtures.openapi_index.clone();
@@ -435,5 +515,110 @@ mod tests {
         server.resume_clock();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(server.inner.clock.now() > now, "running again");
+    }
+
+    #[tokio::test]
+    async fn gvr_skips_a_hidden_preferred_version() {
+        let hpa_v2 = Gvr::new("autoscaling", "v2", "horizontalpodautoscalers");
+        let plain = FakeApiServer::start().await.unwrap();
+        assert_eq!(plain.gvr("horizontalpodautoscalers"), hpa_v2);
+        let server = hiding(vec![hpa_v2.clone()]).await;
+        let gvr = server.gvr("horizontalpodautoscalers");
+        assert_eq!(gvr.version, "v1");
+        let client = server.unrestricted_client().await.unwrap();
+        assert_eq!(get_code(&client, &gvr.collection_path(None)).await, 200);
+        assert_eq!(get_code(&client, &hpa_v2.collection_path(None)).await, 404);
+    }
+
+    #[tokio::test]
+    async fn a_table_watch_event_after_the_clock_moves_shows_the_advanced_age() {
+        use futures::{AsyncBufReadExt as _, TryStreamExt as _};
+
+        let server = FakeApiServer::start().await.unwrap();
+        let client = server.unrestricted_client().await.unwrap();
+        let namespaces = Gvr::core("namespaces");
+        let age = server.column(&namespaces, "Age").unwrap();
+        let row = server.row(&namespaces, None, "demo").unwrap();
+        let created =
+            server.object(&namespaces, None, "demo").unwrap()["metadata"]["creationTimestamp"]
+                .as_str()
+                .and_then(clock::parse)
+                .unwrap()
+                .0;
+        server.freeze_clock();
+        let request = http::Request::get("/api/v1/namespaces?watch=1&resourceVersion=1000")
+            .header(http::header::ACCEPT, TABLE)
+            .body(Vec::new())
+            .unwrap();
+        let body = client.request_stream(request).await.unwrap();
+        let reader = tokio::spawn(async move {
+            Box::pin(body)
+                .lines()
+                .map_ok(|l| serde_json::from_str::<Value>(&l).unwrap())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        });
+        server
+            .wait_for_watches(&namespaces, 1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        server.send_watch(&namespaces, WatchStep::Added(row.clone()));
+        let advance: i64 = 30 * 86_400;
+        server.advance_clock(Duration::from_secs(advance.unsigned_abs()));
+        server.send_watch(&namespaces, WatchStep::Modified(row));
+        server.send_watch(&namespaces, WatchStep::End);
+        let events = reader.await.unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let ages: Vec<_> = events
+            .iter()
+            .map(|e| e["object"]["rows"][0]["cells"][age].clone())
+            .collect();
+        let at_start = server.inner.clock.start().as_second();
+        assert_eq!(
+            ages[0],
+            flint_core::table::human_duration(at_start - created)
+        );
+        assert_eq!(
+            ages[1],
+            flint_core::table::human_duration(at_start + advance - created)
+        );
+        assert!(events[0]["object"]["columnDefinitions"].is_array());
+        assert!(events[1]["object"]["columnDefinitions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn hiding_one_resource_drops_its_openapi_paths_and_keeps_shared_schemas() {
+        let fixtures = Fixtures::shared_default().unwrap();
+        let full = &fixtures.openapi["apis/apps/v1"];
+        let server = hiding(vec![Gvr::new("apps", "v1", "deployments")]).await;
+        let client = server.unrestricted_client().await.unwrap();
+        let doc = get(&client, "/openapi/v3/apis/apps/v1", "application/json")
+            .await
+            .unwrap();
+        let paths: Vec<&String> = doc["paths"].as_object().unwrap().keys().collect();
+        assert!(
+            paths.iter().all(|p| !p.contains("/deployments")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("/statefulsets")),
+            "{paths:?}"
+        );
+        let schemas = doc["components"]["schemas"].as_object().unwrap();
+        assert!(!schemas.contains_key("io.k8s.api.apps.v1.Deployment"));
+        assert!(schemas.contains_key("io.k8s.api.apps.v1.StatefulSet"));
+        // Schemas the remaining resources share are still there.
+        assert!(schemas.contains_key("io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"));
+        for (name, schema) in schemas {
+            assert_eq!(schema, &full["components"]["schemas"][name], "{name}");
+        }
+        // Another server is untouched.
+        let other = FakeApiServer::start().await.unwrap();
+        let client = other.unrestricted_client().await.unwrap();
+        let doc = get(&client, "/openapi/v3/apis/apps/v1", "application/json")
+            .await
+            .unwrap();
+        assert_eq!(&doc, full);
     }
 }
