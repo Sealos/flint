@@ -847,17 +847,32 @@ async fn put_object(
     Ok(rebased(inner, stored))
 }
 
-/// What a replacement cannot change or clear: the fields the API server owns, from `current`,
-/// and the namespace of the request's path. Labels, annotations and the rest are the body's.
+/// The metadata only the API server sets: a replacement can neither change nor clear it.
+const SERVER_METADATA: [&str; 6] = [
+    "uid",
+    "creationTimestamp",
+    "resourceVersion",
+    "generation",
+    "deletionTimestamp",
+    "deletionGracePeriodSeconds",
+];
+
+/// What a replacement cannot change or clear: the fields the API server owns, from `current`
+/// (`generation` goes up with a new `spec`), and the namespace of the request's path. Labels,
+/// annotations and the rest are the body's.
 fn keep_server_metadata(object: &mut Value, current: &Value, namespace: Option<&str>) {
+    let spec_changed = object.get("spec") != current.get("spec");
     let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) else {
         return;
     };
-    for field in ["uid", "creationTimestamp", "resourceVersion"] {
+    for field in SERVER_METADATA {
         match current.pointer(&format!("/metadata/{field}")) {
             Some(live) => meta.insert(field.into(), live.clone()),
             None => meta.remove(field),
         };
+    }
+    if spec_changed && let Some(generation) = meta.get("generation").and_then(Value::as_i64) {
+        meta.insert("generation".into(), (generation + 1).into());
     }
     if let Some(namespace) = namespace {
         meta.insert("namespace".into(), namespace.into());
