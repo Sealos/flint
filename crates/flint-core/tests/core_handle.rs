@@ -351,6 +351,13 @@ async fn events_nobody_reads_stay_bounded() {
 }
 
 /// The generation of each context in the latest list `events` holds, draining it.
+/// Reloads kubeconfig and waits for it, without reading the events under test.
+async fn reload(core: &CoreHandle) {
+    tokio::time::timeout(Duration::from_secs(30), core.reload_kubeconfig())
+        .await
+        .expect("the reload is acknowledged");
+}
+
 async fn latest_generations(events: &flint_core::events::Events) -> Vec<(String, u64)> {
     let mut latest = Vec::new();
     while !events.is_empty() {
@@ -377,7 +384,7 @@ async fn a_context_that_starts_over_has_a_new_generation() {
         kubeconfig(&["one", "two", "three"]),
     )
     .unwrap();
-    let core = start(dir.path(), true);
+    let core = start(dir.path(), false);
     let events = core.events();
     let first = loop {
         if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
@@ -388,7 +395,6 @@ async fn a_context_that_starts_over_has_a_new_generation() {
                 .collect::<Vec<_>>();
         }
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
     let elsewhere = kubeconfig(&["one", "two", "three"]).replace("127.0.0.1:1", "127.0.0.1:2");
     for text in [
         elsewhere,
@@ -396,7 +402,7 @@ async fn a_context_that_starts_over_has_a_new_generation() {
         kubeconfig(&["one", "two", "three"]),
     ] {
         std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        reload(&core).await;
     }
     let last = latest_generations(&events).await;
     let of = |list: &[(String, u64)], name: &str| {
@@ -419,7 +425,7 @@ async fn a_context_that_starts_over_has_a_new_generation() {
 async fn the_only_context_removed_and_added_back_starts_over() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("kubeconfig"), kubeconfig(&["one"])).unwrap();
-    let core = start(dir.path(), true);
+    let core = start(dir.path(), false);
     let events = core.events();
     let mut first = None;
     while first.is_none() {
@@ -427,10 +433,9 @@ async fn the_only_context_removed_and_added_back_starts_over() {
             first = snapshot.clusters.first().map(|c| c.generation);
         }
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
     for text in [kubeconfig(&[]), kubeconfig(&["one"])] {
         std::fs::write(dir.path().join("kubeconfig"), text).unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        reload(&core).await;
     }
     let last = latest_generations(&events).await;
     assert_eq!(last.len(), 1);

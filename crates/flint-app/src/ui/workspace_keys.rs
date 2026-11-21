@@ -365,6 +365,7 @@ impl Workspace {
                 .as_deref()
                 .map(|c| SharedString::from(display::short_name(c).to_string())),
             cluster_id,
+            generation: summary.map(|s| s.generation),
             index: Index::new(&entries, &[]),
             loading: self.cluster.is_some() && !entries.is_empty(),
             discovery_failed,
