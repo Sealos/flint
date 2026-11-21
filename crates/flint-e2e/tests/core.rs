@@ -628,6 +628,7 @@ async fn a_pod_log_streams_resumes_without_repeats_and_ends_with_its_pod() {
     assert_eq!(
         ended.state,
         LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         }
@@ -686,6 +687,7 @@ async fn a_terminating_pod_keeps_its_log_until_its_container_stops() {
     assert_eq!(
         ended.state,
         LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         }
@@ -737,6 +739,7 @@ async fn a_pod_gone_before_its_status_caught_up_ends_as_deleted() {
     assert_eq!(
         ended.state,
         LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         }

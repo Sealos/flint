@@ -639,6 +639,7 @@ async fn a_deleted_pods_log_tab_does_not_reconnect(cx: &mut TestAppContext) {
         view.stop_streaming();
         let snapshot = flint_core::LogSnapshot {
             state: flint_core::LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             },

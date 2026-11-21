@@ -236,7 +236,7 @@ async fn follows_a_chatty_pod_within_the_buffer_and_across_cluster_switches() {
         };
         let mut short = core.handle.open_logs(&first, target, tail);
         let done = until(&mut short, 30, |s| matches!(s.state, LogState::Ended { .. })).await;
-        assert_eq!(done.state, LogState::Ended { error: None, pod_deleted: false });
+        assert_eq!(done.state, LogState::Ended { hop: Default::default(), error: None, pod_deleted: false });
         assert_eq!(done.lines.len(), 5);
         assert!(done.lines.iter().all(|(_, l)| l.text.contains("tick")));
     })
@@ -297,6 +297,7 @@ async fn picks_a_container_and_reads_the_previous_instance() {
         assert_eq!(
             done.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }

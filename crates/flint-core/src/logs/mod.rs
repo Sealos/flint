@@ -29,8 +29,8 @@ pub use pods::{Freshness, PodSet, WorkloadKind, WorkloadPod, WorkloadTarget};
 pub use search::{LogSearch, SearchMatcher, SearchQuery};
 pub use selection::LineSelection;
 pub use session::{
-    ContainerWait, LogOptions, LogSince, LogSnapshot, LogState, LogSubject, LogTarget, MAX_STREAMS,
-    PREVIOUS_NOT_AVAILABLE,
+    ContainerWait, FailedHop, LogOptions, LogSince, LogSnapshot, LogState, LogSubject, LogTarget,
+    MAX_STREAMS, NETWORK_FAILURES, PREVIOUS_NOT_AVAILABLE,
 };
 pub use workload::{PodSetStatus, StreamStatus};
 
