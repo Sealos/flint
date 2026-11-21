@@ -41,10 +41,10 @@ fn log_view(cx: &mut TestAppContext, t: &TestWorkspace, id: u64) -> Entity<LogVi
     view
 }
 
-/// Opens a shell tab on `alpha` over a fake session, focused. Returns its id.
+/// Opens a shell tab on `kind-alpha` over a fake session, focused. Returns its id.
 fn open_shell(cx: &mut TestAppContext, t: &TestWorkspace) -> (u64, FakeExec) {
     let request = ShellRequest {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         namespace: "demo".into(),
         pod: "web".into(),
         container: Some("app".into()),
@@ -57,7 +57,7 @@ fn open_shell(cx: &mut TestAppContext, t: &TestWorkspace) -> (u64, FakeExec) {
             dock.update(cx, |dock, cx| {
                 dock.open(
                     TabKey::Shell(request.clone()),
-                    TabCluster::new("alpha", Some(&server)),
+                    TabCluster::new("kind-alpha", Some(&server)),
                     move |window, cx| {
                         DockTab::Shell(cx.new(|cx| TerminalView::new(session, request, window, cx)))
                     },
@@ -87,7 +87,7 @@ fn tab(state: &Value, id: u64) -> &Value {
 async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     let s = state(cx, &t);
     assert_eq!(
@@ -154,7 +154,7 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     );
     assert_eq!(
         log["cluster"],
-        json!({"context": "alpha", "server": t.server, "chip": "alpha",
+        json!({"context": "kind-alpha", "server": t.server, "chip": "kind-alpha",
                "repointed": false, "removed": false})
     );
     assert_eq!(log["shell"], Value::Null);
@@ -293,8 +293,8 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     assert_eq!(
         labels,
         [
-            "web · app — alpha · Streaming",
-            "Shell: web · app — alpha · live"
+            "web · app — kind-alpha · Streaming",
+            "Shell: web · app — kind-alpha · live"
         ]
     );
     // The shown tab is checked.

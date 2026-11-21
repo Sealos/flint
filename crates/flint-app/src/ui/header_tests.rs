@@ -69,7 +69,7 @@ async fn the_namespace_filter_narrows_the_list_and_is_remembered(cx: &mut TestAp
     wait_for_rows(cx, &t, 3).await;
     t.wait_for_label(cx, "namespace-filter-button", "2 namespaces")
         .await;
-    assert_eq!(filter(cx, &t, "alpha"), ["data", "demo"]);
+    assert_eq!(filter(cx, &t, "kind-alpha"), ["data", "demo"]);
 
     // The popover: "All namespaces" is a checkbox, a name typed in its field is added with
     // Enter, and each filtered namespace has a checkbox.
@@ -77,25 +77,25 @@ async fn the_namespace_filter_narrows_the_list_and_is_remembered(cx: &mut TestAp
     t.wait_for_element(cx, "ns-all").await;
     t.click(cx, "ns-all");
     wait_for_rows(cx, &t, 4).await;
-    assert!(filter(cx, &t, "alpha").is_empty());
+    assert!(filter(cx, &t, "kind-alpha").is_empty());
     for namespace in ["kube-system", "demo"] {
         t.click(cx, "ns-add");
         t.type_text(cx, namespace);
         t.press(cx, "enter");
     }
     wait_for_rows(cx, &t, 3).await;
-    assert_eq!(filter(cx, &t, "alpha"), ["demo", "kube-system"]);
+    assert_eq!(filter(cx, &t, "kind-alpha"), ["demo", "kube-system"]);
     assert_eq!(t.find(cx, "ns-kube-system").unwrap().checked(), Some(true));
     t.click(cx, "ns-kube-system");
     wait_for_rows(cx, &t, 2).await;
-    assert_eq!(filter(cx, &t, "alpha"), ["demo"]);
+    assert_eq!(filter(cx, &t, "kind-alpha"), ["demo"]);
     t.press(cx, "escape");
 
-    // Remembered per cluster: beta has its own (none; as its connection failed, its header has no
-    // filter), and alpha gets its own back, shown
+    // Remembered per cluster: kind-beta has its own (none; as its connection failed, its header has no
+    // filter), and kind-alpha gets its own back, shown
     // as soon as the list reopens, before any rows arrive.
-    t.activate(cx, "beta").await;
-    assert!(filter(cx, &t, "beta").is_empty());
+    t.activate(cx, "kind-beta").await;
+    assert!(filter(cx, &t, "kind-beta").is_empty());
     t.connect_alpha(cx, standard_sections()).await;
     assert_eq!(t.row_count(cx), 0);
     assert_eq!(
@@ -107,8 +107,8 @@ async fn the_namespace_filter_narrows_the_list_and_is_remembered(cx: &mut TestAp
     // And in state.toml, for the next launch.
     cx.run_until_parked();
     let saved = UiState::load(dir.path().to_owned());
-    assert_eq!(saved.namespace_filter("alpha"), ["demo"]);
-    assert!(saved.namespace_filter("beta").is_empty());
+    assert_eq!(saved.namespace_filter("kind-alpha"), ["demo"]);
+    assert!(saved.namespace_filter("kind-beta").is_empty());
 
     // Blank names are refused; ShowAllNamespaces clears the filter.
     assert!(matches!(
@@ -157,7 +157,7 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
     assert!(!available.contains(&"workspace::WatchOpenViewsOnly"));
     assert!(available.contains(&"workspace::DefaultWatchOpenViewsOnly"));
 
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     assert_eq!(
         t.label(cx, "watch-mode").as_deref(),
         Some("Live: all kinds")
@@ -186,18 +186,21 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
         .await;
     let settings = t.model.read_with(cx, |m, _| m.settings.clone());
     assert_eq!(
-        settings.cluster_watch_mode.get("alpha"),
+        settings.cluster_watch_mode.get("kind-alpha"),
         Some(&WatchMode::OnView)
     );
     assert_eq!(settings.watch_mode, WatchMode::All);
     let toml = t.settings_toml();
-    assert!(toml.contains("alpha") && toml.contains("on_view"), "{toml}");
+    assert!(
+        toml.contains("kind-alpha") && toml.contains("on_view"),
+        "{toml}"
+    );
     // And back to all kinds, for this cluster only.
     t.dispatch(cx, "workspace::WatchAllKinds", Value::Null)
         .unwrap();
     t.wait_for_label(cx, "watch-mode", "Live: all kinds").await;
     let own = t.model.read_with(cx, |m, _| {
-        m.settings.cluster_watch_mode.get("alpha").copied()
+        m.settings.cluster_watch_mode.get("kind-alpha").copied()
     });
     assert_eq!(own, Some(WatchMode::All));
     t.dispatch(cx, "workspace::WatchOpenViewsOnly", Value::Null)
@@ -207,8 +210,8 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
 
     // On a failed cluster nothing is watched, so its header has no switch; the default can still
     // be changed from there.
-    t.activate(cx, "beta").await;
-    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+    t.activate(cx, "kind-beta").await;
+    t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
     assert!(t.find(cx, "watch-mode").is_none());
     t.dispatch(cx, "workspace::DefaultWatchOpenViewsOnly", Value::Null)
@@ -219,9 +222,9 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
     })
     .await;
 
-    // Back on alpha, drop its own mode: it follows the default (open views only), and the
+    // Back on kind-alpha, drop its own mode: it follows the default (open views only), and the
     // default back to all kinds takes it along.
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     t.dispatch(cx, "workspace::UseDefaultWatchMode", Value::Null)
         .unwrap();
     let model = t.model.clone();
@@ -230,7 +233,7 @@ async fn the_watch_mode_follows_the_menu_and_persists(cx: &mut TestAppContext) {
             .read(cx)
             .settings
             .cluster_watch_mode
-            .contains_key("alpha")
+            .contains_key("kind-alpha")
     })
     .await;
     t.dispatch(cx, "workspace::DefaultWatchAllKinds", Value::Null)

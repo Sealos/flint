@@ -256,14 +256,14 @@ async fn actions_with_arguments_ask_for_them(cx: &mut TestAppContext) {
     assert_eq!(palette.step.as_deref(), Some("Select Cluster…"));
     assert_eq!(palette.argument.as_deref(), Some("cluster"));
     assert_eq!(palette.query, "", "the field is cleared for the argument");
-    assert_eq!(labels(&palette), ["alpha", "beta"]);
+    assert_eq!(labels(&palette), ["kind-alpha", "kind-beta"]);
     t.type_text(cx, "bet");
-    assert_eq!(labels(&shown(cx, &t)), ["beta"]);
+    assert_eq!(labels(&shown(cx, &t)), ["kind-beta"]);
     t.press(cx, "enter");
     assert!(palette_closed(cx, &t));
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).shown_cluster() == Some("beta")
+        workspace.read(cx).shown_cluster() == Some("kind-beta")
     })
     .await;
 
@@ -367,7 +367,7 @@ async fn a_refusal_stays_in_the_palette(cx: &mut TestAppContext) {
     open_palette(cx, &t).await;
     t.type_text(cx, "hide cluster from ai");
     t.press(cx, "enter");
-    t.type_text(cx, "alpha");
+    t.type_text(cx, "kind-alpha");
     t.press(cx, "enter");
     let palette = shown(cx, &t);
     assert_eq!(
@@ -794,7 +794,7 @@ async fn typed_text_comes_before_listed_values(cx: &mut TestAppContext) {
     assert!(palette_closed(cx, &t));
     let filter = t
         .workspace
-        .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()));
+        .read_with(cx, |ws, _| ws.namespace_filter_of(&"kind-alpha".into()));
     assert_eq!(filter, ["kube-system"]);
 }
 
@@ -804,7 +804,7 @@ async fn an_empty_pick_list_says_so(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     // Alpha never answers, so discovery never finishes: no kinds yet.
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     open_palette(cx, &t).await;
     t.type_text(cx, "open kind");
     t.press(cx, "enter");
@@ -1013,7 +1013,7 @@ async fn an_exact_match_comes_first(cx: &mut TestAppContext) {
     assert!(palette_closed(cx, &t));
     let filter = t
         .workspace
-        .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()));
+        .read_with(cx, |ws, _| ws.namespace_filter_of(&"kind-alpha".into()));
     assert_eq!(filter, ["abc"]);
 }
 
@@ -1030,7 +1030,7 @@ async fn a_click_keeps_typing_in_the_field(cx: &mut TestAppContext) {
     assert_eq!(palette.unwrap().argument.as_deref(), Some("cluster"));
     assert_eq!(focus, Focus::Palette);
     t.type_text(cx, "bet");
-    assert_eq!(labels(&shown(cx, &t)), ["beta"]);
+    assert_eq!(labels(&shown(cx, &t)), ["kind-beta"]);
 }
 
 // A refusal at the last step keeps the earlier picks, so Enter again retries with them.
@@ -1049,7 +1049,7 @@ async fn a_refusal_keeps_the_earlier_picks(cx: &mut TestAppContext) {
     t.feed(
         cx,
         Event::ConnectionChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             state: ConnectionState::Disconnected,
         },
     );
@@ -1066,7 +1066,7 @@ async fn a_refusal_keeps_the_earlier_picks(cx: &mut TestAppContext) {
     t.feed(
         cx,
         Event::ConnectionChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             state: ConnectionState::Connected(ServerVersion {
                 git_version: "v1.33.1".into(),
                 platform: "linux/arm64".into(),
@@ -1308,7 +1308,7 @@ async fn an_open_step_follows_its_data(cx: &mut TestAppContext) {
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     let palette = ask(cx, &t, "open kind").await;
     assert_eq!(
         palette.footer.as_deref(),
@@ -1318,7 +1318,7 @@ async fn an_open_step_follows_its_data(cx: &mut TestAppContext) {
     t.feed(
         cx,
         Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(Arc::new(crate::ui::support_tests::discovery(
                 crate::ui::support_tests::standard_sections(),
@@ -1420,7 +1420,7 @@ async fn a_refresh_selects_an_exact_match_that_arrives(cx: &mut TestAppContext) 
     t.feed(
         cx,
         Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(Arc::new(discovery(vec![section(
                 "Custom",
@@ -1462,18 +1462,25 @@ async fn a_click_on_replaced_rows_is_dropped(cx: &mut TestAppContext) {
         .read_with(cx, |p, _| p.rows_version);
     // A namespace appears above the one about to be clicked.
     t.workspace.update(cx, |ws, cx| {
-        ws.set_namespaces_for_tests(vec!["alpha".into(), "demo".into(), "kube-system".into()]);
+        ws.set_namespaces_for_tests(vec![
+            "kind-alpha".into(),
+            "demo".into(),
+            "kube-system".into(),
+        ]);
         cx.notify();
     });
     cx.run_until_parked();
-    assert_eq!(labels(&shown(cx, &t)), ["alpha", "demo", "kube-system"]);
+    assert_eq!(
+        labels(&shown(cx, &t)),
+        ["kind-alpha", "demo", "kube-system"]
+    );
     // The click on `kube-system` (row 1 when drawn) arrives now: dropped.
     t.dispatch(cx, "palette::PalettePick", json!({"row": 1, "rows": drawn}))
         .unwrap();
     assert!(palette(cx, &t).is_some(), "nothing ran");
     let filter = |cx: &mut TestAppContext| {
         t.workspace
-            .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()))
+            .read_with(cx, |ws, _| ws.namespace_filter_of(&"kind-alpha".into()))
     };
     assert!(filter(cx).is_empty());
     // On the rows shown, row 2 is `kube-system`.

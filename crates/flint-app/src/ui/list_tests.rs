@@ -1262,7 +1262,7 @@ async fn a_closed_list_is_released(cx: &mut TestAppContext) {
 
     // Closed by a cluster switch.
     let (services_list, services_filter) = filtering(cx);
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     cx.run_until_parked();
     assert!(t.list(cx).is_none());
     services_list.assert_released();
@@ -1296,7 +1296,7 @@ async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppCon
     cx.update_window(t.window, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             let request = LogRequest {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 subject: LogSubject::Pod(LogTarget {
                     namespace: "demo".into(),
                     pod: "api".into(),
@@ -1309,13 +1309,16 @@ async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppCon
         // The core reports the switch (as after SelectCluster) in the same update, before
         // anything is drawn.
         t.model.update(cx, |m, cx| {
-            m.feed(flint_core::Event::ActiveChanged(Some("beta".into())), cx)
+            m.feed(
+                flint_core::Event::ActiveChanged(Some("kind-beta".into())),
+                cx,
+            )
         });
     })
     .unwrap();
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, crate::ui::support_tests::WAIT, move |_, cx| {
-        workspace.read(cx).shown_cluster() == Some("beta")
+        workspace.read(cx).shown_cluster() == Some("kind-beta")
     })
     .await;
     cx.run_until_parked();

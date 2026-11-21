@@ -190,20 +190,21 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   members' per-namespace aggregates, keyed by the namespace name; every other list keeps one row per object.
 - **Protection (#81):** every cluster is protected (read-only in Flint) by default
   ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)), except:
-  - clusters on the user's machine: an API server at `localhost` (or a name under `.localhost`), a loopback address
-    (`127.0.0.0/8`, `::1`) or Docker Desktop's `kubernetes.docker.internal`, as the kubeconfig says it, never
-    resolved (`protection::is_local_server`), and only when the cluster entry has no `proxy-url` (behind a proxy
-    a loopback address leads wherever the proxy sends it). That covers kind, Docker Desktop, OrbStack and minikube
-    on macOS; a local cluster served on another address, such as minikube's Docker driver on Linux
-    (`192.168.49.2`, a bridge address), stays protected and is trusted once. `protect_local_clusters = true` in
-    `settings.toml` protects them too, for a local address that is a tunnel to a remote cluster;
+  - known local clusters: a context named exactly `kind`, `minikube`, `docker-desktop` or `orbstack`, or
+    `kind-<name>` (`protection::is_known_local_context`, case-sensitive), whose API server is at `localhost` (or a
+    name under `.localhost`), a loopback address (`127.0.0.0/8`, `::1`) or Docker Desktop's
+    `kubernetes.docker.internal`, as the kubeconfig says it, never resolved (`protection::is_local_server`), and
+    only when the cluster entry has no `proxy-url`. Any other context on those addresses takes Unlock or Trust like
+    any other cluster. So does a local cluster served on another address, such as minikube's Docker driver on Linux
+    (`192.168.49.2`, a bridge address). `protect_local_clusters = true` in `settings.toml` protects the known local
+    clusters too;
   - clusters in `trusted_clusters` in `settings.toml`, pinned to the context and API server URL like AI exposure
     (`settings::ClusterPin`), so a re-pointed context is protected again;
   - clusters unlocked for this session (`protection::SessionUnlocks`): one confirmation naming the context and its
     server, pinned to that server, until Flint quits or Lock Again. Nothing is written to disk.
 - **A `settings.toml` that does not parse** (or a symlink to one that is gone, which is not a fresh install, and
   whose target is watched so restoring it reloads) opens nothing up (`Settings::unreadable_fallback`), at launch and on a
-  reload alike: nothing is exposed or trusted, and clusters on this machine are protected too, since the file may
+  reload alike: nothing is exposed or trusted, and known local clusters are protected too, since the file may
   have asked for that. The sidebar's banner says so. Unknown keys are ignored so newer files load; one within two
   edits of a known key (`protect_local_cluster`) is named in the log, since it would otherwise fail open silently.
 - **One gate in the core.** Every action that changes a cluster or runs code in it gets its client from the cluster
@@ -222,7 +223,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   menu offers the removal again while a pin is on disk. Trust goes through
   `Command::SetTrusted`, which, like exposure, writes nothing if the context moved since the user confirmed. `flint mcp` stays read-only either way.
 - **In the app.** The sidebar shows a lock button per cluster (`lock-<context>`): a closed lock while protected, an
-  open one (in the warning tone) while unlocked, a shield while trusted, nothing for a cluster on this machine. Its
+  open one (in the warning tone) while unlocked, a shield while trusted, nothing for a known local cluster. Its
   menu offers Unlock for This Session…, Lock Again, Trust This Cluster… and Stop Trusting (also Remove the Old Trust
   for a trust left at another server), each a registered action (`workspace::UnlockCluster`, `LockCluster`,
   `TrustCluster`, `UntrustCluster`) the palette lists too. On a protected cluster the detail pane's Shell is

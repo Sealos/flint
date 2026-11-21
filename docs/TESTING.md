@@ -371,7 +371,7 @@ A test, start to finish:
 
 ```rust
 let server = FakeApiServer::start().await?;
-server.write_kubeconfig(&dir.join("kubeconfig"), Some("demo"))?; // context "flint-e2e-fake"
+server.write_kubeconfig(&dir.join("kubeconfig"), Some("demo"))?; // context "kind-flint-e2e-fake"
 let core = /* CoreHandle on that kubeconfig, WatchTiming shortened */;
 let configmaps = server.gvr("configmaps");
 let mut sub = core.subscribe(CONTEXT, &KindId::new("", "configmaps"));
