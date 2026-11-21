@@ -1196,7 +1196,9 @@ impl ClusterManager {
     /// to is still the current one and certain.
     fn write_pin_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
         self.launch_gate(cluster, pin)?;
-        if self.contexts.definition_holds(cluster, pin) {
+        if self.contexts.provisional(cluster) {
+            Err(WriteError::KubeconfigUnreadable)
+        } else if self.contexts.definition_holds(cluster, pin) {
             Ok(())
         } else {
             Err(WriteError::ConnectionChanged)

@@ -53,6 +53,7 @@ impl ActionGate for RequestGate {
             .map_err(|error| match error {
                 WriteError::Refused(refusal) => ActionError::Refused(refusal),
                 WriteError::ConnectionChanged => ActionError::ConnectionChanged,
+                WriteError::KubeconfigUnreadable => ActionError::KubeconfigUnreadable,
                 other => ActionError::Failed(other.to_string()),
             })
     }
@@ -276,6 +277,7 @@ impl From<ActionError> for WriteError {
         match error {
             ActionError::Refused(refusal) => WriteError::Refused(refusal),
             ActionError::ConnectionChanged => WriteError::ConnectionChanged,
+            ActionError::KubeconfigUnreadable => WriteError::KubeconfigUnreadable,
             ActionError::Conflict(_) => WriteError::Conflict,
             ActionError::Gone(_) => WriteError::Gone,
             ActionError::Unsupported(message) => WriteError::Rejected(message),
@@ -307,8 +309,10 @@ impl ActionObject {
 pub(crate) enum ActionError {
     /// The write gate refused it.
     Refused(WriteRefusal),
-    /// The connection definition is not the reviewed one, or is not certain.
+    /// The connection definition is not the reviewed one.
     ConnectionChanged,
+    /// A kubeconfig file that could define the context can't be read.
+    KubeconfigUnreadable,
     /// The object changed since it was reviewed: review it again.
     Conflict(String),
     /// The object is gone.

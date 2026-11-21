@@ -92,6 +92,15 @@ impl ContextPin {
     pub fn server(&self) -> Option<&str> {
         self.server.as_deref()
     }
+
+    /// Whether `other` is this pin on another connection definition, and nothing else moved.
+    pub fn only_definition_differs(&self, other: &ContextPin) -> bool {
+        self.definition != other.definition
+            && self.generation == other.generation
+            && self.endpoint == other.endpoint
+            && self.gate == other.gate
+            && self.server == other.server
+    }
 }
 
 /// A context's definition, as kubeconfig loads last saw it.
@@ -344,6 +353,12 @@ impl ContextHistory {
         self.records
             .get(context)
             .is_some_and(|r| r.present && !r.provisional && r.definition == pin.definition)
+    }
+
+    /// Whether a file that failed in the last load could define `context`, its cluster or its
+    /// user.
+    pub fn provisional(&self, context: &str) -> bool {
+        self.records.get(context).is_none_or(|r| r.provisional)
     }
 
     /// Whether `context`'s recorded server is the exact URL `pin` was taken for. Only says how to

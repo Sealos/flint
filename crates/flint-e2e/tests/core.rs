@@ -1268,7 +1268,7 @@ async fn a_provisional_definition_sends_no_write() {
     std::fs::write(&files[0], "not: [valid").unwrap();
     core.handle.reload_kubeconfig().await.unwrap();
     let result = run_when_connected(&core, &review).await;
-    assert_eq!(result.unwrap_err(), WriteError::ConnectionChanged);
+    assert_eq!(result.unwrap_err(), WriteError::KubeconfigUnreadable);
     assert_eq!(puts(&server), (1, 0), "no write request");
     assert_eq!(replicas(&server), 1);
 
@@ -1277,6 +1277,86 @@ async fn a_provisional_definition_sends_no_write() {
     run_when_connected(&core, &review).await.unwrap();
     assert_eq!(puts(&server), (1, 1));
     assert_eq!(replicas(&server), 3);
+}
+
+/// Reviews `three_replicas` once the core has reconnected after a reload.
+async fn review_when_connected(
+    core: &Core,
+    server: &FakeApiServer,
+) -> Result<WriteReview, WriteError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let result = core
+            .handle
+            .review_write(write_target(server), three_replicas())
+            .await;
+        let waiting = matches!(
+            &result,
+            Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+                | Err(WriteError::NotServed(_))
+        );
+        if !waiting || tokio::time::Instant::now() > deadline {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Whether the server received any request for the edited object.
+fn object_requested(server: &FakeApiServer) -> bool {
+    server.requests().iter().any(|r| r.path.ends_with(EDITED))
+}
+
+// covers UP-54: a new review on a provisional definition at the same URL is refused before it
+// reads the object or sends a dry run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_review_on_a_provisional_definition_sends_nothing() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    server.write_kubeconfig(&path, Some("demo")).unwrap();
+    let files = users_in_files(&path, &["one", "two"]);
+    let paths = vec![path, files[0].clone(), files[1].clone()];
+    let core = Core::start_on(dir, paths, Settings::default()).await;
+
+    std::fs::write(&files[0], "not: [valid").unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    let result = review_when_connected(&core, &server).await;
+    assert_eq!(result.unwrap_err(), WriteError::KubeconfigUnreadable);
+    assert!(!object_requested(&server), "nothing read or written");
+    assert_eq!(puts(&server), (0, 0));
+}
+
+// covers UP-54: a file that can't even be checked counts as unreadable. The cluster still
+// connects and reads, and a review is refused until the file can be read.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_that_cannot_be_checked_refuses_a_review() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let hidden = locked.join("kubeconfig");
+    std::fs::write(&hidden, "apiVersion: v1\nkind: Config\n").unwrap();
+    let path = dir.path().join("kubeconfig");
+    server.write_kubeconfig(&path, Some("demo")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::metadata(&hidden).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return; // Running as a user that permissions don't apply to.
+    }
+    let core = Core::start_on(dir, vec![hidden, path], Settings::default()).await;
+
+    let result = review_when_connected(&core, &server).await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(result.unwrap_err(), WriteError::KubeconfigUnreadable);
+    assert!(!object_requested(&server), "nothing read or written");
+
+    core.handle.reload_kubeconfig().await.unwrap();
+    review_when_connected(&core, &server).await.unwrap();
 }
 
 // covers UP-54: a cluster locked after the review refuses the write before it reaches the

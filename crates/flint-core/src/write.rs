@@ -257,10 +257,12 @@ pub enum WriteError {
     /// The intent's target is not what its review was made for.
     #[error("this review was made for another object; review the change again")]
     ReviewMismatch,
-    /// The context's connection definition is not the reviewed one, or may change once a
-    /// kubeconfig file can be read.
-    #[error("this cluster's connection changed or is not certain; review the change again")]
+    /// The context's connection definition is not the reviewed one.
+    #[error("this cluster's connection changed; review the change again")]
     ConnectionChanged,
+    /// A kubeconfig file that could define this context can't be read.
+    #[error("a kubeconfig file can't be read; fix it, then review the change again")]
+    KubeconfigUnreadable,
     /// The server refused it (validation, an admission webhook, RBAC).
     #[error("{0}")]
     Rejected(String),
@@ -298,8 +300,12 @@ impl RequestGate {
             .core
             .write_client(&self.cluster, Some(self.server.clone()))
             .await?;
+        // A pin can be stale from the start: a fallback showing while a higher file is unreadable.
+        self.core
+            .check_write_pin(&self.cluster, pin.clone())
+            .await?;
         if let Some(first) = self.pin.as_ref().filter(|first| **first != pin) {
-            return Err(if first.server() == pin.server() {
+            return Err(if first.only_definition_differs(&pin) {
                 WriteError::ConnectionChanged
             } else {
                 WriteRefusal::Moved {
@@ -308,10 +314,6 @@ impl RequestGate {
                 .into()
             });
         }
-        // A pin can be stale from the start: a fallback showing while a higher file is unreadable.
-        self.core
-            .check_write_pin(&self.cluster, pin.clone())
-            .await?;
         self.pin = Some(pin);
         Ok(client.into_client())
     }

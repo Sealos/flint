@@ -582,7 +582,12 @@ async fn a_changed_or_provisional_definition_sends_no_action() {
             core.handle.reload_kubeconfig().await.unwrap();
             let from = server.requests().len();
             let result = run_when_connected(&core, &review).await;
-            assert_eq!(result.unwrap_err(), WriteError::ConnectionChanged, "{path}");
+            let expected = if provisional {
+                WriteError::KubeconfigUnreadable
+            } else {
+                WriteError::ConnectionChanged
+            };
+            assert_eq!(result.unwrap_err(), expected, "{path}");
             let seen = since(&server, from);
             assert_eq!(writes_in(&seen), 0, "{path}: {seen:?}");
             assert!(!seen.iter().any(|(_, p)| p == path), "{path}: {seen:?}");
