@@ -68,7 +68,10 @@ pub(super) fn name_of(prefix: &str, millis: u64, pid: u32, n: u32) -> String {
 pub(super) async fn client(path: &Path) -> Client {
     let loaded = kubeconfig::load(&[path.to_owned()]);
     let context = &loaded.contexts[0].name;
-    cluster::connect(&loaded.merged, context).await.unwrap()
+    // Sets up and cleans up fixtures, so it writes: what is under test uses Flint's own clients.
+    cluster::connect_unrestricted_for_tests(&loaded.merged, context)
+        .await
+        .unwrap()
 }
 
 /// Sends core logs to stderr, filtered by `RUST_LOG`.

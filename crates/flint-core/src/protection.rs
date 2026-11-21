@@ -10,10 +10,17 @@
 //! a client through the one check in `ClusterManager::write_client`, which refuses with
 //! [`WriteRefusal::Protected`]. A front end shows the same state with [`protection`], but cannot
 //! open a way around it.
+//!
+//! The types hold that in place. A connection's client that can write is a `WriteAccess`, which
+//! gives up a `GatedClient` only for a [`Protection`] that allows changes, and an action that
+//! changes a cluster takes a `GatedClient`. Every other client refuses anything but reads
+//! (`read_only`), so a write path that skips the gate fails before it reaches the cluster.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+
+use kube::Client;
 
 use crate::settings::{ClusterPin, Settings};
 
@@ -234,6 +241,53 @@ impl SessionUnlocks {
     }
 }
 
+/// A connection's clients: the read-only one for everything that reads, and the one that can
+/// write, closed behind the gate.
+#[derive(Clone)]
+pub(crate) struct ClusterClients {
+    pub(crate) read: Client,
+    pub(crate) writes: WriteAccess,
+}
+
+/// A connection's client that can write, which nothing can use until [`WriteAccess::grant`]
+/// opens it.
+#[derive(Clone)]
+pub(crate) struct WriteAccess(Client);
+
+impl WriteAccess {
+    /// Closes `client` behind the gate.
+    pub(crate) fn new(client: Client) -> Self {
+        Self(client)
+    }
+
+    /// The client for an action on `cluster`, whose protection is `protection` now.
+    pub(crate) fn grant(
+        &self,
+        protection: Protection,
+        cluster: &str,
+    ) -> Result<GatedClient, WriteRefusal> {
+        if protection.allows_changes() {
+            Ok(GatedClient(self.0.clone()))
+        } else {
+            Err(WriteRefusal::Protected {
+                cluster: cluster.to_owned(),
+            })
+        }
+    }
+}
+
+/// A client that passed the write gate: what an action that changes a cluster, or runs code in
+/// it, takes. Only [`WriteAccess::grant`] makes one.
+#[derive(Clone)]
+pub(crate) struct GatedClient(Client);
+
+impl GatedClient {
+    /// The client, for the action that was granted it.
+    pub(crate) fn into_client(self) -> Client {
+        self.0
+    }
+}
+
 /// Why the core would not hand out a client for an action that changes a cluster.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WriteRefusal {
@@ -257,6 +311,22 @@ pub enum WriteRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // covers UP-54: the write-capable client opens only for a protection that allows changes.
+    #[tokio::test]
+    async fn write_access_opens_only_when_changes_are_allowed() {
+        let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        let access = WriteAccess::new(Client::try_from(config).unwrap());
+        assert_eq!(
+            access.grant(Protection::Protected, "prod").err(),
+            Some(WriteRefusal::Protected {
+                cluster: "prod".into()
+            })
+        );
+        for allowed in [Protection::Local, Protection::Unlocked, Protection::Trusted] {
+            assert!(access.grant(allowed, "prod").is_ok(), "{allowed:?}");
+        }
+    }
 
     // covers UP-54: clusters on this machine start unlocked; anything else is protected.
     #[test]
