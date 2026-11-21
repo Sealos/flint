@@ -465,6 +465,12 @@ impl FakeApiServer {
             .unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// The object as a `GET` would return it, if there is one.
+    pub fn object(&self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> Option<Value> {
+        self.require(gvr);
+        lock(&self.inner.state).object(gvr, namespace, name).ok()
+    }
+
     /// Removes an object and its row, silently.
     pub fn remove_object(&self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> bool {
         self.remove_row(gvr, namespace, name)
@@ -742,14 +748,94 @@ async fn handle(
         )),
         Some(Effect::Delay(delay)) => {
             tokio::time::sleep(delay).await;
-            serve(&inner, req, upgrade, &route, verb, &query, &accept)
+            serve_or_put(&inner, req, upgrade, &route, verb, &query, &accept).await
         }
-        Some(Effect::StripUpgrade) => serve(&inner, req, false, &route, verb, &query, &accept),
-        None => serve(&inner, req, upgrade, &route, verb, &query, &accept),
+        Some(Effect::StripUpgrade) => {
+            serve_or_put(&inner, req, false, &route, verb, &query, &accept).await
+        }
+        None => serve_or_put(&inner, req, upgrade, &route, verb, &query, &accept).await,
     };
     record.status = Some(response.status().as_u16());
     lock(&inner.requests).push(record);
     Ok(response)
+}
+
+/// A `PUT` of an object replaces it; anything else is [`serve`]d.
+async fn serve_or_put(
+    inner: &Arc<Inner>,
+    req: Request<Incoming>,
+    upgrade: bool,
+    route: &Route,
+    verb: Verb,
+    query: &Query,
+    accept: &str,
+) -> Response<Body> {
+    if req.method() == Method::PUT && matches!(route, Route::Object { .. }) {
+        return put_object(inner, req, route, query)
+            .await
+            .unwrap_or_else(|e| error(&e));
+    }
+    serve(inner, req, upgrade, route, verb, query, accept)
+}
+
+/// Replaces an object as the API server does: the body's `uid` and `resourceVersion`, when set,
+/// must be the live ones (a 409 otherwise); with `dryRun=All` nothing is stored. Watches are told.
+async fn put_object(
+    inner: &Arc<Inner>,
+    req: Request<Incoming>,
+    route: &Route,
+    query: &Query,
+) -> Result<Response<Body>, ApiError> {
+    let Route::Object {
+        gvr,
+        namespace,
+        name,
+    } = route
+    else {
+        return Err(ApiError::not_found("not an object"));
+    };
+    let ns = namespace.as_deref();
+    known(inner, gvr, ns)?;
+    let bytes = req
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?
+        .to_bytes();
+    let mut object: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?;
+    let mut state = lock(&inner.state);
+    let current = state.object(gvr, ns, name)?;
+    let conflict = |field: &str| {
+        let sent = object.pointer(&format!("/metadata/{field}"));
+        sent.is_some() && sent != current.pointer(&format!("/metadata/{field}"))
+    };
+    if conflict("uid") || conflict("resourceVersion") {
+        return Err(ApiError::new(
+            409,
+            "Conflict",
+            format!("the object \"{name}\" has been modified"),
+        ));
+    }
+    if object.pointer("/metadata/name").and_then(Value::as_str) != Some(name) {
+        return Err(ApiError::new(400, "BadRequest", "the name does not match"));
+    }
+    if query.dry_run {
+        return Ok(rebased(inner, object));
+    }
+    let version = state.bump();
+    object["metadata"]["resourceVersion"] = version.to_string().into();
+    let row = state
+        .row_for_object(gvr, &mut object, &[])
+        .map_err(|e| ApiError::new(400, "BadRequest", e))?;
+    let change = state.apply_object(gvr, "MODIFIED", object.clone(), row);
+    let outgoing = Outgoing::Event(Box::new(change));
+    lock(&inner.watchers)
+        .entry(gvr.clone())
+        .or_default()
+        .retain(|w| w.tx.send(outgoing.clone()).is_ok());
+    drop(state);
+    Ok(rebased(inner, object))
 }
 
 /// Answers a request: an exec is upgraded (or refused), anything else answered at once.

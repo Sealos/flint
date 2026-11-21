@@ -6,9 +6,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::WriteRefusal;
 use flint_core::exec::BracketedPaste;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::read::{self, ListQuery};
+use flint_core::write::{WriteAction, WriteError, WriteProposal, WriteTarget, WriteWarning};
 use flint_core::{
     ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, KindId, KindSnapshot,
     LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet, Settings, Subscription,
@@ -959,6 +961,231 @@ async fn shell_runs(core: &Core) {
         s.state == running("bash") && has_line(s, &prompt)
     })
     .await;
+}
+
+const EDITED: &str = "edit-me";
+
+fn deployments() -> Gvr {
+    Gvr::new("apps", "v1", "deployments")
+}
+
+/// A Deployment to edit, at version `version`, with `labels`.
+fn editable(version: &str, labels: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": EDITED,
+            "namespace": "demo",
+            "uid": "uid-edit",
+            "resourceVersion": version,
+            "labels": labels,
+        },
+        "spec": {"replicas": 1},
+    })
+}
+
+fn write_target(server: &FakeApiServer) -> WriteTarget {
+    WriteTarget {
+        cluster: CONTEXT.into(),
+        server: Some(server.url()),
+        kind: KindId::new("apps", "deployments"),
+        namespace: Some("demo".to_owned()),
+        name: EDITED.to_owned(),
+        uid: None,
+        resource_version: None,
+    }
+}
+
+fn three_replicas() -> WriteProposal {
+    WriteProposal::ApplyYaml {
+        yaml: format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {EDITED}\nspec:\n  replicas: 3\n"
+        ),
+    }
+}
+
+/// The `PUT`s the server received: dry runs, and real ones.
+fn puts(server: &FakeApiServer) -> (usize, usize) {
+    let all: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PUT)
+        .collect();
+    let dry = all.iter().filter(|r| r.parsed_query().dry_run).count();
+    (dry, all.len() - dry)
+}
+
+fn replicas(server: &FakeApiServer) -> serde_json::Value {
+    server
+        .object(&deployments(), Some("demo"), EDITED)
+        .expect("the object")["spec"]["replicas"]
+        .clone()
+}
+
+// covers UP-51: Review is a server dry run that changes nothing; the confirmed write sends the
+// same object once, under Flint's field manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reviewed_edit_is_dry_run_then_applied_once() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let core = Core::start(&server, Some("demo")).await;
+
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+    assert_eq!(puts(&server), (1, 0));
+    assert_eq!(replicas(&server), 1, "a review changes nothing");
+    assert!(review.warnings().is_empty());
+    assert_eq!(review.target().uid.as_deref(), Some("uid-edit"));
+    let live = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+    assert_eq!(
+        review.target().resource_version.as_deref(),
+        live["metadata"]["resourceVersion"].as_str()
+    );
+    let WriteAction::ApplyYaml(edit) = review.action() else {
+        panic!("an edit");
+    };
+    assert!(edit.before().contains("replicas: 1"), "{}", edit.before());
+    assert!(edit.after().contains("replicas: 3"), "{}", edit.after());
+
+    core.handle.run_write(review.into_intent()).await.unwrap();
+    assert_eq!(puts(&server), (1, 1));
+    assert_eq!(replicas(&server), 3);
+    let written = server
+        .requests()
+        .into_iter()
+        .find(|r| r.method == http::Method::PUT && !r.parsed_query().dry_run)
+        .unwrap();
+    assert_eq!(
+        written.parsed_query().field_manager.as_deref(),
+        Some("flint")
+    );
+}
+
+// covers UP-52: the object changed after the review: refused as a conflict, once, nothing
+// overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conflict_is_reported_and_never_retried() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let core = Core::start(&server, Some("demo")).await;
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+    server.set_object(&deployments(), editable("5001", serde_json::json!({})));
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    assert_eq!(puts(&server), (1, 1), "one attempt");
+    assert_eq!(replicas(&server), 1);
+}
+
+// covers UP-54: a cluster locked after the review refuses the write before it reaches the
+// server, and a protected cluster refuses the review too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_locked_after_review_refuses_the_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let settings = Settings {
+        protect_local_clusters: true,
+        ..Settings::default()
+    };
+    let core = Core::start_with(&server, Some("demo"), settings).await;
+    let protected = WriteError::Refused(WriteRefusal::Protected {
+        cluster: CONTEXT.to_owned(),
+    });
+    let refused = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await;
+    assert_eq!(refused.unwrap_err(), protected);
+    assert_eq!(puts(&server), (0, 0));
+
+    core.handle.unlock(CONTEXT, &server.url());
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+    assert!(core.handle.lock(CONTEXT));
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), protected);
+    assert_eq!(puts(&server), (1, 0), "the write never reached the server");
+    assert_eq!(replicas(&server), 1);
+}
+
+// covers UP-52: a review is for the object it read: another uid, a newer version, or an intent
+// retargeted after the review are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_review_is_bound_to_the_object_it_read() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let core = Core::start(&server, Some("demo")).await;
+    let replaced = WriteTarget {
+        uid: Some("uid-old".to_owned()),
+        ..write_target(&server)
+    };
+    assert_eq!(
+        core.handle
+            .review_write(replaced, three_replicas())
+            .await
+            .unwrap_err(),
+        WriteError::Replaced
+    );
+    let stale = WriteTarget {
+        resource_version: Some("4999".to_owned()),
+        ..write_target(&server)
+    };
+    assert_eq!(
+        core.handle
+            .review_write(stale, three_replicas())
+            .await
+            .unwrap_err(),
+        WriteError::Conflict
+    );
+    assert_eq!(puts(&server), (0, 0));
+
+    let mut intent = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap()
+        .into_intent();
+    intent.target.name = "another".to_owned();
+    assert_eq!(
+        core.handle.run_write(intent).await.unwrap_err(),
+        WriteError::ReviewMismatch
+    );
+    assert_eq!(puts(&server), (1, 0));
+}
+
+// covers UP-51: the GitOps warning comes from the live object, so an edit that removes the
+// label still gets it, and the write stays allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gitops_warning_survives_an_edit_that_removes_the_label() {
+    let server = FakeApiServer::start().await.unwrap();
+    let labels = serde_json::json!({
+        "kustomize.toolkit.fluxcd.io/name": "apps",
+        "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+    });
+    server.set_object(&deployments(), editable("5000", labels));
+    let core = Core::start(&server, Some("demo")).await;
+    // The proposal's YAML has no labels.
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::LikelyReverted(managed)] => assert_eq!(managed.name, "apps"),
+        other => panic!("{other:?}"),
+    }
+    core.handle.run_write(review.into_intent()).await.unwrap();
+    assert_eq!(replicas(&server), 3);
 }
 
 // covers UP-54, UP-55: the core refuses a shell on a protected cluster before anything reaches
