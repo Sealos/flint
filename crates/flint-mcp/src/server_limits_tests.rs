@@ -445,7 +445,7 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
         client
             .call(
                 id,
-                "list_resource_kinds",
+                "list_resources",
                 json!({"cluster": "silent", "kind": kind}),
             )
             .await;
