@@ -631,9 +631,13 @@ M4 used every number in the 6x block, so its later paths continue at UP-120.
 
 ## M5.5: Multi-cluster and AI
 
+Cluster sets (UP-82 to UP-85) are scheduled for v0.5 and v0.6. Warm clusters (UP-78, UP-79) are after 1.0 (#247). AI log
+analysis (UP-75 to UP-77) is not scheduled.
+
 M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 and uses UP-75 to UP-79.
 
 ### UP-75 Analyze log lines with Claude Code
+- **Status:** planned, not scheduled on the roadmap, not built yet.
 - **Given** `claude` on my login-shell `PATH`.
 - **When** I select log lines and press Analyze with Claude (or its palette action), tick "Allow log analysis on
   `<context>` (`<server>`)" the first time, and confirm.
@@ -644,6 +648,7 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - Tests: unit (prompt, allow policy, process environment), ui (with a fake `claude` on `PATH`).
 
 ### UP-76 See exactly what leaves my Mac
+- **Status:** planned, not scheduled on the roadmap, not built yet.
 - **When** the confirmation opens.
 - **Then** it shows the full prompt and the lines as they will be sent, with credential shapes, vendor tokens,
   private keys and the values of Secrets, env and ConfigMaps the pod references already replaced. It names the CLI
@@ -654,6 +659,7 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - Tests: unit (redaction patterns and encodings, limits), ui (fake `claude`).
 
 ### UP-77 Claude Code not installed
+- **Status:** planned, not scheduled on the roadmap, not built yet.
 - **Given** no `claude` on the resolved `PATH` (relative and empty entries ignored), nor in settings, nor in a
   supported version. Having only `codex` installed counts as not installed in v1.
 - **Then** the log viewer shows no Analyze with Claude button, the palette has no Analyze action, and there is no
@@ -661,6 +667,7 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - Tests: unit (CLI lookup), ui.
 
 ### UP-78 Switch between recent clusters instantly
+- **Status:** planned (#247, After 1.0), not built yet.
 - **When** I use clusters A, B and C, then switch back to A.
 - **Then** A's lists show current data at once, with no loading state (in mode All, Events, Leases and
   EndpointSlices reload, because warm clusters drop them). The sidebar marks A as active and B and C as
@@ -669,6 +676,7 @@ M5.5 was added after M5 and M6 were numbered, so it shares the 7x block with M5 
 - Tests: unit (warm set), cluster, ui.
 
 ### UP-79 Warm clusters stay bounded and quiet
+- **Status:** planned (#247, After 1.0), not built yet.
 - **When** I use more clusters than `warm_clusters`, the background clusters go over `warm_memory_mib`, a warm
   cluster sits unused for 30 minutes, the Mac sleeps, or a warm cluster's credential expires.
 - **Then** the least recently used (or the affected) cluster goes cold, and the sidebar shows it. An expired
@@ -739,10 +747,10 @@ Deferred until cluster sets are scheduled (#199).
 
 ---
 
-## M7: Fleet actions (after 1.0)
+## M7: Fleet actions (v0.7)
 
-### UP-100 Restart a workload on several clusters
-- **When** I select a Deployment in a combined view and choose Rollout Restart on 3 clusters.
+### UP-100 Restart or scale a workload on several clusters
+- **When** I select a Deployment in a combined view and choose Rollout Restart or Scale on 3 clusters.
 - **Then** a preview lists each target cluster with a dry-run result and a checkbox. The restart runs one cluster at a
   time and stops at the first failure, saying which clusters were done and which were not. Locked clusters in the list
   need their name typed first.
@@ -751,7 +759,7 @@ Deferred until cluster sets are scheduled (#199).
 ### UP-101 Apply one manifest to several clusters
 - **When** I apply a YAML manifest to a cluster set.
 - **Then** I see a server-side dry-run diff per cluster before anything changes, can drop clusters from the target list,
-  and the apply runs one cluster at a time as above. Scale and delete follow the same flow.
+  and the apply runs one cluster at a time as above. Delete follows the same flow.
 - Tests: unit, e2e.
 
 ## M8: Recordings (after 1.0)

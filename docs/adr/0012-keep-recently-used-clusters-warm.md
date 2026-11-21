@@ -1,5 +1,8 @@
 # Keep recently used clusters warm
 
+**Not scheduled before 1.0** (#247, after 1.0). Cluster sets ([ADR-0014](./0014-cluster-sets-and-combined-views.md))
+come first and work without warm clusters.
+
 This amends [ADR-0008](./0008-watch-everything-on-active-cluster.md). It replaces the rule that a cluster drops its
 watches as soon as it stops being active. Everything else in 0008 stays: the watch modes, and one active cluster in
 view at a time.

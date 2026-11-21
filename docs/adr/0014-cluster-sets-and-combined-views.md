@@ -25,8 +25,10 @@ one view, which this document calls a **cluster set**, and the UI calls super mo
 - **Rows keep their cluster:** opening a row shows its detail from its own cluster, and every action on it acts on
   that cluster only (and obeys [ADR-0015](./0015-clusters-are-protected-by-default.md)).
 - **Connections:** every member of an open set is connected and watched as an active cluster is, under the watch
-  mode rules of ADR-0008. Members don't count against `warm_clusters`; closing the set returns them to the warm
-  rules. Each member's errors show in its sidebar row and as a one-line note in the combined list, and never block
+  mode rules of ADR-0008. Closing the set disconnects every member that is not the active cluster, because warm
+  clusters ([ADR-0012](./0012-keep-recently-used-clusters-warm.md), #247) are not scheduled before cluster sets. If
+  warm clusters ship later, members don't count against `warm_clusters`, and closing the set returns them to the
+  warm rules. Each member's errors show in its sidebar row and as a one-line note in the combined list, and never block
   the other members' rows.
 
 ## Considered Options
@@ -49,5 +51,5 @@ one view, which this document calls a **cluster set**, and the UI calls super mo
   snapshots without copying rows (`Arc` rows, as today).
 - Memory and CPU grow with the number of members. The kwok measurements planned for warm clusters also cover a
   5-member set.
-- **Fleet actions** (the same action on several clusters at once) build on sets after 1.0. Their safety rules are
+- **Fleet actions** (the same action on several clusters at once) build on sets in v0.7. Their safety rules are
   in ADR-0015.
