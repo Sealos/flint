@@ -270,7 +270,11 @@ async fn a_text_filter_keeps_the_column_widths(cx: &mut TestAppContext) {
         window.input("api", cx);
     })
     .unwrap();
-    cx.run_until_parked();
+    let long_uid = format!("uid-{long}");
+    cx.wait_for(window, WAIT, move |window, _| {
+        visible_rows(window, &["uid-api", &long_uid]) == ["uid-api"]
+    })
+    .await;
     let state = list.read_with(cx, |list, _| list.view_state());
     assert_eq!(state.rows.len(), 1, "the filter leaves one row");
     let after = headers.map(|column| header_width(cx, window, column));
