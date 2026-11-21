@@ -367,7 +367,7 @@ pub(super) fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
             };
             // A note that wraps carries its text as the value of the label inside the item.
             let label = item.label().map(str::to_owned).or_else(|| {
-                let note = menu.within(ix).try_find(crate::ui::row_menu::MENU_NOTE)?;
+                let note = menu.within(ix).try_find(crate::ui::menu_fit::MENU_NOTE)?;
                 note.value().map(str::to_owned)
             });
             rows.push(label.unwrap_or_default());
@@ -396,11 +396,20 @@ fn click_entry(cx: &mut TestAppContext, t: &TestWorkspace, ix: usize) {
 fn submenu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| {
-        let sub = window.within("submenu");
-        (1usize..)
-            .map_while(|ix| sub.try_find(ix))
-            .map(|item| item.label().unwrap_or_default().to_owned())
-            .collect()
+        let mut sub = window.within("submenu");
+        let mut rows = Vec::new();
+        for ix in 1usize.. {
+            let Some(item) = sub.try_find(ix) else {
+                break;
+            };
+            // A row that wraps carries its text as the value of the label inside the item.
+            let label = item.label().map(str::to_owned).or_else(|| {
+                let text = sub.within(ix).try_find(crate::ui::menu_fit::MENU_NOTE)?;
+                text.value().map(str::to_owned)
+            });
+            rows.push(label.unwrap_or_default());
+        }
+        rows
     })
     .unwrap()
 }
