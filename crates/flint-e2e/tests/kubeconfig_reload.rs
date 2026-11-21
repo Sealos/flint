@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
-use flint_core::write::{WriteError, WriteProposal, WriteReview, WriteTarget};
 use flint_core::settings::{self, AiScope};
+use flint_core::write::{WriteError, WriteProposal, WriteReview, WriteTarget};
 use flint_core::{KindId, Settings, SyncState, WatchMode, WatchTiming, WriteRefusal, kubeconfig};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Gvr, Verb, write_kubeconfigs};
 
@@ -499,9 +499,20 @@ async fn a_held_context_takes_no_new_pin() {
 
     std::fs::write(&path, BROKEN).unwrap();
     core.reload_kubeconfig().await.unwrap();
+    let events = core.events();
     core.trust(CONTEXT, &server.url());
     expose(&core, Some(server.url()));
-    core.reload_kubeconfig().await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        let (mut trust, mut exposure) = (false, false);
+        while !(trust && exposure) {
+            if let Event::Error(notice) = events.recv().await.expect("core running") {
+                trust |= notice.contains("was not trusted");
+                exposure |= notice.contains("was not exposed");
+            }
+        }
+    })
+    .await
+    .expect("both pins refused in time");
     let saved = settings::load_settings(&dir.path().join("config")).unwrap();
     assert!(saved.trusted_clusters.is_empty());
     assert!(saved.ai_exposed_clusters.is_empty());
@@ -540,17 +551,28 @@ async fn a_held_context_can_lose_its_pins() {
     let config = dir.path().join("config");
     core.trust(CONTEXT, &server.url());
     expose(&core, Some(server.url()));
-    core.reload_kubeconfig().await.unwrap();
-    let saved = settings::load_settings(&config).unwrap();
-    assert_eq!(saved.trusted_clusters.len(), 1);
-    assert_eq!(saved.ai_exposed_clusters.len(), 1);
+    until_pins(&config, 1).await;
 
     std::fs::write(&path, BROKEN).unwrap();
     core.reload_kubeconfig().await.unwrap();
     core.untrust(CONTEXT);
     expose(&core, None);
-    core.reload_kubeconfig().await.unwrap();
-    let saved = settings::load_settings(&config).unwrap();
-    assert!(saved.trusted_clusters.is_empty());
-    assert!(saved.ai_exposed_clusters.is_empty());
+    until_pins(&config, 0).await;
+}
+
+/// Waits until `settings.toml` holds `count` Trust pins and `count` exposures.
+async fn until_pins(config: &std::path::Path, count: usize) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(saved) = settings::load_settings(config)
+                && saved.trusted_clusters.len() == count
+                && saved.ai_exposed_clusters.len() == count
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the pins saved in time");
 }
