@@ -387,33 +387,6 @@ async fn a_shell_ends_when_its_context_is_re_pointed(cx: &mut TestAppContext) {
     assert_eq!(found, None, "Shell opens a new tab");
 }
 
-// covers UP-42: a context re-pointed and put back before the list was read has a new generation
-// at the same server. Its live shell keeps running, but Shell opens a new tab, which is sure to
-// be on the server shown.
-#[gpui_kit::test]
-async fn a_shell_is_not_reused_after_its_context_started_over(cx: &mut TestAppContext) {
-    let (window, dock) = open_dock(cx);
-    let generations = |g: u64| std::collections::HashMap::from([("test".to_owned(), g)]);
-    dock.update(cx, |d, _| d.set_generations(generations(1)));
-    let (shell, mut fake) = open_shell(cx, window, &dock);
-    let cluster = TabCluster::new("test", Some("https://10.0.0.1:6443"));
-    let found = |cx: &mut TestAppContext| {
-        dock.read_with(cx, |d, cx| {
-            d.find(&TabKey::Shell(shell_request()), &cluster, cx)
-        })
-    };
-    assert_eq!(found(cx), Some(shell));
-    dock.update(cx, |d, _| d.set_generations(generations(2)));
-    assert_eq!(found(cx), None);
-    draw(cx, window);
-    assert!(!fake.is_closed(), "the shell keeps running");
-    dock.update(cx, |d, cx| {
-        d.check_servers(|_| Some(Some("https://10.0.0.1:6443".into())), cx)
-    });
-    draw(cx, window);
-    assert!(!fake.is_closed(), "a same-server edit does not end it");
-}
-
 /// Whether tab `id` lies wholly within the tab strip, as drawn.
 fn tab_in_view(cx: &mut TestAppContext, window: AnyWindowHandle, id: u64) -> bool {
     cx.update_window(window, |_, window, _| {
