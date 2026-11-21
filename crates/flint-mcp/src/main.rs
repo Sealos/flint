@@ -22,7 +22,7 @@ settings.toml exposes.
 
 settings.toml is read from one directory, chosen without checking that the file exists:
   $FLINT_CONFIG_DIR, if set and not empty
-  else on Linux: $XDG_CONFIG_HOME/flint, if that is an absolute path, else ~/.config/flint
+  else on Linux: $XDG_CONFIG_HOME/flint if XDG_CONFIG_HOME is an absolute path, else ~/.config/flint
   else on macOS: ~/Library/Application Support/Flint";
 
 /// `Ok(verbose)` to serve; `Err` holds what to print and the exit code. Program name excluded.
