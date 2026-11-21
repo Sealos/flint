@@ -982,7 +982,9 @@ Rules:
   replies to other requests included); a request read while 128 are unanswered is refused there at once, as is one
   whose id is still in flight; notifications, a cancellation in particular, always pass. A request counts until its
   reply reaches the transport, or, once cancelled, until nothing works on it (a tool call's handler has ended). When
-  the client closes its end, the stream ends only once every request read is answered. Clusters connect through the
+  the client closes its end, the stream ends once every request read is answered and every refusal written, or once
+  no reply has been written for the call deadline plus 5 s, so a client that stopped reading stdout cannot keep the
+  process alive. Clusters connect through the
   per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
   connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
   as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be

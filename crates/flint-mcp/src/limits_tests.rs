@@ -155,17 +155,38 @@ async fn the_end_of_stdin_waits_for_refusals() {
     assert!(transport.receive().await.is_none());
 }
 
-// covers UP-08: work that never finishes cannot hold the end of stdin past the deadline and the
-// grace period, and replies past the budget do not hide that stdin ended.
+// covers UP-08: with no reply written, work cannot hold the end of stdin past the deadline and
+// the grace period, and replies past the budget do not hide that stdin ended, even behind
+// requests still unread.
 #[tokio::test(start_paused = true)]
 async fn the_wait_after_stdin_ends_is_bounded() {
     let replies = Arc::new(ReplyBytes::default());
-    let mut transport = Counted::new(Gated::new([tool_call(1)]), replies.clone(), &limits(1, 1));
+    let incoming = [tool_call(1), tool_call(2), tool_call(3)];
+    let mut transport = Counted::new(Gated::new(incoming), replies.clone(), &limits(1, 1));
     assert!(transport.receive().await.is_some());
     let _stuck = replies.hold(1001);
     let started = tokio::time::Instant::now();
     assert!(transport.receive().await.is_none());
     assert_eq!(started.elapsed(), limits(1, 1).deadline + SHUTDOWN_GRACE);
+    assert_eq!(replies.unanswered_count(), 1, "nothing read ahead was run");
+}
+
+// covers UP-08: a client that closed stdin and keeps reading stdout gets its slower calls
+// answered: each reply written moves the wait on.
+#[tokio::test(start_paused = true)]
+async fn replies_being_written_keep_the_end_of_stdin_waiting() {
+    let replies = Arc::new(ReplyBytes::default());
+    let mut transport = Counted::new(Gated::new([tool_call(1)]), replies.clone(), &limits(1, 1));
+    assert!(transport.receive().await.is_some());
+    let deadline = limits(1, 1).deadline;
+    let reply = replies.hold(1);
+    tokio::spawn(async move {
+        tokio::time::sleep(deadline).await;
+        drop(reply);
+    });
+    let started = tokio::time::Instant::now();
+    assert!(transport.receive().await.is_none());
+    assert_eq!(started.elapsed(), deadline + deadline + SHUTDOWN_GRACE);
 }
 
 // covers UP-08: a request counts until its reply reaches the transport (where its bytes count

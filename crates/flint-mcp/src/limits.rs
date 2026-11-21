@@ -13,16 +13,17 @@
 //!   about the budget plus that many replies — not one more per call it keeps sending, refusals
 //!   and replies to other requests included.
 //! - **Deadline:** each call ends after [`Limits::deadline`] (`ServerHandler::call_tool`).
-//! - **Shutdown:** when the client closes stdin, requests and refusals still on their way are
-//!   given until [`Limits::deadline`] plus [`SHUTDOWN_GRACE`], so a client that stopped reading
-//!   stdout cannot keep the process alive.
+//! - **Shutdown:** when the client closes stdin, requests and refusals still on their way finish
+//!   as long as replies keep being written. After [`Limits::deadline`] plus [`SHUTDOWN_GRACE`]
+//!   with none written, the server stops waiting, so a client that stopped reading stdout cannot
+//!   keep the process alive.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rmcp::RoleServer;
 use rmcp::model::{ClientNotification, ClientRequest, JsonRpcMessage, RequestId};
@@ -32,7 +33,7 @@ use rmcp::service::{
 use rmcp::transport::Transport;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-/// How long past [`Limits::deadline`] the end of stdin waits for work still on its way, and how
+/// How long past [`Limits::deadline`] the end of stdin waits for a reply to be written, and how
 /// long closing the transport waits for a write that is stuck.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -183,6 +184,8 @@ pub(crate) struct ReplyBytes {
     /// arguments, so it is recorded.
     dropped_call: std::sync::OnceLock<DroppedCall>,
     outstanding: AtomicUsize,
+    /// Replies whose send has finished since the start: progress, while stdin has ended.
+    written: AtomicUsize,
     /// Requests read and not done with yet, and whether each is a tool call.
     unanswered: std::sync::Mutex<HashMap<RequestId, Work>>,
     /// Refusals handed to the transport and not written yet ([`refuse`]).
@@ -272,6 +275,11 @@ impl ReplyBytes {
     /// Requests read and not done with yet.
     pub(crate) fn unanswered_count(&self) -> usize {
         self.unanswered().len()
+    }
+
+    /// Whether no request is unanswered and no refusal unwritten.
+    fn idle(&self) -> bool {
+        self.unanswered_count() == 0 && self.refusing.load(Ordering::Acquire) == 0
     }
 
     /// Updates request `id` with `change`, and lets it go once it is done ([`Work`]).
@@ -390,8 +398,16 @@ impl Drop for Held {
         self.replies
             .outstanding
             .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.replies.written.fetch_add(1, Ordering::AcqRel);
         self.replies.released.notify_waiters();
     }
+}
+
+/// The wait after stdin ended: it runs out at `until`, moved on whenever a reply is written.
+#[derive(Clone, Copy)]
+struct Closed {
+    written: usize,
+    until: tokio::time::Instant,
 }
 
 /// One refusal not written yet, counted until dropped.
@@ -413,13 +429,14 @@ pub(crate) struct Counted<T> {
     /// requests not answered ([`Limits::unanswered`]), no more requests are read.
     budget: usize,
     unanswered: usize,
-    /// How long the end of stdin waits for work still on its way.
-    drain: Duration,
-    /// One message read while replies pass the budget, so the end of stdin is still seen. Kept
-    /// here because rmcp drops the `receive` future whenever something else is ready.
-    read_ahead: Option<RxJsonRpcMessage<RoleServer>>,
-    /// When the wait after the end of stdin runs out, once stdin has ended.
-    closed: Option<tokio::time::Instant>,
+    /// How long after stdin ended the server waits with no reply written.
+    quiet: Duration,
+    /// Up to [`Limits::unanswered`] messages read while replies pass the budget and not acted on
+    /// yet, so the end of stdin is still seen. Kept here because rmcp drops the `receive` future
+    /// whenever something else is ready.
+    read_ahead: VecDeque<RxJsonRpcMessage<RoleServer>>,
+    /// Set once stdin has ended.
+    closed: Option<Closed>,
 }
 
 impl<T> Counted<T> {
@@ -429,8 +446,8 @@ impl<T> Counted<T> {
             replies,
             budget: limits.reply_budget,
             unanswered: limits.unanswered,
-            drain: limits.deadline + SHUTDOWN_GRACE,
-            read_ahead: None,
+            quiet: limits.deadline + SHUTDOWN_GRACE,
+            read_ahead: VecDeque::new(),
             closed: None,
         }
     }
@@ -513,44 +530,67 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
 
     /// The next message for rmcp. Nothing is acted on while replies not written pass the budget:
     /// a client that does not read stdout gets nothing more run or answered (refusals and replies
-    /// to other requests included) until it does. One message is read ahead meanwhile, so the end
-    /// of stdin is seen. Otherwise reading goes on, so a cancellation always gets through. A
-    /// request read while [`Limits::unanswered`] are not done with is refused here at once
-    /// ("busy"), as is one whose id is still in flight; a tool call refused so is recorded. When
-    /// the client closes its end, the stream ends once every request read is answered and every
-    /// refusal written, or when the wait for them runs out (rmcp waits only briefly for running
-    /// handlers after it ends).
+    /// to other requests included) until it does. Up to [`Limits::unanswered`] messages are read
+    /// ahead meanwhile, so the end of stdin is seen. Otherwise reading goes on, so a cancellation
+    /// always gets through. A request read while [`Limits::unanswered`] are not done with is
+    /// refused here at once ("busy"), as is one whose id is still in flight; a tool call refused
+    /// so is recorded. When the client closes its end, the stream ends once every request read is
+    /// answered and every refusal written, or once no reply has been written for
+    /// [`Limits::deadline`] plus [`SHUTDOWN_GRACE`] (rmcp waits only briefly for running handlers
+    /// after it ends).
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
-        let (replies, budget, most, drain) = (
+        let (replies, budget, most, quiet) = (
             self.replies.clone(),
             self.budget,
             self.unanswered,
-            self.drain,
+            self.quiet,
         );
         let (inner, read_ahead, closed) = (&mut self.inner, &mut self.read_ahead, &mut self.closed);
         async move {
             loop {
-                if let Some(until) = *closed {
-                    let drained = replies.until(|| {
-                        replies.unanswered_count() == 0
-                            && replies.refusing.load(Ordering::Acquire) == 0
-                    });
-                    if tokio::time::timeout_at(until, drained).await.is_err() {
-                        tracing::warn!("stdin closed with requests or refusals still unfinished");
-                    }
-                    return None;
-                }
-                if read_ahead.is_none() {
-                    match inner.receive().await {
-                        Some(message) => *read_ahead = Some(message),
-                        None => {
-                            *closed = Some(tokio::time::Instant::now() + drain);
-                            continue;
+                let over = replies.outstanding() > budget;
+                let Some(message) = (!over).then(|| read_ahead.pop_front()).flatten() else {
+                    if let Some(wait) = closed {
+                        let written = replies.written.load(Ordering::Acquire);
+                        if written != wait.written {
+                            *wait = Closed {
+                                written,
+                                until: tokio::time::Instant::now() + quiet,
+                            };
+                        }
+                        let queued = !read_ahead.is_empty();
+                        let ready = replies.until(|| {
+                            replies.written.load(Ordering::Acquire) != written
+                                || if queued {
+                                    replies.outstanding() <= budget
+                                } else {
+                                    replies.idle()
+                                }
+                        });
+                        if tokio::time::timeout_at(wait.until, ready).await.is_err() {
+                            tracing::warn!("stdin closed and no reply was written in time");
+                            return None;
+                        }
+                        if !queued && replies.idle() {
+                            return None;
+                        }
+                    } else if read_ahead.len() >= most {
+                        replies.within(budget).await;
+                    } else {
+                        tokio::select! {
+                            biased;
+                            message = inner.receive() => match message {
+                                Some(message) => read_ahead.push_back(message),
+                                None => {
+                                    *closed = Some(Closed {
+                                        written: replies.written.load(Ordering::Acquire),
+                                        until: tokio::time::Instant::now() + quiet,
+                                    });
+                                }
+                            },
+                            () = replies.within(budget), if over => {}
                         }
                     }
-                }
-                replies.within(budget).await;
-                let Some(message) = read_ahead.take() else {
                     continue;
                 };
                 match &message {

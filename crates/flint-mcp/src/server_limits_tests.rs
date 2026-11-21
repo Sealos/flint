@@ -445,7 +445,7 @@ async fn a_call_cancelled_before_call_tool_lets_go_and_shutdown_finishes() {
     let mut client = Client::start(&server, 64 * 1024).await;
     let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
         "name": "list_clusters", "arguments": {},
-        "_meta": {"protocolVersion": "1900-01-01"},
+        "_meta": {"io.modelcontextprotocol/protocolVersion": "1900-01-01"},
     }});
     let cancel = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 1, "reason": "test"}});
