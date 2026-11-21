@@ -236,8 +236,8 @@ impl TerminalView {
         }
         if snapshot.state.is_finished() {
             self.marked = None;
-        }
-        if snapshot.input_not_replayed && !self.snapshot.input_not_replayed {
+            self.clear_input_refusal();
+        } else if snapshot.input_not_replayed && !self.snapshot.input_not_replayed {
             self.set_note(Tone::Warning, terminal_model::INPUT_NOT_REPLAYED.to_owned());
         }
         // The terminal drops a selection on its own (the program cleared the screen, switched
@@ -286,6 +286,7 @@ impl TerminalView {
         self.session.close();
         self.ended = Some(why);
         self.marked = None;
+        self.clear_input_refusal();
         cx.notify();
     }
 
@@ -365,16 +366,18 @@ impl TerminalView {
     /// which no longer holds.
     pub(super) fn input_sent(&mut self, sent: Result<(), InputRefused>, paste: bool) {
         match sent {
-            Ok(()) => {
-                if self.refusal_shown {
-                    self.note = None;
-                    self.refusal_shown = false;
-                }
-            }
+            Ok(()) => self.clear_input_refusal(),
             Err(refused) => {
                 self.set_note(Tone::Warning, terminal_model::input_refused(refused, paste));
                 self.refusal_shown = true;
             }
+        }
+    }
+
+    fn clear_input_refusal(&mut self) {
+        if self.refusal_shown {
+            self.note = None;
+            self.refusal_shown = false;
         }
     }
 

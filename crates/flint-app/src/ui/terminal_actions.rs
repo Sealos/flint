@@ -2,6 +2,7 @@
 //! the workspace's guards share with them. The toolbar's buttons dispatch these actions; mouse
 //! selection and keystrokes for the shell are not actions (they are the program's input).
 
+use flint_core::exec::BracketedPaste;
 use gpui_kit::component::input;
 use gpui_kit::*;
 
@@ -61,23 +62,26 @@ impl TerminalView {
             }
             PasteCheck::Lines { lines } => {
                 let pasted = match self.session.paste_if_bracketed(text.clone()) {
-                    Ok(pasted) => {
-                        self.input_sent(Ok(()), true);
-                        pasted
-                    }
+                    Ok(pasted) => pasted,
                     Err(refused) => {
                         self.input_sent(Err(refused), true);
                         cx.notify();
                         return;
                     }
                 };
-                cx.spawn_in(window, async move |this, cx| {
-                    if pasted.await {
-                        return;
+                cx.spawn_in(window, async move |this, cx| match pasted.await {
+                    BracketedPaste::Pasted => {
+                        let _ = this.update(cx, |view, cx| {
+                            view.input_sent(Ok(()), true);
+                            cx.notify();
+                        });
                     }
-                    let _ = this.update_in(cx, |view, window, cx| {
-                        view.ask_to_paste(text, lines, window, cx)
-                    });
+                    BracketedPaste::Unbracketed => {
+                        let _ = this.update_in(cx, |view, window, cx| {
+                            view.ask_to_paste(text, lines, window, cx);
+                        });
+                    }
+                    BracketedPaste::Discarded => {}
                 })
                 .detach();
             }

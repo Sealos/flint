@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use super::{ExecRequest, ExecSession, ExecSnapshot, ExecState, Input, SessionChannels};
+use super::{
+    BracketedPaste, ExecRequest, ExecSession, ExecSnapshot, ExecState, Input, SessionChannels,
+};
 use crate::terminal::{TerminalModel, TerminalSize};
 
 /// The test's side of a session from [`FakeExec::open`].
@@ -21,7 +23,6 @@ pub struct FakeExec {
     written: Vec<u8>,
     resizes: Vec<TerminalSize>,
     scrolls: Vec<i32>,
-    closed: bool,
     input_not_replayed: bool,
 }
 
@@ -35,7 +36,6 @@ impl FakeExec {
             written: Vec::new(),
             resizes: Vec::new(),
             scrolls: Vec::new(),
-            closed: false,
             input_not_replayed: false,
         };
         (session, fake)
@@ -77,9 +77,17 @@ impl FakeExec {
     /// Takes in everything the session's handle sent since the last call, as a live session
     /// would: keystrokes and pastes are recorded (pastes encoded as they would be sent), giving
     /// their bytes back to the budget, and resizes, scrolling and selections change the
-    /// screen. Resizes come first, the newest only, as a live session takes them. Publishes a
-    /// snapshot.
+    /// screen. Closing discards the queue first. Otherwise resizes come first, the newest
+    /// only, as a live session takes them. Publishes a snapshot.
     pub fn pump(&mut self) {
+        if *self.channels.close.borrow() || self.channels.inputs.is_closed() {
+            self.channels.inputs.close();
+            while self.channels.inputs.try_recv().is_ok() {}
+            if !self.state.is_finished() {
+                self.set_state(ExecState::Closed);
+            }
+            return;
+        }
         let finished = self.state.is_finished();
         if self.channels.size.has_changed().unwrap_or(false) {
             let size = *self.channels.size.borrow_and_update();
@@ -98,13 +106,17 @@ impl FakeExec {
                     self.model().scroll_to_bottom();
                 }
                 Input::PasteIfBracketed(text, _, reply) => {
-                    let bracketed = !finished && self.channels.model.bracketed_paste();
-                    if bracketed {
+                    let result = if finished {
+                        BracketedPaste::Discarded
+                    } else if self.channels.model.bracketed_paste() {
                         let bytes = self.channels.model.paste_bytes(&text);
                         self.written.extend(bytes);
                         self.model().scroll_to_bottom();
-                    }
-                    let _ = reply.send(bracketed);
+                        BracketedPaste::Pasted
+                    } else {
+                        BracketedPaste::Unbracketed
+                    };
+                    let _ = reply.send(result);
                 }
                 Input::Write(..) | Input::Paste(..) => {}
                 Input::Resize(size) => {
@@ -133,10 +145,6 @@ impl FakeExec {
                 Input::Close => {}
             }
         }
-        if *self.channels.close.borrow() && !self.closed {
-            self.closed = true;
-            self.state = ExecState::Closed;
-        }
         self.publish();
     }
 
@@ -163,7 +171,7 @@ impl FakeExec {
     /// Whether the handle closed the session, or was dropped.
     pub fn is_closed(&mut self) -> bool {
         self.pump();
-        self.closed || self.channels.inputs.is_closed()
+        self.channels.inputs.is_closed()
     }
 
     /// The snapshot the session shows now.
@@ -221,6 +229,29 @@ mod tests {
         fake.pump();
         assert_eq!(session.queued_input(), 0);
         session.paste(paste).unwrap();
+    }
+
+    #[test]
+    fn closing_discards_pending_input_before_it_can_be_recorded() {
+        let (session, mut fake) = open();
+        fake.set_state(ExecState::Running {
+            command: vec!["bash".into()],
+        });
+        fake.print(b"\x1b[?2004h");
+        session.write(b"typed".to_vec()).unwrap();
+        session.paste("pasted").unwrap();
+        let bracketed = session.paste_if_bracketed("a\nb").unwrap();
+
+        session.close();
+        fake.pump();
+
+        assert_eq!(fake.snapshot().state, ExecState::Closed);
+        assert!(fake.written().is_empty());
+        assert_eq!(session.queued_input(), 0);
+        assert_eq!(
+            futures::FutureExt::now_or_never(bracketed),
+            Some(BracketedPaste::Discarded)
+        );
     }
 
     #[test]

@@ -2,15 +2,18 @@
 //! the test drives ([`FakeExec`]): it prints output, sets the state, and reads back what the tab
 //! sent. Keys go through the registry's key bindings, as in the app.
 
-use flint_core::exec::fake::FakeExec;
+use std::cell::Cell;
+use std::rc::Rc;
+
+use flint_core::exec::{INPUT_BUDGET, fake::FakeExec};
 use flint_core::terminal::TerminalSize;
-use flint_core::{ExecState, TerminalSnapshot};
+use flint_core::{ExecFailure, ExecFailureKind, ExecState, TerminalSnapshot};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{ClickOptions, TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, ClipboardItem, Entity, InputHandler as _, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, ScrollDelta,
-    TestAppContext, WindowBounds, WindowOptions, point, px, size,
+    Task, TestAppContext, WindowBounds, WindowOptions, point, px, size,
 };
 use serde_json::json;
 
@@ -122,6 +125,14 @@ impl Shell {
     fn has_dialog(&self, cx: &mut TestAppContext) -> bool {
         cx.update_window(self.window, |_, window, cx| window.has_active_dialog(cx))
             .unwrap()
+    }
+
+    fn show_input_refusal(&self, cx: &mut TestAppContext) {
+        self.view.update(cx, |view, cx| {
+            view.send(vec![b'x'; INPUT_BUDGET - 64], cx);
+            view.send(vec![b'y'; 65], cx);
+        });
+        assert!(self.view.read_with(cx, |view, _| view.refusal_shown));
     }
 
     fn dispatch(
@@ -799,6 +810,95 @@ async fn input_the_shell_is_not_reading_is_refused_saying_so(cx: &mut TestAppCon
     shell.input(cx, "z");
     assert_eq!(shell.sent(cx), b"z");
     assert_eq!(note(&shell, cx), None);
+}
+
+#[gpui_kit::test]
+async fn cancelling_an_unbracketed_paste_keeps_the_input_warning(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    shell.show_input_refusal(cx);
+    cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert!(shell.view.read_with(cx, |view, _| view.refusal_shown));
+
+    assert_eq!(shell.sent(cx), vec![b'x'; INPUT_BUDGET - 64]);
+    cx.wait_for(shell.window, WAIT, |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
+    shell.dispatch(cx, "ui::Cancel", json!(null)).unwrap();
+    assert!(shell.sent(cx).is_empty());
+    assert!(shell.view.read_with(cx, |view, _| view.refusal_shown));
+}
+
+#[gpui_kit::test]
+async fn a_bracketed_paste_clears_the_input_warning_and_notifies_without_output(
+    cx: &mut TestAppContext,
+) {
+    let mut shell = open(cx);
+    shell.print(cx, b"\x1b[?2004h");
+    shell.show_input_refusal(cx);
+    shell.settle(cx);
+    // Unlike a live shell receiving input with no echo, FakeExec publishes on every pump.
+    shell
+        .view
+        .update(cx, |view, _| view._pump = Task::ready(()));
+    let notified = Rc::new(Cell::new(false));
+    let _observer = cx.update(|cx| {
+        let notified = notified.clone();
+        cx.observe(&shell.view, move |_, _| notified.set(true))
+    });
+    cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert!(shell.view.read_with(cx, |view, _| view.refusal_shown));
+    notified.set(false);
+
+    shell.fake.pump();
+    cx.run_until_parked();
+
+    assert!(shell.fake.written().ends_with(b"\x1b[200~a\nb\x1b[201~"));
+    assert!(shell.view.read_with(cx, |view, _| view.note.is_none()));
+    assert!(
+        notified.get(),
+        "the view must redraw when the warning clears"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_discarded_multiline_paste_does_not_ask_for_confirmation(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    // A paste result can reach the view before the next snapshot does.
+    shell
+        .view
+        .update(cx, |view, _| view._pump = Task::ready(()));
+    cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    shell.view.update(cx, |view, _| view.session.close());
+    assert!(shell.sent(cx).is_empty());
+    assert!(shell.view.read_with(cx, |view, _| view.is_live()));
+    assert!(!shell.has_dialog(cx));
+}
+
+#[gpui_kit::test]
+async fn the_input_warning_clears_when_the_shell_finishes(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    for state in [
+        ExecState::Exited { code: Some(0) },
+        ExecState::Failed(ExecFailure::new(
+            ExecFailureKind::Connection,
+            "Disconnected",
+        )),
+    ] {
+        shell.fake.set_state(ExecState::Running {
+            command: vec!["bash".into()],
+        });
+        shell.settle(cx);
+        shell.show_input_refusal(cx);
+
+        shell.fake.set_state(state);
+        shell.settle(cx);
+        assert!(shell.view.read_with(cx, |view, _| view.note.is_none()));
+        shell.fake.pump();
+    }
 }
 
 // covers UP-41 (#256): when what was typed while bash was tried was not kept for /bin/sh, the
