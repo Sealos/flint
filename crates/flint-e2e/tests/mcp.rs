@@ -621,13 +621,19 @@ fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
     ] {
         two.a.set_object(&config_maps, object(name, annotations));
     }
-    // A message field is redacted, so this reply has a `# redacted=` line too.
-    let mut redacted = object(
-        "redacted",
-        json!({tracking: "shop:/ConfigMap:demo/redacted"}),
+    // ConfigMaps are shown as they are; a Pod's annotations are redacted, so this reply has a
+    // `# redacted=` line too.
+    two.a.set_object(
+        &two.a.gvr("pods"),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "redacted", "namespace": "demo", "annotations": {
+                tracking: "shop:/Pod:demo/redacted",
+                "note": "password=flint-e2e-hidden",
+            }},
+        }),
     );
-    redacted["status"] = json!({"message": "password=flint-e2e-hidden"});
-    two.a.set_object(&config_maps, redacted);
     let mut mcp = two.mcp()?;
     for (name, marked) in [("managed", true), ("copied", false), ("plain", false)] {
         let got = mcp.call(
@@ -645,7 +651,7 @@ fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
     // The other header lines stay first.
     let got = mcp.call(
         "get_resource",
-        json!({"cluster": EXPOSED, "kind": "configmaps", "namespace": "demo", "name": "redacted"}),
+        json!({"cluster": EXPOSED, "kind": "pods", "namespace": "demo", "name": "redacted"}),
     )?;
     let mut lines = got.text.lines();
     assert!(
