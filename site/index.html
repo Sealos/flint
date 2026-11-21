@@ -44,7 +44,10 @@
       <pre class="code hero-code" role="region" aria-label="Command to register flint mcp with Claude Code" tabindex="0"><code><span class="c"># read-only access to the clusters you expose</span>
 claude mcp add flint -- /usr/local/bin/flint mcp</code></pre>
       <p class="fineprint">Install Flint, link its binary to <code>/usr/local/bin/flint</code>, mark a cluster <b>Expose to AI</b> in the sidebar, then register it with the command above (<a href="https://github.com/Sealos/flint#add-it-to-an-agent">MCP setup</a>).</p>
-      <p class="fineprint">Built for macOS first. v0.2.0 ships a universal macOS binary for Apple Silicon and Intel and a best-effort Linux AppImage (x86_64 and arm64); releases after it add Flint.app in a DMG. Until the first signed release the app is not signed with a Developer ID or notarized, so macOS asks you to allow it once (<a href="https://github.com/Sealos/flint#install-from-a-release">install steps</a>). v0.2.0 redacts Secret values only; credential redaction in logs, events and messages, and the command palette, come with the next release.</p>
+      <p class="fineprint">The latest release includes Flint.app in a universal macOS DMG for Apple Silicon and Intel
+        and best-effort Linux AppImages (x86_64 and arm64). The Mac app uses an ad-hoc signature, so macOS asks you
+        to allow it on first launch after a browser download
+        (<a href="https://github.com/Sealos/flint#install-from-a-release">install steps</a>).</p>
     </section>
 
     <div class="wrap">
@@ -189,12 +192,13 @@ claude mcp add flint -- /usr/local/bin/flint mcp
         <li class="done"><b>M0</b><span>Cluster sidebar, connect and health check, read-only MCP server</span></li>
         <li class="done"><b>M1</b><span>Every kind with live lists, namespace filter, detail and YAML view</span></li>
         <li class="done"><b>M2</b><span>Streaming pod and workload logs with search, timestamps and save to file; shells in a dock (shipped in v0.2.0)</span></li>
-        <li class="next"><b>Next</b><span>Resource switcher (the Flint Light and Dark themes and the command palette are in)</span></li>
-        <li><b></b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
+        <li class="done"><b>v0.3.0</b><span>Resource switcher, Go Back and pane navigation keys, plus matching-lines-only and errors-only log filters with adjustable context lines</span></li>
+        <li class="next"><b>Next</b><span>YAML editing with inline validation, dry-run and diff; delete, scale, restart, cordon, drain</span></li>
         <li><b></b><span>Curated views for core kinds, CPU and memory from metrics-server, resource diagram</span></li>
         <li><b></b><span>Port-forward panel with open in browser, Helm releases</span></li>
         <li><b></b><span>Warm clusters for instant switching, AI log analysis through your own Claude Code CLI</span></li>
         <li><b></b><span>Signed and notarized universal build, Homebrew cask, first signed release</span></li>
+        <li><b></b><span><a href="https://github.com/Sealos/flint/issues/309">Regex search</a> and <a href="https://github.com/Sealos/flint/issues/265">log time ranges</a></span></li>
       </ol>
     </section>
   </main>
