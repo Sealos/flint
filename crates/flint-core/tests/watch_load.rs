@@ -156,7 +156,10 @@ async fn measure_all_mode_during_scale_down() {
         })
     };
     let loaded = kubeconfig::load(&[path]);
-    let client = cluster::connect(&loaded.merged, &cluster).await.unwrap();
+    // Scales the load's deployment, so it writes.
+    let client = cluster::connect_unrestricted_for_tests(&loaded.merged, &cluster)
+        .await
+        .unwrap();
     let cpu_before = cpu_time();
     let started = Instant::now();
     Api::<Deployment>::namespaced(client, &ns)

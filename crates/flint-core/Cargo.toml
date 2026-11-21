@@ -49,6 +49,8 @@ alacritty_terminal.workspace = true
 test-support = []
 
 [dev-dependencies]
+# Integration tests set up their clusters with `cluster::connect_unrestricted_for_tests`.
+flint-core = { path = ".", features = ["test-support"] }
 rcgen.workspace = true
 tokio-rustls.workspace = true
 async-channel.workspace = true

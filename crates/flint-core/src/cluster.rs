@@ -404,10 +404,13 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
     let ready = prepare(kubeconfig, context).await?;
     let target = ready.target;
     let (config, token) = (ready.config, ready.token);
-    tokio::task::spawn_blocking(move || build_client(config, token, Access::ReadOnly))
-        .await
-        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
-        .map_err(|e| ClusterError::kube(e).for_target(&target))
+    tokio::task::spawn_blocking(move || {
+        let auth = kube::client::ConfigExt::auth_layer(&config)?;
+        build_client(&config, token, auth.as_ref(), Access::ReadOnly)
+    })
+    .await
+    .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+    .map_err(|e| ClusterError::kube(e).for_target(&target))
 }
 
 /// As [`connect`], with the client that can write, closed behind the write gate.
@@ -419,8 +422,10 @@ async fn connect_gated(
     let target = ready.target;
     let (config, token) = (ready.config, ready.token);
     tokio::task::spawn_blocking(move || {
-        let read = build_client(config.clone(), token.clone(), Access::ReadOnly)?;
-        let write = build_client(config, token, Access::Unrestricted)?;
+        // Once: making it can run a credential command, which both clients then share.
+        let auth = kube::client::ConfigExt::auth_layer(&config)?;
+        let read = build_client(&config, token.clone(), auth.as_ref(), Access::ReadOnly)?;
+        let write = build_client(&config, token, auth.as_ref(), Access::Unrestricted)?;
         Ok::<_, kube::Error>(ClusterClients {
             read,
             writes: WriteAccess::new(write),
@@ -441,10 +446,13 @@ pub async fn connect_unrestricted_for_tests(
     let ready = prepare(kubeconfig, context).await?;
     let target = ready.target;
     let (config, token) = (ready.config, ready.token);
-    tokio::task::spawn_blocking(move || build_client(config, token, Access::Unrestricted))
-        .await
-        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
-        .map_err(|e| ClusterError::kube(e).for_target(&target))
+    tokio::task::spawn_blocking(move || {
+        let auth = kube::client::ConfigExt::auth_layer(&config)?;
+        build_client(&config, token, auth.as_ref(), Access::Unrestricted)
+    })
+    .await
+    .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+    .map_err(|e| ClusterError::kube(e).for_target(&target))
 }
 
 /// What building a context's clients takes.
@@ -523,8 +531,9 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// supported, as before. `token` is the refreshing
 /// token of an exec auth plugin ([`crate::auth_plugin::resolve`]), set after kube's auth layer.
 fn build_client(
-    config: kube::Config,
+    config: &kube::Config,
     token: Option<crate::auth_plugin::TokenLayer>,
+    auth: Option<&kube::client::middleware::AuthLayer>,
     access: Access,
 ) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
@@ -550,12 +559,12 @@ fn build_client(
                 .default_retry
                 .then(|| RetryLayer::new(RetryPolicy::server_retry())),
         )
-        .option_layer(config.auth_layer()?)
+        .option_layer(auth)
         .option_layer(token)
         .layer(config.extra_headers_layer()?)
         .map_err(tower::BoxError::from)
         .service(http);
-    Ok(kube::client::ClientBuilder::new(service, config.default_namespace).build())
+    Ok(kube::client::ClientBuilder::new(service, config.default_namespace.clone()).build())
 }
 
 /// Stops exec auth plugins from prompting: they get no stdin and cannot ask for input. Used when
@@ -924,7 +933,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let config = kube::Config::new(url.parse().unwrap());
-        let client = build_client(config, None, Access::ReadOnly).unwrap();
+        let client = build_client(&config, None, None, Access::ReadOnly).unwrap();
         let pod = "/api/v1/namespaces/demo/pods/web";
         for (method, path) in [
             (Method::POST, "/api/v1/namespaces/demo/pods".to_owned()),

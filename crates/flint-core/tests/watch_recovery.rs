@@ -69,9 +69,14 @@ async fn admin(path: &PathBuf, within: Duration) -> Client {
     let context = loaded.contexts[0].name.clone();
     let deadline = Instant::now() + within;
     loop {
-        if let Ok((client, _)) =
-            cluster::connect_and_check(&loaded.merged, &context, Duration::from_secs(5)).await
-        {
+        // Writes fixtures, so it is not one of Flint's read-only clients.
+        let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+            let client = cluster::connect_unrestricted_for_tests(&loaded.merged, &context).await?;
+            cluster::server_version(&client).await?;
+            Ok::<_, cluster::ClusterError>(client)
+        })
+        .await;
+        if let Ok(Ok(client)) = attempt {
             return client;
         }
         assert!(

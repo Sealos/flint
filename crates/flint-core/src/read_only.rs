@@ -50,23 +50,38 @@ fn allows(method: &Method, path: &str) -> bool {
     let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
     match segments.as_slice() {
         ["version"] | ["api"] | ["apis"] | ["api", _] | ["apis", _] | ["apis", _, _] => true,
-        ["api", _, rest @ ..] => reads_objects(rest),
-        ["apis", _, _, rest @ ..] => reads_objects(rest),
+        // The schemas the fixture recorder reads.
+        ["openapi", "v3"] | ["openapi", "v3", "api", "v1"] | ["openapi", "v3", "apis", _, _] => {
+            true
+        }
+        ["api", _, rest @ ..] => reads_core_objects(rest),
+        ["apis", _, _, rest @ ..] => reads_group_objects(rest),
         _ => false,
     }
 }
 
-/// Whether the part of a path after its API version lists or gets objects, or reads a pod's log.
-/// Names may be anything, a pod named `proxy` included; a resource may not be a tunnel.
-fn reads_objects(rest: &[&str]) -> bool {
+/// Whether the part of a core API path after its version lists or gets objects, or reads a
+/// pod's log. Names may be anything, a pod named `proxy` included; a resource may not be a
+/// tunnel (`/api/v1/proxy/...` is the old form of the `proxy` subresource).
+fn reads_core_objects(rest: &[&str]) -> bool {
     match rest {
+        ["namespaces", _, "pods", _, "log"] => true,
         [resource]
         | [resource, _]
         | ["namespaces", _, resource]
         | ["namespaces", _, resource, _] => !is_tunnel(resource),
-        ["namespaces", _, "pods", _, "log"] => true,
         _ => false,
     }
+}
+
+/// Whether the part of a group's API path after its version lists or gets objects. A custom
+/// resource may be named `exec` or `proxy`; a subresource, which this never allows, is what
+/// would be a tunnel.
+fn reads_group_objects(rest: &[&str]) -> bool {
+    matches!(
+        rest,
+        [_] | [_, _] | ["namespaces", _, _] | ["namespaces", _, _, _]
+    )
 }
 
 /// The subresources that open a way into the cluster, in any case.
@@ -135,6 +150,15 @@ mod tests {
         "/api/v1/namespaces/demo/pods/exec/log",
         "/api/v1/namespaces/proxy/pods/attach",
         "/api/v1/nodes/portforward",
+        // Custom resources may be named like a tunnel.
+        "/apis/example.com/v1/exec",
+        "/apis/example.com/v1/attach/one",
+        "/apis/example.com/v1/namespaces/demo/proxy",
+        "/apis/example.com/v1/namespaces/demo/portforward/one",
+        // The schemas the fixture recorder reads.
+        "/openapi/v3",
+        "/openapi/v3/api/v1",
+        "/openapi/v3/apis/apps/v1",
     ];
 
     // covers UP-54: what the read paths ask for still goes through.
@@ -221,7 +245,15 @@ mod tests {
             "/healthz",
             "/metrics",
             "/logs/kube-apiserver.log",
-            "/openapi/v3",
+            "/openapi",
+            "/openapi/v2",
+            "/openapi/v3/",
+            "/openapi/v3/api",
+            "/openapi/v3/api/v2",
+            "/openapi/v3/apis/apps",
+            "/openapi/v3/apis/apps/v1/extra",
+            "/apis/example.com/v1/namespaces/demo/pods/web/log",
+            "/apis/example.com/v1/widgets/one/status",
             "/api/",
             "/api/v1/",
             "/api/v1/pods/",
