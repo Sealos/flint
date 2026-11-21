@@ -1411,7 +1411,7 @@ fn table_rows(
             let cells: Vec<String> = (0..page.columns.len())
                 .map(|i| {
                     let text = row.cell_text(i, now);
-                    if is_secret && !policy::is_safe_secret_column(&page.columns[i].name) {
+                    if is_secret && !policy::is_safe_secret_column(&page.columns, i) {
                         policy::REDACTED.to_owned()
                     } else {
                         let mut text = text.into_owned();
@@ -1590,6 +1590,71 @@ mod tests {
             rows[0]["cells"],
             json!(["web", "Opaque", "2", policy::REDACTED, "0s"])
         );
+    }
+
+    // covers UP-10: a column is not safe because of its header alone.
+    #[test]
+    fn a_repeated_safe_secret_header_never_carries_a_value() {
+        let standard = || {
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Namespace", ColumnRole::Namespace, 0),
+                col("Type", ColumnRole::Value, 0),
+                col("Data", ColumnRole::Value, 0),
+                col("Age", ColumnRole::Age, 0),
+            ]
+        };
+        let cells = || {
+            vec![
+                Cell::Name,
+                Cell::Namespace,
+                Cell::Text("Opaque".into()),
+                Cell::Int(2),
+                Cell::Age,
+            ]
+        };
+        let hidden = policy::REDACTED;
+        for (header, role, extra, shown) in [
+            (
+                "Name",
+                ColumnRole::Value,
+                Cell::Text("hunter2".into()),
+                ["web", "demo", "Opaque", "2", "0s"],
+            ),
+            (
+                "Namespace",
+                ColumnRole::Value,
+                Cell::Text("hunter2".into()),
+                ["web", "demo", "Opaque", "2", "0s"],
+            ),
+            (
+                "Type",
+                ColumnRole::Value,
+                Cell::Text("hunter2".into()),
+                ["web", "demo", hidden, "2", "0s"],
+            ),
+            (
+                "Data",
+                ColumnRole::Value,
+                Cell::Text("hunter2".into()),
+                ["web", "demo", "Opaque", hidden, "0s"],
+            ),
+            (
+                "Age",
+                ColumnRole::Age,
+                Cell::Age,
+                ["web", "demo", "Opaque", "2", "0s"],
+            ),
+        ] {
+            let mut columns = standard();
+            columns.push(col(header, role, 0));
+            let mut row = cells();
+            row.push(extra);
+            let (_, rows, _, _) = table_rows(&page(columns, row), true, 1_000, policy::LIST_BYTES);
+            let mut expected = shown.to_vec();
+            expected.push(hidden);
+            assert_eq!(rows[0]["cells"], json!(expected), "{header}");
+        }
     }
 
     // covers UP-15

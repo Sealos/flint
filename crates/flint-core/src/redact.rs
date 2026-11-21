@@ -16,6 +16,8 @@ pub use text::{Redacted, credential_flag, redact_credentials};
 
 use serde_json::Value;
 
+use crate::table::{Column, ColumnRole, wire_role};
+
 /// Secret annotations whose values are shown.
 const SAFE_SECRET_ANNOTATIONS: &[&str] = &[
     "kubernetes.io/service-account.name",
@@ -24,18 +26,54 @@ const SAFE_SECRET_ANNOTATIONS: &[&str] = &[
     "meta.helm.sh/release-namespace",
 ];
 
-/// Secret Table columns whose cells are shown: identity, type and key count, never values.
-const SAFE_SECRET_COLUMNS: &[&str] = &["Name", "Namespace", "Type", "Data", "Age"];
-
 /// Whether a Secret annotation's value may be shown.
 pub fn is_safe_secret_annotation(key: &str) -> bool {
     SAFE_SECRET_ANNOTATIONS.contains(&key)
 }
 
-/// Whether a Secret Table column may be shown. Any other column is hidden, in case a server or
-/// an extension adds a printer column that shows a value.
-pub fn is_safe_secret_column(name: &str) -> bool {
-    SAFE_SECRET_COLUMNS.contains(&name)
+/// Whether the column at `index` of a Secret Table may be shown. Any other column is hidden, in
+/// case a server or an extension adds a printer column that shows a value.
+pub fn is_safe_secret_column(columns: &[Column], index: usize) -> bool {
+    is_safe_at(
+        columns.len(),
+        |i| (&*columns[i].name, columns[i].role),
+        index,
+    )
+}
+
+/// [`is_safe_secret_column`] for a Table's raw definitions, as `(name, format)`.
+pub fn safe_secret_wire_columns(definitions: &[(&str, &str)]) -> Vec<bool> {
+    let columns: Vec<(&str, ColumnRole)> = definitions
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, format))| (name, wire_role(i, name, format)))
+        .collect();
+    (0..columns.len())
+        .map(|index| is_safe_at(columns.len(), |i| columns[i], index))
+        .collect()
+}
+
+/// The one rule for safe Secret columns, failing closed:
+/// - `Name`, `Namespace` and `Age` by their role, whose cells come from the object's metadata and
+///   never from the server's text. Only the first column with that header and role.
+/// - `Type` and `Data` are server text, so only when no other column has the header: with two,
+///   nothing tells which is the real one.
+fn is_safe_at<'a>(
+    len: usize,
+    column: impl Fn(usize) -> (&'a str, ColumnRole),
+    index: usize,
+) -> bool {
+    if index >= len {
+        return false;
+    }
+    let (name, role) = column(index);
+    match (name, role) {
+        ("Name", ColumnRole::Name)
+        | ("Namespace", ColumnRole::Namespace)
+        | ("Age", ColumnRole::Age) => (0..index).all(|i| column(i) != (name, role)),
+        ("Type" | "Data", ColumnRole::Value) => (0..len).all(|i| i == index || column(i).0 != name),
+        _ => false,
+    }
 }
 
 /// Whether a list of `kind` (a [`crate::KindId`] string) is of core Secrets, whose columns are
@@ -44,10 +82,10 @@ pub fn is_secret_list(kind: &str) -> bool {
     kind == "secrets"
 }
 
-/// Whether `column` of a list hides its values. Everything derived from such a column (text,
-/// filter matches, sort order, width) must not depend on its raw cells.
-pub fn is_masked_column(secret_list: bool, column: &str) -> bool {
-    secret_list && !is_safe_secret_column(column)
+/// Whether the column at `index` of a list hides its values. Everything derived from such a
+/// column (text, filter matches, sort order, width) must not depend on its raw cells.
+pub fn is_masked_column(secret_list: bool, columns: &[Column], index: usize) -> bool {
+    secret_list && !is_safe_secret_column(columns, index)
 }
 
 /// Whether `object` is a core v1 Secret.
@@ -195,7 +233,114 @@ pub fn command_name(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::ColumnType;
     use serde_json::json;
+
+    fn column(name: &str, role: ColumnRole) -> Column {
+        Column {
+            name: name.into(),
+            ty: ColumnType::String,
+            format: "".into(),
+            description: "".into(),
+            priority: 0,
+            role,
+        }
+    }
+
+    fn standard() -> Vec<Column> {
+        vec![
+            column("Name", ColumnRole::Name),
+            column("Namespace", ColumnRole::Namespace),
+            column("Type", ColumnRole::Value),
+            column("Data", ColumnRole::Value),
+            column("Age", ColumnRole::Age),
+        ]
+    }
+
+    fn safe(columns: &[Column]) -> Vec<bool> {
+        (0..columns.len())
+            .map(|i| is_safe_secret_column(columns, i))
+            .collect()
+    }
+
+    #[test]
+    fn the_standard_secret_columns_are_safe() {
+        assert_eq!(safe(&standard()), [true; 5]);
+        assert!(!is_safe_secret_column(&standard(), 5), "past the columns");
+    }
+
+    #[test]
+    fn a_safe_header_needs_the_role_that_makes_it_safe() {
+        for (header, role) in [
+            ("Name", ColumnRole::Value),
+            ("Namespace", ColumnRole::Value),
+            ("Age", ColumnRole::Value),
+            ("Type", ColumnRole::Name),
+            ("Data", ColumnRole::Age),
+            ("Token", ColumnRole::Name),
+            ("type", ColumnRole::Value),
+            ("age", ColumnRole::Age),
+        ] {
+            assert!(!safe(&[column(header, role)])[0], "{header} as {role:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_identity_header_hides_only_the_extra_column() {
+        for (header, role) in [
+            ("Name", ColumnRole::Value),
+            ("Namespace", ColumnRole::Value),
+            ("Age", ColumnRole::Age),
+        ] {
+            let mut columns = standard();
+            columns.push(column(header, role));
+            assert_eq!(
+                safe(&columns),
+                [true, true, true, true, true, false],
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_type_or_data_header_hides_every_copy() {
+        for (header, at) in [("Type", 2), ("Data", 3)] {
+            // After the real column, and before it: position cannot tell them apart.
+            let mut after = standard();
+            after.push(column(header, ColumnRole::Value));
+            let mut before = standard();
+            before.insert(at, column(header, ColumnRole::Value));
+            for columns in [after, before] {
+                let shown = safe(&columns);
+                for (i, c) in columns.iter().enumerate() {
+                    assert_eq!(shown[i], &*c.name != header, "{header} at {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_definitions_follow_the_same_rule() {
+        let plain = [("Name", ""), ("Type", ""), ("Data", ""), ("Age", "")];
+        assert_eq!(safe_secret_wire_columns(&plain), [true; 4]);
+        let repeated = [
+            ("Name", ""),
+            ("Type", ""),
+            ("Data", ""),
+            ("Age", ""),
+            ("Name", ""),
+            ("Namespace", ""),
+            ("Type", ""),
+            ("Data", ""),
+            ("Age", ""),
+        ];
+        assert_eq!(
+            safe_secret_wire_columns(&repeated),
+            [true, false, false, true, false, false, false, false, false]
+        );
+        // A first column of format `name` holds the object's name, but its header is not safe.
+        assert_eq!(safe_secret_wire_columns(&[("Token", "name")]), [false]);
+    }
 
     #[test]
     fn masks_values_and_unsafe_annotations_keeping_keys() {

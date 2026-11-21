@@ -143,7 +143,7 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
         .iter()
         .enumerate()
         .map(|(i, column)| {
-            let cells = if is_masked_column(secret, &column.name) {
+            let cells = if is_masked_column(secret, &snapshot.columns, i) {
                 super::object::MASK.chars().count()
             } else {
                 rows.iter()
@@ -380,8 +380,7 @@ pub struct RowFlags {
     pub health: bool,
     /// The row has finished for good ([`row_finished`]).
     pub finished: bool,
-    /// A Secret row: only identity columns show their value, as in the MCP server, because a
-    /// printer column added by an extension could show one.
+    /// This cell's column hides its value ([`flint_core::redact::is_masked_column`]).
     pub masked: bool,
 }
 
@@ -408,7 +407,7 @@ pub struct CellStyle<T> {
 impl<T: CellText> CellStyle<T> {
     /// The style of `column`'s cell, `width` wide. `raw_text` is not called for a masked cell.
     pub fn of(column: &Column, raw_text: impl FnOnce() -> T, width: f32, flags: RowFlags) -> Self {
-        let text = if is_masked_column(flags.masked, &column.name) {
+        let text = if flags.masked {
             T::from_static(super::object::MASK)
         } else {
             raw_text()
@@ -1083,14 +1082,9 @@ mod tests {
     }
 
     #[test]
-    fn a_secrets_identity_columns_stay_readable() {
-        let flags = RowFlags {
-            masked: true,
-            ..RowFlags::default()
-        };
-        for name in ["Name", "Namespace", "Type", "Data", "Age"] {
-            assert_eq!(style(&value(name), "shown", WIDE, flags).shown, "shown");
-        }
+    fn a_cell_that_is_not_masked_shows_its_value() {
+        let cell = style(&value("Type"), "Opaque", WIDE, RowFlags::default());
+        assert_eq!(cell.shown, "Opaque");
     }
 
     #[test]

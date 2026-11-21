@@ -322,17 +322,17 @@ pub fn scrub_helm_configmaps(list: &mut Value) {
 
 /// Hides annotation values and every cell outside the safe columns of a Secret Table.
 pub fn scrub_secret_table(table: &mut Value) {
-    let safe: Vec<bool> = table
+    let definitions: Vec<(&str, &str)> = table
         .get("columnDefinitions")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .map(|c| {
-            c.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(redact::is_safe_secret_column)
+            let text = |field| c.get(field).and_then(Value::as_str).unwrap_or_default();
+            (text("name"), text("format"))
         })
         .collect();
+    let safe = redact::safe_secret_wire_columns(&definitions);
     for row in table
         .get_mut("rows")
         .and_then(Value::as_array_mut)
@@ -570,6 +570,22 @@ mod tests {
         assert_eq!(
             table["rows"][0]["cells"],
             json!(["s", "Opaque", CREDENTIAL_MARKER])
+        );
+
+        // A column is not safe because of its header alone.
+        let mut repeated = json!({
+            "columnDefinitions": [
+                {"name": "Name"}, {"name": "Type"}, {"name": "Data"}, {"name": "Age"},
+                {"name": "Name"}, {"name": "Namespace"}, {"name": "Type"}, {"name": "Data"},
+                {"name": "Age"},
+            ],
+            "rows": [{"cells": ["s", "Opaque", 1, "1d", "a", "b", "c", "d", "e"]}],
+        });
+        scrub_secret_table(&mut repeated);
+        let m = CREDENTIAL_MARKER;
+        assert_eq!(
+            repeated["rows"][0]["cells"],
+            json!(["s", m, m, "1d", m, m, m, m, m])
         );
         assert_eq!(
             table["rows"][0]["object"]["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"],
