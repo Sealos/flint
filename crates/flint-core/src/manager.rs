@@ -240,6 +240,8 @@ pub(crate) struct ClusterManager {
     kubeconfig_paths: Vec<PathBuf>,
     settings: Arc<Settings>,
     settings_error: Option<String>,
+    /// The newest Trust or Stop Trusting request whose write has finished.
+    trust_settled: u64,
     /// In kubeconfig order.
     clusters: Vec<Cluster>,
     active: Option<ClusterId>,
@@ -288,6 +290,7 @@ impl ClusterManager {
         Self {
             settings: Arc::new(config.settings.clone()),
             settings_error: config.settings_error.clone(),
+            trust_settled: 0,
             config,
             events,
             internal_tx,
@@ -342,6 +345,7 @@ impl ClusterManager {
         self.emit(Event::SettingsChanged {
             settings: self.settings.clone(),
             error: self.settings_error.clone(),
+            trust_settled: self.trust_settled,
         });
     }
 
@@ -691,6 +695,7 @@ impl ClusterManager {
         } else if saved {
             self.unlocks.trust_removed(&cluster, request);
         }
+        self.trust_settled = self.trust_settled.max(request);
         if saved {
             // The settings may be unchanged (the same pin again, or none to remove): say it
             // anyway, so the front end shows the protection that holds now.

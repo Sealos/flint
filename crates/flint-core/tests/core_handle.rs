@@ -119,7 +119,9 @@ async fn settings_where(
     pred: impl Fn(&Settings, Option<&str>) -> bool,
 ) -> (Arc<Settings>, Option<String>) {
     loop {
-        if let Event::SettingsChanged { settings, error } = events.recv().await.unwrap()
+        if let Event::SettingsChanged {
+            settings, error, ..
+        } = events.recv().await.unwrap()
             && pred(&settings, error.as_deref())
         {
             return (settings, error);

@@ -1,6 +1,6 @@
 //! The app's view of the cluster list, updated from core events.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,9 +25,12 @@ pub struct ClustersModel {
     pub loaded: bool,
     pub active: Option<ClusterId>,
     pub settings: Arc<Settings>,
-    /// Clusters this model asked to stop trusting while [`ClustersModel::settings`] still holds
-    /// their trust: it no longer counts for what is shown.
-    stopping_trust: HashSet<ClusterId>,
+    /// Clusters this model asked to stop trusting, by request, until the core reports that
+    /// request done: the trust [`ClustersModel::settings`] holds no longer counts for what is
+    /// shown.
+    stopping_trust: HashMap<ClusterId, u64>,
+    /// The newest Trust or Stop Trusting request the core has finished.
+    pub(in crate::ui) trust_settled: u64,
     /// Why `settings.toml` could not be read. While set, nothing is exposed to AI agents.
     pub settings_error: Option<String>,
     /// The last error not tied to a cluster connection (for example a settings write). Cleared
@@ -73,7 +76,8 @@ impl ClustersModel {
             loaded: false,
             active: None,
             settings: Arc::new(settings),
-            stopping_trust: HashSet::new(),
+            stopping_trust: HashMap::new(),
+            trust_settled: 0,
             settings_error: None,
             last_error: None,
             discovery: HashMap::new(),
@@ -117,12 +121,16 @@ impl ClustersModel {
                     c.state = state;
                 }
             }
-            Event::SettingsChanged { settings, error } => {
+            Event::SettingsChanged {
+                settings,
+                error,
+                trust_settled,
+            } => {
                 self.settings = settings;
                 self.settings_error = error;
-                let trusted = &self.settings.trusted_clusters;
+                self.trust_settled = trust_settled;
                 self.stopping_trust
-                    .retain(|cluster| trusted.iter().any(|pin| pin.context == *cluster));
+                    .retain(|_, request| *request > trust_settled);
             }
             Event::DiscoveryChanged {
                 cluster,
@@ -283,13 +291,16 @@ impl ClustersModel {
     /// Whether Flint may change `cluster` now (ADR-0015). The core keeps the same check for
     /// every action that changes a cluster; this one is for showing it.
     pub fn protection(&self, cluster: &ClusterSummary) -> Protection {
-        let without_its_trust = self.stopping_trust.contains(&cluster.info.name).then(|| {
-            let mut settings = (*self.settings).clone();
-            settings
-                .trusted_clusters
-                .retain(|pin| pin.context != cluster.info.name);
-            settings
-        });
+        let without_its_trust = self
+            .stopping_trust
+            .contains_key(&cluster.info.name)
+            .then(|| {
+                let mut settings = (*self.settings).clone();
+                settings
+                    .trusted_clusters
+                    .retain(|pin| pin.context != cluster.info.name);
+                settings
+            });
         flint_core::protection::protection(
             without_its_trust.as_ref().unwrap_or(&self.settings),
             self.core.unlocks(),
@@ -338,8 +349,8 @@ impl ClustersModel {
     /// moment, in the core's gate too, before `settings.toml` is written.
     pub fn untrust_cluster(&mut self, cluster: ClusterId, cx: &mut Context<Self>) {
         self.last_error = None;
-        self.stopping_trust.insert(cluster.clone());
-        self.core.untrust(&cluster);
+        let request = self.core.untrust(&cluster);
+        self.stopping_trust.insert(cluster, request);
         cx.notify();
     }
 }
