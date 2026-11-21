@@ -224,6 +224,40 @@ pub fn out_of_scope(cluster: &str) -> PolicyError {
     PolicyError::ClusterNotFound(cluster.to_owned())
 }
 
+/// A scope with its hand-written kind names resolved against a cluster's kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKinds {
+    /// The scope with each name that resolved as its kind id. A name that did not stays as
+    /// written and matches nothing, so the list never becomes empty, which would mean every kind.
+    pub scope: AiScope,
+    /// The names that resolved to no kind, or to several.
+    pub unmatched: Vec<String>,
+}
+
+/// Resolves `scope`'s kind names as the tools resolve theirs ([`read::resolve_kind`]): `pod`,
+/// `Deployment` and `deploy` name the kind they do for `kubectl get`.
+pub fn resolve_scope_kinds(scope: &AiScope, kinds: &[KindInfo]) -> ResolvedKinds {
+    let mut names = Vec::with_capacity(scope.kinds.len());
+    let mut unmatched = Vec::new();
+    for name in &scope.kinds {
+        let is_id = kinds
+            .iter()
+            .any(|k| k.id().as_str().eq_ignore_ascii_case(name));
+        if is_id {
+            names.push(name.clone());
+        } else if let Ok(kind) = flint_core::read::resolve_kind(kinds, name, None) {
+            names.push(kind.id().as_str().to_owned());
+        } else {
+            names.push(name.clone());
+            unmatched.push(name.clone());
+        }
+    }
+    ResolvedKinds {
+        scope: AiScope::new(scope.namespaces.clone(), names),
+        unmatched,
+    }
+}
+
 /// The kinds of `kinds` the agent may read: those the scope allows. Under a namespace scope,
 /// cluster-scoped kinds only when the kinds scope names them. On a scoped cluster, events are
 /// read only through `get_events`, which drops those about objects out of scope: listed as a
@@ -732,6 +766,46 @@ mod tests {
             namespaces.iter().map(|s| (*s).to_owned()).collect(),
             kinds.iter().map(|s| (*s).to_owned()).collect(),
         )
+    }
+
+    // covers UP-14: a hand-written name resolves as it does for the tools.
+    #[test]
+    fn scope_kinds_resolve_like_the_tools() {
+        let mut deployments = kind("apps", "v1", "Deployment", "deployments", true);
+        deployments.short_names = vec!["deploy".into()];
+        let kinds = [
+            kind("", "v1", "Pod", "pods", true),
+            deployments,
+            kind("", "v1", "Node", "nodes", false),
+        ];
+        let resolved =
+            resolve_scope_kinds(&scoped(&["demo"], &["pod", "Deployment", "node"]), &kinds);
+        assert_eq!(resolved.unmatched, Vec::<String>::new());
+        assert_eq!(resolved.scope.kinds, ["deployments.apps", "nodes", "pods"]);
+        let ids = |scope: &AiScope| -> Vec<String> {
+            kinds_in_scope(scope, &kinds)
+                .iter()
+                .map(|k| k.id().as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(&resolved.scope).len(), 3, "nodes were named");
+        let short = resolve_scope_kinds(&scoped(&[], &["deploy"]), &kinds);
+        assert_eq!(ids(&short.scope), ["deployments.apps"]);
+    }
+
+    // covers UP-14: a name that matches nothing, or several kinds, grants nothing, and a scope
+    // of only such names never turns into the empty list that means everything.
+    #[test]
+    fn unmatched_scope_kinds_fail_closed() {
+        let kinds = [
+            kind("", "v1", "Pod", "pods", true),
+            kind("a.example.com", "v1", "Widget", "widgets", true),
+            kind("b.example.com", "v1", "Widget", "widgets", true),
+        ];
+        let resolved = resolve_scope_kinds(&scoped(&[], &["nope", "widgets"]), &kinds);
+        assert_eq!(resolved.unmatched, ["nope", "widgets"]);
+        assert!(!resolved.scope.is_everything());
+        assert!(kinds_in_scope(&resolved.scope, &kinds).is_empty());
     }
 
     // covers UP-14: the scope comes from the cluster's entry; one without a scope is whole.
