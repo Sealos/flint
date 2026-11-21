@@ -470,6 +470,19 @@ async fn a_masked_column_header_does_not_sort(cx: &mut TestAppContext) {
         assert_eq!(list.query.sort, None);
         assert!(list.view_state().sort.is_none());
     });
+    // The palette and automation refuse it up front instead of reporting a no-op.
+    list.read_with(cx, |list, _| {
+        let sort = |column: &str, key: Option<&str>| crate::ui::registry::SortBy {
+            column: column.into(),
+            key: key.map(str::to_owned),
+        };
+        assert!(list.check_sort(&sort("Token", None)).is_err());
+        assert!(list.check_sort(&sort("", Some("server:Token"))).is_err());
+        assert!(list.check_sort(&sort("Name", None)).is_ok());
+        let offered = list.drawn_column_names();
+        assert!(offered.iter().any(|c| c == "Name"), "{offered:?}");
+        assert!(!offered.iter().any(|c| c == "Token"), "{offered:?}");
+    });
     // A shown column still sorts.
     cx.update_window(window, |_, window, cx| window.click("sort-Name", cx))
         .unwrap();

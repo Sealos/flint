@@ -678,14 +678,6 @@ impl ResourceList {
         let Some(key) = self.sort_key(action) else {
             return;
         };
-        if self
-            .shown
-            .columns
-            .iter()
-            .any(|c| c.key() == key && self.is_masked(c))
-        {
-            return;
-        }
         self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
         cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
@@ -703,7 +695,7 @@ impl ResourceList {
     }
 
     /// Whether this list hides `column`'s values, so nothing may be derived from them.
-    fn is_masked(&self, column: &flint_core::Column) -> bool {
+    pub(super) fn is_masked(&self, column: &flint_core::Column) -> bool {
         is_masked_column(is_secret_list(self.kind.as_str()), &column.name)
     }
 
