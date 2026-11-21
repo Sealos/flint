@@ -108,8 +108,15 @@ impl Opening {
 /// Why Shell (and, later, any action that changes the cluster) cannot run on a protected
 /// cluster (ADR-0015), as the refusals, tooltips and menus say it.
 pub(in crate::ui) fn protected_reason(cluster: &str) -> String {
-    format!("{cluster} is protected (read-only in Flint) until you unlock it")
+    // The real name, never a custom one: it says which cluster is protected.
+    format!(
+        "{} is protected (read-only in Flint) until you unlock it",
+        flint_core::display::short_name(cluster)
+    )
 }
+
+/// [`protected_reason`] where the Unlock entry right after it names the cluster.
+pub(in crate::ui) const PROTECTED_NOTE: &str = "Protected: read-only until unlocked";
 
 /// A refusal as one sentence that names what was refused, then why: "Can't open a shell: no
 /// pod of Deployment web is ready." Every refusal the strip over the dock and the pane's

@@ -375,6 +375,11 @@ watch_mode = "all"                # or "on_view"
 [cluster_watch_mode]
 # big-prod-cluster = "on_view"
 
+# Names Flint shows for clusters, by context name (right-click a cluster to rename it). Flint only:
+# kubeconfig is not changed, and AI agents and shells keep the context name.
+[cluster_names]
+# "arn:aws:eks:eu-west-1:123456789012:cluster/example" = "example-eu"
+
 # Clusters flint mcp may see, written by the sidebar's Expose to AI toggle. Each entry is a
 # context name and the API server URL it pointed to when you exposed it; if the context later
 # points elsewhere, it is hidden from agents and the sidebar shows "Changed".
