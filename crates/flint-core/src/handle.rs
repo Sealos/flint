@@ -16,7 +16,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
-use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession};
+use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession, LaunchCheck};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
     Freshness, LogFilter, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget,
@@ -206,6 +206,11 @@ pub(crate) enum Request {
         /// shows another.
         server: Option<Option<String>>,
         reply: oneshot::Sender<Result<(GatedClient, ContextPin), WriteRefusal>>,
+    },
+    /// What the write gate says about `cluster` now, for a session about to run a command.
+    CheckWriteGate {
+        cluster: ClusterId,
+        reply: oneshot::Sender<Result<(), WriteRefusal>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
@@ -613,8 +618,9 @@ impl CoreHandle {
         let cluster = request.cluster.clone();
         self.runtime.spawn(async move {
             let client = client.await.map(|(client, pin)| {
+                let launch = launch_check(requests.clone(), cluster.clone());
                 let check = context_check(requests, cluster, pin);
-                (client, ContextWatch::new(check, RECHECK_EVERY))
+                (client, ContextWatch::new(check, launch, RECHECK_EVERY))
             });
             crate::exec::start(client, request, channels).await;
         });
@@ -963,6 +969,23 @@ fn context_check(
                 return None;
             }
             rx.await.ok().flatten()
+        })
+    })
+}
+
+/// Asks the cluster manager's write gate about `cluster`, each time it is called. With the core
+/// gone, the answer is a refusal.
+fn launch_check(requests: async_channel::Sender<Request>, cluster: ClusterId) -> LaunchCheck {
+    Arc::new(move || {
+        let requests = requests.clone();
+        let cluster = cluster.clone();
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            requests
+                .send(Request::CheckWriteGate { cluster, reply })
+                .await
+                .map_err(|_| WriteRefusal::Stopped)?;
+            rx.await.unwrap_or(Err(WriteRefusal::Stopped))
         })
     })
 }

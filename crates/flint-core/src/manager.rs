@@ -506,6 +506,9 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.shell_client(&cluster, server));
             }
+            Request::CheckWriteGate { cluster, reply } => {
+                let _ = reply.send(self.write_gate(&cluster).map(drop));
+            }
             Request::CheckContext {
                 cluster,
                 pin,
@@ -1118,23 +1121,33 @@ impl ClusterManager {
     /// The gate every action that changes a cluster, or runs code in it, goes through
     /// (ADR-0015): the cluster's client, unless the cluster is protected or not connected.
     fn write_client(&self, cluster: &str) -> Result<GatedClient, WriteRefusal> {
-        let not_connected = || WriteRefusal::NotConnected {
-            cluster: cluster.to_owned(),
-        };
-        // A context Flint does not know has no client either: say that, not "protected".
-        let slot = self.cluster(cluster).ok_or_else(not_connected)?;
-        let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
-        let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
-        if !protection.allows_changes() {
-            return Err(WriteRefusal::Protected {
+        let protection = self.write_gate(cluster)?;
+        self.cluster(cluster)
+            .and_then(|slot| slot.client.as_ref())
+            .ok_or_else(|| WriteRefusal::NotConnected {
                 cluster: cluster.to_owned(),
-            });
-        }
-        slot.client
-            .as_ref()
-            .ok_or_else(not_connected)?
+            })?
             .writes
             .grant(protection, cluster)
+    }
+
+    /// The cluster's protection now, if it allows changes.
+    fn write_gate(&self, cluster: &str) -> Result<crate::Protection, WriteRefusal> {
+        // A context Flint does not know has no client either: say that, not "protected".
+        let slot = self
+            .cluster(cluster)
+            .ok_or_else(|| WriteRefusal::NotConnected {
+                cluster: cluster.to_owned(),
+            })?;
+        let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
+        let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
+        if protection.allows_changes() {
+            Ok(protection)
+        } else {
+            Err(WriteRefusal::Protected {
+                cluster: cluster.to_owned(),
+            })
+        }
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -2263,8 +2276,10 @@ mod tests {
             manager.write_client("dev").err(),
             Some(not_connected.clone())
         );
+        assert!(manager.write_gate("dev").is_ok());
         unlocks.lock("dev");
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        assert_eq!(manager.write_gate("dev").err(), Some(protected("dev")));
 
         let mut trusted = Settings::default();
         trusted
