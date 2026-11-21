@@ -320,6 +320,33 @@ impl Engine {
         }
     }
 
+    /// Reports a relist of rows that were synced. Only that is errorless: a relist during an
+    /// outage keeps the error on show. A synced state still held for its snapshot was never
+    /// reported, so the trouble the hub last heard of still stands. The exception is a lane's
+    /// refusal: its list has just worked, and a merged list leaves out the rows of a failed
+    /// lane, so the lane reports a relist and its rows stay on show as not current.
+    fn begin_relist(&mut self) {
+        if !self.synced_once || self.state != SyncState::Synced {
+            return;
+        }
+        if self.synced_held {
+            let reported = self.hub.state();
+            let still_stands = match reported {
+                SyncState::Reconnecting { error: Some(_) } | SyncState::RetryingRefusal { .. } => {
+                    true
+                }
+                SyncState::Failed { .. } => self.namespace.is_none(),
+                _ => false,
+            };
+            if still_stands {
+                self.state = reported;
+                self.synced_held = false;
+                return;
+            }
+        }
+        self.set_state(SyncState::Reconnecting { error: None });
+    }
+
     /// When the next snapshot is due: never while nobody listens or nothing changed. A held
     /// synced state stays due, so it is reported even if the last listener has left.
     fn deadline(&self) -> Option<Instant> {
@@ -444,8 +471,8 @@ impl Engine {
                     });
                     self.denied_wait.next()
                 } else {
-                    self.set_state(SyncState::Reconnecting {
-                        error: Some(sync_error_text(m)),
+                    self.set_state(SyncState::RetryingRefusal {
+                        error: sync_error_text(m),
                     });
                     let n = self.denials.saturating_sub(1).min(8);
                     jittered(self.config.denied_backoff_min * 2u32.pow(n))
@@ -467,8 +494,8 @@ impl Engine {
     async fn watch_refused(&mut self, error: FetchError, retrying: bool) -> Option<Option<String>> {
         if !retrying && self.watch_denials < self.config.transient_denials {
             self.watch_denials += 1;
-            self.set_state(SyncState::Reconnecting {
-                error: Some(sync_error_text(&error.to_string())),
+            self.set_state(SyncState::RetryingRefusal {
+                error: sync_error_text(&error.to_string()),
             });
             let n = self.watch_denials.saturating_sub(1).min(8);
             self.pause(jittered(self.config.denied_backoff_min * 2u32.pow(n)))
@@ -489,12 +516,12 @@ impl Engine {
         // Set while trying a watch that was refused before: one refusal goes back to polling.
         let mut retrying_watch = false;
         'sync: loop {
+            // Before the backoff: a synced state held for its snapshot must not be published
+            // during it, since the watch that followed that list has already failed.
+            self.begin_relist();
             if expiries > 1 {
                 let delay = relist_backoff.next();
                 self.pause(delay).await;
-            }
-            if self.synced_once {
-                self.set_state(SyncState::Reconnecting { error: None });
             }
             let (mut rv, mut stream) = match self.initial_sync().await {
                 Ok(synced) => synced,
@@ -1064,11 +1091,8 @@ fn merge_lanes(
         .any(|v| v.state == SyncState::Loading || v.state == SyncState::Idle)
     {
         SyncState::Loading
-    } else if let Some(v) = open
-        .iter()
-        .find(|v| matches!(v.state, SyncState::Reconnecting { .. }))
-    {
-        v.state.clone()
+    } else if let Some(state) = most_troubled(open.iter().map(|v| &v.state)) {
+        state.clone()
     } else if lagging {
         SyncState::Reconnecting { error: None }
     } else {
@@ -1094,6 +1118,22 @@ fn merge_lanes(
         })),
         ..Default::default()
     }
+}
+
+/// The state a merged list reports for lanes that are retrying: a connection error first, so a
+/// refusal in one namespace cannot hide it, then a refusal, then a routine relist.
+pub(super) fn most_troubled<'a>(
+    states: impl Iterator<Item = &'a SyncState>,
+) -> Option<&'a SyncState> {
+    states
+        .filter_map(|state| match state {
+            SyncState::Reconnecting { error: Some(_) } => Some((0, state)),
+            SyncState::RetryingRefusal { .. } => Some((1, state)),
+            SyncState::Reconnecting { error: None } => Some((2, state)),
+            _ => None,
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, state)| state)
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
