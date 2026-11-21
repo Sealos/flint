@@ -141,13 +141,33 @@ pub fn managed_by<'a>(
     object: &Identity<'_>,
     read: impl Fn(&str) -> Option<&'a str>,
 ) -> Option<ManagedBy> {
+    let tracked = read(ARGO_TRACKING_ID).map(|id| tracking(id, object));
+    manager_from(tracked, read)
+}
+
+/// [`managed_by`] for an object as the API server returned it. Nothing has masked such an object,
+/// so an id that looks masked is an unreadable one.
+pub(crate) fn managed_by_live<'a>(
+    object: &Identity<'_>,
+    read: impl Fn(&str) -> Option<&'a str>,
+) -> Option<ManagedBy> {
+    let tracked = read(ARGO_TRACKING_ID).map(|id| match tracking(id, object) {
+        Tracking::Masked => Tracking::Unreadable,
+        other => other,
+    });
+    manager_from(tracked, read)
+}
+
+fn manager_from<'a>(
+    tracked: Option<Tracking<'_>>,
+    read: impl Fn(&str) -> Option<&'a str>,
+) -> Option<ManagedBy> {
     let plain = |key: &str| read(key).filter(|value| is_plain_name(value));
     let argo = |name: &str| ManagedBy {
         manager: Manager::ArgoCd,
         name: name.to_owned(),
         namespace: None,
     };
-    let tracked = read(ARGO_TRACKING_ID).map(|id| tracking(id, object));
     if let Some(Tracking::App(app)) = tracked {
         return Some(argo(app));
     }
@@ -183,10 +203,22 @@ pub fn managed_by<'a>(
 /// masked annotation counts as absent.
 pub fn managed_by_object(object: &Value) -> Option<ManagedBy> {
     let metadata = object.get("metadata")?;
-    let field = |map: &str, key: &str| metadata.get(map)?.get(key)?.as_str();
     managed_by(&Identity::of(object), |key| {
-        field("labels", key).or_else(|| field("annotations", key))
+        label_or_annotation(metadata, key)
     })
+}
+
+/// [`managed_by_live`] for an object as JSON.
+pub(crate) fn managed_by_live_object(object: &Value) -> Option<ManagedBy> {
+    let metadata = object.get("metadata")?;
+    managed_by_live(&Identity::of(object), |key| {
+        label_or_annotation(metadata, key)
+    })
+}
+
+fn label_or_annotation<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
+    let field = |map: &str| metadata.get(map)?.get(key)?.as_str();
+    field("labels").or_else(|| field("annotations"))
 }
 
 #[cfg(test)]
@@ -324,6 +356,51 @@ mod tests {
             );
             assert_eq!(shown(&secret), None, "{masked}");
         }
+    }
+
+    // covers UP-23: an object straight from the API server has no masks, so such an id is unreadable.
+    #[test]
+    fn a_live_object_with_a_masked_looking_id_counts_as_argo_cd() {
+        for id in [
+            "<redacted>",
+            "[REDACTED]:apps/Deployment:demo/web",
+            "shop\u{2022}:apps/Deployment:demo/web",
+        ] {
+            let live = object(json!({}), json!({ARGO_TRACKING_ID: id}));
+            assert_eq!(
+                managed_by_live_object(&live)
+                    .map(|m| m.to_string())
+                    .as_deref(),
+                Some("Argo CD: unknown application"),
+                "{id}"
+            );
+            assert_eq!(shown(&live), None, "{id}");
+        }
+        let labelled = object(
+            json!({APP_INSTANCE: "shop"}),
+            json!({ARGO_TRACKING_ID: "<redacted>"}),
+        );
+        assert_eq!(
+            managed_by_live_object(&labelled)
+                .map(|m| m.to_string())
+                .as_deref(),
+            Some("Argo CD: shop")
+        );
+    }
+
+    // covers UP-23: other ids read the same either way.
+    #[test]
+    fn a_live_object_with_a_plain_id_reads_as_usual() {
+        let tracked = object(
+            json!({}),
+            json!({ARGO_TRACKING_ID: "shop:apps/Deployment:demo/web"}),
+        );
+        assert_eq!(
+            managed_by_live_object(&tracked),
+            managed_by_object(&tracked)
+        );
+        let none = object(json!({}), json!({}));
+        assert_eq!(managed_by_live_object(&none), None);
     }
 
     // covers UP-23

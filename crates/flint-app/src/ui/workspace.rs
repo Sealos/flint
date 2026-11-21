@@ -1343,10 +1343,9 @@ impl Workspace {
             cluster.info.source.display()
         );
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
-        let (color, filled) = presence.dot(theme);
-        let dot = super::theme::status_dot(color, filled)
+        let dot = presence
+            .marker(theme)
             .id(SharedString::from(format!("cluster-dot-{name}")))
-            .size_2()
             .flex_none()
             .test_support();
 
