@@ -329,9 +329,23 @@ fn up_55_repointing_protects_again() -> Result<()> {
             Any(json!({"name": cluster.context, "protection": "protected"})),
         )?;
 
-        // The row only the second server has shows the app reads from it now.
-        connect(&app, &cluster.context)?;
-        app.open_view("deployments")?;
+        // The app reconnects by itself. Views can open again once it has reached the second
+        // server, and the row only that server has shows the list reads from it.
+        until(
+            "a request to the second server",
+            || other.requests().len(),
+            |count| *count > 0,
+        )?;
+        app.wait_for(
+            "/clusters",
+            Any(json!({"name": cluster.context, "connection": "connected"})),
+        )?;
+        app.wait_for("/nav/status", Equals("ready".into()))?;
+        until(
+            "the deployments view",
+            || app.open_view("deployments").is_ok(),
+            |opened| *opened,
+        )?;
         app.wait_for("/list/rows", Any(json!({"name": ONLY_ON_SECOND})))?;
         select(&app, Some("demo"), ONLY_ON_SECOND)?;
         for write in WRITES {
