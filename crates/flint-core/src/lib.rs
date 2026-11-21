@@ -34,6 +34,7 @@ pub mod terminal;
 pub mod view;
 mod watch;
 pub mod write;
+mod write_actions;
 
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{

@@ -16,6 +16,8 @@ pub enum Effect {
     ForbiddenAs(String),
     /// Any other error status (500, 429, 404...).
     Status(u16),
+    /// The 429 the Eviction API answers when a PodDisruptionBudget does not allow it.
+    DisruptionBudget,
     /// The response is sent normally after this delay.
     Delay(Duration),
     /// The connection is closed without a response.
@@ -76,6 +78,11 @@ impl Fault {
 
     pub fn status(code: u16) -> Self {
         Fault::new(Effect::Status(code))
+    }
+
+    /// A PodDisruptionBudget refuses the eviction ([`Effect::DisruptionBudget`]).
+    pub fn disruption_budget() -> Self {
+        Fault::new(Effect::DisruptionBudget)
     }
 
     /// Answers normally after `delay` ([`Effect::Delay`]).

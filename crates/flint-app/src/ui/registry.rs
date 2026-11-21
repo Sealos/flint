@@ -200,6 +200,25 @@ actions!(
     ]
 );
 actions!(
+    workspace,
+    [
+        /// Delete the selected object, after a review and a confirmation.
+        DeleteObject,
+        /// Ask for a replica count for the selected workload, then review and confirm it.
+        ScaleObject,
+        /// Restart the selected workload's pods, after a review and a confirmation.
+        RestartObject,
+        /// Stop new pods landing on the selected node, after a review and a confirmation.
+        CordonNode,
+        /// Let new pods land on the selected node again, after a review and a confirmation.
+        UncordonNode,
+        /// Ask what a drain of the selected node may evict, then review and confirm it.
+        DrainNode,
+        /// Open the report of the latest drain that ended.
+        ShowDrainReport
+    ]
+);
+actions!(
     terminal,
     [
         /// Copy the text selected in the shell tab.
@@ -360,6 +379,25 @@ pub struct ToggleScopeKind {
 #[serde(deny_unknown_fields)]
 pub struct UnlockCluster {
     pub cluster: String,
+}
+
+/// What a drain may also evict, beyond what it evicts by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainOption {
+    /// Pods with `emptyDir` volumes, whose data is lost.
+    #[default]
+    DeleteEmptydirData,
+    /// Pods without a controller, which nothing recreates.
+    Force,
+}
+
+/// In the drain dialog: turn one of its options on or off.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = resource_actions, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleDrainOption {
+    pub option: DrainOption,
 }
 
 /// Choose the name Flint shows for a cluster: opens a dialog naming its context and server.
@@ -1673,6 +1711,11 @@ const fn arg(name: &'static str, description: &'static str, kind: ArgKind) -> Ar
 }
 
 const CLUSTER: &[Arg] = &[arg("cluster", "kubeconfig context name", ArgKind::Cluster)];
+const DRAIN_OPTION: &[Arg] = &[arg(
+    "option",
+    "what the drain may also evict",
+    ArgKind::Choice(&["delete_emptydir_data", "force"]),
+)];
 const SCOPE_NAMESPACE: &[Arg] = &[arg("namespace", "namespace name", ArgKind::Text)];
 const SCOPE_KIND: &[Arg] = &[arg(
     "kind",
@@ -2274,6 +2317,49 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             SHELL_CONTAINER,
         )
         .of(C::Terminal, S::Detail),
+        Spec::unit::<DeleteObject>(
+            "Delete Selected Object",
+            "Delete the selected object, after a review and a confirmation naming it.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<ScaleObject>(
+            "Scale Selected Workload",
+            "Ask for a replica count for the selected workload, then review and confirm it.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<RestartObject>(
+            "Restart Selected Workload",
+            "Restart the pods of the selected Deployment, DaemonSet or StatefulSet, after a \
+             confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<CordonNode>(
+            "Cordon Selected Node",
+            "Stop new pods landing on the selected node, after a confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<UncordonNode>(
+            "Uncordon Selected Node",
+            "Let new pods land on the selected node again, after a confirmation.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<DrainNode>(
+            "Drain Selected Node",
+            "Choose what a drain of the selected node may evict, then review and confirm it.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<ShowDrainReport>(
+            "Show Drain Report",
+            "Open what the latest drain did, also when it stopped early.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::with_args::<ToggleDrainOption>(
+            "Toggle Drain Option…",
+            "In the drain dialog, turn an option on or off.",
+            DRAIN_OPTION,
+        )
+        .of(C::Detail, S::Dialog)
+        .hidden(),
         Spec::with_args::<OpenSelectorLogs>(
             "Open Logs by Label Selector…",
             "Open the merged logs of every pod matching a label selector on the active cluster, in the dock.",

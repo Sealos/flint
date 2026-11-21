@@ -7,7 +7,7 @@ use std::rc::Rc;
 use flint_core::CoreHandle;
 use flint_core::display::ClusterNames;
 use flint_core::write::{
-    WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
+    ResourceChange, WriteAction, WriteError, WriteOutcome, WriteReview, WriteTarget, WriteWarning,
 };
 use gpui_kit::*;
 
@@ -29,13 +29,111 @@ fn wording(action: &WriteAction) -> Wording {
             ok: "Apply",
             deliberate: false,
         },
+        WriteAction::Resource(action) => change_wording(action.change()),
         // An action this version does not word: the careful default.
-        _ => Wording {
-            title: "Change",
-            ok: "Confirm",
-            deliberate: true,
-        },
+        _ => CAREFUL,
     }
+}
+
+/// The wording of an action this version does not know.
+const CAREFUL: Wording = Wording {
+    title: "Change",
+    ok: "Confirm",
+    deliberate: true,
+};
+
+/// What a drain does whatever its options: as `kubectl drain`, it removes pods that have ended,
+/// also without a controller or with `emptyDir` volumes.
+pub(in crate::ui) const COMPLETED_PODS: &str =
+    "Completed and failed pods are removed whatever these options say.";
+
+/// How a resource action is worded. Delete and Drain cannot be got back: Enter cancels them.
+fn change_wording(change: &ResourceChange) -> Wording {
+    let (title, ok, deliberate) = match change {
+        ResourceChange::Delete => ("Delete", "Delete", true),
+        ResourceChange::Scale { .. } => ("Scale", "Scale", false),
+        ResourceChange::RolloutRestart => ("Restart", "Restart", false),
+        ResourceChange::Cordon => ("Cordon", "Cordon", false),
+        ResourceChange::Uncordon => ("Uncordon", "Uncordon", false),
+        ResourceChange::Drain { .. } => ("Drain", "Drain", true),
+        _ => return CAREFUL,
+    };
+    Wording {
+        title,
+        ok,
+        deliberate,
+    }
+}
+
+/// What a resource action will do, as the confirmation says it.
+fn change_lines(change: &ResourceChange) -> Vec<String> {
+    match change {
+        ResourceChange::Delete => vec!["This cannot be undone.".to_owned()],
+        ResourceChange::Scale { from, to } if from == to => {
+            vec![format!("Replicas: {from} (no change).")]
+        }
+        ResourceChange::Scale { from, to: 0 } => vec![
+            format!("Replicas: {from} to 0."),
+            "Every pod of this workload stops.".to_owned(),
+        ],
+        ResourceChange::Scale { from, to } => vec![format!("Replicas: {from} to {to}.")],
+        ResourceChange::RolloutRestart => {
+            vec!["Replaces its pods, following its update strategy.".to_owned()]
+        }
+        ResourceChange::Cordon => {
+            vec!["No new pods land on this node. Its pods keep running.".to_owned()]
+        }
+        ResourceChange::Uncordon => vec!["New pods can land on this node again.".to_owned()],
+        ResourceChange::Drain {
+            delete_emptydir_data,
+            force,
+        } => {
+            let mut lines = vec![
+                "Cordons the node and evicts its pods. DaemonSet and mirror pods stay.".to_owned(),
+                COMPLETED_PODS.to_owned(),
+            ];
+            lines.push(if *delete_emptydir_data {
+                "Pods with emptyDir volumes are evicted: their emptyDir data is lost.".to_owned()
+            } else {
+                "Other pods with emptyDir volumes stay, and are reported.".to_owned()
+            });
+            lines.push(if *force {
+                "Pods without a controller are evicted: nothing recreates them.".to_owned()
+            } else {
+                "Other pods without a controller stay, and are reported.".to_owned()
+            });
+            lines
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// What a reviewed action will do, for the confirmation; nothing for a YAML edit, whose review
+/// is its diff.
+fn action_lines(action: &WriteAction) -> Vec<String> {
+    match action {
+        WriteAction::Resource(action) => change_lines(action.change()),
+        _ => Vec::new(),
+    }
+}
+
+/// How many managed pods a drain's warning names.
+const WARNED_PODS: usize = 5;
+
+/// A drain's warning about `pods`, each already worded with what manages it.
+fn evicts_managed_text(pods: &[String]) -> String {
+    let count = match pods.len() {
+        1 => "1 pod".to_owned(),
+        n => format!("{n} pods"),
+    };
+    let mut named = pods[..pods.len().min(WARNED_PODS)].to_vec();
+    if pods.len() > WARNED_PODS {
+        named.push(format!("and {} more", pods.len() - WARNED_PODS));
+    }
+    format!(
+        "Evicts {count} managed by GitOps, which will likely be put back on the next sync: {}.",
+        named.join(", ")
+    )
 }
 
 /// What a warning says.
@@ -44,6 +142,12 @@ fn warning_text(warning: &WriteWarning) -> String {
         WriteWarning::LikelyReverted(managed) => {
             format!("Managed by {managed}. This change will likely be reverted on the next sync.")
         }
+        WriteWarning::EvictsManaged(pods) => evicts_managed_text(
+            &pods
+                .iter()
+                .map(|p| format!("{}/{} ({})", p.pod.namespace, p.pod.name, p.managed))
+                .collect::<Vec<_>>(),
+        ),
         // A warning this version does not word must still stop and be read.
         _ => "Flint has a warning about this change that this version cannot describe.".to_owned(),
     }
@@ -52,14 +156,31 @@ fn warning_text(warning: &WriteWarning) -> String {
 /// The dialog for a change to `target`: what it does, warnings first, then exactly which object
 /// on which cluster. `shown` is what the cluster is called, with its real name if it has a
 /// custom one.
+#[cfg(test)]
 fn dialog_text(
     target: &WriteTarget,
     wording: Wording,
     warnings: &[WriteWarning],
     shown: &str,
 ) -> DialogText {
+    dialog_text_saying(target, wording, warnings, &[], shown)
+}
+
+/// The dialog for a change, with `saying` (why it is asked again, what the action does) after the
+/// warnings and before the object's details.
+fn dialog_text_saying(
+    target: &WriteTarget,
+    wording: Wording,
+    warnings: &[WriteWarning],
+    saying: &[String],
+    shown: &str,
+) -> DialogText {
     let mut lines: Vec<String> = warnings.iter().map(warning_text).collect();
     if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    if !saying.is_empty() {
+        lines.extend_from_slice(saying);
         lines.push(String::new());
     }
     lines.push(format!("Context: {}", target.cluster));
@@ -96,29 +217,40 @@ pub fn open(
     names: &ClusterNames,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
-    open_with(window, cx, core, review, names, |_| {}, on_done);
+    open_noted(window, cx, core, review, names, None, |_| true, on_done);
 }
 
-/// [`open`], calling `on_start` once the confirmation is accepted, before the write runs.
-pub fn open_with(
+/// [`open`], first saying `note` (why this review was opened again). Confirming asks `begin`
+/// right before the write: `false` runs nothing and does not call `on_done`.
+#[allow(clippy::too_many_arguments)]
+pub fn open_noted(
     window: &mut Window,
     cx: &mut App,
     core: CoreHandle,
     review: WriteReview,
     names: &ClusterNames,
-    on_start: impl Fn(&mut App) + 'static,
+    note: Option<&str>,
+    begin: impl Fn(&mut App) -> bool + 'static,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
     let shown = names.with_real(&review.target().cluster);
-    let text = dialog_text(
+    let saying: Vec<String> = note
+        .map(str::to_owned)
+        .into_iter()
+        .chain(action_lines(review.action()))
+        .collect();
+    let text = dialog_text_saying(
         review.target(),
         wording(review.action()),
         review.warnings(),
+        &saying,
         &shown,
     );
     let on_done = Rc::new(on_done);
     confirm::open(window, cx, text, move |_, cx| {
-        on_start(cx);
+        if !begin(cx) {
+            return;
+        }
         let run = core.run_write(review.clone().into_intent());
         let on_done = on_done.clone();
         cx.spawn(async move |cx| {
@@ -135,7 +267,12 @@ mod tests {
     use flint_core::gitops::{ManagedBy, Manager};
     use flint_core::write::{WriteTarget, WriteWarning};
 
-    use super::{Wording, dialog_text, warning_text};
+    use flint_core::write::ResourceChange;
+
+    use super::{
+        Wording, change_lines, change_wording, dialog_text, dialog_text_saying,
+        evicts_managed_text, warning_text,
+    };
 
     const APPLY: Wording = Wording {
         title: "Apply changes to",
@@ -191,6 +328,119 @@ mod tests {
             ..APPLY
         };
         assert!(dialog_text(&target(), deliberate, &[], "prod").default_cancel);
+    }
+
+    // covers UP-53: each action says what it does; Delete and Drain take the button, and Scale
+    // shows both counts.
+    #[test]
+    fn each_resource_action_is_worded() {
+        for (change, ok, deliberate) in [
+            (ResourceChange::Delete, "Delete", true),
+            (ResourceChange::Scale { from: 3, to: 5 }, "Scale", false),
+            (ResourceChange::RolloutRestart, "Restart", false),
+            (ResourceChange::Cordon, "Cordon", false),
+            (ResourceChange::Uncordon, "Uncordon", false),
+            (
+                ResourceChange::Drain {
+                    delete_emptydir_data: false,
+                    force: false,
+                },
+                "Drain",
+                true,
+            ),
+        ] {
+            let wording = change_wording(&change);
+            assert_eq!((wording.ok, wording.deliberate), (ok, deliberate));
+            let text = dialog_text_saying(&target(), wording, &[], &change_lines(&change), "prod");
+            assert_eq!(text.default_cancel, deliberate, "{ok}");
+            assert_eq!(text.title, format!("{ok} web on prod?"));
+            assert!(text.text.contains("Context: "), "{}", text.text);
+        }
+        assert_eq!(
+            change_lines(&ResourceChange::Scale { from: 3, to: 5 }),
+            ["Replicas: 3 to 5."]
+        );
+        assert_eq!(
+            change_lines(&ResourceChange::Scale { from: 3, to: 0 }),
+            ["Replicas: 3 to 0.", "Every pod of this workload stops."]
+        );
+    }
+
+    // covers UP-53: a drain's confirmation says what each option loses, and what stays without it.
+    #[test]
+    fn a_drain_says_what_its_options_lose() {
+        let with = change_lines(&ResourceChange::Drain {
+            delete_emptydir_data: true,
+            force: true,
+        })
+        .join("\n");
+        assert!(with.contains("emptyDir data is lost"), "{with}");
+        assert!(with.contains("nothing recreates them"), "{with}");
+        let without = change_lines(&ResourceChange::Drain {
+            delete_emptydir_data: false,
+            force: false,
+        })
+        .join("\n");
+        assert!(without.contains("emptyDir volumes stay"), "{without}");
+        assert!(without.contains("without a controller stay"), "{without}");
+    }
+
+    // covers UP-53: with or without its options, a drain says it removes pods that have ended.
+    #[test]
+    fn a_drain_says_completed_pods_are_removed() {
+        for (delete_emptydir_data, force) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let lines = change_lines(&ResourceChange::Drain {
+                delete_emptydir_data,
+                force,
+            });
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l
+                        == "Completed and failed pods are removed whatever these options say."),
+                "{lines:?}"
+            );
+        }
+    }
+
+    // covers UP-51, UP-53: warnings come first, then what the action does, then the object.
+    #[test]
+    fn a_warning_comes_before_what_the_action_does() {
+        let warning = WriteWarning::LikelyReverted(ManagedBy {
+            manager: Manager::FluxKustomization,
+            name: "apps".to_owned(),
+            namespace: None,
+        });
+        let lines = change_lines(&ResourceChange::Scale { from: 1, to: 2 });
+        let text = dialog_text_saying(
+            &target(),
+            change_wording(&ResourceChange::Delete),
+            &[warning],
+            &lines,
+            "p",
+        )
+        .text;
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in {text}"));
+        assert!(at("Managed by") < at("Replicas: 1 to 2."));
+        assert!(at("Replicas: 1 to 2.") < at("Context: "));
+    }
+
+    // covers UP-51, UP-53: a drain names the managed pods it would evict, up to a limit.
+    #[test]
+    fn a_drain_warning_names_the_managed_pods() {
+        let one = evicts_managed_text(&["demo/web (Flux: apps)".to_owned()]);
+        assert_eq!(
+            one,
+            "Evicts 1 pod managed by GitOps, which will likely be put back on the next sync: \
+             demo/web (Flux: apps)."
+        );
+        let many: Vec<String> = (0..7).map(|n| format!("demo/p{n} (Flux: apps)")).collect();
+        let text = evicts_managed_text(&many);
+        assert!(text.starts_with("Evicts 7 pods"), "{text}");
+        assert!(text.contains("p4") && !text.contains("p5"), "{text}");
+        assert!(text.ends_with("and 2 more."), "{text}");
     }
 
     // covers UP-51: a GitOps warning names what manages the object and says "likely", above
