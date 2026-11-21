@@ -1279,11 +1279,11 @@ impl ResourceList {
             s @ SyncState::RetryingRefusal { .. } if s.is_checking_access() && !has_rows => None,
             s @ SyncState::RetryingRefusal { error, .. } if s.is_checking_access() => Some((
                 theme.muted_foreground,
-                format!("Checking access. These rows may be out of date: {error}"),
+                self.access_banner("Checking access", error),
             )),
             s @ SyncState::Failed { error, .. } if s.is_no_access() && has_rows => Some((
                 theme.muted_foreground,
-                format!("No access. These rows may be out of date: {error}"),
+                self.access_banner("No access", error),
             )),
             SyncState::Reconnecting { error: Some(e) }
             | SyncState::RetryingRefusal { error: e, .. } => Some((
@@ -1312,6 +1312,16 @@ impl ResourceList {
             );
         }
         banners
+    }
+
+    /// The banner for a denial over cached rows. Only rows the filters leave on show can be
+    /// called out of date.
+    fn access_banner(&self, status: &str, error: &str) -> String {
+        if self.rows.is_empty() {
+            format!("{status}: {error}")
+        } else {
+            format!("{status}. These rows may be out of date: {error}")
+        }
     }
 }
 

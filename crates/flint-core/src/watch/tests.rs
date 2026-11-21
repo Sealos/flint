@@ -915,7 +915,9 @@ fn a_merged_list_reports_a_connection_error_over_a_refusal() {
     let refused = refusal("forbidden");
     let pick = |states: &[&SyncState]| engine::most_troubled(states.iter().copied()).cloned();
     assert_eq!(pick(&[&refused, &relist, &down]), Some(down.clone()));
-    assert_eq!(pick(&[&relist, &refused]), Some(refused.clone()));
+    // A denial must not hide another namespace's recovery.
+    assert_eq!(pick(&[&relist, &refused]), Some(relist.clone()));
+    assert_eq!(pick(&[&SyncState::Synced, &refused]), Some(refused.clone()));
     assert_eq!(pick(&[&SyncState::Synced, &relist]), Some(relist));
     assert_eq!(pick(&[&SyncState::Synced]), None);
 }

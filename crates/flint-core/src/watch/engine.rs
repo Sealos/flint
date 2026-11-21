@@ -1112,15 +1112,10 @@ fn merge_lanes(
                      them one by one."
                 ),
             },
-            cause: match denied.split_first() {
-                None => Some(refusal),
-                Some((first, rest)) => {
-                    let cause = failed_cause(&first.state);
-                    rest.iter()
-                        .all(|v| failed_cause(&v.state) == cause)
-                        .then_some(cause)
-                        .flatten()
-                }
+            cause: if denied.is_empty() {
+                Some(refusal)
+            } else {
+                shared_cause(denied.iter().map(|v| &v.state))
             },
         }
     } else if open
@@ -1130,19 +1125,11 @@ fn merge_lanes(
         SyncState::Loading
     } else if let Some(state) = most_troubled(open.iter().map(|v| &v.state)) {
         match state {
-            // A lane that settled on another cause keeps this from reading as a denial.
-            SyncState::RetryingRefusal {
-                error,
-                cause: Some(RefusalCause::Denied),
-            } if denied
-                .iter()
-                .any(|v| failed_cause(&v.state) != Some(RefusalCause::Denied)) =>
-            {
-                SyncState::RetryingRefusal {
-                    error: error.clone(),
-                    cause: None,
-                }
-            }
+            // The message of the most useful lane, the cause of them all.
+            SyncState::RetryingRefusal { error, .. } => SyncState::RetryingRefusal {
+                error: error.clone(),
+                cause: shared_cause(views.iter().map(|v| &v.state)),
+            },
             other => other.clone(),
         }
     } else if lagging {
@@ -1172,12 +1159,14 @@ fn merge_lanes(
     }
 }
 
-/// The cause of a lane's final refusal.
-fn failed_cause(state: &SyncState) -> Option<RefusalCause> {
-    match state {
-        SyncState::Failed { cause, .. } => *cause,
+/// The cause every refusal among `states` shares, retrying or settled. `None` when they differ.
+fn shared_cause<'a>(states: impl Iterator<Item = &'a SyncState>) -> Option<RefusalCause> {
+    let mut causes = states.filter_map(|state| match state {
+        SyncState::Failed { cause, .. } | SyncState::RetryingRefusal { cause, .. } => Some(*cause),
         _ => None,
-    }
+    });
+    let first = causes.next()??;
+    causes.all(|cause| cause == Some(first)).then_some(first)
 }
 
 /// The server's message and cause when `error` is a refusal (403 or 404).
@@ -1190,8 +1179,9 @@ fn refusal_of(error: &FetchError) -> Option<(&str, RefusalCause)> {
 }
 
 /// The state a merged list reports for lanes that are retrying: a connection error first, so a
-/// refusal in one namespace cannot hide it, then a refusal, then a routine relist. A denial ranks
-/// after other refusals, so it is reported only when every refusing lane is denied.
+/// refusal in one namespace cannot hide it, then a refusal that is not a denial, then a relist,
+/// then a denial. A denial ranks last so it cannot hide another lane's recovery, and is reported
+/// only when no lane is reconnecting and every refusing lane is denied.
 pub(super) fn most_troubled<'a>(
     states: impl Iterator<Item = &'a SyncState>,
 ) -> Option<&'a SyncState> {
@@ -1201,9 +1191,9 @@ pub(super) fn most_troubled<'a>(
             SyncState::RetryingRefusal {
                 cause: Some(RefusalCause::Denied),
                 ..
-            } => Some((2, state)),
+            } => Some((3, state)),
             SyncState::RetryingRefusal { .. } => Some((1, state)),
-            SyncState::Reconnecting { error: None } => Some((3, state)),
+            SyncState::Reconnecting { error: None } => Some((2, state)),
             _ => None,
         })
         .min_by_key(|(rank, _)| *rank)
@@ -1461,15 +1451,38 @@ mod tests {
         use RefusalCause::{Denied, NotFound};
         let all_denied = merged_state(vec![retrying("x", Denied), retrying("y", Denied)]);
         assert_eq!(cause_of(&all_denied), Some(Denied));
+        // Mixed is `None` whichever lane comes first and whether a lane retries or has settled.
         for states in [
             vec![retrying("x", Denied), retrying("y", NotFound)],
             vec![retrying("x", NotFound), retrying("y", Denied)],
+            vec![failed("x", NotFound), retrying("y", Denied)],
+            vec![failed("x", Denied), retrying("y", NotFound)],
         ] {
-            assert_ne!(cause_of(&merged_state(states)), Some(Denied));
+            let mixed = merged_state(states);
+            assert!(
+                matches!(mixed, SyncState::RetryingRefusal { .. }),
+                "{mixed:?}"
+            );
+            assert_eq!(cause_of(&mixed), None);
         }
-        // A lane that settled as missing counts too.
-        let settled = merged_state(vec![failed("x", NotFound), retrying("y", Denied)]);
-        assert_ne!(cause_of(&settled), Some(Denied));
+        let same = merged_state(vec![failed("x", Denied), retrying("y", Denied)]);
+        assert_eq!(cause_of(&same), Some(Denied));
+    }
+
+    // covers UP-27
+    #[tokio::test]
+    async fn a_relist_in_one_lane_is_not_hidden_by_a_denial_in_another() {
+        use RefusalCause::{Denied, NotFound};
+        let relist = SyncState::Reconnecting { error: None };
+        for states in [
+            vec![relist.clone(), retrying("x", Denied)],
+            vec![retrying("x", Denied), relist.clone()],
+        ] {
+            assert_eq!(merged_state(states), relist);
+        }
+        // Other refusals already read as reconnecting and keep their error.
+        let missing = merged_state(vec![relist.clone(), retrying("x", NotFound)]);
+        assert_eq!(cause_of(&missing), Some(NotFound));
     }
 
     #[test]
