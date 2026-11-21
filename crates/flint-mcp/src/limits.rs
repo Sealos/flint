@@ -37,6 +37,10 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 /// long closing the transport waits for a write that is stuck.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Bytes of input read ahead, as serialized, past which no more is read while replies pass the
+/// budget ([`Counted`]).
+const READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
+
 /// The limits of one server.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -431,12 +435,16 @@ pub(crate) struct Counted<T> {
     unanswered: usize,
     /// How long after stdin ended the server waits with no reply written.
     quiet: Duration,
-    /// Up to [`Limits::unanswered`] messages read while replies pass the budget and not acted on
-    /// yet, so the end of stdin is still seen. Kept here because rmcp drops the `receive` future
-    /// whenever something else is ready. The stdio transport discards a line over 16 MiB (rmcp's
-    /// `DEFAULT_MAX_LINE_LENGTH`), so at the default limit of 128 this holds at most about 2 GiB
-    /// of JSON, and more once parsed, for a client that sends that much and stops reading stdout.
-    read_ahead: VecDeque<RxJsonRpcMessage<RoleServer>>,
+    /// Messages read while replies pass the budget and not acted on yet, each with its size, so
+    /// the end of stdin is still seen. Kept here because rmcp drops the `receive` future whenever
+    /// something else is ready. Reading stops at [`Limits::unanswered`] messages or once
+    /// `read_ahead_budget` bytes are held. An empty queue always takes one more message, so one
+    /// larger than the budget still proceeds: the stdio transport discards a line over 16 MiB
+    /// (rmcp's `DEFAULT_MAX_LINE_LENGTH`), so this holds less than 24 MiB of JSON.
+    read_ahead: VecDeque<(RxJsonRpcMessage<RoleServer>, usize)>,
+    /// Bytes of the messages in `read_ahead`.
+    read_ahead_bytes: usize,
+    read_ahead_budget: usize,
     /// Set once stdin has ended.
     closed: Option<Closed>,
 }
@@ -450,9 +458,32 @@ impl<T> Counted<T> {
             unanswered: limits.unanswered,
             quiet: limits.deadline + SHUTDOWN_GRACE,
             read_ahead: VecDeque::new(),
+            read_ahead_bytes: 0,
+            read_ahead_budget: READ_AHEAD_BYTES,
             closed: None,
         }
     }
+}
+
+/// Counts what is written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The size of `message` as JSON, without building it in memory.
+fn serialized_len(message: &RxJsonRpcMessage<RoleServer>) -> Option<usize> {
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, message).ok()?;
+    Some(count.0)
 }
 
 /// The request a reply answers, if it is one.
@@ -532,8 +563,9 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
 
     /// The next message for rmcp. Nothing is acted on while replies not written pass the budget:
     /// a client that does not read stdout gets nothing more run or answered (refusals and replies
-    /// to other requests included) until it does. Up to [`Limits::unanswered`] messages are read
-    /// ahead meanwhile, so the end of stdin is seen. Otherwise reading goes on, so a cancellation
+    /// to other requests included) until it does. A bounded queue of messages is read ahead
+    /// meanwhile (`read_ahead`), so the end of stdin is seen unless more than that is waiting.
+    /// Otherwise reading goes on, so a cancellation
     /// always gets through. A request read while [`Limits::unanswered`] are not done with is
     /// refused here at once ("busy"), as is one whose id is still in flight; a tool call refused
     /// so is recorded. When the client closes its end, the stream ends once every request read is
@@ -541,17 +573,24 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
     /// [`Limits::deadline`] plus [`SHUTDOWN_GRACE`] (rmcp waits only briefly for running handlers
     /// after it ends).
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
-        let (replies, budget, most, quiet) = (
+        let (replies, budget, most, quiet, ahead_budget) = (
             self.replies.clone(),
             self.budget,
             self.unanswered,
             self.quiet,
+            self.read_ahead_budget,
         );
-        let (inner, read_ahead, closed) = (&mut self.inner, &mut self.read_ahead, &mut self.closed);
+        let (inner, read_ahead, ahead_bytes, closed) = (
+            &mut self.inner,
+            &mut self.read_ahead,
+            &mut self.read_ahead_bytes,
+            &mut self.closed,
+        );
         async move {
             loop {
                 let over = replies.outstanding() > budget;
-                let Some(message) = (!over).then(|| read_ahead.pop_front()).flatten() else {
+                let Some((message, size)) = (!over).then(|| read_ahead.pop_front()).flatten()
+                else {
                     if let Some(wait) = closed {
                         let written = replies.written.load(Ordering::Acquire);
                         if written != wait.written {
@@ -576,13 +615,18 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                         if !queued && replies.idle() {
                             return None;
                         }
-                    } else if read_ahead.len() >= most {
+                    } else if read_ahead.len() >= most || *ahead_bytes >= ahead_budget {
                         replies.within(budget).await;
                     } else {
                         tokio::select! {
                             biased;
                             message = inner.receive() => match message {
-                                Some(message) => read_ahead.push_back(message),
+                                Some(message) => {
+                                    // Unmeasurable counts as the whole budget: reading stops.
+                                    let size = serialized_len(&message).unwrap_or(ahead_budget);
+                                    *ahead_bytes += size;
+                                    read_ahead.push_back((message, size));
+                                }
                                 None => {
                                     *closed = Some(Closed {
                                         written: replies.written.load(Ordering::Acquire),
@@ -595,6 +639,7 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                     }
                     continue;
                 };
+                *ahead_bytes -= size;
                 match &message {
                     JsonRpcMessage::Request(request) => {
                         let id = &request.id;

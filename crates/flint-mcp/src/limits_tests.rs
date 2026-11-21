@@ -171,6 +171,68 @@ async fn the_wait_after_stdin_ends_is_bounded() {
     assert_eq!(replies.unanswered_count(), 1, "nothing read ahead was run");
 }
 
+/// The id of a request.
+fn request_id(message: &RxJsonRpcMessage<RoleServer>) -> Option<RequestId> {
+    match message {
+        JsonRpcMessage::Request(request) => Some(request.id.clone()),
+        _ => None,
+    }
+}
+
+// covers UP-08: while replies pass the budget, reading ahead stops at the byte budget, and once
+// they are written the queue drains in order and reading resumes.
+#[tokio::test]
+async fn read_ahead_stops_at_its_byte_budget_and_resumes() {
+    let replies = Arc::new(ReplyBytes::default());
+    let incoming = [tool_call(1), tool_call(2), tool_call(3), tool_call(4)];
+    let size = serialized_len(&incoming[0]).unwrap();
+    let mut transport = Counted::new(Gated::new(incoming), replies.clone(), &limits(1, 1));
+    transport.read_ahead_budget = 2 * size;
+    let stuck = replies.hold(1001);
+    assert!(poll_once(&mut Box::pin(transport.receive())).is_none());
+    assert_eq!(transport.read_ahead.len(), 2);
+    assert_eq!(transport.read_ahead_bytes, 2 * size);
+    assert_eq!(transport.inner.incoming.len(), 2, "the rest stays unread");
+
+    drop(stuck);
+    for id in 1..=4 {
+        let message = transport.receive().await.unwrap();
+        assert_eq!(
+            request_id(&message),
+            Some(rmcp::model::NumberOrString::Number(id))
+        );
+        replies.answered(&rmcp::model::NumberOrString::Number(id));
+    }
+    assert_eq!(transport.read_ahead_bytes, 0, "each size is released");
+    assert!(transport.read_ahead.is_empty());
+}
+
+// covers UP-08: one message larger than the byte budget is still read and proceeds, so the
+// server cannot wedge on it; nothing more is read behind it meanwhile.
+#[tokio::test]
+async fn a_message_over_the_read_ahead_budget_still_proceeds() {
+    let replies = Arc::new(ReplyBytes::default());
+    let mut transport = Counted::new(
+        Gated::new([tool_call(1), tool_call(2)]),
+        replies.clone(),
+        &limits(1, 1),
+    );
+    transport.read_ahead_budget = 1;
+    let stuck = replies.hold(1001);
+    assert!(poll_once(&mut Box::pin(transport.receive())).is_none());
+    assert_eq!(transport.read_ahead.len(), 1);
+    assert_eq!(transport.inner.incoming.len(), 1);
+
+    drop(stuck);
+    let first = transport.receive().await.unwrap();
+    assert_eq!(
+        request_id(&first),
+        Some(rmcp::model::NumberOrString::Number(1))
+    );
+    assert_eq!(transport.read_ahead_bytes, 0);
+    assert!(transport.receive().await.is_some(), "reading goes on");
+}
+
 // covers UP-08: a client that closed stdin and keeps reading stdout gets its slower calls
 // answered: each reply written moves the wait on.
 #[tokio::test(start_paused = true)]
