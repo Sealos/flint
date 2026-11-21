@@ -10,6 +10,7 @@ mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;
+mod credential;
 pub mod discovery;
 pub mod display;
 pub mod env_path;
