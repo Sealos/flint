@@ -9,6 +9,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::table::unix_now;
 use flint_core::{
     Cell, ClusterId, ColumnRole, CoreHandle, Feed, KindId, KindSnapshot, ListFormat, NavEntry, Row,
@@ -494,7 +495,7 @@ impl ResourceList {
             sort: list_model::resolve_sort(
                 &snapshot.columns,
                 self.query.sort.as_ref(),
-                &self.drawn_in(&snapshot.columns),
+                &self.sortable_in(&snapshot.columns),
             ),
         };
         self.sort_drawn = query.sort.is_some();
@@ -534,7 +535,7 @@ impl ResourceList {
                 let now = list_model::resolve_sort(
                     &snapshot.columns,
                     list.query.sort.as_ref(),
-                    &list.drawn_in(&snapshot.columns),
+                    &list.sortable_in(&snapshot.columns),
                 );
                 if now != job_sort {
                     list.remeasure |= restart;
@@ -677,6 +678,14 @@ impl ResourceList {
         let Some(key) = self.sort_key(action) else {
             return;
         };
+        if self
+            .shown
+            .columns
+            .iter()
+            .any(|c| c.key() == key && self.is_masked(c))
+        {
+            return;
+        }
         self.query.sort = list_model::next_sort(self.query.sort.as_ref(), &key);
         cx.emit(ListEvent::SortChanged(self.query.sort.clone()));
         self.recompute(cx);
@@ -693,9 +702,27 @@ impl ResourceList {
         list_model::map_drawn(&self.shown.columns, &drawn, columns)
     }
 
-    /// The drawn column the sort applies to, if it is drawn.
+    /// Whether this list hides `column`'s values, so nothing may be derived from them.
+    fn is_masked(&self, column: &flint_core::Column) -> bool {
+        is_masked_column(is_secret_list(self.kind.as_str()), &column.name)
+    }
+
+    /// The drawn columns of `columns` a sort may apply to: a remembered sort on a masked column
+    /// stays suspended, with no arrow, since its rows are not ordered by it.
+    fn sortable_in(&self, columns: &[flint_core::Column]) -> Vec<usize> {
+        let mut drawn = self.drawn_in(columns);
+        drawn.retain(|&col| !self.is_masked(&columns[col]));
+        drawn
+    }
+
+    /// The drawn column the sort applies to, if it is drawn and not masked.
     pub(super) fn drawn_sort_column(&self) -> Option<usize> {
-        let drawn: Vec<usize> = self.drawn.iter().map(|&(col, _)| col).collect();
+        let drawn: Vec<usize> = self
+            .drawn
+            .iter()
+            .map(|&(col, _)| col)
+            .filter(|&col| !self.is_masked(&self.shown.columns[col]))
+            .collect();
         list_model::sort_column(&self.shown.columns, self.query.sort.as_ref(), &drawn)
     }
 
@@ -750,7 +777,7 @@ impl ResourceList {
         let stale = !self.shown.state.is_current();
         // Secret rows show only identity columns, as the MCP server does: a printer column
         // added by an extension could show a value.
-        let secrets = flint_core::redact::is_secret_list(self.kind.as_str());
+        let secrets = is_secret_list(self.kind.as_str());
         let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);
@@ -878,6 +905,7 @@ impl ResourceList {
                 .then(|| self.query.sort.as_ref().map(|s| s.descending))
                 .flatten();
             let numeric = list_model::is_numeric(column);
+            let sortable = !self.is_masked(column);
             let tip = if column.description.is_empty() {
                 name.clone()
             } else {
@@ -895,8 +923,11 @@ impl ResourceList {
                     .px_2()
                     .gap_1()
                     .min_w_0()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.table_hover))
+                    .when(sortable, |el| {
+                        el.cursor_pointer()
+                            .hover(|el| el.bg(theme.table_hover))
+                            .on_click(registry::on_click(click))
+                    })
                     .w(px(width))
                     .flex_none()
                     .when(numeric, |el| el.justify_end())
@@ -913,7 +944,6 @@ impl ResourceList {
                         )
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .on_click(registry::on_click(click))
                     .test_support(),
             );
         }

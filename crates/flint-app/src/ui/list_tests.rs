@@ -420,6 +420,86 @@ async fn a_secret_list_masks_its_non_safe_columns(cx: &mut TestAppContext) {
     );
 }
 
+/// A Secret list with a masked `Token` column, in the order the tokens would not sort to.
+fn secrets_with_tokens() -> Arc<KindSnapshot> {
+    let rows = [("a", "z-value"), ("b", "m-value"), ("c", "a-value")]
+        .into_iter()
+        .map(|(name, token)| {
+            Arc::new(Row {
+                uid: format!("uid-{name}").into(),
+                name: name.into(),
+                namespace: Some("demo".into()),
+                resource_version: "1".into(),
+                generation: None,
+                created: Some(0),
+                labels: Box::new([]),
+                cells: Box::new([Cell::Name, Cell::Text(token.into())]),
+            })
+        })
+        .collect();
+    Arc::new(KindSnapshot {
+        cluster: "test".into(),
+        kind: KindId::new("", "secrets"),
+        namespaced: true,
+        columns: vec![
+            column("Name", ColumnRole::Name, ColumnType::String, 0),
+            column("Token", ColumnRole::Value, ColumnType::String, 0),
+        ]
+        .into(),
+        rows,
+        state: SyncState::Synced,
+        version: 1,
+        ..Default::default()
+    })
+}
+
+// covers UP-21: a masked column cannot be sorted, so no arrow claims an order the rows lack.
+#[gpui_kit::test]
+async fn a_masked_column_header_does_not_sort(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_kind(cx, core, "secrets", "Secrets", 900.);
+    list.update(cx, |list, cx| list.set_snapshot(secrets_with_tokens(), cx));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Token").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| window.click("sort-Token", cx))
+        .unwrap();
+    cx.run_until_parked();
+    list.read_with(cx, |list, _| {
+        assert_eq!(list.query.sort, None);
+        assert!(list.view_state().sort.is_none());
+    });
+    // A shown column still sorts.
+    cx.update_window(window, |_, window, cx| window.click("sort-Name", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(list.read_with(cx, |list, _| list.view_state().sort.is_some()));
+}
+
+// covers UP-21: a sort remembered on a masked column stays suspended, without an arrow.
+#[gpui_kit::test]
+async fn a_remembered_sort_on_a_masked_column_is_suspended(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_kind(cx, core, "secrets", "Secrets", 900.);
+    list.update(cx, |list, cx| {
+        list.query.sort = Some(super::SortSpec {
+            column: "server:Token".into(),
+            descending: false,
+        });
+        list.set_snapshot(secrets_with_tokens(), cx)
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-a").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    let state = list.read_with(cx, |list, _| list.view_state());
+    assert!(state.sort.is_none());
+    let names: Vec<_> = state.rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+}
+
 // covers UP-23: a cell that is cut offers its full text in a tooltip; one that fits has none.
 #[gpui_kit::test]
 async fn a_cut_cell_has_a_tooltip_and_a_fitting_cell_has_none(cx: &mut TestAppContext) {
