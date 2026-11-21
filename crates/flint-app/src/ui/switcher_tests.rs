@@ -9,6 +9,7 @@ use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
 
 use super::{CommandPalette, Mode};
+use crate::ui::registry::SelectRow;
 use crate::ui::support_tests::{
     TestWorkspace, WAIT, objects, open_workspace, standard_sections, weaken,
 };
@@ -325,7 +326,21 @@ async fn enter_on_an_object_opens_it_selected_with_its_details(cx: &mut TestAppC
         "{banner:?}"
     );
     assert!(t.find(cx, "list-filtered-out").is_some());
-    // Picking a row the filter shows ends it.
+    // Picking a row the filter shows ends it. The details open from the newest snapshot, while
+    // the rows land from a recompute on the core's runtime, which `run_until_parked` does not
+    // wait for: wait until the row can be selected.
+    let row = SelectRow {
+        namespace: Some("kube-system".into()),
+        name: "coredns-1".into(),
+    };
+    let workspace = t.workspace.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        workspace
+            .read(cx)
+            .list_view()
+            .is_some_and(|l| l.read(cx).check_select_row(&row).is_ok())
+    })
+    .await;
     t.dispatch(
         cx,
         "resource_list::SelectRow",
