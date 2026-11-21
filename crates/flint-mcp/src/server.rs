@@ -613,40 +613,39 @@ impl FlintMcp {
         // A tool call refused at the transport never reaches `call_tool`:
         // recorded from there.
         let inner = Arc::downgrade(&self.inner);
-        admission
-            .replies()
-            .on_dropped_call(Box::new(move |tool, arguments| {
-                let inner = inner.clone();
-                Box::pin(async move {
-                    let Some(inner) = inner.upgrade() else {
-                        return;
-                    };
-                    let named = named_in(arguments.as_ref());
-                    inner
-                        .record(
-                            activity::ActivityRecord {
-                                at_ms: activity::now_ms(),
-                                tool,
-                                server: None,
-                                cluster: named.cluster,
-                                kind: named.kind,
-                                namespace: named.namespace,
-                                name: named.name,
-                                container: named.container,
-                                items: None,
-                                bytes: 0,
-                                truncated: false,
-                                outcome: activity::Outcome::Failed,
-                                cluster_key: None,
-                                server_key: None,
-                                probed: Vec::new(),
-                                probed_more: 0,
-                            },
-                            activity::Reached::default(),
-                        )
-                        .await;
-                })
-            }));
+        admission.replies().on_dropped_call(Box::new(move |tool| {
+            let inner = inner.clone();
+            Box::pin(async move {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                // Its arguments are unvalidated: none is recorded, or trusted to say which
+                // cluster the call was about.
+                inner
+                    .record(
+                        activity::ActivityRecord {
+                            at_ms: activity::now_ms(),
+                            tool,
+                            server: None,
+                            cluster: None,
+                            kind: None,
+                            namespace: None,
+                            name: None,
+                            container: None,
+                            items: None,
+                            bytes: 0,
+                            truncated: false,
+                            outcome: activity::Outcome::Failed,
+                            cluster_key: None,
+                            server_key: None,
+                            probed: Vec::new(),
+                            probed_more: 0,
+                        },
+                        activity::Reached::default(),
+                    )
+                    .await;
+            })
+        }));
         Counted::new(transport, admission.replies(), &admission.limits())
     }
 
@@ -750,22 +749,21 @@ impl ServerHandler for FlintMcp {
     /// once when too many are in flight), stopped when the client cancels it, and ended at the
     /// deadline. A call the router answers without running its tool (an unknown tool, arguments
     /// that do not fit the tool's schema) is recorded here, as failed, with what its arguments
-    /// name; so is one refused, cancelled or past its deadline. The others are recorded by their
-    /// tool (`FlintMcp::finish`).
+    /// name; so is one cancelled or past its deadline once admitted. One refused or cancelled
+    /// before that is recorded with its tool only: its arguments are unvalidated. The others are
+    /// recorded by their tool (`FlintMcp::finish`).
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
-        let mut named = named_in(request.arguments.as_ref());
+        // Nothing from the arguments until the call is admitted and they fit its tool.
+        let mut named = Named::default();
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         let deadline = admission.limits().deadline;
-        let turn = tokio::select! {
-            turn = admission.enter() => Some(turn),
-            () = cancelled.cancelled() => None,
-        };
+        let turn = admission.enter_unless(cancelled.cancelled()).await;
         let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
         // The reply, the record its tool left when it is the outcome, and what the call learned
         // on its way (for a record of its own otherwise).
@@ -786,9 +784,9 @@ impl ServerHandler for FlintMcp {
                     drop(turn);
                     // Its arguments are unvalidated: none is recorded, or trusted to say which
                     // cluster the call was about.
-                    named = Named::default();
                     (failed(&text), None, CallNote::default())
                 } else {
+                    named = named_in(request.arguments.as_ref());
                     let call =
                         rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
                     CALL.scope(std::cell::RefCell::default(), async {

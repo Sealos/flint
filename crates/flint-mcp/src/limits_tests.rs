@@ -48,6 +48,21 @@ async fn calls_run_wait_or_are_refused() {
     assert_eq!(admission.admitted(), 2, "a call that stops waiting leaves");
 }
 
+// covers UP-16: a cancellation already signalled beats a free turn, so the call is not admitted
+// and its unvalidated arguments are never read for its record.
+#[tokio::test]
+async fn a_cancelled_call_is_not_admitted_even_with_a_turn_free() {
+    let admission = Admission::new(limits(1, 1));
+    for _ in 0..64 {
+        let entered = admission.enter_unless(std::future::ready(())).await;
+        assert!(entered.is_none());
+        assert_eq!(admission.admitted(), 0);
+        assert_eq!(admission.running(), 0);
+    }
+    let turn = admission.enter_unless(std::future::pending()).await;
+    assert!(matches!(turn, Some(Ok(_))), "not cancelled: it runs");
+}
+
 // covers UP-08: while replies not yet written pass the budget, no call starts.
 #[tokio::test]
 async fn no_call_starts_while_replies_pass_the_budget() {

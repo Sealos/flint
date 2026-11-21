@@ -988,7 +988,8 @@ Rules:
   process alive. Clusters connect through the
   per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
   connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
-  as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
+  as failed, tool calls refused at the transport too; a call refused or cancelled before it is admitted is recorded by
+  its tool alone, since its arguments are unvalidated, and shows on no cluster's activity), waiting at most 2 s for the file; a record that cannot be
   written in time is skipped and logged.
 - **stdout is the protocol channel.** Diagnostics go to stderr and Flint's own events also go to the rotating log
   shared with the app. Both destinations use `FLINT_LOG` (else `RUST_LOG`) if set. Otherwise stderr shows warnings
