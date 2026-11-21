@@ -349,6 +349,21 @@ async fn tabs_name_their_cluster(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+// covers UP-42: a live shell is reused after an edit that keeps its context's definition, and
+// not after the context moved and came back to the same server.
+#[gpui_kit::test]
+async fn a_shell_is_reused_only_for_the_same_definition(cx: &mut TestAppContext) {
+    let (window, dock) = open_dock(cx);
+    let (shell, _fake) = open_shell(cx, window, &dock);
+    let key = TabKey::Shell(shell_request_on("test", "web-1"));
+    let at = TabCluster::new("test", Some("https://10.0.0.1:6443"));
+    let found = |cx: &mut TestAppContext, cluster: &TabCluster| {
+        dock.read_with(cx, |d, cx| d.find(&key, cluster, cx))
+    };
+    assert_eq!(found(cx, &at), Some(shell), "a same-server edit");
+    assert_eq!(found(cx, &at.clone().defined_by(7)), None, "moved and back");
+}
+
 // covers UP-41: a shell whose context is re-pointed at another API server ends, says why, and
 // no longer answers for its container; a context that is gone, or unchanged, leaves it alone.
 #[gpui_kit::test]
