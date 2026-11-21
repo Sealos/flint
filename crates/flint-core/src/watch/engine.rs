@@ -296,6 +296,16 @@ impl Engine {
         }
     }
 
+    /// Marks a finished list as synced. When that is news to a listener, the rows go out now
+    /// with the state, so a status display never reports live ahead of them.
+    fn set_listed(&mut self) {
+        if self.state != SyncState::Synced && self.audience() > 0 {
+            self.state = SyncState::Synced;
+            self.publish();
+        }
+        self.set_state(SyncState::Synced);
+    }
+
     /// When the next snapshot is due: never while nobody listens or nothing changed.
     fn deadline(&self) -> Option<Instant> {
         if !self.dirty || self.audience() == 0 {
@@ -483,7 +493,7 @@ impl Engine {
                 }
             };
             self.synced_once = true;
-            self.set_state(SyncState::Synced);
+            self.set_listed();
             backoff.reset();
             loop {
                 let mut events = match stream.take() {
@@ -762,7 +772,7 @@ impl Engine {
             match result {
                 Ok(rv) => {
                     backoff.reset();
-                    self.set_state(SyncState::Synced);
+                    self.set_listed();
                     if retry_at.is_some_and(|at| Instant::now() >= at) {
                         return Some(rv);
                     }
@@ -805,7 +815,11 @@ impl Engine {
             // Rows are merged only for subscribers; status displays need the state alone.
             let listening = self.hub.listeners() > 0;
             let merged = merge_lanes(&lanes, &reason, self.kind.namespaced, listening, None);
-            self.set_state(merged.state.clone());
+            let state = merged.state.clone();
+            // For a subscriber, synced is reported by the snapshot that carries the merged rows.
+            if !listening || state != SyncState::Synced {
+                self.set_state(state.clone());
+            }
             self.set_feed(merged.feed);
             if self.hub.has_peeks() {
                 self.answer_namespaced_peeks(&lanes, &reason).await;
@@ -825,6 +839,7 @@ impl Engine {
                     ..merged
                 };
                 self.hub.publish(self.epoch, snapshot);
+                self.set_state(state);
                 published = Some(Instant::now());
             }
             tokio::select! {

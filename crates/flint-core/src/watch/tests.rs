@@ -36,6 +36,8 @@ struct FakeState {
     watches: HashMap<String, VecDeque<WatchScript>>,
     senders: HashMap<String, Vec<Push>>,
     list_calls: HashMap<String, usize>,
+    /// How long each list takes to answer.
+    list_delay: Duration,
     watch_requests: HashMap<String, Vec<WatchRequest>>,
 }
 
@@ -131,7 +133,14 @@ impl Source for Fake {
         }
         .unwrap_or_else(|| json!({"kind":"Table","metadata":{"resourceVersion":"1"},"columnDefinitions":[],"rows":[]}));
         let parsed: WireObject = serde_json::from_value(page).unwrap();
-        async move { Ok(parsed) }.boxed()
+        let delay = s.list_delay;
+        async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(parsed)
+        }
+        .boxed()
     }
 
     fn watch(
@@ -361,6 +370,99 @@ async fn expired_error_event_inside_a_200_relists() {
         "watch from the new list"
     );
     task.abort();
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_relist_reports_synced_only_with_its_rows() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "old", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods",
+        pod_table(&[("u2", "demo", "new", "Running")], true, "50"),
+    );
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, None);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    // Past the publish interval, so the reconnecting state is published just before the list
+    // and the finished list falls inside the next interval.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fake.sender("pods")
+        .unwrap()
+        .send(event(
+            "ERROR",
+            json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+                   "message":"too old resource version: 1 (773)","reason":"Expired","code":410}),
+        ))
+        .unwrap();
+    // No time passes here, so a snapshot held back for the interval stays unpublished.
+    while fake.list_calls("pods") < 2 || hub.state() != SyncState::Synced {
+        tokio::task::yield_now().await;
+    }
+    let latest = hub.latest();
+    assert_eq!(latest.state, SyncState::Synced);
+    assert_eq!(
+        names(&latest),
+        ["new"],
+        "synced was reported before the rows"
+    );
+    task.abort();
+}
+
+// covers UP-21, UP-27
+#[tokio::test(start_paused = true)]
+async fn a_merged_relist_reports_synced_only_with_its_rows() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", forbidden());
+    }
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "old", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods/a",
+        pod_table(&[("u2", "a", "new", "Running")], true, "50"),
+    );
+    let (_scope_tx, scope) =
+        tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(vec!["a".to_owned()]));
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, Some(scope));
+    until(&mut rx, |s| {
+        s.state == SyncState::Synced && names(s) == ["old"]
+    })
+    .await;
+    // Halfway through the publish interval, with a relist that ends halfway through a later
+    // one: the merged list has just published "reconnecting" when the lane is synced again.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(200);
+    fake.sender("pods/a")
+        .unwrap()
+        .send(event(
+            "ERROR",
+            json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+                   "message":"too old resource version: 1 (773)","reason":"Expired","code":410}),
+        ))
+        .unwrap();
+    let mut reconnected = false;
+    for _ in 0..1000 {
+        let state = hub.state();
+        reconnected |= state != SyncState::Synced;
+        let latest = hub.latest();
+        if names(&latest) == ["new"] && latest.state == SyncState::Synced {
+            assert_eq!(state, SyncState::Synced);
+            assert!(reconnected, "the merged list never showed the reconnect");
+            task.abort();
+            return;
+        }
+        assert!(
+            !(reconnected && state == SyncState::Synced),
+            "synced was reported before the merged rows"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("the merged relist was never published");
 }
 
 // covers UP-27
