@@ -28,6 +28,11 @@ export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 # describe different crates from the ones built.
 lock_before=$(git hash-object Cargo.lock)
 
+work=$(mktemp -d)
+trap 'rm -rf "$work"; rm -f crates/*/"$generated.json"' EXIT
+shipped=$work/shipped.txt
+filtered=$work/filtered.json
+
 # asset-name package target
 while read -r name package target; do
   rm -f crates/*/"$generated.json"
@@ -50,7 +55,32 @@ while read -r name package target; do
     and (.components | length) > 0
   ' "$file" >/dev/null || { echo "error: bad SBOM for $package on $target" >&2; exit 1; }
 
-  mv "$file" "$out/$name.cdx.json"
+  # The tool resolves features across the whole workspace, which pulls in test-only crates. Keep
+  # what `cargo tree` says this package's release build uses on this target (proc macros included),
+  # and fail if the SBOM lacks any of it.
+  cargo tree --locked -p "$package" --target "$target" -e normal --prefix none --format '{p}' |
+    awk '{ print $1 " " substr($2, 2) }' | sort -u > "$shipped"
+  jq --rawfile shipped "$shipped" '
+    ($shipped | split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries) as $keep
+    | .components |= map(select($keep[.name + " " + .version]))
+    | ([.metadata.component["bom-ref"]] + [.components[]["bom-ref"]]) as $refs
+    | ($refs | map({key: ., value: true}) | from_entries) as $known
+    | if has("dependencies") then
+        .dependencies |= map(select($known[.ref]) | if has("dependsOn") then .dependsOn |= map(select($known[.])) else . end)
+      else . end
+  ' "$file" > "$filtered"
+  missing=$(jq -r --rawfile shipped "$shipped" '
+    (.metadata.component.name + " " + .metadata.component.version) as $root
+    | ([.components[] | .name + " " + .version]) as $have
+    | ($shipped | split("\n") | map(select(length > 0 and . != $root))) - $have | .[]
+  ' "$filtered")
+  if [ -n "$missing" ]; then
+    echo "error: SBOM for $package on $target lacks: $missing" >&2
+    exit 1
+  fi
+
+  mv "$filtered" "$out/$name.cdx.json"
+  rm -f "$file"
   (cd "$out" && sha256sum "$name.cdx.json" > "$name.cdx.json.sha256")
 done <<EOF
 flint-$tag-macos-aarch64 flint-app aarch64-apple-darwin

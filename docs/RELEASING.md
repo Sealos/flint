@@ -30,15 +30,21 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
 - [ ] It is marked **Latest**, and [/releases/latest](https://github.com/Sealos/flint/releases/latest) opens it. The
   `publish` job only marks a release Latest when no newer one is out, so an older release re-published later is
   correctly not Latest.
-- [ ] It has twelve files, six binaries and their `.sha256` checksums, besides GitHub's two Source code archives:
+- [ ] It has 24 files, six binaries, six CycloneDX SBOMs and a `.sha256` checksum for each, besides GitHub's two
+  Source code archives:
   - `flint-vX.Y.Z-macos-universal.dmg` and `.dmg.sha256`
   - `flint-vX.Y.Z-macos-universal.tar.gz` and `.tar.gz.sha256`
   - `flint-vX.Y.Z-linux-x86_64.AppImage` and `.AppImage.sha256`
   - `flint-vX.Y.Z-linux-aarch64.AppImage` and `.AppImage.sha256`
   - `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and `.tar.gz.sha256`
   - `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` and `.tar.gz.sha256`
+  - `flint-vX.Y.Z-macos-aarch64.cdx.json` and `flint-vX.Y.Z-macos-x86_64.cdx.json`, one per slice of the universal
+    binary in the DMG and tarball, each with `.cdx.json.sha256`
+  - `flint-vX.Y.Z-linux-x86_64.cdx.json` and `flint-vX.Y.Z-linux-aarch64.cdx.json`, each with `.cdx.json.sha256`
+  - `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.cdx.json` and
+    `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.cdx.json`, each with `.cdx.json.sha256`
 
-  v0.2.0 and earlier have no DMG. v0.2.1 and earlier have no `flint-mcp` archives.
+  v0.2.0 and earlier have no DMG. v0.2.1 and earlier have no `flint-mcp` archives. v0.3.1 and earlier have no SBOMs.
 - [ ] The notes list the changes from `CHANGELOG.md`.
 - [ ] The checksums match. In an empty directory:
 
