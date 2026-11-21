@@ -53,7 +53,7 @@ So a small warm cluster adds about 12 MiB, and the default of 3 costs about 24 M
 clusters. The cost per row grows with labels and cell text, so large clusters cost more. The 128 MiB budget caps the
 background clusters whatever their size.
 
-The target for CPU is under 1% of one core with 3 idle warm clusters. Before M5.5 ships, the estimate is checked
+The target for CPU is under 1% of one core with 3 idle warm clusters. Before warm clusters roll out, the estimate is checked
 against RSS with 1, 3 and 5 warm clusters at 10,000 and 50,000 pods (simulated with kwok), and the multiplier is
 set from those numbers.
 

@@ -751,10 +751,11 @@ Deferred until cluster sets are scheduled (#199).
 
 ### UP-100 Restart or scale a workload on several clusters
 - **When** I select a Deployment in a combined view and choose Rollout Restart or Scale on 3 clusters.
-- **Then** a preview lists each target cluster with a dry-run result and a checkbox. The restart runs one cluster at a
-  time and stops at the first failure, saying which clusters were done and which were not. Locked clusters in the list
+- **Then** a preview lists each target cluster with a dry-run result and a checkbox. Restart and scale each run one
+  cluster at a time and stop at the first failure, reporting a partial result that says which clusters were done and
+  which were not. Locked clusters in the list
   need their name typed first.
-- Tests: unit (sequencing, stop on failure), e2e.
+- Tests: unit (sequencing, stop on failure, partial result for restart and scale), e2e.
 
 ### UP-101 Apply one manifest to several clusters
 - **When** I apply a YAML manifest to a cluster set.

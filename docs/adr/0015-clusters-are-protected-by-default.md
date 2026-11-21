@@ -16,7 +16,7 @@ disabled, and says why.
 - **Session unlock:** a dialog names the cluster and its server, and one click unlocks it until Flint quits. The
   sidebar shows a lock icon for each state (protected, unlocked for this session, trusted). **Lock Again** is in the
   cluster's menu and the palette.
-- **Fleet actions** (after 1.0) on a set: the user picks an explicit target list, sees a server-side dry-run diff
+- **Fleet actions** (v0.7) on a set: the user picks an explicit target list, sees a server-side dry-run diff
   per cluster with checkboxes to drop clusters, and the action runs **one cluster at a time, stopping at the first
   failure**. Any locked cluster in the target list must have its name typed to proceed, and is unlocked for that
   action only. Fleet actions are rollout restart, scale, apply YAML and delete.
