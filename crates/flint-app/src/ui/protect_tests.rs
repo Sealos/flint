@@ -891,8 +891,12 @@ async fn a_dialog_closes_the_namespace_picker(cx: &mut TestAppContext) {
     t.click(cx, "namespace-filter-button");
     t.wait_for_element(cx, "ns-all").await;
     draw(cx, &t);
-    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::UnlockCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     draw(cx, &t);
     assert!(t.find(cx, "ns-all").is_none(), "the picker closed");

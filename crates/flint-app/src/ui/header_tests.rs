@@ -327,17 +327,17 @@ async fn the_namespace_picker_works_from_the_keyboard(cx: &mut TestAppContext) {
     assert_focus(cx, &t, "ns-demo");
     t.press(cx, "space");
     wait_for_rows(cx, &t, 4).await;
-    assert!(filter(cx, &t, "alpha").is_empty());
+    assert!(filter(cx, &t, "kind-alpha").is_empty());
     t.press(cx, "enter");
     wait_for_rows(cx, &t, 2).await;
-    assert_eq!(filter(cx, &t, "alpha"), ["demo"]);
+    assert_eq!(filter(cx, &t, "kind-alpha"), ["demo"]);
 
     t.press(cx, "tab");
     assert_focus(cx, &t, "ns-add");
     t.type_text(cx, "data");
     t.press(cx, "enter");
     wait_for_rows(cx, &t, 3).await;
-    assert_eq!(filter(cx, &t, "alpha"), ["data", "demo"]);
+    assert_eq!(filter(cx, &t, "kind-alpha"), ["data", "demo"]);
 }
 
 // covers UP-33: unchecking a namespace that is not listed removes its row; focus stays in the
