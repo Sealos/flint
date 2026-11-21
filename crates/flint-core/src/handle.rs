@@ -214,7 +214,7 @@ pub(crate) enum Request {
     BoundWriteClient {
         cluster: ClusterId,
         server: Option<Option<String>>,
-        reply: oneshot::Sender<Result<BoundWriteClient, WriteRefusal>>,
+        reply: oneshot::Sender<Result<BoundWriteClient, WriteError>>,
     },
     /// What the write gate says now about `cluster` as pinned at `pin`, for a session about to
     /// run a command.
@@ -719,7 +719,7 @@ impl CoreHandle {
         &self,
         cluster: &str,
         server: Option<Option<String>>,
-    ) -> impl Future<Output = Result<BoundWriteClient, WriteRefusal>> + Send + 'static {
+    ) -> impl Future<Output = Result<BoundWriteClient, WriteError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::BoundWriteClient {
             cluster: cluster.to_owned(),
@@ -728,9 +728,9 @@ impl CoreHandle {
         });
         async move {
             if sent.is_err() {
-                return Err(WriteRefusal::Stopped);
+                return Err(WriteRefusal::Stopped.into());
             }
-            rx.await.unwrap_or(Err(WriteRefusal::Stopped))
+            rx.await.unwrap_or(Err(WriteRefusal::Stopped.into()))
         }
     }
 

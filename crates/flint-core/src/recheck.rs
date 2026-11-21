@@ -369,6 +369,15 @@ impl ContextHistory {
             .is_some_and(|r| r.present && r.server == pin.server)
     }
 
+    /// Whether one of the files that failed in this load defined `context` when it last loaded.
+    pub fn defined_in_failed(&self, context: &str, failed: &[(PathBuf, String)]) -> bool {
+        failed.iter().any(|(path, _)| {
+            self.defines
+                .get(path)
+                .is_some_and(|names| names.contains(context))
+        })
+    }
+
     /// Whether the last load confirmed that `context` is gone.
     pub fn removed(&self, context: &str) -> bool {
         self.records.get(context).is_some_and(|r| !r.present)
