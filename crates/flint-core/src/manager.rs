@@ -1173,7 +1173,9 @@ impl ClusterManager {
         {
             // Refused either way: this only picks the words.
             let cluster = cluster.to_owned();
-            return Err(if self.contexts.on_pinned_server(&cluster, pin) {
+            return Err(if self.contexts.removed(&cluster) {
+                WriteRefusal::Removed { cluster }
+            } else if self.contexts.on_pinned_server(&cluster, pin) {
                 WriteRefusal::Stale { cluster }
             } else {
                 WriteRefusal::Moved { cluster }
@@ -1865,6 +1867,7 @@ mod tests {
         let without_dev = "apiVersion: v1\nkind: Config\nclusters:\n- name: o\n  cluster:\n    \
                            server: https://other\nusers:\n- name: u\n  user: {}\ncontexts:\n- \
                            name: other\n  context:\n    cluster: o\n    user: u\n";
+        let pin = manager.contexts.pin_confirmed("dev");
         rewrite(&mut manager, dir.path(), without_dev).await;
         assert_eq!(
             manager
@@ -1873,6 +1876,13 @@ mod tests {
             Some(WriteRefusal::Removed {
                 cluster: "dev".into()
             })
+        );
+        assert_eq!(
+            manager.launch_gate("dev", &pin),
+            Err(WriteRefusal::Removed {
+                cluster: "dev".into()
+            }),
+            "a launch check says it is gone, not moved"
         );
         assert_eq!(
             manager.shell_client("dev", None).err(),
