@@ -124,7 +124,12 @@ fn open_dialog(
         };
         // A Tab stop only when there is something to scroll to.
         let overflows = scroll.max_offset().y > px(0.);
-        let ring = text_focus.is_focused(window).then(|| cx.theme().ring);
+        // The dialog's own background when unfocused, so focus does not move the text.
+        let border = if text_focus.is_focused(window) {
+            cx.theme().ring
+        } else {
+            cx.theme().background
+        };
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
         alert
@@ -149,10 +154,7 @@ fn open_dialog(
                                 .test_support()
                                 .track_focus(&text_focus.clone().tab_stop(overflows))
                                 .border_1()
-                                .when_some(ring, |this, ring| this.border_color(ring))
-                                .when(ring.is_none(), |this| {
-                                    this.border_color(transparent_black())
-                                })
+                                .border_color(border)
                                 .on_key_down({
                                     let scroll = scroll.clone();
                                     move |event, window, cx| {
