@@ -146,6 +146,10 @@ impl Cluster {
 }
 
 enum Internal {
+    /// Reload kubeconfig, then say so ([`crate::CoreHandle::reload_kubeconfig`]).
+    ReloadKubeconfig {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     Connected {
         cluster: ClusterId,
         attempt: u64,
@@ -401,6 +405,10 @@ impl ClusterManager {
 
     fn handle_request(&mut self, request: Request) {
         match request {
+            // Requests are handled without waiting: the reload runs as an internal message.
+            Request::ReloadKubeconfig { reply } => {
+                let _ = self.internal_tx.send(Internal::ReloadKubeconfig { reply });
+            }
             Request::Subscribe { id, cluster, kind } => {
                 self.subscriptions.insert(id, (cluster.clone(), kind));
                 self.reconcile(&cluster);
@@ -819,6 +827,10 @@ impl ClusterManager {
 
     async fn handle_internal(&mut self, msg: Internal) {
         match msg {
+            Internal::ReloadKubeconfig { reply } => {
+                self.reload_kubeconfig().await;
+                let _ = reply.send(());
+            }
             Internal::Connected {
                 cluster,
                 attempt,
