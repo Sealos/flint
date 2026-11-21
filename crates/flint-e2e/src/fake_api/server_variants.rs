@@ -574,14 +574,11 @@ mod tests {
             .iter()
             .map(|e| e["object"]["rows"][0]["cells"][age].clone())
             .collect();
-        let at_start = server.inner.clock.start().as_second();
-        assert_eq!(
-            ages[0],
-            flint_core::table::human_duration(at_start - created)
-        );
+        let recorded = clock::FIXTURE_NOW_SECONDS - created;
+        assert_eq!(ages[0], flint_core::table::human_duration(recorded));
         assert_eq!(
             ages[1],
-            flint_core::table::human_duration(at_start + advance - created)
+            flint_core::table::human_duration(recorded + advance)
         );
         assert!(events[0]["object"]["columnDefinitions"].is_array());
         assert!(events[1]["object"]["columnDefinitions"].is_null());
