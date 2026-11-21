@@ -597,6 +597,38 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
     );
 }
 
+// covers UP-30 (#407): opening the palette and pressing Enter never quits or closes the window.
+// They rank last, and when only they match, nothing is selected until an arrow key picks one.
+#[gpui_kit::test]
+async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
+    const ENDING: [&str; 2] = ["Quit Flint", "Close Window"];
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    assert!(!ENDING.contains(&selected(&palette)), "{palette:?}");
+    let all = labels(&palette);
+    assert_eq!(all.len(), palette.total, "every row is reported");
+    let mut last_two = all[all.len() - 2..].to_vec();
+    last_two.sort_unstable();
+    assert_eq!(last_two, ["Close Window", "Quit Flint"], "{all:?}");
+
+    t.type_text(cx, "quit flint");
+    let palette = shown(cx, &t);
+    assert_eq!(labels(&palette), ["Quit Flint"]);
+    assert_eq!(palette.selected, None, "{palette:?}");
+    t.press(cx, "enter");
+    assert_eq!(
+        shown(cx, &t).query,
+        "quit flint",
+        "Enter with nothing selected runs nothing"
+    );
+
+    t.press(cx, "down");
+    assert_eq!(selected(&shown(cx, &t)), "Quit Flint");
+    t.press(cx, "escape");
+}
+
 /// A pod `name` in `demo` with containers `app` and `sidecar`, selected and shown in the detail
 /// pane.
 async fn show_pod(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
@@ -788,6 +820,7 @@ async fn a_stale_focus_behind_the_palette_does_not_strand_it(cx: &mut TestAppCon
     open_palette(cx, &t).await;
     strand_palette(cx, &t);
     t.type_text(cx, "quit flint");
+    t.press(cx, "down");
     t.press(cx, "enter");
     assert!(palette_closed(cx, &t));
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))

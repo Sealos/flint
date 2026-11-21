@@ -372,6 +372,9 @@ pub struct Candidate {
     pub alt: Option<String>,
     /// Its place among the recently run actions, 0 for the latest; `None` if it is not one.
     pub recent: Option<usize>,
+    /// Ranks after every other match, however close or recent: Quit and Close Window, so Enter
+    /// on the best row never ends the app (#407).
+    pub last: bool,
 }
 
 /// A listed candidate: its index in the candidates, and the label's matched bytes.
@@ -383,11 +386,12 @@ pub struct Hit {
 
 /// The candidates matching `query`, best first. With no query: the recent ones (latest first),
 /// then the rest in their own order. With one: by score, so a closer match always wins; among
-/// equal scores the recent ones first (latest first), then in their own order.
+/// equal scores the recent ones first (latest first), then in their own order. Either way, the
+/// ones marked [`Candidate::last`] come after all the others.
 pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
     if query.trim().is_empty() {
         let mut hits: Vec<(usize, &Candidate)> = candidates.iter().enumerate().collect();
-        hits.sort_by_key(|(index, c)| (c.recent.unwrap_or(usize::MAX), *index));
+        hits.sort_by_key(|(index, c)| (c.last, c.recent.unwrap_or(usize::MAX), *index));
         return hits
             .into_iter()
             .map(|(index, _)| Hit {
@@ -397,7 +401,7 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             .collect();
     }
     let mut matcher = Matcher::new(query);
-    let mut scored: Vec<(i32, usize, Hit)> = candidates
+    let mut scored: Vec<(bool, i32, usize, Hit)> = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
@@ -409,14 +413,17 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
                 }
             };
             Some((
+                c.last,
                 points,
                 c.recent.unwrap_or(usize::MAX),
                 Hit { index, ranges },
             ))
         })
         .collect();
-    scored.sort_by_key(|(points, recent, hit)| (std::cmp::Reverse(*points), *recent, hit.index));
-    scored.into_iter().map(|(_, _, hit)| hit).collect()
+    scored.sort_by_key(|(last, points, recent, hit)| {
+        (*last, std::cmp::Reverse(*points), *recent, hit.index)
+    });
+    scored.into_iter().map(|(_, _, _, hit)| hit).collect()
 }
 
 /// The actions run from the palette, latest first, by name; at most [`RECENTS`].
@@ -456,6 +463,7 @@ mod tests {
                 label: (*l).to_owned(),
                 alt: None,
                 recent: None,
+                last: false,
             })
             .collect()
     }
@@ -542,11 +550,13 @@ mod tests {
                 label: "Toggle Pause".into(),
                 alt: Some("Logs Toggle Pause".into()),
                 recent: None,
+                last: false,
             },
             Candidate {
                 label: "Open Logs".into(),
                 alt: Some("Logs Open Logs".into()),
                 recent: None,
+                last: false,
             },
         ];
         assert_eq!(labels("logs", &c), ["Open Logs", "Toggle Pause"]);
@@ -583,6 +593,17 @@ mod tests {
         c[0].recent = Some(0);
         assert_eq!(labels("op", &c), ["Open Logs", "Toggle Pause"]);
         assert_eq!(labels("", &c), ["Toggle Pause", "Open Logs"]);
+    }
+
+    // covers UP-30 (#407): an action marked last stays last, however close or recent.
+    #[test]
+    fn a_last_candidate_ranks_after_every_other_match() {
+        let mut c = candidates(&["Quit Flint", "Open Logs", "Query Logs"]);
+        c[0].last = true;
+        c[0].recent = Some(0);
+        assert_eq!(labels("", &c), ["Open Logs", "Query Logs", "Quit Flint"]);
+        assert_eq!(labels("qu", &c), ["Query Logs", "Quit Flint"]);
+        assert_eq!(labels("quit", &c), ["Quit Flint"]);
     }
 
     #[test]
@@ -668,11 +689,13 @@ mod tests {
                 label: format!("team-{i}-payments-service-{}", i % 7),
                 alt: None,
                 recent: None,
+                last: false,
             })
             .chain(std::iter::once(Candidate {
                 label: "kube-system".into(),
                 alt: None,
                 recent: None,
+                last: false,
             }))
             .collect();
         let query = "kube-system";
