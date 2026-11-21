@@ -221,9 +221,13 @@ impl ContextHistory {
                 // A confirmed definition stays until a load confirms a change: a fallback never
                 // replaces it, nor its file.
                 Some(r) if r.present && r.confirmed && provisional => {
-                    if !context_masked && r.server.as_deref() != server {
+                    if cluster_masked && r.server.as_deref() != server {
                         self.last += 1;
                         r.gate = self.last;
+                    }
+                    // The context entry itself is certain: its file is what masks its removal.
+                    if !context_masked {
+                        r.source = info.source.clone();
                     }
                 }
                 // Same server: the file it now comes from is the one whose rank masks its
@@ -570,6 +574,34 @@ mod tests {
         assert!(h.gate_moved("dev", &pin), "the gate stays as strict");
         let fresh = h.pin("dev", STAGING);
         assert!(!h.gate_moved("dev", &fresh));
+    }
+
+    // covers UP-06: `a` defines the cluster, `b` the context, `c` a fallback cluster. With `a`
+    // unreadable both entries are masked, and the gate still refuses the old pin.
+    #[test]
+    fn the_gate_moves_when_context_and_cluster_are_both_masked() {
+        let mut h = ContextHistory::default();
+        h.record(&on_cluster(load(&[("dev", STAGING, "b")], &[]), "a"));
+        let pin = h.pin("dev", STAGING);
+        h.record(&on_cluster(load(&[("dev", PROD, "b")], &["a"]), "c"));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "still running");
+        assert!(h.gate_moved("dev", &pin));
+    }
+
+    // covers UP-06: the context moved to `a`, certain, while its cluster entry is masked. Once
+    // `a` drops it, the failed `b`, ranked below `a` and never defining it, hides nothing.
+    #[test]
+    fn a_confirmed_context_file_decides_its_removal() {
+        let mut h = ContextHistory::default();
+        h.record(&on_cluster(load(&[("dev", STAGING, "c")], &[]), "c"));
+        let pin = h.pin("dev", STAGING);
+        h.record(&on_cluster(load(&[("dev", STAGING, "a")], &["b"]), "c"));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None);
+        h.record(&load(&[], &["b"]));
+        assert_eq!(
+            h.check(Pinned::Shell, "dev", &pin),
+            Some(reason(Pinned::Shell, "dev", Change::Removed))
+        );
     }
 
     // covers UP-06: a cluster entry no file defines, while a file failed, may be in that file.
