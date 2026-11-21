@@ -671,7 +671,7 @@ impl CoreHandle {
     /// The client for an action that changes `cluster` or runs code in it, with the context's
     /// pin: refused while the cluster is protected (ADR-0015) or not connected.
     /// Never blocks.
-    fn write_client(
+    pub(crate) fn write_client(
         &self,
         cluster: &str,
         server: Option<Option<String>>,
@@ -689,6 +689,25 @@ impl CoreHandle {
             }
             rx.await.unwrap_or(Err(WriteRefusal::Stopped))
         }
+    }
+
+    /// Whether a write may go out on `pin`: the context still names its server, confirmed, and
+    /// the gate allows changes there.
+    pub(crate) fn check_write_pin(
+        &self,
+        cluster: &ClusterId,
+        pin: ContextPin,
+    ) -> impl Future<Output = Result<(), WriteRefusal>> + Send + 'static {
+        launch_check(self.requests.clone(), cluster.clone(), pin)()
+    }
+
+    /// Runs `task` on the core's runtime, for callers on another executor. Dropping the returned
+    /// future aborts it.
+    pub(crate) fn on_runtime<T: Send + 'static>(
+        &self,
+        task: impl Future<Output = T> + Send + 'static,
+    ) -> impl Future<Output = Option<T>> + Send + 'static {
+        spawn_aborting(&self.runtime, task)
     }
 
     /// Unlocks `cluster` at `server` (the URL the user confirmed) until Flint quits or

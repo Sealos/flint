@@ -172,6 +172,10 @@ pub struct Query {
     pub container: Option<String>,
     /// `follow` of a log request.
     pub follow: bool,
+    /// `dryRun=All` of a write.
+    pub dry_run: bool,
+    /// `fieldManager` of a write.
+    pub field_manager: Option<String>,
     /// `previous` of a log request.
     pub previous: bool,
     /// `timestamps` of a log request.
@@ -215,6 +219,8 @@ impl Query {
                 "tailLines" => q.tail_lines = value.parse().ok(),
                 "container" => q.container = Some(value).filter(|v| !v.is_empty()),
                 "follow" => q.follow = truthy,
+                "dryRun" => q.dry_run = value == "All",
+                "fieldManager" => q.field_manager = Some(value),
                 "previous" => q.previous = truthy,
                 "timestamps" => q.timestamps = truthy,
                 "sinceSeconds" => q.since_seconds = value.parse().ok(),
