@@ -136,6 +136,7 @@ A test-only control socket lets e2e tests and agents drive the real app. The cod
     then draws twice, since a context menu is built a frame after the click. A row's id is in `list.rows[].id`
     (`row-<uid>`); right-clicking it selects the row and opens its menu, which `state.menu` then lists. `rejected`
     when no element, or more than one, is drawn with that id, or it is out of view (rows are virtualized).
+  - `resize_window {width, height}`: resizes the window, in points (100 to 8000), to check narrow and short layouts.
   - `state`: the visible view tree: `focus` (`workspace`, `sidebar`, `navigation`, `list`, `list_filter`,
     `namespace_input`, `detail`, `detail_yaml`,
     `dock`, `log`, `log_search`, `shell`, `dialog`, `menu`, `palette`, `other` or `none`), `dialog` (`{title, text,
