@@ -550,7 +550,7 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
         LogState::Waiting { wait } => StatusText {
             tone: Tone::Warning,
             text: wait_text(wait),
-            tooltip: Some(WAITING_DETAIL.to_owned()),
+            tooltip: Some(format!("{}\n{WAITING_DETAIL}", wait_text(wait))),
         },
         LogState::Reconnecting { error, attempt, .. } => match error {
             Some(e) => {
@@ -1207,6 +1207,24 @@ mod tests {
         assert!(shown.matches.is_empty());
         let truncated = LogLine::parse("x", true);
         assert!(show(&truncated, ts(false), &SearchQuery::default(), None).cut);
+    }
+
+    // covers UP-40: a narrow toolbar may cut a waiting tab's status, so its tooltip says all of it.
+    #[test]
+    fn a_waiting_tabs_tooltip_has_the_full_status() {
+        for (wait, full) in [
+            (ContainerWait::Unscheduled, "Pod isn't scheduled yet"),
+            (
+                ContainerWait::NotStarted(Some("ImagePullBackOff".into())),
+                "Container hasn't started: ImagePullBackOff",
+            ),
+            (ContainerWait::NotStarted(None), "Container hasn't started"),
+        ] {
+            assert_eq!(
+                state_text(&LogState::Waiting { wait }, true).tooltip,
+                Some(format!("{full}\n{WAITING_DETAIL}"))
+            );
+        }
     }
 
     // covers UP-40: the session state is always shown, in a few words; errors in plain words.
