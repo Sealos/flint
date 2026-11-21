@@ -670,6 +670,36 @@ async fn a_namespace_limited_list_shows_clean_text() {
     task.abort();
 }
 
+/// A 403 `Status` whose URL has its host past the length of a shown error.
+fn long_url_status() -> kube::Error {
+    let password = "placeholder-password-".repeat(20);
+    kube::Error::Api(Box::new(kube::core::Status {
+        code: 403,
+        reason: "Forbidden".into(),
+        message: format!("forbidden: https://placeholder:{password}@api.example.test/ refused"),
+        ..Default::default()
+    }))
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_api_status_is_hidden_from_its_full_text() {
+    let target = crate::cluster::Target {
+        server: None,
+        has_exec_plugin: false,
+        exec_command: None,
+    };
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", FetchError::from_kube(long_url_status(), &target));
+    }
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let snap = until(&mut rx, |s| reconnecting_error(s).is_some()).await;
+    let text = reconnecting_error(&snap).unwrap();
+    assert!(!text.contains("placeholder-password"), "{text}");
+    assert!(text.contains("refused"), "{text}");
+    task.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_very_long_list_error_is_cut() {
     let fake = Fake::new();

@@ -433,7 +433,7 @@ impl Engine {
     /// times (it can be transient), then less and less often, up to every `denied_retry`.
     async fn fail(&mut self, error: FetchError, backoff: &mut Backoff) {
         tracing::debug!(cluster = %self.cluster, kind = %self.id, namespace = ?self.namespace,
-            %error, "watch error");
+            error = %sync_error_text(error.message()), "watch error");
         let delay = match &error {
             FetchError::Denied(m) | FetchError::NotFound(m) => {
                 let final_ = self.denial_is_final();
@@ -627,7 +627,7 @@ impl Engine {
                     // cluster; another 400 (one API's quirk) only skips them this time.
                     if is_streaming_rejection(&m) {
                         tracing::info!(cluster = %self.cluster, kind = %self.id,
-                            error = %crate::redact::safe_error_summary(&m),
+                            error = %sync_error_text(&m),
                             "streaming lists rejected; using list and watch");
                         self.source.disable_streaming_lists();
                     }
@@ -1106,11 +1106,12 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// The most characters of a server's error text a [`SyncState`] carries.
 const MAX_SYNC_ERROR_CHARS: usize = 200;
 
-/// What a [`SyncState`] may say of an error: [`redact::safe_server_error`] of it, on one line and
-/// cut to [`MAX_SYNC_ERROR_CHARS`]. The cut comes last because hiding a quoted value can lengthen
-/// the text. Decisions about an error read the [`FetchError`], never this text.
+/// What a [`SyncState`] may say of an error: the first line of the text with values hidden
+/// ([`redact::hide_server_values`]), cut to [`MAX_SYNC_ERROR_CHARS`]. Values are hidden in the
+/// whole text first, so the cut cannot split one. Decisions about an error read the
+/// [`FetchError`], never this text.
 fn sync_error_text(raw: &str) -> String {
-    let line: String = redact::safe_server_error(raw)
+    redact::first_line(&redact::hide_server_values(raw), MAX_SYNC_ERROR_CHARS)
         .chars()
         .map(|c| {
             if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
@@ -1119,8 +1120,7 @@ fn sync_error_text(raw: &str) -> String {
                 c
             }
         })
-        .collect();
-    redact::first_line(&line, MAX_SYNC_ERROR_CHARS)
+        .collect()
 }
 
 /// Whether a 400/422 is the server refusing streaming lists (feature off or unknown).
@@ -1153,6 +1153,15 @@ mod tests {
             let text = sync_error_text(&long);
             assert!(text.chars().count() <= MAX_SYNC_ERROR_CHARS + 1, "{text}");
         }
+    }
+
+    #[test]
+    fn sync_error_text_keeps_the_explanation_after_a_long_quoted_value() {
+        let value = "v".repeat(500);
+        let text = sync_error_text(&format!(
+            "pods \"{value}\" is forbidden: missing permission"
+        ));
+        assert_eq!(text, "pods \"…\" is forbidden: missing permission");
     }
 
     #[test]
