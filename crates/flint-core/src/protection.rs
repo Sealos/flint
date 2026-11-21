@@ -304,6 +304,9 @@ pub enum WriteRefusal {
          again from the cluster as it is now"
     )]
     Moved { cluster: String },
+    /// A load confirmed the context is gone from the kubeconfig files.
+    #[error("\"{cluster}\" is no longer in your kubeconfig files")]
+    Removed { cluster: String },
     #[error("the core is not running")]
     Stopped,
 }

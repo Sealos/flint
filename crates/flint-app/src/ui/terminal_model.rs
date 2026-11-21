@@ -263,6 +263,17 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
         ExecState::Exited { code: None } => (Tone::Muted, "Exited".to_owned()),
         // Core ended it as the tab does ([`toolbar_state`]).
         ExecState::Failed(f) if f.kind == ExecFailureKind::ContextChanged => context_changed(),
+        ExecState::Failed(f)
+            if matches!(
+                f.kind,
+                ExecFailureKind::NotStartedMoved | ExecFailureKind::NotStartedRemoved
+            ) =>
+        {
+            (
+                Tone::Warning,
+                "Did not start: the context changed".to_owned(),
+            )
+        }
         // Why is said once, in the tab's banner ([`failure_words`]).
         ExecState::Failed(_) => (Tone::Danger, "Failed".to_owned()),
         ExecState::Closed => (Tone::Muted, "Closed".to_owned()),
@@ -303,6 +314,12 @@ pub fn failure_words(failure: &ExecFailure) -> (&'static str, String) {
         }
         ExecFailureKind::ContextChanged => {
             "The shell ended: its context now points to another cluster, or is gone."
+        }
+        ExecFailureKind::NotStartedMoved => {
+            "The shell did not start: its context now points to another cluster."
+        }
+        ExecFailureKind::NotStartedRemoved => {
+            "The shell did not start: its context is no longer in your kubeconfig files."
         }
         ExecFailureKind::Other => "The shell could not start.",
         ExecFailureKind::Server => server_words(&failure.message),
@@ -645,6 +662,23 @@ mod tests {
             "The container is not running, so a shell can't start in it."
         );
         assert_eq!(server("InternalError: boom"), "The shell could not start.");
+        // covers UP-06: a shell refused before it started does not read as one that ran.
+        assert_eq!(
+            words(ExecFailureKind::NotStartedMoved, "moved"),
+            "The shell did not start: its context now points to another cluster."
+        );
+        assert_eq!(
+            words(ExecFailureKind::NotStartedRemoved, "gone"),
+            "The shell did not start: its context is no longer in your kubeconfig files."
+        );
+        assert_eq!(
+            state_text(&ExecState::Failed(ExecFailure::new(
+                ExecFailureKind::NotStartedMoved,
+                "moved"
+            )))
+            .1,
+            "Did not start: the context changed"
+        );
         // Local errors read as Flint's, whatever their words say: a missing auth plugin is
         // "not found on PATH", a missing client certificate "No such file or directory".
         assert_eq!(
