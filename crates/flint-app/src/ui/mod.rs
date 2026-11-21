@@ -39,6 +39,7 @@ mod palette;
 mod palette_model;
 mod quit_flush;
 mod registry;
+mod resource_actions;
 mod row_menu;
 mod scope_picker;
 mod startup;

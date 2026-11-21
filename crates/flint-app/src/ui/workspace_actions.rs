@@ -45,10 +45,14 @@ use super::super::registry::{
     TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
     ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::super::registry::{
+    CordonNode, DeleteObject, DrainNode, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
+};
 use super::super::registry::{EditAiScope, ShowAgentActivity};
 use super::super::registry::{
     LockCluster, RenameCluster, TrustCluster, UnlockCluster, UntrustCluster,
 };
+use super::super::resource_actions::{self, ResourceAction};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
@@ -90,6 +94,25 @@ impl Workspace {
         .bind::<LockCluster>(Self::lock_cluster)
         .bind::<TrustCluster>(Self::trust_cluster)
         .bind::<UntrustCluster>(Self::untrust_cluster)
+        .bind::<DeleteObject>(|this, _, window, cx| {
+            resource_actions::request(this, ResourceAction::Delete, window, cx)
+        })
+        .bind::<ScaleObject>(|this, _, window, cx| {
+            resource_actions::request(this, ResourceAction::Scale, window, cx)
+        })
+        .bind::<RestartObject>(|this, _, window, cx| {
+            resource_actions::request(this, ResourceAction::RolloutRestart, window, cx)
+        })
+        .bind::<CordonNode>(|this, _, window, cx| {
+            resource_actions::request(this, ResourceAction::Cordon, window, cx)
+        })
+        .bind::<UncordonNode>(|this, _, window, cx| {
+            resource_actions::request(this, ResourceAction::Uncordon, window, cx)
+        })
+        .bind::<DrainNode>(|this, _, window, cx| {
+            resource_actions::request(this, ResourceAction::Drain, window, cx)
+        })
+        .bind::<ShowDrainReport>(|_, _, window, cx| resource_actions::show_drain_report(window, cx))
         .bind::<RetryConnection>(Self::retry_connection)
         .bind::<WatchAllKinds>(|this, _, _, cx| this.set_watch_mode(true, Some(WatchMode::All), cx))
         .bind::<WatchOpenViewsOnly>(|this, _, _, cx| {
@@ -293,6 +316,26 @@ impl Workspace {
                     None => Err(ActionError::unavailable::<OpenContainerShell>()),
                 },
             )
+            // The resource actions act on the selected row, with the row menu's checks.
+            .when::<DeleteObject>(|ws, cx| {
+                resource_actions::available(ws, ResourceAction::Delete, cx).is_ok()
+            })
+            .when::<ScaleObject>(|ws, cx| {
+                resource_actions::available(ws, ResourceAction::Scale, cx).is_ok()
+            })
+            .when::<RestartObject>(|ws, cx| {
+                resource_actions::available(ws, ResourceAction::RolloutRestart, cx).is_ok()
+            })
+            .when::<CordonNode>(|ws, cx| {
+                resource_actions::available(ws, ResourceAction::Cordon, cx).is_ok()
+            })
+            .when::<UncordonNode>(|ws, cx| {
+                resource_actions::available(ws, ResourceAction::Uncordon, cx).is_ok()
+            })
+            .when::<DrainNode>(|ws, cx| {
+                resource_actions::available(ws, ResourceAction::Drain, cx).is_ok()
+            })
+            .when::<ShowDrainReport>(|_, cx| resource_actions::has_drain_result(cx))
             .add::<OpenSelectorLogs>(
                 |ws, cx| ws.cluster.is_some() && ws.sessions_open_here(cx),
                 |_, a, _| check_selector(a),
@@ -1045,6 +1088,31 @@ impl Workspace {
         }
     }
 
+    /// The core, for the resource actions' reviews and writes.
+    pub(in crate::ui) fn core<'a>(&self, cx: &'a App) -> &'a flint_core::CoreHandle {
+        self.model.read(cx).core()
+    }
+
+    /// Whether `cluster`'s discovery says `kind` can be deleted. Not known yet: no.
+    pub(in crate::ui) fn kind_deletable(
+        &self,
+        cluster: &str,
+        kind: &flint_core::KindId,
+        cx: &App,
+    ) -> bool {
+        self.model
+            .read(cx)
+            .discovered(cluster)
+            .and_then(|d| d.discovery.as_ref())
+            .and_then(|d| d.kind(kind))
+            .is_some_and(|k| k.supports("delete"))
+    }
+
+    /// Holds the review being read for a resource action; a newer one replaces it.
+    pub(in crate::ui) fn set_write_review(&mut self, review: Task<()>) {
+        self._write_review = review;
+    }
+
     /// What each cluster is called on screen.
     pub(in crate::ui) fn cluster_names(&self, cx: &App) -> flint_core::display::ClusterNames {
         self.model.read(cx).names()
@@ -1396,6 +1464,10 @@ mod protect_tests;
 #[cfg(test)]
 #[path = "row_actions_tests.rs"]
 mod row_actions_tests;
+
+#[cfg(test)]
+#[path = "resource_actions_tests.rs"]
+mod resource_actions_tests;
 
 #[cfg(test)]
 #[path = "dock_state_tests.rs"]

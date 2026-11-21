@@ -630,8 +630,8 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
 }
 
 // covers UP-10, UP-15
-// covers UP-10: `get_resource` names the GitOps controller that manages an object, and nothing
-// for an object it does not manage or a tracking id copied from another object.
+// covers UP-10: `get_resource` names the GitOps controller that manages an object, also through
+// a tracking id naming another object, and nothing for an object with no marker.
 #[test]
 fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
     let two = Two::start()?;
@@ -667,7 +667,7 @@ fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
         }),
     );
     let mut mcp = two.mcp()?;
-    for (name, marked) in [("managed", true), ("copied", false), ("plain", false)] {
+    for (name, marked) in [("managed", true), ("copied", true), ("plain", false)] {
         let got = mcp.call(
             "get_resource",
             json!({"cluster": EXPOSED, "kind": "configmaps", "namespace": "demo", "name": name}),
