@@ -894,6 +894,45 @@ fn exposing_scoped(context: &str, server: &str, namespaces: &[&str], kinds: &[&s
     )
 }
 
+// covers UP-14: kinds written by hand resolve as `kubectl get` names them, and what matches
+// nothing is reported and grants nothing.
+#[test]
+fn up_14_a_hand_written_scope_resolves_and_reports_what_matches_nothing() -> Result<()> {
+    let two = Two::start()?;
+    two.scratch.write_settings(&exposing_scoped(
+        EXPOSED,
+        &two.a.url(),
+        &["demo", "demoo"],
+        &["pod", "Deployment", "nope"],
+    ))?;
+    let mut mcp = two.mcp()?;
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    let scope = &clusters["clusters"][0]["scope"];
+    assert_eq!(scope["unmatched_kinds"], json!(["nope"]), "{clusters}");
+    assert_eq!(
+        scope["unmatched_namespaces"],
+        json!(["demoo"]),
+        "{clusters}"
+    );
+
+    let kinds = mcp.call_json("list_resource_kinds", json!({"cluster": EXPOSED}))?;
+    assert_eq!(kinds["count"], 2, "{kinds}");
+    let list = |kind: &str| json!({"cluster": EXPOSED, "kind": kind, "namespace": "demo"});
+    let deployments = mcp.call("list_resources", list("deployments"))?;
+    assert!(!deployments.is_error, "{}", deployments.text);
+    let services = mcp.call("list_resources", list("services"))?;
+    assert!(services.is_error, "{}", services.text);
+    let unknown = mcp.call(
+        "list_resources",
+        json!({"cluster": "no-such-cluster", "kind": "services", "namespace": "demo"}),
+    )?;
+    assert_eq!(
+        services.text.replace(EXPOSED, "X"),
+        unknown.text.replace("no-such-cluster", "X")
+    );
+    Ok(())
+}
+
 // covers UP-14: a cluster limited to a namespace and kinds shows only those. Every request
 // beyond the scope (another namespace, another kind, a cluster-scoped kind, a missing kind)
 // fails with exactly the error of a cluster that is not exposed, so nothing can be probed.
