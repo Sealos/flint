@@ -46,6 +46,10 @@ pub enum PolicyError {
     /// Used for clusters that do not exist and for clusters that are not exposed, so callers
     /// cannot tell the two apart.
     ClusterNotFound(String),
+    /// A request outside the scope of a cluster the agent can see. It names only the cluster, so
+    /// its text is the same whether what was asked for exists or not, and nothing beyond the
+    /// scope can be probed.
+    OutOfScope(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -54,6 +58,11 @@ impl std::fmt::Display for PolicyError {
             PolicyError::ClusterNotFound(name) => write!(
                 f,
                 "cluster \"{name}\" not found. Call list_clusters for the available clusters."
+            ),
+            PolicyError::OutOfScope(name) => write!(
+                f,
+                "this request is outside the scope exposed to agents on cluster \"{name}\". Call \
+                 list_clusters for the namespaces and kinds in scope."
             ),
         }
     }
@@ -218,10 +227,10 @@ pub fn cluster_scope(settings: &Settings, info: &ContextInfo) -> AiScope {
         .unwrap_or_default()
 }
 
-/// The error for anything outside a cluster's scope: exactly the one a cluster that is not
-/// exposed gives, so an agent cannot tell what exists beyond its scope.
+/// The error for anything outside the scope of an exposed cluster. One text for every such
+/// request, so an agent cannot tell what exists beyond its scope.
 pub fn out_of_scope(cluster: &str) -> PolicyError {
-    PolicyError::ClusterNotFound(cluster.to_owned())
+    PolicyError::OutOfScope(cluster.to_owned())
 }
 
 /// A scope with its hand-written kind names resolved against a cluster's kinds.
@@ -955,20 +964,23 @@ mod tests {
         assert_eq!(cluster_scope(&s, prod).namespaces, ["shop"]);
     }
 
-    // covers UP-14: anything out of scope fails exactly as an unexposed cluster does, in text
-    // and in type, so nothing can be probed.
+    // covers UP-14: out of scope says so, names only the cluster, and stays distinct from a
+    // cluster that is not exposed.
     #[test]
-    fn out_of_scope_is_the_unexposed_error() {
+    fn out_of_scope_names_only_the_cluster() {
         let kc = kubeconfig(&["dev", "prod"]);
         let s = settings(&["dev"]);
         let unexposed = exposed_cluster(&s, &kc, "prod").unwrap_err();
-        assert_eq!(out_of_scope("prod"), unexposed);
-        assert_eq!(out_of_scope("prod").to_string(), unexposed.to_string());
+        assert!(unexposed.to_string().contains("not found"));
+        let text = out_of_scope("prod").to_string();
+        assert!(text.contains("outside the scope"), "{text}");
+        assert!(!text.contains("not found"), "{text}");
         let scope = scoped(&["shop"], &[]);
-        assert_eq!(
-            namespaces_for(&scope, "prod", true, Some("kube-system")),
-            Err(unexposed)
-        );
+        for namespace in ["kube-system", "no-such-namespace"] {
+            let error = namespaces_for(&scope, "prod", true, Some(namespace)).unwrap_err();
+            assert_eq!(error, out_of_scope("prod"));
+            assert!(!error.to_string().contains(namespace));
+        }
     }
 
     // covers UP-14

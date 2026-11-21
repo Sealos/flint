@@ -33,6 +33,9 @@ fn flint_mcp_answers_on_stdio() {
         .env("KUBECONFIG", &kubeconfig)
         .env("FLINT_CONFIG_DIR", &config_dir)
         .env("FLINT_LOG", "warn")
+        // The log file's location: never the real one.
+        .env("HOME", scratch.path())
+        .env("XDG_STATE_HOME", scratch.path().join("state"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

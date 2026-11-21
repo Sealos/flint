@@ -305,13 +305,27 @@ impl Output {
         self.trim_frozen();
     }
 
-    /// Gives memory back to the shared budget: drops the oldest blocks down to `bytes`.
-    fn trim_to(&mut self, bytes: usize) {
-        if self.buffer.trim_to(bytes) {
-            self.trimmed = true;
-            self.dirty = true;
-            self.trim_frozen();
+    /// Gives memory back to the shared budget, if it asks: the oldest blocks, one at a time,
+    /// for as long as the tab stays hidden and the plan stands. `None` when nothing was asked,
+    /// else whether any line went. The lines are freed here, outside the budget's lock.
+    fn trim_for(&mut self, budget: &LogBudget, id: u64) -> Option<bool> {
+        let plan = budget.begin_trim(id)?;
+        let mut detached = Vec::new();
+        let buffer = &mut self.buffer;
+        while let Some(lines) = budget.while_planned(id, plan, || {
+            let before = buffer.bytes();
+            let lines = buffer.detach_oldest(plan.to)?;
+            Some((lines, before - buffer.bytes()))
+        }) {
+            detached.push(lines);
         }
+        if detached.is_empty() {
+            return Some(false);
+        }
+        self.trimmed = true;
+        self.dirty = true;
+        self.trim_frozen();
+        Some(true)
     }
 
     /// Keeps a paused view from holding blocks the buffer dropped.
@@ -328,6 +342,10 @@ impl Output {
         if self.state != *state {
             self.state = state.clone();
             self.dirty = true;
+            // Nothing more will be appended: the open block can go back to the budget too.
+            if matches!(state, LogState::Ended { .. }) {
+                self.buffer.seal_tail();
+            }
         }
     }
 
@@ -426,10 +444,15 @@ pub(crate) async fn run(
             }
             () = trim_asked() => {
                 if let Some(b) = &budget
-                    && let Some(bytes) = b.budget.take_trim(b.id)
+                    && let Some(dropped) = out.trim_for(&b.budget, b.id)
                 {
-                    out.trim_to(bytes);
                     b.budget.trimmed(b.id, out.buffer.bytes(), out.buffer.trimmable_bytes());
+                    if dropped {
+                        // At once, so a tab shown next has no lines that are gone. It stays
+                        // dirty: the next tick reports, and the budget plans again.
+                        out.publish(&tx);
+                        out.dirty = true;
+                    }
                 }
             }
             _ = tick.tick(), if out.dirty => {
@@ -707,6 +730,98 @@ mod tests {
             Some("after the trim")
         );
         assert!(tab1.trimmed);
+    }
+
+    fn output_with(lines: usize) -> Output {
+        // A byte budget large enough that blocks seal by their line count.
+        let mut out = Output::new(&SessionConfig::new(1_000_000, 1 << 30));
+        for n in 0..lines {
+            out.append(LogLine::parse(&format!("line {n}"), false));
+        }
+        out
+    }
+
+    // covers UP-42: a trim taken just before the tab is shown takes nothing from it.
+    #[test]
+    fn a_trim_taken_before_the_tab_is_shown_leaves_its_lines() {
+        let budget = LogBudget::new(1);
+        budget.register(1);
+        let mut out = output_with(crate::logs::CHUNK_LINES * 3);
+        let held = out.buffer.len();
+        budget.report(1, out.buffer.bytes(), out.buffer.trimmable_bytes(), false);
+        let plan = budget.begin_trim(1).expect("over the budget");
+        budget.set_shown(1, true);
+        assert_eq!(
+            budget.while_planned(1, plan, || {
+                out.buffer.detach_oldest(plan.to).map(|lines| (lines, 0))
+            }),
+            None
+        );
+        assert_eq!(out.buffer.len(), held);
+        assert!(!out.trimmed);
+    }
+
+    // covers UP-42: a hidden tab gives its sealed blocks back, and says so.
+    #[test]
+    fn a_hidden_tab_gives_back_its_sealed_blocks() {
+        let budget = LogBudget::new(1);
+        budget.register(1);
+        let mut out = output_with(crate::logs::CHUNK_LINES * 2 + 5);
+        budget.report(1, out.buffer.bytes(), out.buffer.trimmable_bytes(), false);
+        assert_eq!(out.trim_for(&budget, 1), Some(true));
+        assert_eq!(out.buffer.len(), 5, "the open block stays");
+        assert!(out.trimmed);
+        assert_eq!(out.trim_for(&budget, 1), None, "asked once");
+    }
+
+    // covers UP-42: an ended stream never appends again, so its last block can go back too;
+    // one still running keeps its open block.
+    #[test]
+    fn an_ended_stream_can_give_back_its_last_block() {
+        let mut running = output_with(5);
+        running.set_state(&LogState::Streaming);
+        assert_eq!(running.buffer.trimmable_bytes(), 0);
+
+        let mut ended = output_with(5);
+        ended.set_state(&LogState::Ended {
+            error: None,
+            pod_deleted: false,
+        });
+        assert_eq!(ended.buffer.trimmable_bytes(), ended.buffer.bytes());
+        assert_eq!(ended.buffer.len(), 5, "sealing keeps every line");
+
+        let budget = LogBudget::new(0);
+        budget.register(1);
+        budget.report(
+            1,
+            ended.buffer.bytes(),
+            ended.buffer.trimmable_bytes(),
+            false,
+        );
+        assert_eq!(ended.trim_for(&budget, 1), Some(true));
+        assert!(ended.buffer.is_empty());
+        assert!(ended.trimmed);
+    }
+
+    // covers UP-42: an ended tab that is shown keeps its whole log, however far over the budget.
+    #[test]
+    fn an_ended_tab_that_is_shown_keeps_its_log() {
+        let mut ended = output_with(5);
+        ended.set_state(&LogState::Ended {
+            error: None,
+            pod_deleted: true,
+        });
+        let budget = LogBudget::new(0);
+        budget.register(1);
+        budget.set_shown(1, true);
+        budget.report(
+            1,
+            ended.buffer.bytes(),
+            ended.buffer.trimmable_bytes(),
+            false,
+        );
+        assert_eq!(ended.trim_for(&budget, 1), None);
+        assert_eq!(ended.buffer.len(), 5);
     }
 
     // covers UP-40
