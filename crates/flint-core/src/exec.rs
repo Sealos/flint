@@ -306,7 +306,8 @@ pub struct ExecSnapshot {
     pub state: ExecState,
     pub terminal: TerminalSnapshot,
     /// Input typed while a shell that turned out not to exist was tried could not be safely
-    /// replayed. Set once the replacement shell shows it started, and stays set after that.
+    /// replayed. Set once the replacement shell shows it started, by printing or by exiting
+    /// with a code, and stays set after that.
     pub input_not_replayed: bool,
 }
 
@@ -973,7 +974,12 @@ pub(crate) async fn run(
                 session.set_state(ExecState::Closed);
                 return;
             }
-            Outcome::Done(state) => session.set_state(state),
+            Outcome::Done(state) => {
+                // An exit code means the command ran, even if it printed nothing.
+                session.input_not_replayed |=
+                    input_not_replayed && matches!(state, ExecState::Exited { code: Some(_) });
+                session.set_state(state);
+            }
         }
         break;
     }
@@ -3069,6 +3075,28 @@ mod tests {
             assert!(matches!(snap.state, ExecState::Failed(_)));
             assert!(!snap.input_not_replayed);
         }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_shell_that_exits_silently_records_the_lost_input() {
+        let launcher = GatedLauncher::default();
+        let bash = launcher.gate();
+        let sh = launcher.gate();
+        let mut session = open_watched(&launcher, request(), Arc::new(|| async { None }.boxed()));
+        let (bash_proc, mut bash_remote) = process();
+        let paste = "x".repeat(600 * 1024);
+        session.paste(paste.clone()).unwrap();
+        bash.send(bash_proc).ok().unwrap();
+        assert_eq!(bash_remote.read_stdin(paste.len()).await, paste.as_bytes());
+        queued(&session, 0).await;
+        bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
+
+        let (sh_proc, mut sh_remote) = process();
+        sh.send(sh_proc).ok().unwrap();
+        sh_remote.exit(status("Success", "", ""));
+        let snap = wait_for(&mut session, "sh exited", |s| s.state.is_finished()).await;
+        assert_eq!(snap.state, ExecState::Exited { code: Some(0) });
+        assert!(snap.input_not_replayed);
     }
 
     // covers UP-41 (#256): input sent while a shell may still turn out missing is kept for
