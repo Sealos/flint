@@ -81,6 +81,11 @@ claude mcp add flint -- sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTR
 
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
 
+The app and an agent can read different kubeconfig files: an app opened from Finder ignores a `KUBECONFIG` exported in
+your shell, and an agent started from a terminal inherits it. If a cluster you exposed is in none of the files the
+server read, `list_clusters` says so and lists those files. Add the missing file to `kubeconfig_paths` in
+`settings.toml`, which the app and the server both read.
+
 Where the app cannot run, for example on a Linux server or in a devcontainer, install the
 [static `flint-mcp`](#linux-mcp-server-only-flint-mcp) and register it the same way, without `mcp`:
 

@@ -22,7 +22,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::limits::{Admission, Counted, Limits};
+use crate::limits::{Admission, Counted, Limits, Tracked};
 use crate::policy;
 
 /// How long `list_clusters` waits for each cluster's `/version`.
@@ -599,6 +599,12 @@ impl FlintMcp {
         Counted::new(transport, admission.replies(), &admission.limits())
     }
 
+    /// This server as the service to run over [`Self::counted`]'s transport: it tells the
+    /// transport when each tool call's handler ends.
+    pub fn tracked(&self) -> impl rmcp::Service<rmcp::RoleServer> + use<> {
+        Tracked::new(self.clone(), self.inner.admission.replies())
+    }
+
     #[tool(
         description = "List the Kubernetes clusters the user exposed to AI agents in Flint, with \
         server URL and whether a connection works.",
@@ -704,12 +710,6 @@ impl ServerHandler for FlintMcp {
         let mut named = named_in(request.arguments.as_ref());
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
-        // Until this handler ends, the call counts as unanswered, cancelled or not: it may
-        // still be writing its activity record.
-        let _ended = HandlerEnded {
-            replies: admission.replies(),
-            id: context.id.clone(),
-        };
         let deadline = admission.limits().deadline;
         let turn = tokio::select! {
             turn = admission.enter() => Some(turn),
@@ -807,20 +807,6 @@ impl ServerHandler for FlintMcp {
         });
         self.record(record, reached).await;
         result
-    }
-}
-
-/// Marks a tool call's handler as ended when dropped (`limits::ReplyBytes::handler_ended`).
-struct HandlerEnded {
-    replies: Arc<crate::limits::ReplyBytes>,
-    id: rmcp::model::RequestId,
-}
-
-impl Drop for HandlerEnded {
-    fn drop(&mut self) {
-        // A handler that panicked sends no reply: nothing else would let its request go.
-        self.replies
-            .handler_ended(&self.id, std::thread::panicking());
     }
 }
 
@@ -967,6 +953,8 @@ impl FlintMcp {
                 .collect();
         });
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);
+        let missing = policy::missing_exposures(&ctx.settings, &ctx.kubeconfig);
+        let kubeconfig_paths = ctx.kubeconfig.paths.clone();
         let settings = ctx.settings.clone();
         let kubeconfig_errors: Vec<Value> = ctx
             .kubeconfig
@@ -1015,7 +1003,13 @@ impl FlintMcp {
             rows.push(row);
         }
         let mut out = json!({ "clusters": rows });
-        if let Some(hint) = policy::list_clusters_hint(exposed.len(), changed) {
+        if let Some(hint) = policy::list_clusters_hint(
+            exposed.len(),
+            changed,
+            missing,
+            &kubeconfig_paths,
+            !kubeconfig_errors.is_empty(),
+        ) {
             out["hint"] = json!(hint);
         }
         if !kubeconfig_errors.is_empty() {

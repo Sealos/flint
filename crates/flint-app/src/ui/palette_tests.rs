@@ -1203,6 +1203,18 @@ async fn exact_stored_values_win(cx: &mut TestAppContext) {
     }
 }
 
+// covers UP-30: a context removed and added back at the same URL is a new slot, so the switcher
+// does not restore the old selection onto it.
+#[test]
+fn a_selection_stays_only_on_the_same_slot() {
+    use super::same_slot;
+    let id = Some(("a".to_owned(), Some("https://example.invalid".to_owned())));
+    let other = Some(("b".to_owned(), Some("https://example.invalid".to_owned())));
+    assert!(same_slot((&id, Some(1)), (&id, Some(1))));
+    assert!(!same_slot((&id, Some(1)), (&id, Some(2))), "started over");
+    assert!(!same_slot((&id, Some(1)), (&other, Some(1))));
+}
+
 #[test]
 fn exactness_ranks_stored_values_then_labels_case_first() {
     use super::exactness;

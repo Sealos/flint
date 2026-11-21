@@ -164,6 +164,9 @@ pub struct SwitcherScope {
     /// The active cluster's context name and API server: an Enter passes them on, so the
     /// workspace refuses it once another cluster (or server) is active.
     pub cluster_id: Option<(String, Option<String>)>,
+    /// The active context's slot: one that started over has other objects, even at the same
+    /// context and server.
+    pub generation: Option<u64>,
     /// The kinds, at first; the objects come through [`CommandPalette::set_index`].
     pub index: Index,
     /// The objects are being read from the stores.
@@ -172,6 +175,15 @@ pub struct SwitcherScope {
     pub discovery_failed: bool,
     /// The cluster watches only the kinds open in a view.
     pub on_view: bool,
+}
+
+/// Whether two switcher scopes are on one cluster slot, so a selection carries over: a context
+/// removed and added back at the same URL is a new slot, with other objects.
+fn same_slot(
+    old: (&Option<(String, Option<String>)>, Option<u64>),
+    new: (&Option<(String, Option<String>)>, Option<u64>),
+) -> bool {
+    old == new
 }
 
 /// A switcher item by what it is, not by its row: its kind, and the object (`None` for the
@@ -183,6 +195,7 @@ struct Resources {
     /// The active cluster, as the rows name it; `None` with no cluster active.
     cluster: Option<SharedString>,
     cluster_id: Option<(String, Option<String>)>,
+    generation: Option<u64>,
     index: Arc<Index>,
     /// The objects are still being read from the stores.
     loading: bool,
@@ -198,6 +211,7 @@ impl Resources {
         Resources {
             cluster: scope.cluster,
             cluster_id: scope.cluster_id,
+            generation: scope.generation,
             index: Arc::new(scope.index),
             loading: scope.loading,
             discovery_failed: scope.discovery_failed,
@@ -339,7 +353,10 @@ impl CommandPalette {
         let Some(resources) = &self.resources else {
             return;
         };
-        let same_cluster = resources.cluster_id == scope.cluster_id;
+        let same_cluster = same_slot(
+            (&resources.cluster_id, resources.generation),
+            (&scope.cluster_id, scope.generation),
+        );
         let kept = self
             .chosen_item()
             .or_else(|| self.kept.take())

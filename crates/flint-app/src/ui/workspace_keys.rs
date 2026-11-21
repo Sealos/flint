@@ -364,6 +364,7 @@ impl Workspace {
         let scope = SwitcherScope {
             cluster: label.map(SharedString::from),
             cluster_id,
+            generation: summary.map(|s| s.generation),
             index: Index::new(&entries, &[]),
             loading: self.cluster.is_some() && !entries.is_empty(),
             discovery_failed,
