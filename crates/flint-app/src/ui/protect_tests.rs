@@ -822,6 +822,32 @@ async fn clusters_on_this_machine_start_unlocked(cx: &mut TestAppContext) {
     assert!(row.contains("On this machine: unlocked"), "{row}");
 }
 
+// covers UP-33: a dialog closes the namespace picker, which would stay above it, and once the
+// dialog is gone the keys work again from the picker's button.
+#[gpui_kit::test]
+async fn a_dialog_closes_the_namespace_picker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+    draw(cx, &t);
+    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    draw(cx, &t);
+    assert!(t.find(cx, "ns-all").is_none(), "the picker closed");
+    assert!(t.has_dialog(cx), "the dialog stays open");
+
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    draw(cx, &t);
+    assert!(t.find(cx, "ns-all").is_none(), "the picker stays closed");
+    let button = t.find(cx, "namespace-filter-button").unwrap();
+    assert_eq!(button.focused(), Some(true), "focus is back on the button");
+}
+
 const SERVER_WITH_USERINFO: &str = "https://admin:hunter2@prod.example:6443/?token=abc";
 const CLEANED_SERVER: &str = "https://prod.example:6443";
 
