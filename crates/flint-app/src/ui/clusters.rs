@@ -9,8 +9,9 @@ use flint_core::activity::ActivityRecord;
 use flint_core::settings::{AiExposureState, AiScope, TrustState};
 use flint_core::{
     Appearance, ClusterDiscovery, ClusterId, ClusterSummary, Command, ConnectionState, CoreHandle,
-    Event, Protection, Settings, WatchMode,
+    Event, KindId, Protection, Settings, SyncState, WatchMode,
 };
+use gpui_kit::component::Theme;
 use gpui_kit::*;
 
 pub struct ClustersModel {
@@ -415,24 +416,41 @@ pub fn startup_cluster(requested: &str, clusters: &[ClusterSummary]) -> Option<C
 /// keep watching in the background (ADR-0012), this should come from the core's watch state
 /// instead of `active`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Presence {
+pub enum Presence<'a> {
     NotConnected,
     Connecting,
     /// Connected and watched.
     Live,
+    Reconnecting {
+        error: Option<&'a str>,
+    },
     /// Connected, but its watches are stopped (cold).
     Idle,
     Failed,
 }
 
-impl Presence {
-    pub fn of(state: &ConnectionState, active: bool) -> Self {
+impl<'a> Presence<'a> {
+    pub fn of(
+        state: &ConnectionState,
+        active: bool,
+        states: &'a HashMap<KindId, SyncState>,
+    ) -> Self {
         match state {
             ConnectionState::Disconnected => Presence::NotConnected,
             ConnectionState::Connecting => Presence::Connecting,
-            ConnectionState::Connected(_) if active => Presence::Live,
+            ConnectionState::Connected(_) if active => reconnecting(states).unwrap_or(Self::Live),
             ConnectionState::Connected(_) => Presence::Idle,
             ConnectionState::Failed(_) => Presence::Failed,
+        }
+    }
+
+    pub fn dot(self, theme: &Theme) -> (Hsla, bool) {
+        match self {
+            Presence::NotConnected => (theme.muted_foreground.opacity(0.4), true),
+            Presence::Connecting | Presence::Reconnecting { .. } => (theme.warning, true),
+            Presence::Live => (theme.success, true),
+            Presence::Idle => (theme.success, false),
+            Presence::Failed => (theme.danger, true),
         }
     }
 
@@ -443,10 +461,40 @@ impl Presence {
             Presence::NotConnected => "not_connected",
             Presence::Connecting => "connecting",
             Presence::Live => "live",
+            Presence::Reconnecting { .. } => "reconnecting",
             Presence::Idle => "idle",
             Presence::Failed => "failed",
         }
     }
+}
+
+/// The row's status while reconnecting. A watch error can carry the server's own message, so
+/// only its safe summary is shown.
+pub fn reconnecting_text(error: Option<&str>) -> String {
+    match error {
+        Some(error) => format!(
+            "Reconnecting: {}",
+            flint_core::redact::safe_error_summary(error)
+        ),
+        None => "Reconnecting".to_owned(),
+    }
+}
+
+/// The cluster is reconnecting when at least one watched kind is reconnecting and no kind is
+/// synced. Other states alone do not indicate connection trouble. Use the first reconnecting
+/// kind with an error by kind ID so the tooltip is stable.
+fn reconnecting(states: &HashMap<KindId, SyncState>) -> Option<Presence<'_>> {
+    if states.values().any(SyncState::is_current) {
+        return None;
+    }
+    let (_, error) = states
+        .iter()
+        .filter_map(|(kind, state)| match state {
+            SyncState::Reconnecting { error } => Some((kind, error.as_deref())),
+            _ => None,
+        })
+        .min_by_key(|(kind, error)| (error.is_none(), *kind))?;
+    Some(Presence::Reconnecting { error })
 }
 
 /// A connection state's name in the automation state: `disconnected`, `connecting`,
@@ -475,10 +523,11 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
     use super::{
-        Discovered, Presence, forget_stale, replace_clusters, startup_cluster, state_name,
+        Discovered, Presence, forget_stale, reconnecting, reconnecting_text, replace_clusters,
+        startup_cluster, state_name,
     };
     use flint_core::kubeconfig::ContextInfo;
-    use flint_core::{ClusterSummary, ConnectionState, ServerVersion};
+    use flint_core::{ClusterSummary, ConnectionState, KindId, ServerVersion, SyncState};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -581,19 +630,89 @@ mod tests {
             git_version: "v1.31.0".into(),
             platform: "linux/arm64".into(),
         });
-        assert_eq!(Presence::of(&connected, true), Presence::Live);
-        assert_eq!(Presence::of(&connected, false), Presence::Idle);
-        let failed = ConnectionState::Failed(flint_core::SafeErrorText::reduced("refused"));
-        assert_eq!(Presence::of(&failed, false), Presence::Failed);
         assert_eq!(
-            Presence::of(&ConnectionState::Connecting, false),
+            Presence::of(&connected, true, &HashMap::new()),
+            Presence::Live
+        );
+        let states = HashMap::from([(KindId::pods(), SyncState::Reconnecting { error: None })]);
+        assert_eq!(
+            Presence::of(&connected, true, &states),
+            Presence::Reconnecting { error: None }
+        );
+        assert_eq!(Presence::of(&connected, false, &states), Presence::Idle);
+        let failed = ConnectionState::Failed(flint_core::SafeErrorText::reduced("refused"));
+        assert_eq!(Presence::of(&failed, true, &states), Presence::Failed);
+        assert_eq!(
+            Presence::of(&ConnectionState::Connecting, true, &states),
             Presence::Connecting
         );
         assert_eq!(
-            Presence::of(&ConnectionState::Disconnected, true),
+            Presence::of(&ConnectionState::Disconnected, true, &states),
             Presence::NotConnected
         );
         assert_eq!(Presence::Idle.name(), "idle");
+    }
+
+    #[test]
+    fn connection_trouble_requires_a_reconnecting_kind_and_no_synced_kind() {
+        assert_eq!(reconnecting(&HashMap::new()), None);
+        let pods = KindId::pods();
+        let mut states = HashMap::from([
+            (KindId::new("", "configmaps"), SyncState::Idle),
+            (KindId::new("", "nodes"), SyncState::Loading),
+            (KindId::new("", "namespaces"), SyncState::Unavailable),
+            (
+                KindId::new("", "secrets"),
+                SyncState::Failed {
+                    error: "forbidden".into(),
+                },
+            ),
+        ]);
+        assert_eq!(reconnecting(&states), None);
+        states.insert(pods, SyncState::Reconnecting { error: None });
+        assert_eq!(
+            reconnecting(&states),
+            Some(Presence::Reconnecting { error: None })
+        );
+        states.insert(KindId::new("", "nodes"), SyncState::Synced);
+        assert_eq!(reconnecting(&states), None);
+    }
+
+    #[test]
+    fn reconnecting_text_shows_only_a_safe_summary() {
+        assert_eq!(reconnecting_text(None), "Reconnecting");
+        let text = reconnecting_text(Some("denied for \"s3cret-value\"\nsecond line"));
+        assert!(text.starts_with("Reconnecting: denied for"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("second line"), "{text}");
+    }
+
+    #[test]
+    fn reconnecting_uses_the_first_kind_with_an_error() {
+        let states = HashMap::from([
+            (
+                KindId::new("", "configmaps"),
+                SyncState::Reconnecting { error: None },
+            ),
+            (
+                KindId::pods(),
+                SyncState::Reconnecting {
+                    error: Some("timed out".into()),
+                },
+            ),
+            (
+                KindId::new("", "nodes"),
+                SyncState::Reconnecting {
+                    error: Some("connection dropped".into()),
+                },
+            ),
+        ]);
+        assert_eq!(
+            reconnecting(&states),
+            Some(Presence::Reconnecting {
+                error: Some("connection dropped")
+            })
+        );
     }
 
     // The automation state's words for a connection; the e2e tests read them.
