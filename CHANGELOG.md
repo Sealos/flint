@@ -2,6 +2,10 @@
 
 ## [0.3.1](https://github.com/Sealos/flint/compare/v0.3.0...v0.3.1) (2026-11-21)
 
+### Upgrade note
+
+An existing `ai_exposed_clusters` scope that names a kind by an alias (`pod`, `Deployment`, `deploy`) used to grant nothing for that name. After this upgrade it grants that kind to AI agents. Review hand-written `kinds` lists before upgrading, and remove any name agents should not read.
+
 
 ### Features
 
