@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use flint_core::display::{
-    CUSTOM_NAME_PUNCTUATION, ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name, short_name,
+    CUSTOM_NAME_PUNCTUATION, ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name,
+    cluster_name_key, saved_name_key, short_name,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::{Input, InputState};
@@ -33,6 +34,14 @@ fn problem(
              {CUSTOM_NAME_PUNCTUATION}"
         ));
     };
+    // Keeping or re-casing its own name adds no collision, even if a saved name already has one.
+    let key = cluster_name_key(&name);
+    if names
+        .get(context)
+        .is_some_and(|own| saved_name_key(own).as_ref() == Some(&key))
+    {
+        return None;
+    }
     let mut with_it = names.clone();
     with_it.insert(context.to_owned(), name);
     ClusterNames::new(contexts.iter().copied(), &with_it)
@@ -158,6 +167,34 @@ mod tests {
         }
         assert!(problem(&names, &contexts, "dev", "a\u{202e}b").is_some());
         assert!(problem(&names, &contexts, "dev", &"x".repeat(33)).is_some());
+    }
+
+    // covers UP-01: separators and look-alike letters count as the same name.
+    #[test]
+    fn a_look_alike_name_is_refused_but_its_own_name_is_kept() {
+        let contexts = ["a", "b", "c"];
+        let names = BTreeMap::from([("a".to_owned(), "prod-eu".to_owned())]);
+        for taken in ["prod_eu", "PROD EU", "pr\u{43e}d-eu", "\u{ff50}rod-eu"] {
+            assert!(problem(&names, &contexts, "b", taken).is_some(), "{taken}");
+        }
+        assert_eq!(problem(&names, &contexts, "a", "Prod_EU"), None);
+        assert_eq!(problem(&names, &contexts, "b", "север"), None);
+
+        // Saved before the stricter check: either cluster can still save its own name.
+        let names = BTreeMap::from([
+            ("a".to_owned(), "prod-eu".to_owned()),
+            ("b".to_owned(), "prod_eu".to_owned()),
+        ]);
+        assert_eq!(problem(&names, &contexts, "a", "prod-eu"), None);
+        assert_eq!(problem(&names, &contexts, "b", "PROD_EU"), None);
+        assert!(problem(&names, &contexts, "c", "prod eu").is_some());
+
+        // A saved name counts as it is shown, trimmed: this rename would be a new collision.
+        let names = BTreeMap::from([
+            ("a".to_owned(), "prod ".to_owned()),
+            ("b".to_owned(), "prod-".to_owned()),
+        ]);
+        assert!(problem(&names, &contexts, "a", "prod-").is_some());
     }
 
     // covers UP-55: renaming keeps the real cluster on screen.

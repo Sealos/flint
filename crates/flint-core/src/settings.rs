@@ -879,7 +879,10 @@ pub fn set_watch_mode(
 }
 
 /// Sets the custom name of `context` (`None` removes it), and writes `settings.toml`. Returns
-/// the settings as written. A name [`crate::display::clean_custom_name`] refuses is an error.
+/// the settings as written. A name [`crate::display::clean_custom_name`] refuses is an error, and
+/// so is one with the same [`crate::display::cluster_name_key`] as another cluster's, unless
+/// `context` already holds that key: it may keep or re-case its own name even in a file where
+/// that name already collides.
 pub fn set_cluster_name(
     dir: &Path,
     context: &str,
@@ -909,13 +912,18 @@ pub fn set_cluster_name(
         // Against the file as it is now: another Flint may have taken the name since it was
         // checked, and two clusters with one name would both lose it.
         if let Some(name) = &cleaned {
-            let taken = entries.iter().any(|(other, value)| {
-                other != context
-                    && value
-                        .as_str()
-                        .is_some_and(|v| v.to_lowercase() == name.to_lowercase())
-            });
-            if taken {
+            let key = crate::display::cluster_name_key(name);
+            let holds_key = |value: &toml::Value| {
+                value
+                    .as_str()
+                    .and_then(crate::display::saved_name_key)
+                    .is_some_and(|saved| saved == key)
+            };
+            let its_own = entries.get(context).is_some_and(holds_key);
+            let taken = entries
+                .iter()
+                .any(|(other, value)| other != context && holds_key(value));
+            if taken && !its_own {
                 return Err(SettingsError::Invalid {
                     path: path.to_owned(),
                     reason: format!("another cluster already goes by {name:?}"),
@@ -1763,6 +1771,73 @@ mod tests {
         assert!(s.cluster_names.is_empty());
         let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(!text.contains("cluster_names"), "{text}");
+    }
+
+    // covers UP-01: separators and look-alike letters collide when a name is set.
+    #[test]
+    fn a_look_alike_cluster_name_is_refused_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = set_cluster_name(dir.path(), "a", Some("prod-eu")).unwrap();
+        for name in ["prod_eu", "PROD EU", "pr\u{43e}d-eu", "\u{ff50}rod-eu"] {
+            assert!(
+                set_cluster_name(dir.path(), "b", Some(name)).is_err(),
+                "{name}"
+            );
+            assert_eq!(load_settings(dir.path()).unwrap(), s, "{name}");
+        }
+        // Its own name may be kept or re-cased.
+        let s = set_cluster_name(dir.path(), "a", Some("prod-eu")).unwrap();
+        assert_eq!(s.cluster_names["a"], "prod-eu");
+        let s = set_cluster_name(dir.path(), "a", Some("Prod_EU")).unwrap();
+        assert_eq!(s.cluster_names["a"], "Prod_EU");
+        // A non-Latin name that collides with nothing is fine.
+        let s = set_cluster_name(dir.path(), "b", Some("север")).unwrap();
+        assert_eq!(s.cluster_names["b"], "север");
+    }
+
+    // covers UP-01: a saved name counts as it is shown, trimmed.
+    #[test]
+    fn saved_names_are_compared_as_they_are_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[cluster_names]\na = \"prod \"\nb = \"prod-\"\n";
+        std::fs::write(dir.path().join(SETTINGS_FILE), text).unwrap();
+        // Would make two names that are shown apart collide.
+        assert!(set_cluster_name(dir.path(), "a", Some("prod-")).is_err());
+        assert!(set_cluster_name(dir.path(), "c", Some("prod")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(),
+            text
+        );
+    }
+
+    // covers UP-01: a file from before the stricter check loads as it is.
+    #[test]
+    fn saved_names_that_collide_load_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let text = "[cluster_names]\na = \"prod-eu\"\nb = \"prod_eu\"\nc = \"pr\u{43e}d-eu\"\n";
+        std::fs::write(&path, text).unwrap();
+
+        let s = load_settings(dir.path()).unwrap();
+        assert_eq!(s.cluster_names["a"], "prod-eu");
+        assert_eq!(s.cluster_names["b"], "prod_eu");
+        assert_eq!(s.cluster_names["c"], "pr\u{43e}d-eu");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "not rewritten"
+        );
+
+        let shown = crate::display::ClusterNames::new(["a", "b", "c"], &s.cluster_names);
+        for context in ["a", "b", "c"] {
+            assert_eq!(shown.of(context), context);
+        }
+
+        // A cluster in the pair can still save its own name, and the others are left alone.
+        let s = set_cluster_name(dir.path(), "a", Some("PROD-EU")).unwrap();
+        assert_eq!(s.cluster_names["a"], "PROD-EU");
+        assert_eq!(s.cluster_names["b"], "prod_eu");
+        assert_eq!(s.cluster_names["c"], "pr\u{43e}d-eu");
     }
 
     #[test]
