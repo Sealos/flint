@@ -465,9 +465,13 @@ pub(crate) struct Interner {
     kept: usize,
     /// The most strings held as a relist began or ended, since the table was last given back.
     /// Read before the relist's rows arrive, so outgoing and incoming strings aren't added up.
+    /// A failed poll's strings are pruned when it is abandoned, so they don't count.
     high: usize,
-    /// How many distinct strings the relist in progress has asked for.
+    /// How many strings in the set the relist in progress has marked.
     incoming: usize,
+    /// The most strings it had marked at once, before a prune dropped some of them. A string
+    /// pruned and asked for again is then not counted twice.
+    incoming_peak: usize,
     /// The highest capacity seen since shrinking, before retains can hide buckets as tombstones.
     peak_capacity: usize,
     #[cfg(test)]
@@ -503,7 +507,15 @@ impl Interner {
     /// survives until a later prune.
     pub fn prune(&mut self) {
         self.peak_capacity = self.peak_capacity.max(self.set.capacity());
-        self.set.retain(|s, _| Arc::strong_count(s) > 1);
+        self.incoming_peak = self.incoming_peak.max(self.incoming);
+        let relist = self.relist;
+        let mut marked = 0;
+        self.set.retain(|s, last| {
+            let used = Arc::strong_count(s) > 1;
+            marked += usize::from(used && *last == relist);
+            used
+        });
+        self.incoming = marked;
         self.kept = self.set.len();
         self.inserts = 0;
         // After a big drop, give the table back too, so later prunes walk what is left.
@@ -520,6 +532,7 @@ impl Interner {
     pub fn begin_relist(&mut self) {
         self.high = self.high.max(self.set.len());
         self.incoming = 0;
+        self.incoming_peak = 0;
         self.relist += 1;
     }
 
@@ -528,8 +541,9 @@ impl Interner {
     /// are not kept for rows that are gone.
     pub fn remark<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
         // What the relist asked for before its rows were discarded counts as a list it held.
-        self.high = self.high.max(self.incoming);
+        self.high = self.high.max(self.incoming_peak).max(self.incoming);
         self.incoming = 0;
+        self.incoming_peak = 0;
         self.relist += 1;
         for s in used {
             if let Some(last) = self.set.get_mut(&**s)
@@ -576,6 +590,16 @@ impl Interner {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.set.len()
+    }
+
+    #[cfg(test)]
+    pub fn shrinks(&self) -> usize {
+        self.shrinks
+    }
+
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.set.capacity()
     }
 }
 
@@ -1335,6 +1359,63 @@ pub(crate) mod tests {
         }
         drop(rows);
         assert_eq!(interner.shrinks, 0);
+    }
+
+    // covers UP-20: strings grown by watch events count even once their rows are gone, so a
+    // relist after a big drop still gives the table back.
+    #[test]
+    fn watch_growth_counts_towards_the_shrink_mark_after_its_rows_are_deleted() {
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        interner.keep_relisted();
+        let watched: Vec<Arc<str>> = (0..3_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
+        let big = interner.set.capacity();
+        drop(watched);
+        interner.begin_relist();
+        let kept = interner.intern("s-1");
+        interner.keep_relisted();
+        assert_eq!(interner.shrinks, 1);
+        assert!(interner.set.capacity() < big / 4);
+        drop(kept);
+    }
+
+    // covers UP-20: a string pruned during a relist and asked for again counts once.
+    #[test]
+    fn a_pruned_string_asked_for_again_counts_once() {
+        let size = 700;
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        let names = |interner: &mut Interner| -> Vec<Arc<str>> {
+            (0..size)
+                .map(|i| interner.intern(&format!("s-{i}")))
+                .collect()
+        };
+        drop(names(&mut interner));
+        interner.prune();
+        assert_eq!(interner.len(), 0);
+        let again = names(&mut interner);
+        interner.remark(again.iter());
+        assert_eq!(interner.high, size);
+        interner.keep_relisted();
+        assert_eq!(interner.shrinks, 0);
+    }
+
+    // covers UP-20: what was marked before a prune still counts as a list held at once.
+    #[test]
+    fn the_most_strings_marked_at_once_survive_a_prune() {
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        let big: Vec<Arc<str>> = (0..3_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
+        let kept = big[0].clone();
+        drop(big);
+        interner.prune();
+        assert_eq!(interner.incoming, 1);
+        interner.remark(std::iter::once(&kept));
+        assert_eq!(interner.high, 3_000);
     }
 
     #[test]
