@@ -50,6 +50,10 @@ pub(crate) fn init(stderr_filter: EnvFilter, file_filter: EnvFilter) {
         let _ = FILE_QUEUE.set(file.queue.clone());
     }
     subscriber(stderr_filter, file_filter, file, io::stderr).init();
+    // The writer thread can only report a failed open through a subscriber that is installed.
+    if let Some(queue) = FILE_QUEUE.get() {
+        let _ = queue.try_send(Message::SubscriberReady);
+    }
     if let Some(error) = error {
         tracing::warn!(%error, "could not start Flint's log file; logging to stderr");
     }
@@ -147,6 +151,8 @@ impl<W: Write> Write for RedactingWriter<W> {
 enum Message {
     Event(Vec<u8>),
     Flush(SyncSender<()>),
+    /// The global subscriber is installed, so the writer thread can log a failed open.
+    SubscriberReady,
 }
 
 /// The file layer's writer: hands each formatted event to the writer thread, so no file or lock
@@ -162,7 +168,7 @@ impl FileLog {
 
     /// Starts the writer thread, which runs `open` first. Until `open` returns, events wait in
     /// the queue (and past its size are dropped), and if it fails they are dropped: stderr keeps
-    /// them, and says why.
+    /// them, and says why if its filter shows warnings.
     fn spawn_opening(
         open: impl FnOnce() -> io::Result<FileWriter> + Send + 'static,
     ) -> io::Result<Self> {
@@ -170,15 +176,9 @@ impl FileLog {
         std::thread::Builder::new()
             .name("flint-log".into())
             .spawn(move || {
-                let mut writer = match open() {
-                    Ok(writer) => Some(writer),
-                    Err(error) => {
-                        let _ = writeln!(
-                            io::stderr(),
-                            "flint: could not open Flint's log file; logging to stderr: {error}"
-                        );
-                        None
-                    }
+                let (mut writer, mut open_error) = match open() {
+                    Ok(writer) => (Some(writer), None),
+                    Err(error) => (None, Some(error)),
                 };
                 for message in events {
                     match message {
@@ -192,6 +192,14 @@ impl FileLog {
                         }
                         Message::Flush(done) => {
                             let _ = done.send(());
+                        }
+                        Message::SubscriberReady => {
+                            if let Some(error) = open_error.take() {
+                                tracing::warn!(
+                                    %error,
+                                    "could not open Flint's log file; logging to stderr"
+                                );
+                            }
                         }
                     }
                 }

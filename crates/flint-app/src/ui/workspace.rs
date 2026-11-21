@@ -273,9 +273,10 @@ impl Workspace {
             }
         });
         // Quitting right after a drag (or another change) still saves state.toml.
-        let on_quit = cx.on_app_quit(|this: &mut Self, _| {
+        let on_quit = cx.on_app_quit(|this: &mut Self, cx| {
             let save = this.ui_state.set_panes(this.panes);
             let pending = this.saving.take();
+            let flush = super::quit_flush::QuitFlush::join(cx);
             async move {
                 if let Some(pending) = pending {
                     pending.await;
@@ -284,7 +285,7 @@ impl Workspace {
                     ui_state::save(save);
                 }
                 // A failed save logs a warning: it must reach the file before the process ends.
-                flint_core::bootstrap::flush_logs();
+                flush.finish().await;
             }
         });
         let namespace_input =
