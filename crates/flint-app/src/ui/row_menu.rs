@@ -32,8 +32,11 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::detail::{
-    Opening, PROTECTED_NOTE, ShellPod, Subject, fit_container_names, log_item, protected_reason,
-    reason, refused, shell_item,
+    Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, protected_reason, reason, refused,
+    shell_item,
+};
+use super::menu_fit::{
+    dismiss_when_shrunk, fit_menu, fit_picker, note_width, pod_name_chars, wrapped_label,
 };
 use super::object::PodContainer;
 use super::registry::{
@@ -50,13 +53,6 @@ pub type RowMenu = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) ->
 /// The longest reason an action gives that the menu shows; the rest is cut. Long enough for a
 /// long context name and all that is said about it: reasons wrap ([`say`]).
 const MAX_REASON: usize = 200;
-
-/// How wide a reason is before it wraps: inside the menu's default 31.25 rem, at Flint's 15 px
-/// rem, less its padding.
-const REASON_WIDTH: Pixels = px(440.);
-
-/// The element holding a note's text ([`say`]), inside its menu item.
-pub(in crate::ui) const MENU_NOTE: &str = "row-menu-note";
 
 /// The most of a pod's name the Shell entry shows, with its key, inside the menu's width.
 const SHELL_POD_NAME: usize = 28;
@@ -251,6 +247,7 @@ pub fn row_menu(workspace: WeakEntity<Workspace>) -> RowMenu {
         // Holds the menu weakly and ends with it.
         cx.subscribe_self(move |_, _: &DismissEvent, _| observers.borrow_mut().clear())
             .detach();
+        dismiss_when_shrunk(window, cx);
         let now = shown.borrow().clone();
         fill(menu, now, &workspace, window, cx)
     })
@@ -266,7 +263,7 @@ fn fill(
     let Some(a) = actions else {
         return menu;
     };
-    let mut menu = menu;
+    let mut menu = fit_menu(menu, window);
     if let Some(why) = &a.blocked {
         menu = say(menu, why).separator();
     }
@@ -304,10 +301,11 @@ fn fill(
             let label = SharedString::from(unlock_label(&name));
             let tip = SharedString::from(tip);
             menu.item(
-                PopupMenuItem::element(move |_, _| {
+                PopupMenuItem::element(move |window, _| {
                     let tip = tip.clone();
                     div()
                         .id("menu-unlock")
+                        .max_w(note_width(window))
                         .role(Role::MenuItem)
                         .aria_label(label.clone())
                         .aria_description(tip.clone())
@@ -373,7 +371,7 @@ fn session_entries(
             )
         };
     }
-    let label = shell_entry_label(a);
+    let label = shell_entry_label_within(a, pod_name_chars(SHELL_POD_NAME, window));
     let shell_shown = shell_in_menu(a);
     let says_shell = says_why
         && !(once && shell_shown.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
@@ -381,8 +379,8 @@ fn session_entries(
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
             let workspace = workspace.clone();
-            menu.submenu(label, window, cx, move |sub, window, _| {
-                let sub = fit_container_names(sub, window).label("Container");
+            menu.submenu(label, window, cx, move |sub, window, cx| {
+                let sub = fit_picker(sub, window, cx).label("Container");
                 shell.containers.iter().fold(sub, |sub, name| {
                     let running = !shell.not_running.contains(name);
                     let (item, action) = shell_item(name, *name == shell.default, running);
@@ -408,25 +406,19 @@ fn session_entries(
 fn say(menu: PopupMenu, text: &str) -> PopupMenu {
     let text = SharedString::from(text.to_owned());
     menu.item(
-        PopupMenuItem::element(move |_, _| {
-            // A custom item has no accessible name of its own: it takes it from this label's value.
-            div()
-                .id(MENU_NOTE)
-                .test_support()
-                .role(Role::Label)
-                .aria_value(text.clone())
-                .max_w(REASON_WIDTH)
-                .child(text.clone())
+        PopupMenuItem::element(move |window, _| {
+            wrapped_label(text.clone()).max_w(note_width(window))
         })
         .disabled(true),
     )
 }
 
-/// The Shell entry: a workload's names the pod it opens in.
-fn shell_entry_label(a: &RowActions) -> String {
+/// The Shell entry: a workload's names the pod it opens in, with at most `pod_chars` of its name
+/// to fit a narrow window.
+fn shell_entry_label_within(a: &RowActions, pod_chars: usize) -> String {
     match (&a.shell_pod, a.subject) {
         (Some(shell), Subject::Workload(_)) => {
-            let pod = flint_core::display::middle_truncate(&shell.pod, SHELL_POD_NAME);
+            let pod = flint_core::display::middle_truncate(&shell.pod, pod_chars);
             format!("Shell in {pod}")
         }
         _ => "Shell".to_owned(),
@@ -450,8 +442,8 @@ fn log_picker(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let workspace = workspace.clone();
-    menu.submenu(label, window, cx, move |sub, window, _| {
-        let sub = fit_container_names(sub, window).label("Container");
+    menu.submenu(label, window, cx, move |sub, window, cx| {
+        let sub = fit_picker(sub, window, cx).label("Container");
         containers.iter().fold(sub, |sub, c| {
             let (item, action) = log_item(c, previous);
             sub.item(item.on_click(registry::on_click_or(
@@ -600,7 +592,7 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
                 },
             );
         }
-        let label = shell_entry_label(a);
+        let label = shell_entry_label_within(a, SHELL_POD_NAME);
         entries.push(match &a.shell_pod {
             Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
                 label,
@@ -647,7 +639,7 @@ pub(in crate::ui) mod tests {
 
     use super::{
         MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, WriteEntry,
-        menu_state, protected_once, protected_reason, shell_entry_label, unlock_tip,
+        menu_state, protected_once, protected_reason, shell_entry_label_within, unlock_tip,
     };
     use crate::ui::detail::{ShellPod, Subject};
     use crate::ui::object::PodContainer;
@@ -856,8 +848,10 @@ pub(in crate::ui) mod tests {
             }),
             ..pod_actions()
         };
-        let label = shell_entry_label(&workload);
+        let label = shell_entry_label_within(&workload, SHELL_POD_NAME);
         assert!(label.starts_with("Shell in web-platform"), "{label}");
         assert_eq!(label.chars().count(), "Shell in ".len() + SHELL_POD_NAME);
+        let narrow = shell_entry_label_within(&workload, 10);
+        assert_eq!(narrow.chars().count(), "Shell in ".len() + 10, "{narrow}");
     }
 }
