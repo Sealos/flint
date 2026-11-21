@@ -369,13 +369,21 @@ fn to_json<T: Serialize>(value: &T) -> Result<String, ToolError> {
     Ok(serde_json::to_string_pretty(value)?)
 }
 
+/// `list_clusters` takes no arguments, and says so in its schema.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("properties" = {}))]
+pub struct ListClustersParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListResourcesParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -398,6 +406,7 @@ pub struct ListResourcesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetResourceParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -414,6 +423,7 @@ pub struct GetResourceParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetEventsParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -428,6 +438,7 @@ pub struct GetEventsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetPodLogsParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -441,6 +452,62 @@ pub struct GetPodLogsParams {
     pub previous: Option<bool>,
     /// Only lines newer than this many seconds. 0 or omitted means no time limit.
     pub since_seconds: Option<u32>,
+}
+
+/// How many unsupported arguments a refusal names, and how much of each: their names come from
+/// the client and can be any length.
+const UNSUPPORTED_NAMED: usize = 5;
+const UNSUPPORTED_NAME_CHARS: usize = 64;
+
+/// The refusal for `arguments` that `tool`'s schema does not have, naming them and the accepted
+/// ones. A tool that dropped them would answer as if a filter it never applied had matched.
+/// `_meta` is not among them: it sits beside the arguments in the request.
+fn unsupported_arguments(
+    tool: &rmcp::model::Tool,
+    arguments: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
+    let accepted = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    let unsupported: Vec<&String> = arguments?
+        .keys()
+        .filter(|name| !accepted.is_some_and(|a| a.contains_key(name.as_str())))
+        .collect();
+    if unsupported.is_empty() {
+        return None;
+    }
+    let mut names = unsupported
+        .iter()
+        .take(UNSUPPORTED_NAMED)
+        .map(|name| {
+            let short: String = name.chars().take(UNSUPPORTED_NAME_CHARS).collect();
+            format!("{short:?}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unsupported.len() > UNSUPPORTED_NAMED {
+        names.push_str(&format!(
+            " and {} more",
+            unsupported.len() - UNSUPPORTED_NAMED
+        ));
+    }
+    let accepted: Vec<&str> = accepted
+        .into_iter()
+        .flat_map(|a| a.keys().map(String::as_str))
+        .collect();
+    let mut text = if accepted.is_empty() {
+        format!("{} takes no arguments. Unsupported: {names}.", tool.name)
+    } else {
+        format!(
+            "{} does not support {names}. Accepted arguments: {}.",
+            tool.name,
+            accepted.join(", ")
+        )
+    };
+    // As every reply: a client's argument name can hold anything.
+    policy::redact_text(&mut text);
+    Some(text)
 }
 
 #[tool_router]
@@ -527,7 +594,7 @@ impl FlintMcp {
         server URL and whether a connection works.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn list_clusters(&self) -> ToolResult {
+    async fn list_clusters(&self, Parameters(_): Parameters<ListClustersParams>) -> ToolResult {
         let result = self.do_list_clusters().await;
         self.finish("list_clusters", Named::default(), result).await
     }
@@ -625,6 +692,10 @@ impl ServerHandler for FlintMcp {
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
         let named = named_in(request.arguments.as_ref());
+        let unsupported = self
+            .tool_router
+            .get(&request.name)
+            .and_then(|tool| unsupported_arguments(tool, request.arguments.as_ref()));
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         // Until this handler ends, the call counts as unanswered, cancelled or not: it may
@@ -649,6 +720,11 @@ impl ServerHandler for FlintMcp {
                 CallNote::default(),
             ),
             Some(Err(busy)) => (failed(&busy.to_string()), None, CallNote::default()),
+            Some(Ok(turn)) if unsupported.is_some() => {
+                drop(turn);
+                let text = unsupported.unwrap_or_default();
+                (failed(&text), None, CallNote::default())
+            }
             Some(Ok(turn)) => {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -1684,6 +1760,83 @@ mod tests {
         let (_, rows, _, _) = table_rows(&merged, true, 1_000, policy::LIST_BYTES);
         let text = serde_json::to_string(&rows).unwrap();
         assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    fn arguments(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    // covers UP-10
+    #[test]
+    fn every_tool_schema_refuses_other_arguments() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 6);
+        for tool in tools {
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&json!(false)),
+                "{}",
+                tool.name
+            );
+            assert!(
+                tool.input_schema
+                    .get("properties")
+                    .is_some_and(Value::is_object),
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    // covers UP-10
+    #[test]
+    fn a_refusal_names_the_unsupported_and_the_accepted_arguments() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let list = server.tool_router.get("list_resources").unwrap();
+        let known = arguments(json!({"cluster": "c", "kind": "pods", "continue": "t"}));
+        assert_eq!(unsupported_arguments(list, Some(&known)), None);
+        assert_eq!(unsupported_arguments(list, None), None);
+
+        let text = unsupported_arguments(
+            list,
+            Some(&arguments(json!({"cluster": "c", "field_selector": "x"}))),
+        )
+        .unwrap();
+        assert!(text.contains("\"field_selector\""), "{text}");
+        assert!(
+            text.contains("label_selector") && text.contains("continue"),
+            "{text}"
+        );
+
+        let clusters = server.tool_router.get("list_clusters").unwrap();
+        let text = unsupported_arguments(clusters, Some(&arguments(json!({"a": 1})))).unwrap();
+        assert_eq!(
+            text,
+            "list_clusters takes no arguments. Unsupported: \"a\"."
+        );
+    }
+
+    // covers UP-10: argument names come from the client.
+    #[test]
+    fn a_refusal_bounds_and_redacts_what_the_client_sent() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let tool = server.tool_router.get("list_clusters").unwrap();
+        let mut many = serde_json::Map::new();
+        for i in 0..8 {
+            many.insert(format!("{i}{}", "x".repeat(500)), json!(1));
+        }
+        let text = unsupported_arguments(tool, Some(&many)).unwrap();
+        assert!(text.len() < 500, "{text}");
+        assert!(text.ends_with(" and 3 more."), "{text}");
+
+        let line = arguments(json!({"a\nb": 1}));
+        let text = unsupported_arguments(tool, Some(&line)).unwrap();
+        assert!(!text.contains('\n'), "{text}");
+
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        let text = unsupported_arguments(tool, Some(&arguments(json!({ token: 1 })))).unwrap();
+        assert!(!text.contains(token), "{text}");
     }
 
     // covers UP-15
