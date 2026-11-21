@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use flint_core::protection::WriteRefusal;
 use flint_core::write::{WriteError, WriteOutcome, WriteProposal, WriteTarget};
 use flint_core::{ConnectionState, KindId};
+use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Gvr, Options, WriteRecord};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::resource_actions_tests::{LocalApi, connected};
 use crate::ui::registry;
@@ -69,11 +70,22 @@ async fn open(
     proposal: WriteProposal,
     begin: bool,
 ) -> Rc<Flow> {
+    open_on(cx, t, web(api), proposal, begin).await
+}
+
+/// Opens the confirmation of a real review of `proposal` on `target`.
+async fn open_on(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    target: WriteTarget,
+    proposal: WriteProposal,
+    begin: bool,
+) -> Rc<Flow> {
     let (core, names) = t
         .workspace
         .read_with(cx, |ws, cx| (ws.core(cx).clone(), ws.cluster_names(cx)));
     let review = core
-        .review_write(web(api), proposal)
+        .review_write(target, proposal)
         .await
         .expect("the review");
     let flow = Rc::new(Flow::default());
@@ -159,6 +171,78 @@ async fn connected_unlocked(
     })
     .await;
     t
+}
+
+const ACT_PATH: &str = "/apis/apps/v1/namespaces/demo/deployments/act";
+
+fn deployments() -> Gvr {
+    Gvr::new("apps", "v1", "deployments")
+}
+
+/// The fake API server with a Deployment `act` of 2 replicas.
+fn fake_api() -> FakeApiServer {
+    let server = FakeApiServer::start_blocking(Options::default()).unwrap();
+    server.set_object(
+        &deployments(),
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "act", "namespace": "demo", "uid": "uid-act",
+                         "resourceVersion": "5000"},
+            "spec": {"replicas": 2, "template": {"metadata": {}}},
+        }),
+    );
+    server
+}
+
+/// `act` as it is live: the server sets its own `resourceVersion`.
+fn act(server: &FakeApiServer) -> WriteTarget {
+    let live = server
+        .object(&deployments(), Some("demo"), "act")
+        .expect("the workload");
+    let version = live["metadata"]["resourceVersion"].as_str().unwrap();
+    WriteTarget {
+        cluster: CONTEXT.into(),
+        server: Some(server.url()),
+        kind: KindId::new("apps", "deployments"),
+        namespace: Some("demo".to_owned()),
+        name: "act".to_owned(),
+        uid: Some("uid-act".to_owned()),
+        resource_version: Some(version.to_owned()),
+    }
+}
+
+/// The workspace connected to the fake API server.
+async fn connected_to_fake(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    server: &FakeApiServer,
+) -> TestWorkspace {
+    let t = open_workspace_with(cx, dir, |dir, _| {
+        let path = dir.join("kubeconfig");
+        server.write_kubeconfig(&path, Some("demo")).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, CONTEXT).await;
+    t.wait_for_state(cx, CONTEXT, |s| matches!(s, ConnectionState::Connected(_)))
+        .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered(CONTEXT)
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+    t
+}
+
+/// The one write the server received.
+fn only_write(server: &FakeApiServer) -> WriteRecord {
+    let writes = server.writes();
+    assert_eq!(writes.len(), 1, "exactly one write: {writes:?}");
+    writes[0].clone()
 }
 
 /// A confirmation of a real review, not in a dialog, so a test can run it again after its first
@@ -251,6 +335,72 @@ async fn confirming_sends_exactly_one_write(cx: &mut TestAppContext) {
     assert!(!t.has_dialog(cx));
 }
 
+// covers UP-53: Confirm sends the reviewed change to the reviewed object, and nothing before it.
+#[gpui_kit::test]
+async fn confirming_sends_the_reviewed_change_to_the_reviewed_object(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+
+    let flow = open_on(cx, &t, act(&server), SCALE, true).await;
+    assert!(server.writes().is_empty(), "nothing runs before Confirm");
+    t.click(cx, "ok");
+    wait_done(cx, &flow);
+    flow.result().expect("the write went through");
+
+    let write = only_write(&server);
+    assert_eq!(write.method.as_str(), "PATCH");
+    assert_eq!(write.path, format!("{ACT_PATH}/scale"));
+    assert_eq!(write.query, "fieldManager=flint");
+    assert_eq!(write.content_type, "application/json-patch+json");
+    assert_eq!(
+        write.json(),
+        Some(json!([
+            {"op": "test", "path": "/metadata/uid", "value": "uid-act"},
+            {"op": "test", "path": "/spec/replicas", "value": 2},
+            {"op": "replace", "path": "/spec/replicas", "value": 5},
+        ]))
+    );
+    assert_eq!(write.status, Some(200));
+    let live = server.object(&deployments(), Some("demo"), "act");
+    assert_eq!(live.unwrap()["spec"]["replicas"], 5);
+}
+
+// covers UP-53: Enter on Delete sends no mutating request of any method; Confirm then sends the
+// one delete, bound to the reviewed uid.
+#[gpui_kit::test]
+async fn enter_on_delete_sends_no_mutating_request(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+
+    let flow = open_on(cx, &t, act(&server), WriteProposal::Delete, true).await;
+    t.press(cx, "enter");
+    std::thread::sleep(SETTLE);
+    draw(cx, &t);
+    assert_eq!(flow.begun.get(), 0, "begin is not asked");
+    assert_eq!(flow.done_count(), 0, "on_done is not called");
+    let writes = server.writes();
+    assert!(writes.is_empty(), "no mutating request: {writes:?}");
+    assert!(server.object(&deployments(), Some("demo"), "act").is_some());
+
+    if t.has_dialog(cx) {
+        t.press(cx, "escape");
+        draw(cx, &t);
+    }
+    let flow = open_on(cx, &t, act(&server), WriteProposal::Delete, true).await;
+    t.click(cx, "ok");
+    wait_done(cx, &flow);
+    flow.result().expect("the delete went through");
+
+    let write = only_write(&server);
+    assert_eq!(write.method.as_str(), "DELETE");
+    assert_eq!(write.path, ACT_PATH);
+    assert!(!write.is_dry_run());
+    assert_eq!(write.json().unwrap()["preconditions"]["uid"], "uid-act");
+    assert!(server.object(&deployments(), Some("demo"), "act").is_none());
+}
+
 // covers UP-53: Confirm twice before the dialog redraws is still one write.
 #[gpui_kit::test]
 async fn confirming_twice_sends_one_write(cx: &mut TestAppContext) {
@@ -272,11 +422,12 @@ async fn confirming_twice_sends_one_write(cx: &mut TestAppContext) {
     flow.result().expect("the write went through");
 }
 
-// covers UP-52, UP-53: a failed write is reported once and never sent again.
+// covers UP-52, UP-53: a failed write is reported once and never sent again, even on a status a
+// client's retry policy would retry.
 #[gpui_kit::test]
 async fn a_failed_write_is_reported_and_not_retried(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let api = LocalApi::start(&[500, 409]);
+    let api = LocalApi::start(&[503, 409]);
     let t = connected(cx, dir.path(), &api).await;
 
     let flow = open(cx, &t, &api, SCALE, true).await;

@@ -5,7 +5,8 @@
 //! `now - FIXTURE_NOW` on the way out, so ages look the same whenever the tests run, and it
 //! renders `Age` cells from the shifted creation time.
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::jiff::Timestamp;
 use serde_json::Value;
@@ -87,12 +88,31 @@ pub fn map_timestamps(value: &mut Value, f: &impl Fn(i64) -> i64) {
     }
 }
 
-/// The server's clock: fixture time shifted to the server's start.
+/// How far a clock has run since its start. Tests move it forward or stop it.
+#[derive(Debug)]
+struct Elapsed {
+    /// Time counted up to `running_since`, with every advance.
+    counted: Duration,
+    /// When the clock last started running; `None` while frozen.
+    running_since: Option<Instant>,
+}
+
+impl Elapsed {
+    fn get(&self) -> Duration {
+        self.counted
+            + self
+                .running_since
+                .map_or(Duration::ZERO, |since| since.elapsed())
+    }
+}
+
+/// The server's clock: fixture time shifted to the server's start. Clones share one time, so
+/// advancing or freezing it reaches logs and open watches too.
 #[derive(Debug, Clone)]
 pub struct Clock {
     /// Seconds added to every fixture timestamp.
     shift: i64,
-    started: Instant,
+    elapsed: Arc<Mutex<Elapsed>>,
     now_at_start: i64,
 }
 
@@ -102,19 +122,45 @@ impl Clock {
         let now_at_start = unix(now);
         Clock {
             shift: now_at_start - FIXTURE_NOW_SECONDS,
-            started: Instant::now(),
+            elapsed: Arc::new(Mutex::new(Elapsed {
+                counted: Duration::ZERO,
+                running_since: Some(Instant::now()),
+            })),
             now_at_start,
         }
     }
 
+    fn elapsed(&self) -> std::sync::MutexGuard<'_, Elapsed> {
+        self.elapsed.lock().expect("fake API clock lock")
+    }
+
+    /// Moves the time forward by `by`, whether the clock is running or frozen.
+    pub fn advance(&self, by: Duration) {
+        self.elapsed().counted += by;
+    }
+
+    /// Stops the time until [`Clock::resume`]. Freezing a frozen clock changes nothing.
+    pub fn freeze(&self) {
+        let mut elapsed = self.elapsed();
+        elapsed.counted = elapsed.get();
+        elapsed.running_since = None;
+    }
+
+    /// Starts a frozen clock again from the time it shows. A running clock is left alone.
+    pub fn resume(&self) {
+        self.elapsed()
+            .running_since
+            .get_or_insert_with(Instant::now);
+    }
+
     /// The server's current time in Unix seconds.
     pub fn now(&self) -> i64 {
-        self.now_at_start + i64::try_from(self.started.elapsed().as_secs()).unwrap_or(0)
+        self.now_at_start + i64::try_from(self.elapsed().get().as_secs()).unwrap_or(0)
     }
 
     /// The server's current time, to the nanosecond (log line timestamps).
     pub fn now_precise(&self) -> Timestamp {
-        let elapsed = self.started.elapsed();
+        let elapsed = self.elapsed().get();
         Timestamp::from_second(self.now_at_start)
             .ok()
             .and_then(|start| start.checked_add(elapsed).ok())
@@ -135,8 +181,14 @@ impl Clock {
     /// Shifts every timestamp in a response from fixture time to the server's time, and renders
     /// `Age` cells of a Table from the rows' creation times.
     pub fn rebase(&self, value: &mut Value) {
+        self.rebase_with_columns(value, &Value::Null);
+    }
+
+    /// [`Clock::rebase`] for a Table whose own `columnDefinitions` may be omitted (later watch
+    /// events carry `null`): `columns` locates the `Age` column then, and the wire format stays.
+    pub fn rebase_with_columns(&self, value: &mut Value, columns: &Value) {
         map_timestamps(value, &|s| s + self.shift);
-        self.render_ages(value);
+        self.render_ages(value, columns);
         self.render_restarts(value);
     }
 
@@ -171,10 +223,11 @@ impl Clock {
         }
     }
 
-    fn render_ages(&self, value: &mut Value) {
+    fn render_ages(&self, value: &mut Value, fallback: &Value) {
         let age = value
             .get("columnDefinitions")
             .and_then(Value::as_array)
+            .or_else(|| fallback.as_array())
             .and_then(|c| c.iter().position(|c| c["name"] == "Age"));
         let (Some(age), Some(rows)) = (age, value.get_mut("rows").and_then(Value::as_array_mut))
         else {
@@ -199,7 +252,6 @@ impl Clock {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::Duration;
 
     #[test]
     fn parses_and_formats_timestamps() {
@@ -226,6 +278,36 @@ mod tests {
         assert_eq!(round_age(3 * 3600 + 1700), 3 * 3600);
         assert_eq!(round_age(5 * 86_400 + 50_000), 6 * 86_400);
         assert_eq!(round_age(-125), -120);
+    }
+
+    #[test]
+    fn a_frozen_clock_moves_only_when_advanced_and_clones_share_it() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+        let clock = Clock::new(start);
+        let shared = clock.clone();
+        clock.freeze();
+        let frozen = clock.now_precise();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(clock.now_precise(), frozen);
+        clock.freeze();
+        assert_eq!(clock.now_precise(), frozen);
+
+        clock.advance(Duration::from_secs(3600));
+        assert_eq!(shared.now_precise(), frozen + Duration::from_secs(3600));
+        assert_eq!(
+            parse(&shared.fixture_now()).unwrap().0,
+            FIXTURE_NOW_SECONDS + (shared.now() - 1_900_000_000)
+        );
+        // The start and the shift of fixture timestamps stay where they were.
+        assert_eq!(clock.start().as_second(), 1_900_000_000);
+
+        let before = clock.now_precise();
+        clock.resume();
+        clock.resume();
+        std::thread::sleep(Duration::from_millis(5));
+        let after = clock.now_precise();
+        assert!(after > before, "{after} after {before}");
+        assert!(after < before + Duration::from_secs(60), "{after} jumped");
     }
 
     #[test]

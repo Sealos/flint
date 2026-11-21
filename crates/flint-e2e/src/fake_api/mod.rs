@@ -29,6 +29,11 @@
 //! ([`FakeApiServer::set_metrics`], [`FakeApiServer::script_metrics`]) or drop it
 //! ([`Options::no_metrics`]).
 //!
+//! Each server can differ from the recording: another `/version` ([`Options::version`]) and
+//! resources or CRDs it lacks ([`Options::hidden`]), so a test can run a set of unlike clusters.
+//! Tests move its time ([`FakeApiServer::advance_clock`], [`FakeApiServer::freeze_clock`],
+//! [`FakeApiServer::resume_clock`]).
+//!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {
 //! use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
