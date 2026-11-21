@@ -7,8 +7,8 @@ have tests and pass.
 Paths describe what the user does and sees, not how it is built. When behavior changes, update the path in the same
 change.
 
-A path marked **Status: planned** is not built yet. It names the issue and milestone that track it, and gets no tests
-until it ships. Remove the marker in the change that ships it.
+A path marked **Status: planned** is not built yet. It names the issue and milestone that track it. It does not gate
+an earlier release, and gets no tests until it ships. Its tests must pass in the change that removes the marker.
 
 ## How paths are tested
 
@@ -476,6 +476,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (in-use state, folding), ui, e2e (fake API server).
 
 ### UP-57 The tree follows the cluster without jumping
+- **Status:** planned (#194, After 1.0), not built yet.
 - **When** I connect and the lists are still loading, then create the first Job in a cluster that had none, and later
   delete the last Gadget while the tree is open.
 - **Then** while a kind's first list is loading or failing (other than forbidden), it stays shown; it folds at most
@@ -536,8 +537,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-64 A large namespace stays readable
 - **Given** a namespace with hundreds of pods, old empty ReplicaSets and many finished Jobs.
 - **Then** empty ReplicaSets and finished Jobs start collapsed, a group of more than about 50 pods shows a count,
-  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI. In the
-  Replica Sets list, old revisions are hidden behind the header's Show toggle (UP-59).
+  and past the node limit the rest is one summary node. The diagram opens and scrolls without freezing the UI.
 - Tests: unit (collapsing, limits), cluster (generated load), ui.
 
 ---
@@ -551,6 +551,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (problem rules), ui, e2e (fake API server).
 
 ### UP-66 See how full the cluster is
+- **Status:** planned (#101, v0.6), not built yet.
 - **When** metrics-server is installed and I look at the dashboard's usage tiles.
 - **Then** I see CPU and memory used against allocatable, and requests and limits against capacity, per node and in
   total, each with a sparkline of the last hour that keeps growing while I stay connected. Without metrics-server the
@@ -558,12 +559,14 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (ring buffer, aggregation), ui.
 
 ### UP-67 Set warning thresholds
+- **Status:** planned (#102, v0.6), not built yet.
 - **When** I open the dashboard's Thresholds panel and set CPU warnings at 80% for this cluster only.
 - **Then** this cluster's tiles warn from 80%, other clusters keep the global default, and `settings.toml` holds the
   typed override.
 - Tests: unit (settings), ui.
 
 ### UP-68 Follow recent activity
+- **Status:** planned (#101, v0.6), not built yet.
 - **When** a rollout starts or a Warning event fires while the dashboard is open.
 - **Then** it appears at the top of the activity feed within seconds, and clicking it opens the object.
 - Tests: ui, e2e.
