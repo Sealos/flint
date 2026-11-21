@@ -191,11 +191,41 @@ impl Setup {
     }
 }
 
-/// A path as an agent may read it: with anything like a credential redacted.
+/// A path as an agent may read it. A component with anything like a credential is hidden whole:
+/// spaces are valid in a path, so a passphrase can run past where the redactor stops. The whole
+/// path is then redacted too, for a credential that spans components.
 fn shown_path(path: &Path) -> String {
-    let mut shown = path.display().to_string();
+    let mut shown = path
+        .display()
+        .to_string()
+        .split('/')
+        .map(|component| {
+            let mut text = component.to_owned();
+            if redact_text(&mut text) > 0 {
+                "[REDACTED]".to_owned()
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
     redact_text(&mut shown);
     shown
+}
+
+/// One entry of `list_clusters`' `kubeconfig_errors`: the file and a one-line reason, each
+/// redacted on its own, since a redacted value runs to the end of its line.
+pub fn kubeconfig_error_row(path: &Path, error: &str) -> Value {
+    // Redacted before the summary cuts it: a cut can remove what marks a value as a credential.
+    let mut line = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    redact_text(&mut line);
+    let reason = flint_core::redact::safe_error_summary(&line);
+    serde_json::json!({ "file": shown_path(path), "error": reason })
 }
 
 /// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
@@ -1000,6 +1030,55 @@ mod tests {
         assert!(!hint.contains("[[ai_exposed_clusters]]"), "{hint}");
         assert!(headless.fix_settings().contains("fix that file"));
         assert!(app().fix_settings().contains("Flint app"));
+    }
+
+    // covers UP-15: a credential in a kubeconfig path or its error does not reach the agent, and
+    // the other field survives it.
+    #[test]
+    fn kubeconfig_errors_are_redacted_field_by_field() {
+        let row = kubeconfig_error_row(
+            Path::new("/home/me/password=hunter2/config"),
+            "could not read it: token=example-credential",
+        );
+        let text = row.to_string();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("example-credential"), "{text}");
+        assert!(
+            row["file"].as_str().unwrap().starts_with("/home/me/"),
+            "{row}"
+        );
+        assert!(
+            row["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read it"),
+            "{row}"
+        );
+
+        // Spaces are valid in a path: the whole component goes, and the rest stays.
+        let passphrase = kubeconfig_error_row(
+            Path::new("/home/me/password=correct horse battery/config"),
+            "bad yaml",
+        );
+        assert_eq!(
+            passphrase["file"], "/home/me/[REDACTED]/config",
+            "{passphrase}"
+        );
+
+        // A URL whose password starts before the summary's cut and ends after it.
+        let long = format!(
+            "bad url https://user:{}@example.com/ in {}",
+            "p".repeat(300),
+            "x".repeat(10)
+        );
+        let cut = kubeconfig_error_row(Path::new("/home/me/config"), &long);
+        assert!(!cut["error"].as_str().unwrap().contains("ppp"), "{cut}");
+
+        let plain = kubeconfig_error_row(Path::new("/home/me/config"), "bad yaml");
+        assert_eq!(
+            plain,
+            json!({"file": "/home/me/config", "error": "bad yaml"})
+        );
     }
 
     // covers UP-09: the settings path is cluster-independent but still redacted.
