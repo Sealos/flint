@@ -874,7 +874,7 @@ impl ResourceList {
                 } = list_model::CellStyle::of(
                     column,
                     || cell_text(row, col, now),
-                    width,
+                    list_model::text_width(column, row, secrets, width),
                     list_model::RowFlags {
                         masked: is_masked_column(secrets, &self.shown.columns, col),
                         ..flags

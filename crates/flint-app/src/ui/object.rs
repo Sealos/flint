@@ -657,6 +657,17 @@ mod tests {
         assert!(annotations.contains(&("meta.helm.sh/release-name".into(), "app".into())));
     }
 
+    // covers UP-23: the header of a tracked Secret shows the tool and nothing from its annotation.
+    #[test]
+    fn a_tracked_secret_header_shows_only_the_tool() {
+        let mut tracked = secret();
+        tracked["metadata"]["namespace"] = json!("demo");
+        tracked["metadata"]["annotations"]["argocd.argoproj.io/tracking-id"] =
+            json!("plain-value:/Secret:demo/creds");
+        let shown = overview(&tracked, true).managed_by.unwrap().to_string();
+        assert_eq!(shown, "Argo CD");
+    }
+
     #[test]
     fn base64_decodes_standard_padding_variants() {
         assert_eq!(decode_base64("").unwrap(), b"");

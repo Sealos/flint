@@ -912,8 +912,8 @@ pub fn managed_by_line(object: &Value) -> Option<String> {
     manager_line(flint_core::gitops::managed_by_object(object)?)
 }
 
-/// [`managed_by_line`] for a Secret, read **before** it is masked: only its labels and a tracking
-/// id naming this Secret count ([`flint_core::gitops::managed_by_secret`]).
+/// [`managed_by_line`] for a Secret, read **before** it is masked: its labels count, and a tracking
+/// id naming this Secret gives the tool only ([`flint_core::gitops::managed_by_secret`]).
 pub fn managed_by_secret_line(unmasked: &Value) -> Option<String> {
     manager_line(flint_core::gitops::managed_by_secret(unmasked)?)
 }
@@ -1312,17 +1312,17 @@ mod tests {
         assert_eq!(managed_by_line(&labelled), None);
     }
 
-    // covers UP-10: read before masking, a Secret's own tracking id names its application and the
-    // output still holds no annotation value.
+    // covers UP-10: read before masking, a Secret's own tracking id gives the tool only, and the
+    // output holds no annotation value.
     #[test]
-    fn managed_by_secret_line_names_the_app_of_a_tracked_secret() {
-        let id = "shop:/Secret:demo/web";
+    fn managed_by_secret_line_shows_only_the_tool_of_a_tracked_secret() {
+        let id = "plain-value:/Secret:demo/web";
         let mut secret = serde_json::json!({"apiVersion": "v1", "kind": "Secret", "metadata": {
             "name": "web", "namespace": "demo",
             "annotations": {"argocd.argoproj.io/tracking-id": id, "note": "hunter2"},
         }});
         let line = managed_by_secret_line(&secret);
-        assert_eq!(line.as_deref(), Some("# managed_by=Argo CD: shop\n"));
+        assert_eq!(line.as_deref(), Some("# managed_by=Argo CD\n"));
         sanitize_secret(&mut secret);
         let masked = secret.to_string();
         assert!(

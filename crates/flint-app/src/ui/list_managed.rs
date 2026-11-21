@@ -6,6 +6,11 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
+use super::list_model::{CHAR_WIDTH, MARKER_CHARS, shows_marker};
+
+/// The space between a name and its marker.
+const MARKER_GAP: f32 = 4.;
+
 /// The short name drawn on the row, from the manager's full text.
 fn short_name(manager: &str) -> &'static str {
     if manager.starts_with("Argo CD") {
@@ -18,13 +23,17 @@ fn short_name(manager: &str) -> &'static str {
 /// The row's marker, with the full manager in its tooltip. A Secret list shows none: what it would
 /// read comes from annotations that are masked there.
 pub(super) fn marker(row: &Row, secret_list: bool, theme: &Theme) -> Option<AnyElement> {
-    let manager = row.managed_by().filter(|_| !secret_list)?;
+    let manager = row
+        .managed_by()
+        .filter(|_| shows_marker(row, secret_list))?;
     let tip = SharedString::from(format!("Managed by {manager}"));
     Some(
         div()
             .id(SharedString::from(format!("managed-{}", row.uid)))
-            .ml_1()
-            .px_1()
+            .ml(px(MARKER_GAP))
+            .w(px(MARKER_CHARS as f32 * CHAR_WIDTH - MARKER_GAP))
+            .flex()
+            .justify_center()
             .flex_none()
             .rounded_sm()
             .border_1()
@@ -49,10 +58,14 @@ mod tests {
     };
     use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
     use gpui_kit::{
-        AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
+        AppContext as _, Bounds, Point, SharedString, TestAppContext, WindowBounds, WindowOptions,
+        px, size,
     };
 
     use super::super::ResourceList;
+    use super::super::list_model::{
+        CELL_PADDING, CHAR_WIDTH, CellStyle, MARKER_CHARS, RowFlags, measure_columns, text_width,
+    };
     use super::{Row, short_name};
 
     const WAIT: Duration = Duration::from_secs(10);
@@ -184,6 +197,35 @@ mod tests {
         let rows = vec![row("tracked", Some("Argo CD: shop"))];
         let kind = KindId::new("", "secrets");
         assert!(marked(cx, "secrets", kind, rows).await.is_empty());
+    }
+
+    // covers UP-23: a managed name is measured with its marker, and cut with a full-name tooltip
+    // when only the marker's room is missing.
+    #[test]
+    fn a_managed_name_leaves_room_for_its_marker() {
+        let name = "a-long-workload-name-suffix";
+        let managed = row(name, Some("Argo CD: shop"));
+        let plain = row(name, None);
+        let chars = name.chars().count();
+        let measured =
+            |kind, row: &Arc<Row>| measure_columns(&snapshot(kind, vec![row.clone()]), &[0], 0)[0];
+        assert_eq!(measured(KindId::pods(), &managed), chars + MARKER_CHARS);
+        assert_eq!(measured(KindId::pods(), &plain), chars);
+        assert_eq!(measured(KindId::new("", "secrets"), &managed), chars);
+
+        let columns = snapshot(KindId::pods(), Vec::new()).columns.clone();
+        let width = chars as f32 * CHAR_WIDTH + CELL_PADDING;
+        let style = |row: &Row, width: f32| {
+            let room = text_width(&columns[0], row, false, width);
+            CellStyle::<SharedString>::of(&columns[0], || name.into(), room, RowFlags::default())
+        };
+        let cut = style(&managed, width);
+        assert_ne!(cut.shown.as_ref(), name);
+        assert_eq!(cut.tooltip.as_ref().map(|t| t.as_ref()), Some(name));
+        let whole = style(&plain, width);
+        assert_eq!((whole.shown.as_ref(), whole.tooltip), (name, None));
+        let widened = style(&managed, width + MARKER_CHARS as f32 * CHAR_WIDTH);
+        assert_eq!((widened.shown.as_ref(), widened.tooltip), (name, None));
     }
 
     #[test]
