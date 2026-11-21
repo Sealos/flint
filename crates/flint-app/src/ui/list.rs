@@ -27,6 +27,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use list_model::{CELL_PADDING, CHAR_WIDTH};
 
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
@@ -40,8 +41,6 @@ use super::registry::{
 /// The list's key context; the registry binds the list's keys in it.
 pub const CONTEXT: &str = "ResourceList";
 pub const ROW_HEIGHT: f32 = 24.;
-/// Approximate advance of one character at the table's text size, for column widths.
-use list_model::{CELL_PADDING, CHAR_WIDTH};
 
 // The kit's tooltips paint plain text that view tests cannot observe: this records what a cell's
 // tooltip was built with.

@@ -362,7 +362,7 @@ pub fn has_ticking_columns(columns: &[Column]) -> bool {
         .any(|c| c.role == ColumnRole::Age || c.ty == ColumnType::Date)
 }
 
-/// The width of a character in a list cell, for fitting text without measuring it.
+/// Approximate advance of one character at the table's text size, for column widths.
 pub const CHAR_WIDTH: f32 = 8.5;
 /// A cell's horizontal padding, both sides together.
 pub const CELL_PADDING: f32 = 16.;
@@ -402,8 +402,7 @@ pub struct CellStyle<T> {
 }
 
 impl<T: CellText> CellStyle<T> {
-    /// The style of `column`'s cell, `width` wide. `raw_text` is not called for a masked cell,
-    /// so a Secret's value is never read to draw it.
+    /// The style of `column`'s cell, `width` wide. `raw_text` is not called for a masked cell.
     pub fn of(column: &Column, raw_text: impl FnOnce() -> T, width: f32, flags: RowFlags) -> Self {
         let text = if flags.masked && !is_safe_secret_column(&column.name) {
             T::from_static(super::object::MASK)
@@ -996,7 +995,6 @@ mod tests {
         assert_eq!(fit_name("api", 14), None);
     }
 
-    // covers UP-21: the count is within the namespace filter, which the header names.
     impl CellText for String {
         fn from_static(text: &'static str) -> Self {
             text.to_owned()
@@ -1127,9 +1125,23 @@ mod tests {
     fn a_cell_narrower_than_its_padding_still_has_a_style() {
         let name = col("Name", 0, ColumnRole::Name, ColumnType::String);
         let cell = style(&name, "podinfo", 4., RowFlags::default());
+        assert_eq!(
+            cell.shown,
+            flint_core::display::middle_truncate("podinfo", 0)
+        );
         assert_eq!(cell.tooltip.as_deref(), Some("podinfo"));
     }
 
+    #[test]
+    fn a_name_that_fits_is_shown_whole_without_a_tooltip() {
+        let name = col("Name", 0, ColumnRole::Name, ColumnType::String);
+        let cell = style(&name, "podinfo", WIDE, RowFlags::default());
+        assert!(cell.mono);
+        assert_eq!(cell.shown, "podinfo");
+        assert_eq!(cell.tooltip, None);
+    }
+
+    // covers UP-21: the count is within the namespace filter, which the header names.
     #[test]
     fn the_count_matches_the_namespace_filter() {
         let none: [String; 0] = [];
