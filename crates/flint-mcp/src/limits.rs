@@ -13,19 +13,33 @@
 //!   about the budget plus that many replies — not one more per call it keeps sending, refusals
 //!   and replies to other requests included.
 //! - **Deadline:** each call ends after [`Limits::deadline`] (`ServerHandler::call_tool`).
+//! - **Shutdown:** when the client closes stdin, requests and refusals still on their way finish
+//!   as long as replies keep being written. After [`Limits::deadline`] plus [`SHUTDOWN_GRACE`]
+//!   with none written, the server stops waiting, so a client that stopped reading stdout cannot
+//!   keep the process alive.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rmcp::RoleServer;
 use rmcp::model::{ClientNotification, ClientRequest, JsonRpcMessage, RequestId};
-use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
+use rmcp::service::{
+    NotificationContext, RequestContext, RxJsonRpcMessage, Service, ServiceRole, TxJsonRpcMessage,
+};
 use rmcp::transport::Transport;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+
+/// How long past [`Limits::deadline`] the end of stdin waits for a reply to be written, and how
+/// long closing the transport waits for a write that is stuck.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Bytes of input read ahead, as serialized, past which no more is read while replies pass the
+/// budget ([`Counted`]).
+const READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// The limits of one server.
 #[derive(Debug, Clone, Copy)]
@@ -174,15 +188,19 @@ pub(crate) struct ReplyBytes {
     /// arguments, so it is recorded.
     dropped_call: std::sync::OnceLock<DroppedCall>,
     outstanding: AtomicUsize,
+    /// Replies whose send has finished since the start: progress, while stdin has ended.
+    written: AtomicUsize,
     /// Requests read and not done with yet, and whether each is a tool call.
     unanswered: std::sync::Mutex<HashMap<RequestId, Work>>,
+    /// Refusals handed to the transport and not written yet ([`refuse`]).
+    refusing: AtomicUsize,
     released: Notify,
 }
 
 /// A request read and not done with yet. It is done when its reply reaches the transport
 /// ([`Counted`]'s `send`, which counts the reply's bytes from then on), or, once cancelled (rmcp
 /// then sends no reply), when nothing works on it any more: at once for most requests, when its
-/// handler has ended for a tool call (`ServerHandler::call_tool`), which may still be writing.
+/// handler has ended for a tool call ([`Tracked`]), which may still be writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Work {
     tool: bool,
@@ -263,6 +281,11 @@ impl ReplyBytes {
         self.unanswered().len()
     }
 
+    /// Whether no request is unanswered and no refusal unwritten.
+    fn idle(&self) -> bool {
+        self.unanswered_count() == 0 && self.refusing.load(Ordering::Acquire) == 0
+    }
+
     /// Updates request `id` with `change`, and lets it go once it is done ([`Work`]).
     fn update(&self, id: &RequestId, change: impl FnOnce(&mut Work), answered: bool) {
         let mut unanswered = self.unanswered();
@@ -291,7 +314,7 @@ impl ReplyBytes {
 
     /// The handler of tool call `id` ended. Its reply, if it is not cancelled, is still on its way
     /// to the transport and counts until it arrives; `failed` (it panicked) sends none.
-    pub(crate) fn handler_ended(&self, id: &RequestId, failed: bool) {
+    fn handler_ended(&self, id: &RequestId, failed: bool) {
         self.update(
             id,
             |work| {
@@ -300,6 +323,71 @@ impl ReplyBytes {
             },
             false,
         );
+    }
+}
+
+/// Marks a tool call's handler as ended when dropped ([`ReplyBytes::handler_ended`]).
+struct HandlerEnded {
+    replies: Arc<ReplyBytes>,
+    id: RequestId,
+}
+
+impl Drop for HandlerEnded {
+    fn drop(&mut self) {
+        // A handler that panicked sends no reply: nothing else would let its request go.
+        self.replies
+            .handler_ended(&self.id, std::thread::panicking());
+    }
+}
+
+/// `service`, telling [`ReplyBytes`] when each tool call's handler ends. It wraps the whole
+/// handler rather than `call_tool`, because rmcp can reject a call before `call_tool` (an
+/// unsupported `_meta.protocolVersion`, say): if the client's cancellation was read first, rmcp
+/// drops that error, and nothing else would let the request go.
+pub(crate) struct Tracked<S> {
+    service: S,
+    replies: Arc<ReplyBytes>,
+}
+
+impl<S> Tracked<S> {
+    pub(crate) fn new(service: S, replies: Arc<ReplyBytes>) -> Self {
+        Tracked { service, replies }
+    }
+}
+
+impl<S: Service<RoleServer>> Service<RoleServer> for Tracked<S> {
+    async fn handle_request(
+        &self,
+        request: ClientRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<<RoleServer as ServiceRole>::Resp, rmcp::ErrorData> {
+        // Until this handler ends, the call counts as unanswered, cancelled or not: it may still
+        // be writing its activity record.
+        let _ended = matches!(request, ClientRequest::CallToolRequest(_)).then(|| HandlerEnded {
+            replies: self.replies.clone(),
+            id: context.id.clone(),
+        });
+        self.service.handle_request(request, context).await
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: ClientNotification,
+        context: NotificationContext<RoleServer>,
+    ) -> Result<(), rmcp::ErrorData> {
+        self.service
+            .handle_notification(notification, context)
+            .await
+    }
+
+    fn get_info(&self) -> <RoleServer as ServiceRole>::Info {
+        self.service.get_info()
+    }
+
+    fn supported_protocol_versions(
+        &self,
+    ) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
+        self.service.supported_protocol_versions()
     }
 }
 
@@ -314,7 +402,25 @@ impl Drop for Held {
         self.replies
             .outstanding
             .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.replies.written.fetch_add(1, Ordering::AcqRel);
         self.replies.released.notify_waiters();
+    }
+}
+
+/// The wait after stdin ended: it runs out at `until`, moved on whenever a reply is written.
+#[derive(Clone, Copy)]
+struct Closed {
+    written: usize,
+    until: tokio::time::Instant,
+}
+
+/// One refusal not written yet, counted until dropped.
+struct Refusing(Arc<ReplyBytes>);
+
+impl Drop for Refusing {
+    fn drop(&mut self) {
+        self.0.refusing.fetch_sub(1, Ordering::AcqRel);
+        self.0.released.notify_waiters();
     }
 }
 
@@ -327,6 +433,20 @@ pub(crate) struct Counted<T> {
     /// requests not answered ([`Limits::unanswered`]), no more requests are read.
     budget: usize,
     unanswered: usize,
+    /// How long after stdin ended the server waits with no reply written.
+    quiet: Duration,
+    /// Messages read while replies pass the budget and not acted on yet, each with its size, so
+    /// the end of stdin is still seen. Kept here because rmcp drops the `receive` future whenever
+    /// something else is ready. Reading stops at [`Limits::unanswered`] messages or once
+    /// `read_ahead_budget` bytes are held. An empty queue always takes one more message, so one
+    /// larger than the budget still proceeds: the stdio transport discards a line over 16 MiB
+    /// (rmcp's `DEFAULT_MAX_LINE_LENGTH`), so this holds less than 24 MiB of JSON.
+    read_ahead: VecDeque<(RxJsonRpcMessage<RoleServer>, usize)>,
+    /// Bytes of the messages in `read_ahead`.
+    read_ahead_bytes: usize,
+    read_ahead_budget: usize,
+    /// Set once stdin has ended.
+    closed: Option<Closed>,
 }
 
 impl<T> Counted<T> {
@@ -336,8 +456,34 @@ impl<T> Counted<T> {
             replies,
             budget: limits.reply_budget,
             unanswered: limits.unanswered,
+            quiet: limits.deadline + SHUTDOWN_GRACE,
+            read_ahead: VecDeque::new(),
+            read_ahead_bytes: 0,
+            read_ahead_budget: READ_AHEAD_BYTES,
+            closed: None,
         }
     }
+}
+
+/// Counts what is written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The size of `message` as JSON, without building it in memory.
+fn serialized_len(message: &RxJsonRpcMessage<RoleServer>) -> Option<usize> {
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, message).ok()?;
+    Some(count.0)
 }
 
 /// The request a reply answers, if it is one.
@@ -373,10 +519,13 @@ fn refuse<T: Transport<RoleServer>>(
     let reply: TxJsonRpcMessage<RoleServer> = JsonRpcMessage::error(error, Some(id));
     let bytes = serde_json::to_vec(&reply).map_or(0, |line| line.len() + 1);
     let held = replies.hold(bytes);
+    replies.refusing.fetch_add(1, Ordering::AcqRel);
+    let refusing = Refusing(replies.clone());
     let send = inner.send(reply);
     tokio::spawn(async move {
         let _ = send.await;
         drop(held);
+        drop(refusing);
     });
 }
 
@@ -412,23 +561,85 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
         }
     }
 
-    /// The next message for rmcp. Nothing is read while replies not written pass the budget: a
-    /// client that does not read stdout gets nothing more run or answered (refusals and replies
-    /// to other requests included) until it does. Otherwise reading goes on, so a cancellation
+    /// The next message for rmcp. Nothing is acted on while replies not written pass the budget:
+    /// a client that does not read stdout gets nothing more run or answered (refusals and replies
+    /// to other requests included) until it does. A bounded queue of messages is read ahead
+    /// meanwhile (`read_ahead`), so the end of stdin is seen unless more than that is waiting.
+    /// Otherwise reading goes on, so a cancellation
     /// always gets through. A request read while [`Limits::unanswered`] are not done with is
     /// refused here at once ("busy"), as is one whose id is still in flight; a tool call refused
-    /// so is recorded. When the client closes its end, the stream ends once every request read
-    /// is answered (rmcp waits only briefly for running handlers after it ends).
+    /// so is recorded. When the client closes its end, the stream ends once every request read is
+    /// answered and every refusal written, or once no reply has been written for
+    /// [`Limits::deadline`] plus [`SHUTDOWN_GRACE`] (rmcp waits only briefly for running handlers
+    /// after it ends).
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
-        let (replies, budget, most) = (self.replies.clone(), self.budget, self.unanswered);
-        let inner = &mut self.inner;
+        let (replies, budget, most, quiet, ahead_budget) = (
+            self.replies.clone(),
+            self.budget,
+            self.unanswered,
+            self.quiet,
+            self.read_ahead_budget,
+        );
+        let (inner, read_ahead, ahead_bytes, closed) = (
+            &mut self.inner,
+            &mut self.read_ahead,
+            &mut self.read_ahead_bytes,
+            &mut self.closed,
+        );
         async move {
             loop {
-                replies.within(budget).await;
-                let Some(message) = inner.receive().await else {
-                    replies.until(|| replies.unanswered_count() == 0).await;
-                    return None;
+                let over = replies.outstanding() > budget;
+                let Some((message, size)) = (!over).then(|| read_ahead.pop_front()).flatten()
+                else {
+                    if let Some(wait) = closed {
+                        let written = replies.written.load(Ordering::Acquire);
+                        if written != wait.written {
+                            *wait = Closed {
+                                written,
+                                until: tokio::time::Instant::now() + quiet,
+                            };
+                        }
+                        let queued = !read_ahead.is_empty();
+                        let ready = replies.until(|| {
+                            replies.written.load(Ordering::Acquire) != written
+                                || if queued {
+                                    replies.outstanding() <= budget
+                                } else {
+                                    replies.idle()
+                                }
+                        });
+                        if tokio::time::timeout_at(wait.until, ready).await.is_err() {
+                            tracing::warn!("stdin closed and no reply was written in time");
+                            return None;
+                        }
+                        if !queued && replies.idle() {
+                            return None;
+                        }
+                    } else if read_ahead.len() >= most || *ahead_bytes >= ahead_budget {
+                        replies.within(budget).await;
+                    } else {
+                        tokio::select! {
+                            biased;
+                            message = inner.receive() => match message {
+                                Some(message) => {
+                                    // Unmeasurable counts as the whole budget: reading stops.
+                                    let size = serialized_len(&message).unwrap_or(ahead_budget);
+                                    *ahead_bytes += size;
+                                    read_ahead.push_back((message, size));
+                                }
+                                None => {
+                                    *closed = Some(Closed {
+                                        written: replies.written.load(Ordering::Acquire),
+                                        until: tokio::time::Instant::now() + quiet,
+                                    });
+                                }
+                            },
+                            () = replies.within(budget), if over => {}
+                        }
+                    }
+                    continue;
                 };
+                *ahead_bytes -= size;
                 match &message {
                     JsonRpcMessage::Request(request) => {
                         let id = &request.id;
@@ -454,8 +665,14 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
         }
     }
 
+    /// Closes the transport, without waiting for long on a write a stalled client holds up.
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.inner.close()
+        let close = self.inner.close();
+        async move {
+            tokio::time::timeout(SHUTDOWN_GRACE, close)
+                .await
+                .unwrap_or(Ok(()))
+        }
     }
 }
 
