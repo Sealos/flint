@@ -64,6 +64,13 @@ impl DetailView {
             banners,
             // Filled in by the workspace, which knows the cluster's state.
             actions: Vec::new(),
+            edit: self.edit.as_ref().map(|edit| edit.phase.name()),
+            edit_error: self
+                .edit
+                .as_ref()
+                .and_then(|edit| edit.error.as_deref())
+                .map(error_text),
+            edit_blocked: self.edit_blocked().map(|why| error_text(&why)),
         }
     }
 }
@@ -72,6 +79,10 @@ impl DetailView {
     /// Whether focus is in the YAML editor.
     pub fn yaml_focused(&self, window: &Window, cx: &App) -> bool {
         self.yaml.focus_handle(cx).contains_focused(window, cx)
+            || self
+                .edit
+                .as_ref()
+                .is_some_and(|edit| edit.editor.focus_handle(cx).contains_focused(window, cx))
     }
 }
 

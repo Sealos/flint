@@ -1984,6 +1984,7 @@ dependencies = [
  "serde",
  "serde-saphyr 2.2.0",
  "serde_json",
+ "similar",
  "tempfile",
  "tracing",
 ]

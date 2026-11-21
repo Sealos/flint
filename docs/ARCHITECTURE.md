@@ -716,6 +716,10 @@ opens in a tab in the bottom dock.
    nobody else's change is overwritten without them seeing it. This is how `kubectl edit` behaves. Server-side apply
    is not used for editing, because applying a full object would claim ownership of every field and conflict with
    Helm and controllers.
+4. A reload keeps the text being edited and moves it to the current `resourceVersion`, so the new diff shows any
+   change the edit would undo. An edit that leaves `status` out keeps the live value, since a `PUT` to a kind without
+   a status subresource would erase it.
+5. A Secret is not editable yet: its values are masked in the YAML, and a mask must never be written back.
 
 Delete, scale, rollout restart, cordon, and drain are typed actions in `flint-core`, each with a confirmation in the
 UI. Every write refuses on a protected cluster ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)): it
