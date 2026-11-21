@@ -350,6 +350,13 @@ pub struct DetailState {
     /// For pods and workloads: Logs, Previous Logs and Shell, and whether each can run now
     /// (what the row menu shows, disabled entries with their reason).
     pub actions: Vec<ActionAvailability>,
+    /// The YAML edit's step (`editing`, `reviewing`, `reviewed`, `applying`, `conflict`), or
+    /// null with no edit under way. Never its text.
+    pub edit: Option<&'static str>,
+    /// What the edit's last step said.
+    pub edit_error: Option<String>,
+    /// Why Edit, Review or Apply cannot run now.
+    pub edit_blocked: Option<String>,
 }
 
 /// Whether an action can run now, and if not, why.
@@ -442,6 +449,8 @@ pub enum TabStatusState {
         back_off: bool,
         reason: Option<String>,
     },
+    /// A log stream's container has not started; `reason` is what its tab says.
+    Waiting { reason: String },
     /// Nothing more will come, and nothing failed: all lines read, the pod deleted, or a shell
     /// the tab ended itself (`reason` says why).
     Ended {

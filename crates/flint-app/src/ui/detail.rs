@@ -1,5 +1,6 @@
 //! The generic detail view (#10): Overview (metadata, labels, annotations, owners, conditions,
-//! events, and Secret data masked per key) and read-only YAML with syntax highlighting.
+//! events, and Secret data masked per key) and YAML with syntax highlighting, editable through
+//! `detail_edit`.
 //!
 //! The object is fetched through the core ([`CoreHandle::fetch_object`]) and fetched again when
 //! the list reports that its resource version moved.
@@ -12,6 +13,7 @@ use flint_core::table::{human_duration, unix_now};
 use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, WorkloadKind};
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::diff::Diff;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
@@ -32,8 +34,9 @@ use super::menu_record;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
 use super::registry::{
-    self, Close, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell,
-    Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
+    self, ApplyYamlEdit, BackToYamlEdit, CancelYamlEdit, Close, EditYaml, OpenContainerLogs,
+    OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell, Refresh, ReloadYamlEdit,
+    ReviewYamlEdit, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels, ToggleManagedFields,
     ToggleSecretValue, UnlockCluster,
 };
 use super::terminal_model::ShellRequest;
@@ -97,6 +100,8 @@ pub enum DetailEvent {
     /// Logs or Shell was refused, or could not be done once what it waited for loaded: one
     /// sentence saying what and why ([`refused`]), for the window to say.
     Refused(String),
+    /// Apply was pressed on a reviewed edit: the window asks to confirm it, naming the cluster.
+    ConfirmWrite(Box<flint_core::write::WriteReview>),
 }
 
 /// Whether the tab an action opens takes keyboard focus.
@@ -197,6 +202,10 @@ pub struct DetailView {
     /// The object's cluster is protected (ADR-0015), as the workspace says it: Shell is
     /// disabled, saying so, with Unlock beside it. Logs and browsing are not affected.
     protected: bool,
+    /// The server the object's cluster shows, as the workspace says it: what an edit is for.
+    server: Option<String>,
+    /// The YAML edit under way, in its own editor: a list update never touches its text.
+    edit: Option<edit::YamlEdit>,
     /// The pane's own focus, for Tab and Shift-Tab between panes (UP-33).
     focus: FocusHandle,
     _fetch: Task<()>,
@@ -246,6 +255,8 @@ impl DetailView {
             pending: None,
             sessions_blocked: None,
             protected: false,
+            server: None,
+            edit: None,
             focus: cx.focus_handle(),
             _fetch: Task::ready(()),
             _show_pods: Task::ready(()),
@@ -279,6 +290,11 @@ impl DetailView {
             self.protected = protected;
             cx.notify();
         }
+    }
+
+    /// Says which server the object's cluster points at now.
+    pub(in crate::ui) fn set_server(&mut self, server: Option<String>) {
+        self.server = server;
     }
 
     pub fn object(&self) -> &ObjectRef {
@@ -876,7 +892,155 @@ impl DetailView {
             .collect()
     }
 
-    /// The YAML tab's bar: the managedFields toggle.
+    /// The YAML tab's body: the object, the edit, or the edit's diff.
+    fn render_yaml_body(&self) -> AnyElement {
+        match &self.edit {
+            None => Editor::new(&self.yaml)
+                .readonly(true)
+                .bordered(false)
+                .h_full()
+                .into_any_element(),
+            Some(edit) => match edit.phase {
+                edit::Phase::Reviewed(_) | edit::Phase::Applying => div()
+                    .id("yaml-edit-diff")
+                    .test_support()
+                    .size_full()
+                    .child(Diff::new(&edit.diff))
+                    .into_any_element(),
+                _ => div()
+                    .id("yaml-edit-editor")
+                    .test_support()
+                    .size_full()
+                    .child(
+                        Editor::new(&edit.editor)
+                            // What Review sent is what its diff shows.
+                            .readonly(matches!(edit.phase, edit::Phase::Reviewing))
+                            .bordered(false)
+                            .h_full(),
+                    )
+                    .into_any_element(),
+            },
+        }
+    }
+
+    /// What the edit's last step said, or that the object changed.
+    fn render_edit_message(&self, theme: &Theme) -> Option<AnyElement> {
+        let edit = self.edit.as_ref()?;
+        let conflict = matches!(edit.phase, edit::Phase::Conflict);
+        let text = match (&edit.error, conflict) {
+            (Some(error), _) => error.clone(),
+            (None, true) => "This object changed since you opened it, so nothing was applied. Reload keeps your \
+             edit and shows its diff against the current object, including any change it would \
+             undo."
+                .to_owned(),
+            (None, false) => return None,
+        };
+        let color = if conflict {
+            theme.warning
+        } else {
+            theme.danger
+        };
+        // Wrapped, not a one-line notice: it can be a server's whole rejection.
+        Some(
+            div()
+                .id("yaml-edit-message")
+                .test_support()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(color)
+                .text_xs()
+                .text_color(theme.foreground)
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
+    /// The bar's buttons while an edit is under way.
+    fn render_edit_buttons(&self, edit: &edit::YamlEdit) -> Div {
+        let blocked = self.edit_blocked();
+        let primary = |button: Button| match &blocked {
+            Some(why) => button.disabled(true).tooltip(why.clone()),
+            None => button,
+        };
+        let cancel = Button::new("yaml-edit-cancel")
+            .xsmall()
+            .ghost()
+            .label("Cancel")
+            .on_click(registry::on_click(CancelYamlEdit));
+        let buttons = h_flex().gap_1().flex_none();
+        let buttons = match edit.phase {
+            edit::Phase::Editing => buttons.child(cancel).child(primary(
+                Button::new("yaml-edit-review")
+                    .xsmall()
+                    .primary()
+                    .label("Review")
+                    .tooltip("Run a server dry run and show the diff; nothing is changed")
+                    .on_click(registry::on_click(ReviewYamlEdit)),
+            )),
+            edit::Phase::Reviewing | edit::Phase::Applying => buttons.child(Spinner::new().small()),
+            edit::Phase::Reviewed(_) => buttons
+                .child(cancel)
+                .child(
+                    Button::new("yaml-edit-back")
+                        .xsmall()
+                        .ghost()
+                        .label("Back to Edit")
+                        .on_click(registry::on_click(BackToYamlEdit)),
+                )
+                .child(primary(
+                    Button::new("yaml-edit-apply")
+                        .xsmall()
+                        .primary()
+                        .label("Apply…")
+                        .on_click(registry::on_click(ApplyYamlEdit)),
+                )),
+            edit::Phase::Conflict => buttons.child(cancel).child(primary(
+                Button::new("yaml-edit-reload")
+                    .xsmall()
+                    .primary()
+                    .label("Reload and Review")
+                    .on_click(registry::on_click(ReloadYamlEdit)),
+            )),
+        };
+        buttons.when(self.protected, |el| el.child(self.render_edit_unlock()))
+    }
+
+    fn render_edit_unlock(&self) -> Button {
+        Button::new("yaml-edit-unlock")
+            .xsmall()
+            .ghost()
+            .icon(FlintIcon::Lock)
+            .label("Unlock…")
+            .tooltip(format!(
+                "Unlock {} until Flint quits, after a confirmation naming its server",
+                self.object.cluster
+            ))
+            .on_click(registry::on_click(UnlockCluster {
+                cluster: self.object.cluster.clone(),
+            }))
+    }
+
+    /// Edit, disabled with its reason when it cannot run, and Unlock beside it when that is why.
+    fn render_edit_button(&self) -> Div {
+        let button = Button::new("yaml-edit").xsmall().ghost().label("Edit");
+        let button = match self.edit_blocked() {
+            Some(why) => button.disabled(true).tooltip(why),
+            None => button
+                .tooltip("Edit this object's YAML")
+                .on_click(registry::on_click(EditYaml)),
+        };
+        h_flex()
+            .gap_1()
+            .flex_none()
+            .child(button)
+            .when(self.protected && !self.is_secret, |el| {
+                el.child(self.render_edit_unlock())
+            })
+    }
+
+    /// The YAML tab's bar: the managedFields toggle, and Edit or the edit's buttons.
     fn render_yaml_bar(
         &self,
         detail: &ObjectDetail,
@@ -893,14 +1057,22 @@ impl DetailView {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(div().flex_1().min_w_0().truncate().child(if !has_managed {
-                "No managedFields on this object."
-            } else if self.show_managed_fields {
-                "Showing metadata.managedFields."
-            } else {
-                "metadata.managedFields is hidden."
-            }))
-            .when(has_managed, |el| {
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(if self.edit.is_some() {
+                        "Editing"
+                    } else if !has_managed {
+                        "No managedFields on this object."
+                    } else if self.show_managed_fields {
+                        "Showing metadata.managedFields."
+                    } else {
+                        "metadata.managedFields is hidden."
+                    }),
+            )
+            .when(has_managed && self.edit.is_none(), |el| {
                 el.child(
                     Button::new("toggle-managed-fields")
                         .xsmall()
@@ -913,6 +1085,10 @@ impl DetailView {
                         .tooltip("Which field manager (kubectl, Helm, a controller) set each field")
                         .on_click(registry::on_click(ToggleManagedFields)),
                 )
+            })
+            .map(|el| match &self.edit {
+                Some(edit) => el.child(self.render_edit_buttons(edit)),
+                None => el.child(self.render_edit_button()),
             })
     }
 
@@ -1477,14 +1653,8 @@ impl Render for DetailView {
                 .flex_1()
                 .min_h_0()
                 .child(self.render_yaml_bar(detail, &theme, cx))
-                .child(
-                    div().flex_1().min_h_0().child(
-                        Editor::new(&self.yaml)
-                            .readonly(true)
-                            .bordered(false)
-                            .h_full(),
-                    ),
-                )
+                .children(self.render_edit_message(&theme))
+                .child(div().flex_1().min_h_0().child(self.render_yaml_body()))
                 .into_any_element(),
         };
         v_flex()
@@ -1511,6 +1681,9 @@ impl Render for DetailView {
 
 #[path = "detail_actions.rs"]
 mod actions;
+
+#[path = "detail_edit.rs"]
+mod edit;
 
 #[path = "detail_pods.rs"]
 mod pods;

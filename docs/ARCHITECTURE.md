@@ -621,8 +621,10 @@ opens in a tab in the bottom dock.
     missing from a load is removed only if no failed file ranks at or above the file that defined it, and no
     failed file defined it too (a shadowed definition) when it last loaded. A failure in a file never known to
     define the context masks nothing. A context with another server is a confirmed change only if no failed file
-    ranks above the file it now comes from; otherwise it may be a later file's fallback, showing while the first
-    file is unreadable, and it stays provisional.
+    ranks above the file it now comes from, and above the file that won its cluster entry; otherwise it may be a
+    later file's fallback, showing while the first file is unreadable, and it stays provisional. A running session
+    survives a fallback of the cluster entry, but the write gate lets nothing new start on a pin from before it,
+    even once the file is back.
   - **Provisional entries.** What a load cannot confirm never replaces confirmed history, its file included, even
     on the same server. A context first seen that way (a file before it already unreadable at startup) is recorded
     as unconfirmed; a load that confirms it on the same server keeps its sessions. Sessions on the confirmed
@@ -637,7 +639,10 @@ opens in a tab in the bottom dock.
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
     A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
     another server, or, when it points where it did (removed and added back, say), changed since the session
-    opened. A log session opened on a removed context ends at once. Ending drops the exec connection, as closing
+    opened. A shell refused before it starts says it did not start (`NotStartedMoved`, `NotStartedRemoved`). A pin
+    refused while the context's recorded server is still its exact URL gets `WriteRefusal::Stale`, which does not
+    claim the server moved (`NotStartedStale`, or `EndedStale` once its connection is open). A log
+    session opened on a removed context ends at once. Ending drops the exec connection, as closing
     the session does, so no stream stays open on the old server.
 - **Input budget (#256).** A session holds at most 1 MiB of input (`exec::INPUT_BUDGET`) that the pod has not read:
   what waits for the session task, what is kept for the next shell while the first may turn out not to exist, and
@@ -716,6 +721,10 @@ opens in a tab in the bottom dock.
    nobody else's change is overwritten without them seeing it. This is how `kubectl edit` behaves. Server-side apply
    is not used for editing, because applying a full object would claim ownership of every field and conflict with
    Helm and controllers.
+4. A reload keeps the text being edited and moves it to the current `resourceVersion`, so the new diff shows any
+   change the edit would undo. An edit that leaves `status` out keeps the live value, since a `PUT` to a kind without
+   a status subresource would erase it.
+5. A Secret is not editable yet: its values are masked in the YAML, and a mask must never be written back.
 
 Delete, scale, rollout restart, cordon, and drain are typed actions in `flint-core`, each with a confirmation in the
 UI. Every write refuses on a protected cluster ([ADR-0015](./adr/0015-clusters-are-protected-by-default.md)): it

@@ -2,9 +2,6 @@
 //! the core's review returned, names the real context and server, and runs the reviewed intent:
 //! the core asks the write gate again for each request, so confirming authorizes nothing.
 
-// The YAML editor (#16) and the resource actions (#17) open it.
-#![allow(dead_code)]
-
 use std::rc::Rc;
 
 use flint_core::CoreHandle;
@@ -184,6 +181,8 @@ fn dialog_text_saying(
 
 /// Asks to confirm `review`, then runs it on `core` and calls `on_done` with the result.
 /// Cancelling runs nothing and does not call it.
+// The resource actions (#17) open it.
+#[allow(dead_code)]
 pub fn open(
     window: &mut Window,
     cx: &mut App,
@@ -192,7 +191,24 @@ pub fn open(
     names: &ClusterNames,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
-    open_noted(window, cx, core, review, names, None, |_| true, on_done);
+    open_with(window, cx, core, review, names, |_| {}, on_done);
+}
+
+/// [`open`], calling `on_start` once the confirmation is accepted, before the write runs.
+pub fn open_with(
+    window: &mut Window,
+    cx: &mut App,
+    core: CoreHandle,
+    review: WriteReview,
+    names: &ClusterNames,
+    on_start: impl Fn(&mut App) + 'static,
+    on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
+) {
+    let begin = move |cx: &mut App| {
+        on_start(cx);
+        true
+    };
+    open_noted(window, cx, core, review, names, None, begin, on_done);
 }
 
 /// [`open`], first saying `note` (why this review was opened again). Confirming asks `begin`

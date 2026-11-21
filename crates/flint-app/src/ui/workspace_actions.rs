@@ -28,18 +28,19 @@ use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
 use super::super::palette::{ArgInput, Choice, ChoiceSource, CommandPalette, Mode, PaletteEvent};
 use super::super::registry::{
-    About, ActionError, ActionSpec, ActivateTab, AddNamespace, Arg, ArgKind, Bind, ClearSelection,
-    Close, CloseActiveTab, CloseDetail, CloseTab, CopyLines, CopyText, DefaultWatchAllKinds,
-    DefaultWatchOpenViewsOnly, DragSelection, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp,
-    FocusFilter, FocusNextPane, FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack,
-    Guards, Hide, HideFromAi, HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab,
-    OnView, OpenContainerLogs, OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs,
-    OpenSelectorLogs, OpenShell, OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs,
-    Refresh, RestartShell, RetryConnection, SaveLines, SaveLogs, SaveMatchingLines, SaveScope,
-    SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAllLines,
-    SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine, SelectPrev,
-    SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth, ShowAll,
-    ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
+    About, ActionError, ActionSpec, ActivateTab, AddNamespace, ApplyYamlEdit, Arg, ArgKind,
+    BackToYamlEdit, Bind, CancelYamlEdit, ClearSelection, Close, CloseActiveTab, CloseDetail,
+    CloseTab, CopyLines, CopyText, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, DragSelection,
+    EditYaml, ExposeToAi, ExtendSelectionDown, ExtendSelectionUp, FocusFilter, FocusNextPane,
+    FocusPreviousPane, FocusSearch, Forward, ForwardCurrent, GoBack, Guards, Hide, HideFromAi,
+    HideOthers, JumpToEnd, JumpToStart, LeaveSearch, NextMatch, NextTab, OnView, OpenContainerLogs,
+    OpenContainerShell, OpenLogs, OpenObject, OpenPreviousLogs, OpenSelectorLogs, OpenShell,
+    OpenView, PaneName, PasteText, PrevMatch, PrevTab, ReconnectLogs, Refresh, ReloadYamlEdit,
+    RestartShell, RetryConnection, ReviewYamlEdit, SaveLines, SaveLogs, SaveMatchingLines,
+    SaveScope, SaveSelectedLines, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
+    SelectAllLines, SelectCluster, SelectFirst, SelectLast, SelectLine, SelectNext, SelectNextLine,
+    SelectPrev, SelectPrevLine, SelectRow, SelectText, SetDockHeight, SetNamespaces, SetPaneWidth,
+    ShowAll, ShowAllNamespaces, ShowOverview, ShowTabList, ShowYaml, SortBy, ToggleAnnotations,
     ToggleCommandPalette, ToggleLabels, ToggleManagedFields, ToggleNamespace, ToggleNavSection,
     TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
     ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
@@ -262,6 +263,12 @@ impl Workspace {
             .when::<ToggleLabels>(view_open!(detail))
             .when::<ToggleAnnotations>(view_open!(detail))
             .when::<ToggleManagedFields>(view_open!(detail, DetailView::has_managed_fields))
+            .when::<EditYaml>(view_open!(detail, DetailView::can_start_edit))
+            .when::<ReviewYamlEdit>(view_open!(detail, DetailView::can_review_edit))
+            .when::<ApplyYamlEdit>(view_open!(detail, DetailView::can_apply_edit))
+            .when::<ReloadYamlEdit>(view_open!(detail, DetailView::can_reload_edit))
+            .when::<BackToYamlEdit>(view_open!(detail, DetailView::can_go_back_to_edit))
+            .when::<CancelYamlEdit>(view_open!(detail, DetailView::can_cancel_edit))
             .add::<ToggleSecretValue>(view_open!(detail, DetailView::is_secret), |ws, a, cx| {
                 match detail(ws, cx) {
                     Some(d) => d.check_secret_key(a),

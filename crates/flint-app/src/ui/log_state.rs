@@ -119,6 +119,9 @@ pub fn status(state: &LogState, pod: bool) -> TabStatusState {
                 None => None,
             },
         },
+        LogState::Waiting { wait } => TabStatusState::Waiting {
+            reason: log_model::wait_text(wait),
+        },
         LogState::Ended { .. } if state.previous_not_available().is_some() => {
             TabStatusState::Failed {
                 reason: log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
@@ -169,6 +172,7 @@ pub fn stream_counts(status: &PodSetStatus) -> StreamCounts {
                     LogState::Connecting => "connecting",
                     LogState::Streaming => "streaming",
                     LogState::Reconnecting { .. } => "reconnecting",
+                    LogState::Waiting { .. } => "waiting",
                     LogState::Ended { error: Some(_), .. } => "failed",
                     LogState::Ended { .. } => "ended",
                 },

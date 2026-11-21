@@ -224,6 +224,15 @@ pub enum ExecFailureKind {
     /// session opened on, so Flint ended it (the message says which). Checked every
     /// 30 s while the session connects or runs.
     ContextChanged,
+    /// Refused before the shell started: the context now points to another API server than its
+    /// tab was opened for. Nothing ran.
+    NotStartedMoved,
+    /// Refused before the shell started: the context is gone. Nothing ran.
+    NotStartedRemoved,
+    /// Refused before the shell started: its pin is out of date, on the same server. Nothing ran.
+    NotStartedStale,
+    /// Refused with its connection already open: its pin is out of date, on the same server.
+    EndedStale,
     /// Anything else: no cause Flint can name (the full text says what happened).
     Other,
 }
@@ -824,7 +833,7 @@ pub(crate) async fn start(
         }
         Err(refusal) => {
             let mut session = Session::new(channels);
-            session.set_state(ExecState::Failed(refused(&refusal)));
+            session.set_state(ExecState::Failed(refused(&refusal, false)));
             session.linger().await;
         }
     }
@@ -863,11 +872,18 @@ async fn ask_gate(
     }
 }
 
-/// How a session shows a refusal from the write gate.
-fn refused(refusal: &WriteRefusal) -> ExecFailure {
+/// How a session shows a refusal from the write gate. `connected`: its connection was open, so
+/// it cannot say that nothing started.
+fn refused(refusal: &WriteRefusal, connected: bool) -> ExecFailure {
     let kind = match refusal {
         WriteRefusal::Protected { .. } => ExecFailureKind::Protected,
-        WriteRefusal::Moved { .. } => ExecFailureKind::ContextChanged,
+        WriteRefusal::Moved { .. } | WriteRefusal::Removed { .. } if connected => {
+            ExecFailureKind::ContextChanged
+        }
+        WriteRefusal::Moved { .. } => ExecFailureKind::NotStartedMoved,
+        WriteRefusal::Removed { .. } => ExecFailureKind::NotStartedRemoved,
+        WriteRefusal::Stale { .. } if connected => ExecFailureKind::EndedStale,
+        WriteRefusal::Stale { .. } => ExecFailureKind::NotStartedStale,
         WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => ExecFailureKind::Unreachable,
     };
     ExecFailure::new(kind, refusal.to_string())
@@ -894,7 +910,7 @@ pub(crate) async fn run(
         match ask_gate(&mut session, watch.may_launch(), &mut pending).await {
             GateAnswer::Open => {}
             GateAnswer::Refused(refusal) => {
-                session.set_state(ExecState::Failed(refused(&refusal)));
+                session.set_state(ExecState::Failed(refused(&refusal, false)));
                 break;
             }
             GateAnswer::Closed => {
@@ -936,7 +952,7 @@ pub(crate) async fn run(
         match ask_gate(&mut session, watch.may_launch(), &mut pending).await {
             GateAnswer::Open => {}
             GateAnswer::Refused(refusal) => {
-                session.set_state(ExecState::Failed(refused(&refusal)));
+                session.set_state(ExecState::Failed(refused(&refusal, true)));
                 break;
             }
             GateAnswer::Closed => {
@@ -1941,6 +1957,7 @@ mod tests {
                 paths: vec![file],
                 errors: Vec::new(),
                 defines: Vec::new(),
+                cluster_sources: Default::default(),
             }
         }
 
@@ -2864,6 +2881,20 @@ mod tests {
         let watch = ContextWatch::new(never, launch, CHECK_EVERY);
         tokio::spawn(run(launcher.clone(), request(), channels, watch));
         (session, closed)
+    }
+
+    // covers UP-06: a stale pin on the same server is refused without claiming the server moved.
+    #[test]
+    fn a_stale_refusal_does_not_say_the_server_moved() {
+        let stale = WriteRefusal::Stale {
+            cluster: "dev".into(),
+        };
+        assert_eq!(
+            refused(&stale, false).kind,
+            ExecFailureKind::NotStartedStale
+        );
+        assert_eq!(refused(&stale, true).kind, ExecFailureKind::EndedStale);
+        assert!(!stale.to_string().contains("another server"));
     }
 
     fn protected() -> WriteRefusal {

@@ -79,6 +79,8 @@ pub(crate) struct ContextPin {
     /// The same for the endpoint, which ignores a trailing slash: what a log session is pinned
     /// to. A shell keeps the exact [`Self::generation`], since the write gate checks it.
     endpoint: u64,
+    /// [`Record::gate`] when pinned: what the write gate holds a launch to.
+    gate: u64,
     server: Option<String>,
 }
 
@@ -105,6 +107,10 @@ struct Record {
     generation: u64,
     /// Bumped likewise, but not by a change that only adds or drops a trailing slash.
     endpoint: u64,
+    /// Bumped when another file's cluster entry shows another server while the entry that won
+    /// can't be read. A running session survives that, but the write gate does not let
+    /// anything new start on a pin from before it, even once the file is back.
+    gate: u64,
 }
 
 /// Whether two servers are one endpoint: the same URL but for a trailing slash.
@@ -140,7 +146,10 @@ pub(crate) struct Shown {
 ///   the entry may be a fallback, a later file's definition showing only while the first one
 ///   is unreadable: it is provisional, and the confirmed definition stays. A session opened on
 ///   a provisional definition is pinned stale, and its first check ends it
-///   ([`Change::Unconfirmed`]): it never moves to the confirmed server.
+///   ([`Change::Unconfirmed`]): it never moves to the confirmed server. The server comes from
+///   the context's cluster entry, which another file can define: the entry is a fallback too
+///   if a failed file ranks above the file that won the cluster, or if no file defines the
+///   cluster while any file failed.
 ///
 /// A failed file ranked below a context's file cannot change which definition wins, so it
 /// masks nothing by rank. It masks a removal only if it defined the context too (a shadowed
@@ -158,6 +167,8 @@ pub(crate) struct ContextHistory {
     defines: HashMap<PathBuf, HashSet<String>>,
     /// The last generation handed out; generations are unique across contexts.
     last: u64,
+    /// The last load had a file it could not read, so a server shown may be a fallback.
+    failing: bool,
 }
 
 impl ContextHistory {
@@ -166,6 +177,7 @@ impl ContextHistory {
     pub fn record(&mut self, loaded: &LoadedKubeconfig) {
         let rank = |path: &Path| loaded.paths.iter().position(|p| p == path);
         let first_failed = loaded.errors.iter().filter_map(|(p, _)| rank(p)).min();
+        self.failing = !loaded.errors.is_empty();
         // A failed file ranked above `path` (or at it, with `or_at`) could define what `path`
         // does. A file no longer in the list ranks nowhere.
         let masked = |path: &Path, or_at: bool| match (first_failed, rank(path)) {
@@ -196,11 +208,28 @@ impl ContextHistory {
                 continue;
             }
             // A failed file before its own could define it: the entry may be a fallback.
-            let provisional = masked(&info.source, false);
+            let context_masked = masked(&info.source, false);
+            // The same for the cluster entry that gives it its server.
+            let cluster_masked = info.cluster.as_ref().is_some_and(|cluster| {
+                match loaded.cluster_sources.get(cluster) {
+                    Some(file) => masked(file, false),
+                    None => !loaded.errors.is_empty(),
+                }
+            });
+            let provisional = context_masked || cluster_masked;
             match self.records.get_mut(name) {
                 // A confirmed definition stays until a load confirms a change: a fallback never
                 // replaces it, nor its file.
-                Some(r) if r.present && r.confirmed && provisional => {}
+                Some(r) if r.present && r.confirmed && provisional => {
+                    if cluster_masked && r.server.as_deref() != server {
+                        self.last += 1;
+                        r.gate = self.last;
+                    }
+                    // The context entry itself is certain: its file is what masks its removal.
+                    if !context_masked {
+                        r.source = info.source.clone();
+                    }
+                }
                 // Same server: the file it now comes from is the one whose rank masks its
                 // removal, confirmed or not (an unconfirmed record follows its fallback).
                 Some(r) if r.present && r.server.as_deref() == server => {
@@ -221,6 +250,7 @@ impl ContextHistory {
                         confirmed: !provisional,
                         generation: self.last,
                         endpoint,
+                        gate: r.gate,
                     };
                 }
                 None => {
@@ -234,6 +264,7 @@ impl ContextHistory {
                             confirmed: !provisional,
                             generation: self.last,
                             endpoint: self.last,
+                            gate: 0,
                         },
                     );
                 }
@@ -266,8 +297,30 @@ impl ContextHistory {
         ContextPin {
             generation,
             endpoint,
+            gate: record.map_or(0, |r| r.gate),
             server: server.map(str::to_owned),
         }
+    }
+
+    /// Whether a cluster entry's fallback showed since `pin` was taken: nothing new may start
+    /// on it, though a session already running goes on.
+    pub fn gate_moved(&self, context: &str, pin: &ContextPin) -> bool {
+        self.records
+            .get(context)
+            .is_some_and(|r| r.gate != pin.gate)
+    }
+
+    /// Whether `context`'s recorded server is the exact URL `pin` was taken for. Only says how to
+    /// word a refusal: a pin can be stale on the same server.
+    pub fn on_pinned_server(&self, context: &str, pin: &ContextPin) -> bool {
+        self.records
+            .get(context)
+            .is_some_and(|r| r.present && r.server == pin.server)
+    }
+
+    /// Whether the last load confirmed that `context` is gone.
+    pub fn removed(&self, context: &str) -> bool {
+        self.records.get(context).is_some_and(|r| !r.present)
     }
 
     /// What is known of `context` showing `server`.
@@ -308,9 +361,10 @@ impl ContextHistory {
         };
         let change = match self.records.get(context) {
             Some(r) if r.present && current(r) == pinned => return None,
-            // Pinned stale at once: opened on what a load showed but did not confirm (a later
-            // file's fallback, while the first one can't be read).
-            Some(r) if r.present && pinned == 0 => Change::Unconfirmed,
+            // Pinned stale at once, with a file still unreadable: opened on what a load showed
+            // but did not confirm (a later file's fallback). With every file read, the context
+            // has left that server for certain.
+            Some(r) if r.present && pinned == 0 && self.failing => Change::Unconfirmed,
             Some(r) if r.present && moved(r) => Change::Repointed,
             // Removed and added back, or re-pointed and put back, since the session opened.
             Some(r) if r.present => Change::Changed,
@@ -490,7 +544,99 @@ mod tests {
                 .map(|f| (PathBuf::from(f), "did not parse".to_owned()))
                 .collect(),
             defines,
+            cluster_sources: HashMap::new(),
         }
+    }
+
+    /// [`load`] with `dev` on the cluster entry `shared`, which `file` won.
+    fn on_cluster(mut loaded: LoadedKubeconfig, file: &str) -> LoadedKubeconfig {
+        loaded.contexts[0].cluster = Some("shared".to_owned());
+        loaded
+            .cluster_sources
+            .insert("shared".to_owned(), PathBuf::from(file));
+        loaded
+    }
+
+    // covers UP-06: `a` defines the context, `b` its cluster, and `c` shadows that cluster. With
+    // `b` unreadable, `c`'s URL is a fallback: a running session goes on, and nothing new starts
+    // on it, or on a pin from before it, even once `b` is back.
+    #[test]
+    fn a_shadowed_cluster_entry_is_a_fallback() {
+        let mut h = ContextHistory::default();
+        h.record(&on_cluster(load(&[("dev", STAGING, "a")], &[]), "b"));
+        let pin = h.pin("dev", STAGING);
+
+        h.record(&on_cluster(load(&[("dev", PROD, "a")], &["b"]), "c"));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "still running");
+        assert_eq!(h.check(Pinned::Logs, "dev", &pin), None, "still running");
+        assert!(h.gate_moved("dev", &pin), "nothing new starts on it");
+        assert!(!h.shown("dev", PROD).confirmed);
+        let fallback = h.pin("dev", PROD);
+        assert_eq!(
+            h.check(Pinned::Shell, "dev", &fallback),
+            Some(reason(Pinned::Shell, "dev", Change::Unconfirmed))
+        );
+
+        h.record(&on_cluster(load(&[("dev", STAGING, "a")], &[]), "b"));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "survived");
+        assert!(h.gate_moved("dev", &pin), "the gate stays as strict");
+        assert!(h.on_pinned_server("dev", &pin), "refused, but not moved");
+        assert!(!h.on_pinned_server("dev", &fallback), "this one did move");
+        let fresh = h.pin("dev", STAGING);
+        assert!(!h.gate_moved("dev", &fresh));
+    }
+
+    // covers UP-06: `a` defines the cluster, `b` the context, `c` a fallback cluster. With `a`
+    // unreadable both entries are masked, and the gate still refuses the old pin.
+    #[test]
+    fn the_gate_moves_when_context_and_cluster_are_both_masked() {
+        let mut h = ContextHistory::default();
+        h.record(&on_cluster(load(&[("dev", STAGING, "b")], &[]), "a"));
+        let pin = h.pin("dev", STAGING);
+        h.record(&on_cluster(load(&[("dev", PROD, "b")], &["a"]), "c"));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "still running");
+        assert!(h.gate_moved("dev", &pin));
+    }
+
+    // covers UP-06: the context moved to `a`, certain, while its cluster entry is masked. Once
+    // `a` drops it, the failed `b`, ranked below `a` and never defining it, hides nothing.
+    #[test]
+    fn a_confirmed_context_file_decides_its_removal() {
+        let mut h = ContextHistory::default();
+        h.record(&on_cluster(load(&[("dev", STAGING, "c")], &[]), "c"));
+        let pin = h.pin("dev", STAGING);
+        h.record(&on_cluster(load(&[("dev", STAGING, "a")], &["b"]), "c"));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None);
+        h.record(&load(&[], &["b"]));
+        assert_eq!(
+            h.check(Pinned::Shell, "dev", &pin),
+            Some(reason(Pinned::Shell, "dev", Change::Removed))
+        );
+    }
+
+    // covers UP-06: a cluster entry no file defines, while a file failed, may be in that file.
+    #[test]
+    fn a_missing_cluster_entry_with_a_failed_file_is_unconfirmed() {
+        let mut h = ContextHistory::default();
+        h.record(&on_cluster(load(&[("dev", STAGING, "a")], &[]), "b"));
+        let mut failed = load(&[("dev", None, "a")], &["b"]);
+        failed.contexts[0].cluster = Some("shared".to_owned());
+        h.record(&failed);
+        assert!(!h.shown("dev", None).confirmed);
+        assert_eq!(h.check(Pinned::Logs, "dev", &h.pin("dev", STAGING)), None);
+    }
+
+    // covers UP-06: a request pinned to a server the context left for certain says it moved; the
+    // kubeconfig files all read, so no unreadable file is to blame.
+    #[test]
+    fn a_stale_pin_says_moved_when_every_file_loaded() {
+        let mut h = history(&[("dev", STAGING, "a")]);
+        h.record(&load(&[("dev", PROD, "a")], &[]));
+        let late = h.pin("dev", STAGING);
+        assert_eq!(
+            h.check(Pinned::Logs, "dev", &late),
+            Some(reason(Pinned::Logs, "dev", Change::Repointed))
+        );
     }
 
     fn history(contexts: &[(&str, Option<&str>, &str)]) -> ContextHistory {

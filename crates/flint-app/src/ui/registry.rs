@@ -148,8 +148,10 @@ actions!(
         ToggleWide,
         /// Move focus to the list's text filter.
         FocusFilter,
-        /// Move focus from the list's text filter back to its rows (Esc, Enter or Down there).
-        FocusRows
+        /// Move focus from the list's text filter back to its rows (Esc or Enter there).
+        FocusRows,
+        /// Down in the list's text filter: back to the rows, selecting the first if none is.
+        SelectFromFilter
     ]
 );
 actions!(
@@ -163,7 +165,19 @@ actions!(
         ShowYaml,
         ToggleManagedFields,
         ToggleLabels,
-        ToggleAnnotations
+        ToggleAnnotations,
+        /// Edit the object's YAML.
+        EditYaml,
+        /// Run a server dry run of the edit and show its diff.
+        ReviewYamlEdit,
+        /// Apply the reviewed edit, after a confirmation.
+        ApplyYamlEdit,
+        /// Reload an object that changed, keep the edit, and review it again.
+        ReloadYamlEdit,
+        /// Go back from the diff to the editor.
+        BackToYamlEdit,
+        /// Discard the edit.
+        CancelYamlEdit
     ]
 );
 
@@ -2175,7 +2189,14 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Move focus from the filter back to the rows, keeping the filter text.",
         )
         .of(C::List, S::List)
-        .keys(&["escape", "enter", "down"], Some(LIST_FILTER))
+        .keys(&["escape", "enter"], Some(LIST_FILTER))
+        .hidden(),
+        Spec::unit::<SelectFromFilter>(
+            "Select From Filter",
+            "Move focus from the filter to the rows, selecting the first if none is selected.",
+        )
+        .of(C::List, S::List)
+        .keys(&["down"], Some(LIST_FILTER))
         .hidden(),
         Spec::unit::<SelectPrev>("Select Previous Row", "Move the selection up.")
             .of(C::List, S::List)
@@ -2232,6 +2253,26 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Show or hide metadata.managedFields in the YAML.",
         )
         .of(C::Detail, S::Detail),
+        Spec::unit::<EditYaml>("Edit YAML", "Edit the object's YAML.").of(C::Detail, S::Detail),
+        Spec::unit::<ReviewYamlEdit>(
+            "Review YAML Edit",
+            "Run a server dry run of the edit and show its diff.",
+        )
+        .of(C::Detail, S::Detail),
+        Spec::unit::<ApplyYamlEdit>(
+            "Apply YAML Edit",
+            "Apply the reviewed edit, after a confirmation.",
+        )
+        .of(C::Detail, S::Detail),
+        Spec::unit::<ReloadYamlEdit>(
+            "Reload YAML Edit",
+            "Reload an object that changed, keep the edit, and review it again.",
+        )
+        .of(C::Detail, S::Detail),
+        Spec::unit::<BackToYamlEdit>("Back to YAML Edit", "Go back from the diff to the editor.")
+            .of(C::Detail, S::Detail),
+        Spec::unit::<CancelYamlEdit>("Cancel YAML Edit", "Discard the edit.")
+            .of(C::Detail, S::Detail),
         Spec::unit::<ToggleLabels>("Toggle Labels", "Expand or collapse the labels.")
             .of(C::Detail, S::Detail),
         Spec::unit::<ToggleAnnotations>(

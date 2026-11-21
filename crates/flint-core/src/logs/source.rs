@@ -6,12 +6,12 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{AsyncBufRead, AsyncBufReadExt as _, FutureExt as _, StreamExt as _};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::Client;
 use kube::api::{Api, LogParams};
 
 use super::line::MAX_LINE_BYTES;
-use super::session::{LogSince, LogTarget};
+use super::session::{ContainerWait, LogSince, LogTarget};
 use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{ClusterError, Target};
 
@@ -87,6 +87,9 @@ pub(crate) enum ErrorKind {
     /// [`ErrorKind::Fatal`]; a stream that already read the pod, or saw it being deleted, takes
     /// it as the pod's deletion.
     NotFound,
+    /// A 400 saying the container has not started (and is not crash-looping). Retried after
+    /// asking the pod why. Read from the whole answer: [`LogError::message`] may be cut short.
+    NotStarted,
 }
 
 impl LogError {
@@ -120,9 +123,23 @@ impl LogError {
         }
     }
 
+    /// See [`ErrorKind::NotStarted`].
+    pub(crate) fn not_started(message: impl Into<String>) -> Self {
+        LogError {
+            message: message.into(),
+            kind: ErrorKind::NotStarted,
+        }
+    }
+
     /// Retrying cannot help (a [`ErrorKind::Fatal`] or [`ErrorKind::Cluster`] error).
     pub fn is_fatal(&self) -> bool {
-        self.kind != ErrorKind::Retry
+        !matches!(self.kind, ErrorKind::Retry | ErrorKind::NotStarted)
+    }
+
+    /// The log endpoint says the container has not started, and not because it crash-loops
+    /// (which has its own wait).
+    pub(crate) fn waits_for_start(&self) -> bool {
+        self.kind == ErrorKind::NotStarted
     }
 
     /// See [`ErrorKind::Cluster`].
@@ -140,8 +157,15 @@ impl LogError {
             ApiErrorKind::BadRequest => !is_starting(api.message),
             _ => false,
         });
+        let not_started = ApiError::from_kube(&err).is_some_and(|api| {
+            api.kind() == ApiErrorKind::BadRequest
+                && is_starting(api.message)
+                && !api.message.contains(CRASH_LOOP)
+        });
         let message = ClusterError::kube(err).summary().to_string();
-        if not_found {
+        if not_started {
+            LogError::not_started(message)
+        } else if not_found {
             LogError {
                 message,
                 kind: ErrorKind::NotFound,
@@ -166,13 +190,15 @@ fn is_starting(message: &str) -> bool {
 }
 
 /// What to do after a followed stream ended cleanly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AfterEnd {
     /// The container may run again (it restarts, or the pod is still running): reconnect.
     Restarts,
     /// As [`AfterEnd::Restarts`], but the pod's status says the container is waiting in
     /// `CrashLoopBackOff`: the kubelet restarts it after its back-off, which can take minutes.
     BackOff,
+    /// The container has not started: there is no log yet, for this reason.
+    NotStarted(ContainerWait),
     /// The container finished for good.
     Finished,
     /// The pod is being deleted (it has a `deletionTimestamp`) but the container has not
@@ -369,8 +395,45 @@ pub(crate) fn fate(pod: Option<&Pod>, container: Option<&str>) -> AfterEnd {
         // A failed init container is retried unless the pod never restarts anything.
         (Some(_), "Once") if pod_policy == "Never" => AfterEnd::Finished,
         _ if waiting_reason == Some(CRASH_LOOP) => AfterEnd::BackOff,
-        _ => AfterEnd::Restarts,
+        // Between restarts the status can stay `terminated` for the whole back-off, without
+        // ever saying `CrashLoopBackOff`. Stopped again after a restart, it is looping.
+        (Some(_), _) if container_status.is_some_and(|c| c.restart_count > 0) => AfterEnd::BackOff,
+        _ => not_started(pod, container_status).map_or(AfterEnd::Restarts, AfterEnd::NotStarted),
     }
+}
+
+/// Why the selected container of `pod`, whose status is `container`, has not started, if it has
+/// not. A pod can stay `Pending` around a container that runs (a native sidecar, while a later
+/// init container blocks), so the container's own state comes first.
+fn not_started(pod: &Pod, container: Option<&ContainerStatus>) -> Option<ContainerWait> {
+    let state = container.and_then(|c| c.state.as_ref());
+    if let Some(reason) = state.and_then(|s| s.waiting.as_ref()?.reason.as_deref()) {
+        return Some(ContainerWait::NotStarted(plain_reason(reason)));
+    }
+    let ran = state.is_some_and(|s| s.running.is_some() || s.terminated.is_some())
+        || container
+            .and_then(|c| c.last_state.as_ref())
+            .is_some_and(|last| last.terminated.is_some());
+    let pending = pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Pending");
+    if ran || !pending {
+        return None;
+    }
+    let on_a_node = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .is_some_and(|node| !node.is_empty());
+    Some(if on_a_node {
+        ContainerWait::NotStarted(None)
+    } else {
+        ContainerWait::Unscheduled
+    })
+}
+
+/// `reason` if it is the one word a status reason should be. It is shown as it is.
+fn plain_reason(reason: &str) -> Option<String> {
+    ((1..=64).contains(&reason.len()) && reason.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| reason.to_owned())
 }
 
 /// The waiting reason of a container the kubelet restarts after a back-off.
@@ -536,6 +599,26 @@ mod tests {
             "container \"c\" in pod \"p\" is waiting to start: ContainerCreating",
         ));
         assert!(!starting.is_fatal());
+        assert!(starting.waits_for_start());
+        // Told from the whole answer: a long pod name pushes the words past the shown message.
+        let long = LogError::from_kube(api_error(
+            400,
+            &format!(
+                "container \"c\" in pod \"{}\" is waiting to start: image can't be pulled",
+                "p".repeat(253)
+            ),
+        ));
+        assert!(
+            !long.message.contains("waiting to start"),
+            "{}",
+            long.message
+        );
+        assert!(long.waits_for_start());
+        let looping = LogError::from_kube(api_error(
+            400,
+            "container \"c\" in pod \"p\" is waiting to start: CrashLoopBackOff",
+        ));
+        assert!(!looping.is_fatal() && !looping.waits_for_start());
         let missing = LogError::from_kube(api_error(400, "container x is not valid for pod p"));
         assert!(missing.is_fatal());
         assert!(missing.message.contains("not valid"), "{}", missing.message);
@@ -641,6 +724,58 @@ mod tests {
         );
     }
 
+    // covers UP-40: a pod that cannot start says why, from its status and its node.
+    #[test]
+    fn a_pod_that_has_not_started_says_why() {
+        let pending = |node: Option<&str>, statuses: serde_json::Value| {
+            let mut spec = json!({"restartPolicy": "Always", "containers": [{"name": "app"}]});
+            if let Some(node) = node {
+                spec["nodeName"] = node.into();
+            }
+            pod(
+                json!({"spec": spec, "status": {"phase": "Pending", "containerStatuses": statuses}}),
+            )
+        };
+        let in_state = |state: serde_json::Value| {
+            json!([{"name": "app", "image": "i", "imageID": "", "ready": false,
+                    "restartCount": 0, "state": state}])
+        };
+        let waiting = |reason: &str| in_state(json!({"waiting": {"reason": reason}}));
+        let not_started = |reason: Option<&str>| {
+            AfterEnd::NotStarted(ContainerWait::NotStarted(reason.map(str::to_owned)))
+        };
+        // No node yet, whether or not the scheduler has said so.
+        assert_eq!(
+            fate(Some(&pending(None, json!([]))), Some("app")),
+            AfterEnd::NotStarted(ContainerWait::Unscheduled)
+        );
+        assert_eq!(
+            fate(
+                Some(&pending(Some("n"), waiting("ImagePullBackOff"))),
+                Some("app")
+            ),
+            not_started(Some("ImagePullBackOff"))
+        );
+        assert_eq!(
+            fate(Some(&pending(Some("n"), json!([]))), Some("app")),
+            not_started(None)
+        );
+        // Shown as it is, so anything but one plain word is left out.
+        assert_eq!(
+            fate(
+                Some(&pending(Some("n"), waiting("not\nplain"))),
+                Some("app")
+            ),
+            not_started(None)
+        );
+        // A native sidecar runs while the pod is still Pending: its stream just reconnects.
+        let running = in_state(json!({"running": {"startedAt": "2024-05-01T12:00:00Z"}}));
+        assert_eq!(
+            fate(Some(&pending(Some("n"), running)), Some("app")),
+            AfterEnd::Restarts
+        );
+    }
+
     // covers UP-40: a crash-looping container is waited for as the kubelet's back-off, not as a
     // broken connection; the kubelet's "unable to retrieve" answer is told apart from a line.
     #[test]
@@ -662,9 +797,21 @@ mod tests {
             fate(Some(&waiting("CrashLoopBackOff")), None),
             AfterEnd::BackOff
         );
+        // The same loop while the status still shows the last exit; a first exit is not a loop.
+        let stopped = |restarts: i32| {
+            pod(json!({
+                "spec": {"restartPolicy": "Always", "containers": [{"name": "app"}]},
+                "status": {"phase": "Running", "containerStatuses": [
+                    {"name": "app", "image": "i", "imageID": "", "ready": false,
+                     "restartCount": restarts,
+                     "state": {"terminated": {"exitCode": 1}}}]},
+            }))
+        };
+        assert_eq!(fate(Some(&stopped(2)), Some("app")), AfterEnd::BackOff);
+        assert_eq!(fate(Some(&stopped(0)), Some("app")), AfterEnd::Restarts);
         assert_eq!(
             fate(Some(&waiting("ContainerCreating")), Some("app")),
-            AfterEnd::Restarts
+            AfterEnd::NotStarted(ContainerWait::NotStarted(Some("ContainerCreating".into())))
         );
         assert!(is_unavailable_notice(
             "unable to retrieve container logs for containerd://c54f232e5b"

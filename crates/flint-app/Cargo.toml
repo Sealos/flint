@@ -19,6 +19,8 @@ tracing.workspace = true
 flint-mcp.workspace = true
 # Detail view: the object as JSON, its events, and a redacted YAML rendering for Secrets.
 k8s-openapi.workspace = true
+# The diff a YAML review shows.
+similar.workspace = true
 # Log timestamps in the local time zone (the same jiff as k8s-openapi's, with `tz-system`).
 jiff.workspace = true
 serde_json.workspace = true

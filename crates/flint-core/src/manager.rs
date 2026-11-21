@@ -1111,6 +1111,12 @@ impl ClusterManager {
         cluster: &str,
         server: Option<Option<String>>,
     ) -> Result<(GatedClient, ContextPin), WriteRefusal> {
+        // Asked for a server, on a context a load confirmed is gone: say so, not "not connected".
+        if server.is_some() && self.cluster(cluster).is_none() && self.contexts.removed(cluster) {
+            return Err(WriteRefusal::Removed {
+                cluster: cluster.to_owned(),
+            });
+        }
         if let Some(expected) = &server
             && self
                 .cluster(cluster)
@@ -1162,9 +1168,17 @@ impl ClusterManager {
     /// The gate for a session about to run a command with the client it was given at `pin`: for
     /// the server that client talks to, in the same step as checking the context still names it.
     fn launch_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteRefusal> {
-        if self.contexts.check(Pinned::Shell, cluster, pin).is_some() {
-            return Err(WriteRefusal::Moved {
-                cluster: cluster.to_owned(),
+        if self.contexts.check(Pinned::Shell, cluster, pin).is_some()
+            || self.contexts.gate_moved(cluster, pin)
+        {
+            // Refused either way: this only picks the words.
+            let cluster = cluster.to_owned();
+            return Err(if self.contexts.removed(&cluster) {
+                WriteRefusal::Removed { cluster }
+            } else if self.contexts.on_pinned_server(&cluster, pin) {
+                WriteRefusal::Stale { cluster }
+            } else {
+                WriteRefusal::Moved { cluster }
             });
         }
         self.gate_for_server(cluster, pin.server()).map(drop)
@@ -1845,6 +1859,40 @@ mod tests {
         )
     }
 
+    // covers UP-06: a shell asked for on a context a load removed says so.
+    #[tokio::test]
+    async fn a_shell_on_a_removed_context_says_it_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://remote-a")).await;
+        let without_dev = "apiVersion: v1\nkind: Config\nclusters:\n- name: o\n  cluster:\n    \
+                           server: https://other\nusers:\n- name: u\n  user: {}\ncontexts:\n- \
+                           name: other\n  context:\n    cluster: o\n    user: u\n";
+        let pin = manager.contexts.pin_confirmed("dev");
+        rewrite(&mut manager, dir.path(), without_dev).await;
+        assert_eq!(
+            manager
+                .shell_client("dev", Some(Some("https://remote-a".into())))
+                .err(),
+            Some(WriteRefusal::Removed {
+                cluster: "dev".into()
+            })
+        );
+        assert_eq!(
+            manager.launch_gate("dev", &pin),
+            Err(WriteRefusal::Removed {
+                cluster: "dev".into()
+            }),
+            "a launch check says it is gone, not moved"
+        );
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::NotConnected {
+                cluster: "dev".into()
+            }),
+            "no tab named a server"
+        );
+    }
+
     /// A manager reading one kubeconfig file, `kubeconfig` in `dir`, loaded once.
     async fn manager_reading(dir: &Path, yaml: &str) -> ClusterManager {
         let path = dir.join("kubeconfig");
@@ -2068,7 +2116,10 @@ mod tests {
         .await;
         offline(&mut manager);
         unlocks.unlock("dev", "https://remote-a");
-        assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
+        let stale = Err(WriteRefusal::Stale {
+            cluster: "dev".into(),
+        });
+        assert_eq!(ask(&mut manager, &inbox, &check).await, stale);
 
         drop(inbox);
         assert_eq!(check().await, Err(WriteRefusal::Stopped));
@@ -2285,8 +2336,9 @@ mod tests {
     // before the session asks for its client.
     #[tokio::test]
     async fn open_logs_on_a_fallback_ends_instead_of_switching_servers() {
+        // The file is back by the time it ends: no unreadable file is left to blame.
         let error = log_error_on_a_fallback(false).await;
-        assert!(error.contains("can't be read"), "{error}");
+        assert!(error.contains("different API server"), "{error}");
     }
 
     // covers UP-06, UP-40: a log tab opened on the fallback, its request taken only once the
@@ -2295,7 +2347,7 @@ mod tests {
     #[tokio::test]
     async fn open_logs_taken_after_the_fallback_went_keeps_the_tabs_server() {
         let error = log_error_on_a_fallback(true).await;
-        assert!(error.contains("may be defined differently"), "{error}");
+        assert!(error.contains("different API server"), "{error}");
     }
 
     /// Opens logs on `dev` while its first file is half-written (a fallback to prod shows),

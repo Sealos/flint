@@ -1587,6 +1587,12 @@ impl LogView {
                         .to_owned(),
                 ),
             ),
+            LogState::Waiting { wait } => (
+                true,
+                theme.warning,
+                log_model::wait_text(wait),
+                Some(log_model::WAITING_DETAIL.to_owned()),
+            ),
             LogState::Reconnecting { error, attempt, .. } => (
                 true,
                 theme.warning,
@@ -1799,10 +1805,14 @@ impl DockItem for LogView {
         match &self.snapshot.state {
             LogState::Connecting => TabStatus::Starting,
             LogState::Streaming => TabStatus::Live,
-            LogState::Reconnecting { .. } => TabStatus::Retrying,
+            LogState::Reconnecting { .. } | LogState::Waiting { .. } => TabStatus::Retrying,
             LogState::Ended { error: Some(_), .. } => TabStatus::Failed,
             LogState::Ended { .. } => TabStatus::Ended,
         }
+    }
+
+    fn tab_status_text(&self) -> String {
+        log_model::state_text(&self.snapshot.state, !self.is_workload()).text
     }
 
     fn tab_focus(&self) -> FocusHandle {
