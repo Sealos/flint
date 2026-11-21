@@ -306,6 +306,45 @@ async fn reports_the_agent_activity_log_as_it_grows() {
     assert_eq!(*grown, [record(1), record(2)]);
 }
 
+/// One context `dev` on `server`, with `token`.
+fn dev_at(server: &str, token: &str) -> String {
+    format!(
+        "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {server}\n\
+         users:\n- name: u\n  user:\n    token: {token}\ncontexts:\n- name: dev\n  context:\n    \
+         cluster: c\n    user: u\n"
+    )
+}
+
+// covers UP-42: through real reloads, `dev`'s definition stays across an edit that keeps its
+// server (a rotated token), and changes when it moves, even back to the same server.
+#[tokio::test]
+async fn a_contexts_definition_tells_a_move_from_a_same_server_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kubeconfig");
+    std::fs::write(&file, dev_at("https://127.0.0.1:1", "one")).unwrap();
+    let core = start(dir.path(), false);
+    let events = core.events();
+    let definition = async |server: &str, token: &str| {
+        std::fs::write(&file, dev_at(server, token)).unwrap();
+        reload(&core).await;
+        let mut latest = None;
+        while !events.is_empty() {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap() {
+                latest = Some(snapshot);
+            }
+        }
+        let snapshot = latest.expect("the reload sent a list");
+        assert!(snapshot.clusters[0].confirmed);
+        snapshot.clusters[0].definition
+    };
+    let first = definition("https://127.0.0.1:1", "one").await;
+    assert_eq!(definition("https://127.0.0.1:1", "two").await, first);
+    let moved = definition("https://127.0.0.1:2", "two").await;
+    assert_ne!(moved, first);
+    let back = definition("https://127.0.0.1:1", "two").await;
+    assert_ne!(back, first, "moved and back is another definition");
+}
+
 /// Rewrites kubeconfig `times` times (a cloud CLI in a loop), with `contexts` contexts.
 async fn rewrite_kubeconfig(dir: &Path, times: usize, contexts: &[&str]) {
     for n in 0..times {
@@ -357,7 +396,8 @@ async fn events_nobody_reads_stay_bounded() {
 async fn reload(core: &CoreHandle) {
     tokio::time::timeout(Duration::from_secs(30), core.reload_kubeconfig())
         .await
-        .expect("the reload is acknowledged");
+        .expect("the reload is acknowledged")
+        .expect("the reload is applied");
 }
 
 async fn latest_generations(events: &flint_core::events::Events) -> Vec<(String, u64)> {
