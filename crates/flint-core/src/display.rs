@@ -79,11 +79,92 @@ pub fn clean_custom_name(name: &str) -> Option<String> {
         .then(|| name.to_owned())
 }
 
+/// The form in which two cluster names count as the same name. Only for comparing, never shown
+/// or saved.
+///
+/// Folds case, treats any run of [`CUSTOM_NAME_PUNCTUATION`] as one separator, folds fullwidth
+/// Latin letters and digits, and maps common Cyrillic and Greek look-alike letters to Latin. Other
+/// non-Latin letters stay as they are, so names in those scripts remain distinct.
+///
+/// Case is folded before the look-alike map, so each letter has one Latin form in both cases.
+/// That form follows the capital where the two cases resemble different Latin letters: Greek
+/// nu is `n`, eta is `h` and upsilon is `y`.
+pub fn cluster_name_key(name: &str) -> String {
+    let mut key = String::with_capacity(name.len());
+    let mut in_separator = false;
+    for c in name.chars() {
+        if CUSTOM_NAME_PUNCTUATION.contains(c) {
+            if !in_separator {
+                key.push('-');
+            }
+            in_separator = true;
+            continue;
+        }
+        in_separator = false;
+        // One character at a time: `str::to_lowercase` gives a word-final sigma its own form.
+        key.extend(without_width(c).to_lowercase().map(latin_look_alike));
+    }
+    key
+}
+
+/// The [`cluster_name_key`] of a name read back from settings, as it would be shown: cleaned by
+/// [`clean_custom_name`]. `None` for a saved name that is never shown.
+pub fn saved_name_key(saved: &str) -> Option<String> {
+    clean_custom_name(saved).map(|name| cluster_name_key(&name))
+}
+
+/// `c` with a fullwidth Latin letter or digit made ASCII, and Turkish dotted capital I made a
+/// plain `I`, whose lowercase would otherwise carry a combining dot.
+fn without_width(c: char) -> char {
+    match c {
+        '\u{ff10}'..='\u{ff19}' | '\u{ff21}'..='\u{ff3a}' | '\u{ff41}'..='\u{ff5a}' => {
+            char::from_u32(c as u32 - 0xfee0).unwrap_or(c)
+        }
+        '\u{130}' => 'I',
+        c => c,
+    }
+}
+
+/// The Latin letter a lowercase Cyrillic or Greek letter reads as, else `c`. Written as escapes
+/// because the letters would be indistinguishable here.
+fn latin_look_alike(c: char) -> char {
+    match c {
+        '\u{430}' | '\u{3b1}' => 'a',
+        '\u{432}' | '\u{3b2}' => 'b',
+        '\u{441}' | '\u{3f2}' => 'c',
+        '\u{501}' => 'd',
+        '\u{435}' | '\u{3b5}' => 'e',
+        '\u{43d}' | '\u{4bb}' | '\u{3b7}' => 'h',
+        '\u{456}' | '\u{3b9}' | '\u{131}' => 'i',
+        // Palochka, in both cases, reads as a lowercase L.
+        '\u{4cf}' => 'l',
+        '\u{458}' | '\u{3f3}' => 'j',
+        // Greek kappa as a literal: the spell check reads its escape as a misspelled word.
+        '\u{43a}' | 'κ' => 'k',
+        '\u{43c}' | '\u{3bc}' | '\u{b5}' => 'm',
+        '\u{3bd}' => 'n',
+        '\u{43e}' | '\u{3bf}' => 'o',
+        '\u{440}' | '\u{3c1}' => 'p',
+        '\u{51b}' => 'q',
+        '\u{455}' | '\u{17f}' => 's',
+        '\u{442}' | '\u{3c4}' => 't',
+        '\u{51d}' => 'w',
+        '\u{445}' | '\u{3c7}' => 'x',
+        '\u{443}' | '\u{4af}' | '\u{3c5}' => 'y',
+        '\u{3b6}' => 'z',
+        // Final sigma is the same letter as sigma.
+        '\u{3c2}' => '\u{3c3}',
+        c => c,
+    }
+}
+
 /// What each context is called on screen: its custom name, else [`short_name`]. Only for
 /// display: MCP, `FLINT_CLUSTER`, exposure and trust go by the context name.
 ///
-/// A custom name must not pass for another cluster, so one that reads like another context's
-/// name or short name, or like another custom name (ignoring case), is not used.
+/// A custom name must not pass for another cluster, so one with the same [`cluster_name_key`] as
+/// another context's name or short name, or as another custom name, is not used. Saved names
+/// that collide stay in the settings file unchanged; each of those clusters shows its real short
+/// name instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClusterNames {
     custom: HashMap<String, String>,
@@ -96,18 +177,19 @@ impl ClusterNames {
         names: &BTreeMap<String, String>,
     ) -> Self {
         let contexts: Vec<&str> = contexts.into_iter().collect();
-        let fold = |text: &str| text.to_lowercase();
         let wanted: Vec<(&str, String)> = contexts
             .iter()
             .filter_map(|&c| Some((c, clean_custom_name(names.get(c)?)?)))
             .collect();
         let reads_like_another = |context: &str, name: &str| {
-            let name = fold(name);
+            let name = cluster_name_key(name);
             contexts.iter().any(|&other| {
-                other != context && (fold(other) == name || fold(&short_name(other)) == name)
+                other != context
+                    && (cluster_name_key(other) == name
+                        || cluster_name_key(&short_name(other)) == name)
             }) || wanted
                 .iter()
-                .any(|(other, custom)| *other != context && fold(custom) == name)
+                .any(|(other, custom)| *other != context && cluster_name_key(custom) == name)
         };
         let custom = wanted
             .iter()
@@ -248,6 +330,93 @@ mod tests {
         // Its own name is fine, and a context not in kubeconfig reserves nothing.
         let shown = ClusterNames::new(["a"], &names(&[("a", "A"), ("gone", "b")]));
         assert_eq!(shown.of("a"), "A");
+    }
+
+    // covers UP-01
+    #[test]
+    fn the_name_key_treats_separators_as_one() {
+        let key = cluster_name_key("prod-eu");
+        for same in [
+            "prod_eu",
+            "PROD EU",
+            "prod.eu",
+            "prod:/eu",
+            "prod -_ eu",
+            "prod·eu",
+        ] {
+            assert_eq!(cluster_name_key(same), key, "{same}");
+        }
+        assert_ne!(cluster_name_key("prodeu"), key, "a separator still counts");
+        assert_ne!(cluster_name_key("prod-e-u"), key);
+    }
+
+    // covers UP-01
+    #[test]
+    fn the_name_key_maps_look_alike_letters_in_both_cases() {
+        // Cyrillic letters, mixed with Latin or alone, lower and upper.
+        assert_eq!(cluster_name_key("pr\u{43e}d"), cluster_name_key("prod"));
+        assert_eq!(cluster_name_key("PR\u{41e}D"), cluster_name_key("prod"));
+        assert_eq!(
+            cluster_name_key("\u{440}\u{430}\u{441}\u{435}"),
+            cluster_name_key("pace")
+        );
+        // Greek omicron and capital alpha, kappa, tau.
+        assert_eq!(cluster_name_key("pr\u{3bf}d"), cluster_name_key("prod"));
+        assert_eq!(
+            cluster_name_key("\u{391}\u{39a}\u{3a4}"),
+            cluster_name_key("akt")
+        );
+        // Fullwidth letters and digits, in both cases.
+        assert_eq!(
+            cluster_name_key("\u{ff50}\u{ff32}\u{ff4f}\u{ff24}\u{ff11}"),
+            cluster_name_key("prod1")
+        );
+        // Case folds inside a script, including a word-final sigma.
+        assert_eq!(
+            cluster_name_key("\u{3a3}\u{391}\u{3a3}"),
+            cluster_name_key("\u{3c3}\u{3b1}\u{3c2}")
+        );
+        assert_eq!(cluster_name_key("\u{130}D"), cluster_name_key("id"));
+        // Palochka, in both cases, reads as a lowercase L.
+        for palochka in ["c\u{4cf}uster", "c\u{4c0}uster"] {
+            assert_eq!(cluster_name_key(palochka), cluster_name_key("cluster"));
+        }
+    }
+
+    // covers UP-01: only look-alike letters fold, so other scripts stay usable and distinct.
+    #[test]
+    fn non_latin_names_stay_allowed_and_distinct() {
+        for name in ["продакшн", "δοκιμή", "本番", "프로덕션"] {
+            let shown = ClusterNames::new(["a", "b"], &names(&[("a", name)]));
+            assert_eq!(shown.custom("a"), Some(name));
+        }
+        let shown = ClusterNames::new(["a", "b"], &names(&[("a", "север"), ("b", "запад")]));
+        assert_eq!(shown.of("a"), "север");
+        assert_eq!(shown.of("b"), "запад");
+        let shown = ClusterNames::new(["a", "b"], &names(&[("a", "本番"), ("b", "開発")]));
+        assert_eq!(shown.of("a"), "本番");
+        assert_eq!(shown.of("b"), "開発");
+    }
+
+    // covers UP-01: colliding names, as an older settings file may hold them.
+    #[test]
+    fn colliding_names_fall_back_to_the_real_names() {
+        for (one, two) in [
+            ("prod-eu", "prod_eu"),
+            ("prod", "pr\u{43e}d"),
+            ("prod", "\u{ff50}\u{ff52}\u{ff4f}\u{ff44}"),
+        ] {
+            let shown = ClusterNames::new(["a", "b"], &names(&[("a", one), ("b", two)]));
+            assert_eq!((shown.of("a").as_str(), shown.of("b").as_str()), ("a", "b"));
+        }
+        // Nor may a name pass for another context through a separator or look-alike.
+        for name in ["kind_prod", "kind pr\u{43e}d"] {
+            let shown = ClusterNames::new(["dev", "kind-prod"], &names(&[("dev", name)]));
+            assert_eq!(shown.custom("dev"), None, "{name}");
+        }
+        // A context's own name, in another form, is fine.
+        let shown = ClusterNames::new(["kind-dev"], &names(&[("kind-dev", "KIND_DEV")]));
+        assert_eq!(shown.of("kind-dev"), "KIND_DEV");
     }
 
     // covers UP-01

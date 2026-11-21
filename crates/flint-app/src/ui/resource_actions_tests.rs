@@ -335,11 +335,11 @@ impl LocalApi {
         }
     }
 
-    fn patches(&self) -> usize {
+    pub(super) fn patches(&self) -> usize {
         self.control.patches.load(Ordering::SeqCst)
     }
 
-    fn hold(&self, held: bool) {
+    pub(super) fn hold(&self, held: bool) {
         self.control.hold.store(held, Ordering::SeqCst);
     }
 }
@@ -647,7 +647,7 @@ fn writes(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(ResourceAction, Re
 }
 
 /// The workspace connected for real to `api`, its discovery in.
-async fn connected(
+pub(super) async fn connected(
     cx: &mut TestAppContext,
     dir: &std::path::Path,
     api: &LocalApi,
