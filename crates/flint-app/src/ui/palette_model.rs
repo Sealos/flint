@@ -372,19 +372,41 @@ pub struct Candidate {
     pub alt: Option<String>,
     /// Its place among the recently run actions, 0 for the latest; `None` if it is not one.
     pub recent: Option<usize>,
-    /// Ranks after every other match, however recent, unless the query is a [`clear_match`] for
-    /// it: Quit and Close Window, so Enter on the best row ends the app only when asked (#407).
+    /// Ranks after every other match, however recent, unless the query starts its name: Quit
+    /// and Close Window, so Enter on the best row ends the app only when asked (#407).
     pub last: bool,
+}
+
+/// How clearly `query` names `label`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Clarity {
+    /// A long enough prefix of the whole label ("quit flint").
+    Name,
+    /// A long enough prefix of a later word ("flint"), which other actions can share.
+    Word,
+    /// Short or scattered.
+    Unclear,
+}
+
+fn clarity(query: &str, label: &str) -> Clarity {
+    let spaced = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let query = spaced(query).to_lowercase();
+    let label = spaced(label).to_lowercase();
+    if query.chars().count() < CLEAR_MATCH_CHARS {
+        Clarity::Unclear
+    } else if label.starts_with(&query) {
+        Clarity::Name
+    } else if label.split(' ').any(|word| word.starts_with(&query)) {
+        Clarity::Word
+    } else {
+        Clarity::Unclear
+    }
 }
 
 /// Whether `query` deliberately names `label`: at least [`CLEAR_MATCH_CHARS`] characters, and a
 /// prefix of the label or of a word in it, ignoring case and repeated spaces.
 pub fn clear_match(query: &str, label: &str) -> bool {
-    let spaced = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let query = spaced(query).to_lowercase();
-    let label = spaced(label).to_lowercase();
-    query.chars().count() >= CLEAR_MATCH_CHARS
-        && (label.starts_with(&query) || label.split(' ').any(|word| word.starts_with(&query)))
+    clarity(query, label) != Clarity::Unclear
 }
 
 /// The shortest query that can be a [`clear_match`].
@@ -400,8 +422,8 @@ pub struct Hit {
 /// The candidates matching `query`, best first. With no query: the recent ones (latest first),
 /// then the rest in their own order. With one: by score, so a closer match always wins; among
 /// equal scores the recent ones first (latest first), then in their own order. Either way, the
-/// ones marked [`Candidate::last`] come after all the others, unless the query is a
-/// [`clear_match`] for them; even then they lose a tie.
+/// ones marked [`Candidate::last`] come after all the others, unless the query starts their
+/// name; even then they lose a tie.
 pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
     if query.trim().is_empty() {
         let mut hits: Vec<(usize, &Candidate)> = candidates.iter().enumerate().collect();
@@ -415,7 +437,7 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             .collect();
     }
     let mut matcher = Matcher::new(query);
-    let mut scored: Vec<(bool, std::cmp::Reverse<i32>, bool, usize, Hit)> = candidates
+    let mut scored: Vec<(Clarity, std::cmp::Reverse<i32>, bool, usize, Hit)> = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
@@ -427,7 +449,11 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
                 }
             };
             Some((
-                c.last && !clear_match(query, &c.label),
+                if c.last {
+                    clarity(query, &c.label)
+                } else {
+                    Clarity::Name
+                },
                 std::cmp::Reverse(points),
                 c.last,
                 c.recent.unwrap_or(usize::MAX),
@@ -435,8 +461,8 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             ))
         })
         .collect();
-    scored.sort_by_key(|(held, points, last, recent, hit)| {
-        (*held, *points, *last, *recent, hit.index)
+    scored.sort_by_key(|(clarity, points, last, recent, hit)| {
+        (*clarity, *points, *last, *recent, hit.index)
     });
     scored.into_iter().map(|(.., hit)| hit).collect()
 }
@@ -621,9 +647,17 @@ mod tests {
         assert_eq!(labels("qu", &c), ["Query Logs", "Quit Flint"]);
         assert_eq!(labels("quit", &c), ["Quit Flint"]);
 
-        let mut tied = candidates(&["Quit Tool", "Hide Tool"]);
+        // Starting its name, it competes but loses a tie.
+        let mut tied = candidates(&["Close Alpha", "Close Bravo"]);
         tied[0].last = true;
-        assert_eq!(labels("tool", &tied), ["Hide Tool", "Quit Tool"]);
+        assert_eq!(labels("close", &tied), ["Close Bravo", "Close Alpha"]);
+
+        // Only a later word: every other match comes first, even a lower-scoring one. Alone, it
+        // is still the best row.
+        let mut word = candidates(&["Quit Tool", "About Tool"]);
+        word[0].last = true;
+        assert_eq!(labels("tool", &word), ["About Tool", "Quit Tool"]);
+        assert_eq!(labels("tool", &word[..1]), ["Quit Tool"]);
     }
 
     #[test]

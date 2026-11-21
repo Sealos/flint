@@ -629,7 +629,8 @@ async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
     assert_eq!(last_two, ["Close Window", "Quit Flint"], "{all:?}");
     t.press(cx, "escape");
 
-    // Short or scattered: not selected. "flint" names a word of Quit Flint, but ties with others.
+    // Short or scattered: not selected. "flint" is only a later word of Quit Flint, so About
+    // Flint comes first.
     for query in ["q", "qt", "qu", "flint"] {
         let palette = showing(cx, &t, query).await;
         let first = preselected(&palette);
