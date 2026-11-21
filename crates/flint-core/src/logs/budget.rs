@@ -226,8 +226,8 @@ impl LogBudget {
     /// Runs `detach` under the budget's lock if session `id`'s tab is still hidden and `plan`
     /// still stands, and counts the bytes it returns as gone in the same step, so a plan made
     /// right after does not ask another tab for them. `detach` sets the new cutoff it is handed
-    /// ([`LogBudget::trim_cutoff`]). It must take constant time: the UI thread can wait on this
-    /// lock.
+    /// ([`crate::LogSession::trim_cutoff`]). It must take constant time: the UI thread can wait
+    /// on this lock.
     pub(crate) fn while_planned<T>(
         &self,
         id: u64,
