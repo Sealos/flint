@@ -967,6 +967,8 @@ impl FlintMcp {
                 .collect();
         });
         let changed = policy::changed_exposures(&ctx.settings, &ctx.kubeconfig);
+        let missing = policy::missing_exposures(&ctx.settings, &ctx.kubeconfig);
+        let kubeconfig_paths = ctx.kubeconfig.paths.clone();
         let settings = ctx.settings.clone();
         let kubeconfig_errors: Vec<Value> = ctx
             .kubeconfig
@@ -1015,7 +1017,9 @@ impl FlintMcp {
             rows.push(row);
         }
         let mut out = json!({ "clusters": rows });
-        if let Some(hint) = policy::list_clusters_hint(exposed.len(), changed) {
+        if let Some(hint) =
+            policy::list_clusters_hint(exposed.len(), changed, missing, &kubeconfig_paths)
+        {
             out["hint"] = json!(hint);
         }
         if !kubeconfig_errors.is_empty() {
