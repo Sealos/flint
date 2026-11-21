@@ -32,18 +32,33 @@ impl Refused {
     /// Why `method` on `path`, which [`allows`] refused, was not sent. This only picks the
     /// message: the request is refused either way.
     fn of(method: &Method, path: &str) -> Self {
-        let without_semicolons = path
-            .replace(';', "_")
-            .replace("%3B", "_")
-            .replace("%3b", "_");
-        if without_semicolons != path && allows(method, &without_semicolons) {
-            Self::SemicolonInName
-        } else {
-            Self::Request {
-                method: method.clone(),
+        let holds = |text: &str| text.contains(';') || text.to_ascii_lowercase().contains("%3b");
+        match path.rsplit_once('/') {
+            Some((parent, name))
+                if holds(name)
+                    && !holds(parent)
+                    && ends_in_object_name(path)
+                    && allows(method, &format!("{parent}/_")) =>
+            {
+                Self::SemicolonInName
             }
+            _ => Self::Request {
+                method: method.clone(),
+            },
         }
     }
+}
+
+/// Whether the last segment of an API path is an object's name, not a group, version or resource.
+fn ends_in_object_name(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let resource = match segments.first() {
+        Some(&"api") => 2,
+        Some(&"apis") => 3,
+        _ => return false,
+    };
+    segments.len() == resource + 2
+        || (segments.len() == resource + 4 && segments[resource] == "namespaces")
 }
 
 fn check(request: Request<Body>) -> Result<Request<Body>, BoxError> {
@@ -280,6 +295,8 @@ mod tests {
             format!("{pod}/exec;x"),
             format!("{pod};x/proxy/admin"),
             format!("{roles}/name;x/exec"),
+            "/apis/example;group/v1".to_owned(),
+            "/api/v1/namespaces/demo/po;ds".to_owned(),
         ] {
             assert!(!allows(&Method::GET, &path), "{path}");
             assert_eq!(
