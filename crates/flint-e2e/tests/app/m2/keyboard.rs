@@ -249,9 +249,17 @@ fn up_31_jump_to_a_resource() -> Result<()> {
     assert!(sent.is_empty(), "the search sent requests: {sent:?}");
 
     // Enter on an object from another list switches to its list, with it selected and its
-    // details shown. Watching every kind keeps the pods in memory while Services is open.
+    // details shown. Pods is loaded before every kind is watched, so its watch is settled and
+    // answers the switcher's read while the other kinds start, and stays once Services opens.
+    app.open_view("pods")?;
+    app.wait_for("/list/kind", Equals("pods".into()))?;
+    app.wait_for("/list/sync", Equals("live".into()))?;
+    app.wait_for("/list/total", Equals(total.into()))?;
     app.dispatch("workspace::WatchAllKinds", Value::Null)?;
-    wait_for_watches(fake, &["pods"])?;
+    wait_for_watches(fake, &["deployments"])?;
+    app.open_view("services")?;
+    app.wait_for("/list/kind", Equals("services".into()))?;
+    app.wait_for("/list/sync", Equals("live".into()))?;
     app.press_key("secondary-p")?;
     app.wait_for("/palette/mode", Equals("resources".into()))?;
     app.type_text("crash-loop")?;
