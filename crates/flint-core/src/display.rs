@@ -83,7 +83,7 @@ pub fn clean_custom_name(name: &str) -> Option<String> {
 /// or saved.
 ///
 /// Folds case, treats any run of [`CUSTOM_NAME_PUNCTUATION`] as one separator, folds fullwidth
-/// Latin letters and digits, and maps common Cyrillic and Greek look-alikes to Latin. Other
+/// Latin letters and digits, and maps common Cyrillic and Greek look-alike letters to Latin. Other
 /// non-Latin letters stay as they are, so names in those scripts remain distinct.
 ///
 /// Case is folded before the look-alike map, so each letter has one Latin form in both cases.
@@ -139,7 +139,8 @@ fn latin_look_alike(c: char) -> char {
         // Palochka, in both cases, reads as a lowercase L.
         '\u{4cf}' => 'l',
         '\u{458}' | '\u{3f3}' => 'j',
-        '\u{43a}' | '\u{3ba}' => 'k',
+        // Greek kappa as a literal: the spell check reads its escape as a misspelled word.
+        '\u{43a}' | 'κ' => 'k',
         '\u{43c}' | '\u{3bc}' | '\u{b5}' => 'm',
         '\u{3bd}' => 'n',
         '\u{43e}' | '\u{3bf}' => 'o',
@@ -351,7 +352,7 @@ mod tests {
 
     // covers UP-01
     #[test]
-    fn the_name_key_maps_look_alikes_in_both_cases() {
+    fn the_name_key_maps_look_alike_letters_in_both_cases() {
         // Cyrillic letters, mixed with Latin or alone, lower and upper.
         assert_eq!(cluster_name_key("pr\u{43e}d"), cluster_name_key("prod"));
         assert_eq!(cluster_name_key("PR\u{41e}D"), cluster_name_key("prod"));
@@ -382,7 +383,7 @@ mod tests {
         }
     }
 
-    // covers UP-01: only look-alikes fold, so names in other scripts stay usable and distinct.
+    // covers UP-01: only look-alike letters fold, so other scripts stay usable and distinct.
     #[test]
     fn non_latin_names_stay_allowed_and_distinct() {
         for name in ["продакшн", "δοκιμή", "本番", "프로덕션"] {

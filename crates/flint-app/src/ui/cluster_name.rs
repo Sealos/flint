@@ -169,7 +169,7 @@ mod tests {
         assert!(problem(&names, &contexts, "dev", &"x".repeat(33)).is_some());
     }
 
-    // covers UP-01: separators and look-alikes count as the same name.
+    // covers UP-01: separators and look-alike letters count as the same name.
     #[test]
     fn a_look_alike_name_is_refused_but_its_own_name_is_kept() {
         let contexts = ["a", "b", "c"];

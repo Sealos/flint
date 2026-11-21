@@ -1773,7 +1773,7 @@ mod tests {
         assert!(!text.contains("cluster_names"), "{text}");
     }
 
-    // covers UP-01: separators and look-alikes collide when a name is set.
+    // covers UP-01: separators and look-alike letters collide when a name is set.
     #[test]
     fn a_look_alike_cluster_name_is_refused_when_set() {
         let dir = tempfile::tempdir().unwrap();
