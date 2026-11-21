@@ -167,6 +167,12 @@ pub fn safe_server_error(text: &str) -> String {
     safe_error_summary(&hide_bearer_values(&redact_credentials(text).text))
 }
 
+/// An API server's error text, whole, with credentials, bearer values and quoted values hidden.
+/// For a caller that applies its own length limit afterwards.
+pub fn hide_server_values(text: &str) -> String {
+    redact_quoted(&hide_bearer_values(&redact_credentials(text).text))
+}
+
 /// Stands for a value hidden after `Bearer`.
 const BEARER_MARKER: &str = "[REDACTED:bearer]";
 
