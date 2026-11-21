@@ -29,7 +29,9 @@ use flint_core::redact::first_line;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
 
-use super::detail::{Opening, ShellPod, Subject, log_item, reason, refused, shell_item};
+use super::detail::{
+    Opening, ShellPod, Subject, fit_container_names, log_item, reason, refused, shell_item,
+};
 use super::object::PodContainer;
 use super::registry::{
     self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell, UnlockCluster,
@@ -41,8 +43,19 @@ use super::workspace::Workspace;
 /// Builds a row's context menu (gpui-component's `context_menu` builder).
 pub type RowMenu = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
 
-/// The longest reason an action gives that a menu line shows; the rest is cut.
-const MAX_REASON: usize = 80;
+/// The longest reason an action gives that the menu shows; the rest is cut. Long enough for a
+/// long context name and all that is said about it: reasons wrap ([`say`]).
+const MAX_REASON: usize = 200;
+
+/// How wide a reason is before it wraps: inside the menu's default 31.25 rem, at Flint's 15 px
+/// rem, less its padding.
+const REASON_WIDTH: Pixels = px(440.);
+
+/// The element holding a note's text ([`say`]), inside its menu item.
+pub(in crate::ui) const MENU_NOTE: &str = "row-menu-note";
+
+/// The most of a pod's name the Shell entry shows, with its key, inside the menu's width.
+const SHELL_POD_NAME: usize = 28;
 
 /// Whether rows of `kind` get the menu: pods and workloads.
 pub fn has_row_actions(kind: &KindId) -> bool {
@@ -176,7 +189,7 @@ fn fill(
     };
     let mut menu = menu;
     if let Some(why) = &a.blocked {
-        menu = menu.label(why.clone()).separator();
+        menu = say(menu, why).separator();
     }
     // The cluster's reason is said once, above.
     let says_why = a.blocked.is_none();
@@ -219,25 +232,20 @@ fn fill(
             )
         };
     }
-    let label = match (&a.shell_pod, a.subject) {
-        (Some(shell), Subject::Workload(_)) => format!("Shell in {}", shell.pod),
-        _ => "Shell".to_owned(),
-    };
+    let label = shell_entry_label(&a);
     let menu = match a.shell_pod {
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
-            menu.submenu(label, window, cx, move |sub, _, _| {
-                shell
-                    .containers
-                    .iter()
-                    .fold(sub.label("Container"), |sub, name| {
-                        let running = !shell.not_running.contains(name);
-                        let (item, action) = shell_item(name, *name == shell.default, running);
-                        sub.item(item.on_click(registry::on_click_or(
-                            Box::new(action),
-                            refuse_in(&workspace),
-                        )))
-                    })
+            menu.submenu(label, window, cx, move |sub, window, _| {
+                let sub = fit_container_names(sub, window).label("Container");
+                shell.containers.iter().fold(sub, |sub, name| {
+                    let running = !shell.not_running.contains(name);
+                    let (item, action) = shell_item(name, *name == shell.default, running);
+                    sub.item(item.on_click(registry::on_click_or(
+                        Box::new(action),
+                        refuse_in(&workspace),
+                    )))
+                })
             })
         }
         _ => entry(menu, label.into(), Box::new(OpenShell), &a.shell, says_why),
@@ -248,6 +256,36 @@ fn fill(
                 .on_click(registry::on_click(UnlockCluster { cluster })),
         ),
         None => menu,
+    }
+}
+
+/// Adds `text` to the menu as a note that wraps: a menu's labels neither wrap nor shrink, and a
+/// reason must stay whole to say why.
+fn say(menu: PopupMenu, text: &str) -> PopupMenu {
+    let text = SharedString::from(text.to_owned());
+    menu.item(
+        PopupMenuItem::element(move |_, _| {
+            // A custom item has no accessible name of its own: it takes it from this label's value.
+            div()
+                .id(MENU_NOTE)
+                .test_support()
+                .role(Role::Label)
+                .aria_value(text.clone())
+                .max_w(REASON_WIDTH)
+                .child(text.clone())
+        })
+        .disabled(true),
+    )
+}
+
+/// The Shell entry: a workload's names the pod it opens in.
+fn shell_entry_label(a: &RowActions) -> String {
+    match (&a.shell_pod, a.subject) {
+        (Some(shell), Subject::Workload(_)) => {
+            let pod = flint_core::display::middle_truncate(&shell.pod, SHELL_POD_NAME);
+            format!("Shell in {pod}")
+        }
+        _ => "Shell".to_owned(),
     }
 }
 
@@ -268,8 +306,9 @@ fn log_picker(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let workspace = workspace.clone();
-    menu.submenu(label, window, cx, move |sub, _, _| {
-        containers.iter().fold(sub.label("Container"), |sub, c| {
+    menu.submenu(label, window, cx, move |sub, window, _| {
+        let sub = fit_container_names(sub, window).label("Container");
+        containers.iter().fold(sub, |sub, c| {
             let (item, action) = log_item(c, previous);
             sub.item(item.on_click(registry::on_click_or(
                 Box::new(action),
@@ -295,7 +334,7 @@ fn entry(
             .on_click(registry::on_click_or(action, refuse_in(workspace))),
     );
     match can {
-        Err(why) if says_why => menu.label(why.clone()),
+        Err(why) if says_why => say(menu, why),
         _ => menu,
     }
 }
@@ -403,10 +442,7 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             },
         );
     }
-    let label = match (&a.shell_pod, a.subject) {
-        (Some(shell), Subject::Workload(_)) => format!("Shell in {}", shell.pod),
-        _ => "Shell".to_owned(),
-    };
+    let label = shell_entry_label(a);
     entries.push(match &a.shell_pod {
         Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
             label,
@@ -442,7 +478,9 @@ pub(in crate::ui) mod tests {
     use flint_core::WorkloadKind;
     use serde_json::json;
 
-    use super::{RowActions, menu_state};
+    use flint_core::redact::first_line;
+
+    use super::{MAX_REASON, RowActions, SHELL_POD_NAME, menu_state, shell_entry_label};
     use crate::ui::detail::{ShellPod, Subject};
     use crate::ui::object::PodContainer;
 
@@ -558,5 +596,44 @@ pub(in crate::ui) mod tests {
                 json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
             ]
         );
+    }
+
+    // Menu labels neither wrap nor shrink, so a long one is drawn past the menu's edge (#338).
+    // Pickers show names in full, so containers that differ in the middle stay apart; a reason
+    // stays whole, so it still says why; only the one pod in "Shell in" is cut.
+    #[test]
+    fn long_names_stay_readable_in_a_row_menu() {
+        let http = "mesh-production-app-http-instrumentation-proxy";
+        let grpc = "mesh-production-app-grpc-instrumentation-proxy";
+        let picker = RowActions {
+            log_containers: vec![container(http, true, false), container(grpc, false, false)],
+            ..pod_actions()
+        };
+        let (_, entries) = menu_state(&picker);
+        let labels: Vec<&str> = entries[0]
+            .submenu
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(labels, [format!("{http} (default)").as_str(), grpc]);
+
+        let cluster =
+            "arn:aws:eks:eu-north-1:123456789012:cluster/production-platform-services-primary";
+        let why = format!("{cluster} is protected (read-only in Flint) until you unlock it");
+        assert_eq!(first_line(&why, MAX_REASON), why, "it still says why");
+
+        let workload = RowActions {
+            subject: Subject::Workload(WorkloadKind::Deployment),
+            shell_pod: Some(ShellPod {
+                pod: "web-platform-services-canary-release-".repeat(6),
+                containers: vec!["app".into()],
+                default: "app".into(),
+                not_running: Vec::new(),
+            }),
+            ..pod_actions()
+        };
+        let label = shell_entry_label(&workload);
+        assert!(label.starts_with("Shell in web-platform"), "{label}");
+        assert_eq!(label.chars().count(), "Shell in ".len() + SHELL_POD_NAME);
     }
 }

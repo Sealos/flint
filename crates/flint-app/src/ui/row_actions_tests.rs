@@ -359,11 +359,20 @@ pub(super) async fn right_click(cx: &mut TestAppContext, t: &TestWorkspace, name
 pub(super) fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
     draw(cx, t);
     cx.update_window(t.window, |_, window, _| {
-        let menu = window.within("popup-menu");
-        (0usize..)
-            .map_while(|ix| menu.try_find(ix))
-            .map(|item| item.label().unwrap_or_default().to_owned())
-            .collect()
+        let mut menu = window.within("popup-menu");
+        let mut rows = Vec::new();
+        for ix in 0usize.. {
+            let Some(item) = menu.try_find(ix) else {
+                break;
+            };
+            // A note that wraps carries its text as the value of the label inside the item.
+            let label = item.label().map(str::to_owned).or_else(|| {
+                let note = menu.within(ix).try_find(crate::ui::row_menu::MENU_NOTE)?;
+                note.value().map(str::to_owned)
+            });
+            rows.push(label.unwrap_or_default());
+        }
+        rows
     })
     .unwrap()
 }

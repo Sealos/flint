@@ -13,7 +13,7 @@ use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, WorkloadKind};
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
@@ -590,7 +590,7 @@ impl DetailView {
                         containers.iter().find(|c| c.default).map(|c| &c.name[..]),
                         &keys,
                     ))
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                         menu_record::record(cx, "detail-logs", || {
                             let label =
                                 |c: &PodContainer| container_label(&c.name, c.init, c.default);
@@ -600,7 +600,7 @@ impl DetailView {
                                 .map(|c| menu_record::Entry::new(label(c), true))
                                 .collect()
                         });
-                        let mut menu = menu.label("Container");
+                        let mut menu = fit_container_names(menu, window).label("Container");
                         for c in &containers {
                             let (item, action) = log_item(c, false);
                             menu = menu.item(item.on_click(registry::on_click(action)));
@@ -723,7 +723,7 @@ impl DetailView {
                         _ => hint,
                     }
                 })
-                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                     menu_record::record(cx, "detail-shell", || {
                         containers
                             .iter()
@@ -736,7 +736,7 @@ impl DetailView {
                             })
                             .collect()
                     });
-                    let mut menu = menu.label("Container");
+                    let mut menu = fit_container_names(menu, window).label("Container");
                     for name in &containers {
                         let running = !not_running.contains(name);
                         let (item, action) = shell_item(name, *name == default, running);
@@ -1328,6 +1328,15 @@ fn key_value(
         )
         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
         .into_any_element()
+}
+
+/// A container picker, wide enough for its entries in full: names that differ only in the
+/// middle must stay apart, and menu items neither wrap nor shrink. A container's name is at most
+/// 63 characters; the picker never grows past the window.
+pub(in crate::ui) fn fit_container_names(menu: PopupMenu, window: &Window) -> PopupMenu {
+    const WIDEST: Pixels = px(1000.);
+    let room = window.viewport_size().width - px(16.);
+    menu.max_w(if room < WIDEST { room } else { WIDEST })
 }
 
 /// "5m" for an RFC 3339 timestamp five minutes ago.
