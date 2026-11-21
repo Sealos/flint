@@ -192,7 +192,7 @@ pub struct ClusterState {
     /// `disconnected`, `connecting`, `connected` or `failed`.
     pub connection: &'static str,
     /// What its dot shows: `not_connected`, `connecting`, `live` (connected and watched),
-    /// `idle` (connected, watches stopped) or `failed`.
+    /// `reconnecting`, `idle` (connected, watches stopped) or `failed`.
     pub presence: &'static str,
     /// Why the connection failed (a sanitized summary).
     pub error: Option<String>,

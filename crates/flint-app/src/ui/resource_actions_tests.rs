@@ -2,9 +2,9 @@
 //! cluster, the scale and drain dialogs, and a whole write against a small local API server
 //! whose first write answers with a conflict.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -278,6 +278,7 @@ async fn a_refused_review_says_why(cx: &mut TestAppContext) {
 /// How the local API server answers.
 #[derive(Default)]
 struct Control {
+    watches: Mutex<WatchConnections>,
     /// PATCH requests received.
     patches: AtomicUsize,
     /// The status of the next PATCH requests; 200 once empty.
@@ -290,14 +291,20 @@ struct Control {
     pods_down: AtomicBool,
 }
 
+#[derive(Default)]
+struct WatchConnections {
+    down: bool,
+    streams: HashMap<SocketAddr, TcpStream>,
+}
+
 /// A small local API server: a Deployment `web` with 2 replicas and a Node `node-1`.
-struct LocalApi {
-    url: String,
+pub(in crate::ui::workspace) struct LocalApi {
+    pub(in crate::ui::workspace) url: String,
     control: Arc<Control>,
 }
 
 impl LocalApi {
-    fn start(statuses: &[u16]) -> Self {
+    pub(in crate::ui::workspace) fn start(statuses: &[u16]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let control = Arc::new(Control {
@@ -312,6 +319,20 @@ impl LocalApi {
             }
         });
         LocalApi { url, control }
+    }
+
+    pub(in crate::ui::workspace) fn open_watches(&self) -> usize {
+        self.control.watches.lock().unwrap().streams.len()
+    }
+
+    pub(in crate::ui::workspace) fn set_watches_down(&self, down: bool) {
+        let mut watches = self.control.watches.lock().unwrap();
+        watches.down = down;
+        if down {
+            for stream in watches.streams.values() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
     }
 
     fn patches(&self) -> usize {
@@ -364,8 +385,7 @@ fn serve(stream: TcpStream, control: &Control) {
         let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if query.contains("watch=true") || query.contains("watch=1") {
-            // A watch with nothing to say: held open until the client goes.
-            let _ = reader.read_to_end(&mut Vec::new());
+            serve_watch(&mut stream, reader, query, control);
             return;
         }
         let (status, answer) = answer(method, path, query, control);
@@ -379,6 +399,33 @@ fn serve(stream: TcpStream, control: &Control) {
             return;
         }
     }
+}
+
+fn serve_watch(
+    stream: &mut TcpStream,
+    mut reader: BufReader<TcpStream>,
+    query: &str,
+    control: &Control,
+) {
+    let mut watches = control.watches.lock().unwrap();
+    if watches.down || stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").is_err() {
+        return;
+    }
+    if query.contains("sendInitialEvents=true") {
+        // End the initial list while leaving the watch open for further events.
+        let bookmark = concat!(
+            r#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"1","annotations":{"k8s.io/initial-events-end":"true"}}}}"#,
+            "\n"
+        );
+        if write!(stream, "{:x}\r\n{bookmark}\r\n", bookmark.len()).is_err() {
+            return;
+        }
+    }
+    let peer = stream.peer_addr().unwrap();
+    watches.streams.insert(peer, stream.try_clone().unwrap());
+    drop(watches);
+    let _ = reader.read_to_end(&mut Vec::new());
+    control.watches.lock().unwrap().streams.remove(&peer);
 }
 
 fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Value) {

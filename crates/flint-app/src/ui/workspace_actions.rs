@@ -1467,7 +1467,7 @@ mod row_actions_tests;
 
 #[cfg(test)]
 #[path = "resource_actions_tests.rs"]
-mod resource_actions_tests;
+pub(super) mod resource_actions_tests;
 
 #[cfg(test)]
 #[path = "dock_state_tests.rs"]
