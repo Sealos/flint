@@ -4,9 +4,9 @@
 #   scripts/smoke-appimage.sh <AppImage> <version>
 #
 # `--version` must print "flint <version>", LICENSE and LICENSE-LUCIDE must be inside, and `mcp`
-# must reach the MCP server (arguments pass through the AppImage) and answer `initialize`. Runs
-# with APPIMAGE_EXTRACT_AND_RUN=1, since CI runners have no FUSE; the kubeconfig points at a port
-# that refuses connections.
+# must reach the MCP server (arguments pass through the AppImage) and answer `initialize`, as must
+# the registration command `mcp --help` prints. Runs with APPIMAGE_EXTRACT_AND_RUN=1, since CI
+# runners have no FUSE; the kubeconfig points at a port that refuses connections.
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
@@ -73,3 +73,22 @@ if ! grep -q '"serverInfo":{[^}]*"name":"flint"' <<<"$answer"; then
   exit 1
 fi
 echo "mcp: answered initialize"
+
+# The command `mcp --help` suggests must work in a later launch, as an AI client would run it:
+# the path this launch runs from is gone by then, and APPIMAGE_EXTRACT_AND_RUN is not inherited.
+help=$("$appimage" mcp --help)
+command=$(sed -n 's/^ *claude mcp add flint -- //p' <<<"$help")
+if [ -z "$command" ]; then
+  echo "error: mcp --help has no registration command:" >&2
+  echo "$help" >&2
+  exit 1
+fi
+eval "set -- $command"
+answer=$(echo "$init" | KUBECONFIG=$scratch/kubeconfig FLINT_CONFIG_DIR=$scratch/config FLINT_LOG=warn \
+  timeout 60 env -u APPIMAGE_EXTRACT_AND_RUN "$@" | head -n 1)
+if ! grep -q '"serverInfo":{[^}]*"name":"flint"' <<<"$answer"; then
+  echo "error: the command from mcp --help did not answer initialize: $command" >&2
+  echo "$answer" >&2
+  exit 1
+fi
+echo "mcp --help: its command answers initialize"
