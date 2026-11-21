@@ -107,6 +107,7 @@ fn a_review_binds_to_the_live_object() {
 fn reviewed() -> ReviewedEdit {
     ReviewedEdit {
         bound: target(),
+        pin: crate::recheck::ContextHistory::default().pin("dev", None),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
         before: String::new(),
         after: String::new(),
@@ -236,3 +237,6 @@ fn the_gitops_warning_comes_from_the_live_object() {
     );
     assert!(warnings_for(&json!({"metadata": {"name": "web"}})).is_empty());
 }
+
+#[path = "write_timeout_tests.rs"]
+mod timeout;

@@ -18,6 +18,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use tokio::time::{Instant, Sleep};
 
+use crate::cluster::context_fingerprint;
 use crate::kubeconfig::LoadedKubeconfig;
 use crate::settings::server_identity;
 
@@ -81,6 +82,8 @@ pub(crate) struct ContextPin {
     endpoint: u64,
     /// [`Record::gate`] when pinned: what the write gate holds a launch to.
     gate: u64,
+    /// [`Record::definition`] when pinned. A write compares it with the one it was reviewed on.
+    definition: Option<u64>,
     server: Option<String>,
 }
 
@@ -88,6 +91,15 @@ impl ContextPin {
     /// The API server the session's client was built for.
     pub fn server(&self) -> Option<&str> {
         self.server.as_deref()
+    }
+
+    /// Whether `other` is this pin on another connection definition, and nothing else moved.
+    pub fn only_definition_differs(&self, other: &ContextPin) -> bool {
+        self.definition != other.definition
+            && self.generation == other.generation
+            && self.endpoint == other.endpoint
+            && self.gate == other.gate
+            && self.server == other.server
     }
 }
 
@@ -111,6 +123,11 @@ struct Record {
     /// can't be read. A running session survives that, but the write gate does not let
     /// anything new start on a pin from before it, even once the file is back.
     gate: u64,
+    /// The hash of the context, cluster and user entries the last load showed
+    /// ([`context_fingerprint`]), confirmed or not.
+    definition: Option<u64>,
+    /// A file that failed in the last load could define the context, its cluster or its user.
+    provisional: bool,
 }
 
 /// Whether two servers are one endpoint: the same URL but for a trailing slash.
@@ -217,6 +234,16 @@ impl ContextHistory {
                 }
             });
             let provisional = context_masked || cluster_masked;
+            // The user entry says nothing about the server, so it stays out of the history above,
+            // but a write must not go out on one that may be a fallback.
+            let user_masked =
+                info.user
+                    .as_ref()
+                    .is_some_and(|user| match loaded.user_sources.get(user) {
+                        Some(file) => masked(file, false),
+                        None => !loaded.errors.is_empty(),
+                    });
+            let definition = context_fingerprint(&loaded.merged, name);
             match self.records.get_mut(name) {
                 // A confirmed definition stays until a load confirms a change: a fallback never
                 // replaces it, nor its file.
@@ -251,6 +278,8 @@ impl ContextHistory {
                         generation: self.last,
                         endpoint,
                         gate: r.gate,
+                        definition,
+                        provisional: false,
                     };
                 }
                 None => {
@@ -265,17 +294,24 @@ impl ContextHistory {
                             generation: self.last,
                             endpoint: self.last,
                             gate: 0,
+                            definition,
+                            provisional: false,
                         },
                     );
                 }
             }
+            if let Some(r) = self.records.get_mut(name) {
+                r.definition = definition;
+                r.provisional = provisional || user_masked;
+            }
         }
         for (name, r) in &mut self.records {
-            if r.present
-                && !seen.contains(name.as_str())
-                && !masked(&r.source, true)
-                && !known_in_failed(name)
-            {
+            if !r.present || seen.contains(name.as_str()) {
+                continue;
+            }
+            r.definition = None;
+            r.provisional = true;
+            if !masked(&r.source, true) && !known_in_failed(name) {
                 self.last += 1;
                 r.present = false;
                 r.generation = self.last;
@@ -298,6 +334,7 @@ impl ContextHistory {
             generation,
             endpoint,
             gate: record.map_or(0, |r| r.gate),
+            definition: record.and_then(|r| r.definition),
             server: server.map(str::to_owned),
         }
     }
@@ -308,6 +345,20 @@ impl ContextHistory {
         self.records
             .get(context)
             .is_some_and(|r| r.gate != pin.gate)
+    }
+
+    /// Whether a write may go out on `pin`: the context's definition is the pinned one, and no
+    /// file that can't be read could change it.
+    pub fn definition_holds(&self, context: &str, pin: &ContextPin) -> bool {
+        self.records
+            .get(context)
+            .is_some_and(|r| r.present && !r.provisional && r.definition == pin.definition)
+    }
+
+    /// Whether a file that failed in the last load could define `context`, its cluster or its
+    /// user.
+    pub fn provisional(&self, context: &str) -> bool {
+        self.records.get(context).is_none_or(|r| r.provisional)
     }
 
     /// Whether `context`'s recorded server is the exact URL `pin` was taken for. Only says how to
@@ -545,6 +596,7 @@ mod tests {
                 .collect(),
             defines,
             cluster_sources: HashMap::new(),
+            user_sources: HashMap::new(),
         }
     }
 
@@ -612,6 +664,59 @@ mod tests {
             h.check(Pinned::Shell, "dev", &pin),
             Some(reason(Pinned::Shell, "dev", Change::Removed))
         );
+    }
+
+    // covers UP-54: a user entry that may be a fallback makes the pin provisional for the write
+    // gate, and leaves a running session's pin as it was.
+    #[test]
+    fn a_masked_user_entry_is_provisional() {
+        let on_user = |mut loaded: LoadedKubeconfig, file: &str| {
+            loaded.contexts[0].user = Some("me".to_owned());
+            loaded
+                .user_sources
+                .insert("me".to_owned(), PathBuf::from(file));
+            loaded
+        };
+        let mut h = ContextHistory::default();
+        h.record(&on_user(load(&[("dev", STAGING, "a")], &[]), "b"));
+        let pin = h.pin("dev", STAGING);
+        assert!(h.definition_holds("dev", &pin));
+
+        h.record(&on_user(load(&[("dev", STAGING, "a")], &["b"]), "c"));
+        assert!(!h.definition_holds("dev", &pin));
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "still running");
+
+        let mut missing = load(&[("dev", STAGING, "a")], &["b"]);
+        missing.contexts[0].user = Some("me".to_owned());
+        h.record(&missing);
+        assert!(!h.definition_holds("dev", &pin), "may be in `b`");
+
+        h.record(&on_user(load(&[("dev", STAGING, "a")], &[]), "b"));
+        assert!(h.definition_holds("dev", &pin));
+        assert_eq!(h.pin("dev", STAGING), pin);
+    }
+
+    // covers UP-54: a pin holds only for the definition it was taken on, while a running session
+    // on the same server goes on.
+    #[test]
+    fn a_changed_user_entry_no_longer_holds() {
+        let with_token = |token: &str| {
+            let mut loaded = load(&[("dev", STAGING, "a")], &[]);
+            loaded.merged = kube::config::Kubeconfig::from_yaml(&format!(
+                "contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n\
+                 users:\n- name: u\n  user:\n    token: {token}\n"
+            ))
+            .unwrap();
+            loaded
+        };
+        let mut h = ContextHistory::default();
+        h.record(&with_token("one"));
+        let pin = h.pin("dev", STAGING);
+        assert!(h.definition_holds("dev", &pin));
+        h.record(&with_token("two"));
+        assert!(!h.definition_holds("dev", &pin));
+        assert_ne!(h.pin("dev", STAGING), pin);
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None);
     }
 
     // covers UP-06: a cluster entry no file defines, while a file failed, may be in that file.
