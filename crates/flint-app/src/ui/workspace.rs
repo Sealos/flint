@@ -53,6 +53,7 @@ use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
 use super::ui_state::{self, UiState};
+use super::write_confirm;
 use flint_core::display::{self, ClusterNames};
 
 /// The height of the main area's header and the list's toolbar.
@@ -722,10 +723,46 @@ impl Workspace {
         let cluster = detail.read(cx).object().cluster.clone();
         let why = self.sessions_blocked(&cluster, cx);
         let protected = self.is_protected(&cluster, cx);
+        let server = self
+            .cluster_summary(&cluster, cx)
+            .and_then(|c| c.info.server.clone());
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, cx);
+            d.set_server(server);
         });
+    }
+
+    /// Confirms a reviewed edit from the detail pane, naming its cluster, and runs it.
+    fn confirm_detail_write(
+        &mut self,
+        review: &flint_core::write::WriteReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(detail) = self.detail.as_ref().map(Entity::downgrade) else {
+            return;
+        };
+        let core = self.model.read(cx).core().clone();
+        let names = self.cluster_names(cx);
+        let handle = window.window_handle();
+        let started = detail.clone();
+        write_confirm::open_with(
+            window,
+            cx,
+            core,
+            review.clone(),
+            &names,
+            move |cx| {
+                let _ = started.update(cx, |d, cx| d.edit_applying(cx));
+            },
+            move |result, cx| {
+                let detail = detail.clone();
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = detail.update(cx, |d, cx| d.edit_applied(result, window, cx));
+                });
+            },
+        );
     }
 
     /// Tells each shell tab why its Restart shell cannot run, if it cannot: its context is
@@ -1042,6 +1079,9 @@ impl Workspace {
                                     this.open_shell(request.clone(), focus, window, cx)
                                 }
                                 DetailEvent::Refused(why) => this.refuse(why.clone(), cx),
+                                DetailEvent::ConfirmWrite(review) => {
+                                    this.confirm_detail_write(review, window, cx)
+                                }
                             }
                         }),
                     ];
@@ -2019,7 +2059,7 @@ fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
             "Until Flint quits, or until you lock it again, actions that change this cluster or \
-             run code in it work without asking again: opening a shell, today. It stays unlocked \
+             run code in it work without asking again: opening a shell or applying an edit. It stays unlocked \
              only while the context points at this server. Locking it again stops new shells; \
              shells already open keep running.\n\n\
              Context: {context}\nServer: {server}"

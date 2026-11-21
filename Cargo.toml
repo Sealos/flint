@@ -39,6 +39,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"
 serde_json = "1.0.154"
+similar = "2.7.0"
 # Already in the tree through kube; names the request type kube's raw request API takes.
 http = "1.5.0"
 # kube 5.1 parses kubeconfig with serde-saphyr; reuse the same YAML implementation for output.

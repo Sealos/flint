@@ -14,8 +14,9 @@ use serde_json::Value;
 
 use super::super::log_view::LogRequest;
 use super::super::registry::{
-    ActionError, Bind, Close, OnView, OpenContainerLogs, OpenContainerShell, OpenLogs,
-    OpenPreviousLogs, OpenShell, Refresh, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels,
+    ActionError, ApplyYamlEdit, BackToYamlEdit, Bind, CancelYamlEdit, Close, EditYaml, OnView,
+    OpenContainerLogs, OpenContainerShell, OpenLogs, OpenPreviousLogs, OpenShell, Refresh,
+    ReloadYamlEdit, ReviewYamlEdit, ShowOverview, ShowYaml, ToggleAnnotations, ToggleLabels,
     ToggleManagedFields, ToggleSecretValue,
 };
 use super::super::terminal_model::ShellRequest;
@@ -154,6 +155,12 @@ impl DetailView {
                     view.toggle_managed_fields(window, cx)
                 }
             })
+            .bind::<EditYaml>(|view, _, window, cx| view.start_edit(window, cx))
+            .bind::<ReviewYamlEdit>(|view, _, _, cx| view.review_edit(cx))
+            .bind::<ApplyYamlEdit>(|view, _, _, cx| view.apply_edit(cx))
+            .bind::<ReloadYamlEdit>(|view, _, window, cx| view.reload_edit(window, cx))
+            .bind::<BackToYamlEdit>(|view, _, _, cx| view.back_to_edit(cx))
+            .bind::<CancelYamlEdit>(|view, _, _, cx| view.cancel_edit(cx))
             .bind::<ToggleLabels>(|view, _, _, cx| {
                 view.show_labels = !view.show_labels;
                 cx.notify();
