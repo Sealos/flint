@@ -1330,10 +1330,18 @@ fn key_value(
         .into_any_element()
 }
 
+/// A name as a menu line shows it, cut in the middle when long: menu items neither wrap nor
+/// shrink, and what is said after the name, like `(default, not running)`, must fit too.
+pub(in crate::ui) fn menu_name(name: &str) -> String {
+    const MENU_NAME: usize = 40;
+    flint_core::display::middle_truncate(name, MENU_NAME)
+}
+
 /// "5m" for an RFC 3339 timestamp five minutes ago.
 /// A container as a picker lists it: `app (default)`, `migrate (init)`. The default one is
 /// what the keys open (⌘L, ⇧⌘L, ⇧⌘E), so the picker says which it is.
 pub(in crate::ui) fn container_label(name: &str, init: bool, default: bool) -> String {
+    let name = menu_name(name);
     match (init, default) {
         (true, _) => format!("{name} (init)"),
         (false, true) => format!("{name} (default)"),
@@ -1344,6 +1352,7 @@ pub(in crate::ui) fn container_label(name: &str, init: bool, default: bool) -> S
 /// A Shell picker's entry: a container that is not running (waiting, crash-looping,
 /// terminated) is listed disabled, saying so.
 pub(in crate::ui) fn shell_label(name: &str, default: bool, running: bool) -> String {
+    let name = menu_name(name);
     match (default, running) {
         (true, true) => format!("{name} (default)"),
         (false, true) => name.to_owned(),
