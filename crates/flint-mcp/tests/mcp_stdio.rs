@@ -484,7 +484,10 @@ fn mcp_policy_without_a_cluster() {
         format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {refusing}\nusers:\n- name: u\n  user:\n    token: SECRETTOKEN\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n- name: other\n  context:\n    cluster: c\n    user: u\n"),
     )
     .unwrap();
-    let broken = scratch.path().join("broken");
+    // In a directory whose name holds a credential: the error names the file, redacted.
+    let broken_dir = scratch.path().join("password=PATHSECRET");
+    std::fs::create_dir_all(&broken_dir).unwrap();
+    let broken = broken_dir.join("broken");
     std::fs::write(
         &broken,
         "users:\n- name: x\n  user:\n    token: BROKENSECRET\nclusters: [\n",
@@ -515,6 +518,7 @@ fn mcp_policy_without_a_cluster() {
         !text.contains("SECRETTOKEN") && !text.contains("BROKENSECRET"),
         "{text}"
     );
+    assert!(!text.contains("PATHSECRET"), "{text}");
     assert!(
         !text.contains("\"dev\""),
         "a re-pointed cluster was named: {text}"

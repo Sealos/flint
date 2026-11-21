@@ -198,6 +198,14 @@ fn shown_path(path: &Path) -> String {
     shown
 }
 
+/// One entry of `list_clusters`' `kubeconfig_errors`: the file and a one-line reason, each
+/// redacted on its own, since a redacted value runs to the end of its line.
+pub fn kubeconfig_error_row(path: &Path, error: &str) -> Value {
+    let mut reason = flint_core::redact::safe_error_summary(error);
+    redact_text(&mut reason);
+    serde_json::json!({ "file": shown_path(path), "error": reason })
+}
+
 /// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
 /// the count is reported, not their names.
 pub fn missing_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> usize {
@@ -1000,6 +1008,36 @@ mod tests {
         assert!(!hint.contains("[[ai_exposed_clusters]]"), "{hint}");
         assert!(headless.fix_settings().contains("fix that file"));
         assert!(app().fix_settings().contains("Flint app"));
+    }
+
+    // covers UP-15: a credential in a kubeconfig path or its error does not reach the agent, and
+    // the other field survives it.
+    #[test]
+    fn kubeconfig_errors_are_redacted_field_by_field() {
+        let row = kubeconfig_error_row(
+            Path::new("/home/me/password=hunter2/config"),
+            "could not read it: token=example-credential",
+        );
+        let text = row.to_string();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("example-credential"), "{text}");
+        assert!(
+            row["file"].as_str().unwrap().starts_with("/home/me/"),
+            "{row}"
+        );
+        assert!(
+            row["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read it"),
+            "{row}"
+        );
+
+        let plain = kubeconfig_error_row(Path::new("/home/me/config"), "bad yaml");
+        assert_eq!(
+            plain,
+            json!({"file": "/home/me/config", "error": "bad yaml"})
+        );
     }
 
     // covers UP-09: the settings path is cluster-independent but still redacted.
