@@ -35,8 +35,8 @@ use super::notice::notice;
 use super::row_menu::RowMenu;
 
 use super::registry::{
-    self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow, SortBy,
-    ToggleWide,
+    self, CloseDetail, SelectFirst, SelectLast, SelectNext, SelectPrev, SelectRow,
+    ShowAllNamespaces, SortBy, ToggleWide,
 };
 
 /// The list's key context; the registry binds the list's keys in it.
@@ -1134,6 +1134,37 @@ impl ResourceList {
                     || (self.namespaced && !self.query.namespaces.is_empty());
                 Some(if snapshot.rows.is_empty() {
                     message(format!("No {label}"), None, theme.muted_foreground)
+                } else if self.namespaced && !self.query.namespaces.is_empty() && self.scoped == 0 {
+                    // The namespace filter names nothing the cluster has rows in (a typed
+                    // name that does not exist): say which, and offer the way out.
+                    let names = self.query.namespaces.join(", ");
+                    v_flex()
+                        .id("list-placeholder")
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_6()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("No {label} in namespace {names}")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} in other namespaces.", snapshot.rows.len())),
+                        )
+                        .child(
+                            Button::new("show-all-namespaces")
+                                .small()
+                                .label("Show All Namespaces")
+                                .on_click(registry::on_click(ShowAllNamespaces)),
+                        )
+                        .test_support()
+                        .into_any_element()
                 } else if filtered {
                     message(
                         format!("No {label} match the filters"),
