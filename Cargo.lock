@@ -1974,6 +1974,7 @@ version = "0.3.1"
 dependencies = [
  "async-channel",
  "flint-core",
+ "flint-e2e",
  "flint-mcp",
  "gpui-kit",
  "image",
