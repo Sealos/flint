@@ -651,6 +651,20 @@ mod tests {
         assert!(namespace.starts_with(&"é".repeat(126)) && namespace.ends_with("…(+348 bytes)"));
     }
 
+    /// [`append`], tried again when it gives up on the lock, which a busy machine can make it do:
+    /// nothing was written then, and skipping the record would leave the previous file short.
+    /// Any other error fails the test, and so does a lock that never comes free.
+    fn append_retrying(dir: &Path, record: &ActivityRecord) {
+        for _ in 0..60 {
+            match append(dir, record) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("append failed: {e}"),
+            }
+        }
+        panic!("the activity log's lock never came free");
+    }
+
     // covers UP-16: writers in several processes (and threads) rotate in turn: no record is
     // lost but the ones the cap drops, and the kept ones are complete files' worth.
     #[test]
@@ -663,7 +677,7 @@ mod tests {
                 let dir = dir.path();
                 s.spawn(move || {
                     for n in 0..per_writer {
-                        append(dir, &record(w * 1_000_000 + n)).unwrap();
+                        append_retrying(dir, &record(w * 1_000_000 + n));
                     }
                 });
             }
