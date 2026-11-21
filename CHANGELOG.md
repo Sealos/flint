@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.3.1](https://github.com/Sealos/flint/compare/v0.3.0...v0.3.1) (2026-11-21)
+
+
+### Features
+
+* **app:** custom cluster names ([#358](https://github.com/Sealos/flint/issues/358)) ([22e361f](https://github.com/Sealos/flint/commit/22e361fae18ffb7556b816f26483a268327a3f69))
+* **app:** mark objects managed by argo cd or flux ([#368](https://github.com/Sealos/flint/issues/368)) ([3e80c25](https://github.com/Sealos/flint/commit/3e80c2514f72afe9fdb0ee4443e2fcac4f6380d5))
+* **core:** add the write module and shared confirmation ([#380](https://github.com/Sealos/flint/issues/380)) ([8b86f09](https://github.com/Sealos/flint/commit/8b86f09d6d462d51fd6c051f654e6a8d779673dc))
+* **core:** make the write gate the only way to a client that can write ([#369](https://github.com/Sealos/flint/issues/369)) ([662a672](https://github.com/Sealos/flint/commit/662a6720ec57e5e9179fddc402ed9a21dd225dcc))
+
+
+### Bug Fixes
+
+* **app:** keep a cluster's trust state consistent while settings update ([#382](https://github.com/Sealos/flint/issues/382)) ([510cb7c](https://github.com/Sealos/flint/commit/510cb7cb1b07118e67922416d906211c8912e0f1))
+* **app:** keep context menus inside narrow and short windows ([#392](https://github.com/Sealos/flint/issues/392)) ([5a8ee97](https://github.com/Sealos/flint/commit/5a8ee9710dccf36f6c2a32eca842e26712f71013))
+* **app:** keep long names inside the row context menu ([#339](https://github.com/Sealos/flint/issues/339)) ([5c11ad9](https://github.com/Sealos/flint/commit/5c11ad9131ae001325f42a077793ffe37e651b48))
+* **app:** keep masked secret columns out of filter, sort and width ([#340](https://github.com/Sealos/flint/issues/340)) ([d20c0cb](https://github.com/Sealos/flint/commit/d20c0cb5b88e5e502d84c84f8f7ef751135e4ffe))
+* **app:** name the appimage in flint mcp --help ([#357](https://github.com/Sealos/flint/issues/357)) ([b3b1afd](https://github.com/Sealos/flint/commit/b3b1afd5120994a84018d8951b6d88923998d3cd))
+* **app:** report discarded and refused terminal input accurately ([#356](https://github.com/Sealos/flint/issues/356)) ([2f9da83](https://github.com/Sealos/flint/commit/2f9da8362c72f50f19909474a4b490479348f7c4))
+* **core:** decide safe secret columns by role and position ([#344](https://github.com/Sealos/flint/issues/344)) ([b9191c1](https://github.com/Sealos/flint/commit/b9191c13bd2586393ac0cd0f0e81d1d26a457d7f))
+* **core:** event coalescing edge cases ([#362](https://github.com/Sealos/flint/issues/362)) ([7ce3b8b](https://github.com/Sealos/flint/commit/7ce3b8ba0404d8bc4826a054adb26115ca538f76))
+* **core:** harden the read-only client and client construction ([#397](https://github.com/Sealos/flint/issues/397)) ([45d8274](https://github.com/Sealos/flint/commit/45d8274542d5d04a2944afe8ecaeb703fdbe0604))
+* **core:** keep a shown log tab from being trimmed and seal ended streams ([#370](https://github.com/Sealos/flint/issues/370)) ([f35fbba](https://github.com/Sealos/flint/commit/f35fbbacf963460b4fa1ab57d9b00f36ea625d5d))
+* **core:** keep credentials out of an exec request's debug output ([#365](https://github.com/Sealos/flint/issues/365)) ([9f8267c](https://github.com/Sealos/flint/commit/9f8267c5b0eb6f3741e5adc87a1bedc05a3ac5df))
+* **core:** open the log file off the startup path and close its gaps ([#375](https://github.com/Sealos/flint/issues/375)) ([2670cc7](https://github.com/Sealos/flint/commit/2670cc711778f640be3aa79a196252124abb4d12))
+* **core:** retry only read requests ([#379](https://github.com/Sealos/flint/issues/379)) ([0f6f619](https://github.com/Sealos/flint/commit/0f6f6191854073e35ec717a1064de221924a3ae6))
+* **core:** tell the dock which context changes are confirmed ([#390](https://github.com/Sealos/flint/issues/390)) ([258b43a](https://github.com/Sealos/flint/commit/258b43a755c756dbd80703dccd47396a68fd90f3))
+* **core:** tell when input was lost to a fallback shell that exits at once ([#396](https://github.com/Sealos/flint/issues/396)) ([344f978](https://github.com/Sealos/flint/commit/344f9787ffda6ac881520857ee9e17203ca5c4b5))
+* **mcp:** do not echo raw values in wrong-type argument errors ([#387](https://github.com/Sealos/flint/issues/387)) ([5191e11](https://github.com/Sealos/flint/commit/5191e11158bcd4c1fe813750b0663d2852243600))
+* **mcp:** give setup advice and settings errors that work without the app ([#384](https://github.com/Sealos/flint/issues/384)) ([6a0d829](https://github.com/Sealos/flint/commit/6a0d829ea29f1cd39fbd756f22ba0d0e98f0d47b))
+* **mcp:** record no unvalidated arguments for calls refused before admission ([#385](https://github.com/Sealos/flint/issues/385)) ([387350e](https://github.com/Sealos/flint/commit/387350ec5dd47c7203902fd8ebfa16f6d31225f6))
+* **mcp:** redact file paths in kubeconfig errors ([#386](https://github.com/Sealos/flint/issues/386)) ([c0d6321](https://github.com/Sealos/flint/commit/c0d6321cab32647681c859f80e94b98f509cd00c))
+* **mcp:** reject unsupported tool arguments ([#347](https://github.com/Sealos/flint/issues/347)) ([65cd05e](https://github.com/Sealos/flint/commit/65cd05eac7c4b7475056d40f15eb69d954ca8856))
+* **mcp:** release cancelled calls and always finish shutdown ([#363](https://github.com/Sealos/flint/issues/363)) ([b40b418](https://github.com/Sealos/flint/commit/b40b4181c6778e7d16debdfa29242c6217031d11))
+* **mcp:** report an out-of-scope request as out of scope ([#378](https://github.com/Sealos/flint/issues/378)) ([150ba8f](https://github.com/Sealos/flint/commit/150ba8f838bf13472f5575ba28e82c39c15e95d0))
+* **mcp:** resolve hand-written ai scopes and report what matches nothing ([#373](https://github.com/Sealos/flint/issues/373)) ([cb5a457](https://github.com/Sealos/flint/commit/cb5a457a37531f1d2a86fd3baba33c589cb4c3b2))
+* **mcp:** say when an exposed context is missing from the loaded kubeconfig ([#360](https://github.com/Sealos/flint/issues/360)) ([a30a71a](https://github.com/Sealos/flint/commit/a30a71ae0f974730baa7cc956abe5e984c32d082))
+* **mcp:** show the settings path order in flint-mcp --help ([#355](https://github.com/Sealos/flint/issues/355)) ([449ae1e](https://github.com/Sealos/flint/commit/449ae1ed4eb21d97cd6af7d8a149354e6a758645))
+* **mcp:** treat a client that stops reading with a full queue as gone ([#388](https://github.com/Sealos/flint/issues/388)) ([b69e34c](https://github.com/Sealos/flint/commit/b69e34c92763998a60f79d98ea4c2ba5a3161609))
+
+
+### Performance
+
+* **core:** keep failed polls and pruned strings out of the shrink mark ([#377](https://github.com/Sealos/flint/issues/377)) ([ccaf496](https://github.com/Sealos/flint/commit/ccaf49648678111067c75c4f6c26943a5a645d87))
+* **core:** shrink the interner by peak capacity and completed list sizes ([#348](https://github.com/Sealos/flint/issues/348)) ([0a24cb8](https://github.com/Sealos/flint/commit/0a24cb83baf38d43c2910a05da86f51d5e1bf907))
+
 ## [0.3.0](https://github.com/Sealos/flint/compare/v0.2.1...v0.3.0) (2026-11-20)
 
 
