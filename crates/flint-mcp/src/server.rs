@@ -458,6 +458,9 @@ pub struct GetPodLogsParams {
 /// the client and can be any length.
 const UNSUPPORTED_NAMED: usize = 5;
 const UNSUPPORTED_NAME_CHARS: usize = 64;
+/// A longer name is not read at all: redacting it would hold a worker for as long as the client
+/// likes, and a prefix of it could hold part of a credential.
+const UNSUPPORTED_NAME_BYTES: usize = 1024;
 
 /// The refusal for `arguments` that `tool`'s schema does not have, naming them and the accepted
 /// ones. A tool that dropped them would answer as if a filter it never applied had matched.
@@ -477,6 +480,9 @@ fn unsupported_arguments(
         .by_ref()
         .take(UNSUPPORTED_NAMED)
         .map(|name| {
+            if name.len() > UNSUPPORTED_NAME_BYTES {
+                return "<a name too long to show>".to_owned();
+            }
             // Whole, before it is cut: a rule can need what comes after the cut. On its own, so
             // a rule that takes the rest of the line cannot take the accepted arguments too.
             let mut name = name.clone();
@@ -1831,6 +1837,12 @@ mod tests {
         let line = arguments(json!({"a\nb": 1}));
         let text = unsupported_arguments(tool, Some(&line)).unwrap();
         assert!(!text.contains('\n'), "{text}");
+
+        // A name past the limit is not read or echoed, not even its start.
+        let huge = format!("hunter2{}", "x".repeat(UNSUPPORTED_NAME_BYTES));
+        let text = unsupported_arguments(tool, Some(&arguments(json!({ huge: 1 })))).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("too long"), "{text}");
 
         // A password whose closing `@` lies past the cut is still recognized.
         let url = format!("https://user:{}@example.com", "p".repeat(100));
