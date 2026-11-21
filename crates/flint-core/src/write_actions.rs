@@ -55,6 +55,10 @@ impl ActionGate for RequestGate {
                 WriteError::Refused(refusal) => ActionError::Refused(refusal),
                 WriteError::ConnectionChanged => ActionError::ConnectionChanged,
                 WriteError::KubeconfigUnreadable => ActionError::KubeconfigUnreadable,
+                refused @ (WriteError::CredentialChanged
+                | WriteError::CredentialUnreadable
+                | WriteError::IdentityUnverified
+                | WriteError::IdentityUnavailable) => ActionError::Credential(refused),
                 other => ActionError::Failed(other.to_string()),
             })
     }
@@ -279,6 +283,7 @@ impl From<ActionError> for WriteError {
             ActionError::Refused(refusal) => WriteError::Refused(refusal),
             ActionError::ConnectionChanged => WriteError::ConnectionChanged,
             ActionError::KubeconfigUnreadable => WriteError::KubeconfigUnreadable,
+            ActionError::Credential(refused) => refused,
             ActionError::Conflict(_) => WriteError::Conflict,
             ActionError::Gone(_) => WriteError::Gone,
             ActionError::Unsupported(message) => WriteError::Rejected(message),
@@ -314,6 +319,8 @@ pub(crate) enum ActionError {
     ConnectionChanged,
     /// A kubeconfig file that could define the context can't be read.
     KubeconfigUnreadable,
+    /// The credential is not the reviewed one, or could not be confirmed.
+    Credential(WriteError),
     /// The object changed since it was reviewed: review it again.
     Conflict(String),
     /// The object is gone.
@@ -1608,6 +1615,22 @@ mod tests {
             .filter(|s| s.method == "POST")
             .count();
         assert_eq!(evictions, 1);
+    }
+
+    // covers UP-53: an identity refusal after an eviction keeps the partial report, and its text
+    // speaks of the next request only.
+    #[test]
+    fn a_credential_refusal_does_not_deny_earlier_changes() {
+        for refused in [
+            WriteError::IdentityUnverified,
+            WriteError::IdentityUnavailable,
+        ] {
+            let stopped = WriteError::from(ActionError::Credential(refused.clone()));
+            assert_eq!(stopped, refused);
+            let text = stopped.to_string();
+            assert!(text.contains("the next request was refused"), "{text}");
+            assert!(!text.contains("nothing was changed"), "{text}");
+        }
     }
 
     // covers UP-54: the gate closing while evicted pods terminate ends the wait, saying so.
