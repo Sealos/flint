@@ -3,8 +3,8 @@
 //!
 //! Events that state something (the cluster list, the active cluster, a cluster's connection or
 //! discovery, the settings, the agent activity log) matter only in their latest form, so the
-//! queue keeps one per key (a connection keeps two: its latest attempt starting, and where it
-//! settled): a newer one replaces the queued one, and moves to the back, so the
+//! queue keeps one per key (a connection keeps two: its latest attempt starting, and where that
+//! attempt settled): a newer one replaces the queued one, and moves to the back, so the
 //! order of what is left is the order of the last changes, and applying them leaves the reader
 //! where applying every event would have. (Readers that compare successive cluster lists see
 //! fewer of them; the manager sends a discovery reset for a context that starts over, so they do
@@ -174,6 +174,13 @@ impl EventSender {
             pending.errors += 1;
         } else if pending.events.contains_key(&key) {
             pending.order.retain(|k| k != &key);
+        }
+        // A new attempt: the previous attempt's result, not read yet, no longer says anything.
+        if let Key::Connection(context, Phase::Connecting) = &key {
+            let settled = Key::Connection(context.clone(), Phase::Settled);
+            if pending.events.remove(&settled).is_some() {
+                pending.order.retain(|k| k != &settled);
+            }
         }
         // A context the new list no longer has: its queued connection and discovery events go
         // (the reader forgets a context that left the list anyway), so contexts that come and go

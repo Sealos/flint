@@ -220,6 +220,20 @@ impl ClustersModel {
         self.send(Command::SetWatchMode { cluster, mode });
     }
 
+    /// What each cluster is called on screen.
+    pub fn names(&self) -> flint_core::display::ClusterNames {
+        flint_core::display::ClusterNames::new(
+            self.clusters.iter().map(|c| c.info.name.as_str()),
+            &self.settings.cluster_names,
+        )
+    }
+
+    /// Sets the name shown for `cluster` (`None` removes it). Written to `settings.toml`; the
+    /// change comes back as a settings event.
+    pub fn set_cluster_name(&mut self, cluster: ClusterId, name: Option<String>) {
+        self.send(Command::SetClusterName { cluster, name });
+    }
+
     /// Sets the appearance. Written to `settings.toml`; the change comes back as a settings
     /// event, and the window follows it.
     pub fn set_appearance(&mut self, appearance: Appearance) {

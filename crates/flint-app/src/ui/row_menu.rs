@@ -27,10 +27,12 @@ use std::rc::Rc;
 use flint_core::KindId;
 use flint_core::redact::first_line;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::detail::{
-    Opening, ShellPod, Subject, fit_container_names, log_item, reason, refused, shell_item,
+    Opening, PROTECTED_NOTE, ShellPod, Subject, fit_container_names, log_item, protected_reason,
+    reason, refused, shell_item,
 };
 use super::object::PodContainer;
 use super::registry::{
@@ -87,7 +89,22 @@ pub struct RowActions {
     pub log_containers: Vec<PodContainer>,
     /// The row's cluster, when it is protected (ADR-0015): Shell is disabled, saying so, and
     /// an Unlock entry follows it, so the unlock is offered in place.
-    pub unlock: Option<String>,
+    pub unlock: Option<UnlockEntry>,
+}
+
+/// The Unlock entry of a protected cluster's row menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockEntry {
+    pub cluster: String,
+    /// As shown: a custom name comes with the real one.
+    pub name: String,
+    /// The full context and server, for telling apart clusters with the same short name.
+    pub tip: String,
+}
+
+/// The tooltip of the Unlock entry: exactly which cluster it unlocks.
+fn unlock_tip(context: &str, server: Option<&str>) -> String {
+    format!("{context}\n{}", server.unwrap_or("no server"))
 }
 
 /// What the selected row's actions can do now, if a pod or workload row is selected. The
@@ -116,11 +133,32 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
             Subject::Pod => detail.log_containers().to_vec(),
             _ => Vec::new(),
         },
-        unlock: (blocked.is_none() && ws.is_protected(&detail.object().cluster, cx))
-            .then(|| detail.object().cluster.clone()),
+        unlock: (blocked.is_none() && ws.is_protected(&detail.object().cluster, cx)).then(|| {
+            UnlockEntry {
+                cluster: detail.object().cluster.clone(),
+                name: ws.cluster_names(cx).with_real(&detail.object().cluster),
+                tip: unlock_tip(
+                    &detail.object().cluster,
+                    ws.cluster_summary(&detail.object().cluster, cx)
+                        .and_then(|c| c.info.server.as_deref()),
+                ),
+            }
+        }),
         blocked,
         subject,
     })
+}
+
+/// Shell's availability as the menu draws it: on a protected cluster a short note, since the
+/// Unlock entry right after it names the cluster. Everything else (refusals, the automation
+/// state) keeps [`RowActions::shell`], which names it.
+fn shell_in_menu(a: &RowActions) -> Availability {
+    match (&a.shell, &a.unlock) {
+        (Err(why), Some(unlock)) if *why == protected_reason(&unlock.cluster) => {
+            Err(PROTECTED_NOTE.to_owned())
+        }
+        (shell, _) => shell.clone(),
+    }
 }
 
 /// The menu for the rows of the workspace's list, acting on the row selected.
@@ -233,6 +271,7 @@ fn fill(
         };
     }
     let label = shell_entry_label(&a);
+    let shell_shown = shell_in_menu(&a);
     let menu = match a.shell_pod {
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
@@ -248,13 +287,33 @@ fn fill(
                 })
             })
         }
-        _ => entry(menu, label.into(), Box::new(OpenShell), &a.shell, says_why),
+        _ => entry(
+            menu,
+            label.into(),
+            Box::new(OpenShell),
+            &shell_shown,
+            says_why,
+        ),
     };
     match a.unlock {
-        Some(cluster) => menu.item(
-            PopupMenuItem::new(unlock_label(&cluster))
+        Some(UnlockEntry { cluster, name, tip }) => {
+            let label = SharedString::from(unlock_label(&name));
+            let tip = SharedString::from(tip);
+            menu.item(
+                PopupMenuItem::element(move |_, _| {
+                    let tip = tip.clone();
+                    div()
+                        .id("menu-unlock")
+                        .role(Role::MenuItem)
+                        .aria_label(label.clone())
+                        .aria_description(tip.clone())
+                        .child(label.clone())
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .test_support()
+                })
                 .on_click(registry::on_click(UnlockCluster { cluster })),
-        ),
+            )
+        }
         None => menu,
     }
 }
@@ -290,8 +349,8 @@ fn shell_entry_label(a: &RowActions) -> String {
 }
 
 /// The Unlock entry of a protected cluster's row menu.
-fn unlock_label(cluster: &str) -> String {
-    format!("Unlock {}…", flint_core::display::short_name(cluster))
+fn unlock_label(name: &str) -> String {
+    format!("Unlock {name}…")
 }
 
 /// `label` as a submenu that picks one of `containers` for Logs (or Previous Logs, with
@@ -458,10 +517,10 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
                 })
                 .collect(),
         ),
-        _ => entry(label, &a.shell),
+        _ => entry(label, &shell_in_menu(a)),
     });
-    if let Some(cluster) = &a.unlock {
-        entries.push(entry(unlock_label(cluster), &Ok(())));
+    if let Some(unlock) = &a.unlock {
+        entries.push(entry(unlock_label(&unlock.name), &Ok(())));
     }
     (a.blocked.clone(), entries)
 }
@@ -480,7 +539,10 @@ pub(in crate::ui) mod tests {
 
     use flint_core::redact::first_line;
 
-    use super::{MAX_REASON, RowActions, SHELL_POD_NAME, menu_state, shell_entry_label};
+    use super::{
+        MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, menu_state,
+        protected_reason, shell_entry_label, unlock_tip,
+    };
     use crate::ui::detail::{ShellPod, Subject};
     use crate::ui::object::PodContainer;
 
@@ -583,10 +645,15 @@ pub(in crate::ui) mod tests {
         );
 
         // covers UP-54: on a protected cluster Shell says why, and Unlock follows it.
-        let why = "alpha is protected (read-only in Flint) until you unlock it".to_owned();
+        // The menu's note is short; the reason refusals use still names the cluster.
+        let why = PROTECTED_NOTE.to_owned();
         let protected = RowActions {
-            shell: Err(why.clone()),
-            unlock: Some("alpha".into()),
+            shell: Err(protected_reason("alpha")),
+            unlock: Some(UnlockEntry {
+                cluster: "alpha".into(),
+                name: "alpha".into(),
+                tip: "alpha\nhttps://example.invalid".into(),
+            }),
             ..pod_actions()
         };
         assert_eq!(
@@ -596,6 +663,18 @@ pub(in crate::ui) mod tests {
                 json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
             ]
         );
+    }
+
+    // covers UP-55: two clusters can share a short name, so the Unlock entry's tooltip says
+    // which context and server it unlocks.
+    #[test]
+    fn the_unlock_tooltip_names_the_full_context_and_server() {
+        let arn = "arn:aws:eks:eu-west-1:123456789012:cluster/example-prod";
+        assert_eq!(
+            unlock_tip(arn, Some("https://example.invalid")),
+            format!("{arn}\nhttps://example.invalid")
+        );
+        assert_eq!(unlock_tip("a", None), "a\nno server");
     }
 
     // Menu labels neither wrap nor shrink, so a long one is drawn past the menu's edge (#338).

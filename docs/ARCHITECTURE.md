@@ -982,7 +982,9 @@ Rules:
   replies to other requests included); a request read while 128 are unanswered is refused there at once, as is one
   whose id is still in flight; notifications, a cancellation in particular, always pass. A request counts until its
   reply reaches the transport, or, once cancelled, until nothing works on it (a tool call's handler has ended). When
-  the client closes its end, the stream ends only once every request read is answered. Clusters connect through the
+  the client closes its end, the stream ends once every request read is answered and every refusal written, or once
+  no reply has been written for the call deadline plus 5 s, so a client that stopped reading stdout cannot keep the
+  process alive. Clusters connect through the
   per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
   connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
   as failed, tool calls refused at the transport too), waiting at most 2 s for the file; a record that cannot be
@@ -1042,7 +1044,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     the namespace and container ones) asks for each required one in turn: a list of the clusters, namespaces, kinds
     the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label selector). Values
     equal to the text typed come first: a stored value as typed, then ignoring case, then a shown label (so contexts
-    `cluster/prod` and an EKS ARN shown as `cluster/prod` do not collide, nor `ABC` and `abc`), and the action always
+    `prod` and an EKS ARN shown as `prod` do not collide, nor `ABC` and `abc`), and the action always
     gets the stored value; else, where a typed value is allowed (a namespace not listed, a selector), the text typed
     is the first row and selected. Typed text is trimmed, a picked value never is. Open Container Shell… offers only
     the running app containers a shell can open in (a workload's first ready pod's), Open Container Logs… every

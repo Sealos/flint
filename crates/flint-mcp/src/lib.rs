@@ -91,7 +91,7 @@ pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
                 rmcp::transport::stdio(),
             );
         let transport = server.counted(stdio);
-        let service = server.serve(transport).await?;
+        let service = server.tracked().serve(transport).await?;
         service.waiting().await?;
         anyhow::Ok(())
     });

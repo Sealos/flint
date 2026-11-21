@@ -120,6 +120,12 @@ pub enum Command {
         cluster: Option<ClusterId>,
         mode: Option<WatchMode>,
     },
+    /// Set the custom name shown for `cluster` (`None` removes it) and write it to
+    /// `settings.toml`. Display only. The change arrives back as `Event::SettingsChanged`.
+    SetClusterName {
+        cluster: ClusterId,
+        name: Option<String>,
+    },
     /// Set the appearance (light, dark, or following macOS) and write it to `settings.toml`. The
     /// change arrives back as `Event::SettingsChanged`.
     SetAppearance(Appearance),
@@ -141,6 +147,10 @@ pub enum Command {
 
 /// Requests that carry a reply channel or come from a [`Subscription`].
 pub(crate) enum Request {
+    /// Reload the kubeconfig files, and say when that is done.
+    ReloadKubeconfig {
+        reply: oneshot::Sender<()>,
+    },
     Subscribe {
         id: u64,
         cluster: ClusterId,
@@ -400,6 +410,17 @@ impl CoreHandle {
             reply,
         });
         async move { rx.await.ok().flatten() }
+    }
+
+    /// Reloads the kubeconfig files now, and resolves once the reload is applied: an
+    /// acknowledgement that does not depend on the event stream or the file watcher. Works on
+    /// any executor.
+    pub fn reload_kubeconfig(&self) -> impl Future<Output = ()> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.requests.try_send(Request::ReloadKubeconfig { reply });
+        async move {
+            let _ = rx.await;
+        }
     }
 
     /// The kinds of `cluster` being watched (or polled) right now, sorted. For status displays
