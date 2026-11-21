@@ -45,6 +45,13 @@ pub const ROW_HEIGHT: f32 = 24.;
 /// Approximate advance of one character at the table's text size, for column widths.
 const CHAR_WIDTH: f32 = 8.5;
 const CELL_PADDING: f32 = 16.;
+
+// The kit's tooltips paint plain text that view tests cannot observe: this records what a cell's
+// tooltip was built with.
+#[cfg(test)]
+thread_local! {
+    static CELL_TOOLTIPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 /// How narrow Name and Namespace get in a tight list (characters), so status columns fit. The
 /// Namespace column keeps room for its header and the sort arrow, as measured.
 const SQUEEZED_NAME_CHARS: usize = 12;
@@ -836,7 +843,11 @@ impl ResourceList {
                             .test_text(shown_text),
                     )
                     .when(!fits, |el| {
-                        el.tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+                        el.tooltip(move |window, cx| {
+                            #[cfg(test)]
+                            CELL_TOOLTIPS.with_borrow_mut(|tips| tips.push(text.to_string()));
+                            Tooltip::new(text.clone()).build(window, cx)
+                        })
                     });
                 el = el.child(cell);
             }
