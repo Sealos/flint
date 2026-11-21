@@ -265,6 +265,14 @@ async fn the_row_menu_unlock_entry_asks_before_unlocking(cx: &mut TestAppContext
     let t = open_with_settings(cx, dir.path(), &settings).await;
     show_web(cx, &t).await;
     let wanted = unlock_dialog("main (alpha)", "alpha", &t.server);
+    // A refusal names the real cluster, whatever the menu's short note says.
+    let shell = t.workspace.read_with(cx, |ws, cx| {
+        crate::ui::row_menu::row_actions(ws, cx).unwrap().shell
+    });
+    assert_eq!(
+        shell,
+        Err("alpha is protected (read-only in Flint) until you unlock it".to_owned())
+    );
 
     right_click(cx, &t, "web").await;
     draw(cx, &t);

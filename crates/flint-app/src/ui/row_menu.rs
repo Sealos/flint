@@ -126,14 +126,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         logs: gate(detail.log_plan::<OpenLogs>(None, false).map(drop)),
         previous: (subject == Subject::Pod)
             .then(|| gate(detail.log_plan::<OpenPreviousLogs>(None, true).map(drop))),
-        // The Unlock entry after it names the cluster.
-        shell: gate(detail.shell_check::<OpenShell>(None)).map_err(|why| {
-            if why == protected_reason(&detail.object().cluster) {
-                PROTECTED_NOTE.to_owned()
-            } else {
-                why
-            }
-        }),
+        shell: gate(detail.shell_check::<OpenShell>(None)),
         shell_pod: detail.shell_pod(),
         shell_picker: detail.shell_picker().is_some(),
         log_containers: match subject {
@@ -154,6 +147,18 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         blocked,
         subject,
     })
+}
+
+/// Shell's availability as the menu draws it: on a protected cluster a short note, since the
+/// Unlock entry right after it names the cluster. Everything else (refusals, the automation
+/// state) keeps [`RowActions::shell`], which names it.
+fn shell_in_menu(a: &RowActions) -> Availability {
+    match (&a.shell, &a.unlock) {
+        (Err(why), Some(unlock)) if *why == protected_reason(&unlock.cluster) => {
+            Err(PROTECTED_NOTE.to_owned())
+        }
+        (shell, _) => shell.clone(),
+    }
 }
 
 /// The menu for the rows of the workspace's list, acting on the row selected.
@@ -266,6 +271,7 @@ fn fill(
         };
     }
     let label = shell_entry_label(&a);
+    let shell_shown = shell_in_menu(&a);
     let menu = match a.shell_pod {
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
@@ -281,7 +287,13 @@ fn fill(
                 })
             })
         }
-        _ => entry(menu, label.into(), Box::new(OpenShell), &a.shell, says_why),
+        _ => entry(
+            menu,
+            label.into(),
+            Box::new(OpenShell),
+            &shell_shown,
+            says_why,
+        ),
     };
     match a.unlock {
         Some(UnlockEntry { cluster, name, tip }) => {
@@ -505,7 +517,7 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
                 })
                 .collect(),
         ),
-        _ => entry(label, &a.shell),
+        _ => entry(label, &shell_in_menu(a)),
     });
     if let Some(unlock) = &a.unlock {
         entries.push(entry(unlock_label(&unlock.name), &Ok(())));
@@ -529,7 +541,7 @@ pub(in crate::ui) mod tests {
 
     use super::{
         MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, menu_state,
-        shell_entry_label, unlock_tip,
+        protected_reason, shell_entry_label, unlock_tip,
     };
     use crate::ui::detail::{ShellPod, Subject};
     use crate::ui::object::PodContainer;
@@ -633,9 +645,10 @@ pub(in crate::ui) mod tests {
         );
 
         // covers UP-54: on a protected cluster Shell says why, and Unlock follows it.
+        // The menu's note is short; the reason refusals use still names the cluster.
         let why = PROTECTED_NOTE.to_owned();
         let protected = RowActions {
-            shell: Err(why.clone()),
+            shell: Err(protected_reason("alpha")),
             unlock: Some(UnlockEntry {
                 cluster: "alpha".into(),
                 name: "alpha".into(),
