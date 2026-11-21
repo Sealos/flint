@@ -397,16 +397,70 @@ async fn a_relist_reports_synced_only_with_its_rows() {
                    "message":"too old resource version: 1 (773)","reason":"Expired","code":410}),
         ))
         .unwrap();
-    // No time passes here, so a snapshot held back for the interval stays unpublished.
-    while fake.list_calls("pods") < 2 || hub.state() != SyncState::Synced {
-        tokio::task::yield_now().await;
+    until(&mut rx, |s| {
+        matches!(s.state, SyncState::Reconnecting { .. })
+    })
+    .await;
+    let reconnecting = tokio::time::Instant::now();
+    // Each step lets the paused clock advance. The state is read first: rows read after it
+    // are at least as new as the snapshot that reported it.
+    for _ in 0..1000 {
+        if hub.state() == SyncState::Synced {
+            assert_eq!(
+                names(&hub.latest()),
+                ["new"],
+                "synced was reported before the rows"
+            );
+            assert_eq!(fake.list_calls("pods"), 2);
+            assert!(
+                reconnecting.elapsed() >= config().publish_interval,
+                "two snapshots inside one publish interval"
+            );
+            task.abort();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    let latest = hub.latest();
-    assert_eq!(latest.state, SyncState::Synced);
-    assert_eq!(
-        names(&latest),
-        ["new"],
-        "synced was reported before the rows"
+    panic!("the relist was never reported as synced");
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_relist_reports_synced_after_its_last_listener_leaves() {
+    let fake = Fake::new();
+    fake.list(
+        "pods",
+        pod_table(&[("u1", "demo", "old", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods",
+        pod_table(&[("u2", "demo", "new", "Running")], true, "50"),
+    );
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, None);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fake.sender("pods")
+        .unwrap()
+        .send(event(
+            "ERROR",
+            json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+                   "message":"too old resource version: 1 (773)","reason":"Expired","code":410}),
+        ))
+        .unwrap();
+    until(&mut rx, |s| {
+        matches!(s.state, SyncState::Reconnecting { .. })
+    })
+    .await;
+    // The list is done and its synced state waits for the next snapshot.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(fake.list_calls("pods"), 2);
+    assert!(matches!(hub.state(), SyncState::Reconnecting { .. }));
+    drop(rx);
+    tokio::time::sleep(config().publish_interval).await;
+    assert_eq!(hub.state(), SyncState::Synced);
+    assert!(
+        matches!(hub.latest().state, SyncState::Reconnecting { .. }),
+        "no snapshot is built for nobody"
     );
     task.abort();
 }

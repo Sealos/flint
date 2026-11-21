@@ -191,6 +191,8 @@ pub(crate) struct Engine {
     feed: Feed,
     synced_once: bool,
     dirty: bool,
+    /// `state` is synced but the hub has not been told: the next snapshot says so with the rows.
+    synced_held: bool,
     last_publish: Option<Instant>,
     /// 403s and 404s of lists in a row; reset by a successful list.
     denials: u32,
@@ -236,6 +238,7 @@ impl Engine {
             feed: Feed::Watch,
             synced_once: false,
             dirty: true,
+            synced_held: false,
             last_publish: None,
             denials: 0,
         }
@@ -293,22 +296,33 @@ impl Engine {
             self.hub.set_state(self.epoch, &state);
             self.state = state;
             self.dirty = true;
+            self.synced_held = false;
         }
     }
 
-    /// Marks a finished list as synced. When that is news to a listener, the rows go out now
-    /// with the state, so a status display never reports live ahead of them.
-    fn set_listed(&mut self) {
+    /// Marks the rows as current. When that is news to a listener, the hub learns it from the
+    /// next snapshot, at the usual deadline, so a status display never reports live ahead of
+    /// the rows and a view gets no extra update.
+    fn set_synced(&mut self) {
         if self.state != SyncState::Synced && self.audience() > 0 {
             self.state = SyncState::Synced;
-            self.publish();
+            self.dirty = true;
+            self.synced_held = true;
         }
         self.set_state(SyncState::Synced);
     }
 
-    /// When the next snapshot is due: never while nobody listens or nothing changed.
+    /// Tells the hub about a synced state held for a snapshot that will not be sent.
+    fn report_held_synced(&mut self) {
+        if std::mem::take(&mut self.synced_held) {
+            self.hub.set_state(self.epoch, &self.state);
+        }
+    }
+
+    /// When the next snapshot is due: never while nobody listens or nothing changed. A held
+    /// synced state stays due, so it is reported even if the last listener has left.
     fn deadline(&self) -> Option<Instant> {
-        if !self.dirty || self.audience() == 0 {
+        if !self.dirty || (self.audience() == 0 && !self.synced_held) {
             return None;
         }
         Some(match self.last_publish {
@@ -333,9 +347,19 @@ impl Engine {
         });
     }
 
+    /// Sends a snapshot if someone listens; otherwise only a held state is recorded.
     fn publish(&mut self) {
+        if self.send_snapshot() {
+            self.synced_held = false;
+        } else {
+            self.report_held_synced();
+        }
+    }
+
+    /// Builds and sends a snapshot. Returns whether the hub took one.
+    fn send_snapshot(&mut self) -> bool {
         if self.audience() == 0 {
-            return;
+            return false;
         }
         let base = KindSnapshot {
             cluster: self.cluster.clone(),
@@ -345,9 +369,10 @@ impl Engine {
             ..Default::default()
         };
         let snapshot = self.store.snapshot(base);
-        self.hub.publish(self.epoch, snapshot);
+        let sent = self.hub.publish(self.epoch, snapshot);
         self.dirty = false;
         self.last_publish = Some(Instant::now());
+        sent
     }
 
     /// Awaits `fut` while publishing due snapshots. The deadline is checked first, so a burst
@@ -384,6 +409,8 @@ impl Engine {
             if self.audience() > 0 {
                 return None;
             }
+            // This wait runs no publish deadline, and nobody is left to send a snapshot to.
+            self.report_held_synced();
             tokio::select! {
                 permit = &mut acquire => return permit.ok(),
                 // A subscriber arrived: check again, and publish what was held back.
@@ -493,7 +520,7 @@ impl Engine {
                 }
             };
             self.synced_once = true;
-            self.set_listed();
+            self.set_synced();
             backoff.reset();
             loop {
                 let mut events = match stream.take() {
@@ -543,7 +570,7 @@ impl Engine {
                 retrying_watch = false;
                 self.watch_denials = 0;
                 self.set_feed(Feed::Watch);
-                self.set_state(SyncState::Synced);
+                self.set_synced();
                 let started = Instant::now();
                 let end = self.consume(&mut events, &mut rv, false).await;
                 let healthy = started.elapsed() >= Duration::from_secs(30);
@@ -772,7 +799,7 @@ impl Engine {
             match result {
                 Ok(rv) => {
                     backoff.reset();
-                    self.set_listed();
+                    self.set_synced();
                     if retry_at.is_some_and(|at| Instant::now() >= at) {
                         return Some(rv);
                     }
