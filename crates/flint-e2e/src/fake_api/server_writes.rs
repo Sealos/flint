@@ -1,16 +1,82 @@
-//! The writes the resource actions send: `PATCH` and `DELETE` of an object, and a pod's
-//! `eviction`. Each checks what the API server checks, and tells watches.
+//! The writes the fake server applies: `POST` to a collection (with
+//! [`Options::accept_creates`]), `PUT`, `PATCH` and `DELETE` of an object, a pod's `eviction`
+//! and a `PATCH` of `scale`. Each checks what the API server checks and tells watches; with
+//! `dryRun=All` it checks and answers, and stores nothing.
 
 // module-tests: ../../tests/write_actions.rs
 
 use serde_json::json;
 
 use super::*;
+use crate::record::normalize::stable_uid;
 
-/// Whether this request is one of these writes.
-pub(super) fn handles(method: &Method, route: &Route) -> bool {
+/// A write with its body read.
+pub(super) struct WriteRequest {
+    pub(super) method: Method,
+    pub(super) content_type: String,
+    pub(super) body: Bytes,
+}
+
+/// Whether a request is a write to record: a mutating method, and not a stream being opened.
+pub(super) fn is_write(method: &Method, route: &Route, upgrade: bool) -> bool {
+    let mutating = [Method::POST, Method::PUT, Method::PATCH, Method::DELETE].contains(method);
+    mutating && !upgrade && route.subresource() != Some("exec")
+}
+
+/// Reads a write's body.
+pub(super) async fn read(req: Request<Incoming>) -> Result<WriteRequest, ApiError> {
+    let method = req.method().clone();
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = req
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?
+        .to_bytes();
+    Ok(WriteRequest {
+        method,
+        content_type,
+        body,
+    })
+}
+
+/// The `DeleteOptions` a delete or an eviction carries in its body.
+pub(super) fn delete_options<'a>(
+    method: &Method,
+    route: &Route,
+    body: &'a Value,
+) -> Option<&'a Value> {
     match route {
-        Route::Object { .. } => method == Method::PATCH || method == Method::DELETE,
+        Route::Object { .. } if method == Method::DELETE => Some(body),
+        Route::Subresource {
+            gvr, subresource, ..
+        } if method == Method::POST && *gvr == Gvr::core("pods") && subresource == "eviction" => {
+            body.get("deleteOptions")
+        }
+        _ => None,
+    }
+}
+
+/// Whether `DeleteOptions` ask for a dry run: `"dryRun": ["All"]`.
+pub(super) fn asks_dry_run(options: &Value) -> bool {
+    options
+        .get("dryRun")
+        .and_then(Value::as_array)
+        .is_some_and(|stages| stages.iter().any(|stage| stage == "All"))
+}
+
+/// Whether this server applies this write.
+pub(super) fn handles(inner: &Inner, method: &Method, route: &Route) -> bool {
+    match route {
+        Route::Collection { .. } => inner.options.accept_creates && method == Method::POST,
+        Route::Object { .. } => {
+            method == Method::PATCH || method == Method::DELETE || method == Method::PUT
+        }
         Route::Subresource {
             gvr, subresource, ..
         } => {
@@ -21,11 +87,18 @@ pub(super) fn handles(method: &Method, route: &Route) -> bool {
     }
 }
 
-pub(super) async fn serve(
+pub(super) fn serve(
     inner: &Arc<Inner>,
-    req: Request<Incoming>,
+    write: &WriteRequest,
     route: &Route,
+    query: &Query,
 ) -> Result<Response<Body>, ApiError> {
+    if let Route::Collection { gvr, namespace } = route {
+        return create(inner, gvr, namespace.as_deref(), &write.body, query.dry_run);
+    }
+    if write.method == Method::PUT {
+        return put_object(inner, write, route, query);
+    }
     let (gvr, namespace, name) = match route {
         Route::Object {
             gvr,
@@ -41,42 +114,140 @@ pub(super) async fn serve(
         _ => return Err(ApiError::not_found("not an object")),
     };
     known(inner, gvr, namespace)?;
-    let method = req.method().clone();
-    let content_type = req
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    let bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?
-        .to_bytes();
-    let body: Value = if bytes.is_empty() {
+    let body: Value = if write.body.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes)
+        serde_json::from_slice(&write.body)
             .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?
     };
-    if method == Method::PATCH {
+    let dry_run = query.dry_run;
+    if write.method == Method::PATCH {
         if matches!(route, Route::Subresource { .. }) {
-            return patch_scale(inner, gvr, namespace, name, &body);
+            return patch_scale(inner, gvr, namespace, name, &body, dry_run);
         }
-        return patch(inner, gvr, namespace, name, &content_type, &body);
+        let content_type = write.content_type.as_str();
+        return patch(inner, gvr, namespace, name, content_type, &body, dry_run);
     }
-    let (options, code) = if method == Method::POST {
-        (body.get("deleteOptions").unwrap_or(&Value::Null), 201)
+    let options = delete_options(&write.method, route, &body).unwrap_or(&Value::Null);
+    let code = if write.method == Method::POST {
+        201
     } else {
-        (&body, 200)
+        200
     };
-    remove(inner, gvr, namespace, name, options)?;
+    let dry_run = dry_run || asks_dry_run(options);
+    remove(inner, gvr, namespace, name, options, dry_run)?;
     Ok(json_with(
         code,
         "application/json",
         &json!({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Success"}),
     ))
+}
+
+/// Creates an object from a `POST`: the name is the body's or made from `generateName`, the
+/// namespace the path's, and the metadata only the API server sets is its own.
+fn create(
+    inner: &Arc<Inner>,
+    gvr: &Gvr,
+    namespace: Option<&str>,
+    body: &[u8],
+    dry_run: bool,
+) -> Result<Response<Body>, ApiError> {
+    let resource = known(inner, gvr, namespace)?;
+    if resource.namespaced && namespace.is_none() {
+        return Err(ApiError::new(
+            405,
+            "MethodNotAllowed",
+            format!("{} are created in a namespace", gvr.resource),
+        ));
+    }
+    if !resource.supports("create") {
+        return Err(ApiError::new(
+            405,
+            "MethodNotAllowed",
+            format!("create is not supported on {}", gvr.resource),
+        ));
+    }
+    let mut object: Value = serde_json::from_slice(body)
+        .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?;
+    let sent_namespace = object
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str);
+    if sent_namespace.is_some_and(|sent| Some(sent) != namespace) {
+        return Err(ApiError::new(
+            400,
+            "BadRequest",
+            "the namespace does not match",
+        ));
+    }
+    let mut state = lock(&inner.state);
+    let text = |field: &str| {
+        object
+            .pointer(&format!("/metadata/{field}"))
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let name = match (text("name"), text("generateName")) {
+        (Some(name), _) => name,
+        (None, Some(prefix)) => format!("{prefix}{:05x}", state.resource_version() + 1),
+        (None, None) => {
+            return Err(ApiError::new(
+                422,
+                "Invalid",
+                "metadata.name: Required value: name or generateName is required",
+            ));
+        }
+    };
+    if state.row(gvr, namespace, &name).is_some() {
+        return Err(ApiError::new(
+            409,
+            "AlreadyExists",
+            format!("{} \"{name}\" already exists", gvr.resource),
+        ));
+    }
+    let identity = format!(
+        "fake-create/{gvr}/{}/{name}/{}",
+        namespace.unwrap_or_default(),
+        state.resource_version()
+    );
+    let has_spec = object.get("spec").is_some();
+    let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return Err(ApiError::new(
+            400,
+            "BadRequest",
+            "the object has no metadata",
+        ));
+    };
+    for field in SERVER_METADATA {
+        meta.remove(field);
+    }
+    meta.insert("name".into(), name.into());
+    meta.insert("uid".into(), stable_uid(&identity).into());
+    meta.insert("creationTimestamp".into(), inner.clock.fixture_now().into());
+    if has_spec {
+        meta.insert("generation".into(), 1.into());
+    }
+    if let Some(namespace) = namespace {
+        meta.insert("namespace".into(), namespace.into());
+    }
+    let stored = if dry_run {
+        state
+            .row_for_object(gvr, &mut object, &[])
+            .map_err(|e| ApiError::new(400, "BadRequest", e))?;
+        object
+    } else {
+        let row = state
+            .row_for_object(gvr, &mut object, &[])
+            .map_err(|e| ApiError::new(400, "BadRequest", e))?;
+        let change = state.apply_object(gvr, "ADDED", object, row);
+        let stored = change.object.clone();
+        tell_watches(inner, gvr, change);
+        stored
+    };
+    drop(state);
+    let mut stored = stored;
+    inner.clock.rebase(&mut stored);
+    Ok(json_with(201, "application/json", &stored))
 }
 
 /// The answer to a JSON Patch whose `test` failed: Invalid, with no field named.
@@ -97,6 +268,7 @@ fn patch(
     name: &str,
     content_type: &str,
     body: &Value,
+    dry_run: bool,
 ) -> Result<Response<Body>, ApiError> {
     let mut state = lock(&inner.state);
     let mut object = state.object(gvr, namespace, name)?;
@@ -117,6 +289,14 @@ fn patch(
             return Err(error);
         }
         merge(&mut object, body);
+    }
+    // Checked first, so a dry run refuses what the write would, and a refusal moves no version.
+    state
+        .row_for_object(gvr, &mut object, &[])
+        .map_err(|e| ApiError::new(400, "BadRequest", e))?;
+    if dry_run {
+        drop(state);
+        return Ok(rebased(inner, object));
     }
     let version = state.bump();
     object["metadata"]["resourceVersion"] = version.to_string().into();
@@ -160,6 +340,7 @@ fn patch_scale(
     namespace: Option<&str>,
     name: &str,
     body: &Value,
+    dry_run: bool,
 ) -> Result<Response<Body>, ApiError> {
     let operations = body
         .as_array()
@@ -183,6 +364,10 @@ fn patch_scale(
         "spec": spec,
     });
     apply_json_patch(&mut scale, operations)?;
+    if dry_run {
+        drop(state);
+        return Ok(rebased(inner, scale));
+    }
     let to = scale.pointer("/spec/replicas").cloned().unwrap_or(json!(0));
     object["spec"]["replicas"] = to;
     let version = state.bump();
@@ -216,13 +401,14 @@ fn merge(into: &mut Value, patch: &Value) {
     }
 }
 
-/// Removes the object, if `options` name its uid or none.
+/// Removes the object, if `options` name its uid or none; a dry run only checks.
 fn remove(
     inner: &Arc<Inner>,
     gvr: &Gvr,
     namespace: Option<&str>,
     name: &str,
     options: &Value,
+    dry_run: bool,
 ) -> Result<(), ApiError> {
     let mut state = lock(&inner.state);
     let object = state.object(gvr, namespace, name)?;
@@ -233,6 +419,9 @@ fn remove(
             "Conflict",
             format!("the uid of \"{name}\" does not match the precondition"),
         ));
+    }
+    if dry_run {
+        return Ok(());
     }
     let row = state
         .row(gvr, namespace, name)
