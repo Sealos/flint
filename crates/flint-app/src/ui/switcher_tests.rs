@@ -357,8 +357,10 @@ async fn searching_never_reaches_the_cluster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let _stored = alpha_with_objects(cx, &t).await;
-    // Whatever connecting alpha did, before the switcher opens.
-    while t.server_was_contacted() {}
+    // Activating alpha starts one real connection, which reaches the server on its own task,
+    // possibly well after "connecting" is reported. Wait for it, and keep it open and unanswered,
+    // so that any connection from here on is the switcher's.
+    let _activation = t.wait_for_contact(cx).await;
     let core = t.model.read_with(cx, |m, _| m.core().clone());
     let hubs = core.sync_states("alpha");
 

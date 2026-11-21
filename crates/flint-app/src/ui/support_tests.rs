@@ -6,7 +6,7 @@
 //! [`ClustersModel`]'s in `clusters_tests.rs`.
 
 use std::cell::RefCell;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -609,6 +609,25 @@ impl TestWorkspace {
     /// `settings.toml` as written, or empty.
     pub fn settings_toml(&self) -> String {
         std::fs::read_to_string(self.dir.join("settings.toml")).unwrap_or_default()
+    }
+
+    /// Waits for the next connection to the silent server (`alpha`'s) and returns it. While it
+    /// is held, open and unanswered, the attempt that made it neither fails nor retries.
+    pub async fn wait_for_contact(&self, cx: &mut TestAppContext) -> TcpStream {
+        let listener = self.listener.try_clone().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepted: Rc<RefCell<Option<TcpStream>>> = Rc::default();
+        let slot = accepted.clone();
+        cx.wait_for(self.window, WAIT, move |_, _| match listener.accept() {
+            Ok((stream, _)) => {
+                *slot.borrow_mut() = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("accept: {e}"),
+        })
+        .await;
+        accepted.take().expect("a connection was accepted")
     }
 
     /// Whether anything has connected to the silent server (`alpha`'s) so far.
