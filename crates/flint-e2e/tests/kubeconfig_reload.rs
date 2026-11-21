@@ -625,12 +625,12 @@ async fn until_scope(config: &std::path::Path, scope: &AiScope) {
     .expect("the scope saved in time");
 }
 
-/// Waits for the notice that a scope was not widened.
-async fn until_not_widened(events: &flint_core::events::Events) {
+/// Waits for an error notice containing `text`.
+async fn until_notice(events: &flint_core::events::Events, text: &str) {
     tokio::time::timeout(WAIT, async {
         loop {
             if let Event::Error(notice) = events.recv().await.expect("core running")
-                && notice.contains("was not widened")
+                && notice.contains(text)
             {
                 return;
             }
@@ -650,7 +650,7 @@ async fn only_narrows(
 ) {
     let events = core.events();
     set_scope(core, server, wide, &AiScope::default());
-    until_not_widened(&events).await;
+    until_notice(&events, "was not widened").await;
     let saved = settings::load_settings(config).unwrap();
     assert_eq!(saved.ai_exposed_clusters[0].scope(), *wide);
     set_scope(core, server, wide, narrow);
@@ -713,17 +713,7 @@ async fn a_fallback_definition_refuses_new_trust_and_wider_scope() {
     core.reload_kubeconfig().await.unwrap();
     let events = core.events();
     core.trust(CONTEXT, &server.url());
-    tokio::time::timeout(WAIT, async {
-        loop {
-            if let Event::Error(notice) = events.recv().await.expect("core running")
-                && notice.contains("was not trusted")
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("the pin refused in time");
+    until_notice(&events, "was not trusted").await;
     let saved = settings::load_settings(&config).unwrap();
     assert!(saved.trusted_clusters.is_empty());
     only_narrows(&core, &server, &config, &wide, &narrow).await;
@@ -744,5 +734,45 @@ async fn a_fallback_definition_refuses_new_trust_and_wider_scope() {
     core.reload_kubeconfig().await.unwrap();
     core.trust(CONTEXT, &server.url());
     expose(&core, Some(server.url()));
+    until_pins(&config, 1).await;
+}
+
+// covers UP-06, UP-55: Trust, exposure and a wider scope are checked against the files as they
+// are now, with no reload since they changed. Narrowing still saves, and the same file allows
+// them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_access_increase_checks_the_files_as_they_are_now() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = protected_core(&server, dir.path(), &path).await;
+    let whole = std::fs::read_to_string(&path).unwrap();
+    let config = dir.path().join("config");
+    let (wide, narrow) = (namespaces(&["demo", "other"]), namespaces(&["demo"]));
+    core.send(Command::SetAiExposed {
+        cluster: CONTEXT.to_owned(),
+        server: Some(server.url()),
+        scope: wide.clone(),
+    });
+    until_scope(&config, &wide).await;
+
+    let moved = whole.replace(&server.url(), "https://127.0.0.1:1");
+    assert_ne!(moved, whole);
+    for changed in [BROKEN, moved.as_str()] {
+        std::fs::write(&path, changed).unwrap();
+        let events = core.events();
+        core.trust(CONTEXT, &server.url());
+        until_notice(&events, "was not trusted").await;
+        expose(&core, Some(server.url()));
+        until_notice(&events, "was not exposed").await;
+        let saved = settings::load_settings(&config).unwrap();
+        assert!(saved.trusted_clusters.is_empty());
+        only_narrows(&core, &server, &config, &wide, &narrow).await;
+
+        std::fs::write(&path, &whole).unwrap();
+        set_scope(&core, &server, &narrow, &wide);
+        until_scope(&config, &wide).await;
+    }
+    core.trust(CONTEXT, &server.url());
     until_pins(&config, 1).await;
 }
