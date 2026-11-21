@@ -1434,17 +1434,17 @@ impl Render for ResourceList {
                         ),
                 )
                 // Visible whenever the columns are wider than the pane, so it is clear that
-                // more columns are to the right.
-                .when(available.is_some_and(|w| total_width > w), |el| {
-                    el.child(
-                        div().absolute().inset_0().child(
-                            Scrollbar::horizontal(&self.hscroll)
-                                .id("list-hscrollbar")
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
-                    )
-                })
+                // more columns are to the right. Always mounted: it hides itself using this
+                // frame's layout, while `available` is a frame old, and its state then lives
+                // and dies with the list instead of following pane resizes.
+                .child(
+                    div().absolute().inset_0().child(
+                        Scrollbar::horizontal(&self.hscroll)
+                            .id("list-hscrollbar")
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+                )
                 .into_any_element(),
         };
         // The rows have focus (not the filter): ringed, as Tab between panes shows (UP-33).
