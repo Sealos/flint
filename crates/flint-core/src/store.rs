@@ -221,6 +221,8 @@ impl Store {
 
     /// Starts a full list. Until [`Store::finish_resync`], changes go to a separate map.
     pub fn begin_resync(&mut self) {
+        // A list started over is abandoned first, so its strings do not count as held.
+        self.abandon_resync();
         self.pending = Some(HashMap::new());
         self.pending_layout = self.layout.clone();
         self.interner.begin_relist();
@@ -251,8 +253,12 @@ impl Store {
 
     /// Drops an unfinished list.
     pub fn abandon_resync(&mut self) {
-        self.pending = None;
         self.pending_layout = None;
+        // Its strings are in no row now. Dropped here, they cannot look like a list this size
+        // to the next relist, and a large failed list gives its table back.
+        if self.pending.take().is_some() {
+            self.interner.prune();
+        }
     }
 
     /// Applies an added, modified, listed, or (`delete`) deleted object. Rows collected by a
@@ -397,6 +403,71 @@ mod tests {
 
     fn obj(rows: &[(&str, &str, &str, &str)], rv: &str) -> WireObject {
         serde_json::from_value(pod_table(rows, true, rv)).unwrap()
+    }
+
+    /// A list of `size` pods, all strings its own, applied to `store`'s list in progress.
+    fn list_pods(store: &mut Store, poll: usize, size: usize) {
+        for i in 0..size {
+            let (uid, name, status) = (
+                format!("u{poll}-{i}"),
+                format!("pod-{poll}-{i}"),
+                format!("status-{poll}-{i}"),
+            );
+            store.apply(obj(&[(&uid, "demo", &name, &status)], "1"), false, 0);
+        }
+    }
+
+    // covers UP-20: failed polls leave nothing behind, so a retry of the same size is no
+    // scale-down from them.
+    #[test]
+    fn failed_polls_do_not_make_a_retry_shrink_the_interner() {
+        let size = 300;
+        let mut store = Store::new(true);
+        store.begin_resync();
+        list_pods(&mut store, 0, size);
+        store.finish_resync();
+        let listed = store.interned();
+        for failed in 1..=3 {
+            store.begin_resync();
+            list_pods(&mut store, failed, size);
+            assert!(store.interned() > listed);
+            store.abandon_resync();
+            assert_eq!(store.interned(), listed, "poll {failed}'s strings are gone");
+        }
+        store.begin_resync();
+        list_pods(&mut store, 4, size);
+        store.finish_resync();
+        assert_eq!(store.interned(), listed);
+        assert_eq!(store.interner.shrinks(), 0);
+    }
+
+    // covers UP-20: a list started over without finishing counts as failed.
+    #[test]
+    fn a_list_started_over_drops_the_strings_of_the_first_try() {
+        let mut store = Store::new(true);
+        store.begin_resync();
+        list_pods(&mut store, 0, 100);
+        store.begin_resync();
+        assert_eq!(store.interned(), 0);
+    }
+
+    // covers UP-20: a large list that fails gives its table back, though the next poll reuses
+    // the few strings of the last good list and inserts nothing new.
+    #[test]
+    fn a_large_failed_list_gives_its_table_back() {
+        let mut store = Store::new(true);
+        store.begin_resync();
+        list_pods(&mut store, 0, 10);
+        store.finish_resync();
+        store.begin_resync();
+        list_pods(&mut store, 1, 20_000);
+        let big = store.interner.capacity();
+        store.abandon_resync();
+        assert!(
+            store.interner.capacity() < big / 4,
+            "{}",
+            store.interner.capacity()
+        );
     }
 
     // covers UP-31: the revision moves when rows change or a list completes, and never when
