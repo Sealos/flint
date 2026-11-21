@@ -820,22 +820,63 @@ async fn put_object(
     if object.pointer("/metadata/name").and_then(Value::as_str) != Some(name) {
         return Err(ApiError::new(400, "BadRequest", "the name does not match"));
     }
+    let sent_namespace = object
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str);
+    if sent_namespace.is_some_and(|sent| Some(sent) != ns) {
+        return Err(ApiError::new(
+            400,
+            "BadRequest",
+            "the namespace does not match",
+        ));
+    }
+    keep_server_metadata(&mut object, &current, ns);
     if query.dry_run {
         return Ok(rebased(inner, object));
     }
-    let version = state.bump();
-    object["metadata"]["resourceVersion"] = version.to_string().into();
-    let row = state
-        .row_for_object(gvr, &mut object, &[])
+    let change = state
+        .replace_object(gvr, object)
         .map_err(|e| ApiError::new(400, "BadRequest", e))?;
-    let change = state.apply_object(gvr, "MODIFIED", object.clone(), row);
+    let stored = change.object.clone();
     let outgoing = Outgoing::Event(Box::new(change));
     lock(&inner.watchers)
         .entry(gvr.clone())
         .or_default()
         .retain(|w| w.tx.send(outgoing.clone()).is_ok());
     drop(state);
-    Ok(rebased(inner, object))
+    Ok(rebased(inner, stored))
+}
+
+/// The metadata only the API server sets: a replacement can neither change nor clear it.
+const SERVER_METADATA: [&str; 6] = [
+    "uid",
+    "creationTimestamp",
+    "resourceVersion",
+    "generation",
+    "deletionTimestamp",
+    "deletionGracePeriodSeconds",
+];
+
+/// What a replacement cannot change or clear: the fields the API server owns, from `current`
+/// (`generation` goes up with a new `spec`), and the namespace of the request's path. Labels,
+/// annotations and the rest are the body's.
+fn keep_server_metadata(object: &mut Value, current: &Value, namespace: Option<&str>) {
+    let spec_changed = object.get("spec") != current.get("spec");
+    let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in SERVER_METADATA {
+        match current.pointer(&format!("/metadata/{field}")) {
+            Some(live) => meta.insert(field.into(), live.clone()),
+            None => meta.remove(field),
+        };
+    }
+    if spec_changed && let Some(generation) = meta.get("generation").and_then(Value::as_i64) {
+        meta.insert("generation".into(), (generation + 1).into());
+    }
+    if let Some(namespace) = namespace {
+        meta.insert("namespace".into(), namespace.into());
+    }
 }
 
 /// Answers a request: an exec is upgraded (or refused), anything else answered at once.

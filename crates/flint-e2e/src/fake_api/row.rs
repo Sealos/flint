@@ -134,6 +134,15 @@ impl FakeRow {
         }
     }
 
+    /// Makes the row's metadata exactly `metadata`, without `managedFields`, which a Table row
+    /// does not carry.
+    pub(crate) fn replace_metadata(&mut self, metadata: &Value) {
+        if let (Some(meta), Some(from)) = (self.metadata_mut(), metadata.as_object()) {
+            *meta = from.clone();
+            meta.remove("managedFields");
+        }
+    }
+
     /// Whether this row is the object `namespace`/`name`.
     pub(crate) fn is(&self, namespace: Option<&str>, name: &str) -> bool {
         self.namespace() == namespace && self.name() == name
