@@ -849,7 +849,14 @@ async fn a_marker_added_after_the_review_is_a_conflict() {
         assert_eq!(result.unwrap_err(), WriteError::Conflict, "{path}");
         let seen = since(&server, from);
         assert_eq!(writes_in(&seen), 0, "{seen:?}");
-        assert_eq!(seen[0], (http::Method::GET, path.to_owned()));
+        // Unrelated discovery traffic may interleave; only the reviewed object's requests count.
+        let object = |(_, p): &&(http::Method, String)| p == path;
+        let for_object: Vec<_> = seen.iter().filter(object).collect();
+        assert_eq!(
+            for_object,
+            [&(http::Method::GET, path.to_owned())],
+            "{path}: {seen:?}"
+        );
     }
 }
 
