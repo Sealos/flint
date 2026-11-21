@@ -33,6 +33,11 @@ pub mod table;
 pub mod terminal;
 pub mod view;
 mod watch;
+#[allow(
+    dead_code,
+    reason = "the action bodies; `write::run_write` calls them when it lands"
+)]
+mod write_actions;
 
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
 pub use discovery::{

@@ -509,6 +509,43 @@ enum Access {
     Unrestricted,
 }
 
+/// kube's retry policy for `GET`s only. A write is sent once: each one asks the write gate first,
+/// and a refused or conflicting one goes back to the user.
+#[derive(Clone)]
+struct ReadRetry(kube::client::retry::RetryPolicy);
+
+impl<Res>
+    tower::retry::Policy<http::Request<kube::client::Body>, http::Response<Res>, tower::BoxError>
+    for ReadRetry
+{
+    type Future = tokio::time::Sleep;
+
+    fn retry(
+        &mut self,
+        request: &mut http::Request<kube::client::Body>,
+        result: &mut Result<http::Response<Res>, tower::BoxError>,
+    ) -> Option<Self::Future> {
+        if request.method() != http::Method::GET {
+            return None;
+        }
+        tower::retry::Policy::retry(&mut self.0, request, result)
+    }
+
+    fn clone_request(
+        &mut self,
+        request: &http::Request<kube::client::Body>,
+    ) -> Option<http::Request<kube::client::Body>> {
+        if request.method() != http::Method::GET {
+            return None;
+        }
+        <kube::client::retry::RetryPolicy as tower::retry::Policy<
+            http::Request<kube::client::Body>,
+            http::Response<Res>,
+            tower::BoxError,
+        >>::clone_request(&mut self.0, request)
+    }
+}
+
 /// The TCP connector under every client: kube's (`enforce_http(false)`, so HTTPS is allowed),
 /// with [`KEEPALIVE`].
 fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
@@ -557,7 +594,7 @@ fn build_client(
         .option_layer(
             config
                 .default_retry
-                .then(|| RetryLayer::new(RetryPolicy::server_retry())),
+                .then(|| RetryLayer::new(ReadRetry(RetryPolicy::server_retry()))),
         )
         .option_layer(auth)
         .option_layer(token)
@@ -923,6 +960,44 @@ mod tests {
     }
 
     // covers UP-04
+    // covers UP-53: a write answered 429 is sent once; only reads are retried.
+    #[tokio::test]
+    async fn writes_are_never_retried() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use http::Request;
+        use kube::client::Body;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await;
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\
+                          connection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let config = kube::Config::new(url.parse().unwrap());
+        assert!(config.default_retry, "the retry layer is on");
+        let client = build_client(&config, None, None, Access::Unrestricted).unwrap();
+        let request = Request::post("/api/v1/namespaces/demo/pods/web/eviction")
+            .body(Body::from(b"{}".to_vec()))
+            .unwrap();
+        let response = client.send(request).await.unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
     // covers UP-54: a read-only client refuses writes and tunnels without touching the server,
     // and still sends reads.
     #[tokio::test]
