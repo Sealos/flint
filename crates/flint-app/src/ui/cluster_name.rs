@@ -58,7 +58,7 @@ fn dialog(context: &str, server: Option<&str>) -> DialogText {
             "Shown instead of the context name, in Flint only. kubeconfig is not changed, and AI \
              agents and shells keep the context name. Leave it empty to use the context name \
              again.\n\nContext: {context}\nServer: {}",
-            server.unwrap_or("no server")
+            super::workspace::server_text(server)
         ),
         ok: "Rename".into(),
         cancel: "Cancel".into(),
@@ -205,5 +205,15 @@ mod tests {
         assert!(text.contains(&format!("Context: {arn}")), "{text}");
         assert!(text.contains("Server: https://example.invalid"), "{text}");
         assert!(text.contains("kubeconfig is not changed"), "{text}");
+    }
+
+    #[test]
+    fn the_dialog_shows_the_cleaned_server_address() {
+        let text = dialog("alpha", Some("https://admin:hunter2@prod.example:6443")).text;
+        assert!(text.contains("Server: https://prod.example:6443"), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("admin"),
+            "{text}"
+        );
     }
 }

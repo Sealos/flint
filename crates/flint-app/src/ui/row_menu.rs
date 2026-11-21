@@ -112,7 +112,7 @@ pub struct UnlockEntry {
 
 /// The tooltip of the Unlock entry: exactly which cluster it unlocks.
 fn unlock_tip(context: &str, server: Option<&str>) -> String {
-    format!("{context}\n{}", server.unwrap_or("no server"))
+    format!("{context}\n{}", super::workspace::server_text(server))
 }
 
 /// What the selected row's actions can do now, if its kind has any. The actions' guards
@@ -676,6 +676,16 @@ pub(in crate::ui) mod tests {
 
     // The state names a row menu's entries as `fill` draws them: plain entries with why they are
     // disabled, pickers with their containers, and the cluster's reason once above.
+    #[test]
+    fn the_unlock_tip_shows_the_cleaned_server_address() {
+        let tip = unlock_tip(
+            "alpha",
+            Some("https://admin:hunter2@prod.example:6443/?token=abc"),
+        );
+        assert_eq!(tip, "alpha\nhttps://prod.example:6443");
+        assert_eq!(unlock_tip("alpha", None), "alpha\nno server");
+    }
+
     #[test]
     fn a_row_menus_entries_are_named_as_drawn() {
         assert_eq!(

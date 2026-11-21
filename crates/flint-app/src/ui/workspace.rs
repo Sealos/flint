@@ -1307,7 +1307,8 @@ impl Workspace {
         let server = cluster.info.server.clone();
         let title = names.of(&name);
         // With a custom name, it starts with the real one: the row always says which cluster.
-        let subtitle = names.subtitle(&name, cluster.info.server_host());
+        let host = cluster.info.server.as_deref().map(shown_host);
+        let subtitle = names.subtitle(&name, host.as_deref());
         let state_text = match (presence, &cluster.state) {
             (Presence::Reconnecting { error }, _) => reconnecting_text(error),
             (Presence::Idle, ConnectionState::Connected(v)) => format!(
@@ -1327,14 +1328,15 @@ impl Workspace {
                 scope_picker::summary(&ai_scope.clone().unwrap_or_default())
             ),
             AiExposureState::ServerChanged { exposed_server } => format!(
-                "Cluster changed: exposed at {exposed_server}, now points elsewhere. Hidden from \
-                 AI agents until you expose it again."
+                "Cluster changed: exposed at {}, now points elsewhere. Hidden from AI agents \
+                 until you expose it again.",
+                flint_core::redact::server_url(exposed_server)
             ),
         };
         let hover_text = format!(
             "{}\n{}\n{}\n{}\n{}\nfrom {}",
             name,
-            server.as_deref().unwrap_or("no server"),
+            server_text(server.as_deref()),
             state_text,
             protection_text(protection, &trust),
             exposure_text,
@@ -1387,6 +1389,7 @@ impl Workspace {
                     .child(
                         div()
                             .id(SharedString::from(format!("cluster-server-{name}")))
+                            .aria_label(subtitle.clone())
                             .text_xs()
                             .line_height(px(14.))
                             .truncate()
@@ -1589,10 +1592,7 @@ impl Workspace {
 
         let mut crumbs: Vec<(SharedString, String)> = vec![(
             self.model.read(cx).names().of(&name).into(),
-            format!(
-                "{name}\n{}",
-                cluster.info.server.as_deref().unwrap_or("no server")
-            ),
+            format!("{name}\n{}", server_text(cluster.info.server.as_deref())),
         )];
         // The namespaces are not a crumb: the namespace filter next to it already shows them.
         if let Some(list) = list {
@@ -1922,7 +1922,8 @@ fn protection_text(protection: Protection, trust: &TrustState) -> String {
     };
     match trust {
         TrustState::ServerChanged { trusted_server } if protection != Protection::Trusted => {
-            format!("{text}. Cluster changed: trusted at {trusted_server}, now points elsewhere")
+            let trusted = flint_core::redact::server_url(trusted_server);
+            format!("{text}. Cluster changed: trusted at {trusted}, now points elsewhere")
         }
         _ => text.to_owned(),
     }
@@ -2072,6 +2073,30 @@ fn render_lock_button(
     )
 }
 
+/// A server URL as the UI shows it ([`flint_core::redact::server_url`]), or "no server". Pins
+/// are compared on the exact URL, never on this text.
+pub(super) fn server_text(server: Option<&str>) -> String {
+    server.map_or("no server".to_owned(), flint_core::redact::server_url)
+}
+
+/// The host and port of a server URL as the UI shows it, for a row's compact second line.
+fn shown_host(server: &str) -> String {
+    let shown = flint_core::redact::server_url(server);
+    let rest = shown.split_once("://").map_or(shown.as_str(), |(_, r)| r);
+    rest.split('/').next().unwrap_or(rest).to_owned()
+}
+
+/// How a dialog names the server a pin was made for. Two different URLs can show as the same
+/// text, and "trusted at X, which is a different server" would then read as a contradiction.
+fn previous_address(server: &str, previous: &str) -> String {
+    let shown = flint_core::redact::server_url(previous);
+    if shown == flint_core::redact::server_url(server) {
+        "another URL that shows the same here".to_owned()
+    } else {
+        shown
+    }
+}
+
 /// Asks before unlocking a protected cluster until Flint quits, naming the context and its
 /// server (UP-55).
 fn confirm_unlock(
@@ -2091,6 +2116,7 @@ fn confirm_unlock(
 /// The unlock confirmation, naming the context and the server it points at. `shown` is what the
 /// title calls it ([`ClusterNames::with_real`]).
 fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
+    let server = flint_core::redact::server_url(server);
     DialogText {
         title: format!("Unlock {shown}?"),
         text: format!(
@@ -2127,6 +2153,8 @@ fn confirm_trust(
 /// The trust confirmation, naming the context and the server it points at (and the server it
 /// was trusted at before, when the context moved).
 fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let previous = previous.map(|previous| previous_address(server, previous));
+    let server = flint_core::redact::server_url(server);
     let mut text = format!(
         "A trusted cluster stays unlocked when Flint restarts: actions that change it or run \
          code in it work without asking. Trust is kept in settings.toml and pinned to this \
@@ -2177,6 +2205,7 @@ fn confirm_expose(
 
 /// The Edit AI Scope dialog of an exposed cluster: what agents may read now, and the pickers.
 fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
+    let server = flint_core::redact::server_url(server);
     DialogText {
         title: "What may AI agents read?".into(),
         text: format!(
@@ -2195,6 +2224,8 @@ fn scope_dialog(context: &str, server: &str, scope: &AiScope) -> DialogText {
 
 /// The Expose to AI confirmation, naming the context and the server it points at.
 fn expose_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+    let previous = previous.map(|previous| previous_address(server, previous));
+    let server = flint_core::redact::server_url(server);
     let mut text = format!(
         "AI agents using Flint's MCP server will be able to read this cluster: resources, events \
          and pod logs. They cannot change anything. Secret values are hidden, and so are values in \
