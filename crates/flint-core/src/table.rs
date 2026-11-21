@@ -557,6 +557,17 @@ impl Interner {
 }
 
 /// How server cells map onto a kind's columns.
+/// The role of the server column at `index` of a Table's definitions.
+pub(crate) fn wire_role(index: usize, name: &str, format: &str) -> ColumnRole {
+    if index == 0 && (name == "Name" || format == "name") {
+        ColumnRole::Name
+    } else if name.eq_ignore_ascii_case("age") {
+        ColumnRole::Age
+    } else {
+        ColumnRole::Value
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Layout {
     /// The published columns, Namespace included.
@@ -577,14 +588,7 @@ impl Layout {
             .enumerate()
             .map(|(i, d)| {
                 let ty = ColumnType::parse(&d.ty);
-                let role = if i == 0 && (d.name == "Name" || d.format == "name") {
-                    ColumnRole::Name
-                } else if d.name.eq_ignore_ascii_case("age") {
-                    ColumnRole::Age
-                } else {
-                    ColumnRole::Value
-                };
-                (ty, role)
+                (ty, wire_role(i, &d.name, &d.format))
             })
             .collect();
         let namespace_at = namespaced
