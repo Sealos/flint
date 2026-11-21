@@ -149,7 +149,7 @@ pub enum Command {
 pub(crate) enum Request {
     /// Reload the kubeconfig files, and say when that is done.
     ReloadKubeconfig {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     Subscribe {
         id: u64,
@@ -245,6 +245,41 @@ pub struct ClusterSummary {
     /// session opened on it) belongs to a cluster that is gone, whatever lists a front end skipped
     /// (#255).
     pub generation: u64,
+    /// The context's confirmed definition. A move changes it, even one a later reload undoes;
+    /// an edit that keeps the server (a rotated token, a namespace) does not.
+    pub definition: u64,
+    /// The same for the endpoint: an edit that only adds or drops a trailing slash keeps it, as
+    /// it keeps a log session running (a shell, which the write gate checks, ends).
+    pub endpoint: u64,
+    /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
+    /// kubeconfig file before it can't be read.
+    pub confirmed: bool,
+}
+
+/// What the core's answer to a reload means: `None` when it stopped without answering.
+fn reload_outcome(applied: Option<bool>) -> Result<(), ReloadError> {
+    match applied {
+        Some(true) => Ok(()),
+        Some(false) => Err(ReloadError::Failed),
+        None => Err(ReloadError::Stopped),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_reload_that_was_not_applied_is_an_error() {
+    assert_eq!(reload_outcome(Some(true)), Ok(()));
+    assert_eq!(reload_outcome(Some(false)), Err(ReloadError::Failed));
+    assert_eq!(reload_outcome(None), Err(ReloadError::Stopped));
+}
+
+/// Why [`CoreHandle::reload_kubeconfig`] did not apply a reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReloadError {
+    #[error("the core stopped before it reloaded kubeconfig")]
+    Stopped,
+    #[error("the kubeconfig files could not be loaded")]
+    Failed,
 }
 
 /// The full cluster list. Sent whole whenever kubeconfig is (re)loaded.
@@ -422,15 +457,16 @@ impl CoreHandle {
         async move { rx.await.ok().flatten() }
     }
 
-    /// Reloads the kubeconfig files now, and resolves once the reload is applied: an
-    /// acknowledgement that does not depend on the event stream or the file watcher. Works on
-    /// any executor.
-    pub fn reload_kubeconfig(&self) -> impl Future<Output = ()> + Send + 'static {
+    /// Reloads the kubeconfig files now, and resolves once the reload is applied, or with why it
+    /// was not: an acknowledgement that does not depend on the event stream or the file watcher.
+    /// A file that fails to parse does not fail the reload: it is reported in the cluster list.
+    /// Works on any executor.
+    pub fn reload_kubeconfig(
+        &self,
+    ) -> impl Future<Output = Result<(), ReloadError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
         let _ = self.requests.try_send(Request::ReloadKubeconfig { reply });
-        async move {
-            let _ = rx.await;
-        }
+        async move { reload_outcome(rx.await.ok()) }
     }
 
     /// The kinds of `cluster` being watched (or polled) right now, sorted. For status displays
