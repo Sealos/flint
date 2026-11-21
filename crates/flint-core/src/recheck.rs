@@ -118,6 +118,9 @@ pub(crate) struct Shown {
     /// The context's confirmed definition: it changes when a confirmed change moves the context,
     /// even one a later reload undoes, and not on an edit that keeps its server.
     pub definition: u64,
+    /// [`Self::definition`] for the endpoint: an edit that only adds or drops a trailing slash
+    /// keeps it, as it keeps a log session running.
+    pub endpoint: u64,
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,
@@ -272,10 +275,12 @@ impl ContextHistory {
         match self.records.get(context).filter(|r| r.present) {
             Some(r) => Shown {
                 definition: r.generation,
+                endpoint: r.endpoint,
                 confirmed: r.confirmed && r.server.as_deref() == server,
             },
             None => Shown {
                 definition: 0,
+                endpoint: 0,
                 confirmed: false,
             },
         }

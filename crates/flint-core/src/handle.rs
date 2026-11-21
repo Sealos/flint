@@ -248,6 +248,9 @@ pub struct ClusterSummary {
     /// The context's confirmed definition. A move changes it, even one a later reload undoes;
     /// an edit that keeps the server (a rotated token, a namespace) does not.
     pub definition: u64,
+    /// The same for the endpoint: an edit that only adds or drops a trailing slash keeps it, as
+    /// it keeps a log session running (a shell, which the write gate checks, ends).
+    pub endpoint: u64,
     /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
     /// kubeconfig file before it can't be read.
     pub confirmed: bool,

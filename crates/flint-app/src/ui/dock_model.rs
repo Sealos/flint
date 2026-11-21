@@ -110,11 +110,14 @@ pub struct TabCluster {
     pub context: ClusterId,
     /// The server URL without a trailing slash; `None` when the context names no cluster entry.
     pub server: Option<String>,
-    /// The context's confirmed definition when the tab opened ([`ClusterSummary::definition`]).
-    /// A context moved and put back is another definition at the same server, so the tab is not
-    /// reused for it; an edit that keeps the server keeps the definition.
+    /// The context's confirmed definition when the tab opened, as far as its session depends on
+    /// it: [`ClusterSummary::definition`] for a shell, [`ClusterSummary::endpoint`] for logs, and
+    /// `0` for agent activity, which reads a file. A context moved and put back is another
+    /// definition at the same server, so the tab is not reused for it; an edit that keeps the
+    /// server keeps the definition.
     ///
-    /// [`ClusterSummary::definition`]: flint_core::handle::ClusterSummary::definition
+    /// [`ClusterSummary::definition`]: flint_core::ClusterSummary::definition
+    /// [`ClusterSummary::endpoint`]: flint_core::ClusterSummary::endpoint
     definition: u64,
 }
 
@@ -335,6 +338,7 @@ mod tests {
             state: flint_core::ConnectionState::Disconnected,
             generation: 1,
             definition: 1,
+            endpoint: 1,
             confirmed,
         };
         let servers = confirmed_servers(&[summary("sure", true), summary("fallback", false)]);

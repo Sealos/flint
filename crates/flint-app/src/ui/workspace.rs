@@ -512,10 +512,11 @@ impl Workspace {
             return;
         }
         let core = self.model.read(cx).core().clone();
-        let cluster = self.tab_cluster(&request.cluster, cx);
+        let key = TabKey::Logs(request.clone());
+        let cluster = self.tab_cluster(&key, cx);
         let server = self.shown_server(&request.cluster, cx);
         self.open_tab(
-            TabKey::Logs(request.clone()),
+            key,
             cluster,
             |window, cx| DockTab::Logs(cx.new(|cx| LogView::at(core, request, server, window, cx))),
             focus,
@@ -574,7 +575,7 @@ impl Workspace {
             return;
         }
         self.clear_action_error(cx);
-        let cluster = self.tab_cluster(key.context(), cx);
+        let cluster = self.tab_cluster(&key, cx);
         let server = self.shown_server(key.context(), cx);
         let core = self.model.read(cx).core().clone();
         self.dock.update(cx, |dock, cx| {
@@ -648,10 +649,11 @@ impl Workspace {
             return;
         }
         let core = self.model.read(cx).core().clone();
-        let cluster = self.tab_cluster(&request.cluster, cx);
+        let key = TabKey::Shell(request.clone());
+        let cluster = self.tab_cluster(&key, cx);
         let server = self.shown_server(&request.cluster, cx);
         self.open_tab(
-            TabKey::Shell(request.clone()),
+            key,
             cluster,
             |window, cx| {
                 let session = core.exec(request.exec_request(Default::default()).at(server));
@@ -664,10 +666,16 @@ impl Workspace {
     }
 
     /// The cluster a session opened on `context` now runs on: the context and its server.
-    fn tab_cluster(&self, context: &str, cx: &App) -> TabCluster {
-        let definition = self
-            .cluster_summary(context, cx)
-            .map_or(0, |c| c.definition);
+    fn tab_cluster(&self, key: &TabKey, cx: &App) -> TabCluster {
+        let context = key.context();
+        let summary = self.cluster_summary(context, cx);
+        let definition = match key {
+            // The core ends a shell on any change of the exact URL, and a log session only when
+            // the endpoint changes. Agent activity depends on neither.
+            TabKey::Shell(_) => summary.map_or(0, |c| c.definition),
+            TabKey::Logs(_) => summary.map_or(0, |c| c.endpoint),
+            TabKey::Activity(_) => 0,
+        };
         TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }
 

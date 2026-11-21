@@ -143,6 +143,7 @@ impl Cluster {
             state: self.state.clone(),
             generation: self.generation,
             definition: shown.definition,
+            endpoint: shown.endpoint,
             confirmed: shown.confirmed,
         }
     }
@@ -1072,7 +1073,12 @@ impl ClusterManager {
         // kubeconfig file failed to load (caught half-written, say), and what shows is not
         // confirmed (`ContextHistory`). Wait for the file rather than read from it.
         let slot = self.cluster(cluster).filter(|s| {
-            s.info.server.as_deref().map(server_identity) == pin.server().map(server_identity)
+            let shown = s.info.server.as_deref();
+            // The endpoint alone is enough only for a confirmed server: a fallback at the same
+            // URL can come with other credentials.
+            shown == pin.server()
+                || (shown.map(server_identity) == pin.server().map(server_identity)
+                    && self.contexts.shown(cluster, shown).confirmed)
         });
         let Some(slot) = slot else {
             return Err(LogError::retry(format!(
@@ -2126,6 +2132,33 @@ mod tests {
     }
 
     const UNREADABLE: &str = "apiVersion: v1\nkind: Config\nclusters:\n- name: [";
+
+    // covers UP-06: a log session waits rather than use a fallback that differs from its server
+    // only by a trailing slash, since it can carry other credentials. Once a load confirms the
+    // slash, the session goes on.
+    #[tokio::test]
+    async fn a_log_session_does_not_reconnect_on_a_slash_only_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let (exact, slash) = (
+            kubeconfig_with("https://dev"),
+            kubeconfig_with("https://dev/"),
+        );
+        let mut manager = manager_reading_two(dir.path(), &exact, &slash).await;
+        let pin = manager.contexts.pin_confirmed("dev");
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        let waiting = manager.log_client("dev", &pin).err().expect("no client");
+        assert!(waiting.message.contains("uncertain"), "{}", waiting.message);
+
+        rewrite_file(&mut manager, &first, &slash).await;
+        let connecting = manager.log_client("dev", &pin).err().expect("no client");
+        assert!(
+            connecting.message.contains("connecting"),
+            "{}",
+            connecting.message
+        );
+    }
 
     // covers UP-06, UP-41: a file that fails to load after the one defining a context cannot
     // change it, so it masks no removal: shells and log sessions on it end.
