@@ -268,6 +268,12 @@ pub(crate) struct ClusterManager {
     log_budget: Arc<logs::LogBudget>,
     /// The clusters the user unlocked for this session, shared with the front end (ADR-0015).
     unlocks: SessionUnlocks,
+    /// Contexts the last load did not show, listed only because a file that defined them can't
+    /// be parsed. Their connections and watches go on, for reading only.
+    held: HashSet<ClusterId>,
+    /// Each context's definition when a load last showed it with no unreadable file that could
+    /// change it.
+    settled: HashMap<ClusterId, Option<u64>>,
 }
 
 struct FileWatcher {
@@ -318,6 +324,8 @@ impl ClusterManager {
             log_sessions: HashMap::new(),
             log_budget,
             unlocks,
+            held: HashSet::new(),
+            settled: HashMap::new(),
         }
     }
 
@@ -1095,11 +1103,13 @@ impl ClusterManager {
         // confirmed (`ContextHistory`). Wait for the file rather than read from it.
         let slot = self.cluster(cluster).filter(|s| {
             let shown = s.info.server.as_deref();
-            // The endpoint alone is enough only for a confirmed server: a fallback at the same
-            // URL can come with other credentials.
-            shown == pin.server()
-                || (shown.map(server_identity) == pin.server().map(server_identity)
-                    && self.contexts.shown(cluster, shown).confirmed)
+            // A held slot's connection goes on, but no load shows a definition to connect with.
+            (s.client.is_some() || !self.held(cluster))
+                // The endpoint alone is enough only for a confirmed server: a fallback at the
+                // same URL can come with other credentials.
+                && (shown == pin.server()
+                    || (shown.map(server_identity) == pin.server().map(server_identity)
+                        && self.contexts.shown(cluster, shown).confirmed))
         });
         let Some(slot) = slot else {
             return Err(LogError::retry(format!(
@@ -1157,7 +1167,10 @@ impl ClusterManager {
         &self,
         cluster: &str,
         server: Option<Option<String>>,
-    ) -> Result<crate::handle::BoundWriteClient, WriteRefusal> {
+    ) -> Result<crate::handle::BoundWriteClient, WriteError> {
+        if self.held(cluster) {
+            return Err(WriteError::KubeconfigUnreadable);
+        }
         let (client, pin) = self.shell_client(cluster, server)?;
         let credential = self
             .cluster(cluster)
@@ -1225,6 +1238,9 @@ impl ClusterManager {
     /// [`Self::launch_gate`] for a write, in one step with checking the definition it is pinned
     /// to is still the current one and certain.
     fn write_pin_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        if self.held(cluster) {
+            return Err(WriteError::KubeconfigUnreadable);
+        }
         self.launch_gate(cluster, pin)?;
         if self.contexts.provisional(cluster) {
             Err(WriteError::KubeconfigUnreadable)
@@ -1241,9 +1257,11 @@ impl ClusterManager {
         cluster: &str,
         server: Option<&str>,
     ) -> Result<crate::Protection, WriteRefusal> {
-        // A context Flint does not know has no client either: say that, not "protected".
+        // A context Flint does not know has no client either: say that, not "protected". A held
+        // slot counts as unknown here: no load shows its definition, so nothing new starts on it.
         let slot = self
             .cluster(cluster)
+            .filter(|_| !self.held(cluster))
             .ok_or_else(|| WriteRefusal::NotConnected {
                 cluster: cluster.to_owned(),
             })?;
@@ -1256,6 +1274,11 @@ impl ClusterManager {
                 cluster: cluster.to_owned(),
             })
         }
+    }
+
+    /// Whether `id`'s slot is only kept because a file that defined it can't be parsed.
+    fn held(&self, id: &str) -> bool {
+        self.held.contains(id)
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1405,6 +1428,7 @@ impl ClusterManager {
             );
         }
 
+        let order: Vec<String> = self.clusters.iter().map(|c| c.info.name.clone()).collect();
         let mut old: HashMap<String, Cluster> = self
             .clusters
             .drain(..)
@@ -1413,8 +1437,13 @@ impl ClusterManager {
         let mut changed_active = false;
         for info in &loaded.contexts {
             let fingerprint = cluster::context_fingerprint(&loaded.merged, &info.name);
+            let was_held = self.held(&info.name);
             let slot = match old.remove(&info.name) {
                 Some(mut existing) if existing.fingerprint == fingerprint => {
+                    // Back unchanged. A connection attempted while held had nothing to use.
+                    if was_held && self.active.as_deref() == Some(&info.name) {
+                        changed_active = true;
+                    }
                     existing.info = info.clone();
                     // The default namespace may have changed.
                     existing.update_scope();
@@ -1444,8 +1473,37 @@ impl ClusterManager {
             self.clusters.push(slot);
         }
         self.kubeconfig = loaded.clone();
+        let uncertain: HashSet<&str> = loaded
+            .contexts
+            .iter()
+            .map(|info| info.name.as_str())
+            .filter(|name| self.contexts.provisional(name))
+            .collect();
         // A file that failed to load masks the changes it could have made (UP-06).
         self.contexts.record(&loaded);
+        // An unlock names only the server. A context that comes out of an uncertain spell on
+        // another definition may hold another user or token there, so it is locked again.
+        for info in &loaded.contexts {
+            if self.contexts.provisional(&info.name) {
+                continue;
+            }
+            let definition = cluster::context_fingerprint(&loaded.merged, &info.name);
+            let before = self.settled.insert(info.name.clone(), definition);
+            if uncertain.contains(info.name.as_str()) && before.is_some_and(|b| b != definition) {
+                self.unlocks.lock(&info.name);
+            }
+        }
+        // A context that a file which can't be parsed defined is not gone: keep its slot, in its
+        // place. Writes on it are refused until a load shows it again ([`Self::held`]).
+        self.held.clear();
+        for (at, name) in order.iter().enumerate() {
+            if self.contexts.defined_in_failed(name, &loaded.errors)
+                && let Some(slot) = old.remove(name)
+            {
+                self.clusters.insert(at.min(self.clusters.len()), slot);
+                self.held.insert(name.clone());
+            }
+        }
 
         let snapshot = ClustersSnapshot {
             clusters: self
@@ -2191,7 +2249,7 @@ mod tests {
             !manager.kubeconfig.errors.is_empty(),
             "the file failed to load"
         );
-        assert!(manager.cluster("dev").is_none(), "its contexts are skipped");
+        assert!(manager.held("dev"), "its contexts stay listed");
         assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
         let logs = manager.log_client("dev", &pin).err().expect("no client");
         assert!(
@@ -2316,6 +2374,120 @@ mod tests {
         // Back as it was: `dev` from the second file, on the same server.
         rewrite_file(&mut manager, &dir.path().join("second"), &yaml).await;
         assert_eq!(manager.contexts.check(Pinned::Shell, "dev", &pin), None);
+    }
+
+    const NO_CONTEXTS: &str =
+        "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\n";
+
+    /// Asserts that nothing that changes the cluster can start on `dev` now.
+    fn assert_no_write_starts(manager: &ClusterManager, pin: &ContextPin) {
+        let not_connected = WriteRefusal::NotConnected {
+            cluster: "dev".to_owned(),
+        };
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(not_connected.clone())
+        );
+        assert_eq!(manager.launch_gate("dev", pin).err(), Some(not_connected));
+        assert_eq!(
+            manager.bound_write_client("dev", None).err(),
+            Some(WriteError::KubeconfigUnreadable)
+        );
+        assert_eq!(
+            manager.write_pin_gate("dev", pin).err(),
+            Some(WriteError::KubeconfigUnreadable)
+        );
+    }
+
+    // covers UP-06, UP-54: a context whose file is broken stays listed, in its place, and refuses
+    // every write, even unlocked. The same file back restores the unlock and the review's pin.
+    #[tokio::test]
+    async fn a_broken_file_keeps_its_context_listed_but_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        assert_eq!(manager.write_pin_gate("dev", &pin), Ok(()));
+
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, UNREADABLE).await;
+        let names: Vec<_> = manager.clusters.iter().map(|c| &*c.info.name).collect();
+        assert_eq!(names, ["dev", "other"]);
+        assert_no_write_starts(&manager, &pin);
+
+        rewrite_file(&mut manager, &path, &yaml).await;
+        assert!(manager.unlocks.is_unlocked("dev", "https://dev"));
+        assert_eq!(manager.write_pin_gate("dev", &pin), Ok(()));
+    }
+
+    // covers UP-06, UP-54: a file that comes back with another server, user or token carries
+    // over neither the unlock nor a review made before it broke.
+    #[tokio::test]
+    async fn a_broken_file_back_with_another_definition_keeps_no_unlock_or_review() {
+        let yaml = kubeconfig_with("https://dev");
+        let another_server = kubeconfig_with("https://elsewhere");
+        let another_token = yaml.replace("user: {}", "user: {token: another}");
+        let another_user = yaml
+            .replace("name: u\n", "name: w\n")
+            .replace("user: u\n", "user: w\n");
+        for (changed, server) in [
+            (&another_server, "https://elsewhere"),
+            (&another_token, "https://dev"),
+            (&another_user, "https://dev"),
+        ] {
+            assert_ne!(changed, &yaml);
+            let dir = tempfile::tempdir().unwrap();
+            let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+            manager.unlocks.unlock("dev", "https://dev");
+            let pin = manager.contexts.pin_confirmed("dev");
+            let path = dir.path().join("first");
+            rewrite_file(&mut manager, &path, UNREADABLE).await;
+            rewrite_file(&mut manager, &path, changed).await;
+
+            assert!(
+                !manager.unlocks.is_unlocked("dev", "https://dev"),
+                "{changed}"
+            );
+            assert!(manager.write_pin_gate("dev", &pin).is_err(), "{changed}");
+            // Unlocked again, the review made before still does not hold.
+            manager.unlocks.unlock("dev", server);
+            assert!(manager.write_pin_gate("dev", &pin).is_err(), "{changed}");
+        }
+    }
+
+    // covers UP-06, UP-54: the same when a later file's `dev` shows while the first is broken,
+    // so the slot is never held: the first file back with another token ends the unlock.
+    #[tokio::test]
+    async fn a_file_back_with_another_token_after_a_fallback_keeps_no_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let fallback = yaml.replace("user: {}", "user: {token: fallback}");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &fallback).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, UNREADABLE).await;
+        assert!(!manager.held("dev"), "the fallback shows");
+        let another = yaml.replace("user: {}", "user: {token: another}");
+        rewrite_file(&mut manager, &path, &another).await;
+        assert!(!manager.unlocks.is_unlocked("dev", "https://dev"));
+    }
+
+    // covers UP-06: once the broken file is valid without the context, it is gone.
+    #[tokio::test]
+    async fn a_broken_file_back_without_the_context_deselects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.active = Some("dev".to_owned());
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, UNREADABLE).await;
+        assert_eq!(manager.active.as_deref(), Some("dev"));
+
+        rewrite_file(&mut manager, &path, NO_CONTEXTS).await;
+        assert_eq!(manager.active, None);
+        assert!(manager.cluster("dev").is_none());
+        assert!(manager.contexts.removed("dev"));
     }
 
     // covers UP-06: while the first file defining `dev` is caught half-written, the second
