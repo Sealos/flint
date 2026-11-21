@@ -17,7 +17,7 @@ use gpui_kit::{
 };
 use serde_json::json;
 
-use super::{RESIZE_DELAY, TerminalInput, TerminalView};
+use super::{NoteKind, RESIZE_DELAY, TerminalInput, TerminalView};
 use crate::ui::dock::{DockItem as _, TabKey, TabStatus};
 use crate::ui::registry::{self, SelectText, TERMINAL_COPY, TERMINAL_PASTE};
 use crate::ui::support_tests::WAIT;
@@ -132,7 +132,12 @@ impl Shell {
             view.send(vec![b'x'; INPUT_BUDGET - 64], cx);
             view.send(vec![b'y'; 65], cx);
         });
-        assert!(self.view.read_with(cx, |view, _| view.refusal_shown));
+        assert!(self.is_refusing_input(cx));
+    }
+
+    fn is_refusing_input(&self, cx: &mut TestAppContext) -> bool {
+        self.view
+            .read_with(cx, |view, _| view.note_kind == NoteKind::InputRefusal)
     }
 
     fn dispatch(
@@ -818,7 +823,7 @@ async fn cancelling_an_unbracketed_paste_keeps_the_input_warning(cx: &mut TestAp
     shell.show_input_refusal(cx);
     cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
     shell.press(cx, TERMINAL_PASTE[0]);
-    assert!(shell.view.read_with(cx, |view, _| view.refusal_shown));
+    assert!(shell.is_refusing_input(cx));
 
     assert_eq!(shell.sent(cx), vec![b'x'; INPUT_BUDGET - 64]);
     cx.wait_for(shell.window, WAIT, |window, cx| {
@@ -827,7 +832,7 @@ async fn cancelling_an_unbracketed_paste_keeps_the_input_warning(cx: &mut TestAp
     .await;
     shell.dispatch(cx, "ui::Cancel", json!(null)).unwrap();
     assert!(shell.sent(cx).is_empty());
-    assert!(shell.view.read_with(cx, |view, _| view.refusal_shown));
+    assert!(shell.is_refusing_input(cx));
 }
 
 #[gpui_kit::test]
@@ -849,7 +854,7 @@ async fn a_bracketed_paste_clears_the_input_warning_and_notifies_without_output(
     });
     cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
     shell.press(cx, TERMINAL_PASTE[0]);
-    assert!(shell.view.read_with(cx, |view, _| view.refusal_shown));
+    assert!(shell.is_refusing_input(cx));
     notified.set(false);
 
     shell.fake.pump();
@@ -860,6 +865,50 @@ async fn a_bracketed_paste_clears_the_input_warning_and_notifies_without_output(
     assert!(
         notified.get(),
         "the view must redraw when the warning clears"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_bracketed_paste_does_not_clear_a_newer_input_warning(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    shell.print(cx, b"\x1b[?2004h");
+    cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    // The paste has been accepted, but its result has yet to reach the view.
+    shell.fake.pump();
+    assert_eq!(shell.fake.written(), b"\x1b[200~a\nb\x1b[201~");
+    shell.show_input_refusal(cx);
+
+    cx.run_until_parked();
+
+    assert!(shell.is_refusing_input(cx));
+}
+
+#[gpui_kit::test]
+async fn confirming_a_paste_after_fallback_warns_and_sends_nothing(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
+    shell.press(cx, TERMINAL_PASTE[0]);
+    assert!(shell.sent(cx).is_empty());
+    cx.wait_for(shell.window, WAIT, |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
+
+    shell.fake.fallback();
+    shell.fake.set_state(ExecState::Running {
+        command: vec!["/bin/sh".into()],
+    });
+    shell.settle(cx);
+    shell.dispatch(cx, "ui::Confirm", json!(null)).unwrap();
+
+    assert!(shell.sent(cx).is_empty());
+    let note = shell.view.read_with(cx, |view, _| {
+        view.note.as_ref().map(|note| note.text.clone())
+    });
+    assert_eq!(
+        note.as_deref(),
+        Some("The shell changed and your paste was not sent. Paste it again.")
     );
 }
 
@@ -915,4 +964,36 @@ async fn input_not_replayed_to_the_next_shell_is_said(cx: &mut TestAppContext) {
         note.as_deref(),
         Some(crate::ui::terminal_model::INPUT_NOT_REPLAYED)
     );
+}
+
+#[gpui_kit::test]
+async fn the_input_not_replayed_note_clears_when_the_shell_ends(cx: &mut TestAppContext) {
+    for state in [
+        Some(ExecState::Exited { code: Some(0) }),
+        Some(ExecState::Failed(ExecFailure::new(
+            ExecFailureKind::Connection,
+            "Disconnected",
+        ))),
+        None,
+    ] {
+        let mut shell = open(cx);
+        shell.fake.fallback();
+        shell.fake.set_state(ExecState::Running {
+            command: vec!["/bin/sh".into()],
+        });
+        shell.fake.input_not_replayed();
+        shell.settle(cx);
+        assert!(shell.view.read_with(cx, |view, _| view.note.is_some()));
+
+        if let Some(state) = state {
+            shell.fake.set_state(state);
+            shell.settle(cx);
+        } else {
+            shell.view.update(cx, |view, cx| {
+                view.end("The context changed.".into(), cx);
+            });
+        }
+
+        assert!(shell.view.read_with(cx, |view, _| view.note.is_none()));
+    }
 }

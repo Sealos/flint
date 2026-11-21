@@ -113,6 +113,14 @@ pub(super) struct RestartBlocked {
     pub unlock: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteKind {
+    General,
+    InputRefusal,
+    InputNotReplayed,
+    PasteDiscarded,
+}
+
 pub struct TerminalView {
     request: ShellRequest,
     /// Dropping the view drops the session, which ends the command.
@@ -135,8 +143,9 @@ pub struct TerminalView {
     /// The bell rang a moment ago.
     bell: bool,
     note: Option<Note>,
-    /// The note says the shell is not reading its input ([`TerminalView::input_sent`]).
-    refusal_shown: bool,
+    note_kind: NoteKind,
+    /// Asynchronous paste replies can only clear refusals already shown when they were sent.
+    refusal_sequence: u64,
     /// Why the tab ended the session itself ([`TerminalView::end`]).
     ended: Option<String>,
     /// Why Restart Shell cannot run, as the workspace says it: the tab's cluster is protected
@@ -200,7 +209,8 @@ impl TerminalView {
             marked: None,
             bell: false,
             note: None,
-            refusal_shown: false,
+            note_kind: NoteKind::General,
+            refusal_sequence: 0,
             ended: None,
             protected: None,
             chip,
@@ -234,11 +244,17 @@ impl TerminalView {
         if snapshot.terminal.bells > self.snapshot.terminal.bells {
             self.ring(cx);
         }
-        if snapshot.state.is_finished() {
+        if snapshot.state.is_finished() || self.ended.is_some() {
             self.marked = None;
-            self.clear_input_refusal();
-        } else if snapshot.input_not_replayed && !self.snapshot.input_not_replayed {
-            self.set_note(Tone::Warning, terminal_model::INPUT_NOT_REPLAYED.to_owned());
+            self.clear_shell_input_note();
+        } else if snapshot.input_not_replayed
+            && !self.snapshot.input_not_replayed
+            && self.note_kind != NoteKind::PasteDiscarded
+        {
+            self.set_shell_input_note(
+                NoteKind::InputNotReplayed,
+                terminal_model::INPUT_NOT_REPLAYED.to_owned(),
+            );
         }
         // The terminal drops a selection on its own (the program cleared the screen, switched
         // screens or wrote over it); one scrolled out of view is still there to copy.
@@ -286,7 +302,7 @@ impl TerminalView {
         self.session.close();
         self.ended = Some(why);
         self.marked = None;
-        self.clear_input_refusal();
+        self.clear_shell_input_note();
         cx.notify();
     }
 
@@ -368,16 +384,25 @@ impl TerminalView {
         match sent {
             Ok(()) => self.clear_input_refusal(),
             Err(refused) => {
-                self.set_note(Tone::Warning, terminal_model::input_refused(refused, paste));
-                self.refusal_shown = true;
+                self.refusal_sequence += 1;
+                self.set_shell_input_note(
+                    NoteKind::InputRefusal,
+                    terminal_model::input_refused(refused, paste),
+                );
             }
         }
     }
 
     fn clear_input_refusal(&mut self) {
-        if self.refusal_shown {
+        if self.note_kind == NoteKind::InputRefusal {
+            self.clear_shell_input_note();
+        }
+    }
+
+    fn clear_shell_input_note(&mut self) {
+        if self.note_kind != NoteKind::General {
             self.note = None;
-            self.refusal_shown = false;
+            self.note_kind = NoteKind::General;
         }
     }
 
@@ -735,7 +760,12 @@ impl TerminalView {
 
     pub(super) fn set_note(&mut self, tone: Tone, text: String) {
         self.note = Some(Note { tone, text });
-        self.refusal_shown = false;
+        self.note_kind = NoteKind::General;
+    }
+
+    fn set_shell_input_note(&mut self, kind: NoteKind, text: String) {
+        self.set_note(Tone::Warning, text);
+        self.note_kind = kind;
     }
 
     /// What the grid paints this frame.

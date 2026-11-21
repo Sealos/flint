@@ -287,9 +287,8 @@ impl ExecState {
 pub struct ExecSnapshot {
     pub state: ExecState,
     pub terminal: TerminalSnapshot,
-    /// Input typed while a shell that turned out not to exist was tried was more than the
-    /// session keeps for the next one ([`INPUT_BUDGET`]), so the shell that started did not
-    /// get it. Set once the replacement shell shows it started, and stays set after that.
+    /// Input typed while a shell that turned out not to exist was tried could not be safely
+    /// replayed. Set once the replacement shell shows it started, and stays set after that.
     pub input_not_replayed: bool,
 }
 
@@ -298,9 +297,37 @@ pub struct ExecSnapshot {
 pub enum BracketedPaste {
     /// Accepted for sending with bracketed paste markers.
     Pasted,
-    /// Bracketed paste was unavailable, so the front end can ask before sending it.
-    Unbracketed,
+    /// Bracketed paste was unavailable in this shell attempt, so the front end can ask
+    /// before sending it with [`ExecSession::paste_confirmed`].
+    Unbracketed(ShellAttempt),
     /// Dropped because the command ended or its queued input was discarded during fallback.
+    Discarded,
+}
+
+/// The shell attempt for which an unbracketed paste can be confirmed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ShellAttempt(u64);
+
+impl std::fmt::Debug for ShellAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShellAttempt")
+    }
+}
+
+impl ShellAttempt {
+    fn next() -> u64 {
+        // Distinct across sessions as well as across fallback attempts within one session.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// What happened to a paste sent through [`ExecSession::paste_confirmed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmedPaste {
+    /// Accepted for sending in the confirmed shell attempt.
+    Pasted,
+    /// The attempt changed or ended before the paste could be sent.
     Discarded,
 }
 
@@ -309,7 +336,7 @@ pub enum BracketedPaste {
 /// them from the size slot and the close signal.
 pub(crate) enum Input {
     Write(Vec<u8>, Sent),
-    Paste(String, Sent),
+    Paste(String, Sent, Option<oneshot::Sender<()>>),
     PasteIfBracketed(String, Sent, oneshot::Sender<BracketedPaste>),
     Resize(TerminalSize),
     Scroll(i32),
@@ -331,7 +358,7 @@ pub(crate) enum Input {
 }
 
 /// What a keystroke or a paste carries besides itself: the share of the input budget reserved
-/// for it, and the shell attempt it was sent during (see `Session::forget_queued_input`).
+/// for it, and the shell attempt it was sent during (see `Session::fallback`).
 pub(crate) struct Sent {
     charge: Charge,
     attempt: u64,
@@ -380,7 +407,7 @@ impl ExecSession {
         let (size_tx, size) = watch::channel(request.size);
         let (close_tx, close) = watch::channel(false);
         let budget = InputBudget::new(INPUT_BUDGET);
-        let attempt = Arc::new(AtomicU64::new(0));
+        let attempt = Arc::new(AtomicU64::new(ShellAttempt::next()));
         (
             Self {
                 request,
@@ -418,6 +445,10 @@ impl ExecSession {
     /// first, so input reserved while one shell runs is never counted as the next one's.
     fn reserve(&self, bytes: usize) -> Result<Sent, InputRefused> {
         let attempt = self.attempt.load(Ordering::Acquire);
+        self.reserve_for(bytes, attempt)
+    }
+
+    fn reserve_for(&self, bytes: usize, attempt: u64) -> Result<Sent, InputRefused> {
         Ok(Sent {
             charge: budget::reserve(&self.budget, bytes)?,
             attempt,
@@ -443,7 +474,7 @@ impl ExecSession {
     pub fn paste(&self, text: impl Into<String>) -> Result<(), InputRefused> {
         let text = text.into();
         let sent = self.reserve(text.len() + PASTE_MARKERS)?;
-        self.send(Input::Paste(text, sent));
+        self.send(Input::Paste(text, sent, None));
         Ok(())
     }
 
@@ -460,6 +491,28 @@ impl ExecSession {
         let (reply, rx) = oneshot::channel();
         self.send(Input::PasteIfBracketed(text, sent, reply));
         Ok(async move { rx.await.unwrap_or(BracketedPaste::Discarded) })
+    }
+
+    /// Pastes `text` only in the shell attempt for which the front end asked. Refused at once
+    /// if it exceeds the input budget. The result also covers an attempt changing after the
+    /// input was queued.
+    pub fn paste_confirmed(
+        &self,
+        text: impl Into<String>,
+        attempt: ShellAttempt,
+    ) -> Result<impl Future<Output = ConfirmedPaste> + Send + 'static, InputRefused> {
+        let (reply, rx) = oneshot::channel();
+        if attempt.0 == self.attempt.load(Ordering::Acquire) {
+            let text = text.into();
+            let sent = self.reserve_for(text.len() + PASTE_MARKERS, attempt.0)?;
+            self.send(Input::Paste(text, sent, Some(reply)));
+        }
+        Ok(async move {
+            match rx.await {
+                Ok(()) => ConfirmedPaste::Pasted,
+                Err(_) => ConfirmedPaste::Discarded,
+            }
+        })
     }
 
     /// How many bytes of input wait for the command to read them (or for the session to take
@@ -795,6 +848,7 @@ pub(crate) async fn run(
             Ok(process) => process,
             Err(e) if e.missing_command && !last => {
                 tracing::debug!(?command, "command not in the container; trying the next");
+                input_not_replayed |= session.fallback(&mut pending);
                 continue;
             }
             Err(e) => {
@@ -819,10 +873,7 @@ pub(crate) async fn run(
         {
             Outcome::MissingCommand(_) if !last => {
                 tracing::debug!(?command, "command not in the container; trying the next");
-                if std::mem::take(&mut pending.dropped) {
-                    input_not_replayed = true;
-                    session.forget_queued_input();
-                }
+                input_not_replayed |= session.fallback(&mut pending);
                 // Some runtimes print the error on the TTY: start the next shell on a clean
                 // screen.
                 session.reset_screen();
@@ -886,8 +937,11 @@ impl ToPod {
 struct Replay {
     bytes: Vec<u8>,
     charge: Option<Charge>,
-    /// Some input did not fit in the budget, so none is kept: a replay with a gap could run
-    /// something never typed.
+    /// Replies for confirmed pastes buffered while the shell starts. If there are any, the
+    /// batch can only be sent in this attempt. Replaying around a gap could run something
+    /// never typed.
+    confirmations: Vec<oneshot::Sender<()>>,
+    /// Some input could not be kept for replay, so none of it is kept.
     dropped: bool,
 }
 
@@ -926,8 +980,18 @@ impl Replay {
         self.charge.take().map(|charge| (bytes, charge))
     }
 
+    fn write_to(&mut self, to_pod: &ToPod) {
+        if let Some((bytes, charge)) = self.take() {
+            to_pod.write(bytes, charge);
+        }
+        for reply in self.confirmations.drain(..) {
+            let _ = reply.send(());
+        }
+    }
+
     fn clear(&mut self) {
         drop(self.take());
+        self.confirmations.clear();
     }
 
     fn drop_all(&mut self) {
@@ -946,8 +1010,9 @@ struct Session {
     close: watch::Receiver<bool>,
     budget: Arc<InputBudget>,
     attempt: Arc<AtomicU64>,
-    /// Input sent during an attempt before this one is dropped when it arrives.
     current_attempt: u64,
+    /// Ordinary input can cross attempts while its replay is intact.
+    first_replayable_attempt: u64,
     out: watch::Sender<Arc<ExecSnapshot>>,
     last_publish: Option<Instant>,
     /// Output arrived since the last snapshot.
@@ -958,6 +1023,7 @@ struct Session {
 
 impl Session {
     fn new(channels: SessionChannels) -> Self {
+        let current_attempt = channels.attempt.load(Ordering::Acquire);
         Self {
             model: channels.model,
             state: ExecState::Connecting,
@@ -967,7 +1033,8 @@ impl Session {
             close: channels.close,
             budget: channels.budget,
             attempt: channels.attempt,
-            current_attempt: 0,
+            current_attempt,
+            first_replayable_attempt: current_attempt,
             out: channels.out,
             last_publish: None,
             dirty: false,
@@ -1007,20 +1074,32 @@ impl Session {
             .then(|| self.last_publish.map_or_else(Instant::now, |at| at + FRAME))
     }
 
-    /// Starts the next shell without anything sent for the ones tried before: input still
-    /// queued from then is dropped when it arrives, so no tail of what was typed for a shell
-    /// whose replay was dropped reaches the next one. Input sent from now on is kept.
-    fn forget_queued_input(&mut self) {
-        self.current_attempt = self.attempt.fetch_add(1, Ordering::AcqRel) + 1;
+    /// Starts the next attempt. If replay was dropped, also discard ordinary input still
+    /// queued from earlier attempts so the next shell does not receive only part of it.
+    fn fallback(&mut self, pending: &mut Replay) -> bool {
+        self.current_attempt = ShellAttempt::next();
+        self.attempt.store(self.current_attempt, Ordering::Release);
+        if !pending.confirmations.is_empty() {
+            pending.drop_all();
+        }
+        let dropped = std::mem::take(&mut pending.dropped);
+        if dropped {
+            self.first_replayable_attempt = self.current_attempt;
+        }
+        dropped
     }
 
-    /// Whether `input` was sent for a shell tried before the current one.
+    /// Whether the queued input can still be sent to this shell attempt.
     fn is_stale(&self, input: &Result<Input, async_channel::RecvError>) -> bool {
-        matches!(
-            input,
-            Ok(Input::Write(_, sent) | Input::Paste(_, sent) | Input::PasteIfBracketed(_, sent, _))
-                if sent.attempt < self.current_attempt
-        )
+        match input {
+            Ok(Input::Paste(_, sent, Some(_))) => sent.attempt != self.current_attempt,
+            Ok(
+                Input::Write(_, sent)
+                | Input::Paste(_, sent, _)
+                | Input::PasteIfBracketed(_, sent, _),
+            ) => sent.attempt < self.first_replayable_attempt,
+            _ => false,
+        }
     }
 
     /// What the front end asks next: closing first, then a new size, then queued input, so
@@ -1075,17 +1154,24 @@ impl Session {
                     pending.take_in(bytes, sent.charge);
                 }
             }
-            Input::Paste(text, Sent { mut charge, .. }) => {
-                if let Some(pending) = pending {
+            Input::Paste(text, Sent { mut charge, .. }, reply) => {
+                if let Some(pending) = pending.filter(|pending| !pending.dropped) {
                     let bytes = self.model.paste_bytes(&text);
                     charge.set(bytes.len());
+                    if let Some(reply) = reply {
+                        if bytes.is_empty() {
+                            let _ = reply.send(());
+                            return Flow::Continue;
+                        }
+                        pending.confirmations.push(reply);
+                    }
                     pending.take_in(bytes, charge);
                 }
             }
             Input::PasteIfBracketed(_, _, reply) => {
                 let result = if pending.is_some() {
                     // The command is starting and can still take confirmed input.
-                    BracketedPaste::Unbracketed
+                    BracketedPaste::Unbracketed(ShellAttempt(self.current_attempt))
                 } else {
                     BracketedPaste::Discarded
                 };
@@ -1139,29 +1225,39 @@ impl Session {
         if self.is_stale(&input) {
             return Flow::Continue;
         }
-        let (bytes, mut charge) = match input {
-            Ok(Input::Write(bytes, sent)) => (bytes, sent.charge),
-            Ok(Input::Paste(text, sent)) => (self.model.paste_bytes(&text), sent.charge),
+        let (bytes, mut charge, confirmation) = match input {
+            Ok(Input::Write(bytes, sent)) => (bytes, sent.charge, None),
+            Ok(Input::Paste(text, sent, reply)) => {
+                (self.model.paste_bytes(&text), sent.charge, reply)
+            }
             Ok(Input::PasteIfBracketed(text, sent, reply)) => {
                 if !self.model.bracketed_paste() {
-                    let _ = reply.send(BracketedPaste::Unbracketed);
+                    let _ = reply.send(BracketedPaste::Unbracketed(ShellAttempt(
+                        self.current_attempt,
+                    )));
                     return Flow::Continue;
                 }
                 let _ = reply.send(BracketedPaste::Pasted);
-                (self.model.paste_bytes(&text), sent.charge)
+                (self.model.paste_bytes(&text), sent.charge, None)
             }
             other => return self.handle_live_control(other, to_pod),
         };
         charge.set(bytes.len());
-        if bytes.is_empty() {
-            // An empty paste without bracketed paste: nothing to send.
-            return Flow::Continue;
+        if !bytes.is_empty() {
+            self.follow_output();
+            if let Some(unconfirmed) = unconfirmed {
+                if confirmation.is_some() {
+                    // The confirmed paste cannot be replayed. Do not replay around it.
+                    unconfirmed.drop_all();
+                } else {
+                    unconfirmed.keep(&bytes, &self.budget);
+                }
+            }
+            to_pod.write(bytes, charge);
         }
-        self.follow_output();
-        if let Some(unconfirmed) = unconfirmed {
-            unconfirmed.keep(&bytes, &self.budget);
+        if let Some(reply) = confirmation {
+            let _ = reply.send(());
         }
-        to_pod.write(bytes, charge);
         Flow::Continue
     }
 
@@ -1243,21 +1339,23 @@ impl Session {
         };
         let writer = AbortOnDrop(tokio::spawn(write_remote(stdin, stdin_rx)));
         let resizer = resize.map(|tx| AbortOnDrop(tokio::spawn(resize_remote(tx, size_rx))));
-        if fallback {
+        let attempt_only = !pending.confirmations.is_empty();
+        if fallback && !attempt_only {
             if !pending.is_empty() {
                 match budget::reserve(&self.budget, pending.bytes.len()) {
                     Ok(charge) => to_pod.write(pending.bytes.clone(), charge),
                     // No room for a copy: send what was typed, and keep nothing for the next.
                     Err(_) => {
-                        if let Some((bytes, charge)) = pending.take() {
-                            to_pod.write(bytes, charge);
-                        }
+                        pending.write_to(&to_pod);
                         pending.drop_all();
                     }
                 }
             }
-        } else if let Some((bytes, charge)) = pending.take() {
-            to_pod.write(bytes, charge);
+        } else {
+            pending.write_to(&to_pod);
+            if fallback {
+                pending.drop_all();
+            }
         }
         let mut pending = fallback.then_some(pending);
         let mut buf = vec![0; IO_BUFFER];
@@ -1880,10 +1978,10 @@ mod tests {
         assert_eq!(remote.read_stdin(3).await, b"a\rb");
         // A paste that waits for bracketed paste mode is refused while it is off, and sent
         // bracketed once the program turns it on.
-        assert_eq!(
+        assert!(matches!(
             session.paste_if_bracketed("c\nd").unwrap().await,
-            BracketedPaste::Unbracketed
-        );
+            BracketedPaste::Unbracketed(_)
+        ));
         remote.print(b"\x1b[?2004h").await;
         wait_for(&mut session, "bracketed paste", |s| {
             s.terminal
@@ -1979,6 +2077,67 @@ mod tests {
             launcher.launched(),
             vec![vec!["bash".to_owned()], vec!["/bin/sh".to_owned()]]
         );
+    }
+
+    #[tokio::test]
+    async fn a_paste_confirmed_after_fallback_is_discarded() {
+        let launcher = FakeLauncher::default();
+        let (bash, mut bash_remote) = process();
+        let (sh, mut sh_remote) = process();
+        launcher.push(Ok(bash));
+        launcher.push(Ok(sh));
+        let mut session = open(&launcher, request());
+        bash_remote.next_resize().await;
+
+        let text = "echo a\necho b\n";
+        let BracketedPaste::Unbracketed(attempt) = session.paste_if_bracketed(text).unwrap().await
+        else {
+            panic!("bash should ask for confirmation");
+        };
+        bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
+        wait_for(
+            &mut session,
+            "sh",
+            |s| matches!(&s.state, ExecState::Running { command } if command == &["/bin/sh"]),
+        )
+        .await;
+
+        assert_eq!(
+            session.paste_confirmed(text, attempt).unwrap().await,
+            ConfirmedPaste::Discarded
+        );
+        assert_eq!(session.queued_input(), 0);
+        session.write(b"q".to_vec()).unwrap();
+        assert_eq!(sh_remote.read_stdin(1).await, b"q");
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_paste_reaches_its_shell_but_is_never_replayed() {
+        let launcher = FakeLauncher::default();
+        let (bash, mut bash_remote) = process();
+        let (sh, mut sh_remote) = process();
+        launcher.push(Ok(bash));
+        launcher.push(Ok(sh));
+        let session = open(&launcher, request());
+        bash_remote.next_resize().await;
+
+        let BracketedPaste::Unbracketed(attempt) =
+            session.paste_if_bracketed("a\nb").unwrap().await
+        else {
+            panic!("bash should ask for confirmation");
+        };
+        assert_eq!(
+            session.paste_confirmed("a\nb", attempt).unwrap().await,
+            ConfirmedPaste::Pasted
+        );
+        assert_eq!(bash_remote.read_stdin(3).await, b"a\rb");
+        session.write(b"c".to_vec()).unwrap();
+        assert_eq!(bash_remote.read_stdin(1).await, b"c");
+        bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
+
+        sh_remote.next_resize().await;
+        session.write(b"q".to_vec()).unwrap();
+        assert_eq!(sh_remote.read_stdin(1).await, b"q", "no partial replay");
     }
 
     // covers UP-41
@@ -2653,6 +2812,56 @@ mod tests {
         (session, core, to_pod, rx)
     }
 
+    #[tokio::test]
+    async fn a_confirmed_paste_in_the_queue_cannot_race_a_shell_change() {
+        let (session, mut core, to_pod, mut stdin) = session_parts();
+        let mut pending = Replay::default();
+        let bracketed = session.paste_if_bracketed("a\nb").unwrap();
+        let input = core.recv().await;
+        core.handle_offline(input, Some(&mut pending));
+        let BracketedPaste::Unbracketed(attempt) = bracketed.await else {
+            panic!("bash should ask for confirmation");
+        };
+        let confirmed = session.paste_confirmed("a\nb", attempt).unwrap();
+        assert!(session.queued_input() > 0, "queued before fallback");
+
+        assert!(!core.fallback(&mut pending));
+        let input = core.recv().await;
+        core.handle_live(input, &to_pod, None);
+
+        assert_eq!(confirmed.await, ConfirmedPaste::Discarded);
+        assert!(stdin.try_recv().is_err());
+        assert_eq!(session.queued_input(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_paste_buffered_while_connecting_is_attempt_local() {
+        let (session, mut core, to_pod, mut stdin) = session_parts();
+        for connects in [true, false] {
+            let mut pending = Replay::default();
+            let bracketed = session.paste_if_bracketed("a\nb").unwrap();
+            let input = core.recv().await;
+            core.handle_offline(input, Some(&mut pending));
+            let BracketedPaste::Unbracketed(attempt) = bracketed.await else {
+                panic!("the connecting shell should ask for confirmation");
+            };
+            let confirmed = session.paste_confirmed("a\nb", attempt).unwrap();
+            let input = core.recv().await;
+            core.handle_offline(input, Some(&mut pending));
+
+            if connects {
+                pending.write_to(&to_pod);
+                assert_eq!(confirmed.await, ConfirmedPaste::Pasted);
+                assert_eq!(stdin.try_recv().unwrap().bytes, b"a\rb");
+            } else {
+                assert!(core.fallback(&mut pending));
+                assert_eq!(confirmed.await, ConfirmedPaste::Discarded);
+                assert!(pending.is_empty());
+                assert!(stdin.try_recv().is_err());
+            }
+        }
+    }
+
     // covers UP-41 (#256): when what was typed for bash was too large to keep for /bin/sh,
     // input sent for bash and still queued is dropped, not sent to /bin/sh without its
     // beginning; input sent once /bin/sh is tried still goes to it.
@@ -2664,12 +2873,13 @@ mod tests {
         let while_connecting = session.paste_if_bracketed("a\nb").unwrap();
         let while_running = session.paste_if_bracketed("c\nd").unwrap();
         session.write(b"z".to_vec()).unwrap();
-        core.forget_queued_input();
+        let mut pending = Replay::default();
+        pending.drop_all();
+        assert!(core.fallback(&mut pending));
         // Sent once /bin/sh is tried.
         session.write(b"ls\r".to_vec()).unwrap();
         session.write(b"pwd\r".to_vec()).unwrap();
 
-        let mut pending = Replay::default();
         for _ in 0..2 {
             let input = core.recv().await;
             assert_eq!(

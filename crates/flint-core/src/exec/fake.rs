@@ -10,9 +10,11 @@
 //! command is not reading them, so a test can fill it.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::{
     BracketedPaste, ExecRequest, ExecSession, ExecSnapshot, ExecState, Input, SessionChannels,
+    ShellAttempt,
 };
 use crate::terminal::{TerminalModel, TerminalSize};
 
@@ -60,6 +62,14 @@ impl FakeExec {
         self.publish();
     }
 
+    /// Starts the fallback shell attempt.
+    pub fn fallback(&mut self) {
+        self.channels
+            .attempt
+            .store(ShellAttempt::next(), Ordering::Release);
+        self.set_state(ExecState::Connecting);
+    }
+
     /// Says, as a live session does, that what was typed while the first shell was tried was
     /// not kept for the shell that started ([`ExecSnapshot::input_not_replayed`]).
     pub fn input_not_replayed(&mut self) {
@@ -94,16 +104,22 @@ impl FakeExec {
             self.resizes.push(size);
             self.model().resize(size);
         }
+        let attempt = self.channels.attempt.load(Ordering::Acquire);
         while let Ok(input) = self.channels.inputs.try_recv() {
             match input {
                 Input::Write(bytes, _) if !finished => {
                     self.written.extend(bytes);
                     self.model().scroll_to_bottom();
                 }
-                Input::Paste(text, _) if !finished => {
+                Input::Paste(text, sent, reply)
+                    if !finished && (reply.is_none() || sent.attempt == attempt) =>
+                {
                     let bytes = self.channels.model.paste_bytes(&text);
                     self.written.extend(bytes);
                     self.model().scroll_to_bottom();
+                    if let Some(reply) = reply {
+                        let _ = reply.send(());
+                    }
                 }
                 Input::PasteIfBracketed(text, _, reply) => {
                     let result = if finished {
@@ -114,7 +130,7 @@ impl FakeExec {
                         self.model().scroll_to_bottom();
                         BracketedPaste::Pasted
                     } else {
-                        BracketedPaste::Unbracketed
+                        BracketedPaste::Unbracketed(ShellAttempt(attempt))
                     };
                     let _ = reply.send(result);
                 }
