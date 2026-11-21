@@ -3,8 +3,9 @@
 //!
 //! Every request first asks the write gate ([`ActionGate::client`]) and never keeps the client,
 //! so a drain stops at its next request once its cluster is locked. Each action names the object
-//! the user reviewed by its uid, and where the API allows it its `resourceVersion`: a conflict
-//! comes back as [`ActionError::Conflict`], for the review to open again. Nothing here retries.
+//! the user reviewed by its uid (a `resourceVersion` would conflict with every status update of
+//! a live workload or node): a conflict comes back as [`ActionError::Conflict`], for the review
+//! to open again. Nothing here retries.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -43,7 +44,6 @@ pub(crate) struct ActionObject {
     pub(crate) namespace: Option<String>,
     pub(crate) name: String,
     pub(crate) uid: String,
-    pub(crate) resource_version: Option<String>,
 }
 
 impl ActionObject {
@@ -141,11 +141,10 @@ pub(crate) async fn scale(
     replicas: u32,
 ) -> Result<(), ActionError> {
     let client = gate.client().await?;
-    let mut metadata = json!({ "uid": object.uid });
-    if let Some(version) = &object.resource_version {
-        metadata["resourceVersion"] = json!(version);
-    }
-    let patch = json!({ "metadata": metadata, "spec": { "replicas": replicas } });
+    let patch = json!({
+        "metadata": { "uid": object.uid },
+        "spec": { "replicas": replicas },
+    });
     object
         .api(client)
         .patch_scale(&object.name, &patch_params(), &Patch::Merge(&patch))
@@ -192,7 +191,6 @@ pub(crate) async fn set_cordoned(
     cordoned: bool,
 ) -> Result<(), ActionError> {
     let client = gate.client().await?;
-    // By uid only: a node's resourceVersion moves with every status update.
     let patch = json!({
         "metadata": { "uid": node.uid },
         "spec": { "unschedulable": cordoned },
@@ -537,7 +535,6 @@ mod tests {
             namespace: Some("demo".into()),
             name: "web".into(),
             uid: "uid-web".into(),
-            resource_version: Some("42".into()),
         }
     }
 
@@ -547,7 +544,6 @@ mod tests {
             namespace: None,
             name: "worker".into(),
             uid: "uid-node".into(),
-            resource_version: Some("7".into()),
         }
     }
 
@@ -656,7 +652,7 @@ mod tests {
 
     // covers UP-53
     #[tokio::test]
-    async fn scale_patches_the_scale_subresource_of_the_reviewed_version() {
+    async fn scale_patches_the_scale_subresource_of_the_reviewed_object() {
         let reply: Reply = Arc::new(|_| {
             (
                 200,
@@ -676,7 +672,10 @@ mod tests {
         );
         assert_eq!(seen[0].body["spec"]["replicas"], 3);
         assert_eq!(seen[0].body["metadata"]["uid"], "uid-web");
-        assert_eq!(seen[0].body["metadata"]["resourceVersion"], "42");
+        assert!(
+            seen[0].body["metadata"].get("resourceVersion").is_none(),
+            "status updates must not conflict with it"
+        );
     }
 
     // covers UP-53
