@@ -130,8 +130,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 
 ### UP-14 Limit what an agent may read
 - **When** I expose a cluster and limit it to some namespaces and kinds in the Expose to AI dialog.
-- **Then** the agent sees only those namespaces and kinds. Asking for anything else returns the same "not found" error
-  as an unexposed cluster. Cluster-scoped kinds are hidden unless I named them. Clearing the scope exposes everything
+- **Then** the agent sees only those namespaces and kinds. Asking for anything else returns one "outside the scope"
+  error, byte for byte the same whether what it named exists or not. A cluster that is not exposed stays "not found".
+  Cluster-scoped kinds are hidden unless I named them. Clearing the scope exposes everything
   again.
 - **And** kinds written by hand resolve as `kubectl get` names them. A kind that matches nothing or several grants
   nothing. `list_clusters` reports it in `unmatched_kinds`, and a namespace that does not exist in

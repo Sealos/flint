@@ -102,9 +102,9 @@ struct Discovered {
 #[derive(Debug)]
 struct ToolError {
     message: String,
-    /// The call named something the agent may not read: a cluster not exposed, or a namespace or
-    /// kind outside its scope. Only [`policy::PolicyError`] sets it. The agent cannot tell (the
-    /// message is the same as for a cluster that does not exist); the activity log can.
+    /// The call named something the agent may not read: a cluster not exposed (the message is
+    /// the same as for a cluster that does not exist), or a namespace or kind outside its scope
+    /// (one message, whatever it named). Only [`policy::PolicyError`] sets it.
     denied: bool,
 }
 
@@ -1009,7 +1009,7 @@ impl FlintMcp {
     /// The connection and the resolved kind. `check` (the names the call carries) runs once the
     /// cluster is known to be exposed and before discovery or the scope, so a call it refuses
     /// sends no request at all. The kind is resolved among those the agent may read: on a
-    /// scoped cluster one that does not resolve gives the unexposed-cluster error, whether it
+    /// scoped cluster one that does not resolve gives the out-of-scope error, whether it
     /// is out of scope or does not exist, so the two cannot be told apart.
     async fn resolve(
         &self,
