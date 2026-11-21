@@ -446,7 +446,9 @@ impl<'a> Presence<'a> {
 
     pub fn dot(self, theme: &Theme) -> (Hsla, bool) {
         match self {
-            Presence::NotConnected => (theme.muted_foreground.opacity(0.4), true),
+            // Solid, not dimmed: faded it fell under 3:1. A filled grey is still not the hollow
+            // green of idle.
+            Presence::NotConnected => (theme.muted_foreground, true),
             Presence::Connecting | Presence::Reconnecting { .. } => (theme.warning, true),
             Presence::Live => (theme.success, true),
             Presence::Idle => (theme.success, false),
