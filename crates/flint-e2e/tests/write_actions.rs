@@ -1093,12 +1093,13 @@ async fn a_pod_marked_after_the_review_stops_the_drain() {
 }
 
 // covers UP-51, UP-53: a pod whose marker is an annotation behind an empty label is named in the
-// review, and a change to that annotation after the review stops the drain before the pod is
-// evicted.
+// review, and a change to that annotation after the checks that start the drain stops the drain
+// before the pod is evicted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_annotation_changed_after_the_review_stops_the_drain_before_the_eviction() {
+async fn an_annotation_changed_during_the_drain_stops_the_eviction() {
     let server = FakeApiServer::start().await.unwrap();
     node(&server);
+    server.add_pod(pod_on_node("first", "ReplicaSet"));
     let mut pod = pod_json("web", "ReplicaSet");
     pod["metadata"]["labels"] = json!({FLUX_LABEL: ""});
     pod["metadata"]["annotations"] = json!({FLUX_LABEL: "apps"});
@@ -1115,18 +1116,34 @@ async fn an_annotation_changed_after_the_review_stops_the_drain_before_the_evict
         }
         other => panic!("{other:?}"),
     }
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("first")
+            .subresource("eviction")
+            .times(1),
+    );
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let first = "/api/v1/namespaces/demo/pods/first/eviction";
+        while !server.arrivals().iter().any(|r| r.path == first) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first eviction");
     let pods = Gvr::core("pods");
     let mut live = server.object(&pods, Some("demo"), "web").expect("the pod");
     live["metadata"]["annotations"] = json!({FLUX_LABEL: "other"});
     server.set_object(&pods, live);
-    let result = core.handle.run_write(review.into_intent()).await;
-    match result {
-        Err(error) => assert_eq!(error, WriteError::Conflict),
-        Ok(outcome) => assert_eq!(
-            report(outcome).blocked,
-            [(named("web"), BlockedReason::ManagedSinceReview)]
-        ),
-    }
+
+    let drained = report(running.await.unwrap().unwrap());
+    assert_eq!(drained.evicted, [named("first")]);
+    assert_eq!(
+        drained.blocked,
+        [(named("web"), BlockedReason::ManagedSinceReview)]
+    );
     assert_eq!(evictions(&server, "web"), 0);
     assert!(server.object(&pods, Some("demo"), "web").is_some());
 }
