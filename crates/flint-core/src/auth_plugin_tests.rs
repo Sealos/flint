@@ -271,7 +271,7 @@ async fn a_token_without_expiry_is_used_as_it_is() {
 async fn a_plugin_certificate_becomes_the_client_identity() {
     let plugin = printing(r#"{"clientCertificateData":"CERT","clientKeyData":"KEY"}"#);
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
-    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().token.is_none());
     let auth = &config.auth_info;
     assert!(auth.exec.is_none(), "kube must not run the plugin again");
     assert_eq!(auth.client_certificate_data.as_deref(), Some("Q0VSVA=="));
@@ -288,7 +288,7 @@ async fn a_kubeconfig_token_wins_over_the_plugin() {
     let mut kubeconfig = plugin.kubeconfig("https://127.0.0.1:1");
     kubeconfig.auth_infos[0].auth_info.as_mut().unwrap().token = Some("t-file".into());
     let mut config = config(&kubeconfig).await;
-    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().token.is_none());
     assert_eq!(runs(&plugin), 0);
     assert!(config.auth_info.exec.is_some());
 }
@@ -458,7 +458,7 @@ async fn a_helper_holding_the_output_does_not_cost_the_credential() {
     );
     let mut config = config(&plugin.kubeconfig("https://127.0.0.1:1")).await;
     let started = std::time::Instant::now();
-    assert!(resolve(&mut config, "ctx").await.unwrap().is_none());
+    assert!(resolve(&mut config, "ctx").await.unwrap().token.is_none());
     assert!(started.elapsed() >= DRAIN_GRACE);
     assert_eq!(config.auth_info.token.unwrap().expose_secret(), "t-held");
     let helper: libc::pid_t = std::fs::read_to_string(plugin.dir.path().join("child"))
