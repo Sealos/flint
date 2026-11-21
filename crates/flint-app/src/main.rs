@@ -39,8 +39,8 @@ development and testing only:
                      with #yaml for the YAML tab or #logs for a pod's logs
   FLINT_APPEARANCE   light or dark, over the appearance setting";
 
-/// Help for `flint mcp`. `exe` is this binary's absolute path, for the example.
-fn mcp_usage(exe: &str) -> String {
+/// Help for `flint mcp`. `command` is what an AI client should run, for the example.
+fn mcp_usage(command: &str) -> String {
     format!(
         "\
 usage: flint mcp [--verbose]  serve the read-only MCP server on stdio
@@ -49,7 +49,7 @@ usage: flint mcp [--verbose]  serve the read-only MCP server on stdio
 
 Register `flint mcp` as a stdio MCP server in your AI client, for example:
 
-    claude mcp add flint -- {exe} mcp
+    claude mcp add flint -- {command}
 
 It only sees the clusters marked Expose to AI in Flint. Diagnostics go to stderr and Flint
 events also go to the app's log file (see flint --help). Warnings and errors are logged by
@@ -57,34 +57,49 @@ default. Use --verbose for info, or set FLINT_LOG (for example FLINT_LOG=debug).
     )
 }
 
-/// The command that starts this binary later, for the `flint mcp --help` example.
-fn registered_exe() -> String {
+/// The command that starts the MCP server later, for the `flint mcp --help` example.
+fn registered_command() -> String {
     let appdir = std::env::var_os("APPDIR").and_then(|dir| std::fs::canonicalize(dir).ok());
-    registered_exe_from(
+    registered_command_from(
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("APPIMAGE").as_deref(),
         appdir.as_deref(),
+        std::env::var_os("APPIMAGE_EXTRACT_AND_RUN").is_some(),
     )
 }
 
-/// `exe`, shell-quoted, or `flint` if it is unknown or not UTF-8. Inside an AppImage `exe` is a
-/// temporary path that goes away when the launch exits, so the AppImage itself is named instead.
-/// `APPIMAGE` counts only when `exe` is inside `APPDIR`: child processes inherit both variables,
-/// so another `flint` started from an AppImage's shell must still name itself.
-fn registered_exe_from(
+/// `<exe> mcp` with `exe` shell-quoted, or `flint mcp` if it is unknown or not UTF-8. Inside an
+/// AppImage `exe` is a temporary path that goes away when the launch exits, so the AppImage itself
+/// is named instead. `APPIMAGE` counts only when `exe` is inside `APPDIR`: child processes inherit
+/// both variables, so another `flint` started from an AppImage's shell must still name itself.
+///
+/// An AppImage launched with `extract_and_run` is on a host without FUSE, where a later launch
+/// needs the same variable and a private `TMPDIR` (the README's no-FUSE form).
+fn registered_command_from(
     exe: Option<&Path>,
     appimage: Option<&OsStr>,
     appdir: Option<&Path>,
+    extract_and_run: bool,
 ) -> String {
+    let fallback = || "flint mcp".to_owned();
     let Some(exe) = exe else {
-        return "flint".to_owned();
+        return fallback();
     };
-    let path = match (appimage.map(Path::new), appdir) {
-        (Some(image), Some(dir)) if image.is_absolute() && exe.starts_with(dir) => image,
-        _ => exe,
+    let image = match (appimage.map(Path::new), appdir) {
+        (Some(image), Some(dir)) if image.is_absolute() && exe.starts_with(dir) => Some(image),
+        _ => None,
     };
-    path.to_str()
-        .map_or_else(|| "flint".to_owned(), shell_quote)
+    let Some(word) = image.unwrap_or(exe).to_str().map(shell_quote) else {
+        return fallback();
+    };
+    if image.is_some() && extract_and_run {
+        let script = format!(
+            r#"d=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTRACT_AND_RUN=1 {word} mcp; s=$?; rm -rf "$d"; exit $s"#
+        );
+        format!("sh -c {}", shell_quote(&script))
+    } else {
+        format!("{word} mcp")
+    }
 }
 
 /// `text` as one POSIX shell word: unchanged when it is safe, otherwise in single quotes.
@@ -130,7 +145,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Run, (String, u8
         // Checked before the server starts: on stdio, `--help` would otherwise be served as a
         // session that ends at once.
         ["mcp"] => run(Mode::Mcp),
-        ["mcp", "-h" | "--help" | "help", ..] => Err((mcp_usage(&registered_exe()), 0)),
+        ["mcp", "-h" | "--help" | "help", ..] => Err((mcp_usage(&registered_command()), 0)),
         ["mcp", "-V" | "--version" | "version", ..] => Err((version(), 0)),
         ["mcp", other, ..] => Err((
             format!("flint mcp: unknown argument \"{other}\" (try flint mcp --help)"),
@@ -185,7 +200,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use super::{Mode, Run, parse_args, registered_exe_from, shell_quote, version};
+    use super::{Mode, Run, parse_args, registered_command_from, shell_quote, version};
 
     #[test]
     fn mcp_help_names_the_appimage_not_its_temporary_mount() {
@@ -193,14 +208,25 @@ mod tests {
         let dir = Path::new("/tmp/.mount_FlintX");
         let image = OsStr::new("/home/me/My Apps/Flint's.AppImage");
         assert_eq!(
-            registered_exe_from(Some(exe), Some(image), Some(dir)),
-            r"'/home/me/My Apps/Flint'\''s.AppImage'"
+            registered_command_from(Some(exe), Some(image), Some(dir), false),
+            r"'/home/me/My Apps/Flint'\''s.AppImage' mcp"
         );
         // A relative APPIMAGE would not work from another directory.
         let relative = OsStr::new("Flint.AppImage");
         assert_eq!(
-            registered_exe_from(Some(exe), Some(relative), Some(dir)),
-            exe.to_str().unwrap()
+            registered_command_from(Some(exe), Some(relative), Some(dir), false),
+            format!("{} mcp", exe.display())
+        );
+    }
+
+    #[test]
+    fn mcp_help_without_fuse_gives_each_launch_a_private_tmpdir() {
+        let exe = Path::new("/tmp/appimage_extracted_x/usr/bin/flint");
+        let dir = Path::new("/tmp/appimage_extracted_x");
+        let image = OsStr::new("/home/me/Flint.AppImage");
+        assert_eq!(
+            registered_command_from(Some(exe), Some(image), Some(dir), true),
+            r#"sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTRACT_AND_RUN=1 /home/me/Flint.AppImage mcp; s=$?; rm -rf "$d"; exit $s'"#
         );
     }
 
@@ -209,24 +235,29 @@ mod tests {
         let exe = Path::new("/usr/local/bin/flint");
         let image = OsStr::new("/home/me/Flint.AppImage");
         let dir = Path::new("/tmp/.mount_FlintX");
-        assert_eq!(
-            registered_exe_from(Some(exe), Some(image), Some(dir)),
-            "/usr/local/bin/flint"
-        );
-        assert_eq!(
-            registered_exe_from(Some(exe), Some(image), None),
-            "/usr/local/bin/flint"
-        );
+        for extract_and_run in [false, true] {
+            assert_eq!(
+                registered_command_from(Some(exe), Some(image), Some(dir), extract_and_run),
+                "/usr/local/bin/flint mcp"
+            );
+            assert_eq!(
+                registered_command_from(Some(exe), Some(image), None, extract_and_run),
+                "/usr/local/bin/flint mcp"
+            );
+        }
     }
 
     #[test]
     fn mcp_help_quotes_the_path_and_falls_back_to_flint() {
         let spaced = Path::new("/Applications/My Tools/flint");
         assert_eq!(
-            registered_exe_from(Some(spaced), None, None),
-            "'/Applications/My Tools/flint'"
+            registered_command_from(Some(spaced), None, None, false),
+            "'/Applications/My Tools/flint' mcp"
         );
-        assert_eq!(registered_exe_from(None, None, None), "flint");
+        assert_eq!(
+            registered_command_from(None, None, None, false),
+            "flint mcp"
+        );
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("a$(b)"), "'a$(b)'");
     }
