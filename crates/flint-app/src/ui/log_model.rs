@@ -664,6 +664,28 @@ pub fn all_lines_dropped(snapshot: &flint_core::LogSnapshot) -> bool {
         && snapshot.held_back == 0
 }
 
+/// An empty ended tab's `text` and `detail`, its lines having all been dropped. A failure keeps
+/// its explanation, with the notice under it; otherwise the notice is the headline, and what
+/// else the tab says (the pod was deleted) stays.
+pub fn with_lines_dropped(
+    text: String,
+    detail: Option<String>,
+    failed: bool,
+) -> (String, Option<String>) {
+    if failed {
+        let detail = match detail {
+            Some(detail) => format!("{detail}\n{ALL_LINES_DROPPED}"),
+            None => ALL_LINES_DROPPED.to_owned(),
+        };
+        return (text, Some(detail));
+    }
+    let detail = match detail {
+        Some(detail) => format!("{detail} {TRIMMED_TOOLTIP}"),
+        None => TRIMMED_TOOLTIP.to_owned(),
+    };
+    (ALL_LINES_DROPPED.to_owned(), Some(detail))
+}
+
 /// What the pause indicator says: why it is paused, and how many lines wait.
 pub fn pause_text(held_back: u64, by_selection: bool) -> String {
     let why = if by_selection {
@@ -1629,6 +1651,27 @@ mod tests {
                 "{scope:?}"
             );
         }
+    }
+
+    // covers UP-40, UP-42: a failed stream keeps its explanation when its lines are dropped.
+    #[test]
+    fn a_failure_stays_visible_when_all_lines_were_dropped() {
+        let (text, detail) = with_lines_dropped(
+            "The stream ended.".into(),
+            Some("server said no".into()),
+            true,
+        );
+        assert_eq!(text, "The stream ended.");
+        let detail = detail.unwrap();
+        assert!(detail.contains("server said no") && detail.contains(ALL_LINES_DROPPED));
+
+        let (text, detail) = with_lines_dropped(
+            "No log lines.".into(),
+            Some("The pod was deleted.".into()),
+            false,
+        );
+        assert_eq!(text, ALL_LINES_DROPPED);
+        assert!(detail.unwrap().starts_with("The pod was deleted."));
     }
 
     // covers UP-42: only an ended tab that lost every line says so. A paused one with newer

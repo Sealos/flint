@@ -311,9 +311,12 @@ impl Output {
     fn trim_for(&mut self, budget: &LogBudget, id: u64) -> Option<bool> {
         let plan = budget.begin_trim(id)?;
         let mut detached = Vec::new();
-        while let Some(lines) =
-            budget.while_planned(id, plan, || self.buffer.detach_oldest(plan.to))
-        {
+        let buffer = &mut self.buffer;
+        while let Some(lines) = budget.while_planned(id, plan, || {
+            let before = buffer.bytes();
+            let lines = buffer.detach_oldest(plan.to)?;
+            Some((lines, before - buffer.bytes()))
+        }) {
             detached.push(lines);
         }
         if detached.is_empty() {
@@ -749,7 +752,9 @@ mod tests {
         let plan = budget.begin_trim(1).expect("over the budget");
         budget.set_shown(1, true);
         assert_eq!(
-            budget.while_planned(1, plan, || out.buffer.detach_oldest(plan.to)),
+            budget.while_planned(1, plan, || {
+                out.buffer.detach_oldest(plan.to).map(|lines| (lines, 0))
+            }),
             None
         );
         assert_eq!(out.buffer.len(), held);

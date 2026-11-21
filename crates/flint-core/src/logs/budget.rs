@@ -54,6 +54,8 @@ struct Entry {
     /// again from the measured sizes on every change ([`Inner::rebalance`]), so a tab shown
     /// since, or resumed, is never left with an old target.
     trim_to: Option<usize>,
+    /// The target of the trim the session took and is carrying out, so a new plan can revoke it.
+    in_flight: Option<usize>,
     /// Advances when what the session may give back changes: shown, hidden, paused, resumed, or
     /// planned again. A trim under way stops when it moves.
     plan: u64,
@@ -108,6 +110,7 @@ impl LogBudget {
                 shown: false,
                 paused: false,
                 trim_to: None,
+                in_flight: None,
                 plan: 0,
                 wake: wake.clone(),
             },
@@ -177,6 +180,7 @@ impl LogBudget {
         if let Some(entry) = self.lock().sessions.get_mut(&id) {
             entry.bytes = bytes;
             entry.trimmable = trimmable;
+            entry.in_flight = None;
         }
     }
 
@@ -185,6 +189,7 @@ impl LogBudget {
         let mut inner = self.lock();
         let entry = inner.sessions.get_mut(&id)?;
         let to = entry.trim_to.take()?;
+        entry.in_flight = Some(to);
         Some(TrimPlan {
             to,
             plan: entry.plan,
@@ -192,19 +197,24 @@ impl LogBudget {
     }
 
     /// Runs `detach` under the budget's lock if session `id`'s tab is still hidden and `plan`
-    /// still stands. `detach` must take constant time: the UI thread can wait on this lock.
+    /// still stands, and counts the bytes it returns as gone in the same step, so a plan made
+    /// right after does not ask another tab for them. `detach` must take constant time: the UI
+    /// thread can wait on this lock.
     pub(crate) fn while_planned<T>(
         &self,
         id: u64,
         plan: TrimPlan,
-        detach: impl FnOnce() -> Option<T>,
+        detach: impl FnOnce() -> Option<(T, usize)>,
     ) -> Option<T> {
-        let inner = self.lock();
-        let entry = inner.sessions.get(&id)?;
+        let mut inner = self.lock();
+        let entry = inner.sessions.get_mut(&id)?;
         if entry.shown || entry.plan != plan.plan {
             return None;
         }
-        detach()
+        let (detached, freed) = detach()?;
+        entry.bytes = entry.bytes.saturating_sub(freed);
+        entry.trimmable = entry.trimmable.saturating_sub(freed);
+        Some(detached)
     }
 
     #[cfg(test)]
@@ -217,7 +227,11 @@ impl LogBudget {
         self.lock()
             .sessions
             .values()
-            .map(|e| e.trim_to.map_or(e.bytes, |t| t.min(e.bytes)))
+            .map(|e| {
+                e.trim_to
+                    .or(e.in_flight)
+                    .map_or(e.bytes, |t| t.min(e.bytes))
+            })
             .sum()
     }
 }
@@ -253,6 +267,15 @@ impl Inner {
             }
         }
         for (id, entry) in &mut self.sessions {
+            // A trim under way that the new plan still wants carries on; any other is revoked.
+            if entry.in_flight.is_some() {
+                if entry.trim_to == entry.in_flight {
+                    entry.trim_to = None;
+                    continue;
+                }
+                entry.in_flight = None;
+                entry.plan += 1;
+            }
             let was = before.get(id).copied().flatten();
             if was != entry.trim_to {
                 entry.plan += 1;
@@ -368,11 +391,11 @@ mod tests {
         let plan = budget.begin_trim(1).expect("over the budget");
         assert_eq!(plan.to, 10 * MIB);
         assert_eq!(
-            budget.while_planned(1, plan, || Some("detached")),
+            budget.while_planned(1, plan, || Some(("detached", MIB))),
             Some("detached")
         );
         budget.set_shown(1, true);
-        let late = budget.while_planned(1, plan, || -> Option<()> {
+        let late = budget.while_planned(1, plan, || -> Option<((), usize)> {
             panic!("a block was detached from a tab shown")
         });
         assert_eq!(late, None);
@@ -387,7 +410,51 @@ mod tests {
         let plan = budget.begin_trim(1).unwrap();
         budget.set_shown(1, true);
         budget.set_shown(1, false);
-        assert_eq!(budget.while_planned(1, plan, || Some(())), None);
+        assert_eq!(budget.while_planned(1, plan, || Some(((), 0))), None);
+    }
+
+    // covers UP-42: a trim under way stops once the budget no longer needs it.
+    #[test]
+    fn closing_a_tab_revokes_a_trim_under_way() {
+        let budget = LogBudget::new(10 * MIB);
+        budget.register(1);
+        budget.register(2);
+        budget.report(1, 6 * MIB, 6 * MIB, false);
+        budget.report(2, 6 * MIB, 6 * MIB, false);
+        let plan = budget.begin_trim(1).expect("2 MiB over");
+        budget.unregister(2);
+        assert_eq!(budget.while_planned(1, plan, || Some(((), MIB))), None);
+    }
+
+    // covers UP-42: a report that keeps the same plan does not stop a trim under way.
+    #[test]
+    fn a_plan_that_still_stands_lets_a_trim_carry_on() {
+        let budget = LogBudget::new(10 * MIB);
+        budget.register(1);
+        budget.report(1, 20 * MIB, 20 * MIB, false);
+        let plan = budget.begin_trim(1).unwrap();
+        budget.report(1, 20 * MIB, 20 * MIB, false);
+        assert_eq!(budget.while_planned(1, plan, || Some(((), MIB))), Some(()));
+        assert_eq!(budget.begin_trim(1), None, "not asked twice");
+    }
+
+    // covers UP-42: what a trim detached counts at once, so showing the tab right after does not
+    // ask another tab for the same bytes.
+    #[test]
+    fn detached_bytes_are_not_asked_of_another_tab() {
+        let budget = LogBudget::new(10 * MIB);
+        budget.register(1);
+        budget.register(2);
+        budget.report(1, 8 * MIB, 8 * MIB, false);
+        budget.report(2, 4 * MIB, 4 * MIB, false);
+        let plan = budget.begin_trim(1).expect("2 MiB over");
+        assert_eq!(plan.to, 6 * MIB);
+        assert_eq!(
+            budget.while_planned(1, plan, || Some(((), 2 * MIB))),
+            Some(())
+        );
+        budget.set_shown(1, true);
+        assert_eq!(budget.take_trim(2), None, "already within the budget");
     }
 
     // covers UP-42: pausing counts at once, not with the next snapshot.
