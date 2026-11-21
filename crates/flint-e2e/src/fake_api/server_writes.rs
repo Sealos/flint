@@ -1,6 +1,8 @@
 //! The writes the resource actions send: `PATCH` and `DELETE` of an object, and a pod's
 //! `eviction`. Each checks what the API server checks, and tells watches.
 
+// module-tests: ../../tests/write_actions.rs
+
 use serde_json::json;
 
 use super::*;

@@ -89,6 +89,8 @@ pub(in crate::ui) enum Opening {
     ReconnectLogs,
     /// An ended shell tab's Restart shell.
     RestartShell,
+    /// A resource action (delete, scale, restart, cordon, uncordon, drain).
+    Write(super::super::resource_actions::ResourceAction),
 }
 
 impl Opening {
@@ -101,6 +103,7 @@ impl Opening {
             Opening::LogsAndShell => "Can't open the logs or a shell",
             Opening::ReconnectLogs => "Can't reconnect the logs",
             Opening::RestartShell => "Can't restart the shell",
+            Opening::Write(action) => action.cant(),
         }
     }
 }
@@ -538,6 +541,35 @@ impl DetailView {
             pod: target.pod,
             container: Some(container),
         }))
+    }
+
+    /// Whether the object shown was deleted.
+    pub(in crate::ui) fn is_gone(&self) -> bool {
+        self.gone
+    }
+
+    /// Whether the node shown is cordoned, once fetched; `Err` says why it is not known.
+    pub(in crate::ui) fn node_cordoned(&self) -> Result<bool, String> {
+        match &self.fetch {
+            Fetch::Loading => Err(format!("{} is still loading", self.object.name)),
+            Fetch::Failed(e) => Err(format!("the node could not be fetched: {e}")),
+            Fetch::Loaded { detail, .. } => Ok(detail
+                .object
+                .pointer("/spec/unschedulable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)),
+        }
+    }
+
+    /// The replica count of the workload shown, once fetched: what the scale dialog starts from.
+    pub(in crate::ui) fn replicas(&self) -> Option<u64> {
+        match &self.fetch {
+            Fetch::Loaded { detail, .. } => detail
+                .object
+                .pointer("/spec/replicas")
+                .and_then(Value::as_u64),
+            _ => None,
+        }
     }
 
     /// The fetched pod's containers; empty for other kinds or before the fetch.

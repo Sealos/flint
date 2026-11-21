@@ -229,6 +229,8 @@ pub struct Workspace {
     /// the selection, list or cluster changes, or [`ACTION_ERROR_SHOWN`] has passed.
     action_error: Option<String>,
     _action_error: Task<()>,
+    /// The review a resource action is waiting for.
+    _write_review: Task<()>,
     /// The last write of `state.toml`; the next one waits for it, so writes land in order.
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
@@ -362,6 +364,7 @@ impl Workspace {
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
             _action_error: Task::ready(()),
+            _write_review: Task::ready(()),
             startup_view,
             saving: None,
             _save_panes: Task::ready(()),
@@ -943,7 +946,8 @@ impl Workspace {
         let list = cx.new(|cx| {
             ResourceList::new(core, cluster.clone(), entry, namespaces, sort, window, cx)
         });
-        if row_menu::has_row_actions(&entry.id) {
+        let deletable = self.kind_deletable(&cluster, &entry.id, cx);
+        if row_menu::has_row_actions(&entry.id, deletable) {
             let menu = row_menu::row_menu(cx.weak_entity());
             list.update(cx, |list, _| list.set_row_menu(menu));
         }

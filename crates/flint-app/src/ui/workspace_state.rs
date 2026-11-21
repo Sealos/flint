@@ -256,6 +256,9 @@ fn row_action_states(ws: &Workspace, cx: &App) -> Vec<ActionAvailability> {
     let Some(a) = row_menu::row_actions(ws, cx) else {
         return Vec::new();
     };
+    if a.subject == crate::ui::detail::Subject::Other {
+        return Vec::new();
+    }
     let state = |action, can: &row_menu::Availability| ActionAvailability {
         action,
         enabled: can.is_ok(),

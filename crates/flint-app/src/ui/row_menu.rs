@@ -1,4 +1,5 @@
-//! The context menu of a pod or workload row (UP-47): Logs, Previous Logs and Shell.
+//! The context menu of a row: Logs, Previous Logs and Shell on a pod or workload (UP-47), and the
+//! resource actions its kind has (UP-53, [`resource_actions`]).
 //!
 //! On a pod with several containers each entry is a container picker, the default container
 //! marked; the keys (⌘L, ⇧⌘L, ⇧⌘E) open the default container at once (see "From rows" in
@@ -38,6 +39,7 @@ use super::object::PodContainer;
 use super::registry::{
     self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell, UnlockCluster,
 };
+use super::resource_actions::{self, ResourceAction, has_sessions};
 #[cfg(any(test, feature = "automation"))]
 use super::view_state::{MenuEntryState, SubmenuEntryState};
 use super::workspace::Workspace;
@@ -59,9 +61,10 @@ pub(in crate::ui) const MENU_NOTE: &str = "row-menu-note";
 /// The most of a pod's name the Shell entry shows, with its key, inside the menu's width.
 const SHELL_POD_NAME: usize = 28;
 
-/// Whether rows of `kind` get the menu: pods and workloads.
-pub fn has_row_actions(kind: &KindId) -> bool {
-    Subject::of(kind) != Subject::Other
+/// Whether rows of `kind` get the menu: pods, workloads, and kinds with a resource action
+/// (`deletable`: discovery lists the `delete` verb).
+pub fn has_row_actions(kind: &KindId, deletable: bool) -> bool {
+    Subject::of(kind) != Subject::Other || resource_actions::kind_has_actions(kind, deletable)
 }
 
 /// Whether an entry can run now: `Err` says why not.
@@ -90,6 +93,15 @@ pub struct RowActions {
     /// The row's cluster, when it is protected (ADR-0015): Shell is disabled, saying so, and
     /// an Unlock entry follows it, so the unlock is offered in place.
     pub unlock: Option<UnlockEntry>,
+    /// The resource actions the row's kind has, in menu order, and whether each can run now.
+    pub writes: Vec<WriteEntry>,
+}
+
+/// A resource action's entry in a row's menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteEntry {
+    pub action: ResourceAction,
+    pub can: Availability,
 }
 
 /// The Unlock entry of a protected cluster's row menu.
@@ -107,13 +119,21 @@ fn unlock_tip(context: &str, server: Option<&str>) -> String {
     format!("{context}\n{}", server.unwrap_or("no server"))
 }
 
-/// What the selected row's actions can do now, if a pod or workload row is selected. The
-/// actions' guards (`workspace_actions`) use the same checks.
+/// What the selected row's actions can do now, if its kind has any. The actions' guards
+/// (`workspace_actions`) use the same checks.
 pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
     let detail = ws.detail_view()?;
     let detail = detail.read(cx);
     let subject = detail.subject();
-    if subject == Subject::Other {
+    let writes: Vec<WriteEntry> = resource_actions::offered(ws, detail, cx)
+        .into_iter()
+        .map(|action| WriteEntry {
+            action,
+            can: resource_actions::available(ws, action, cx)
+                .map_err(|why| first_line(&why, MAX_REASON)),
+        })
+        .collect();
+    if subject == Subject::Other && writes.is_empty() {
         return None;
     }
     let blocked = ws.sessions_blocked(&detail.object().cluster, cx);
@@ -146,6 +166,7 @@ pub fn row_actions(ws: &Workspace, cx: &App) -> Option<RowActions> {
         }),
         blocked,
         subject,
+        writes,
     })
 }
 
@@ -159,6 +180,26 @@ fn shell_in_menu(a: &RowActions) -> Availability {
         }
         (shell, _) => shell.clone(),
     }
+}
+
+/// A resource action's availability as the menu draws it: on a protected cluster the short note,
+/// as for Shell.
+fn write_in_menu(a: &RowActions, write: &WriteEntry) -> Availability {
+    match (&write.can, &a.unlock) {
+        (Err(why), Some(unlock)) if *why == protected_reason(&unlock.cluster) => {
+            Err(PROTECTED_NOTE.to_owned())
+        }
+        (can, _) => can.clone(),
+    }
+}
+
+/// Whether the menu says "protected" once, right above Unlock, rather than under each entry:
+/// when it has resource actions, all disabled for the same reason.
+fn protected_once(a: &RowActions) -> bool {
+    a.unlock.is_some()
+        && a.writes
+            .iter()
+            .any(|w| write_in_menu(a, w).err().as_deref() == Some(PROTECTED_NOTE))
 }
 
 /// The menu for the rows of the workspace's list, acting on the row selected.
@@ -231,70 +272,33 @@ fn fill(
     }
     // The cluster's reason is said once, above.
     let says_why = a.blocked.is_none();
-    let entry =
-        |menu, label, action, can, says_why| entry(menu, label, action, can, says_why, workspace);
     let workspace = workspace.clone();
-    // A pod with several containers: Logs and Previous Logs pick one, as Shell does.
-    let several = a.log_containers.len() > 1;
-    menu = if several && a.logs.is_ok() {
-        let containers = a.log_containers.clone();
-        log_picker(menu, "Logs", containers, false, &workspace, window, cx)
-    } else {
-        entry(menu, "Logs".into(), Box::new(OpenLogs), &a.logs, says_why)
-    };
-    if let Some(previous) = &a.previous {
-        // Only the containers that ran before have a previous instance.
-        let restarted: Vec<PodContainer> = a
-            .log_containers
-            .iter()
-            .filter(|c| c.has_previous)
-            .cloned()
-            .collect();
-        menu = if several && !restarted.is_empty() && a.blocked.is_none() {
-            log_picker(
-                menu,
-                "Previous Logs",
-                restarted,
-                true,
-                &workspace,
-                window,
-                cx,
-            )
-        } else {
-            entry(
-                menu,
-                "Previous Logs".into(),
-                Box::new(OpenPreviousLogs),
-                previous,
-                says_why,
-            )
-        };
+    let once = protected_once(&a);
+    if has_sessions(a.subject) {
+        menu = session_entries(menu, &a, once, &workspace, window, cx);
     }
-    let label = shell_entry_label(&a);
-    let shell_shown = shell_in_menu(&a);
-    let menu = match a.shell_pod {
-        // The container picker.
-        Some(shell) if a.shell_picker && a.blocked.is_none() => {
-            menu.submenu(label, window, cx, move |sub, window, _| {
-                let sub = fit_container_names(sub, window).label("Container");
-                shell.containers.iter().fold(sub, |sub, name| {
-                    let running = !shell.not_running.contains(name);
-                    let (item, action) = shell_item(name, *name == shell.default, running);
-                    sub.item(item.on_click(registry::on_click_or(
-                        Box::new(action),
-                        refuse_in(&workspace),
-                    )))
-                })
-            })
+    if !a.writes.is_empty() {
+        if has_sessions(a.subject) {
+            menu = menu.separator();
         }
-        _ => entry(
-            menu,
-            label.into(),
-            Box::new(OpenShell),
-            &shell_shown,
-            says_why,
-        ),
-    };
+        for write in &a.writes {
+            let can = write_in_menu(&a, write);
+            // The protected note is said once, above Unlock.
+            let says = says_why
+                && !(once && can.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
+            menu = entry(
+                menu,
+                write.action.label().into(),
+                write.action.boxed(),
+                &can,
+                says,
+                &workspace,
+            );
+        }
+    }
+    if once {
+        menu = say(menu, PROTECTED_NOTE);
+    }
     match a.unlock {
         Some(UnlockEntry { cluster, name, tip }) => {
             let label = SharedString::from(unlock_label(&name));
@@ -315,6 +319,87 @@ fn fill(
             )
         }
         None => menu,
+    }
+}
+
+/// Logs, Previous Logs and Shell. With `once`, Shell's protected note waits for the one above
+/// Unlock.
+fn session_entries(
+    menu: PopupMenu,
+    a: &RowActions,
+    once: bool,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let mut menu = menu;
+    // The cluster's reason is said once, above.
+    let says_why = a.blocked.is_none();
+    let plain =
+        |menu, label, action, can, says_why| entry(menu, label, action, can, says_why, workspace);
+    // A pod with several containers: Logs and Previous Logs pick one, as Shell does.
+    let several = a.log_containers.len() > 1;
+    menu = if several && a.logs.is_ok() {
+        let containers = a.log_containers.clone();
+        log_picker(menu, "Logs", containers, false, workspace, window, cx)
+    } else {
+        plain(menu, "Logs".into(), Box::new(OpenLogs), &a.logs, says_why)
+    };
+    if let Some(previous) = &a.previous {
+        // Only the containers that ran before have a previous instance.
+        let restarted: Vec<PodContainer> = a
+            .log_containers
+            .iter()
+            .filter(|c| c.has_previous)
+            .cloned()
+            .collect();
+        menu = if several && !restarted.is_empty() && a.blocked.is_none() {
+            log_picker(
+                menu,
+                "Previous Logs",
+                restarted,
+                true,
+                workspace,
+                window,
+                cx,
+            )
+        } else {
+            plain(
+                menu,
+                "Previous Logs".into(),
+                Box::new(OpenPreviousLogs),
+                previous,
+                says_why,
+            )
+        };
+    }
+    let label = shell_entry_label(a);
+    let shell_shown = shell_in_menu(a);
+    let says_shell = says_why
+        && !(once && shell_shown.as_ref().err().map(String::as_str) == Some(PROTECTED_NOTE));
+    match a.shell_pod.clone() {
+        // The container picker.
+        Some(shell) if a.shell_picker && a.blocked.is_none() => {
+            let workspace = workspace.clone();
+            menu.submenu(label, window, cx, move |sub, window, _| {
+                let sub = fit_container_names(sub, window).label("Container");
+                shell.containers.iter().fold(sub, |sub, name| {
+                    let running = !shell.not_running.contains(name);
+                    let (item, action) = shell_item(name, *name == shell.default, running);
+                    sub.item(item.on_click(registry::on_click_or(
+                        Box::new(action),
+                        refuse_in(&workspace),
+                    )))
+                })
+            })
+        }
+        _ => plain(
+            menu,
+            label.into(),
+            Box::new(OpenShell),
+            &shell_shown,
+            says_shell,
+        ),
     }
 }
 
@@ -421,6 +506,18 @@ pub(in crate::ui) fn refusal(
     error: &registry::ActionError,
     cx: &App,
 ) -> String {
+    if let Some(write) = ResourceAction::of(action) {
+        let why = match error {
+            registry::ActionError::NotAvailable(_) => row_actions(ws, cx)
+                .and_then(|a| a.writes.into_iter().find(|w| w.action == write))
+                .and_then(|w| w.can.err()),
+            other => Some(reason(other)),
+        };
+        return refused(
+            Opening::Write(write),
+            why.as_deref().unwrap_or("it cannot run now"),
+        );
+    }
     let any = action.as_any();
     let opening = if any.is::<OpenLogs>() {
         Opening::Logs
@@ -444,6 +541,7 @@ pub(in crate::ui) fn refusal(
             Opening::PreviousLogs => a.previous?,
             Opening::Shell | Opening::LogsAndShell | Opening::RestartShell => a.shell,
             Opening::ReconnectLogs => a.logs,
+            Opening::Write(_) => return None,
         };
         can.err()
     });
@@ -482,43 +580,51 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
     };
     let several = a.log_containers.len() > 1;
     let mut entries = Vec::new();
-    entries.push(if several && a.logs.is_ok() {
-        picker("Logs".into(), logs_of(&mut a.log_containers.iter()))
-    } else {
-        entry("Logs".into(), &a.logs)
-    });
-    if let Some(previous) = &a.previous {
-        let mut restarted = a
-            .log_containers
-            .iter()
-            .filter(|c| c.has_previous)
-            .peekable();
-        entries.push(
-            if several && restarted.peek().is_some() && a.blocked.is_none() {
-                picker("Previous Logs".into(), logs_of(&mut restarted))
-            } else {
-                entry("Previous Logs".into(), previous)
-            },
-        );
-    }
-    let label = shell_entry_label(a);
-    entries.push(match &a.shell_pod {
-        Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
-            label,
-            shell
-                .containers
+    if has_sessions(a.subject) {
+        entries.push(if several && a.logs.is_ok() {
+            picker("Logs".into(), logs_of(&mut a.log_containers.iter()))
+        } else {
+            entry("Logs".into(), &a.logs)
+        });
+        if let Some(previous) = &a.previous {
+            let mut restarted = a
+                .log_containers
                 .iter()
-                .map(|name| {
-                    let running = !shell.not_running.contains(name);
-                    SubmenuEntryState {
-                        label: shell_label(name, *name == shell.default, running),
-                        enabled: running,
-                    }
-                })
-                .collect(),
-        ),
-        _ => entry(label, &shell_in_menu(a)),
-    });
+                .filter(|c| c.has_previous)
+                .peekable();
+            entries.push(
+                if several && restarted.peek().is_some() && a.blocked.is_none() {
+                    picker("Previous Logs".into(), logs_of(&mut restarted))
+                } else {
+                    entry("Previous Logs".into(), previous)
+                },
+            );
+        }
+        let label = shell_entry_label(a);
+        entries.push(match &a.shell_pod {
+            Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
+                label,
+                shell
+                    .containers
+                    .iter()
+                    .map(|name| {
+                        let running = !shell.not_running.contains(name);
+                        SubmenuEntryState {
+                            label: shell_label(name, *name == shell.default, running),
+                            enabled: running,
+                        }
+                    })
+                    .collect(),
+            ),
+            _ => entry(label, &shell_in_menu(a)),
+        });
+    }
+    for write in &a.writes {
+        entries.push(entry(
+            write.action.label().to_owned(),
+            &write_in_menu(a, write),
+        ));
+    }
     if let Some(unlock) = &a.unlock {
         entries.push(entry(unlock_label(&unlock.name), &Ok(())));
     }
@@ -540,8 +646,8 @@ pub(in crate::ui) mod tests {
     use flint_core::redact::first_line;
 
     use super::{
-        MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, menu_state,
-        protected_reason, shell_entry_label, unlock_tip,
+        MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, WriteEntry,
+        menu_state, protected_once, protected_reason, shell_entry_label, unlock_tip,
     };
     use crate::ui::detail::{ShellPod, Subject};
     use crate::ui::object::PodContainer;
@@ -567,6 +673,7 @@ pub(in crate::ui) mod tests {
             shell_picker: false,
             log_containers: vec![container("app", true, false)],
             unlock: None,
+            writes: Vec::new(),
         }
     }
 
@@ -660,6 +767,44 @@ pub(in crate::ui) mod tests {
             state(&protected)["entries"].as_array().unwrap()[2..],
             [
                 json!({"label": "Shell", "enabled": false, "reason": why, "checked": null, "submenu": []}),
+                json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
+            ]
+        );
+    }
+
+    // covers UP-54: on a protected cluster every resource action is disabled, the state says why
+    // for each, and Unlock follows them.
+    #[test]
+    fn a_protected_rows_resource_actions_say_why() {
+        use crate::ui::resource_actions::ResourceAction;
+
+        let why = protected_reason("alpha");
+        let protected = RowActions {
+            subject: Subject::Workload(WorkloadKind::Deployment),
+            previous: None,
+            shell: Err(why.clone()),
+            writes: [ResourceAction::Scale, ResourceAction::Delete]
+                .into_iter()
+                .map(|action| WriteEntry {
+                    action,
+                    can: Err(why.clone()),
+                })
+                .collect(),
+            unlock: Some(UnlockEntry {
+                cluster: "alpha".into(),
+                name: "alpha".into(),
+                tip: "alpha\nhttps://example.invalid".into(),
+            }),
+            ..pod_actions()
+        };
+        assert!(protected_once(&protected));
+        let note = PROTECTED_NOTE;
+        assert_eq!(
+            state(&protected)["entries"].as_array().unwrap()[1..],
+            [
+                json!({"label": "Shell", "enabled": false, "reason": note, "checked": null, "submenu": []}),
+                json!({"label": "Scale…", "enabled": false, "reason": note, "checked": null, "submenu": []}),
+                json!({"label": "Delete…", "enabled": false, "reason": note, "checked": null, "submenu": []}),
                 json!({"label": "Unlock alpha…", "enabled": true, "reason": null, "checked": null, "submenu": []}),
             ]
         );

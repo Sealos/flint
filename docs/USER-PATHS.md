@@ -420,9 +420,12 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: cluster.
 
 ### UP-53 Destructive actions are deliberate
-- **When** I delete, scale, rollout-restart, cordon or drain.
-- **Then** a confirmation names the cluster, namespace and object. Drain reports pods blocked by a PodDisruptionBudget
-  instead of hanging.
+- **When** I delete, scale, rollout-restart, cordon, uncordon or drain from a row's context menu.
+- **Then** a confirmation names the cluster, server, namespace and object, after any GitOps warning. Delete and Drain
+  take the button: Enter cancels them. Scale asks for the count first and shows from and to. Drain first offers two
+  unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost. If the object
+  changed, nothing is run again: a new review opens, saying so. Drain reports what it did, also when it stopped early:
+  cordoned, evicted, blocked and why (a PodDisruptionBudget is named), skipped, not tried, still terminating.
 - Tests: cluster, ui.
 
 ---
@@ -434,8 +437,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   details work as usual. A cluster whose API server kubeconfig names by a loopback address or name (kind, Docker
   Desktop, OrbStack, minikube on macOS) starts unlocked. One on another address stays protected even if it runs on
   my machine, such as minikube's Docker driver on Linux (`192.168.49.2`): I trust it once.
-- Tests: unit (core refuses writes on protected clusters), ui, e2e. Today exec is the only action that changes a
-  cluster, so Shell is the one gated; the rest join the same gate as they are built.
+- Tests: unit (core refuses writes on protected clusters), ui, e2e. Shell and the resource actions (UP-53) are
+  gated today; the rest join the same gate as they are built.
 
 ### UP-55 Unlock or trust a cluster
 - **When** I unlock a protected cluster, or mark it trusted.

@@ -663,7 +663,10 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
     activate(cx, &t, "alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     // One wording for Logs, on pods and workloads alike: the menu, the pane and the palette.
-    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell"]);
+    assert_eq!(
+        open_menu(cx, &t, "web").await,
+        ["Logs", "Shell", "", "Scale…", "Rollout Restart…"]
+    );
     let button = cx
         .update_window(t.window, |_, window, _| {
             window.find("detail-logs").label().map(str::to_owned)
@@ -770,7 +773,10 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
         [available("Logs"), unavailable("Shell", why)]
     );
     assert_eq!(shell_button_disabled(cx, &t), Some(true));
-    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell", why]);
+    assert_eq!(
+        open_menu(cx, &t, "web").await,
+        ["Logs", "Shell", why, "", "Scale…", "Rollout Restart…"]
+    );
     assert_eq!(pods.asked(), 1, "the pods listed still hold");
     click_entry(cx, &t, 1);
     assert_eq!(refusal(cx, &t), None, "a disabled entry does not run");
@@ -789,7 +795,10 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
         Vec::<Freshness>::new(),
         "not on every change"
     );
-    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell"]);
+    assert_eq!(
+        open_menu(cx, &t, "web").await,
+        ["Logs", "Shell", "", "Scale…", "Rollout Restart…"]
+    );
     assert_eq!(pods.waiting(), [Freshness::Cached]);
     pods.answer(
         cx,
@@ -800,7 +809,10 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
             workload_pod("web-b", true, &["app"]),
         ]),
     );
-    assert_eq!(menu(cx, &t), ["Logs", "Shell in web-b"]);
+    assert_eq!(
+        menu(cx, &t),
+        ["Logs", "Shell in web-b", "", "Scale…", "Rollout Restart…"]
+    );
     assert_eq!(shell_button_disabled(cx, &t), Some(false));
 
     // Chosen, Shell lists the pods once more, as they are now: web-b went meanwhile.
@@ -1519,7 +1531,10 @@ async fn a_stale_or_failed_pod_list_does_not_disable_shell(cx: &mut TestAppConte
     draw(cx, &t);
     assert_eq!(pods.waiting(), [Freshness::Cached]);
     pods.answer(cx, &t, Ok(vec![workload_pod("web-a", true, &["app"])]));
-    assert_eq!(open_menu(cx, &t, "web").await, ["Logs", "Shell in web-a"]);
+    assert_eq!(
+        open_menu(cx, &t, "web").await,
+        ["Logs", "Shell in web-a", "", "Scale…", "Rollout Restart…"]
+    );
     press(cx, &t, "escape");
 
     // A failed list: Shell stays enabled, and the keys run it.
