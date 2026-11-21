@@ -118,6 +118,7 @@ fn a_review_is_refused_for_any_other_target() {
     let intent = |target| WriteIntent {
         target,
         action: WriteAction::ApplyYaml(reviewed()),
+        reviewed: crate::recheck::ContextHistory::default().pin("dev", None),
     };
     assert_eq!(check_bound(&intent(target())), Ok(()));
     let others = [

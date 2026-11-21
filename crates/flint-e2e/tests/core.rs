@@ -10,7 +10,9 @@ use flint_core::WriteRefusal;
 use flint_core::exec::BracketedPaste;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::read::{self, ListQuery};
-use flint_core::write::{WriteAction, WriteError, WriteProposal, WriteTarget, WriteWarning};
+use flint_core::write::{
+    WriteAction, WriteError, WriteOutcome, WriteProposal, WriteReview, WriteTarget, WriteWarning,
+};
 use flint_core::{
     ExecFailureKind, ExecRequest, ExecSession, ExecSnapshot, ExecState, KindId, KindSnapshot,
     LogOptions, LogSession, LogSnapshot, LogState, LogTarget, PodSet, Settings, Subscription,
@@ -1121,6 +1123,160 @@ async fn a_write_answered_503_is_sent_once() {
     assert!(result.is_err(), "{result:?}");
     assert_eq!(puts(&server), (1, 1), "one attempt");
     assert_eq!(replicas(&server), 1);
+}
+
+/// The kubeconfig at `path` with its `users:` section moved into one file per token, in order.
+/// Returns those files.
+fn users_in_files(path: &Path, tokens: &[&str]) -> Vec<PathBuf> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let (mut kept, mut users, mut inside) = (String::new(), String::new(), false);
+    for line in text.lines() {
+        if line.starts_with("users:") {
+            inside = true;
+        } else if inside && line.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            inside = false;
+        }
+        let out = if inside { &mut users } else { &mut kept };
+        out.push_str(line);
+        out.push('\n');
+    }
+    assert!(users.contains("user: {}"), "{text}");
+    std::fs::write(path, kept).unwrap();
+    let dir = path.parent().unwrap();
+    tokens
+        .iter()
+        .map(|token| {
+            let file = dir.join(format!("user-{token}"));
+            let entry = format!("user:\n    token: {token}");
+            let body = users.replace("user: {}", &entry);
+            std::fs::write(&file, format!("apiVersion: v1\nkind: Config\n{body}")).unwrap();
+            file
+        })
+        .collect()
+}
+
+/// Runs `review` once the core has reconnected after a reload. A refusal for not being connected
+/// yet sends nothing.
+async fn run_when_connected(core: &Core, review: &WriteReview) -> Result<WriteOutcome, WriteError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let result = core.handle.run_write(review.clone().into_intent()).await;
+        let waiting = matches!(
+            &result,
+            Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+                | Err(WriteError::NotServed(_))
+        );
+        if !waiting || tokio::time::Instant::now() > deadline {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+// covers UP-54: an edit to the cluster entry that keeps its URL needs a new review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_cluster_entry_sends_no_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    server.write_kubeconfig(&path, Some("demo")).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let core = Core::start_on(dir, vec![path.clone()], Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+
+    let line = text.lines().find(|l| l.contains("server:")).unwrap();
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let edited = text.replace(line, &format!("{line}\n{indent}disable-compression: true"));
+    std::fs::write(&path, edited).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    let result = run_when_connected(&core, &review).await;
+    assert_eq!(result.unwrap_err(), WriteError::ConnectionChanged);
+    assert_eq!(puts(&server), (1, 0), "no write request");
+    assert_eq!(replicas(&server), 1);
+}
+
+// covers UP-54: an edit to the user entry needs a new review, and a new review goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_user_entry_sends_no_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    server.write_kubeconfig(&path, Some("demo")).unwrap();
+    let files = users_in_files(&path, &["one", "two"]);
+    let two = std::fs::read_to_string(&files[1]).unwrap();
+    let core = Core::start_on(dir, vec![path, files[0].clone()], Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+
+    std::fs::write(&files[0], two).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+
+    let result = run_when_connected(&core, &review).await;
+    assert_eq!(result.unwrap_err(), WriteError::ConnectionChanged);
+    assert_eq!(puts(&server), (1, 0), "no write request");
+    assert_eq!(replicas(&server), 1);
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let again = loop {
+        match core
+            .handle
+            .review_write(write_target(&server), three_replicas())
+            .await
+        {
+            Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+            | Err(WriteError::NotServed(_))
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => break other.unwrap(),
+        }
+    };
+    core.handle.run_write(again.into_intent()).await.unwrap();
+    assert_eq!(replicas(&server), 3);
+}
+
+// covers UP-54: no write goes out while a file that could define the user entry is unreadable,
+// and the review holds again once the same definition is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provisional_definition_sends_no_write() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    server.write_kubeconfig(&path, Some("demo")).unwrap();
+    let files = users_in_files(&path, &["one", "two"]);
+    let one = std::fs::read_to_string(&files[0]).unwrap();
+    let paths = vec![path, files[0].clone(), files[1].clone()];
+    let core = Core::start_on(dir, paths, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+
+    std::fs::write(&files[0], "not: [valid").unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    let result = run_when_connected(&core, &review).await;
+    assert_eq!(result.unwrap_err(), WriteError::ConnectionChanged);
+    assert_eq!(puts(&server), (1, 0), "no write request");
+    assert_eq!(replicas(&server), 1);
+
+    std::fs::write(&files[0], one).unwrap();
+    core.handle.reload_kubeconfig().await.unwrap();
+    run_when_connected(&core, &review).await.unwrap();
+    assert_eq!(puts(&server), (1, 1));
+    assert_eq!(replicas(&server), 3);
 }
 
 // covers UP-54: a cluster locked after the review refuses the write before it reaches the

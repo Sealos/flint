@@ -59,6 +59,8 @@ pub struct LoadedKubeconfig {
     /// The file whose entry won each cluster name: a context and its cluster can come from
     /// different files, and the server shown is the cluster entry's.
     pub cluster_sources: HashMap<String, PathBuf>,
+    /// The same for each user entry, which can come from yet another file.
+    pub user_sources: HashMap<String, PathBuf>,
 }
 
 impl LoadedKubeconfig {
@@ -162,6 +164,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     let mut errors = Vec::new();
     let mut defines = Vec::new();
     let mut cluster_sources = HashMap::new();
+    let mut user_sources = HashMap::new();
     for path in paths {
         if !path.exists() {
             continue;
@@ -185,6 +188,11 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         for cluster in &config.clusters {
             cluster_sources
                 .entry(cluster.name.clone())
+                .or_insert_with(|| path.clone());
+        }
+        for user in &config.auth_infos {
+            user_sources
+                .entry(user.name.clone())
                 .or_insert_with(|| path.clone());
         }
         let known: HashSet<String> = merged.contexts.iter().map(|c| c.name.clone()).collect();
@@ -234,6 +242,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         errors,
         defines,
         cluster_sources,
+        user_sources,
     }
 }
 

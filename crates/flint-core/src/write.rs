@@ -76,6 +76,8 @@ pub enum WriteAction {
 pub struct WriteIntent {
     pub target: WriteTarget,
     pub action: WriteAction,
+    /// The connection definition the review ran on.
+    reviewed: ContextPin,
 }
 
 /// What a confirmation must say before a change.
@@ -92,6 +94,7 @@ pub struct WriteReview {
     target: WriteTarget,
     action: WriteAction,
     warnings: Vec<WriteWarning>,
+    reviewed: ContextPin,
 }
 
 impl WriteReview {
@@ -113,6 +116,7 @@ impl WriteReview {
         WriteIntent {
             target: self.target,
             action: self.action,
+            reviewed: self.reviewed,
         }
     }
 }
@@ -181,6 +185,10 @@ pub enum WriteError {
     /// The intent's target is not what its review was made for.
     #[error("this review was made for another object; review the change again")]
     ReviewMismatch,
+    /// The context's connection definition is not the reviewed one, or may change once a
+    /// kubeconfig file can be read.
+    #[error("this cluster's connection changed or is not certain; review the change again")]
+    ConnectionChanged,
     /// The server refused it (validation, an admission webhook, RBAC).
     #[error("{0}")]
     Rejected(String),
@@ -213,16 +221,23 @@ impl RequestGate {
             .core
             .write_client(&self.cluster, Some(self.server.clone()))
             .await?;
-        if self.pin.as_ref().is_some_and(|first| *first != pin) {
-            return Err(WriteRefusal::Moved {
-                cluster: self.cluster.to_string(),
-            }
-            .into());
+        if let Some(first) = self.pin.as_ref().filter(|first| **first != pin) {
+            return Err(if first.server() == pin.server() {
+                WriteError::ConnectionChanged
+            } else {
+                WriteRefusal::Moved {
+                    cluster: self.cluster.to_string(),
+                }
+                .into()
+            });
         }
         // A pin can be stale from the start: a fallback showing while a higher file is unreadable.
         self.core
             .check_write_pin(&self.cluster, pin.clone())
             .await?;
+        if pin.provisional() {
+            return Err(WriteError::ConnectionChanged);
+        }
         self.pin = Some(pin);
         Ok(client.into_client())
     }
@@ -246,10 +261,12 @@ impl CoreHandle {
             let target = bound_to_live(target, &live)?;
             let warnings = warnings_for(&live);
             let action = prepare(&mut gate, &kind, &target, &live, proposal).await?;
+            let reviewed = gate.pin.take().ok_or(WriteRefusal::Stopped)?;
             Ok(WriteReview {
                 target,
                 action,
                 warnings,
+                reviewed,
             })
         });
         async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
@@ -265,6 +282,7 @@ impl CoreHandle {
         let task = self.on_runtime(async move {
             check_bound(&intent)?;
             let mut gate = RequestGate::new(core.clone(), &intent.target);
+            gate.pin = Some(intent.reviewed.clone());
             let kind = kind_of(&core, &intent.target).await?;
             execute(&mut gate, &kind, intent).await
         });
