@@ -5,14 +5,14 @@
 //! and returns a [`WriteReview`]. Its [`WriteIntent`] is what [`CoreHandle::run_write`] takes.
 //!
 //! - A confirmation authorizes nothing: the write gate is asked again before **every** request
-//!   ([`RequestGate`]), so locking a cluster stops a multi-step action at its next request.
+//!   (`RequestGate`), so locking a cluster stops a multi-step action at its next request.
 //! - A review is bound to what it read: its cluster, server, kind, namespace, name, uid and
 //!   `resourceVersion`. A [`ReviewedEdit`] can only be made here, and is refused for any other
 //!   target.
 //! - A write is never retried: a conflict goes back to a new review.
 //!
 //! To add an action: a [`WriteProposal`] variant, a [`WriteAction`] variant, and an arm in
-//! `prepare` and in `execute`. Each request goes through [`RequestGate::client`].
+//! `prepare` and in `execute`. Each request goes through `RequestGate::client`.
 
 use std::future::Future;
 use std::time::Duration;
