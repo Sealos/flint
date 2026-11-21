@@ -11,9 +11,9 @@
 //! [`WriteRefusal::Protected`]. A front end shows the same state with [`protection`], but cannot
 //! open a way around it.
 //!
-//! The types hold that in place. A connection's client that can write is a [`WriteAccess`], which
-//! gives up a [`GatedClient`] only for a [`Protection`] that allows changes, and an action that
-//! changes a cluster takes a [`GatedClient`]. Every other client refuses anything but reads
+//! The types hold that in place. A connection's client that can write is a `WriteAccess`, which
+//! gives up a `GatedClient` only for a [`Protection`] that allows changes, and an action that
+//! changes a cluster takes a `GatedClient`. Every other client refuses anything but reads
 //! (`read_only`), so a write path that skips the gate fails before it reaches the cluster.
 
 use std::collections::{BTreeMap, BTreeSet};
