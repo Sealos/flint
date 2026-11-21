@@ -297,21 +297,21 @@ fn up_24_switch_clusters() -> Result<()> {
     connect(&app, TwoClusters::A)?;
     open_live(&app, "pods", 17)?;
     until(
-        "fake-a's watches",
+        "kind-fake-a's watches",
         || open_watches(&two.a, &gvrs),
         |n| *n >= 3,
     )?;
 
-    // Away to fake-b: fake-a's watches stop.
+    // Away to kind-fake-b: kind-fake-a's watches stop.
     connect(&app, TwoClusters::B)?;
     until(
-        "fake-a's watches to stop",
+        "kind-fake-a's watches to stop",
         || open_watches(&two.a, &gvrs),
         |n| *n == 0,
     )?;
     open_live(&app, "pods", 17)?;
 
-    // A change on fake-a while nobody watches; switching back loads fresh data.
+    // A change on kind-fake-a while nobody watches; switching back loads fresh data.
     let pods = two.a.gvr("pods");
     two.a
         .set_row(&pods, pod_row(&two.a, "while-away", "Running"));
@@ -322,7 +322,7 @@ fn up_24_switch_clusters() -> Result<()> {
     }
     app.wait_for("/list/rows", Any(json!({"name": "while-away"})))?;
     until(
-        "fake-b's watches to stop",
+        "kind-fake-b's watches to stop",
         || open_watches(&two.b, &gvrs),
         |n| *n == 0,
     )?;
