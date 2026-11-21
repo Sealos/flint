@@ -551,25 +551,21 @@ mod tests {
             .body(Vec::new())
             .unwrap();
         let body = client.request_stream(request).await.unwrap();
-        let reader = tokio::spawn(async move {
-            Box::pin(body)
-                .lines()
-                .map_ok(|l| serde_json::from_str::<Value>(&l).unwrap())
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap()
-        });
+        let mut lines = Box::pin(body).lines();
         server
             .wait_for_watches(&namespaces, 1, Duration::from_secs(5))
             .await
             .unwrap();
-        server.send_watch(&namespaces, WatchStep::Added(row.clone()));
+        let mut next = async |step| {
+            server.send_watch(&namespaces, step);
+            let line = lines.try_next().await.unwrap().expect("an event");
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let first = next(WatchStep::Added(row.clone())).await;
         let advance: i64 = 30 * 86_400;
         server.advance_clock(Duration::from_secs(advance.unsigned_abs()));
-        server.send_watch(&namespaces, WatchStep::Modified(row));
-        server.send_watch(&namespaces, WatchStep::End);
-        let events = reader.await.unwrap();
-        assert_eq!(events.len(), 2, "{events:?}");
+        let second = next(WatchStep::Modified(row)).await;
+        let events = [first, second];
         let ages: Vec<_> = events
             .iter()
             .map(|e| e["object"]["rows"][0]["cells"][age].clone())
