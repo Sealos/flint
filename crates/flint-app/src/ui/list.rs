@@ -49,9 +49,8 @@ pub const ROW_HEIGHT: f32 = 24.;
 thread_local! {
     static CELL_TOOLTIPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// How narrow Name and Namespace get in a tight list (characters), so status columns fit. The
-/// Namespace column keeps room for its header and the sort arrow, as measured.
-const SQUEEZED_NAME_CHARS: usize = 12;
+/// How narrow Namespace gets in a tight list (characters), so status columns fit. It keeps room
+/// for its header and the sort arrow, as measured. Name stops at [`list_model::NAME_MIN_CHARS`].
 const SQUEEZED_NAMESPACE_CHARS: usize = 11;
 
 /// The object a list has selected.
@@ -759,8 +758,8 @@ impl ResourceList {
     }
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
-    /// before the first layout). Wide columns that do not fit are left out; spare width goes to
-    /// the Name column first.
+    /// before the first layout). Wide columns that do not fit are left out, then Ready and
+    /// Namespace if Name and Status still lack room; spare width goes to the Name column first.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
@@ -771,13 +770,13 @@ impl ResourceList {
             available,
         );
         if let Some(room) = available {
-            list_model::squeeze_identity(
-                &mut drawn,
-                columns,
-                room,
-                width(SQUEEZED_NAME_CHARS),
-                width(SQUEEZED_NAMESPACE_CHARS),
-            );
+            let name_min = width(list_model::NAME_MIN_CHARS);
+            let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
+            let sort = self.query.sort.as_ref();
+            list_model::shed_columns(&mut drawn, columns, room, name_min, namespace_min, |i| {
+                sort.is_some_and(|s| columns[i].key() == s.column)
+            });
+            list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
             if let Some(name) = columns.iter().position(|c| c.role == ColumnRole::Name) {
                 let wanted = width(self.widths.wanted(name, &columns[name]));
                 list_model::widen_name(&mut drawn, columns, room, wanted);

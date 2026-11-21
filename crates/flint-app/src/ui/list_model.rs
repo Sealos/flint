@@ -323,6 +323,43 @@ pub fn fit_columns(
     }
 }
 
+/// Leaves out Ready, then Namespace, while the drawn columns would not fit `room` even with Name
+/// and Namespace at their minimums, so Name and Status stay readable in a narrow pane. Ready goes
+/// first because Status says much the same, and it stays when there is no Status to say it (a
+/// Deployment's). Namespace goes last because it tells apart objects with the same name. A column
+/// for which `keep` holds stays: it is the one the list is sorted by, and hiding it would reorder
+/// the rows when a detail pane opens.
+pub fn shed_columns(
+    drawn: &mut Vec<(usize, f32)>,
+    columns: &[Column],
+    room: f32,
+    name_min: f32,
+    namespace_min: f32,
+    keep: impl Fn(usize) -> bool,
+) {
+    let named = |i: usize, name: &str| {
+        columns[i].role == ColumnRole::Value && columns[i].name.eq_ignore_ascii_case(name)
+    };
+    let has_status = drawn.iter().any(|&(i, _)| named(i, "Status"));
+    let is_ready = |i: usize| has_status && named(i, "Ready");
+    let is_namespace = |i: usize| columns[i].role == ColumnRole::Namespace;
+    let candidates: [&dyn Fn(usize) -> bool; 2] = [&is_ready, &is_namespace];
+    for candidate in candidates {
+        let needed: f32 = drawn
+            .iter()
+            .map(|&(i, width)| match columns[i].role {
+                ColumnRole::Name => width.min(name_min),
+                ColumnRole::Namespace => width.min(namespace_min),
+                _ => width,
+            })
+            .sum();
+        if needed <= room {
+            return;
+        }
+        drawn.retain(|&(i, _)| !candidate(i) || keep(i));
+    }
+}
+
 /// Narrows the Namespace column, then the Name column, down to their minimums when the drawn
 /// columns are wider than `room`, so the status columns to their right stay in view instead of
 /// scrolling off. Namespaces go first: they repeat down the list and the namespace filter names
@@ -976,6 +1013,33 @@ mod tests {
             "Status starts at {}",
             status_x(&tight)
         );
+    }
+
+    // covers UP-20, UP-23: Ready, then Namespace, leave before Name is cut below its minimum.
+    #[test]
+    fn a_narrow_pane_sheds_ready_then_namespace() {
+        let columns = vec![
+            col("Name", 0, ColumnRole::Name, ColumnType::String),
+            col("Namespace", 0, ColumnRole::Namespace, ColumnType::String),
+            col("Ready", 0, ColumnRole::Value, ColumnType::String),
+            col("Status", 0, ColumnRole::Value, ColumnType::String),
+        ];
+        let shed = |room: f32, keep: Option<usize>| {
+            let mut drawn = vec![(0, 300.), (1, 170.), (2, 76.), (3, 152.)];
+            shed_columns(&mut drawn, &columns, room, 152., 110., |i| Some(i) == keep);
+            drawn.into_iter().map(|(i, _)| i).collect::<Vec<_>>()
+        };
+        // 152 + 110 + 76 + 152 = 490 once Name and Namespace are at their minimums.
+        assert_eq!(shed(490., None), [0, 1, 2, 3], "squeezing is enough");
+        assert_eq!(shed(489., None), [0, 1, 3], "Ready goes first");
+        assert_eq!(shed(413., None), [0, 3], "then Namespace");
+        assert_eq!(shed(300., Some(2)), [0, 2, 3], "the sorted column stays");
+
+        // Without a Status column, Ready is the only health signal.
+        let deployment = [columns[0].clone(), columns[2].clone()];
+        let mut drawn = vec![(0, 300.), (1, 76.)];
+        shed_columns(&mut drawn, &deployment, 100., 152., 110., |_| false);
+        assert_eq!(drawn.len(), 2);
     }
 
     // covers UP-20, UP-25, UP-27: a long name must not be cut while the list has room.

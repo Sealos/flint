@@ -297,7 +297,7 @@ async fn a_text_filter_keeps_the_column_widths(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
     let (core, _dir) = core();
-    let (window, list) = open_sized(cx, core, "Pods", 360.);
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
     list.update(cx, |list, cx| {
         list.set_snapshot(
             pods(
@@ -341,6 +341,70 @@ async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
         names.iter().all(|n| n.contains('…')),
         "names are not cut: {names:?}"
     );
+}
+
+/// One pod with the real pod columns, its status as long as a crash loop gets.
+fn crash_looping_pod() -> Arc<KindSnapshot> {
+    let columns: Arc<[Column]> = vec![
+        column("Name", ColumnRole::Name, ColumnType::String, 0),
+        column("Namespace", ColumnRole::Namespace, ColumnType::String, 0),
+        column("Ready", ColumnRole::Value, ColumnType::String, 0),
+        column("Status", ColumnRole::Value, ColumnType::String, 0),
+        column("Restarts", ColumnRole::Value, ColumnType::Integer, 0),
+        column("Age", ColumnRole::Age, ColumnType::Date, 0),
+    ]
+    .into();
+    let row = Arc::new(Row {
+        uid: "uid-api".into(),
+        name: "podinfo-frontend-7b9c8d5f4-abcde".into(),
+        namespace: Some("local-path-storage".into()),
+        resource_version: "1".into(),
+        generation: None,
+        created: Some(0),
+        labels: Box::new([]),
+        cells: Box::new([
+            Cell::Name,
+            Cell::Namespace,
+            Cell::Text("0/1".into()),
+            Cell::Text("CrashLoopBackOff".into()),
+            Cell::Int(12),
+            Cell::Age,
+        ]),
+    });
+    Arc::new(KindSnapshot {
+        cluster: "test".into(),
+        kind: KindId::pods(),
+        namespaced: true,
+        columns,
+        rows: vec![row],
+        state: SyncState::Synced,
+        version: 1,
+        ..Default::default()
+    })
+}
+
+// covers UP-20, UP-23: beside an open detail pane, Name and Status stay readable: Ready and
+// Namespace leave before Name is cut to a stub or Status runs past the pane's edge.
+#[gpui_kit::test]
+async fn a_narrow_list_keeps_name_and_status_readable(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    // A 1280 px window less the default sidebar, navigation and detail panes.
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    list.update(cx, |list, cx| list.set_snapshot(crash_looping_pod(), cx));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Status").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    let name = header_width(cx, window, "Name");
+    assert!(name >= 16. * 8.5 + 16. - 0.5, "Name is {name} wide");
+    let status_end = cx
+        .update_window(window, |_, window, _| {
+            let status = window.find("sort-Status").bounds();
+            f32::from(status.origin.x + status.size.width)
+        })
+        .unwrap();
+    assert!(status_end <= 400., "Status ends at {status_end}");
 }
 
 /// The texts painted in the window's last frame.
