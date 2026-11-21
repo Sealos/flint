@@ -76,11 +76,36 @@ pub enum Marker {
 pub fn marker(state: &SyncState) -> Option<Marker> {
     match state {
         SyncState::Loading => Some(Marker::Loading),
+        // A denial is settled by its retries, and then is no fault to flag: the tooltip says it.
+        s if s.is_checking_access() => Some(Marker::Loading),
+        s if s.is_no_access() => None,
         SyncState::Reconnecting { .. } | SyncState::RetryingRefusal { .. } => {
             Some(Marker::Reconnecting)
         }
         SyncState::Failed { .. } => Some(Marker::Failed),
         SyncState::Idle | SyncState::Synced | SyncState::Unavailable => None,
+    }
+}
+
+/// A kind's watch state in its tooltip.
+fn state_text(state: Option<&SyncState>) -> String {
+    match state {
+        None | Some(SyncState::Idle) => "not watched".to_owned(),
+        Some(SyncState::Loading) => "loading".to_owned(),
+        Some(SyncState::Synced) => "live".to_owned(),
+        Some(SyncState::Reconnecting { error }) => match error {
+            Some(e) => format!("reconnecting: {e}"),
+            None => "reconnecting".to_owned(),
+        },
+        Some(s @ SyncState::RetryingRefusal { error, .. }) if s.is_checking_access() => {
+            format!("checking access: {error}")
+        }
+        Some(SyncState::RetryingRefusal { error, .. }) => format!("reconnecting: {error}"),
+        Some(s @ SyncState::Failed { error, .. }) if s.is_no_access() => {
+            format!("no access: {error}")
+        }
+        Some(SyncState::Failed { error, .. }) => format!("failed: {error}"),
+        Some(SyncState::Unavailable) => "unavailable".to_owned(),
     }
 }
 
@@ -251,18 +276,7 @@ impl NavPanel {
         let is_selected = self.selected.as_ref() == Some(&entry.id);
         let state = self.states.get(&entry.id);
         let mark = state.and_then(marker);
-        let state_text = match state {
-            None | Some(SyncState::Idle) => "not watched".to_owned(),
-            Some(SyncState::Loading) => "loading".to_owned(),
-            Some(SyncState::Synced) => "live".to_owned(),
-            Some(SyncState::Reconnecting { error }) => match error {
-                Some(e) => format!("reconnecting: {e}"),
-                None => "reconnecting".to_owned(),
-            },
-            Some(SyncState::RetryingRefusal { error }) => format!("reconnecting: {error}"),
-            Some(SyncState::Failed { error }) => format!("failed: {error}"),
-            Some(SyncState::Unavailable) => "unavailable".to_owned(),
-        };
+        let state_text = state_text(state);
         let listable = entry.listable;
         let tip = format!(
             "{}\n{} {}{}\n{}",
@@ -549,8 +563,8 @@ mod state;
 
 #[cfg(test)]
 mod tests {
-    use super::{Collapsed, Marker, collapsed_by_default, marker};
-    use flint_core::{KindId, NavEntry, NavSection, SectionKind, SyncState};
+    use super::{Collapsed, Marker, collapsed_by_default, marker, state_text};
+    use flint_core::{KindId, NavEntry, NavSection, RefusalCause, SectionKind, SyncState};
 
     fn section(title: &str, kind: SectionKind, plural: &str) -> NavSection {
         NavSection {
@@ -626,9 +640,35 @@ mod tests {
         );
         assert_eq!(
             marker(&SyncState::Failed {
-                error: "forbidden".into()
+                error: "gone".into(),
+                cause: Some(RefusalCause::NotFound),
             }),
             Some(Marker::Failed)
         );
+    }
+
+    // covers UP-27
+    #[test]
+    fn a_denied_kind_is_calm_and_a_missing_one_is_not_called_denied() {
+        let refused = |retrying: bool, cause| {
+            let error = "refused".to_owned();
+            if retrying {
+                SyncState::RetryingRefusal { error, cause }
+            } else {
+                SyncState::Failed { error, cause }
+            }
+        };
+        let denied = Some(RefusalCause::Denied);
+        let missing = Some(RefusalCause::NotFound);
+        assert_eq!(marker(&refused(true, denied)), Some(Marker::Loading));
+        assert_eq!(marker(&refused(false, denied)), None);
+        assert_eq!(marker(&refused(true, missing)), Some(Marker::Reconnecting));
+        assert_eq!(marker(&refused(false, None)), Some(Marker::Failed));
+        let text = |state: SyncState| state_text(Some(&state));
+        assert_eq!(text(refused(true, denied)), "checking access: refused");
+        assert_eq!(text(refused(false, denied)), "no access: refused");
+        assert_eq!(text(refused(true, missing)), "reconnecting: refused");
+        assert_eq!(text(refused(false, missing)), "failed: refused");
+        assert_eq!(text(refused(false, None)), "failed: refused");
     }
 }

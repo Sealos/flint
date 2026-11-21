@@ -1121,6 +1121,21 @@ impl ResourceList {
                 .test_support()
                 .into_any_element()
         };
+        if snapshot.rows.is_empty()
+            && let Some(title) = access_title(&snapshot.state, label)
+        {
+            let detail = match &snapshot.state {
+                // Nothing to fall back to: the error says how to pick namespaces.
+                SyncState::Failed { error, .. } if snapshot.limited_to.is_some() => {
+                    Some(error.clone())
+                }
+                SyncState::Failed { error, .. } => {
+                    Some(format!("{error}\nFlint retries in the background."))
+                }
+                _ => None,
+            };
+            return Some(message(title, detail, theme.muted_foreground));
+        }
         match &snapshot.state {
             SyncState::Idle | SyncState::Loading if snapshot.rows.is_empty() => Some(
                 h_flex()
@@ -1141,7 +1156,7 @@ impl ResourceList {
                 Some(format!("{} is not in its API discovery.", self.kind)),
                 theme.muted_foreground,
             )),
-            SyncState::Failed { error } if snapshot.rows.is_empty() => Some(message(
+            SyncState::Failed { error, .. } if snapshot.rows.is_empty() => Some(message(
                 format!("Could not list {label}"),
                 Some(match &snapshot.limited_to {
                     // Nothing to fall back to: the error says how to pick namespaces.
@@ -1155,7 +1170,7 @@ impl ResourceList {
                 error.clone(),
                 theme.warning,
             )),
-            SyncState::RetryingRefusal { error } if snapshot.rows.is_empty() => Some(message(
+            SyncState::RetryingRefusal { error, .. } if snapshot.rows.is_empty() => Some(message(
                 format!("Reconnecting to list {label}…"),
                 Some(error.clone()),
                 theme.warning,
@@ -1258,9 +1273,20 @@ impl ResourceList {
                     .into_any_element(),
             );
         }
+        let has_rows = !snapshot.rows.is_empty();
         let state = match &snapshot.state {
+            // With no rows the placeholder says it all: there is nothing to call out of date.
+            s @ SyncState::RetryingRefusal { .. } if s.is_checking_access() && !has_rows => None,
+            s @ SyncState::RetryingRefusal { error, .. } if s.is_checking_access() => Some((
+                theme.muted_foreground,
+                format!("Checking access. These rows may be out of date: {error}"),
+            )),
+            s @ SyncState::Failed { error, .. } if s.is_no_access() && has_rows => Some((
+                theme.muted_foreground,
+                format!("No access. These rows may be out of date: {error}"),
+            )),
             SyncState::Reconnecting { error: Some(e) }
-            | SyncState::RetryingRefusal { error: e } => Some((
+            | SyncState::RetryingRefusal { error: e, .. } => Some((
                 theme.warning,
                 format!("Reconnecting. These rows may be out of date: {e}"),
             )),
@@ -1268,7 +1294,7 @@ impl ResourceList {
                 theme.warning,
                 "Reconnecting. These rows may be out of date.".to_owned(),
             )),
-            SyncState::Failed { error } if !snapshot.rows.is_empty() => Some((
+            SyncState::Failed { error, .. } if !snapshot.rows.is_empty() => Some((
                 theme.danger,
                 format!("The list failed and is retried. These rows may be out of date: {error}"),
             )),
@@ -1286,6 +1312,18 @@ impl ResourceList {
             );
         }
         banners
+    }
+}
+
+/// What the list is titled while an account's access is the question. `None` for anything that
+/// is not a denial: a missing API must not read as a permissions problem.
+fn access_title(state: &SyncState, label: &str) -> Option<String> {
+    if state.is_checking_access() {
+        Some(format!("Checking access to {label}…"))
+    } else if state.is_no_access() {
+        Some(format!("No access to {label}"))
+    } else {
+        None
     }
 }
 
@@ -1369,10 +1407,18 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         SyncState::Idle => ("not watched", theme.muted_foreground, None),
         SyncState::Loading => ("loading", theme.muted_foreground, None),
         SyncState::Reconnecting { error } => ("reconnecting", theme.warning, error.clone()),
-        SyncState::RetryingRefusal { error } => {
+        SyncState::RetryingRefusal { error, .. } if state.is_checking_access() => (
+            "checking access",
+            theme.muted_foreground,
+            Some(error.clone()),
+        ),
+        SyncState::RetryingRefusal { error, .. } => {
             ("reconnecting", theme.warning, Some(error.clone()))
         }
-        SyncState::Failed { error } => ("failed", theme.danger, Some(error.clone())),
+        SyncState::Failed { error, .. } if state.is_no_access() => {
+            ("no access", theme.muted_foreground, Some(error.clone()))
+        }
+        SyncState::Failed { error, .. } => ("failed", theme.danger, Some(error.clone())),
         SyncState::Unavailable => ("unavailable", theme.muted_foreground, None),
     };
     h_flex()

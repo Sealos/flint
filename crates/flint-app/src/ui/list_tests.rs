@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flint_core::{
-    Cell, Column, ColumnRole, ColumnType, CoreConfig, CoreHandle, KindId, KindSnapshot, Row,
-    Settings, SyncState,
+    Cell, Column, ColumnRole, ColumnType, CoreConfig, CoreHandle, KindId, KindSnapshot,
+    RefusalCause, Row, Settings, SyncState,
 };
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
@@ -955,6 +955,7 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
                 &[],
                 SyncState::Failed {
                     error: "forbidden".into(),
+                    cause: Some(RefusalCause::Denied),
                 },
                 4,
             ),
@@ -965,6 +966,120 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
         window.try_find("list-placeholder").is_some() && window.try_find("row-uid-web").is_none()
     })
     .await;
+}
+
+// covers UP-27
+#[gpui_kit::test]
+async fn a_denied_list_checks_access_then_says_no_access(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (_window, list) = open(cx, core);
+    let refused = |retrying: bool, cause| {
+        let error = "pods is forbidden".to_owned();
+        if retrying {
+            SyncState::RetryingRefusal { error, cause }
+        } else {
+            SyncState::Failed { error, cause }
+        }
+    };
+    let denied = Some(RefusalCause::Denied);
+    // (state, rows, chip, placeholder, banner start)
+    let rows = [("demo", "web", 0)];
+    type Rows<'a> = &'a [(&'a str, &'a str, i64)];
+    let cases: [(SyncState, Rows<'_>, _, _, _); 6] = [
+        (
+            refused(true, denied),
+            &[],
+            "checking access",
+            Some("checking_access"),
+            None,
+        ),
+        (
+            refused(false, denied),
+            &[],
+            "no access",
+            Some("no_access"),
+            None,
+        ),
+        (
+            refused(true, denied),
+            &rows,
+            "checking access",
+            None,
+            Some("Checking access"),
+        ),
+        (
+            refused(false, denied),
+            &rows,
+            "no access",
+            None,
+            Some("No access"),
+        ),
+        // Not a denial: nothing may claim the account lacks access.
+        (
+            refused(true, Some(RefusalCause::NotFound)),
+            &[],
+            "reconnecting",
+            Some("reconnecting"),
+            Some("Reconnecting"),
+        ),
+        (refused(false, None), &[], "failed", Some("failed"), None),
+    ];
+    for (version, (state, shown, chip, placeholder, banner)) in cases.into_iter().enumerate() {
+        list.update(cx, |list, cx| {
+            list.set_snapshot(pods(shown, state.clone(), version as u64 + 1), cx)
+        });
+        cx.run_until_parked();
+        let view = list.read_with(cx, |list, _| list.view_state());
+        assert_eq!(view.sync, chip, "{state:?}");
+        assert_eq!(view.placeholder, placeholder, "{state:?}");
+        let text = view.banners.iter().find(|b| b.id == "list-banner");
+        match banner {
+            Some(start) => {
+                let text = &text.expect("a banner").text;
+                assert!(text.starts_with(start), "{state:?}: {text}");
+            }
+            None => assert!(text.is_none(), "{state:?}: {text:?}"),
+        }
+    }
+}
+
+// covers UP-27
+#[test]
+fn only_a_denial_is_titled_as_access() {
+    let title = |state: SyncState| super::access_title(&state, "Pods");
+    let error = || "refused".to_owned();
+    assert_eq!(
+        title(SyncState::RetryingRefusal {
+            error: error(),
+            cause: Some(RefusalCause::Denied),
+        })
+        .as_deref(),
+        Some("Checking access to Pods…")
+    );
+    assert_eq!(
+        title(SyncState::Failed {
+            error: error(),
+            cause: Some(RefusalCause::Denied),
+        })
+        .as_deref(),
+        Some("No access to Pods")
+    );
+    for cause in [Some(RefusalCause::NotFound), None] {
+        assert_eq!(
+            title(SyncState::Failed {
+                error: error(),
+                cause
+            }),
+            None
+        );
+        assert_eq!(
+            title(SyncState::RetryingRefusal {
+                error: error(),
+                cause
+            }),
+            None
+        );
+    }
 }
 
 // covers UP-20
@@ -1221,6 +1336,7 @@ async fn banners_say_what_the_rows_cover(cx: &mut TestAppContext) {
                 &rows,
                 SyncState::Failed {
                     error: "connection refused".into(),
+                    cause: None,
                 },
                 2,
             ),

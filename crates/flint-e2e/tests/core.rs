@@ -477,7 +477,7 @@ async fn forbidden_lists_fail_or_fall_back_to_the_default_namespace() {
         matches!(s.state, SyncState::Failed { .. })
     })
     .await;
-    let SyncState::Failed { error } = &failed.state else {
+    let SyncState::Failed { error, .. } = &failed.state else {
         unreachable!()
     };
     assert!(error.contains("forbidden"), "{error}");

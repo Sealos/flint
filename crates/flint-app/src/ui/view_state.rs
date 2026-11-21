@@ -639,6 +639,8 @@ pub struct SubmenuEntryState {
 /// The state chip's word for a list's sync state.
 pub fn sync_word(state: &SyncState, polled: bool) -> &'static str {
     match state {
+        s if s.is_checking_access() => "checking access",
+        s if s.is_no_access() => "no access",
         SyncState::Synced if polled => "polled",
         SyncState::Synced => "live",
         SyncState::Idle => "not watched",
@@ -663,6 +665,7 @@ pub fn connection_error_text(error: &SafeErrorText) -> String {
 
 #[cfg(test)]
 mod tests {
+    use flint_core::RefusalCause;
     use serde_json::json;
 
     use super::*;
@@ -692,13 +695,21 @@ mod tests {
     fn sync_words_match_the_chip() {
         assert_eq!(sync_word(&SyncState::Synced, false), "live");
         assert_eq!(sync_word(&SyncState::Synced, true), "polled");
-        assert_eq!(
-            sync_word(&SyncState::RetryingRefusal { error: "x".into() }, false),
-            "reconnecting"
-        );
-        assert_eq!(
-            sync_word(&SyncState::Failed { error: "x".into() }, false),
-            "failed"
-        );
+        let retrying = |cause| SyncState::RetryingRefusal {
+            error: "x".into(),
+            cause,
+        };
+        let failed = |cause| SyncState::Failed {
+            error: "x".into(),
+            cause,
+        };
+        let denied = Some(RefusalCause::Denied);
+        let missing = Some(RefusalCause::NotFound);
+        assert_eq!(sync_word(&retrying(denied), false), "checking access");
+        assert_eq!(sync_word(&failed(denied), false), "no access");
+        assert_eq!(sync_word(&retrying(missing), false), "reconnecting");
+        assert_eq!(sync_word(&failed(missing), false), "failed");
+        assert_eq!(sync_word(&retrying(None), false), "reconnecting");
+        assert_eq!(sync_word(&failed(None), false), "failed");
     }
 }

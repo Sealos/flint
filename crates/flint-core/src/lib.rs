@@ -57,7 +57,7 @@ pub use logs::{
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};
-pub use store::{Feed, KindSnapshot, NamespaceLimit, SyncState};
+pub use store::{Feed, KindSnapshot, NamespaceLimit, RefusalCause, SyncState};
 pub use table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
 pub use terminal::{TerminalSize, TerminalSnapshot};
 pub use view::{SortBy, ViewQuery};
