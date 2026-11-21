@@ -88,12 +88,12 @@ pub(crate) enum Credential {
 }
 
 /// Runs the exec plugin of `config`'s user, if kube would, and puts its credential in `config`
-/// in place of the plugin. A token with an expiry comes back as a [`TokenLayer`] for the client
-/// stack, which refreshes it. Cancel-safe: dropping the future kills the plugin.
+/// in place of the plugin. A token with an expiry comes back as a [`RefreshingToken`] for the
+/// client stack ([`TokenLayer`]), which refreshes it. Cancel-safe: dropping the future kills the plugin.
 pub(crate) async fn resolve(
     config: &mut kube::Config,
     context: &str,
-) -> Result<Option<TokenLayer>, AuthError> {
+) -> Result<Option<RefreshingToken>, AuthError> {
     let auth = &config.auth_info;
     // kube's precedence (`Auth::try_from`): all of these win over an exec plugin.
     let other = auth.auth_provider.is_some()
@@ -128,19 +128,17 @@ pub(crate) async fn resolve(
         Credential::Token {
             token,
             expires: Some(expires),
-        } => Some(AsyncFilterLayer::new(RefreshingToken(Arc::new(
-            TokenShared {
-                task: std::sync::Mutex::default(),
-                state: Arc::new(tokio::sync::Mutex::new(TokenState {
-                    context: context.to_owned(),
-                    exec,
-                    token,
-                    expires,
-                    refreshing: None,
-                    resting: None,
-                })),
-            },
-        )))),
+        } => Some(RefreshingToken(Arc::new(TokenShared {
+            task: std::sync::Mutex::default(),
+            state: Arc::new(tokio::sync::Mutex::new(TokenState {
+                context: context.to_owned(),
+                exec,
+                token,
+                expires,
+                refreshing: None,
+                resting: None,
+            })),
+        }))),
         Credential::None => None,
     })
 }
@@ -724,7 +722,8 @@ impl std::error::Error for SharedAuthError {
 }
 
 impl RefreshingToken {
-    async fn header(&self) -> Result<HeaderValue, BoxError> {
+    /// The `Authorization` value to send now, refreshing the token first if it is due.
+    pub(crate) async fn header(&self) -> Result<HeaderValue, BoxError> {
         let refresh = {
             let mut state = self.0.state.lock().await;
             // The margin decides whether to refresh; a refresh's own result is used as it is

@@ -8,6 +8,7 @@ use kube::Client;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
 use crate::api_error::{self, ApiError, Transport};
+use crate::credential::{self, CredentialSource, WriteCredential};
 use crate::protection::{ClusterClients, WriteAccess};
 use crate::redact;
 
@@ -413,22 +414,41 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
     .map_err(|e| ClusterError::kube(e).for_target(&target))
 }
 
-/// As [`connect`], with the client that can write, closed behind the write gate.
+/// A connection's clients, and the credential its write client presents.
+pub(crate) struct GatedConnection {
+    pub(crate) clients: ClusterClients,
+    pub(crate) credential: WriteCredential,
+}
+
+/// As [`connect`], with the client that can write, closed behind the write gate. Its certificate
+/// and key files are read once here, and both clients are built from those bytes.
 async fn connect_gated(
     kubeconfig: &Kubeconfig,
     context: &str,
-) -> Result<ClusterClients, ClusterError> {
-    let ready = prepare(kubeconfig, context).await?;
+) -> Result<GatedConnection, ClusterError> {
+    let mut held = kubeconfig.clone();
+    let name = context.to_owned();
+    let (held, files) = tokio::task::spawn_blocking(move || {
+        let files = credential::hold_credential_files(&mut held, &name);
+        (held, files)
+    })
+    .await
+    .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?;
+    let ready = prepare(&held, context).await?;
     let target = ready.target;
+    let writes = WriteCredential::new(files, ready.source, ready.token.clone());
     let (config, token) = (ready.config, ready.token);
     tokio::task::spawn_blocking(move || {
         // Once: making it can run a credential command, which both clients then share.
         let auth = kube::client::ConfigExt::auth_layer(&config)?;
         let read = build_client(&config, token.clone(), auth.as_ref(), Access::ReadOnly)?;
         let write = build_client(&config, token, auth.as_ref(), Access::Unrestricted)?;
-        Ok::<_, kube::Error>(ClusterClients {
-            read,
-            writes: WriteAccess::new(write),
+        Ok::<_, kube::Error>(GatedConnection {
+            clients: ClusterClients {
+                read,
+                writes: WriteAccess::new(write),
+            },
+            credential: writes,
         })
     })
     .await
@@ -458,7 +478,9 @@ pub async fn connect_unrestricted_for_tests(
 /// What building a context's clients takes.
 struct Prepared {
     config: kube::Config,
-    token: Option<crate::auth_plugin::TokenLayer>,
+    token: Option<crate::auth_plugin::RefreshingToken>,
+    /// Where the credential comes from, read before an exec plugin is replaced by its output.
+    source: CredentialSource,
     target: Target,
 }
 
@@ -491,12 +513,14 @@ async fn prepare(kubeconfig: &Kubeconfig, context: &str) -> Result<Prepared, Clu
             Ok(_) => ClusterError::Kube("connecting through a proxy is not supported".to_owned()),
         });
     }
+    let source = CredentialSource::of(&config.auth_info);
     let token = crate::auth_plugin::resolve(&mut config, context)
         .await
         .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
     Ok(Prepared {
         config,
         token,
+        source,
         target,
     })
 }
@@ -543,6 +567,13 @@ impl<Res>
             http::Response<Res>,
             tower::BoxError,
         >>::clone_request(&mut self.0, request)
+        .map(|mut copy| {
+            // A retry goes out with the credential the request was checked with.
+            if let Some(bound) = request.extensions().get::<credential::BoundHeader>() {
+                copy.extensions_mut().insert(bound.clone());
+            }
+            copy
+        })
     }
 }
 
@@ -573,7 +604,7 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 )]
 fn build_client(
     config: &kube::Config,
-    token: Option<crate::auth_plugin::TokenLayer>,
+    token: Option<crate::auth_plugin::RefreshingToken>,
     auth: Option<&kube::client::middleware::AuthLayer>,
     access: Access,
 ) -> Result<Client, kube::Error> {
@@ -601,11 +632,29 @@ fn build_client(
                 .then(|| RetryLayer::new(ReadRetry(RetryPolicy::server_retry()))),
         )
         .option_layer(auth)
-        .option_layer(token)
+        .option_layer(token.map(crate::auth_plugin::TokenLayer::new))
+        // Below the auth layers: a write's checked credential is the one that goes out.
+        .map_request(credential::apply_bound_header::<kube::client::Body>)
         .layer(config.extra_headers_layer()?)
         .map_err(tower::BoxError::from)
         .service(http);
     Ok(kube::client::ClientBuilder::new(service, config.default_namespace.clone()).build())
+}
+
+/// `client`, whose every request goes out with `credential`. It adds nothing else: each request
+/// still passes through the stack [`build_client`] gave `client`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "wraps a client build_client made, for one request of a write"
+)]
+pub(crate) fn sending_credential(client: Client, credential: credential::BoundHeader) -> Client {
+    let namespace = client.default_namespace().to_owned();
+    let service = tower::service_fn(move |mut request: http::Request<kube::client::Body>| {
+        let client = client.clone();
+        request.extensions_mut().insert(credential.clone());
+        async move { client.send(request).await }
+    });
+    Client::new(service, namespace)
 }
 
 /// Stops exec auth plugins from prompting: they get no stdin and cannot ask for input. Used when
@@ -651,11 +700,11 @@ pub(crate) async fn connect_gated_and_check(
     kubeconfig: &Kubeconfig,
     context: &str,
     timeout: Duration,
-) -> Result<(ClusterClients, ServerVersion), ClusterError> {
+) -> Result<(GatedConnection, ServerVersion), ClusterError> {
     bounded(kubeconfig, context, timeout, async {
-        let clients = connect_gated(kubeconfig, context).await?;
-        let version = server_version(&clients.read).await?;
-        Ok((clients, version))
+        let connection = connect_gated(kubeconfig, context).await?;
+        let version = server_version(&connection.clients.read).await?;
+        Ok((connection, version))
     })
     .await
 }

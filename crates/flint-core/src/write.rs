@@ -9,6 +9,8 @@
 //! - A review is bound to what it read: its cluster, server, kind, namespace, name, uid and
 //!   `resourceVersion`. A [`ReviewedEdit`] can only be made here, and is refused for any other
 //!   target.
+//! - A review is bound to the credential it was made with (`credential`): any change refuses
+//!   the write, and the request sends the credential that was checked.
 //! - A write is never retried: a conflict goes back to a new review.
 //! - A resource action rechecks the live object before it runs, and a different uid or GitOps
 //!   manager is a conflict.
@@ -26,6 +28,7 @@ use serde_json::Value;
 
 use crate::ClusterId;
 use crate::api_error::ApiError;
+use crate::credential::CredentialBinding;
 use crate::gitops::{self, ManagedBy};
 use crate::handle::CoreHandle;
 use crate::protection::WriteRefusal;
@@ -103,6 +106,14 @@ impl WriteAction {
             WriteAction::Resource(action) => &action.pin,
         }
     }
+
+    /// The credential this action was reviewed with.
+    fn credential(&self) -> &CredentialBinding {
+        match self {
+            WriteAction::ApplyYaml(edit) => &edit.credential,
+            WriteAction::Resource(action) => &action.credential,
+        }
+    }
 }
 
 /// A resource action as reviewed. Only a review makes one, and it holds what it was reviewed
@@ -112,6 +123,8 @@ pub struct ReviewedAction {
     bound: WriteTarget,
     /// The connection definition it was reviewed on.
     pin: ContextPin,
+    /// The credential it was reviewed with.
+    credential: CredentialBinding,
     change: ResourceChange,
     reviewed: write_actions::Reviewed,
 }
@@ -196,6 +209,8 @@ pub struct ReviewedEdit {
     bound: WriteTarget,
     /// The connection definition it was reviewed on.
     pin: ContextPin,
+    /// The credential it was reviewed with.
+    credential: CredentialBinding,
     body: Value,
     before: String,
     after: String,
@@ -263,6 +278,27 @@ pub enum WriteError {
     /// A kubeconfig file that could define this context can't be read.
     #[error("a kubeconfig file can't be read; fix it, then review the change again")]
     KubeconfigUnreadable,
+    /// The credential is not the one the review was made with.
+    #[error("this cluster's credential changed since the review; review the change again")]
+    CredentialChanged,
+    /// A token, certificate or key file can't be read.
+    #[error(
+        "a credential file for this cluster can't be read; fix it, then review the change again"
+    )]
+    CredentialUnreadable,
+    /// The server did not say who the credential authenticates as.
+    #[error(
+        "Flint could not confirm who this cluster sees you as, so nothing was changed; review \
+         the change again"
+    )]
+    IdentityUnverified,
+    /// The credential comes from a plugin and the server has no `SelfSubjectReview`.
+    #[error(
+        "this cluster does not serve SelfSubjectReview (Kubernetes 1.28 or later), which Flint \
+         needs to confirm a plugin's identity, so nothing was changed; review the change again \
+         once it does"
+    )]
+    IdentityUnavailable,
     /// The server refused it (validation, an admission webhook, RBAC).
     #[error("{0}")]
     Rejected(String),
@@ -280,6 +316,8 @@ pub(crate) struct RequestGate {
     cluster: ClusterId,
     server: Option<String>,
     pin: Option<ContextPin>,
+    /// The credential every request of this review goes out with.
+    credential: Option<CredentialBinding>,
 }
 
 impl RequestGate {
@@ -289,6 +327,7 @@ impl RequestGate {
             cluster: target.cluster.clone(),
             server: target.server.clone(),
             pin: None,
+            credential: None,
         }
     }
 
@@ -297,11 +336,16 @@ impl RequestGate {
         self.pin.clone().ok_or(WriteRefusal::Stopped.into())
     }
 
+    /// The credential every request of this review went out with.
+    fn reviewed_credential(&self) -> Result<CredentialBinding, WriteError> {
+        self.credential.clone().ok_or(WriteRefusal::Stopped.into())
+    }
+
     /// A client for the next request. Call it again for every request: never keep the client.
     pub(crate) async fn client(&mut self) -> Result<Client, WriteError> {
-        let (client, pin) = self
+        let (client, pin, credential) = self
             .core
-            .write_client(&self.cluster, Some(self.server.clone()))
+            .bound_write_client(&self.cluster, Some(self.server.clone()))
             .await?;
         // A pin can be stale from the start: a fallback showing while a higher file is unreadable.
         self.core
@@ -317,8 +361,15 @@ impl RequestGate {
                 .into()
             });
         }
-        self.pin = Some(pin);
-        Ok(client.into_client())
+        self.pin = Some(pin.clone());
+        let presented = credential.present(client.into_client()).await?;
+        if let Some(reviewed) = &self.credential {
+            reviewed.holds(&presented.binding)?;
+        }
+        // Reading the credential can take a while: the gate has the last word.
+        self.core.check_write_pin(&self.cluster, pin).await?;
+        self.credential = Some(presented.binding);
+        Ok(presented.client)
     }
 }
 
@@ -365,6 +416,7 @@ impl CoreHandle {
             check_bound(&intent)?;
             let mut gate = RequestGate::new(core.clone(), &intent.target);
             gate.pin = Some(intent.action.pin().clone());
+            gate.credential = Some(intent.action.credential().clone());
             let kind = kind_of(&core, &intent.target).await?;
             execute(&mut gate, &kind, intent).await
         });
@@ -477,6 +529,7 @@ async fn prepare(
             Ok(WriteAction::ApplyYaml(ReviewedEdit {
                 bound: target.clone(),
                 pin: gate.reviewed_pin()?,
+                credential: gate.reviewed_credential()?,
                 before: shown_yaml(live)?,
                 after: shown_after(live, &result)?,
                 body,
@@ -488,6 +541,7 @@ async fn prepare(
             Ok(WriteAction::Resource(ReviewedAction {
                 bound: target.clone(),
                 pin: gate.reviewed_pin()?,
+                credential: gate.reviewed_credential()?,
                 change,
                 reviewed,
             }))
