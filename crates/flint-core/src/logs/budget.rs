@@ -59,6 +59,8 @@ struct Entry {
     /// Advances when what the session may give back changes: shown, hidden, paused, resumed, or
     /// planned again. A trim under way stops when it moves.
     plan: u64,
+    /// The session's oldest line after its latest trim, recorded in the step that detached it.
+    cutoff: u64,
     wake: Arc<Notify>,
 }
 
@@ -112,6 +114,7 @@ impl LogBudget {
                 trim_to: None,
                 in_flight: None,
                 plan: 0,
+                cutoff: 0,
                 wake: wake.clone(),
             },
         );
@@ -141,6 +144,13 @@ impl LogBudget {
             entry.plan += 1;
             inner.rebalance();
         }
+    }
+
+    /// The first line session `id` still holds after its trims. Once [`LogBudget::set_shown`]
+    /// has returned for a shown tab, no trim is under way, so this cannot move past what a frame
+    /// drawn next reads.
+    pub fn trim_cutoff(&self, id: u64) -> u64 {
+        self.lock().sessions.get(&id).map_or(0, |e| e.cutoff)
     }
 
     /// Whether session `id`'s tab is the one shown.
@@ -198,20 +208,21 @@ impl LogBudget {
 
     /// Runs `detach` under the budget's lock if session `id`'s tab is still hidden and `plan`
     /// still stands, and counts the bytes it returns as gone in the same step, so a plan made
-    /// right after does not ask another tab for them. `detach` must take constant time: the UI
-    /// thread can wait on this lock.
+    /// right after does not ask another tab for them. `detach` sets the new cutoff it is handed
+    /// ([`LogBudget::trim_cutoff`]). It must take constant time: the UI thread can wait on this
+    /// lock.
     pub(crate) fn while_planned<T>(
         &self,
         id: u64,
         plan: TrimPlan,
-        detach: impl FnOnce() -> Option<(T, usize)>,
+        detach: impl FnOnce(&mut u64) -> Option<(T, usize)>,
     ) -> Option<T> {
         let mut inner = self.lock();
         let entry = inner.sessions.get_mut(&id)?;
         if entry.shown || entry.plan != plan.plan {
             return None;
         }
-        let (detached, freed) = detach()?;
+        let (detached, freed) = detach(&mut entry.cutoff)?;
         entry.bytes = entry.bytes.saturating_sub(freed);
         entry.trimmable = entry.trimmable.saturating_sub(freed);
         Some(detached)
@@ -391,11 +402,11 @@ mod tests {
         let plan = budget.begin_trim(1).expect("over the budget");
         assert_eq!(plan.to, 10 * MIB);
         assert_eq!(
-            budget.while_planned(1, plan, || Some(("detached", MIB))),
+            budget.while_planned(1, plan, |_| Some(("detached", MIB))),
             Some("detached")
         );
         budget.set_shown(1, true);
-        let late = budget.while_planned(1, plan, || -> Option<((), usize)> {
+        let late = budget.while_planned(1, plan, |_| -> Option<((), usize)> {
             panic!("a block was detached from a tab shown")
         });
         assert_eq!(late, None);
@@ -410,7 +421,7 @@ mod tests {
         let plan = budget.begin_trim(1).unwrap();
         budget.set_shown(1, true);
         budget.set_shown(1, false);
-        assert_eq!(budget.while_planned(1, plan, || Some(((), 0))), None);
+        assert_eq!(budget.while_planned(1, plan, |_| Some(((), 0))), None);
     }
 
     // covers UP-42: a trim under way stops once the budget no longer needs it.
@@ -423,7 +434,7 @@ mod tests {
         budget.report(2, 6 * MIB, 6 * MIB, false);
         let plan = budget.begin_trim(1).expect("2 MiB over");
         budget.unregister(2);
-        assert_eq!(budget.while_planned(1, plan, || Some(((), MIB))), None);
+        assert_eq!(budget.while_planned(1, plan, |_| Some(((), MIB))), None);
     }
 
     // covers UP-42: a report that keeps the same plan does not stop a trim under way.
@@ -434,7 +445,7 @@ mod tests {
         budget.report(1, 20 * MIB, 20 * MIB, false);
         let plan = budget.begin_trim(1).unwrap();
         budget.report(1, 20 * MIB, 20 * MIB, false);
-        assert_eq!(budget.while_planned(1, plan, || Some(((), MIB))), Some(()));
+        assert_eq!(budget.while_planned(1, plan, |_| Some(((), MIB))), Some(()));
         assert_eq!(budget.begin_trim(1), None, "not asked twice");
     }
 
@@ -450,7 +461,7 @@ mod tests {
         let plan = budget.begin_trim(1).expect("2 MiB over");
         assert_eq!(plan.to, 6 * MIB);
         assert_eq!(
-            budget.while_planned(1, plan, || Some(((), 2 * MIB))),
+            budget.while_planned(1, plan, |_| Some(((), 2 * MIB))),
             Some(())
         );
         budget.set_shown(1, true);

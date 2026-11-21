@@ -282,6 +282,8 @@ pub(crate) struct Output {
     trimmed: bool,
     version: u64,
     dirty: bool,
+    /// A trim published its snapshot; the next tick still reports to the budget.
+    report_due: bool,
 }
 
 impl Output {
@@ -296,6 +298,7 @@ impl Output {
             trimmed: false,
             version: 0,
             dirty: true,
+            report_due: false,
         }
     }
 
@@ -312,9 +315,10 @@ impl Output {
         let plan = budget.begin_trim(id)?;
         let mut detached = Vec::new();
         let buffer = &mut self.buffer;
-        while let Some(lines) = budget.while_planned(id, plan, || {
+        while let Some(lines) = budget.while_planned(id, plan, |cutoff| {
             let before = buffer.bytes();
             let lines = buffer.detach_oldest(plan.to)?;
+            *cutoff = buffer.first_id();
             Some((lines, before - buffer.bytes()))
         }) {
             detached.push(lines);
@@ -448,15 +452,18 @@ pub(crate) async fn run(
                 {
                     b.budget.trimmed(b.id, out.buffer.bytes(), out.buffer.trimmable_bytes());
                     if dropped {
-                        // At once, so a tab shown next has no lines that are gone. It stays
-                        // dirty: the next tick reports, and the budget plans again.
+                        // At once, so a tab shown next has no lines that are gone. The next
+                        // tick reports, and the budget plans again.
                         out.publish(&tx);
-                        out.dirty = true;
+                        out.report_due = true;
                     }
                 }
             }
-            _ = tick.tick(), if out.dirty => {
-                out.publish(&tx);
+            _ = tick.tick(), if out.dirty || out.report_due => {
+                if out.dirty {
+                    out.publish(&tx);
+                }
+                out.report_due = false;
                 if let Some(b) = &budget {
                     b.budget.report(
                         b.id,
@@ -732,6 +739,39 @@ mod tests {
         assert!(tab1.trimmed);
     }
 
+    // A trim that is the last change to a tab publishes once, and still reports to the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_trim_that_is_the_last_change_publishes_once() {
+        let budget = LogBudget::new(1);
+        let (lines, rx) = futures::channel::mpsc::unbounded();
+        let fake = Arc::new(Fake::default());
+        fake.scripts.lock().unwrap().push_back(Script::Feed(rx));
+        let (tx, mut snapshots) = watch::channel(Arc::new(LogSnapshot::connecting()));
+        let (_paused, paused_rx) = watch::channel(false);
+        let config = SessionConfig {
+            budget: 1 << 30,
+            ..config(1_000_000)
+        };
+        let feed = PodFeed::new(fake, target(), LogOptions::default(), &config);
+        let budgeted = Budgeted::new(budget.clone(), 1);
+        tokio::spawn(run(Box::new(feed), config, tx, paused_rx, Some(budgeted)));
+        for n in 0..crate::logs::CHUNK_LINES * 2 + 5 {
+            lines.unbounded_send(format!("{n}")).unwrap();
+        }
+        let trimmed = snapshots.wait_for(|s| s.trimmed).await.unwrap().clone();
+        assert_eq!(budget.trim_cutoff(1), trimmed.lines.first_id());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(snapshots.borrow().version, trimmed.version);
+        assert_eq!(
+            budget.total(),
+            trimmed
+                .lines
+                .iter()
+                .map(|(_, l)| l.heap_bytes())
+                .sum::<usize>()
+        );
+    }
+
     fn output_with(lines: usize) -> Output {
         // A byte budget large enough that blocks seal by their line count.
         let mut out = Output::new(&SessionConfig::new(1_000_000, 1 << 30));
@@ -752,7 +792,7 @@ mod tests {
         let plan = budget.begin_trim(1).expect("over the budget");
         budget.set_shown(1, true);
         assert_eq!(
-            budget.while_planned(1, plan, || {
+            budget.while_planned(1, plan, |_| {
                 out.buffer.detach_oldest(plan.to).map(|lines| (lines, 0))
             }),
             None

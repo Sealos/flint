@@ -958,6 +958,12 @@ impl LogSession {
         self.budget.set_shown(self.id, shown);
     }
 
+    /// The first line the shared budget left this session. A snapshot older than the latest
+    /// trim can still start before it, so a front end drops those rows before drawing them.
+    pub fn trim_cutoff(&self) -> u64 {
+        self.budget.trim_cutoff(self.id)
+    }
+
     /// Whether [`LogSession::set_shown`] last said this tab is shown (once the core has started
     /// the session).
     pub fn is_shown(&self) -> bool {

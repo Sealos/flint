@@ -195,6 +195,8 @@ pub struct LogView {
     _pump: Task<()>,
     _search: Task<()>,
     _subscriptions: Vec<Subscription>,
+    #[cfg(test)]
+    test_trim_cutoff: Option<u64>,
 }
 
 impl LogView {
@@ -308,6 +310,8 @@ impl LogView {
             _pump: pump,
             _search: Task::ready(()),
             _subscriptions: vec![on_search],
+            #[cfg(test)]
+            test_trim_cutoff: None,
         }
     }
 
@@ -362,6 +366,45 @@ impl LogView {
     /// lines still present. The search catches up when the tab is drawn
     /// ([`LogView::catch_up_search`]).
     pub fn set_snapshot(&mut self, snapshot: Arc<LogSnapshot>, cx: &mut Context<Self>) {
+        self.take_snapshot(snapshot, cx);
+        cx.notify();
+    }
+
+    /// The first line the session still holds after a trim.
+    fn trim_cutoff(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(cutoff) = self.test_trim_cutoff {
+            return cutoff;
+        }
+        self.session.trim_cutoff()
+    }
+
+    #[cfg(test)]
+    pub fn set_trim_cutoff(&mut self, cutoff: u64) {
+        self.test_trim_cutoff = Some(cutoff);
+    }
+
+    /// Before a frame: removes rows a trim dropped whose snapshot has not arrived yet.
+    fn drop_trimmed_rows(&mut self, cx: &mut Context<Self>) {
+        if starts_before(&self.snapshot.lines, self.trim_cutoff()) {
+            self.take_snapshot(self.snapshot.clone(), cx);
+        }
+    }
+
+    fn take_snapshot(&mut self, snapshot: Arc<LogSnapshot>, cx: &mut Context<Self>) {
+        // A snapshot queued before a trim must not bring its lines back. Its blocks are let go
+        // off the UI thread.
+        let cutoff = self.trim_cutoff();
+        let snapshot = if starts_before(&snapshot.lines, cutoff) {
+            let kept = Arc::new(LogSnapshot {
+                lines: snapshot.lines.trimmed(cutoff),
+                ..(*snapshot).clone()
+            });
+            cx.background_spawn(async move { drop(snapshot) }).detach();
+            kept
+        } else {
+            snapshot
+        };
         let old = &self.snapshot.lines;
         let new = &snapshot.lines;
         // A filtered list follows its rows instead ([`LogView::catch_up_filter`]); rows of
@@ -394,7 +437,10 @@ impl LogView {
             }
             ListChange::Reset(count) => self.list.reset(count),
         }
-        self.snapshot = snapshot;
+        let previous = std::mem::replace(&mut self.snapshot, snapshot);
+        if previous.lines.first_id() < self.snapshot.lines.first_id() {
+            cx.background_spawn(async move { drop(previous) }).detach();
+        }
         if let Some(pods) = &self.snapshot.pods
             && self.labels.learn(pods)
             && self.wrap
@@ -417,7 +463,6 @@ impl LogView {
         if self.current_match.is_some_and(|id| !lines.contains(id)) {
             self.current_match = None;
         }
-        cx.notify();
     }
 
     /// Whether this tab is the one shown, for the shared log memory budget (see the dock).
@@ -1769,8 +1814,15 @@ impl DockItem for LogView {
     }
 }
 
+/// Whether `lines` still hold a line below `cutoff`. Lines entirely below it end up empty, at
+/// their end.
+fn starts_before(lines: &flint_core::logs::LogLines, cutoff: u64) -> bool {
+    lines.first_id() < cutoff.min(lines.end_id())
+}
+
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drop_trimmed_rows(cx);
         self.catch_up_search(cx);
         self.catch_up_filter(cx);
         let theme = cx.theme().clone();
