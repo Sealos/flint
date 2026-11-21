@@ -129,6 +129,30 @@ async fn each_connection_attempt_is_seen_starting() {
     assert_eq!(drain(&events).await, ["b Connecting"]);
 }
 
+// covers UP-04: a retry supersedes the previous attempt's result: a reader that fell behind does
+// not see the old failure after the new attempt started.
+#[tokio::test]
+async fn a_new_attempt_drops_the_previous_result() {
+    let (sender, events) = channel();
+    sender.send(connection("a", ConnectionState::Connecting));
+    sender.send(connection(
+        "a",
+        ConnectionState::Failed(crate::SafeErrorText::fixed("refused")),
+    ));
+    sender.send(connection(
+        "b",
+        ConnectionState::Failed(crate::SafeErrorText::fixed("refused")),
+    ));
+    sender.send(connection("a", ConnectionState::Connecting));
+    let read = drain(&events).await;
+    assert_eq!(read.len(), 2, "{read:?}");
+    assert!(
+        read[0].starts_with("b Failed"),
+        "another cluster's stays: {read:?}"
+    );
+    assert_eq!(read[1], "a Connecting");
+}
+
 fn snapshot(contexts: &[String]) -> Event {
     let clusters = contexts
         .iter()
