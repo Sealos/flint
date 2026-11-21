@@ -363,6 +363,17 @@ impl FakeApiServer {
         Ok(flint_core::cluster::connect(&self.kubeconfig(None), kubeconfig::CONTEXT).await?)
     }
 
+    /// A client with no read-only rule, for tests of what this server answers to requests
+    /// Flint's read paths never make. Flint's own sessions get theirs from the write gate.
+    #[cfg(test)]
+    pub(crate) async fn unrestricted_client(&self) -> Result<kube::Client> {
+        Ok(flint_core::cluster::connect_unrestricted_for_tests(
+            &self.kubeconfig(None),
+            kubeconfig::CONTEXT,
+        )
+        .await?)
+    }
+
     /// Panics unless the fixtures serve `gvr`, suggesting what was meant.
     fn require(&self, gvr: &Gvr) {
         let resources = &self.inner.fixtures.resources;

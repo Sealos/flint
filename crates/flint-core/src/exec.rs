@@ -34,7 +34,6 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, SinkExt};
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
-use kube::Client;
 use kube::api::{Api, AttachParams};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -42,7 +41,7 @@ use tokio::time::Instant;
 
 use crate::api_error::ApiError;
 use crate::cluster::{ClusterError, ClusterId};
-use crate::protection::WriteRefusal;
+use crate::protection::{GatedClient, WriteRefusal};
 use crate::recheck::Recheck;
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
 use budget::{Charge, InputBudget};
@@ -764,24 +763,36 @@ impl Launcher for KubeLauncher {
 /// `None` while the context still points at the API server the session opened on.
 pub(crate) type ContextCheck = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
-/// Runs a session's [`ContextCheck`] every so often (see [`crate::recheck`]).
+/// Asks the write gate whether a session's cluster may run a command now.
+pub(crate) type LaunchCheck =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<(), WriteRefusal>> + Send + Sync>;
+
+/// Runs a session's [`ContextCheck`] every so often (see [`crate::recheck`]), and holds its
+/// [`LaunchCheck`].
 pub(crate) struct ContextWatch {
     check: ContextCheck,
+    launch: LaunchCheck,
     recheck: Recheck<Option<String>>,
 }
 
 impl ContextWatch {
-    pub fn new(check: ContextCheck, every: Duration) -> Self {
+    pub fn new(check: ContextCheck, launch: LaunchCheck, every: Duration) -> Self {
         Self {
             check,
+            launch,
             recheck: Recheck::new(every),
         }
+    }
+
+    /// What the write gate says about running a command now.
+    fn may_launch(&self) -> BoxFuture<'static, Result<(), WriteRefusal>> {
+        (self.launch)()
     }
 
     /// Resolves with why the session must end, once a check says so. Cancel-safe: the timer
     /// and a check in flight carry over to the next call.
     async fn changed(&mut self) -> String {
-        let Self { check, recheck } = self;
+        let Self { check, recheck, .. } = self;
         std::future::poll_fn(|cx| {
             loop {
                 if let Some(reason) = std::task::ready!(recheck.poll_check(cx, || check())) {
@@ -797,35 +808,68 @@ impl ContextWatch {
 /// its context unchanged; without one, the session fails at once with the given reason (the
 /// cluster is not connected, say).
 pub(crate) async fn start(
-    client: Result<(Client, ContextWatch), WriteRefusal>,
+    client: Result<(GatedClient, ContextWatch), WriteRefusal>,
     request: ExecRequest,
     channels: SessionChannels,
 ) {
     match client {
         Ok((client, watch)) => {
             let launcher = KubeLauncher {
-                api: Api::namespaced(client, &request.namespace),
+                api: Api::namespaced(client.into_client(), &request.namespace),
                 pod: request.pod.clone(),
                 container: request.container.clone(),
             };
             run(launcher, request, channels, watch).await;
         }
         Err(refusal) => {
-            let kind = match refusal {
-                WriteRefusal::Protected { .. } => ExecFailureKind::Protected,
-                WriteRefusal::Moved { .. } => ExecFailureKind::ContextChanged,
-                WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => {
-                    ExecFailureKind::Unreachable
-                }
-            };
             let mut session = Session::new(channels);
-            session.set_state(ExecState::Failed(ExecFailure::new(
-                kind,
-                refusal.to_string(),
-            )));
+            session.set_state(ExecState::Failed(refused(&refusal)));
             session.linger().await;
         }
     }
+}
+
+/// What came of asking the write gate.
+enum GateAnswer {
+    Open,
+    Refused(WriteRefusal),
+    /// The session was closed before the gate answered.
+    Closed,
+}
+
+/// Asks the write gate, taking in what is typed meanwhile. Input goes first, so a session closed
+/// by the time the gate answers counts as closed.
+async fn ask_gate(
+    session: &mut Session,
+    mut answer: BoxFuture<'static, Result<(), WriteRefusal>>,
+    pending: &mut Replay,
+) -> GateAnswer {
+    loop {
+        tokio::select! {
+            biased;
+            input = session.next_input() => {
+                if session.handle_offline(input, Some(&mut *pending)) == Flow::Close {
+                    return GateAnswer::Closed;
+                }
+            }
+            result = &mut answer => {
+                return match result {
+                    Ok(()) => GateAnswer::Open,
+                    Err(refusal) => GateAnswer::Refused(refusal),
+                };
+            }
+        }
+    }
+}
+
+/// How a session shows a refusal from the write gate.
+fn refused(refusal: &WriteRefusal) -> ExecFailure {
+    let kind = match refusal {
+        WriteRefusal::Protected { .. } => ExecFailureKind::Protected,
+        WriteRefusal::Moved { .. } => ExecFailureKind::ContextChanged,
+        WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => ExecFailureKind::Unreachable,
+    };
+    ExecFailure::new(kind, refusal.to_string())
 }
 
 /// The session task: tries each candidate command, drives the one that starts, then keeps the
@@ -845,6 +889,18 @@ pub(crate) async fn run(
     for (i, command) in candidates.iter().enumerate() {
         let last = i + 1 == candidates.len();
         session.set_state(ExecState::Connecting);
+        // Every command asks the gate, before it is launched and before it is handed the input.
+        match ask_gate(&mut session, watch.may_launch(), &mut pending).await {
+            GateAnswer::Open => {}
+            GateAnswer::Refused(refusal) => {
+                session.set_state(ExecState::Failed(refused(&refusal)));
+                break;
+            }
+            GateAnswer::Closed => {
+                session.set_state(ExecState::Closed);
+                return;
+            }
+        }
         let mut launch = launcher.launch(command.clone());
         let launched = loop {
             tokio::select! {
@@ -875,6 +931,18 @@ pub(crate) async fn run(
                 break;
             }
         };
+        // Leaving this turn of the loop drops the process, which closes its connection.
+        match ask_gate(&mut session, watch.may_launch(), &mut pending).await {
+            GateAnswer::Open => {}
+            GateAnswer::Refused(refusal) => {
+                session.set_state(ExecState::Failed(refused(&refusal)));
+                break;
+            }
+            GateAnswer::Closed => {
+                session.set_state(ExecState::Closed);
+                return;
+            }
+        }
         session.set_state(ExecState::Running {
             command: command.clone(),
         });
@@ -1815,7 +1883,8 @@ mod tests {
         check: ContextCheck,
     ) -> ExecSession {
         let (session, channels) = ExecSession::new(request.clone());
-        let watch = ContextWatch::new(check, CHECK_EVERY);
+        let allowed: LaunchCheck = Arc::new(|| async { Ok(()) }.boxed());
+        let watch = ContextWatch::new(check, allowed, CHECK_EVERY);
         tokio::spawn(run(launcher.clone(), request, channels, watch));
         session
     }
@@ -2723,6 +2792,205 @@ mod tests {
             }
             .boxed()
         }
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Launches that wait for the result the test hands over, and record what they ran.
+    #[derive(Clone, Default)]
+    #[allow(clippy::type_complexity, reason = "a test's queue of scripted results")]
+    struct ScriptedLauncher {
+        results: Arc<Mutex<VecDeque<oneshot::Receiver<Result<Process, LaunchError>>>>>,
+        launched: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl ScriptedLauncher {
+        fn next(&self) -> oneshot::Sender<Result<Process, LaunchError>> {
+            let (tx, rx) = oneshot::channel();
+            self.results.lock().unwrap().push_back(rx);
+            tx
+        }
+
+        fn launches(&self) -> usize {
+            self.launched.lock().unwrap().len()
+        }
+
+        async fn launched(&self, times: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.launches() < times {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the launch");
+        }
+    }
+
+    impl Launcher for ScriptedLauncher {
+        fn launch(&self, command: Vec<String>) -> BoxFuture<'static, Result<Process, LaunchError>> {
+            self.launched.lock().unwrap().push(command);
+            let rx = self.results.lock().unwrap().pop_front();
+            async move {
+                match rx {
+                    Some(rx) => rx
+                        .await
+                        .unwrap_or_else(|_| Err(LaunchError::new("no result".to_owned()))),
+                    None => Err(LaunchError::new("no scripted launch".to_owned())),
+                }
+            }
+            .boxed()
+        }
+    }
+
+    /// A session whose launches ask a gate the test closes with the returned flag.
+    fn open_gated(launcher: &ScriptedLauncher) -> (ExecSession, Arc<AtomicBool>) {
+        let closed = Arc::new(AtomicBool::new(false));
+        let gate = closed.clone();
+        let launch: LaunchCheck = Arc::new(move || {
+            let closed = gate.load(Ordering::SeqCst);
+            async move { if closed { Err(protected()) } else { Ok(()) } }.boxed()
+        });
+        let (session, channels) = ExecSession::new(request());
+        let never: ContextCheck = Arc::new(|| async { None }.boxed());
+        let watch = ContextWatch::new(never, launch, CHECK_EVERY);
+        tokio::spawn(run(launcher.clone(), request(), channels, watch));
+        (session, closed)
+    }
+
+    fn protected() -> WriteRefusal {
+        WriteRefusal::Protected {
+            cluster: "dev".into(),
+        }
+    }
+
+    fn refused_as_protected() -> ExecState {
+        ExecState::Failed(ExecFailure::new(
+            ExecFailureKind::Protected,
+            protected().to_string(),
+        ))
+    }
+
+    // covers UP-54: the next shell asks the gate before it is launched.
+    #[tokio::test]
+    async fn each_shell_launch_checks_the_gate() {
+        let launcher = ScriptedLauncher::default();
+        let bash = launcher.next();
+        let (mut session, gate) = open_gated(&launcher);
+        launcher.launched(1).await;
+        session.write(b"typed".to_vec()).unwrap();
+        gate.store(true, Ordering::SeqCst);
+        let mut missing = LaunchError::new("no bash".to_owned());
+        missing.missing_command = true;
+        bash.send(Err(missing)).ok().unwrap();
+
+        let snap = wait_for(&mut session, "the refusal", |s| s.state.is_finished()).await;
+        assert_eq!(snap.state, refused_as_protected());
+        assert_eq!(launcher.launches(), 1, "/bin/sh is not launched");
+    }
+
+    // covers UP-54: a command that started is handed nothing unless the gate still allows it.
+    #[tokio::test]
+    async fn a_launched_shell_checks_the_gate_before_it_gets_input() {
+        let launcher = ScriptedLauncher::default();
+        let bash = launcher.next();
+        let (mut session, gate) = open_gated(&launcher);
+        launcher.launched(1).await;
+        session.write(b"typed".to_vec()).unwrap();
+        gate.store(true, Ordering::SeqCst);
+        let (process, mut remote) = process();
+        bash.send(Ok(process)).ok().unwrap();
+
+        let snap = wait_for(&mut session, "the refusal", |s| s.state.is_finished()).await;
+        assert_eq!(snap.state, refused_as_protected());
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut remote.stdin, &mut received),
+        )
+        .await
+        .expect("the connection is closed")
+        .unwrap();
+        assert!(received.is_empty(), "no input is replayed");
+        assert_eq!(launcher.launches(), 1);
+    }
+
+    // covers UP-54: with the gate closed, nothing is launched at all.
+    #[tokio::test]
+    async fn a_closed_gate_launches_nothing() {
+        let launcher = ScriptedLauncher::default();
+        let closed = Arc::new(AtomicBool::new(true));
+        let gate = closed.clone();
+        let launch: LaunchCheck = Arc::new(move || {
+            let closed = gate.load(Ordering::SeqCst);
+            async move { if closed { Err(protected()) } else { Ok(()) } }.boxed()
+        });
+        let (mut session, channels) = ExecSession::new(request());
+        let never: ContextCheck = Arc::new(|| async { None }.boxed());
+        let watch = ContextWatch::new(never, launch, CHECK_EVERY);
+        tokio::spawn(run(launcher.clone(), request(), channels, watch));
+        let snap = wait_for(&mut session, "the refusal", |s| s.state.is_finished()).await;
+        assert_eq!(snap.state, refused_as_protected());
+        assert_eq!(launcher.launches(), 0);
+    }
+
+    // covers UP-41: a session closed while the gate answers ends there, and its input goes nowhere.
+    #[tokio::test]
+    async fn closing_while_the_gate_answers_sends_nothing() {
+        let launcher = ScriptedLauncher::default();
+        let bash = launcher.next();
+        let (answer, held) = oneshot::channel::<()>();
+        let held = Arc::new(Mutex::new(Some(held)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let launch: LaunchCheck = Arc::new(move || {
+            let call = counted.fetch_add(1, Ordering::SeqCst);
+            let wait = (call == 1).then(|| held.lock().unwrap().take()).flatten();
+            async move {
+                if let Some(wait) = wait {
+                    let _ = wait.await;
+                }
+                Ok(())
+            }
+            .boxed()
+        });
+        let (mut session, channels) = ExecSession::new(request());
+        let never: ContextCheck = Arc::new(|| async { None }.boxed());
+        let watch = ContextWatch::new(never, launch, CHECK_EVERY);
+        tokio::spawn(run(launcher.clone(), request(), channels, watch));
+        launcher.launched(1).await;
+        session.write(b"typed".to_vec()).unwrap();
+        // The session takes it in while the command starts.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let (process, mut remote) = process();
+        bash.send(Ok(process)).ok().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second gate check");
+
+        // It does not wait for the gate's answer.
+        session.close();
+        let snap = wait_for(&mut session, "closed", |s| s.state == ExecState::Closed).await;
+        assert_eq!(snap.state, ExecState::Closed);
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut remote.stdin, &mut received),
+        )
+        .await
+        .expect("the connection is closed")
+        .unwrap();
+        assert!(
+            received.is_empty(),
+            "sent {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        drop(answer);
     }
 
     // covers UP-41 (#256): pastes before the shell starts, while another shell could still

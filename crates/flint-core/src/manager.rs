@@ -21,7 +21,7 @@ use crate::handle::{
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
-use crate::protection::{SessionUnlocks, WriteRefusal, protection};
+use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::{ContextHistory, ContextPin, Pinned};
 use crate::settings::{self, AiScope, Settings};
@@ -46,7 +46,7 @@ pub(crate) struct Cluster {
     info: ContextInfo,
     fingerprint: Option<u64>,
     state: ConnectionState,
-    client: Option<Client>,
+    client: Option<ClusterClients>,
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
@@ -153,7 +153,7 @@ enum Internal {
     Connected {
         cluster: ClusterId,
         attempt: u64,
-        result: Result<(Client, ServerVersion), cluster::SafeErrorText>,
+        result: Result<(ClusterClients, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
     Discovered {
@@ -506,6 +506,13 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.shell_client(&cluster, server));
             }
+            Request::CheckWriteGate {
+                cluster,
+                pin,
+                reply,
+            } => {
+                let _ = reply.send(self.launch_gate(&cluster, &pin));
+            }
             Request::CheckContext {
                 cluster,
                 pin,
@@ -625,7 +632,7 @@ impl ClusterManager {
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        let Some(client) = slot.client.clone() else {
+        let Some(client) = slot.client.as_ref().map(|c| c.read.clone()) else {
             return;
         };
         if slot.discovering {
@@ -851,13 +858,13 @@ impl ClusterManager {
                 }
                 let connected = result.is_ok();
                 match result {
-                    Ok((client, version)) => {
+                    Ok((clients, version)) => {
                         slot.watches.set_source(Some(KubeSource::new(
-                            client.clone(),
+                            clients.read.clone(),
                             Some(&version),
                             target,
                         )));
-                        slot.client = Some(client);
+                        slot.client = Some(clients);
                         slot.state = ConnectionState::Connected(version);
                     }
                     Err(message) => {
@@ -1062,8 +1069,8 @@ impl ClusterManager {
                 "\"{cluster}\" is uncertain while a kubeconfig file can't be read"
             )));
         };
-        if let Some(client) = &slot.client {
-            return Ok(client.clone());
+        if let Some(clients) = &slot.client {
+            return Ok(clients.read.clone());
         }
         match &slot.state {
             ConnectionState::Failed(error) => Err(LogError::retry(format!(
@@ -1087,7 +1094,7 @@ impl ClusterManager {
         &self,
         cluster: &str,
         server: Option<Option<String>>,
-    ) -> Result<(Client, ContextPin), WriteRefusal> {
+    ) -> Result<(GatedClient, ContextPin), WriteRefusal> {
         if let Some(expected) = &server
             && self
                 .cluster(cluster)
@@ -1111,24 +1118,63 @@ impl ClusterManager {
     }
 
     fn client(&self, cluster: &str) -> Option<Client> {
-        self.cluster(cluster).and_then(|c| c.client.clone())
+        self.cluster(cluster)
+            .and_then(|c| c.client.as_ref().map(|c| c.read.clone()))
     }
 
     /// The gate every action that changes a cluster, or runs code in it, goes through
     /// (ADR-0015): the cluster's client, unless the cluster is protected or not connected.
-    fn write_client(&self, cluster: &str) -> Result<Client, WriteRefusal> {
-        let not_connected = || WriteRefusal::NotConnected {
-            cluster: cluster.to_owned(),
-        };
-        // A context Flint does not know has no client either: say that, not "protected".
-        let slot = self.cluster(cluster).ok_or_else(not_connected)?;
-        let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
-        if !protection(&self.settings, &self.unlocks, cluster, server, proxy).allows_changes() {
-            return Err(WriteRefusal::Protected {
+    fn write_client(&self, cluster: &str) -> Result<GatedClient, WriteRefusal> {
+        let protection = self.write_gate(cluster)?;
+        self.cluster(cluster)
+            .and_then(|slot| slot.client.as_ref())
+            .ok_or_else(|| WriteRefusal::NotConnected {
+                cluster: cluster.to_owned(),
+            })?
+            .writes
+            .grant(protection, cluster)
+    }
+
+    /// The cluster's protection now, if it allows changes.
+    fn write_gate(&self, cluster: &str) -> Result<crate::Protection, WriteRefusal> {
+        let server = self
+            .cluster(cluster)
+            .and_then(|slot| slot.info.server.as_deref());
+        self.gate_for_server(cluster, server)
+    }
+
+    /// The gate for a session about to run a command with the client it was given at `pin`: for
+    /// the server that client talks to, in the same step as checking the context still names it.
+    fn launch_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteRefusal> {
+        if self.contexts.check(Pinned::Shell, cluster, pin).is_some() {
+            return Err(WriteRefusal::Moved {
                 cluster: cluster.to_owned(),
             });
         }
-        slot.client.clone().ok_or_else(not_connected)
+        self.gate_for_server(cluster, pin.server()).map(drop)
+    }
+
+    /// `cluster`'s protection for `server`, if it allows changes.
+    fn gate_for_server(
+        &self,
+        cluster: &str,
+        server: Option<&str>,
+    ) -> Result<crate::Protection, WriteRefusal> {
+        // A context Flint does not know has no client either: say that, not "protected".
+        let slot = self
+            .cluster(cluster)
+            .ok_or_else(|| WriteRefusal::NotConnected {
+                cluster: cluster.to_owned(),
+            })?;
+        let proxy = slot.info.proxy_url.as_deref();
+        let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
+        if protection.allows_changes() {
+            Ok(protection)
+        } else {
+            Err(WriteRefusal::Protected {
+                cluster: cluster.to_owned(),
+            })
+        }
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1204,7 +1250,7 @@ impl ClusterManager {
             // becomes a failed connection instead of a cluster stuck in "connecting".
             let name = cluster.clone();
             let attempt_task = tokio::spawn(async move {
-                cluster::connect_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
+                cluster::connect_gated_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
                     .await
                     .map_err(|e| e.summary())
             });
@@ -1897,6 +1943,70 @@ mod tests {
         assert!(logs.is_cluster(), "{}", logs.message);
     }
 
+    // covers UP-54: a session's launch check goes through the request channel and answers for
+    // the server its client talks to, whatever the context names now.
+    #[tokio::test]
+    async fn a_launch_check_answers_for_the_pinned_server() {
+        async fn ask(
+            manager: &mut ClusterManager,
+            inbox: &async_channel::Receiver<Request>,
+            check: &crate::exec::LaunchCheck,
+        ) -> Result<(), WriteRefusal> {
+            let answer = tokio::spawn(check());
+            let request = inbox.recv().await.unwrap();
+            manager.handle_request(request);
+            answer.await.unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://remote-a")).await;
+        offline(&mut manager);
+        let unlocks = manager.unlocks.clone();
+        unlocks.unlock("dev", "https://remote-a");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let (requests, inbox) = async_channel::bounded(8);
+        let check = crate::handle::launch_check(requests, "dev".into(), pin);
+        let protected = Err(WriteRefusal::Protected {
+            cluster: "dev".into(),
+        });
+        let moved = Err(WriteRefusal::Moved {
+            cluster: "dev".into(),
+        });
+
+        assert_eq!(ask(&mut manager, &inbox, &check).await, Ok(()));
+        unlocks.lock("dev");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, protected);
+        unlocks.unlock("dev", "https://remote-a");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, Ok(()));
+
+        // The context now names a server that needs no unlock: the client still talks to the
+        // first one.
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://127.0.0.1:6443"),
+        )
+        .await;
+        offline(&mut manager);
+        unlocks.lock("dev");
+        assert!(manager.write_gate("dev").is_ok(), "open for the new server");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
+
+        // Put back, it is still not the definition the session was pinned to.
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://remote-a"),
+        )
+        .await;
+        offline(&mut manager);
+        unlocks.unlock("dev", "https://remote-a");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
+
+        drop(inbox);
+        assert_eq!(check().await, Err(WriteRefusal::Stopped));
+    }
+
     // covers UP-06: a kubeconfig caught half-written fails to parse and is skipped. That is not
     // a removal: a shell and a log session on its contexts go on, and still do once the file is
     // back as it was.
@@ -2257,8 +2367,10 @@ mod tests {
             manager.write_client("dev").err(),
             Some(not_connected.clone())
         );
+        assert!(manager.write_gate("dev").is_ok());
         unlocks.lock("dev");
         assert_eq!(manager.write_client("dev").err(), Some(protected("dev")));
+        assert_eq!(manager.write_gate("dev").err(), Some(protected("dev")));
 
         let mut trusted = Settings::default();
         trusted

@@ -1996,6 +1996,7 @@ dependencies = [
  "alacritty_terminal",
  "async-channel",
  "base64 0.22.1",
+ "flint-core",
  "futures",
  "http",
  "hyper-timeout",

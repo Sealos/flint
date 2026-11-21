@@ -16,14 +16,14 @@ use tokio::sync::{oneshot, watch};
 
 use crate::cluster::{ClusterId, ServerVersion};
 use crate::discovery::ClusterDiscovery;
-use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession};
+use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession, LaunchCheck};
 use crate::kubeconfig::ContextInfo;
 use crate::logs::{
     Freshness, LogFilter, LogLines, LogOptions, LogSearch, LogSnapshot, LogSubject, LogTarget,
     PodSet, WorkloadPod,
 };
 use crate::manager::ClusterManager;
-use crate::protection::{SessionUnlocks, WriteRefusal};
+use crate::protection::{GatedClient, SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
 use crate::recheck::{ContextPin, RECHECK_EVERY};
 use crate::settings::{Appearance, Settings, WatchMode};
@@ -205,7 +205,14 @@ pub(crate) enum Request {
         /// The server the session is for (its tab's), if it names one: refused if the context
         /// shows another.
         server: Option<Option<String>>,
-        reply: oneshot::Sender<Result<(kube::Client, ContextPin), WriteRefusal>>,
+        reply: oneshot::Sender<Result<(GatedClient, ContextPin), WriteRefusal>>,
+    },
+    /// What the write gate says now about `cluster` as pinned at `pin`, for a session about to
+    /// run a command.
+    CheckWriteGate {
+        cluster: ClusterId,
+        pin: ContextPin,
+        reply: oneshot::Sender<Result<(), WriteRefusal>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
@@ -613,8 +620,9 @@ impl CoreHandle {
         let cluster = request.cluster.clone();
         self.runtime.spawn(async move {
             let client = client.await.map(|(client, pin)| {
+                let launch = launch_check(requests.clone(), cluster.clone(), pin.clone());
                 let check = context_check(requests, cluster, pin);
-                (client, ContextWatch::new(check, RECHECK_EVERY))
+                (client, ContextWatch::new(check, launch, RECHECK_EVERY))
             });
             crate::exec::start(client, request, channels).await;
         });
@@ -628,7 +636,7 @@ impl CoreHandle {
         &self,
         cluster: &str,
         server: Option<Option<String>>,
-    ) -> impl Future<Output = Result<(kube::Client, ContextPin), WriteRefusal>> + Send + 'static
+    ) -> impl Future<Output = Result<(GatedClient, ContextPin), WriteRefusal>> + Send + 'static
     {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::WriteClient {
@@ -963,6 +971,32 @@ fn context_check(
                 return None;
             }
             rx.await.ok().flatten()
+        })
+    })
+}
+
+/// Asks the cluster manager's write gate about `cluster` as pinned at `pin`, each time it is
+/// called. With the core gone, the answer is a refusal.
+pub(crate) fn launch_check(
+    requests: async_channel::Sender<Request>,
+    cluster: ClusterId,
+    pin: ContextPin,
+) -> LaunchCheck {
+    Arc::new(move || {
+        let requests = requests.clone();
+        let cluster = cluster.clone();
+        let pin = pin.clone();
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            requests
+                .send(Request::CheckWriteGate {
+                    cluster,
+                    pin,
+                    reply,
+                })
+                .await
+                .map_err(|_| WriteRefusal::Stopped)?;
+            rx.await.unwrap_or(Err(WriteRefusal::Stopped))
         })
     })
 }
