@@ -670,6 +670,17 @@ pub(super) mod tests {
             base,
             UI,
         );
+        // The disconnected dot is the row's only mark of that state.
+        let (not_connected, _) = crate::ui::clusters::Presence::NotConnected.dot(t);
+        for (surface, bg) in [("sidebar", t.sidebar), ("active cluster", active_cluster)] {
+            need(
+                &format!("disconnected mark on the {surface}"),
+                not_connected,
+                bg,
+                base,
+                UI,
+            );
+        }
         // Log lines (`log_view`): error and warning lines and timestamps on the background and
         // on a selected line are checked above (status text and muted text on the selected
         // row). Matched text is drawn in the foreground color over the match tint, also inside
