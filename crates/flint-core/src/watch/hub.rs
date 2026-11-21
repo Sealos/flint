@@ -167,10 +167,13 @@ impl Hub {
     }
 
     fn send(&self, mut snapshot: KindSnapshot) {
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.state.clone();
+        // Held across the send, so whoever reads this state finds its rows published.
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *state = snapshot.state.clone();
         *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.feed;
         snapshot.version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
         self.tx.send_replace(Arc::new(snapshot));
+        drop(state);
         if let Some(notify) = &self.on_publish {
             notify.notify_one();
         }
