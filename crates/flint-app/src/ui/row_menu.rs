@@ -328,12 +328,8 @@ fn say(menu: PopupMenu, text: &str) -> PopupMenu {
     )
 }
 
-/// The Shell entry: a workload's names the pod it opens in.
-fn shell_entry_label(a: &RowActions) -> String {
-    shell_entry_label_within(a, SHELL_POD_NAME)
-}
-
-/// [`shell_entry_label`] with at most `pod_chars` of the pod's name, to fit a narrow window.
+/// The Shell entry: a workload's names the pod it opens in, with at most `pod_chars` of its name
+/// to fit a narrow window.
 fn shell_entry_label_within(a: &RowActions, pod_chars: usize) -> String {
     match (&a.shell_pod, a.subject) {
         (Some(shell), Subject::Workload(_)) => {
@@ -497,7 +493,7 @@ pub fn menu_state(a: &RowActions) -> (Option<String>, Vec<MenuEntryState>) {
             },
         );
     }
-    let label = shell_entry_label(a);
+    let label = shell_entry_label_within(a, SHELL_POD_NAME);
     entries.push(match &a.shell_pod {
         Some(shell) if a.shell_picker && a.blocked.is_none() => picker(
             label,
@@ -537,7 +533,7 @@ pub(in crate::ui) mod tests {
 
     use super::{
         MAX_REASON, PROTECTED_NOTE, RowActions, SHELL_POD_NAME, UnlockEntry, menu_state,
-        protected_reason, shell_entry_label, shell_entry_label_within, unlock_tip,
+        protected_reason, shell_entry_label_within, unlock_tip,
     };
     use crate::ui::detail::{ShellPod, Subject};
     use crate::ui::object::PodContainer;
@@ -707,7 +703,7 @@ pub(in crate::ui) mod tests {
             }),
             ..pod_actions()
         };
-        let label = shell_entry_label(&workload);
+        let label = shell_entry_label_within(&workload, SHELL_POD_NAME);
         assert!(label.starts_with("Shell in web-platform"), "{label}");
         assert_eq!(label.chars().count(), "Shell in ".len() + SHELL_POD_NAME);
         let narrow = shell_entry_label_within(&workload, 10);
