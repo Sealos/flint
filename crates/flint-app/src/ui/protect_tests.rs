@@ -9,12 +9,12 @@ use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
-use super::super::{trust_dialog, unlock_dialog};
+use super::super::{expose_dialog, scope_dialog, trust_dialog, unlock_dialog};
 use super::row_actions_tests::right_click;
 use crate::ui::dock::{DockItem as _, TabStatus};
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
-    TestWorkspace, WAIT, alpha_and_beta, open_fake_shell, open_workspace_with,
+    TestWorkspace, WAIT, alpha_and_beta, kubeconfig_yaml, open_fake_shell, open_workspace_with,
 };
 
 const PROTECT_LOCAL: &str = "protect_local_clusters = true\n";
@@ -820,4 +820,91 @@ async fn clusters_on_this_machine_start_unlocked(cx: &mut TestAppContext) {
     }
     let row = t.description(cx, "cluster-alpha").unwrap_or_default();
     assert!(row.contains("On this machine: unlocked"), "{row}");
+}
+
+const SERVER_WITH_USERINFO: &str = "https://admin:hunter2@prod.example:6443/?token=abc";
+const CLEANED_SERVER: &str = "https://prod.example:6443";
+
+fn assert_cleaned(text: &str) {
+    for part in ["admin", "hunter2", "token=", "@"] {
+        assert!(!text.contains(part), "{part} in {text}");
+    }
+}
+
+#[test]
+fn dialogs_show_the_cleaned_server_address() {
+    let previous = "https://old:pass@old.example:6443";
+    let texts = [
+        unlock_dialog("alpha", "alpha", SERVER_WITH_USERINFO).text,
+        trust_dialog("alpha", "alpha", SERVER_WITH_USERINFO, Some(previous)).text,
+        scope_dialog("alpha", SERVER_WITH_USERINFO, &Default::default()).text,
+        expose_dialog("alpha", SERVER_WITH_USERINFO, Some(previous)).text,
+    ];
+    for text in &texts {
+        assert_cleaned(text);
+        assert!(
+            text.contains(&format!("Server: {CLEANED_SERVER}")),
+            "{text}"
+        );
+    }
+    assert!(texts[1].contains("trusted at https://old.example:6443,"));
+    assert!(!texts[1].contains("pass@"));
+}
+
+#[test]
+fn a_previous_server_that_shows_the_same_is_still_called_different() {
+    let previous = "https://other:login@prod.example:6443";
+    let text = trust_dialog("alpha", "alpha", SERVER_WITH_USERINFO, Some(previous)).text;
+    assert_cleaned(&text);
+    assert!(!text.contains("other:login"), "{text}");
+    assert!(
+        text.contains("trusted at another URL that shows the same here"),
+        "{text}"
+    );
+}
+
+#[gpui_kit::test]
+async fn the_row_is_cleaned_while_pins_keep_the_exact_url(cx: &mut TestAppContext) {
+    // On this machine, at a port nothing listens on: the test never reaches another host.
+    const RAW: &str = "https://admin:hunter2@127.0.0.1:1/?token=abc";
+    const CLEANED: &str = "https://127.0.0.1:1";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("settings.toml"), PROTECT_LOCAL).unwrap();
+    let t = open_workspace_with(cx, dir.path(), |dir, servers| {
+        let kubeconfig = dir.join("kubeconfig");
+        let contexts = [("alpha", RAW), ("beta", servers.refused.as_str())];
+        std::fs::write(&kubeconfig, kubeconfig_yaml(&contexts)).unwrap();
+        vec![kubeconfig]
+    })
+    .await;
+    draw(cx, &t);
+
+    let row = t.description(cx, "cluster-alpha").unwrap();
+    assert_cleaned(&row);
+    assert!(row.starts_with(&format!("alpha\n{CLEANED}\n")), "{row}");
+    assert_eq!(
+        t.label(cx, "cluster-server-alpha").as_deref(),
+        Some("127.0.0.1:1")
+    );
+
+    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert_cleaned(&t.label(cx, "unlock-description").unwrap());
+    t.click(cx, "ok");
+    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    wait_for_dialog(cx, &t, false).await;
+    t.model.read_with(cx, |m, _| {
+        let unlocks = m.core().unlocks();
+        assert!(unlocks.is_unlocked("alpha", RAW));
+        assert!(!unlocks.is_unlocked("alpha", CLEANED));
+    });
+
+    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    assert_cleaned(&t.label(cx, "trust-description").unwrap());
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+    assert!(t.settings_toml().contains(RAW));
 }

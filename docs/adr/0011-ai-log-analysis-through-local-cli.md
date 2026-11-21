@@ -1,5 +1,7 @@
 # AI log analysis through the user's local CLI
 
+**Not scheduled.** No release on the roadmap includes AI log analysis. The design below is kept for when it is.
+
 The log viewer gets an **Analyze with Claude** button. It runs the user's own `claude` (Claude Code) in its
 non-interactive mode as a child process. A short prompt with the pod and container context and the selected log
 lines go in on stdin. The answer streams into a side panel. Flint holds no API keys and talks to no LLM

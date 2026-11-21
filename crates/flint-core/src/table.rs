@@ -959,12 +959,14 @@ impl PageError {
         }
     }
 
-    /// The error as the watch engine sorts it, naming `target`'s server.
+    /// The error as the watch engine sorts it, naming `target`'s server. Text from the server or
+    /// kube stays whole, so that whatever displays it can hide values before shortening it.
     pub fn into_fetch(self, target: &cluster::Target) -> FetchError {
-        FetchError::from_kind(
-            self.kind,
-            self.error.for_target(target).summary().to_string(),
-        )
+        let message = match self.error {
+            ClusterError::Api(message) | ClusterError::Kube(message) => message,
+            other => other.for_target(target).summary().to_string(),
+        };
+        FetchError::from_kind(self.kind, message)
     }
 }
 
