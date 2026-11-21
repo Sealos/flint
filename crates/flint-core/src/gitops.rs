@@ -241,10 +241,16 @@ pub fn managed_by_object(object: &Value) -> Option<ManagedBy> {
 
 /// [`managed_by_live`] for an object as JSON.
 pub(crate) fn managed_by_live_object(object: &Value) -> Option<ManagedBy> {
-    let metadata = object.get("metadata")?;
-    managed_by_live(&Identity::of(object), |key| {
-        live_label_or_annotation(metadata, key)
-    })
+    managed_by_live_metadata(&Identity::of(object), object.get("metadata")?)
+}
+
+/// The one reader of a live object's `metadata` (its labels and annotations), so every caller
+/// reads the same markers the same way.
+pub(crate) fn managed_by_live_metadata(
+    identity: &Identity<'_>,
+    metadata: &Value,
+) -> Option<ManagedBy> {
+    managed_by_live(identity, |key| live_label_or_annotation(metadata, key))
 }
 
 /// A marker on a live object: an empty label gives way to an annotation of the same key, and a

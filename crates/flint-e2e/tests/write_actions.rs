@@ -1092,6 +1092,45 @@ async fn a_pod_marked_after_the_review_stops_the_drain() {
     assert!(server.object(&nodes(), None, NODE).unwrap()["spec"]["unschedulable"].is_null());
 }
 
+// covers UP-51, UP-53: a pod whose marker is an annotation behind an empty label is named in the
+// review, and a change to that annotation after the review stops the drain before the pod is
+// evicted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_annotation_changed_after_the_review_stops_the_drain_before_the_eviction() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    let mut pod = pod_json("web", "ReplicaSet");
+    pod["metadata"]["labels"] = json!({FLUX_LABEL: ""});
+    pod["metadata"]["annotations"] = json!({FLUX_LABEL: "apps"});
+    server.add_pod(FakePod::from_json(pod));
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::EvictsManaged(pods)] => {
+            assert_eq!(pods[0].managed.to_string(), "Flux: apps");
+        }
+        other => panic!("{other:?}"),
+    }
+    let pods = Gvr::core("pods");
+    let mut live = server.object(&pods, Some("demo"), "web").expect("the pod");
+    live["metadata"]["annotations"] = json!({FLUX_LABEL: "other"});
+    server.set_object(&pods, live);
+    let result = core.handle.run_write(review.into_intent()).await;
+    match result {
+        Err(error) => assert_eq!(error, WriteError::Conflict),
+        Ok(outcome) => assert_eq!(
+            report(outcome).blocked,
+            [(named("web"), BlockedReason::ManagedSinceReview)]
+        ),
+    }
+    assert_eq!(evictions(&server, "web"), 0);
+    assert!(server.object(&pods, Some("demo"), "web").is_some());
+}
+
 // covers UP-53: a Deployment paused after the review is a conflict, and no patch is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deployment_paused_after_the_review_is_not_restarted() {
