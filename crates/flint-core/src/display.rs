@@ -107,6 +107,12 @@ pub fn cluster_name_key(name: &str) -> String {
     key
 }
 
+/// The [`cluster_name_key`] of a name read back from settings, as it would be shown: cleaned by
+/// [`clean_custom_name`]. `None` for a saved name that is never shown.
+pub fn saved_name_key(saved: &str) -> Option<String> {
+    clean_custom_name(saved).map(|name| cluster_name_key(&name))
+}
+
 /// `c` with a fullwidth Latin letter or digit made ASCII, and Turkish dotted capital I made a
 /// plain `I`, whose lowercase would otherwise carry a combining dot.
 fn without_width(c: char) -> char {
@@ -129,7 +135,9 @@ fn latin_look_alike(c: char) -> char {
         '\u{501}' => 'd',
         '\u{435}' | '\u{3b5}' => 'e',
         '\u{43d}' | '\u{4bb}' | '\u{3b7}' => 'h',
-        '\u{456}' | '\u{4cf}' | '\u{3b9}' | '\u{131}' => 'i',
+        '\u{456}' | '\u{3b9}' | '\u{131}' => 'i',
+        // Palochka, in both cases, reads as a lowercase L.
+        '\u{4cf}' => 'l',
         '\u{458}' | '\u{3f3}' => 'j',
         '\u{43a}' | '\u{3ba}' => 'k',
         '\u{43c}' | '\u{3bc}' | '\u{b5}' => 'm',
@@ -368,6 +376,10 @@ mod tests {
             cluster_name_key("\u{3c3}\u{3b1}\u{3c2}")
         );
         assert_eq!(cluster_name_key("\u{130}D"), cluster_name_key("id"));
+        // Palochka, in both cases, reads as a lowercase L.
+        for palochka in ["c\u{4cf}uster", "c\u{4c0}uster"] {
+            assert_eq!(cluster_name_key(palochka), cluster_name_key("cluster"));
+        }
     }
 
     // covers UP-01: only look-alikes fold, so names in other scripts stay usable and distinct.

@@ -916,7 +916,8 @@ pub fn set_cluster_name(
             let holds_key = |value: &toml::Value| {
                 value
                     .as_str()
-                    .is_some_and(|v| crate::display::cluster_name_key(v) == key)
+                    .and_then(crate::display::saved_name_key)
+                    .is_some_and(|saved| saved == key)
             };
             let its_own = entries.get(context).is_some_and(holds_key);
             let taken = entries
@@ -1792,6 +1793,21 @@ mod tests {
         // A non-Latin name that collides with nothing is fine.
         let s = set_cluster_name(dir.path(), "b", Some("север")).unwrap();
         assert_eq!(s.cluster_names["b"], "север");
+    }
+
+    // covers UP-01: a saved name counts as it is shown, trimmed.
+    #[test]
+    fn saved_names_are_compared_as_they_are_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[cluster_names]\na = \"prod \"\nb = \"prod-\"\n";
+        std::fs::write(dir.path().join(SETTINGS_FILE), text).unwrap();
+        // Would make two names that are shown apart collide.
+        assert!(set_cluster_name(dir.path(), "a", Some("prod-")).is_err());
+        assert!(set_cluster_name(dir.path(), "c", Some("prod")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(),
+            text
+        );
     }
 
     // covers UP-01: a file from before the stricter check loads as it is.
