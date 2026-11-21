@@ -388,7 +388,7 @@ async fn banners_mark_a_stale_or_deleted_object(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx), None);
 }
 
-/// Publishes `state` for Pods on `alpha` as a watch would. Keep the value while the test runs.
+/// Publishes `state` for Pods on `kind-alpha` as a watch would. Keep the value while the test runs.
 fn publish_sync(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -396,7 +396,7 @@ fn publish_sync(
 ) -> impl Sized + use<> {
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
     core.store_for_tests(KindSnapshot {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         kind: KindId::pods(),
         state,
         ..Default::default()
