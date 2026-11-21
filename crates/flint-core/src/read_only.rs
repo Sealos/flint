@@ -20,19 +20,40 @@ pub(crate) fn layer() -> ReadOnlyLayer {
 }
 
 /// Why a read-only client did not send a request.
-#[derive(Debug, thiserror::Error)]
-#[error("refused a {method} request: this connection is read-only")]
-struct Refused {
-    method: Method,
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum Refused {
+    #[error("refused a {method} request: this connection is read-only")]
+    Request { method: Method },
+    #[error("cannot open an object whose name contains `;`: this connection is read-only")]
+    SemicolonInName,
+}
+
+impl Refused {
+    /// Why `method` on `path`, which [`allows`] refused, was not sent. This only picks the
+    /// message: the request is refused either way.
+    fn of(method: &Method, path: &str) -> Self {
+        let without_semicolons = path
+            .replace(';', "_")
+            .replace("%3B", "_")
+            .replace("%3b", "_");
+        if without_semicolons != path && allows(method, &without_semicolons) {
+            Self::SemicolonInName
+        } else {
+            Self::Request {
+                method: method.clone(),
+            }
+        }
+    }
 }
 
 fn check(request: Request<Body>) -> Result<Request<Body>, BoxError> {
     if allows(request.method(), request.uri().path()) {
         Ok(request)
     } else {
-        Err(Box::new(Refused {
-            method: request.method().clone(),
-        }))
+        Err(Box::new(Refused::of(
+            request.method(),
+            request.uri().path(),
+        )))
     }
 }
 
@@ -233,6 +254,50 @@ mod tests {
                 assert!(!allows(&Method::GET, &path), "{path}");
             }
         }
+    }
+
+    // A `;` stays refused in every segment. An object's name gets a message of its own; anything
+    // else that holds one is refused as any other path is.
+    #[test]
+    fn a_semicolon_is_refused_and_a_name_with_one_says_so() {
+        let roles = "/apis/rbac.authorization.k8s.io/v1/clusterroles";
+        for path in [
+            format!("{roles}/team;readers"),
+            format!("{roles}/team%3Breaders"),
+            format!("{roles}/team%3breaders"),
+        ] {
+            assert!(!allows(&Method::GET, &path), "{path}");
+            assert_eq!(
+                Refused::of(&Method::GET, &path),
+                Refused::SemicolonInName,
+                "{path}"
+            );
+        }
+        let pod = "/api/v1/namespaces/demo/pods/name";
+        for path in [
+            format!("{pod};x/exec"),
+            format!("{pod}%3Bx/exec"),
+            format!("{pod}/exec;x"),
+            format!("{pod};x/proxy/admin"),
+            format!("{roles}/name;x/exec"),
+        ] {
+            assert!(!allows(&Method::GET, &path), "{path}");
+            assert_eq!(
+                Refused::of(&Method::GET, &path),
+                Refused::Request {
+                    method: Method::GET
+                },
+                "{path}"
+            );
+        }
+        let name = format!("{roles}/team;readers");
+        assert!(!allows(&Method::DELETE, &name));
+        assert_eq!(
+            Refused::of(&Method::DELETE, &name),
+            Refused::Request {
+                method: Method::DELETE
+            }
+        );
     }
 
     // covers UP-54: anything the allowlist does not name is refused.
