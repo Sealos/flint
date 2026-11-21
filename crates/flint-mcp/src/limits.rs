@@ -184,8 +184,8 @@ impl Admission {
 /// answered yet.
 #[derive(Default)]
 pub(crate) struct ReplyBytes {
-    /// Told of a tool call refused at the transport (it never reaches a handler): its tool and
-    /// arguments, so it is recorded.
+    /// Told of a tool call refused at the transport (it never reaches a handler): its tool, so
+    /// it is recorded. Its arguments are unvalidated and are not passed on.
     dropped_call: std::sync::OnceLock<DroppedCall>,
     outstanding: AtomicUsize,
     /// Replies whose send has finished since the start: progress, while stdin has ended.
@@ -217,14 +217,8 @@ impl Work {
 }
 
 /// What [`ReplyBytes`] tells of a dropped tool call.
-pub(crate) type DroppedCall = Box<
-    dyn Fn(
-            String,
-            Option<serde_json::Map<String, serde_json::Value>>,
-        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
+pub(crate) type DroppedCall =
+    Box<dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 impl ReplyBytes {
     /// Sets what is told of a dropped tool call; only the first one set counts.
@@ -238,7 +232,7 @@ impl ReplyBytes {
         if let (JsonRpcMessage::Request(request), Some(tell)) = (message, self.dropped_call.get())
             && let ClientRequest::CallToolRequest(call) = &request.request
         {
-            tell(call.params.name.to_string(), call.params.arguments.clone()).await;
+            tell(call.params.name.to_string()).await;
         }
     }
 
