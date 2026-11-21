@@ -149,6 +149,9 @@ pub(crate) struct Stream {
     tail: i64,
     /// Failed attempts in a row, for the backoff. Reset when a line arrives (and on a revive).
     retry: Retry,
+    /// Polls of a container that has not started, for their own backoff: nothing is failing, so
+    /// they do not count as attempts. Reset like `retry`, but not by a failure.
+    start_wait: Retry,
     /// The pod set this stream belongs to (workload sessions).
     member: Option<Member>,
     phase: Phase,
@@ -211,6 +214,7 @@ impl Stream {
             options,
             tail,
             retry: Retry::new(backoff),
+            start_wait: Retry::new(backoff),
             member,
             phase: Phase::Done,
             state: LogState::Connecting,
@@ -444,6 +448,7 @@ impl Stream {
         self.deleted = false;
         self.starting = None;
         self.retry.reset();
+        self.start_wait.reset();
         self.set_state(LogState::Connecting);
         let request = self.resume_request();
         self.phase = Phase::Connect(self.source.open(&request));
@@ -525,6 +530,7 @@ impl Stream {
         }
         line.source = self.tag().cloned();
         self.retry.reset();
+        self.start_wait.reset();
         out(line);
     }
 
@@ -592,10 +598,10 @@ impl Stream {
         Phase::Connect(self.source.open(&request))
     }
 
-    /// Polls for a container that has not started. Counted for the delay, which grows, but
-    /// shown without an attempt: nothing is failing.
+    /// Polls for a container that has not started, at a delay that grows on its own count:
+    /// nothing is failing, so the reconnect attempts are left alone.
     fn wait_for_container(&mut self, wait: ContainerWait) -> Phase {
-        let next = self.retry.fail(None, false);
+        let next = self.start_wait.fail(None, false);
         self.set_state(LogState::Waiting { wait });
         Phase::Wait(next.sleep)
     }
@@ -1165,6 +1171,54 @@ mod tests {
 
     fn attempt(s: &Stream) -> u32 {
         attempt_of(s.state())
+    }
+
+    // covers UP-40: polling a container that has not started is not a failed attempt. The first
+    // real failure after a long wait is attempt 1 at the shortest delay, and the wait's own delay
+    // goes on growing until a line arrives or the stream is revived.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_container_keeps_its_own_backoff() {
+        let not_started = || {
+            Step::AfterEnd(Ok(AfterEnd::NotStarted(ContainerWait::NotStarted(Some(
+                "ImagePullBackOff".into(),
+            )))))
+        };
+        let mut s = stream(&[], Some(Arc::new(LineSource::new("p", "c"))));
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            s.handle(not_started(), &mut |_| {});
+            waits.push(wait_left(&s).as_secs());
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30]);
+
+        s.handle(Step::Opened(Err(LogError::retry("down"))), &mut |_| {});
+        assert_eq!((attempt(&s), wait_left(&s).as_secs()), (1, 1));
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(
+            wait_left(&s).as_secs(),
+            30,
+            "a failure does not reset the wait"
+        );
+
+        // A line is progress for both.
+        s.handle(Step::Opened(Ok(stream::pending().boxed())), &mut |_| {});
+        s.handle(
+            Step::Line(Ok(RawLine {
+                text: "started".into(),
+                truncated: false,
+            })),
+            &mut |_| {},
+        );
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(wait_left(&s).as_secs(), 1, "a line resets the wait");
+
+        // So is a revive.
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(wait_left(&s).as_secs(), 2);
+        s.handle(Step::Opened(Err(LogError::fatal("gone"))), &mut |_| {});
+        s.revive();
+        s.handle(not_started(), &mut |_| {});
+        assert_eq!(wait_left(&s).as_secs(), 1, "a revive resets the wait");
     }
 
     // covers UP-40: the kubelet's "cannot read the log" answer is not progress, so a container
