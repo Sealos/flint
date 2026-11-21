@@ -22,18 +22,28 @@ const PLUGIN: &str = "flint-e2e-stub-plugin";
 /// How long the hanging plugin's attempt may take to be reported: `CONNECT_TIMEOUT` and a margin.
 const HANG_REPORTED: Duration = Duration::from_secs(90);
 
-/// Answers with a credential once the `answer` file exists, and until then waits. It records
-/// each run's process id, and ends by itself once the scratch directory is gone (or after five
-/// minutes), so a failed test leaves nothing running.
+/// Answers with a credential once the `answer` file exists, and until then waits. Each run
+/// records its process id and starts a child that waits the same way and records its own, with
+/// its output detached so it cannot hold the plugin's pipe open. Both end by themselves once the
+/// scratch directory is gone (or after five minutes).
 const STUB: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
+wait_for_answer() {
+  waited=0
+  while [ ! -e "$dir/answer" ]; do
+    [ -d "$dir" ] && [ "$waited" -lt 300 ] || exit 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+if [ "$1" = child ]; then
+  wait_for_answer
+  exit 0
+fi
 echo $$ >> "$dir/starts"
-waited=0
-while [ ! -e "$dir/answer" ]; do
-  [ -d "$dir" ] && [ "$waited" -lt 300 ] || exit 1
-  sleep 1
-  waited=$((waited + 1))
-done
+"$0" child </dev/null >/dev/null 2>&1 &
+echo $! >> "$dir/children"
+wait_for_answer
 printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1beta1","kind":"ExecCredential","status":{"token":"e2e-stub-token"}}'
 "#;
 
@@ -89,6 +99,25 @@ impl Plugin {
     fn starts(&self) -> Vec<i32> {
         read_pids(&self.dir.join("starts"))
     }
+
+    /// The process id of the child each run started.
+    fn children(&self) -> Vec<i32> {
+        read_pids(&self.dir.join("children"))
+    }
+}
+
+/// Kills whatever is left of the stub, also when a test fails. A recorded id counts only while
+/// it still runs this stub's file, since the system may have given it to another process.
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        let program = self.path().display().to_string();
+        for pid in self.starts().into_iter().chain(self.children()) {
+            if runs(pid, &program) {
+                // SAFETY: kill takes plain integers, and `pid` was just seen running the stub.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
 }
 
 fn read_pids(path: &Path) -> Vec<i32> {
@@ -106,6 +135,14 @@ fn exists(pid: i32) -> bool {
     sent == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// Whether process `pid` has `program` on its command line.
+fn runs(pid: i32, program: &str) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|ps| String::from_utf8_lossy(&ps.stdout).contains(program))
+}
+
 fn main_error(state: &Value) -> &str {
     state["main"]["error"].as_str().unwrap_or_default()
 }
@@ -120,7 +157,7 @@ fn retry_connects(app: &App) -> Result<()> {
 }
 
 // covers UP-04: a missing plugin is named in plain words, without its directory, at once; the
-// other cluster works, and Retry connects once the plugin is installed.
+// other cluster stays connected and still works, and Retry connects once the plugin is installed.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_04_missing_exec_plugin_is_named_and_retries() -> Result<()> {
@@ -128,6 +165,9 @@ fn up_04_missing_exec_plugin_is_named_and_retries() -> Result<()> {
     let plugin = Plugin::configure(&two)?;
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
+
+    connect(&app, TwoClusters::B)?;
+    open_live(&app, "pods", 17)?;
 
     let started = Instant::now();
     app.select_cluster(TwoClusters::A)?;
@@ -149,21 +189,23 @@ fn up_04_missing_exec_plugin_is_named_and_retries() -> Result<()> {
         two.a.requests()
     );
 
-    connect(&app, TwoClusters::B)?;
-    open_live(&app, "pods", 17)?;
+    assert_eq!(sidebar(&state, TwoClusters::B)["connection"], "connected");
 
-    app.select_cluster(TwoClusters::A)?;
-    app.wait_for("/main/view", Equals("failed".into()))?;
+    // `fake-a` stays selected: selecting it again would start an attempt of its own.
     plugin.install()?;
     plugin.answer()?;
     retry_connects(&app)?;
     assert_eq!(plugin.starts().len(), 1, "one run, from the retry");
     assert!(!two.a.requests().is_empty());
+
+    connect(&app, TwoClusters::B)?;
+    open_live(&app, "pods", 17)?;
     Ok(())
 }
 
-// covers UP-04: a plugin that never answers fails at the connect timeout and is killed; the other
-// cluster connects and the UI answers meanwhile, and Retry runs the plugin again.
+// covers UP-04: a plugin that never answers fails at the connect timeout and is killed with the
+// child it started; the other cluster connects and the UI answers meanwhile, and Retry runs the
+// plugin again.
 #[test]
 #[ignore = "app e2e: needs macOS with a GUI session (see docs/TESTING.md)"]
 fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
@@ -173,10 +215,13 @@ fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
     let app = App::launch(AppOptions::new(two.kubeconfig()))?;
     app.wait_for("/kubeconfig/loaded", Equals(true.into()))?;
 
+    let started = Instant::now();
     app.select_cluster(TwoClusters::A)?;
     app.wait_for("/main/view", Equals("connecting".into()))?;
     let starts = until("the plugin to start", || plugin.starts(), |s| s.len() == 1)?;
     let hung = starts[0];
+    let children = until("its child to start", || plugin.children(), |c| c.len() == 1)?;
+    let child = children[0];
 
     // The other cluster connects and lists while the plugin hangs, and the UI keeps answering.
     connect(&app, TwoClusters::B)?;
@@ -185,11 +230,13 @@ fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
     let state = app.state()?;
     assert_eq!(sidebar(&state, TwoClusters::A)["connection"], "connecting");
     assert!(exists(hung), "the plugin is still waiting");
+    assert!(exists(child), "its child is still waiting");
     assert!(two.a.requests().is_empty(), "{:?}", two.a.requests());
 
     // Back on the hanging cluster: the same attempt runs out.
     app.select_cluster(TwoClusters::A)?;
-    let state = app.wait_for_within("/main/view", Equals("failed".into()), HANG_REPORTED)?;
+    let left = HANG_REPORTED.saturating_sub(started.elapsed());
+    let state = app.wait_for_within("/main/view", Equals("failed".into()), left)?;
     let error = main_error(&state);
     assert!(error.contains("1m0s"), "{error}");
     assert!(
@@ -201,6 +248,7 @@ fn up_04_hanging_exec_plugin_times_out_and_retries() -> Result<()> {
         "the plugin's directory is hidden: {error}"
     );
     until("the plugin to be killed", || exists(hung), |alive| !alive)?;
+    until("its child to be killed", || exists(child), |alive| !alive)?;
     assert_eq!(plugin.starts(), [hung], "no second run without a retry");
 
     plugin.answer()?;
