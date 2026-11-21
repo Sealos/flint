@@ -513,11 +513,18 @@ impl App {
         self.teardown().selecting(context);
     }
 
-    /// Runs `edit`, the test's own change to the kubeconfig files (UP-06), and takes the files as
-    /// they are after it as the ones the app must leave untouched (UP-90).
-    pub fn edit_kubeconfig<T>(&self, edit: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// Runs `edit`, the test's own change to the kubeconfig `files` (UP-06), and takes those files
+    /// as they are after it as the ones the app must leave untouched (UP-90). Every other file
+    /// keeps its baseline, and a named file that had already changed is still reported.
+    pub fn edit_kubeconfig<T>(
+        &self,
+        files: impl IntoIterator<Item: AsRef<Path>>,
+        edit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let files: Vec<PathBuf> = files.into_iter().map(|f| f.as_ref().to_owned()).collect();
+        self.teardown().kubeconfig_editing(&files);
         let result = edit();
-        self.teardown().kubeconfig_edited();
+        self.teardown().kubeconfig_edited(&files);
         result
     }
 

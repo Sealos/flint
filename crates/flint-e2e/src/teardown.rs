@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-use crate::fake_api::{RequestRecord, arrivals_at, connection_mark_at};
+use crate::fake_api::{ArrivalLog, RequestRecord, arrival_log_at, connection_mark_at};
 
 /// How many of a server's unexpected requests a violation lists.
 const LISTED: usize = 5;
@@ -27,13 +27,36 @@ const LISTED: usize = 5;
 /// One fake server the app could reach.
 #[derive(Debug)]
 struct Server {
+    /// Its request logs, which outlive it: more than one when another server took over the URL.
+    logs: Vec<Log>,
+    selected: bool,
+}
+
+/// One server's request log, and where the app's requests start in it.
+#[derive(Debug)]
+struct Log {
+    log: ArrivalLog,
     /// The server's connection mark when the app launched (or when the kubeconfig first named
     /// it): only requests on later connections are the app's. A client that came before (the
     /// app this one relaunches, the test itself) may still have requests on its way on its own
     /// connections. Requests count on arrival, so one a fault delays counts from when it was
     /// sent.
     since: u64,
-    selected: bool,
+}
+
+impl Server {
+    fn requests(&self) -> Vec<RequestRecord> {
+        self.logs
+            .iter()
+            .flat_map(|l| {
+                let since = l.since;
+                l.log
+                    .records()
+                    .into_iter()
+                    .filter(move |r| r.connection > since)
+            })
+            .collect()
+    }
 }
 
 /// The kubeconfig files the app reads now (its settings can add some during a test).
@@ -49,6 +72,12 @@ pub struct Teardown {
     contexts: BTreeMap<String, BTreeSet<String>>,
     /// Fake servers by URL.
     servers: BTreeMap<String, Server>,
+    /// The contexts the test has selected.
+    selected: BTreeSet<String>,
+    /// What had reached each unselected server when the test's kubeconfig edit began: a context
+    /// the edit moves onto one is checked against this, since the app may react to the edit
+    /// before the harness reads it.
+    before_edit: BTreeMap<String, Vec<RequestRecord>>,
     violations: Vec<String>,
 }
 
@@ -61,6 +90,8 @@ impl Teardown {
             kubeconfigs: Vec::new(),
             contexts: BTreeMap::new(),
             servers: BTreeMap::new(),
+            selected: BTreeSet::new(),
+            before_edit: BTreeMap::new(),
             violations: Vec::new(),
         };
         teardown.snapshot_kubeconfigs();
@@ -68,11 +99,36 @@ impl Teardown {
         teardown
     }
 
-    /// The test changed the kubeconfig files on purpose (UP-06): their new bytes are the ones
-    /// checked at the end.
-    pub fn kubeconfig_edited(&mut self) {
-        self.snapshot_kubeconfigs();
+    /// The test is about to change the kubeconfig `files` on purpose (UP-06): a named file that
+    /// already differs from its baseline was changed by something else.
+    pub fn kubeconfig_editing(&mut self, files: &[PathBuf]) {
+        for (path, before) in &self.kubeconfigs {
+            if files.contains(path)
+                && let Some(violation) = changed(path, before)
+            {
+                self.violations.push(violation);
+            }
+        }
+        self.before_edit = self
+            .servers
+            .iter()
+            .filter(|(_, server)| !server.selected)
+            .map(|(url, server)| (url.clone(), server.requests()))
+            .collect();
+    }
+
+    /// The test has changed the kubeconfig `files`: their new bytes are the ones checked at the
+    /// end. Other files keep their baseline.
+    pub fn kubeconfig_edited(&mut self, files: &[PathBuf]) {
+        for path in files {
+            let bytes = std::fs::read(path).ok();
+            match self.kubeconfigs.iter_mut().find(|(p, _)| p == path) {
+                Some((_, baseline)) => *baseline = bytes,
+                None => self.kubeconfigs.push((path.clone(), bytes)),
+            }
+        }
         self.refresh_contexts();
+        self.before_edit.clear();
     }
 
     /// The app is about to read `files` (settings the test is about to write list them): their
@@ -88,27 +144,43 @@ impl Teardown {
         self.refresh_contexts();
     }
 
-    /// The test selects `context` now: checks that the app has not contacted its servers yet,
-    /// and allows requests to them from here on.
+    /// The test selects `context` now, as the current kubeconfig search order resolves it:
+    /// checks that the app has not contacted its server yet, and allows requests to it from here
+    /// on.
     pub fn selecting(&mut self, context: &str) {
         self.refresh_contexts();
-        let urls = self.contexts.get(context).cloned().unwrap_or_default();
-        for url in urls {
-            let Some(server) = self.servers.get_mut(&url) else {
-                continue;
-            };
-            if server.selected {
-                continue;
-            }
-            server.selected = true;
-            let requests = since(&url, server.since);
-            if !requests.is_empty() {
-                self.violations.push(unexpected(
-                    &format!("before the test selected {context:?}"),
-                    &url,
-                    &requests,
-                ));
-            }
+        self.selected.insert(context.to_owned());
+        let current = flint_core::kubeconfig::load(&(self.files)());
+        if let Some(url) = current
+            .context(context)
+            .and_then(|c| c.server.as_deref())
+            .map(server_key)
+        {
+            self.checkpoint(context, &url);
+        }
+    }
+
+    /// `context` now names the server at `url`: the first time that makes the server selected,
+    /// anything that had already reached it is a violation.
+    fn checkpoint(&mut self, context: &str, url: &str) {
+        let Some(server) = self.servers.get_mut(url) else {
+            return;
+        };
+        if server.selected {
+            return;
+        }
+        server.selected = true;
+        let requests = self
+            .before_edit
+            .get(url)
+            .cloned()
+            .unwrap_or_else(|| server.requests());
+        if !requests.is_empty() {
+            self.violations.push(unexpected(
+                &format!("before the test selected {context:?}"),
+                url,
+                &requests,
+            ));
         }
     }
 
@@ -121,7 +193,7 @@ impl Teardown {
             if server.selected {
                 continue;
             }
-            let requests = since(url, server.since);
+            let requests = server.requests();
             if !requests.is_empty() {
                 violations.push(unexpected(
                     &format!(
@@ -134,19 +206,7 @@ impl Teardown {
             }
         }
         for (path, before) in &self.kubeconfigs {
-            let after = std::fs::read(path).ok();
-            if after != *before {
-                let change = match (before, &after) {
-                    (None, Some(_)) => "was created",
-                    (Some(_), None) => "was removed",
-                    _ => "changed",
-                };
-                violations.push(format!(
-                    "UP-90: the kubeconfig {} {change} during the test, and not through \
-                     App::edit_kubeconfig",
-                    path.display()
-                ));
-            }
+            violations.extend(changed(path, before));
         }
         match exit {
             Ok(status) if status.success() => {}
@@ -180,31 +240,50 @@ impl Teardown {
     }
 
     /// Reads the contexts the kubeconfig files name now, and starts counting for fake servers
-    /// seen for the first time. A server that a context the test already selected now names
-    /// counts as selected.
+    /// seen for the first time. Files are also read one by one, so a server only a shadowed or
+    /// no longer listed file names is still counted. A context the test selected that now
+    /// resolves to another server makes that server selected.
     fn refresh_contexts(&mut self) {
         self.add_new_files();
-        let paths: Vec<PathBuf> = self.kubeconfigs.iter().map(|(p, _)| p.clone()).collect();
-        let loaded = flint_core::kubeconfig::load(&paths);
-        for context in loaded.contexts {
-            let Some(url) = context.server else { continue };
-            let url = url.trim_end_matches('/').to_owned();
-            if !self.servers.contains_key(&url)
-                && let Some(mark) = connection_mark_at(&url)
-            {
-                let selected = self.contexts.get(&context.name).is_some_and(|urls| {
-                    urls.iter()
-                        .any(|u| self.servers.get(u).is_some_and(|s| s.selected))
-                });
-                self.servers.insert(
-                    url.clone(),
-                    Server {
-                        since: mark,
-                        selected,
-                    },
-                );
+        let current = named_servers(&(self.files)());
+        let mut named = current.clone();
+        for (path, _) in &self.kubeconfigs {
+            named.extend(named_servers(std::slice::from_ref(path)));
+        }
+        for (name, url) in named {
+            self.track(&url);
+            self.contexts.entry(name).or_default().insert(url);
+        }
+        for (name, url) in current {
+            if self.selected.contains(&name) {
+                self.checkpoint(&name, &url);
             }
-            self.contexts.entry(context.name).or_default().insert(url);
+        }
+    }
+
+    /// Starts counting for the fake server at `url`, if one runs there and it is a new one.
+    fn track(&mut self, url: &str) {
+        let Some(log) = arrival_log_at(url) else {
+            return;
+        };
+        match self.servers.get_mut(url) {
+            // Another server took over the URL: everything it received is after the launch.
+            Some(server) => {
+                if !server.logs.iter().any(|l| l.log.is_same(&log)) {
+                    server.logs.push(Log { log, since: 0 });
+                }
+            }
+            None => {
+                if let Some(since) = connection_mark_at(url) {
+                    self.servers.insert(
+                        url.to_owned(),
+                        Server {
+                            logs: vec![Log { log, since }],
+                            selected: false,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -217,13 +296,44 @@ impl Teardown {
     }
 }
 
-/// The requests that have arrived at the fake server at `url` on connections after `mark`.
-fn since(url: &str, mark: u64) -> Vec<RequestRecord> {
-    arrivals_at(url)
-        .unwrap_or_default()
+/// The contexts `paths` define, merged in order, with the servers they resolve to.
+fn named_servers(paths: &[PathBuf]) -> Vec<(String, String)> {
+    flint_core::kubeconfig::load(paths)
+        .contexts
         .into_iter()
-        .filter(|r| r.connection > mark)
+        .filter_map(|c| Some((c.name, server_key(c.server.as_deref()?))))
         .collect()
+}
+
+/// The URL fake servers are registered under: fake servers listen on 127.0.0.1, which a
+/// kubeconfig can also spell `localhost`.
+fn server_key(url: &str) -> String {
+    const LOCALHOST: &str = "https://localhost:";
+    let url = url.trim_end_matches('/');
+    match url.get(..LOCALHOST.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(LOCALHOST) => {
+            format!("https://127.0.0.1:{}", &url[LOCALHOST.len()..])
+        }
+        _ => url.to_owned(),
+    }
+}
+
+/// A UP-90 violation if the file at `path` no longer has the bytes `before`.
+fn changed(path: &Path, before: &Option<Vec<u8>>) -> Option<String> {
+    let after = std::fs::read(path).ok();
+    if after == *before {
+        return None;
+    }
+    let change = match (before, &after) {
+        (None, Some(_)) => "was created",
+        (Some(_), None) => "was removed",
+        _ => "changed",
+    };
+    Some(format!(
+        "UP-90: the kubeconfig {} {change} during the test, and not through \
+         App::edit_kubeconfig",
+        path.display()
+    ))
 }
 
 /// A UP-91 violation: `requests` reached `url` `when`.
@@ -375,8 +485,9 @@ mod tests {
         let mut teardown = files(vec![two.kubeconfig(), missing.clone()]);
         let socket = two.dir.path().join("no-socket");
 
+        teardown.kubeconfig_editing(&[two.kubeconfig()]);
         std::fs::write(two.kubeconfig(), "edited by the test").unwrap();
-        teardown.kubeconfig_edited();
+        teardown.kubeconfig_edited(&[two.kubeconfig()]);
         assert_eq!(teardown.finish(ok(), &socket), Vec::<String>::new());
 
         std::fs::write(two.kubeconfig(), "rewritten by the app").unwrap();
@@ -414,8 +525,9 @@ mod tests {
         let mut teardown = two.teardown();
         // Before b was in the kubeconfig: the app could not have sent this.
         two.contact(&two.b);
+        teardown.kubeconfig_editing(std::slice::from_ref(&path));
         write_kubeconfigs(&path, &[(&two.a, "a", None), (&two.b, "b", None)]).unwrap();
-        teardown.kubeconfig_edited();
+        teardown.kubeconfig_edited(std::slice::from_ref(&path));
         teardown.selecting("b");
         two.contact(&two.b);
         let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
@@ -429,8 +541,9 @@ mod tests {
         write_kubeconfigs(&path, &[(&two.a, "x", None)]).unwrap();
         let mut teardown = two.teardown();
         teardown.selecting("x");
+        teardown.kubeconfig_editing(std::slice::from_ref(&path));
         write_kubeconfigs(&path, &[(&two.b, "x", None)]).unwrap();
-        teardown.kubeconfig_edited();
+        teardown.kubeconfig_edited(std::slice::from_ref(&path));
         two.contact(&two.b);
         let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
         assert_eq!(violations, Vec::<String>::new());
