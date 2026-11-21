@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 
 use crate::cluster::{ClusterId, ServerVersion};
+use crate::credential::WriteCredential;
 use crate::discovery::ClusterDiscovery;
 use crate::exec::{ContextCheck, ContextWatch, ExecRequest, ExecSession, LaunchCheck};
 use crate::kubeconfig::ContextInfo;
@@ -208,6 +209,13 @@ pub(crate) enum Request {
         server: Option<Option<String>>,
         reply: oneshot::Sender<Result<(GatedClient, ContextPin), WriteRefusal>>,
     },
+    /// [`Self::WriteClient`] for one request of a reviewed write: also the credential of the same
+    /// connection as the client.
+    BoundWriteClient {
+        cluster: ClusterId,
+        server: Option<Option<String>>,
+        reply: oneshot::Sender<Result<BoundWriteClient, WriteRefusal>>,
+    },
     /// What the write gate says now about `cluster` as pinned at `pin`, for a session about to
     /// run a command.
     CheckWriteGate {
@@ -229,6 +237,10 @@ pub(crate) enum Request {
         reply: oneshot::Sender<Option<String>>,
     },
 }
+
+/// The client for one request of a reviewed write, its context's pin, and its connection's
+/// credential, all read in one step.
+pub(crate) type BoundWriteClient = (GatedClient, ContextPin, WriteCredential);
 
 /// Connection state of one cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -689,6 +701,27 @@ impl CoreHandle {
     {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::WriteClient {
+            cluster: cluster.to_owned(),
+            server,
+            reply,
+        });
+        async move {
+            if sent.is_err() {
+                return Err(WriteRefusal::Stopped);
+            }
+            rx.await.unwrap_or(Err(WriteRefusal::Stopped))
+        }
+    }
+
+    /// [`Self::write_client`] for one request of a reviewed write, with the credential of the
+    /// connection that client belongs to, read in the same step.
+    pub(crate) fn bound_write_client(
+        &self,
+        cluster: &str,
+        server: Option<Option<String>>,
+    ) -> impl Future<Output = Result<BoundWriteClient, WriteRefusal>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.requests.try_send(Request::BoundWriteClient {
             cluster: cluster.to_owned(),
             server,
             reply,
