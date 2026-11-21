@@ -513,6 +513,74 @@ async fn a_remembered_sort_on_a_masked_column_is_suspended(cx: &mut TestAppConte
     assert_eq!(names, ["a", "b", "c"]);
 }
 
+// covers UP-20: a column is not safe because of its header alone.
+#[gpui_kit::test]
+async fn a_repeated_safe_header_is_masked_in_a_secret_list(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_kind(cx, core, "secrets", "Secrets", 1600.);
+    let columns: Arc<[Column]> = vec![
+        column("Name", ColumnRole::Name, ColumnType::String, 0),
+        column("Namespace", ColumnRole::Namespace, ColumnType::String, 0),
+        column("Type", ColumnRole::Value, ColumnType::String, 0),
+        column("Data", ColumnRole::Value, ColumnType::Integer, 0),
+        column("Age", ColumnRole::Age, ColumnType::Date, 0),
+        column("Name", ColumnRole::Value, ColumnType::String, 0),
+        column("Namespace", ColumnRole::Value, ColumnType::String, 0),
+        column("Type", ColumnRole::Value, ColumnType::String, 0),
+        column("Data", ColumnRole::Value, ColumnType::String, 0),
+    ]
+    .into();
+    let row = Arc::new(Row {
+        uid: "uid-creds".into(),
+        name: "creds".into(),
+        namespace: Some("demo".into()),
+        resource_version: "1".into(),
+        generation: None,
+        created: Some(0),
+        labels: Box::new([]),
+        cells: Box::new([
+            Cell::Name,
+            Cell::Namespace,
+            Cell::Text("Opaque".into()),
+            Cell::Int(1),
+            Cell::Age,
+            Cell::Text("raw-name".into()),
+            Cell::Text("raw-namespace".into()),
+            Cell::Text("raw-type".into()),
+            Cell::Text("raw-data".into()),
+        ]),
+    });
+    let snapshot = Arc::new(KindSnapshot {
+        cluster: "test".into(),
+        kind: KindId::new("", "secrets"),
+        namespaced: true,
+        columns,
+        rows: vec![row],
+        state: SyncState::Synced,
+        version: 1,
+        ..Default::default()
+    });
+    list.update(cx, |list, cx| list.set_snapshot(snapshot, cx));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-creds").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    let texts = painted_texts(cx, window);
+    assert!(!texts.iter().any(|t| t.starts_with("raw-")), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "creds"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "demo"), "{texts:?}");
+    // All nine columns are drawn: both copies of Type and Data, and the extra Name and
+    // Namespace, each with the mask.
+    let drawn = list.read_with(cx, |list, _| list.drawn.len());
+    assert_eq!(drawn, 9);
+    let masks = texts
+        .iter()
+        .filter(|t| *t == crate::ui::object::MASK)
+        .count();
+    assert_eq!(masks, 6, "{texts:?}");
+}
+
 // covers UP-23: a cell that is cut offers its full text in a tooltip; one that fits has none.
 #[gpui_kit::test]
 async fn a_cut_cell_has_a_tooltip_and_a_fitting_cell_has_none(cx: &mut TestAppContext) {

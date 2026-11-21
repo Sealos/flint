@@ -66,8 +66,8 @@ impl ResourceList {
         let mut drawn = self
             .drawn
             .iter()
-            .map(|&(col, _)| &columns[col])
-            .filter(|c| !self.is_masked(c));
+            .filter(|&&(col, _)| !self.is_masked(columns, col))
+            .map(|&(col, _)| &columns[col]);
         let found = match &action.key {
             Some(key) => drawn.find(|c| c.key() == *key),
             None => drawn.find(|c| *c.name == *action.column),
@@ -79,9 +79,8 @@ impl ResourceList {
     pub(in crate::ui) fn drawn_column_names(&self) -> Vec<String> {
         self.drawn
             .iter()
-            .map(|&(col, _)| &self.shown.columns[col])
-            .filter(|c| !self.is_masked(c))
-            .map(|c| c.name.to_string())
+            .filter(|&&(col, _)| !self.is_masked(&self.shown.columns, col))
+            .map(|&(col, _)| self.shown.columns[col].name.to_string())
             .collect()
     }
 

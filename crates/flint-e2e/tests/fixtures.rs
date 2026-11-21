@@ -42,14 +42,24 @@ fn secrets_show_keys_but_no_values() {
         assert!(annotations_ok(&item["metadata"]));
     }
     let table = &fixtures.tables[&secrets];
-    let columns = table["columnDefinitions"].as_array().unwrap();
+    let definitions: Vec<(&str, &str)> = table["columnDefinitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["name"].as_str().unwrap(),
+                c["format"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let safe = redact::safe_secret_wire_columns(&definitions);
     for row in table["rows"].as_array().unwrap() {
         assert!(annotations_ok(&row["object"]["metadata"]));
-        for (cell, column) in row["cells"].as_array().unwrap().iter().zip(columns) {
-            let name = column["name"].as_str().unwrap();
+        for (i, cell) in row["cells"].as_array().unwrap().iter().enumerate() {
             assert!(
-                redact::is_safe_secret_column(name) || cell == "<redacted>",
-                "{name}: {cell}"
+                safe.get(i).copied().unwrap_or(false) || cell == "<redacted>",
+                "column {i}: {cell}"
             );
         }
     }
