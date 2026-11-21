@@ -120,6 +120,12 @@ pub enum Command {
         cluster: Option<ClusterId>,
         mode: Option<WatchMode>,
     },
+    /// Set the custom name shown for `cluster` (`None` removes it) and write it to
+    /// `settings.toml`. Display only. The change arrives back as `Event::SettingsChanged`.
+    SetClusterName {
+        cluster: ClusterId,
+        name: Option<String>,
+    },
     /// Set the appearance (light, dark, or following macOS) and write it to `settings.toml`. The
     /// change arrives back as `Event::SettingsChanged`.
     SetAppearance(Appearance),

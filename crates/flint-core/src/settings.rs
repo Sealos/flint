@@ -289,6 +289,10 @@ pub struct Settings {
     pub watch_mode: WatchMode,
     /// Per-cluster watch mode overrides, keyed by context name.
     pub cluster_watch_mode: BTreeMap<String, WatchMode>,
+    /// Custom names shown for clusters, keyed by context name. Display only: kubeconfig is never
+    /// written, and MCP, `FLINT_CLUSTER`, exposure and trust keep the context name. Read them
+    /// through [`crate::display::ClusterNames`].
+    pub cluster_names: BTreeMap<String, String>,
     /// Lines each log session keeps; older lines are dropped. Applies to sessions opened after
     /// a change. Read it through [`Settings::log_buffer_limit`].
     pub log_buffer_lines: u32,
@@ -314,6 +318,7 @@ impl Default for Settings {
             helm: None,
             watch_mode: WatchMode::default(),
             cluster_watch_mode: BTreeMap::new(),
+            cluster_names: BTreeMap::new(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
@@ -592,6 +597,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "helm",
     "watch_mode",
     "cluster_watch_mode",
+    "cluster_names",
     "log_buffer_lines",
     "log_buffer_mib",
     "log_total_mib",
@@ -823,6 +829,48 @@ pub fn set_watch_mode(
                     }
                 }
             }
+        }
+        Ok(())
+    })
+}
+
+/// Sets the custom name of `context` (`None` removes it), and writes `settings.toml`. Returns
+/// the settings as written. A name [`crate::display::clean_custom_name`] refuses is an error.
+pub fn set_cluster_name(
+    dir: &Path,
+    context: &str,
+    name: Option<&str>,
+) -> Result<Settings, SettingsError> {
+    edit_settings(dir, |table, path| {
+        let cleaned = match name {
+            Some(name) => Some(crate::display::clean_custom_name(name).ok_or_else(|| {
+                SettingsError::Invalid {
+                    path: path.to_owned(),
+                    reason: format!(
+                        "a cluster name has 1 to {} characters, none of them hidden",
+                        crate::display::MAX_CUSTOM_NAME_CHARS
+                    ),
+                }
+            })?),
+            None => None,
+        };
+        let names = table
+            .entry("cluster_names")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !names.is_table() {
+            *names = toml::Value::Table(toml::Table::new());
+        }
+        let entries = names.as_table_mut().expect("a table");
+        match cleaned {
+            Some(name) => {
+                entries.insert(context.to_owned(), toml::Value::String(name));
+            }
+            None => {
+                entries.remove(context);
+            }
+        }
+        if entries.is_empty() {
+            table.remove("cluster_names");
         }
         Ok(())
     })
@@ -1563,6 +1611,28 @@ mod tests {
     }
 
     // covers UP-55
+    // covers UP-01, UP-90: a custom name lives in settings.toml, keyed by context.
+    #[test]
+    fn cluster_names_round_trip_and_keep_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "watch_mode = \"on_view\"\n").unwrap();
+        let context = "arn:aws:eks:eu-west-1:123456789012:cluster/example";
+        let s = set_cluster_name(dir.path(), context, Some("  main ")).unwrap();
+        assert_eq!(s.cluster_names[context], "main");
+        assert_eq!(s.watch_mode, WatchMode::OnView);
+        assert_eq!(load_settings(dir.path()).unwrap(), s);
+        assert!(set_cluster_name(dir.path(), context, Some("a\u{202e}b")).is_err());
+        assert_eq!(
+            load_settings(dir.path()).unwrap(),
+            s,
+            "a refused name changes nothing"
+        );
+        let s = set_cluster_name(dir.path(), context, None).unwrap();
+        assert!(s.cluster_names.is_empty());
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!text.contains("cluster_names"), "{text}");
+    }
+
     #[test]
     fn set_trusted_round_trips_and_keeps_other_keys() {
         let dir = tempfile::tempdir().unwrap();
