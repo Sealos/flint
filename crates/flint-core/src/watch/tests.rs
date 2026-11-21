@@ -247,6 +247,21 @@ fn start_engine_with(
     tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
     Arc<Hub>,
 ) {
+    start_engine_configured(fake, kind, feed, scope, config())
+}
+
+/// [`start_engine_with`] with other timings.
+fn start_engine_configured(
+    fake: &Arc<Fake>,
+    kind: KindInfo,
+    feed: Feed,
+    scope: Option<engine::Scope>,
+    config: Arc<EngineConfig>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Arc<KindSnapshot>>,
+    Arc<Hub>,
+) {
     let hub = Arc::new(Hub::new("c".into(), kind.id()));
     let rx = hub.subscribe();
     let epoch = hub.take_over(KindSnapshot::default());
@@ -256,7 +271,7 @@ fn start_engine_with(
         fake.clone(),
         hub.clone(),
         epoch,
-        config(),
+        config,
         Arc::new(tokio::sync::Semaphore::new(4)),
     )
     .with_scope(scope);
@@ -679,6 +694,103 @@ async fn a_held_synced_state_does_not_clear_the_outage_error() {
         states_until_synced_again(&hub, &["new"]).await,
         ["synced", "relisting", "error", "synced"]
     );
+    task.abort();
+}
+
+/// Waits (in paused time) until `key` has been listed `calls` times.
+async fn until_listed(fake: &Fake, key: &str, calls: usize) {
+    for _ in 0..20_000 {
+        if fake.list_calls(key) >= calls {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{key} was not listed {calls} times");
+}
+
+// covers UP-27
+#[tokio::test(start_paused = true)]
+async fn a_relist_backoff_does_not_publish_a_held_synced_state() {
+    let fake = Fake::new();
+    fake.list("pods", pod("u1", "old", "Running", "10", true));
+    fake.list("pods", pod("u2", "new", "Running", "50", true));
+    fake.list("pods", pod("u3", "newer", "Running", "60", true));
+    fake.script("pods", WatchScript::Live);
+    // The list after the outage works, but its watch expires before the snapshot is due.
+    fake.script(
+        "pods",
+        WatchScript::Fail(FetchError::Expired("too old".into())),
+    );
+    // Every backoff is longer than the publish interval, so the snapshot falls due during it.
+    let timing = Arc::new(EngineConfig {
+        backoff_min: Duration::from_millis(200),
+        backoff_max: Duration::from_millis(200),
+        ..EngineConfig::default()
+    });
+    let (task, mut rx, hub) = start_engine_configured(&fake, pods(), Feed::Watch, None, timing);
+    until(&mut rx, |s| s.state == SyncState::Synced).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fake.list_error("pods", FetchError::Other("connection refused".into()));
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(50);
+    fake.sender("pods").unwrap().send(expired_event()).unwrap();
+    until_listed(&fake, "pods", 3).await;
+    assert_eq!(shape(&hub.state()), "error");
+    // A snapshot now makes the one for the list in flight wait out the publish interval.
+    let _peek = hub.peek();
+    assert_eq!(
+        states_until_synced_again(&hub, &["newer"]).await,
+        ["error", "synced"]
+    );
+    task.abort();
+}
+
+// covers UP-21, UP-27
+#[tokio::test(start_paused = true)]
+async fn a_lane_recovering_from_a_refusal_keeps_its_rows_through_a_410() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", forbidden());
+    }
+    for _ in 0..4 {
+        fake.list_error("pods/a", forbidden());
+    }
+    fake.list(
+        "pods/a",
+        pod_table(&[("u1", "a", "fresh", "Running")], true, "10"),
+    );
+    fake.list(
+        "pods/a",
+        pod_table(&[("u2", "a", "newer", "Running")], true, "20"),
+    );
+    fake.script(
+        "pods/a",
+        WatchScript::Fail(FetchError::Expired("too old".into())),
+    );
+    let (_scope_tx, scope) =
+        tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(vec!["a".to_owned()]));
+    let (task, mut rx, hub) = start_engine_with(&fake, pods(), Feed::Watch, Some(scope));
+    until(&mut rx, |s| {
+        matches!(s.state, SyncState::Failed { .. })
+            && s.limited_to.as_ref().is_some_and(|l| l.denied == ["a"])
+    })
+    .await;
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(50);
+    until_listed(&fake, "pods/a", 5).await;
+    // The relist after the 410 takes long enough to be seen.
+    fake.state.lock().unwrap().list_delay = Duration::from_millis(300);
+    // A snapshot now makes the lane's recovery snapshot wait out the publish interval.
+    let _peek = hub.peek();
+    let snap = until(&mut rx, |s| {
+        s.state == (SyncState::Reconnecting { error: None }) && names(s) == ["fresh"]
+    })
+    .await;
+    let limit = snap.limited_to.as_ref().unwrap();
+    assert_eq!(limit.listed, ["a"]);
+    assert!(limit.denied.is_empty(), "{:?}", limit.denied);
+    until(&mut rx, |s| {
+        s.state == SyncState::Synced && names(s) == ["newer"]
+    })
+    .await;
     task.abort();
 }
 

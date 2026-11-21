@@ -322,19 +322,23 @@ impl Engine {
 
     /// Reports a relist of rows that were synced. Only that is errorless: a relist during an
     /// outage keeps the error on show. A synced state still held for its snapshot was never
-    /// reported, so the trouble the hub last heard of still stands.
+    /// reported, so the trouble the hub last heard of still stands. The exception is a lane's
+    /// refusal: its list has just worked, and a merged list leaves out the rows of a failed
+    /// lane, so the lane reports a relist and its rows stay on show as not current.
     fn begin_relist(&mut self) {
         if !self.synced_once || self.state != SyncState::Synced {
             return;
         }
         if self.synced_held {
             let reported = self.hub.state();
-            if matches!(
-                reported,
-                SyncState::Reconnecting { error: Some(_) }
-                    | SyncState::RetryingRefusal { .. }
-                    | SyncState::Failed { .. }
-            ) {
+            let still_stands = match reported {
+                SyncState::Reconnecting { error: Some(_) } | SyncState::RetryingRefusal { .. } => {
+                    true
+                }
+                SyncState::Failed { .. } => self.namespace.is_none(),
+                _ => false,
+            };
+            if still_stands {
                 self.state = reported;
                 self.synced_held = false;
                 return;
@@ -512,11 +516,13 @@ impl Engine {
         // Set while trying a watch that was refused before: one refusal goes back to polling.
         let mut retrying_watch = false;
         'sync: loop {
+            // Before the backoff: a synced state held for its snapshot must not be published
+            // during it, since the watch that followed that list has already failed.
+            self.begin_relist();
             if expiries > 1 {
                 let delay = relist_backoff.next();
                 self.pause(delay).await;
             }
-            self.begin_relist();
             let (mut rv, mut stream) = match self.initial_sync().await {
                 Ok(synced) => synced,
                 Err(FetchError::Expired(_)) => {
