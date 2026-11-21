@@ -25,6 +25,12 @@ const ROW_PADDING: Rems = rems(2.);
 /// moves it 1 rem further left when it opens on that side, past the edge by this much at most:
 /// its border and padding can go there, and the text must not.
 const SUBMENU_OVERHANG: Rems = rems(0.75);
+/// What a `Shell in <pod>` entry holds beside its text: its key and the row's gaps.
+const SHELL_ENTRY_REST: Rems = rems(4.);
+/// A generous width for one character of an entry's text.
+const WIDE_CHAR: Rems = rems(0.6);
+/// The least of a pod's name an entry shows.
+const MIN_POD_CHARS: usize = 8;
 
 /// The widest a menu of at most `widest` can be in this window.
 fn fitted(widest: Pixels, window: &Window) -> Pixels {
@@ -43,19 +49,55 @@ fn tallest(window: &Window) -> Pixels {
     window.viewport_size().height - WINDOW_MARGIN
 }
 
-/// A menu that stays inside the window, and scrolls when it is taller than it.
-pub(in crate::ui) fn fit_menu(menu: PopupMenu, window: &Window) -> PopupMenu {
-    menu.max_w(menu_width(window))
+/// gpui-component's minimum menu width, which would otherwise win in a very narrow window.
+const MENU_MIN_WIDTH: Rems = rems(8.);
+
+/// A menu at most `width` wide: never wider than that, even by its minimum width.
+fn capped(menu: PopupMenu, width: Pixels, window: &Window) -> PopupMenu {
+    menu.min_w(MENU_MIN_WIDTH.to_pixels(window.rem_size()).min(width))
+        .max_w(width)
         .max_h(tallest(window))
         .scrollable(true)
 }
 
+/// A menu that stays inside the window, and scrolls when it is taller than it.
+pub(in crate::ui) fn fit_menu(menu: PopupMenu, window: &Window) -> PopupMenu {
+    capped(menu, menu_width(window), window)
+}
+
+/// Dismisses the menu if the window gets smaller while it is open: its size limits were worked
+/// out for the window it opened in.
+pub(in crate::ui) fn dismiss_when_shrunk(window: &mut Window, cx: &mut Context<PopupMenu>) {
+    let opened = window.viewport_size();
+    cx.observe_window_bounds(window, move |_, window, cx| {
+        let now = window.viewport_size();
+        if now.width < opened.width || now.height < opened.height {
+            cx.emit(DismissEvent);
+        }
+    })
+    .detach();
+}
+
+/// How many characters of a pod's name fit in a `Shell in <pod>` entry with its key.
+pub(in crate::ui) fn pod_name_chars(most: usize, window: &Window) -> usize {
+    let rem = window.rem_size();
+    let beside = SHELL_ENTRY_REST.to_pixels(rem);
+    let room = (note_width(window) - beside).max(px(0.));
+    let fits = (room / WIDE_CHAR.to_pixels(rem)) as usize;
+    fits.saturating_sub("Shell in ".len())
+        .clamp(MIN_POD_CHARS, most)
+}
+
 /// A container picker: wide enough for full names when there is room (names that differ only in
 /// the middle must stay apart), and inside the window when there is not, where its rows wrap.
-pub(in crate::ui) fn fit_picker(menu: PopupMenu, window: &Window) -> PopupMenu {
-    menu.max_w(fitted(PICKER_WIDTH, window))
-        .max_h(tallest(window))
-        .scrollable(true)
+pub(in crate::ui) fn fit_picker(
+    menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    dismiss_when_shrunk(window, cx);
+    let width = fitted(PICKER_WIDTH, window);
+    capped(menu, width, window)
 }
 
 /// How wide a note in a [`fit_menu`] menu is before it wraps.

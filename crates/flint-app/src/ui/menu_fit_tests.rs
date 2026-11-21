@@ -1,12 +1,17 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, IntoElement, MouseMoveEvent,
-    ParentElement as _, PlatformInput, Point, Render, ScrollDelta, ScrollEvent, Styled as _,
-    TestAppContext, Window, WindowBounds, WindowOptions, div, point, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Context, DismissEvent, Entity, IntoElement,
+    MouseMoveEvent, ParentElement as _, PlatformInput, Point, Render, ScrollDelta, ScrollEvent,
+    Styled as _, TestAppContext, Window, WindowBounds, WindowOptions, div, point, px, size,
 };
 
-use super::{MENU_NOTE, MENU_WIDTH, fit_menu, fit_picker, note_width, picker_item};
+use super::{
+    MENU_NOTE, MENU_WIDTH, dismiss_when_shrunk, fit_menu, fit_picker, note_width, picker_item,
+};
 
 /// A window of `width` by `height` showing `menu`.
 struct Host(Entity<PopupMenu>);
@@ -21,7 +26,7 @@ fn open(
     cx: &mut TestAppContext,
     width: f32,
     height: f32,
-    build: impl Fn(PopupMenu, &Window) -> PopupMenu + 'static,
+    build: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
 ) -> AnyWindowHandle {
     cx.update(gpui_kit::init);
     let window = cx
@@ -36,7 +41,8 @@ fn open(
                 },
                 cx,
                 |window, cx| {
-                    let menu = PopupMenu::build(window, cx, |menu, window, _| build(menu, window));
+                    let menu =
+                        PopupMenu::build(window, cx, |menu, window, cx| build(menu, window, cx));
                     cx.new(|_| Host(menu))
                 },
             )
@@ -54,8 +60,8 @@ const LONG_NAME: &str = "mesh-production-app-http-instrumentation-proxy-with-a-l
 // covers UP-47: in a narrow window a picker's long name wraps, inside the window.
 #[gpui_kit::test]
 async fn a_picker_stays_inside_a_narrow_window(cx: &mut TestAppContext) {
-    let window = open(cx, 240., 500., |menu, window| {
-        fit_picker(menu, window).item(picker_item(LONG_NAME.to_owned(), None))
+    let window = open(cx, 240., 500., |menu, window, cx| {
+        fit_picker(menu, window, cx).item(picker_item(LONG_NAME.to_owned(), None))
     });
     cx.update_window(window, |_, window, _| {
         let menu = window.find("popup-menu").bounds();
@@ -71,7 +77,7 @@ async fn a_picker_stays_inside_a_narrow_window(cx: &mut TestAppContext) {
 // covers UP-47: a menu taller than a short window is capped to it, and scrolls.
 #[gpui_kit::test]
 async fn a_tall_menu_stays_inside_a_short_window(cx: &mut TestAppContext) {
-    let window = open(cx, 800., 200., |menu, window| {
+    let window = open(cx, 800., 200., |menu, window, _| {
         (0..40).fold(fit_menu(menu, window), |menu, n| {
             menu.item(PopupMenuItem::new(format!("entry {n}")))
         })
@@ -123,7 +129,7 @@ async fn a_tall_menu_stays_inside_a_short_window(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_notes_width_follows_the_window(cx: &mut TestAppContext) {
     let width_in = |cx: &mut TestAppContext, width: f32| {
-        let window = open(cx, width, 500., fit_menu);
+        let window = open(cx, width, 500., |menu, window, _| fit_menu(menu, window));
         cx.update_window(window, |_, window, _| {
             (note_width(window), MENU_WIDTH.to_pixels(window.rem_size()))
         })
@@ -134,4 +140,36 @@ async fn a_notes_width_follows_the_window(cx: &mut TestAppContext) {
     let (wide, default) = width_in(cx, 1200.);
     assert!(wide > narrow, "{wide:?}");
     assert!(wide < default, "{wide:?} inside {default:?}");
+}
+
+// covers UP-47: even narrower than a menu's minimum width, it stays inside the window.
+#[gpui_kit::test]
+async fn a_menu_is_never_wider_than_a_very_narrow_window(cx: &mut TestAppContext) {
+    let window = open(cx, 100., 300., |menu, window, _| {
+        fit_menu(menu, window).item(PopupMenuItem::new("x"))
+    });
+    cx.update_window(window, |_, window, _| {
+        let menu = window.find("popup-menu").bounds();
+        assert!(menu.size.width <= window.viewport_size().width, "{menu:?}");
+    })
+    .unwrap();
+}
+
+// covers UP-47: an open menu goes when the window shrinks under the limits it was built for, and
+// stays when the window grows.
+#[gpui_kit::test]
+async fn a_menu_is_dismissed_when_the_window_shrinks(cx: &mut TestAppContext) {
+    let dismissed = Rc::new(Cell::new(0));
+    let seen = dismissed.clone();
+    let window = open(cx, 800., 600., move |menu, window, cx| {
+        let seen = seen.clone();
+        cx.subscribe_self(move |_, _: &DismissEvent, _| seen.set(seen.get() + 1))
+            .detach();
+        dismiss_when_shrunk(window, cx);
+        fit_menu(menu, window)
+    });
+    cx.simulate_window_resize(window, size(px(1000.), px(700.)));
+    assert_eq!(dismissed.get(), 0, "it grew");
+    cx.simulate_window_resize(window, size(px(400.), px(700.)));
+    assert_eq!(dismissed.get(), 1, "it shrank");
 }

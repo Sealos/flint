@@ -628,7 +628,7 @@ impl DetailView {
                                 .map(|c| menu_record::Entry::new(label(c), true))
                                 .collect()
                         });
-                        let mut menu = fit_picker(menu, window).label("Container");
+                        let mut menu = fit_picker(menu, window, cx).label("Container");
                         for c in &containers {
                             let (item, action) = log_item(c, false);
                             menu = menu.item(item.on_click(registry::on_click(action)));
@@ -764,7 +764,7 @@ impl DetailView {
                             })
                             .collect()
                     });
-                    let mut menu = fit_picker(menu, window).label("Container");
+                    let mut menu = fit_picker(menu, window, cx).label("Container");
                     for name in &containers {
                         let running = !not_running.contains(name);
                         let (item, action) = shell_item(name, *name == default, running);
