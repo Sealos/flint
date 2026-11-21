@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the MCP end-to-end tests (flint-e2e's tests/mcp.rs, against the fake API server) on a
-# packaged flint-mcp archive, in a bare `ubuntu:22.04` container:
+# Runs the MCP end-to-end tests (flint-e2e's tests/mcp.rs and tests/mcp_coverage/, against the
+# fake API server) on a packaged flint-mcp archive, in a bare `ubuntu:22.04` container:
 #
 #   scripts/test-mcp-linux.sh <arch> <archive>
 #
@@ -23,22 +23,29 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 IMAGE=ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6
 
 export "CC_${target//-/_}=${CC_MUSL:-musl-gcc}"
-# Cargo builds flint-e2e's binaries for its integration tests too; take the `mcp` test's path.
-tests=$(cd "$repo" && cargo test -p flint-e2e --test mcp --locked --no-run --target "$target" \
-  --message-format=json | grep '"reason":"compiler-artifact"' | grep '"kind":\["test"\]' |
-  grep '"name":"mcp"' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
-if [ ! -x "$tests" ]; then
-  echo "error: cargo did not report the mcp test binary" >&2
-  exit 1
-fi
+test_targets="mcp mcp_coverage"
+# Cargo builds flint-e2e's binaries for its integration tests too; keep only the test artifacts.
+built=$(cd "$repo" && cargo test -p flint-e2e --test mcp --test mcp_coverage --locked --no-run \
+  --target "$target" --message-format=json | grep '"reason":"compiler-artifact"' |
+  grep '"kind":\["test"\]')
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 tar -xzf "$archive" -C "$scratch"
-cp "$tests" "$scratch/mcp-tests"
+for name in $test_targets; do
+  tests=$(printf '%s\n' "$built" | grep "\"name\":\"$name\"" |
+    grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
+  if [ ! -x "$tests" ]; then
+    echo "error: cargo did not report the $name test binary" >&2
+    exit 1
+  fi
+  cp "$tests" "$scratch/$name-tests"
+done
 
 # HOME and the config directory are the container's own; the tests make scratch ones anyway.
-docker run --rm --network none \
-  -v "$repo:$repo:ro" -v "$scratch:/flint:ro" -w "$repo" \
-  -e FLINT_E2E_MCP_BIN=/flint/flint-mcp/flint-mcp -e FLINT_CONFIG_DIR=/tmp/flint-config \
-  "$IMAGE" /flint/mcp-tests
+for name in $test_targets; do
+  docker run --rm --network none \
+    -v "$repo:$repo:ro" -v "$scratch:/flint:ro" -w "$repo" \
+    -e FLINT_E2E_MCP_BIN=/flint/flint-mcp/flint-mcp -e FLINT_CONFIG_DIR=/tmp/flint-config \
+    "$IMAGE" "/flint/$name-tests"
+done
