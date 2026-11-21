@@ -245,7 +245,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   Enter does nothing until an arrow key selects one. The arrows
   or Ctrl-N and Ctrl-P move the selection, Enter (or a click) runs it where focus was before the palette opened, and
   Esc closes the palette and puts focus back. An action that needs something asks for it next: a cluster, a namespace
-  (one I type is fine, and what I typed comes first), a kind, a column or a container from a list, or typed text such
+  (one I type is fine, and it comes after the listed matches), a kind, a column or a container from a list, or typed text such
   as a label selector; the heading shows what I picked so far, and Esc or Backspace in the empty field goes back a
   step. If it cannot run, the palette says why and stays open. Switching to another app and back keeps it open. Every menu item is in the palette, so on Linux, where there is no menu bar, it reaches them all.
 - Tests: unit (matching and ranking), ui.

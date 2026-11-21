@@ -767,8 +767,8 @@ async fn esc_and_backspace_go_back_a_step(cx: &mut TestAppContext) {
     assert!(palette_closed(cx, &t));
 }
 
-// covers UP-30: when the text typed is not one of the values listed, it comes first and is
-// selected, so Enter on "kube" takes "kube", not "kube-system".
+// covers UP-30: when the text typed is not one of the values listed, it follows the listed
+// matches, so Enter on "kube" takes "kube-system"; with no match it is the only row.
 #[gpui_kit::test]
 async fn typed_text_comes_before_listed_values(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -784,14 +784,18 @@ async fn typed_text_comes_before_listed_values(cx: &mut TestAppContext) {
     assert_eq!(labels(&shown(cx, &t)), ["demo", "kube-system"]);
     t.type_text(cx, "kube");
     let palette = shown(cx, &t);
-    assert_eq!(labels(&palette), ["“kube”", "kube-system"]);
+    assert_eq!(labels(&palette), ["kube-system", "“kube”"]);
     assert_eq!(palette.selected, Some(0));
+    t.type_text(cx, "zz");
+    assert_eq!(labels(&shown(cx, &t)), ["“kubezz”"]);
+    t.press(cx, "backspace");
+    t.press(cx, "backspace");
     t.press(cx, "enter");
     assert!(palette_closed(cx, &t));
     let filter = t
         .workspace
         .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()));
-    assert_eq!(filter, ["kube"]);
+    assert_eq!(filter, ["kube-system"]);
 }
 
 // covers UP-30: a pick list with nothing in it says so, and Enter does nothing.
