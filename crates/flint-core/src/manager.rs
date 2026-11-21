@@ -2294,8 +2294,8 @@ mod tests {
         unlocks.unlock("dev", "https://remote-a");
         assert_eq!(ask(&mut manager, &inbox, &check).await, Ok(()));
 
-        // The context now names a server that needs no unlock: the client still talks to the
-        // first one.
+        // The context now names another server, unlocked in its own right: the client still
+        // talks to the first one.
         rewrite(
             &mut manager,
             dir.path(),
@@ -2304,6 +2304,11 @@ mod tests {
         .await;
         offline(&mut manager);
         unlocks.lock("dev");
+        assert!(
+            manager.write_gate("dev").is_err(),
+            "locked at the new server"
+        );
+        unlocks.unlock("dev", "https://127.0.0.1:6443");
         assert!(manager.write_gate("dev").is_ok(), "open for the new server");
         assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
 

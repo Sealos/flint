@@ -41,13 +41,16 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
         let second = dir.join("second.yaml");
         std::fs::write(
             &first,
-            kubeconfig_yaml(&[("alpha", server), (EKS, "https://127.0.0.1:9")]),
+            kubeconfig_yaml(&[("kind-alpha", server), (EKS, "https://127.0.0.1:9")]),
         )
         .unwrap();
-        // `alpha` again, on another server: the first file's wins.
+        // `kind-alpha` again, on another server: the first file's wins.
         std::fs::write(
             &second,
-            kubeconfig_yaml(&[("alpha", "https://elsewhere.invalid"), ("gamma", server)]),
+            kubeconfig_yaml(&[
+                ("kind-alpha", "https://elsewhere.invalid"),
+                ("gamma", server),
+            ]),
         )
         .unwrap();
         std::fs::write(&extra, kubeconfig_yaml(&[("delta", server)])).unwrap();
@@ -62,7 +65,7 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
             .collect()
     });
     let names: Vec<&str> = clusters.iter().map(|(n, _, _)| n.as_str()).collect();
-    assert_eq!(names, ["alpha", EKS, "gamma", "delta"]);
+    assert_eq!(names, ["kind-alpha", EKS, "gamma", "delta"]);
     assert_eq!(clusters[0].1.as_deref(), Some(t.server.as_str()));
     assert!(
         clusters
@@ -83,7 +86,10 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
         tip.starts_with(&format!("{EKS}\nhttps://127.0.0.1:9\nNot connected\n")),
         "{tip}"
     );
-    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("alpha"));
+    assert_eq!(
+        t.label(cx, "cluster-kind-alpha").as_deref(),
+        Some("kind-alpha")
+    );
 
     // Nothing is selected, the navigation is hidden, and no request reached a server.
     assert_eq!(t.model.read_with(cx, |m, _| m.active.clone()), None);
@@ -137,7 +143,11 @@ async fn no_usable_kubeconfig_shows_what_was_searched(cx: &mut TestAppContext) {
         Some(format!("{} (missing)", missing_path.display()))
     );
     assert!(matches!(
-        t.dispatch(cx, "workspace::SelectCluster", json!({"cluster": "alpha"})),
+        t.dispatch(
+            cx,
+            "workspace::SelectCluster",
+            json!({"cluster": "kind-alpha"})
+        ),
         Err(ActionError::Rejected { .. })
     ));
 
@@ -180,10 +190,10 @@ async fn no_usable_kubeconfig_shows_what_was_searched(cx: &mut TestAppContext) {
 async fn a_failed_connection_leaves_the_toggles_enabled(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "beta").await;
-    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+    t.activate(cx, "kind-beta").await;
+    t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
-    let toggle = t.find(cx, "expose-beta").unwrap();
+    let toggle = t.find(cx, "expose-kind-beta").unwrap();
     assert_ne!(toggle.disabled(), Some(true));
     assert!(
         toggle
@@ -207,7 +217,7 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("settings.toml"),
-        "ai_exposed_clusters = [{ context = \"alpha\" \n",
+        "ai_exposed_clusters = [{ context = \"kind-alpha\" \n",
     )
     .unwrap();
     let t = open_workspace(cx, dir.path()).await;
@@ -220,8 +230,8 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
         )
     );
     assert!(!banner.description().unwrap_or_default().is_empty());
-    t.activate(cx, "alpha").await;
-    for id in ["expose-alpha", "expose-beta", "watch-mode"] {
+    t.activate(cx, "kind-alpha").await;
+    for id in ["expose-kind-alpha", "expose-kind-beta", "watch-mode"] {
         assert_eq!(t.find(cx, id).unwrap().disabled(), Some(true), "{id}");
     }
     let available = t.available(cx);
@@ -232,7 +242,11 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
     assert!(!available.contains(&"workspace::WatchAllKinds"));
     assert!(available.contains(&"workspace::SelectCluster"));
     let exposure = t.model.read_with(cx, |m, _| {
-        let alpha = m.clusters.iter().find(|c| c.info.name == "alpha").unwrap();
+        let alpha = m
+            .clusters
+            .iter()
+            .find(|c| c.info.name == "kind-alpha")
+            .unwrap();
         m.ai_exposure(alpha)
     });
     assert_eq!(exposure, AiExposureState::Hidden);
@@ -247,5 +261,8 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
         },
     );
     assert!(t.find(cx, "settings-error").is_none());
-    assert_ne!(t.find(cx, "expose-beta").unwrap().disabled(), Some(true));
+    assert_ne!(
+        t.find(cx, "expose-kind-beta").unwrap().disabled(),
+        Some(true)
+    );
 }
