@@ -53,9 +53,9 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
   shasum -a 256 -c ./*.sha256
   ```
 
-- [ ] The provenance verifies. Every binary and SBOM has a build provenance attestation, made by the `attest` job
-  before the files were attached (checksum files are not attested). For each file, in the directory you downloaded
-  into:
+- [ ] The provenance verifies. Every release asset (binaries, SBOMs and their `.sha256` files) has a build provenance
+  attestation naming the release commit, made by the `attest` job before the files were attached. For each file, in
+  the directory you downloaded into:
 
   ```sh
   gh attestation verify ./flint-vX.Y.Z-linux-x86_64.AppImage -R Sealos/flint
@@ -67,6 +67,23 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
 The `publish` job already checks that all twelve files are on the draft, non-empty and matching their checksums, and
 that the release ends up published (and Latest when it should be). This step confirms what someone downloading it
 sees.
+
+### If the `release-commit` job fails
+
+The run stopped because the release tag is not the commit the run was triggered by, which happens when release-please
+picks up a merged release PR on a later `master` push. Nothing was built, attested or uploaded, and the release is
+still a draft. Re-running the same run fails the same way, because its commit does not change. To release from the
+tagged commit, put the release back to pending and re-run that commit's workflow run:
+
+```sh
+sha=$(gh api repos/Sealos/flint/commits/vX.Y.Z --jq .sha)   # the commit the tag names
+gh release delete vX.Y.Z -R Sealos/flint --cleanup-tag --yes
+gh pr edit <release PR> -R Sealos/flint --remove-label 'autorelease: tagged' --add-label 'autorelease: pending'
+gh run list -R Sealos/flint -w Release -c "$sha"            # find that commit's run
+gh run rerun <run id> -R Sealos/flint
+```
+
+Only do this for a draft. These commands delete a tag and start a release, so check the version and the commit first.
 
 ## 2. Install from the DMG on a clean Mac (UP-80)
 
