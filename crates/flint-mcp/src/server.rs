@@ -54,7 +54,7 @@ struct Inner {
     /// The last parsed kubeconfig and the file stamps it was parsed from.
     kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
     clients: SlotMap<Client>,
-    discovery: SlotMap<Kinds>,
+    discovery: SlotMap<Discovered>,
     /// Unmatched scopes already logged, so each is logged once.
     warned_scopes: std::sync::Mutex<std::collections::HashSet<String>>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
@@ -87,6 +87,13 @@ impl Inner {
 
 /// Discovery results for one cluster.
 type Kinds = Arc<Vec<KindInfo>>;
+
+/// A cluster's kinds, and the API groups discovery could not read this time.
+#[derive(Clone)]
+struct Discovered {
+    kinds: Kinds,
+    skipped_groups: Arc<Vec<String>>,
+}
 
 /// A failed call, shown to the agent as a tool error.
 ///
@@ -894,6 +901,10 @@ impl FlintMcp {
     }
 
     async fn kinds(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
+        Ok(self.discovered(cluster, conn).await?.kinds)
+    }
+
+    async fn discovered(&self, cluster: &str, conn: &Conn) -> Result<Discovered, ToolError> {
         let slot = slot(
             &self.inner.discovery,
             cluster,
@@ -901,26 +912,40 @@ impl FlintMcp {
             Some(DISCOVERY_TTL),
         );
         // Groups skipped this time are missing until the cache expires; the agent can retry.
-        let kinds = slot
+        let discovered = slot
             .cell
             .get_or_try_init(|| async {
                 read::discover_kinds(&conn.client)
                     .await
-                    .map(|found| Arc::new(found.kinds))
+                    .map(|found| Discovered {
+                        kinds: Arc::new(found.kinds),
+                        skipped_groups: Arc::new(found.skipped_groups),
+                    })
             })
             .await
             .map_err(|e| conn.fail(e))?;
-        Ok(kinds.clone())
+        Ok(discovered.clone())
+    }
+
+    /// The cluster's kinds, with `conn`'s scope resolved against them.
+    async fn resolved_scope(
+        &self,
+        cluster: &str,
+        conn: &Conn,
+    ) -> Result<(Kinds, policy::ResolvedKinds), ToolError> {
+        let found = self.discovered(cluster, conn).await?;
+        let resolved =
+            policy::resolve_scope_kinds(&conn.scope, &found.kinds, &found.skipped_groups);
+        Ok((found.kinds, resolved))
     }
 
     /// The kinds of `cluster` the agent may read: all of them, or those its scope allows.
     async fn kinds_in_scope(&self, cluster: &str, conn: &Conn) -> Result<Kinds, ToolError> {
-        let kinds = self.kinds(cluster, conn).await?;
         if conn.scope.is_everything() {
-            return Ok(kinds);
+            return self.kinds(cluster, conn).await;
         }
-        let scope = policy::resolve_scope_kinds(&conn.scope, &kinds).scope;
-        Ok(Arc::new(policy::kinds_in_scope(&scope, &kinds)))
+        let (kinds, resolved) = self.resolved_scope(cluster, conn).await?;
+        Ok(Arc::new(policy::kinds_in_scope(&resolved.scope, &kinds)))
     }
 
     /// What in `conn`'s scope matches nothing on the cluster, for `list_clusters`. Each result
@@ -933,19 +958,31 @@ impl FlintMcp {
         if conn.scope.is_everything() {
             return None;
         }
-        let kinds = self.kinds(cluster, conn).await.ok()?;
-        let unmatched_kinds = policy::resolve_scope_kinds(&conn.scope, &kinds).unmatched;
+        // One limit for the whole check, so a stalled lookup keeps what was already found.
+        let until = tokio::time::Instant::now() + PROBE_TIMEOUT;
+        let (kinds, resolved) = tokio::time::timeout_at(until, self.resolved_scope(cluster, conn))
+            .await
+            .ok()?
+            .ok()?;
+        let unmatched_kinds = resolved.unmatched;
         let mut unmatched_namespaces = Vec::new();
         let namespaces = kinds
             .iter()
             .find(|k| k.group().is_empty() && k.plural() == "namespaces");
         if let Some(namespaces) = namespaces {
             for name in conn.scope.namespaces.iter().take(SCOPE_NAMESPACES_CHECKED) {
-                if let Err(ClusterError::Api(text)) =
-                    read::get(&conn.client, namespaces, None, name).await
-                    && text.starts_with("NotFound:")
-                {
+                // Never sent: it goes into the request path, and no namespace has such a name.
+                if !policy::is_label_name(name) {
                     unmatched_namespaces.push(name.clone());
+                    continue;
+                }
+                let lookup = read::get(&conn.client, namespaces, None, name);
+                match tokio::time::timeout_at(until, lookup).await {
+                    Err(_) => break,
+                    Ok(Err(ClusterError::Api(text))) if text.starts_with("NotFound:") => {
+                        unmatched_namespaces.push(name.clone());
+                    }
+                    Ok(_) => {}
                 }
             }
         }
@@ -1119,13 +1156,12 @@ impl FlintMcp {
                     .map_err(|e| e.message);
                 // Apart from the probe, so a slow lookup cannot make the cluster look unreachable.
                 let unmatched = match &result {
-                    Ok(_) => tokio::time::timeout(PROBE_TIMEOUT, async {
-                        let conn = this.client(&ctx, &name).await.ok()?;
-                        this.unmatched_scope(&name, &conn).await
-                    })
-                    .await
-                    .ok()
-                    .flatten(),
+                    Ok(_) => {
+                        match tokio::time::timeout(PROBE_TIMEOUT, this.client(&ctx, &name)).await {
+                            Ok(Ok(conn)) => this.unmatched_scope(&name, &conn).await,
+                            _ => None,
+                        }
+                    }
                     Err(_) => None,
                 };
                 (name, (result, unmatched))
@@ -1312,8 +1348,8 @@ impl FlintMcp {
         let scoped = !conn.scope.is_everything();
         // Events about a kind outside the scope: refused before anything is fetched.
         let kinds = if scoped {
-            let kinds = self.kinds(&p.cluster, &conn).await?;
-            let scope = policy::resolve_scope_kinds(&conn.scope, &kinds).scope;
+            let (kinds, resolved) = self.resolved_scope(&p.cluster, &conn).await?;
+            let scope = resolved.scope;
             if let Some(kind) = p.object_kind.as_deref()
                 && !policy::kind_name_in_scope(&scope, &kinds, kind)
             {
@@ -1419,8 +1455,12 @@ impl FlintMcp {
         }
         // Discovery only for a kinds scope that does not name `pods` as written (`pod`, `po`).
         if !policy::logs_in_scope(&conn.scope) {
-            let kinds = self.kinds(&p.cluster, &conn).await?;
-            if !policy::logs_in_scope(&policy::resolve_scope_kinds(&conn.scope, &kinds).scope) {
+            // A failed discovery cannot show pods are allowed: the same denial as out of scope.
+            let allowed = self
+                .resolved_scope(&p.cluster, &conn)
+                .await
+                .is_ok_and(|(_, resolved)| policy::logs_in_scope(&resolved.scope));
+            if !allowed {
                 return Err(policy::out_of_scope(&p.cluster).into());
             }
         }

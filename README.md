@@ -113,7 +113,8 @@ server = "https://staging.example.com:6443"
 ```
 
 Kinds are written as for `kubectl get`: plural, singular, Kind or short name (`pods`, `pod`, `Pod`, `po`), with
-`.group` when needed. A name that matches no kind, or several, grants nothing. `list_clusters` reports such names as
+`.group` when needed. A name that matches no kind, or several, grants nothing, and so does a name without a group
+while part of API discovery is failing. `list_clusters` reports such names as
 `unmatched_kinds`, and namespaces that do not exist as `unmatched_namespaces`. The server logs them once to stderr.
 
 An empty list (`namespaces = []`) means no limit, not no access: to keep agents away from a cluster, remove its entry.
