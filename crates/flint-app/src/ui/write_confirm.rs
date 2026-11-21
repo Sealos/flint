@@ -2,6 +2,7 @@
 //! the core's review returned, names the real context and server, and runs the reviewed intent:
 //! the core asks the write gate again for each request, so confirming authorizes nothing.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use flint_core::CoreHandle;
@@ -233,9 +234,23 @@ pub fn open_noted(
         &saying,
         &shown,
     );
+    let confirmed = confirmation(core, review, begin, on_done);
+    confirm::open(window, cx, text, move |_, cx| confirmed(cx));
+}
+
+/// What confirming `review` does. A confirmation runs once, whatever `begin` or the write answers:
+/// a dialog's handler can outlive the click that closed it, so this does not count on the dialog
+/// being gone. Asking again takes a new review.
+pub(in crate::ui) fn confirmation(
+    core: CoreHandle,
+    review: WriteReview,
+    begin: impl Fn(&mut App) -> bool + 'static,
+    on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
+) -> impl Fn(&mut App) + 'static {
     let on_done = Rc::new(on_done);
-    confirm::open(window, cx, text, move |_, cx| {
-        if !begin(cx) {
+    let used = Cell::new(false);
+    move |cx| {
+        if used.replace(true) || !begin(cx) {
             return;
         }
         let run = core.run_write(review.clone().into_intent());
@@ -245,7 +260,7 @@ pub fn open_noted(
             cx.update(|cx| on_done(result, cx));
         })
         .detach();
-    });
+    }
 }
 
 #[cfg(test)]
