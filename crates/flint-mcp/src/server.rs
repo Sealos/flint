@@ -1361,16 +1361,17 @@ impl Inner {
 }
 
 /// Adds the rows of `page` (another namespace's) to `merged`. Each row's cells follow its own
-/// page's columns; when the columns differ (a server that changed its printer columns between
-/// the requests), every row falls back to the plain layout (name, namespace, age) rather than
-/// mixing cells under the wrong headers.
+/// page's columns; when the columns or their roles differ (a server that changed its printer
+/// columns between the requests), every row falls back to the plain layout (name, namespace,
+/// age) rather than mixing cells under the wrong headers. Roles matter: they decide which of a
+/// Secret's columns are safe.
 fn merge_page(merged: &mut TablePage, page: TablePage) {
     let same = merged.columns.len() == page.columns.len()
         && merged
             .columns
             .iter()
             .zip(page.columns.iter())
-            .all(|(a, b)| a.name == b.name);
+            .all(|(a, b)| a.name == b.name && a.role == b.role);
     if !same {
         merged.columns = Arc::from(Vec::new());
     }
@@ -1652,9 +1653,37 @@ mod tests {
             row.push(extra);
             let (_, rows, _, _) = table_rows(&page(columns, row), true, 1_000, policy::LIST_BYTES);
             let mut expected = shown.to_vec();
-            expected.push(hidden);
+            // A second Age is computed from the object's metadata, like the first.
+            expected.push(if header == "Age" { "0s" } else { hidden });
             assert_eq!(rows[0]["cells"], json!(expected), "{header}");
         }
+    }
+
+    // covers UP-14: pages with the same headers but other roles do not share a layout, so a
+    // printer column is never taken for the safe column of another page.
+    #[test]
+    fn secret_pages_with_different_column_roles_do_not_merge() {
+        let mut merged = page(
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Namespace", ColumnRole::Namespace, 0),
+            ],
+            vec![Cell::Name, Cell::Namespace],
+        );
+        merge_page(
+            &mut merged,
+            page(
+                vec![
+                    col("Name", ColumnRole::Name, 0),
+                    col("Namespace", ColumnRole::Value, 0),
+                ],
+                vec![Cell::Name, Cell::Text("hunter2".into())],
+            ),
+        );
+        assert!(merged.columns.is_empty(), "the plain layout");
+        let (_, rows, _, _) = table_rows(&merged, true, 1_000, policy::LIST_BYTES);
+        let text = serde_json::to_string(&rows).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
     }
 
     // covers UP-15

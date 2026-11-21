@@ -55,7 +55,7 @@ pub fn safe_secret_wire_columns(definitions: &[(&str, &str)]) -> Vec<bool> {
 
 /// The one rule for safe Secret columns, failing closed:
 /// - `Name`, `Namespace` and `Age` by their role, whose cells come from the object's metadata and
-///   never from the server's text. Only the first column with that header and role.
+///   never from the server's text, however many there are.
 /// - `Type` and `Data` are server text, so only when no other column has the header: with two,
 ///   nothing tells which is the real one.
 fn is_safe_at<'a>(
@@ -70,7 +70,7 @@ fn is_safe_at<'a>(
     match (name, role) {
         ("Name", ColumnRole::Name)
         | ("Namespace", ColumnRole::Namespace)
-        | ("Age", ColumnRole::Age) => (0..index).all(|i| column(i) != (name, role)),
+        | ("Age", ColumnRole::Age) => true,
         ("Type" | "Data", ColumnRole::Value) => (0..len).all(|i| i == index || column(i).0 != name),
         _ => false,
     }
@@ -286,11 +286,18 @@ mod tests {
     }
 
     #[test]
+    fn a_second_age_is_computed_from_metadata_so_it_stays_safe() {
+        let mut columns = standard();
+        columns.push(column("Age", ColumnRole::Age));
+        assert_eq!(safe(&columns), [true; 6]);
+    }
+
+    #[test]
     fn a_repeated_identity_header_hides_only_the_extra_column() {
         for (header, role) in [
             ("Name", ColumnRole::Value),
             ("Namespace", ColumnRole::Value),
-            ("Age", ColumnRole::Age),
+            ("Age", ColumnRole::Value),
         ] {
             let mut columns = standard();
             columns.push(column(header, role));
@@ -336,7 +343,7 @@ mod tests {
         ];
         assert_eq!(
             safe_secret_wire_columns(&repeated),
-            [true, false, false, true, false, false, false, false, false]
+            [true, false, false, true, false, false, false, false, true]
         );
         // A first column of format `name` holds the object's name, but its header is not safe.
         assert_eq!(safe_secret_wire_columns(&[("Token", "name")]), [false]);

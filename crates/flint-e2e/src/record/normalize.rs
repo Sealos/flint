@@ -262,6 +262,9 @@ fn normalize_age_cells(table: &mut Map<String, Value>) {
     {
         for (i, cell) in cells.iter_mut().enumerate() {
             let Value::String(text) = cell else { continue };
+            if text == CREDENTIAL_MARKER {
+                continue;
+            }
             if ages.contains(&i) {
                 if Some(i) == age {
                     // The fake server renders Age from the creation time.
@@ -572,6 +575,15 @@ mod tests {
             json!(["s", "Opaque", CREDENTIAL_MARKER])
         );
 
+        // A hidden cell stays hidden when ages are normalized, even under an `Age` header.
+        let mut named_age = json!({
+            "columnDefinitions": [{"name": "Age", "format": "name"}],
+            "rows": [{"cells": ["hunter2"]}],
+        });
+        scrub_secret_table(&mut named_age);
+        normalize_age_cells(named_age.as_object_mut().unwrap());
+        assert_eq!(named_age["rows"][0]["cells"], json!([CREDENTIAL_MARKER]));
+
         // A column is not safe because of its header alone.
         let mut repeated = json!({
             "columnDefinitions": [
@@ -585,7 +597,7 @@ mod tests {
         let m = CREDENTIAL_MARKER;
         assert_eq!(
             repeated["rows"][0]["cells"],
-            json!(["s", m, m, "1d", m, m, m, m, m])
+            json!(["s", m, m, "1d", m, m, m, m, "e"])
         );
         assert_eq!(
             table["rows"][0]["object"]["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"],
