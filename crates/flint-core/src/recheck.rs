@@ -310,6 +310,14 @@ impl ContextHistory {
             .is_some_and(|r| r.gate != pin.gate)
     }
 
+    /// Whether `context`'s recorded server is the exact URL `pin` was taken for. Only says how to
+    /// word a refusal: a pin can be stale on the same server.
+    pub fn on_pinned_server(&self, context: &str, pin: &ContextPin) -> bool {
+        self.records
+            .get(context)
+            .is_some_and(|r| r.present && r.server == pin.server)
+    }
+
     /// Whether the last load confirmed that `context` is gone.
     pub fn removed(&self, context: &str) -> bool {
         self.records.get(context).is_some_and(|r| !r.present)
@@ -572,6 +580,8 @@ mod tests {
         h.record(&on_cluster(load(&[("dev", STAGING, "a")], &[]), "b"));
         assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "survived");
         assert!(h.gate_moved("dev", &pin), "the gate stays as strict");
+        assert!(h.on_pinned_server("dev", &pin), "refused, but not moved");
+        assert!(!h.on_pinned_server("dev", &fallback), "this one did move");
         let fresh = h.pin("dev", STAGING);
         assert!(!h.gate_moved("dev", &fresh));
     }

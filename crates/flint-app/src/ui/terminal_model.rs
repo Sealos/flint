@@ -266,11 +266,20 @@ pub fn state_text(state: &ExecState) -> (Tone, String) {
         ExecState::Exited { code: Some(code) } => (Tone::Warning, format!("Exited (code {code})")),
         ExecState::Exited { code: None } => (Tone::Muted, "Exited".to_owned()),
         // Core ended it as the tab does ([`toolbar_state`]).
-        ExecState::Failed(f) if f.kind == ExecFailureKind::ContextChanged => context_changed(),
         ExecState::Failed(f)
             if matches!(
                 f.kind,
-                ExecFailureKind::NotStartedMoved | ExecFailureKind::NotStartedRemoved
+                ExecFailureKind::ContextChanged | ExecFailureKind::EndedStale
+            ) =>
+        {
+            context_changed()
+        }
+        ExecState::Failed(f)
+            if matches!(
+                f.kind,
+                ExecFailureKind::NotStartedMoved
+                    | ExecFailureKind::NotStartedRemoved
+                    | ExecFailureKind::NotStartedStale
             ) =>
         {
             (
@@ -324,6 +333,12 @@ pub fn failure_words(failure: &ExecFailure) -> (&'static str, String) {
         }
         ExecFailureKind::NotStartedRemoved => {
             "The shell did not start: its context is no longer in your kubeconfig files."
+        }
+        ExecFailureKind::NotStartedStale => {
+            "The shell did not start: its context changed since this tab was opened."
+        }
+        ExecFailureKind::EndedStale => {
+            "The shell ended: its context changed since this tab was opened."
         }
         ExecFailureKind::Other => "The shell could not start.",
         ExecFailureKind::Server => server_words(&failure.message),
@@ -674,6 +689,14 @@ mod tests {
         assert_eq!(
             words(ExecFailureKind::NotStartedRemoved, "gone"),
             "The shell did not start: its context is no longer in your kubeconfig files."
+        );
+        assert_eq!(
+            words(ExecFailureKind::NotStartedStale, "stale"),
+            "The shell did not start: its context changed since this tab was opened."
+        );
+        assert_eq!(
+            words(ExecFailureKind::EndedStale, "stale"),
+            "The shell ended: its context changed since this tab was opened."
         );
         assert_eq!(
             state_text(&ExecState::Failed(ExecFailure::new(

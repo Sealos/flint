@@ -304,6 +304,13 @@ pub enum WriteRefusal {
          again from the cluster as it is now"
     )]
     Moved { cluster: String },
+    /// The session's pin is out of date, though the context's recorded server is still the one
+    /// it was taken for: a fallback showed since, or the context was removed and put back.
+    #[error(
+        "\"{cluster}\" changed in your kubeconfig files since this tab was opened; open it again \
+         from the cluster as it is now"
+    )]
+    Stale { cluster: String },
     /// A load confirmed the context is gone from the kubeconfig files.
     #[error("\"{cluster}\" is no longer in your kubeconfig files")]
     Removed { cluster: String },
