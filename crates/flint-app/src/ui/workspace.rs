@@ -2,7 +2,6 @@
 //! with a header (breadcrumb, namespace filter, watch mode), the resource list, and the detail
 //! pane, above the bottom dock (log tabs, which outlive cluster switches).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -34,7 +33,7 @@ use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
 };
 use super::dock::{self, Dock, DockEvent, DockItem as _, DockTab, TabKey};
-use super::dock_model::{LiveSessions, TabCluster};
+use super::dock_model::{LiveSessions, TabCluster, confirmed_servers};
 use super::focus::release_unfocused_input;
 use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
@@ -666,7 +665,10 @@ impl Workspace {
 
     /// The cluster a session opened on `context` now runs on: the context and its server.
     fn tab_cluster(&self, context: &str, cx: &App) -> TabCluster {
-        TabCluster::new(context, self.shown_server(context, cx).as_deref())
+        let definition = self
+            .cluster_summary(context, cx)
+            .map_or(0, |c| c.definition);
+        TabCluster::new(context, self.shown_server(context, cx).as_deref()).defined_by(definition)
     }
 
     /// The server `context` shows now, as the cluster list has it: what a tab opened on it is
@@ -693,14 +695,10 @@ impl Workspace {
         }
         // By server only: a context that started over at the same server (a namespace edit, a
         // rotated token) is the same cluster to a shell. One re-pointed and put back between
-        // reads is ended by the core, which checks each shell's pin against the context's history.
-        let servers: HashMap<String, Option<String>> = self
-            .model
-            .read(cx)
-            .clusters
-            .iter()
-            .map(|c| (c.info.name.clone(), c.info.server.clone()))
-            .collect();
+        // reads is not reused (`TabCluster`), and is ended by the core, which checks each shell's
+        // pin against the context's history. A server the core has not confirmed may be a
+        // fallback while a kubeconfig file can't be read: its shells are left running.
+        let servers = confirmed_servers(&self.model.read(cx).clusters);
         self.dock.update(cx, |dock, cx| {
             dock.check_servers(|context| servers.get(context).cloned(), cx)
         });

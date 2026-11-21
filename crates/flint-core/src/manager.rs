@@ -24,7 +24,7 @@ use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
 use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::{ContextHistory, ContextPin, Pinned};
-use crate::settings::{self, AiScope, Settings};
+use crate::settings::{self, AiScope, Settings, server_identity};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
 
@@ -136,11 +136,14 @@ impl Cluster {
         self.watches.set_scope(scope);
     }
 
-    fn summary(&self) -> ClusterSummary {
+    fn summary(&self, history: &ContextHistory) -> ClusterSummary {
+        let shown = history.shown(&self.info.name, self.info.server.as_deref());
         ClusterSummary {
             info: self.info.clone(),
             state: self.state.clone(),
             generation: self.generation,
+            definition: shown.definition,
+            confirmed: shown.confirmed,
         }
     }
 }
@@ -148,7 +151,7 @@ impl Cluster {
 enum Internal {
     /// Reload kubeconfig, then say so ([`crate::CoreHandle::reload_kubeconfig`]).
     ReloadKubeconfig {
-        reply: tokio::sync::oneshot::Sender<()>,
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
     Connected {
         cluster: ClusterId,
@@ -370,7 +373,9 @@ impl ClusterManager {
                 server,
                 request,
             } => self.set_trusted(cluster, server, request).await,
-            Command::ReloadKubeconfig => self.reload_kubeconfig().await,
+            Command::ReloadKubeconfig => {
+                self.reload_kubeconfig().await;
+            }
             Command::SetWatchMode { cluster, mode } => {
                 self.write_settings("the watch mode", move |dir| {
                     settings::set_watch_mode(dir, cluster.as_deref(), mode)
@@ -846,8 +851,8 @@ impl ClusterManager {
     async fn handle_internal(&mut self, msg: Internal) {
         match msg {
             Internal::ReloadKubeconfig { reply } => {
-                self.reload_kubeconfig().await;
-                let _ = reply.send(());
+                let applied = self.reload_kubeconfig().await;
+                let _ = reply.send(applied);
             }
             Internal::Connected {
                 cluster,
@@ -1066,9 +1071,9 @@ impl ClusterManager {
         // A context unchanged since `pin` whose entry is missing or points elsewhere: a
         // kubeconfig file failed to load (caught half-written, say), and what shows is not
         // confirmed (`ContextHistory`). Wait for the file rather than read from it.
-        let slot = self
-            .cluster(cluster)
-            .filter(|s| s.info.server.as_deref() == pin.server());
+        let slot = self.cluster(cluster).filter(|s| {
+            s.info.server.as_deref().map(server_identity) == pin.server().map(server_identity)
+        });
         let Some(slot) = slot else {
             return Err(LogError::retry(format!(
                 "\"{cluster}\" is uncertain while a kubeconfig file can't be read"
@@ -1293,7 +1298,9 @@ impl ClusterManager {
         self.generation
     }
 
-    async fn reload_kubeconfig(&mut self) {
+    /// Loads the kubeconfig files and applies them. Whether that was done: a file that fails to
+    /// parse still counts, and is reported in the cluster list.
+    async fn reload_kubeconfig(&mut self) -> bool {
         let paths = self.kubeconfig_paths.clone();
         let loaded = tokio::task::spawn_blocking(move || {
             let loaded = kubeconfig::load(&paths);
@@ -1309,7 +1316,7 @@ impl ClusterManager {
             Ok((loaded, exist)) => (Arc::new(loaded), exist),
             Err(e) => {
                 self.emit(Event::Error(format!("kubeconfig reload failed: {e}")));
-                return;
+                return false;
             }
         };
         tracing::info!(
@@ -1369,7 +1376,11 @@ impl ClusterManager {
         self.contexts.record(&loaded);
 
         let snapshot = ClustersSnapshot {
-            clusters: self.clusters.iter().map(Cluster::summary).collect(),
+            clusters: self
+                .clusters
+                .iter()
+                .map(|c| c.summary(&self.contexts))
+                .collect(),
             errors: loaded.errors.clone(),
             paths: path_exist,
         };
@@ -1387,6 +1398,7 @@ impl ClusterManager {
                 self.ensure_connected(&active);
             }
         }
+        true
     }
 
     /// (Re)creates the file watcher for the current kubeconfig files and `settings.toml`, if

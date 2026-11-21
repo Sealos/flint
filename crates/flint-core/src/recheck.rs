@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 use tokio::time::{Instant, Sleep};
 
 use crate::kubeconfig::LoadedKubeconfig;
+use crate::settings::server_identity;
 
 /// How often a running session checks its context still points at the server it opened on.
 pub(crate) const RECHECK_EVERY: Duration = Duration::from_secs(30);
@@ -75,6 +76,9 @@ pub(crate) struct ContextPin {
     /// `0` when the client was not built from the context's confirmed definition: the pin is
     /// stale from the start.
     generation: u64,
+    /// The same for the endpoint, which ignores a trailing slash: what a log session is pinned
+    /// to. A shell keeps the exact [`Self::generation`], since the write gate checks it.
+    endpoint: u64,
     server: Option<String>,
 }
 
@@ -99,6 +103,24 @@ struct Record {
     /// Bumped whenever a confirmed change gives the context another server, or removes it, so
     /// a change that a later reload undoes is still seen by sessions pinned before it.
     generation: u64,
+    /// Bumped likewise, but not by a change that only adds or drops a trailing slash.
+    endpoint: u64,
+}
+
+/// Whether two servers are one endpoint: the same URL but for a trailing slash.
+fn same_endpoint(a: Option<&str>, b: Option<&str>) -> bool {
+    a.map(server_identity) == b.map(server_identity)
+}
+
+/// What the core knows of the server a context shows, for the front end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shown {
+    /// The context's confirmed definition: it changes when a confirmed change moves the context,
+    /// even one a later reload undoes, and not on an edit that keeps its server.
+    pub definition: u64,
+    /// A load confirmed the server shown. Otherwise it may be a fallback, showing only while a
+    /// kubeconfig file before it can't be read.
+    pub confirmed: bool,
 }
 
 /// Every context's history across kubeconfig loads, for the sessions pinned to them (UP-06).
@@ -184,12 +206,18 @@ impl ContextHistory {
                 }
                 Some(r) => {
                     self.last += 1;
+                    let endpoint = if r.present && same_endpoint(r.server.as_deref(), server) {
+                        r.endpoint
+                    } else {
+                        self.last
+                    };
                     *r = Record {
                         server: server.map(str::to_owned),
                         source: info.source.clone(),
                         present: true,
                         confirmed: !provisional,
                         generation: self.last,
+                        endpoint,
                     };
                 }
                 None => {
@@ -202,6 +230,7 @@ impl ContextHistory {
                             present: true,
                             confirmed: !provisional,
                             generation: self.last,
+                            endpoint: self.last,
                         },
                     );
                 }
@@ -216,6 +245,7 @@ impl ContextHistory {
                 self.last += 1;
                 r.present = false;
                 r.generation = self.last;
+                r.endpoint = self.last;
             }
         }
     }
@@ -223,14 +253,31 @@ impl ContextHistory {
     /// The pin for a session on `context` whose client was built for `server`: stale unless
     /// that is the context's confirmed server.
     pub fn pin(&self, context: &str, server: Option<&str>) -> ContextPin {
-        let generation = self
-            .records
-            .get(context)
-            .filter(|r| r.present && r.server.as_deref() == server)
+        let record = self.records.get(context).filter(|r| r.present);
+        let generation = record
+            .filter(|r| r.server.as_deref() == server)
             .map_or(0, |r| r.generation);
+        let endpoint = record
+            .filter(|r| same_endpoint(r.server.as_deref(), server))
+            .map_or(0, |r| r.endpoint);
         ContextPin {
             generation,
+            endpoint,
             server: server.map(str::to_owned),
+        }
+    }
+
+    /// What is known of `context` showing `server`.
+    pub fn shown(&self, context: &str, server: Option<&str>) -> Shown {
+        match self.records.get(context).filter(|r| r.present) {
+            Some(r) => Shown {
+                definition: r.generation,
+                confirmed: r.confirmed && r.server.as_deref() == server,
+            },
+            None => Shown {
+                definition: 0,
+                confirmed: false,
+            },
         }
     }
 
@@ -242,14 +289,24 @@ impl ContextHistory {
     }
 
     /// Why a session on `context` pinned at `pin` must end, or `None` while the context's
-    /// confirmed definition is unchanged since.
+    /// confirmed definition is unchanged since. A shell compares the exact URL: the write gate
+    /// relies on this, so it refuses even a change that only adds a trailing slash. Log sessions
+    /// only read, and compare the endpoint.
     pub fn check(&self, session: Pinned, context: &str, pin: &ContextPin) -> Option<String> {
+        let (current, pinned): (fn(&Record) -> u64, u64) = match session {
+            Pinned::Shell => (|r| r.generation, pin.generation),
+            Pinned::Logs => (|r| r.endpoint, pin.endpoint),
+        };
+        let moved = |r: &Record| match session {
+            Pinned::Shell => r.server != pin.server,
+            Pinned::Logs => !same_endpoint(r.server.as_deref(), pin.server.as_deref()),
+        };
         let change = match self.records.get(context) {
-            Some(r) if r.present && r.generation == pin.generation => return None,
+            Some(r) if r.present && current(r) == pinned => return None,
             // Pinned stale at once: opened on what a load showed but did not confirm (a later
             // file's fallback, while the first one can't be read).
-            Some(r) if r.present && pin.generation == 0 => Change::Unconfirmed,
-            Some(r) if r.present && r.server != pin.server => Change::Repointed,
+            Some(r) if r.present && pinned == 0 => Change::Unconfirmed,
+            Some(r) if r.present && moved(r) => Change::Repointed,
             // Removed and added back, or re-pointed and put back, since the session opened.
             Some(r) if r.present => Change::Changed,
             _ => Change::Removed,
@@ -320,6 +377,67 @@ mod tests {
             "\"dev\" changed in your kubeconfig files since this session opened; open the logs \
              again to read from it"
         );
+    }
+
+    // covers UP-06: a change of only a trailing slash leaves a log session running, and the exact
+    // pin a shell and the write gate use still refuses it.
+    #[test]
+    fn a_trailing_slash_is_one_endpoint_for_logs_only() {
+        let (with, without) = (Some("https://staging/"), Some("https://staging"));
+        let mut h = ContextHistory::default();
+        h.record(&load(&[("dev", without, "a")], &[]));
+        let (logs, shell) = (h.pin("dev", without), h.pin("dev", without));
+        h.record(&load(&[("dev", with, "a")], &[]));
+        assert_eq!(h.check(Pinned::Logs, "dev", &logs), None);
+        assert!(h.check(Pinned::Shell, "dev", &shell).is_some());
+        // A log tab labelled before the slash changed, pinned after it.
+        let late = h.pin("dev", without);
+        assert_eq!(h.check(Pinned::Logs, "dev", &late), None);
+        assert!(h.check(Pinned::Shell, "dev", &late).is_some(), "not exact");
+        assert_eq!(h.check(Pinned::Shell, "dev", &h.pin("dev", with)), None);
+    }
+
+    // covers UP-06: a log session still ends on a real move, and on one that was undone.
+    #[test]
+    fn a_log_session_ends_on_a_move_even_if_undone() {
+        let mut h = ContextHistory::default();
+        h.record(&load(&[("dev", STAGING, "a")], &[]));
+        let pin = h.pin("dev", STAGING);
+        h.record(&load(&[("dev", PROD, "a")], &[]));
+        assert!(h.check(Pinned::Logs, "dev", &pin).is_some());
+        h.record(&load(&[("dev", STAGING, "a")], &[]));
+        assert!(
+            h.check(Pinned::Logs, "dev", &pin).is_some(),
+            "moved and back"
+        );
+        assert!(
+            h.check(Pinned::Shell, "dev", &pin).is_some(),
+            "moved and back"
+        );
+    }
+
+    // covers UP-06: the definition the dock compares changes on a confirmed move, even undone,
+    // and not on an edit that keeps the server; a fallback is not confirmed.
+    #[test]
+    fn shown_tells_a_confirmed_move_from_a_same_server_edit() {
+        let mut h = ContextHistory::default();
+        h.record(&load(&[("dev", STAGING, "a")], &[]));
+        let first = h.shown("dev", STAGING);
+        assert!(first.confirmed);
+        h.record(&load(&[("dev", STAGING, "b")], &[]));
+        assert_eq!(h.shown("dev", STAGING), first, "same server");
+        h.record(&load(&[("dev", PROD, "a")], &[]));
+        h.record(&load(&[("dev", STAGING, "a")], &[]));
+        assert_ne!(h.shown("dev", STAGING).definition, first.definition);
+
+        let settled = h.shown("dev", STAGING);
+        // `a` can't be read, and `b`'s definition shows meanwhile.
+        h.record(&load(&[("dev", PROD, "b")], &["a"]));
+        let fallback = h.shown("dev", PROD);
+        assert!(!fallback.confirmed);
+        assert_eq!(fallback.definition, settled.definition);
+        assert_eq!(h.shown("nope", STAGING).definition, 0);
+        assert!(!h.shown("nope", STAGING).confirmed);
     }
 
     const STAGING: Option<&str> = Some("https://staging");

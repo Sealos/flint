@@ -495,6 +495,8 @@ mod tests {
             },
             state: ConnectionState::Disconnected,
             generation: 1,
+            definition: 1,
+            confirmed: true,
         }
     }
 

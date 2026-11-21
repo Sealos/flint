@@ -168,6 +168,8 @@ fn snapshot(contexts: &[String]) -> Event {
             },
             state: ConnectionState::Disconnected,
             generation: 1,
+            definition: 1,
+            confirmed: true,
         })
         .collect();
     Event::ClustersChanged(Arc::new(crate::handle::ClustersSnapshot {
