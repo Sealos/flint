@@ -1114,12 +1114,7 @@ impl FlintMcp {
             .kubeconfig
             .errors
             .iter()
-            .map(|(path, error)| {
-                json!({
-                    "file": path.display().to_string(),
-                    "error": flint_core::redact::safe_error_summary(error),
-                })
-            })
+            .map(|(path, error)| policy::kubeconfig_error_row(path, error))
             .collect();
         let mut rows = Vec::new();
         let results = self.probe_all(ctx, &exposed).await;
