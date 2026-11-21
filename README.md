@@ -126,8 +126,8 @@ that array instead; TOML doesn't allow both forms for one key, and an invalid fi
   context of the same name at another server, it is hidden from agents until you update `server`. A trailing slash
   does not matter.
 - **Checked.** A misspelt key (`namespace` for `namespaces`), or the same context and server listed twice, makes the
-  file invalid. Then nothing is exposed: every call fails and says that `settings.toml` is invalid, and the server
-  logs the reason on stderr when it starts.
+  file invalid. Then nothing is exposed: every call fails and says that `settings.toml` is invalid, with the unknown
+  field and its line and column but no value from the file. The server logs the same reason on stderr when it starts.
 - **Read again on every call**, so an edit applies to the agent's next call without a restart.
 - **Read-only either way.** The entry decides what the server may read, never what it may do: it has no tool that
   creates, changes or deletes anything. It reads with the kubeconfig's credentials, so a user with read-only RBAC
