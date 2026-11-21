@@ -502,6 +502,125 @@ async fn a_failed_pane_refetches_when_the_connection_returns(cx: &mut TestAppCon
     wait_for_failed_fetch(cx, &t).await;
 }
 
+/// `pod(name)` as the object that took the name after the first one was deleted.
+fn replacement(name: &str) -> ObjectDetail {
+    let mut detail = pod(name);
+    detail.object["metadata"]["uid"] = "uid-replacement".into();
+    detail.object["metadata"]["labels"]["replacement"] = "yes".into();
+    detail
+}
+
+// covers UP-20, UP-23: a pod deleted and recreated under its name during an outage: the fetch on
+// the return finds the new pod. The old copy stays, marked deleted, and no edit can start from it.
+#[gpui_kit::test]
+async fn a_replacement_under_the_same_name_is_not_shown(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    let v = view(cx, &t);
+    let before = v.read_with(cx, |v, _| v.yaml_text.clone());
+
+    show_fetched(cx, &t, replacement("api"));
+
+    v.read_with(cx, |v, _| {
+        assert!(v.gone);
+        assert_eq!(v.yaml_text, before);
+        assert!(!v.yaml_text.contains("replacement"));
+        let Fetch::Loaded { detail, .. } = &v.fetch else {
+            panic!("the old copy stays");
+        };
+        assert_eq!(detail.object["metadata"]["uid"], "uid-api");
+        assert!(!v.can_start_edit());
+        assert_eq!(v.edit_blocked().as_deref(), Some("This object was deleted"));
+    });
+}
+
+// covers UP-20, UP-23: with no copy to keep, the replacement is still not shown as the object.
+#[gpui_kit::test]
+async fn a_replacement_is_not_shown_in_a_pane_with_no_copy(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+
+    show_fetched(cx, &t, replacement("api"));
+
+    let v = view(cx, &t);
+    v.read_with(cx, |v, _| {
+        assert!(v.gone);
+        assert!(matches!(&v.fetch, Fetch::Failed(e) if e.contains("new one")));
+        assert!(!v.can_start_edit());
+    });
+}
+
+// covers UP-20: a list that publishes rows while another namespace loads does not make a fetched
+// copy read as current.
+#[gpui_kit::test]
+async fn a_fetched_copy_is_stale_while_the_kind_loads(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+
+    let _sync = publish_sync(cx, &t, SyncState::Loading);
+    wait_for_stale(cx, &t, "Still loading").await;
+}
+
+// covers UP-20, UP-23: an outage the subscription skipped (it only saw the kind current again)
+// still retries a held error, and further updates during a lasting failure wait their turn.
+#[gpui_kit::test]
+async fn a_held_error_retries_on_a_skipped_outage_within_a_limit(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    let v = view(cx, &t);
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::ui::detail::sync::error_retry_delay(16));
+    cx.run_until_parked();
+    wait_for_failed_fetch(cx, &t).await;
+
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    wait_for_failed_fetch(cx, &t).await;
+
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    cx.run_until_parked();
+    assert!(
+        v.read_with(cx, |v, _| {
+            matches!(&v.fetch, Fetch::Failed(e) if e == "connection refused")
+        }),
+        "the next retry waits"
+    );
+    cx.executor()
+        .advance_clock(crate::ui::detail::sync::error_retry_delay(16));
+    wait_for_failed_fetch(cx, &t).await;
+}
+
+// covers UP-20: the state's notice keeps the time after a long server error, with its values
+// hidden.
+#[gpui_kit::test]
+async fn the_stale_state_keeps_the_time_after_a_long_error(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+
+    let error = format!("refused \"hidden-value\" {}", "long ".repeat(200));
+    let _sync = publish_sync(cx, &t, SyncState::Reconnecting { error: Some(error) });
+    wait_for_stale(cx, &t, "Last updated").await;
+    let text = stale_banner(cx, &t).unwrap();
+    assert!(!text.contains("hidden-value"), "{text}");
+    assert!(text.ends_with("Ages are as of then."), "{text}");
+}
+
 // covers UP-04, UP-23: Cmd-R (Refresh and Retry Connection share it) fetches the shown object
 // again on a connected cluster, and retries the connection on a failed one.
 #[gpui_kit::test]

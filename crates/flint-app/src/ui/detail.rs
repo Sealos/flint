@@ -184,6 +184,12 @@ pub struct DetailView {
     freshness: sync::Freshness,
     /// When the copy shown was fetched.
     fetched_at: Option<jiff::Timestamp>,
+    /// Automatic fetches made since the last success, which space out the next one.
+    error_retries: u32,
+    /// The kind was seen current while an automatic fetch could not start yet.
+    error_retry_due: bool,
+    /// Runs until another automatic fetch may start.
+    _error_retry_cooldown: Option<Task<()>>,
     /// The object disappeared from the list (deleted).
     gone: bool,
     revealed: HashSet<String>,
@@ -269,6 +275,9 @@ impl DetailView {
             refresh_error: None,
             freshness,
             fetched_at: None,
+            error_retries: 0,
+            error_retry_due: false,
+            _error_retry_cooldown: None,
             gone: false,
             revealed: HashSet::new(),
             show_annotations: false,
@@ -388,6 +397,8 @@ impl DetailView {
                 }
                 if view.refetch {
                     view.refresh(window, cx);
+                } else if view.error_retry_due {
+                    view.retry_held_error(window, cx);
                 }
                 cx.notify();
             });
@@ -396,14 +407,59 @@ impl DetailView {
 
     /// The kind's sync state moved: redraw, and fetch again if the connection came back.
     fn sync_changed(&mut self, state: SyncState, window: &mut Window, cx: &mut Context<Self>) {
-        if *self.freshness.state() == state {
-            return;
+        if *self.freshness.state() != state {
+            if !state.is_current() {
+                self.error_retries = 0;
+            }
+            if self.freshness.update(state, self.holds_fetch_error()) {
+                self.refresh(window, cx);
+            }
+            cx.notify();
         }
-        let holds_error = matches!(self.fetch, Fetch::Failed(_)) || self.refresh_error.is_some();
-        if self.freshness.update(state, holds_error) {
+        self.retry_held_error(window, cx);
+    }
+
+    fn holds_fetch_error(&self) -> bool {
+        !self.gone && (matches!(self.fetch, Fetch::Failed(_)) || self.refresh_error.is_some())
+    }
+
+    /// Fetches again if the pane holds an error while its kind is current. A subscription can
+    /// skip a brief outage, so the pane cannot rely on seeing the kind come back. Only the kind's
+    /// updates start this, and [`sync::error_retry_delay`] spaces it out on a lasting failure.
+    fn retry_held_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.gone || !self.freshness.state().is_current() {
+            self.error_retry_due = false;
+        } else if self.fetching {
+            self.error_retry_due = true;
+        } else if !self.holds_fetch_error() {
+            self.error_retry_due = false;
+        } else if self._error_retry_cooldown.is_some() {
+            self.error_retry_due = true;
+        } else {
+            self.error_retry_due = false;
+            let timer = cx
+                .background_executor()
+                .timer(sync::error_retry_delay(self.error_retries));
+            self.error_retries = self.error_retries.saturating_add(1);
+            self._error_retry_cooldown = Some(cx.spawn_in(window, async move |this, cx| {
+                timer.await;
+                let _ = this.update_in(cx, |view, window, cx| {
+                    view._error_retry_cooldown = None;
+                    if view.error_retry_due {
+                        view.retry_held_error(window, cx);
+                    }
+                });
+            }));
             self.refresh(window, cx);
         }
-        cx.notify();
+    }
+
+    /// Whether to show the stale notice. A deleted object's own notice says what the copy is
+    /// once the connection is back, when "until it is fetched" could never come true.
+    fn shows_stale_notice(&self) -> bool {
+        self.freshness.is_stale()
+            && matches!(self.fetch, Fetch::Loaded { .. })
+            && !(self.gone && self.freshness.state().is_current())
     }
 
     /// `color`, or the muted colour while the copy shown may be out of date: a status from
@@ -429,8 +485,22 @@ impl DetailView {
         Button::new("detail-retry")
             .label("Retry")
             .xsmall()
-            .disabled(self.fetching)
+            .disabled(self.fetching || self.gone)
             .on_click(registry::on_click(Refresh))
+    }
+
+    /// The name now belongs to another object, so the one this pane is for was deleted. Its copy
+    /// stays, and the other object is neither shown nor available to an edit.
+    fn replaced(&mut self, cx: &mut Context<Self>) {
+        self.gone = true;
+        self.refetch = false;
+        self.error_retry_due = false;
+        self._error_retry_cooldown = None;
+        self.refresh_error = None;
+        if !matches!(self.fetch, Fetch::Loaded { .. }) {
+            self.fetch = Fetch::Failed(sync::REPLACED.to_owned());
+        }
+        self.run_pending(cx);
     }
 
     /// Shows a fetched object: what a fetch that succeeded ends with.
@@ -442,7 +512,14 @@ impl DetailView {
             managed,
             fetched_at,
         } = prepared;
+        if sync::is_other_object(&self.object, &detail.object) {
+            self.replaced(cx);
+            return;
+        }
         self.refresh_error = None;
+        self.error_retries = 0;
+        self.error_retry_due = false;
+        self._error_retry_cooldown = None;
         self.fetched_at = Some(fetched_at);
         self.freshness.fetched(self.refetch);
         // A re-render of the previous copy must not land after this one.
@@ -951,7 +1028,7 @@ impl DetailView {
         if let Some(waiting) = self.waiting() {
             notices.push(notice("detail-pending", waiting, theme.info));
         }
-        if self.freshness.is_stale() && matches!(self.fetch, Fetch::Loaded { .. }) {
+        if self.shows_stale_notice() {
             notices.push(notice_detail(
                 "detail-stale",
                 self.freshness.headline(),

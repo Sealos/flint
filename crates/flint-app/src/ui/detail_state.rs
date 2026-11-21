@@ -20,17 +20,14 @@ impl DetailView {
         if let Some(waiting) = self.waiting() {
             banners.push(Banner::new("detail-pending", Level::Info, waiting));
         }
-        if self.freshness.is_stale() && matches!(self.fetch, Fetch::Loaded { .. }) {
+        if self.shows_stale_notice() {
+            // Only the server's words are reduced, so a long error cannot cut off the time.
             let text = format!(
                 "{} {}",
-                self.freshness.headline(),
+                self.freshness.headline_with(error_text),
                 super::sync::last_updated(self.fetched_at)
             );
-            banners.push(Banner::new(
-                "detail-stale",
-                Level::Warning,
-                error_text(&text),
-            ));
+            banners.push(Banner::new("detail-stale", Level::Warning, text));
         }
         if let Some(error) = &self.refresh_error {
             banners.push(Banner::new(
