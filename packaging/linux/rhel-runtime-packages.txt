@@ -1,0 +1,5 @@
+# RHEL 9 family packages the AppImage needs from the host to start, the counterpart of
+# ubuntu-runtime-packages.txt. CI installs exactly these in a clean almalinux:9 container and runs
+# the smoke test there. diffutils provides the `cmp` the smoke test itself uses.
+libxcb
+diffutils

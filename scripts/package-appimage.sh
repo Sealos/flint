@@ -121,6 +121,22 @@ install -Dm644 "$runtime_license" "$appdir/usr/share/doc/appimage-runtime/LICENS
 # The binary must be called flint: the desktop file's Exec and the AppRun link point at it.
 test -x "$appdir/usr/bin/flint"
 
+# With FLINT_GLIBC_FLOOR set (scripts/build-linux-appimage.sh), no ELF file in the AppDir may ask
+# for a newer glibc symbol version: a single one would stop the AppImage on the oldest systems.
+if [ -n "${FLINT_GLIBC_FLOOR:-}" ]; then
+  newest=$(find "$appdir" -type f -exec sh -c 'head -c4 "$1" | grep -q "^.ELF" && readelf -W --version-info "$1"' _ {} \; |
+    grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n 1)
+  if [ -z "$newest" ]; then
+    echo "error: found no glibc symbol versions in $appdir" >&2
+    exit 1
+  fi
+  if [ "$(printf '%s\n%s\n' "$newest" "$FLINT_GLIBC_FLOOR" | sort -V | tail -n 1)" != "$FLINT_GLIBC_FLOOR" ]; then
+    echo "error: the AppDir needs glibc $newest, above the floor $FLINT_GLIBC_FLOOR" >&2
+    exit 1
+  fi
+  echo "glibc: newest symbol version $newest (floor $FLINT_GLIBC_FLOOR)"
+fi
+
 rm -f "$out"
 ARCH=$arch VERSION=$version "$tools/appimagetool-$APPIMAGETOOL_VERSION-$arch.AppImage" \
   --no-appstream \

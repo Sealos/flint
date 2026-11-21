@@ -11,18 +11,20 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
 - **What is bundled.** `scripts/package-appimage.sh` runs linuxdeploy, which copies the shared libraries the binary
   links and a desktop may lack (for example `libxkbcommon-x11`), and leaves out what must come from the host: glibc,
   GL and Vulkan drivers, fontconfig and freetype, libxcb (linuxdeploy's excludelist). Vulkan is loaded at run time
-  and is never bundled. The packages a minimal Debian or Ubuntu system needs for the rest are in
-  `packaging/linux/ubuntu-runtime-packages.txt`; CI and the release run the AppImage in a clean `ubuntu:24.04`
-  container with only those installed. appimagetool then wraps the AppDir with the AppImage type-2 runtime. All three tools are official
+  and is never bundled. The binary links none of the excluded libraries except libxcb, so that is the one package a
+  minimal system adds, listed in `packaging/linux/ubuntu-runtime-packages.txt` and
+  `packaging/linux/rhel-runtime-packages.txt`; CI and the release run the AppImage in clean AlmaLinux 9, Ubuntu 22.04,
+  Debian 12 and Ubuntu 24.04 containers with only those installed. appimagetool then wraps the AppDir with the AppImage type-2 runtime. All three tools are official
   releases from the linuxdeploy and AppImage GitHub organizations, pinned by version and SHA-256 in the script.
   The runtime is MIT-licensed and embedded in every AppImage, so its notice
   (`packaging/linux/appimage-runtime-LICENSE`, checked against the pinned tag) ships in the AppDir next to Flint's
   `LICENSE`; linuxdeploy copies the bundled libraries' copyright files.
-- **Built natively.** The release builds x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`; linuxdeploy
-  inspects the binary with the host's loader, so there is no cross-compiling. CI packages and smoke-tests the x86_64
-  AppImage on every pull request (`--version` and `mcp`, without FUSE).
-- **The MCP server alone, static.** Agents often run where the AppImage cannot: an older distribution (Ubuntu
-  22.04), or a container without fontconfig and libxcb. Each release therefore also ships `flint-mcp`, the GPUI-free
+- **Built natively, on the floor.** x86_64 runs on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`, each building
+  and packaging inside AlmaLinux 9 pinned by digest (`scripts/build-linux-appimage.sh`); linuxdeploy inspects the
+  binary with the container's loader, so there is no cross-compiling. CI packages and smoke-tests both AppImages when
+  the Rust code or the packaging changes (`--version` and `mcp`, without FUSE).
+- **The MCP server alone, static.** Agents often run where the AppImage cannot: a distribution older than glibc
+  2.34, or a container without libxcb. Each release therefore also ships `flint-mcp`, the GPUI-free
   server, as `flint-mcp-vX.Y.Z-<arch>-unknown-linux-musl.tar.gz` for x86_64 and aarch64. It is linked statically
   against musl, so it needs no library from the host, glibc included; rustls with ring is the only C code in its tree,
   and the runner's `musl-gcc` (Debian's `musl-tools`) compiles it. It is built natively on the same runners as the
@@ -51,12 +53,12 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
 ## Consequences
 
 - **Best effort.** Linux is supported on a best-effort basis. CI builds, tests (headless GPUI) and packages the app
-  on Linux, but nothing tests it on a real X11 or Wayland desktop, or across distributions. Bugs that only show on a
-  desktop are found by users.
-- **glibc floor.** The binary links the glibc of the build runner (Ubuntu 24.04, glibc 2.39), so older
-  distributions cannot run it. The runners are pinned to 24.04 rather than `ubuntu-latest`, which would raise the
-  floor silently when GitHub moves it. Building on an older image would lower the floor. The static `flint-mcp` has
-  no floor, so agents on older systems run that instead of `flint mcp`.
+  on Linux and starts it headless on four distributions, but nothing tests it on a real X11 or Wayland desktop. Bugs
+  that only show on a desktop are found by users.
+- **glibc floor: 2.34.** The binary links the glibc of the AlmaLinux 9 build image, so distributions older than that
+  cannot run it. The image is pinned by digest, and `scripts/package-appimage.sh` fails the build if any ELF file in
+  the AppDir asks for a newer glibc symbol version, so the floor cannot rise silently. The static `flint-mcp` has no
+  floor, so agents on older systems run that instead of `flint mcp`.
 - **musl's allocator.** The static `flint-mcp` uses musl's `malloc`, which is slower than glibc's under many
   threads. The server is mostly waiting on the API server, so this has not mattered; a faster allocator can be
   linked in if it does.

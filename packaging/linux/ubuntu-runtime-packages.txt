@@ -1,5 +1,5 @@
 # Ubuntu/Debian packages the AppImage needs from the host to start (the libraries `flint` links
-# that linuxdeploy leaves out; package-appimage.sh prints them). CI installs exactly these in a clean
-# ubuntu:24.04 container and runs the smoke test there; the README lists them. A desktop has them.
-libfontconfig1
+# that linuxdeploy leaves out, beyond glibc and libgcc; package-appimage.sh prints them). CI
+# installs exactly these in clean ubuntu:22.04, debian:12 and ubuntu:24.04 containers and runs the
+# smoke test there (smoke-appimage-distros.sh); the README lists them. A desktop has them.
 libxcb1

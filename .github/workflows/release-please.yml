@@ -148,8 +148,8 @@ jobs:
           retention-days: 30
 
   # One AppImage per architecture (ADR-0016), each built natively: linuxdeploy inspects the
-  # binary with the host's loader. Both on Ubuntu 24.04, not ubuntu-latest: the binary needs the
-  # build image's glibc (2.39) or newer, and the README promises that floor.
+  # binary with the host's loader. Both inside the pinned AlmaLinux 9 image: the binary needs
+  # that image's glibc (2.34) or newer, and the README promises that floor.
   build-linux:
     name: build-linux (${{ matrix.arch }})
     needs: release-please
@@ -174,34 +174,29 @@ jobs:
           ref: ${{ needs.release-please.outputs.tag_name }}
           # Keeps even the read-only token out of .git/config, away from cargo build scripts.
           persist-credentials: false
-      - uses: ./.github/actions/gpui-linux-deps
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # The key names the floor: objects built against a newer glibc must never be reused here.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ matrix.arch }}
-      - name: Release build
-        run: cargo build --release --locked -p flint-app
-      # On the ELF binary, before the AppImage compresses it (docs/TESTING.md).
-      - name: No automation channel
-        run: scripts/check-no-automation.sh ./target/release/flint
-      - name: Package
+          key: glibc-2.34-${{ matrix.arch }}
+      # Includes the check that the release binary has no automation channel (docs/TESTING.md).
+      - name: Build and package on the glibc floor
         run: |
-          scripts/package-appimage.sh target/release/flint "$VERSION" "${{ matrix.arch }}"
+          scripts/build-linux-appimage.sh "${{ matrix.arch }}"
           APPIMAGE="flint-${TAG}-linux-${{ matrix.arch }}.AppImage"
           test -f "$APPIMAGE"
           sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
           echo "APPIMAGE=$APPIMAGE" >> "$GITHUB_ENV"
+      - name: Install the documented host packages
+        run: |
+          sudo apt-get update -qq
+          grep -v '^#' packaging/linux/ubuntu-runtime-packages.txt |
+            xargs sudo apt-get install -y -qq --no-install-recommends
       - name: Smoke test
         run: scripts/smoke-appimage.sh "$APPIMAGE" "$VERSION"
-      # Again with only the host packages the README documents (see ci.yml).
-      - name: Smoke test in a clean Ubuntu 24.04
-        run: |
-          docker run --rm -v "$PWD:/w:ro" -w /w -e APPIMAGE -e VERSION -e DEBIAN_FRONTEND=noninteractive \
-            ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
-            bash -c 'apt-get update -qq &&
-              grep -v "^#" packaging/linux/ubuntu-runtime-packages.txt |
-                xargs apt-get install -y -qq --no-install-recommends >/dev/null &&
-              scripts/smoke-appimage.sh "$APPIMAGE" "$VERSION"'
+      # Again with only the documented host packages, down to the oldest supported distribution.
+      - name: Smoke test on each supported distribution
+        run: scripts/smoke-appimage-distros.sh "$APPIMAGE" "$VERSION"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-linux-${{ matrix.arch }}

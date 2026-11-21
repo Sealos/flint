@@ -154,44 +154,49 @@ jobs:
         run: cargo test -p flint-app --features automation --locked
 
   # The release build packaged as an AppImage, as release-please does, then run without FUSE:
-  # `--version` and `mcp` through the AppImage. x86_64 only; the release also builds aarch64. On
-  # Ubuntu 24.04 like the release, whose glibc sets the AppImage's floor.
+  # `--version` and `mcp` through the AppImage, on both architectures. Built in the pinned
+  # AlmaLinux 9 image like the release, whose glibc (2.34) sets the AppImage's floor. The cache
+  # key names the floor: objects built against a newer glibc must never be reused here.
   appimage:
-    name: appimage (x86_64)
+    name: appimage (${{ matrix.arch }})
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.appimage == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/gpui-linux-deps
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux-appimage
+          shared-key: linux-appimage-glibc-2.34-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Release build
-        run: cargo build --release --locked -p flint-app
-      # On the ELF binary: the AppImage compresses it, so its strings cannot be searched.
-      - name: Release binary has no automation channel
-        run: scripts/check-no-automation.sh ./target/release/flint
-      - name: Package
+      # Includes the check that the release binary has no automation channel.
+      - name: Build and package on the glibc floor
         run: |
-          VERSION=$(./target/release/flint --version | cut -d' ' -f2)
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          scripts/package-appimage.sh target/release/flint "$VERSION" x86_64
+          scripts/build-linux-appimage.sh "${{ matrix.arch }}"
+          APPIMAGE=$(ls flint-v*-linux-${{ matrix.arch }}.AppImage)
+          VERSION=${APPIMAGE#flint-v}
+          VERSION=${VERSION%-linux-*}
+          { echo "APPIMAGE=$APPIMAGE"; echo "VERSION=$VERSION"; } >> "$GITHUB_ENV"
+      - name: Install the documented host packages
+        run: |
+          sudo apt-get update -qq
+          grep -v '^#' packaging/linux/ubuntu-runtime-packages.txt |
+            xargs sudo apt-get install -y -qq --no-install-recommends
       - name: Smoke test
-        run: scripts/smoke-appimage.sh "flint-v$VERSION-linux-x86_64.AppImage" "$VERSION"
-      # The runner has every -dev package installed, so the test above cannot catch a library the
-      # AppImage expects from the host. Run it again where only the documented packages are.
-      - name: Smoke test in a clean Ubuntu 24.04
-        run: |
-          docker run --rm -v "$PWD:/w:ro" -w /w -e VERSION -e DEBIAN_FRONTEND=noninteractive \
-            ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
-            bash -c 'apt-get update -qq &&
-              grep -v "^#" packaging/linux/ubuntu-runtime-packages.txt |
-                xargs apt-get install -y -qq --no-install-recommends >/dev/null &&
-              scripts/smoke-appimage.sh "flint-v$VERSION-linux-x86_64.AppImage" "$VERSION"'
+        run: scripts/smoke-appimage.sh "$APPIMAGE" "$VERSION"
+      # Clean containers hold only the documented packages, so a library the AppImage expects
+      # from the host cannot go unnoticed, down to the oldest supported distribution.
+      - name: Smoke test on each supported distribution
+        run: scripts/smoke-appimage-distros.sh "$APPIMAGE" "$VERSION"
 
   # The static musl `flint-mcp` the release ships for Linux, built and checked as release-please
   # does: in a bare Ubuntu 22.04, `--version`, `initialize` and the MCP e2e tests on the fake API

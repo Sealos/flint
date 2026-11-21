@@ -256,7 +256,7 @@ Security** and choose **Open Anyway**.
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 or later).
+needs glibc 2.34 or newer. CI starts it on AlmaLinux 9 (RHEL 9 compatible), Ubuntu 22.04, Debian 12 and Ubuntu 24.04.
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64
@@ -266,11 +266,12 @@ flint --version
 flint                                   # opens the window
 ```
 
-**Host libraries.** The AppImage bundles what a desktop may lack, but takes glibc, fontconfig and libxcb from the
-host; without them it does not start at all, not even `--version` or `mcp`. Every desktop has them. On a minimal or
-headless system install them (on Debian and Ubuntu: `libfontconfig1 libxcb1`, listed in
-[`packaging/linux/ubuntu-runtime-packages.txt`](packaging/linux/ubuntu-runtime-packages.txt); CI runs the AppImage in
-a clean `ubuntu:24.04` with only those). The window also needs an X11 or Wayland session and a GPU driver with
+**Host libraries.** The AppImage bundles what a desktop may lack, but takes glibc and libxcb from the host; without
+them it does not start at all, not even `--version` or `mcp`. Every desktop has them. On a minimal or headless system
+install libxcb (`libxcb1` on Debian and Ubuntu, `libxcb` on the RHEL 9 family, listed in
+[`packaging/linux/ubuntu-runtime-packages.txt`](packaging/linux/ubuntu-runtime-packages.txt) and
+[`packaging/linux/rhel-runtime-packages.txt`](packaging/linux/rhel-runtime-packages.txt); CI runs the AppImage in clean
+containers with only those). The window also needs an X11 or Wayland session, installed fonts and a GPU driver with
 Vulkan or OpenGL ES (Mesa on most systems). To run only the MCP server on a headless system, an older distribution or
 in a container, use the [static `flint-mcp`](#linux-mcp-server-only-flint-mcp) instead: it needs none of these.
 
@@ -294,7 +295,7 @@ state live in `~/.config/flint/` (`$XDG_CONFIG_HOME/flint/`).
 Releases after v0.2.1 also have the MCP server on its own, for x86_64 and aarch64:
 `flint-mcp-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` and `flint-mcp-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`. It is
 the same read-only server as `flint mcp`, without the desktop app. It is a static binary that needs no system
-libraries, not even glibc, so it runs where the AppImage does not: Ubuntu 22.04 and other older distributions, minimal
+libraries, not even glibc, so it runs where the AppImage does not: distributions older than glibc 2.34, minimal
 containers and devcontainers. CI runs it in a bare `ubuntu:22.04`. A kubeconfig without `certificate-authority-data`
 relies on the system's CA certificates, so a minimal image needs `ca-certificates` installed (or the cluster's CA in
 the kubeconfig). The archive includes musl's license (`LICENSE-MUSL`), since the binary links it statically.
@@ -502,8 +503,9 @@ any change to the CI files themselves, run everything.
 
 - **CI (Linux):** `cargo fmt --check`, and for `flint-core` and `flint-mcp`: clippy with `-D warnings`,
   `cargo test -p <crate>` as a separate job per crate, and `cargo doc` with `-D warnings`. For the app,
-  `linux (flint-app)` runs its clippy and view tests, and `appimage (x86_64)` packages a release build with
-  `scripts/package-appimage.sh` and smoke-tests it with `scripts/smoke-appimage.sh`.
+  `linux (flint-app)` runs its clippy and view tests, and `appimage (x86_64)` and `appimage (aarch64)` package a
+  release build on the glibc floor with `scripts/build-linux-appimage.sh` and smoke-test it on each supported
+  distribution with `scripts/smoke-appimage-distros.sh`.
 - **CI (macOS), one job, `macos (flint-app)`:** the app's clippy, view tests and docs, and a release build. macOS
   runners cost about ten times as much as Linux ones, so only work that needs macOS runs there.
 - **macOS packaging, `macos-app (dmg)`:** on PRs that touch the DMG packaging, packages `Flint.app` and its DMG and

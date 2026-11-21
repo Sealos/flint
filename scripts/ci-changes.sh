@@ -80,6 +80,7 @@ while IFS= read -r path; do
   esac
   case "$path" in
     scripts/package-appimage.sh | scripts/smoke-appimage.sh | packaging/linux/* | \
+      scripts/build-linux-appimage.sh | scripts/smoke-appimage-distros.sh | \
       scripts/package-mcp-linux.sh | scripts/smoke-mcp-linux.sh | scripts/test-mcp-linux.sh)
       turn_on appimage
       ;;

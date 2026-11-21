@@ -1,0 +1,21 @@
+# AlmaLinux 9 packages scripts/build-linux-appimage.sh installs to build and package the app on the
+# glibc floor: the compiler, GPUI's system libraries, and the tools package-appimage.sh runs.
+gcc
+gcc-c++
+pkgconf-pkg-config
+fontconfig-devel
+freetype-devel
+libxkbcommon-devel
+libxkbcommon-x11-devel
+wayland-devel
+libX11-devel
+libxcb-devel
+vulkan-loader-devel
+alsa-lib-devel
+openssl-devel
+libzstd-devel
+binutils
+diffutils
+file
+findutils
+util-linux
