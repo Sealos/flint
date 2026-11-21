@@ -365,10 +365,10 @@ pub(super) fn menu(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<String> {
             let Some(item) = menu.try_find(ix) else {
                 break;
             };
-            // A note that wraps carries its label on the element inside the item.
+            // A note that wraps carries its text as the value of the label inside the item.
             let label = item.label().map(str::to_owned).or_else(|| {
                 let note = menu.within(ix).try_find(crate::ui::row_menu::MENU_NOTE)?;
-                note.label().map(str::to_owned)
+                note.value().map(str::to_owned)
             });
             rows.push(label.unwrap_or_default());
         }

@@ -1334,7 +1334,7 @@ fn key_value(
 /// middle must stay apart, and menu items neither wrap nor shrink. A container's name is at most
 /// 63 characters; the picker never grows past the window.
 pub(in crate::ui) fn fit_container_names(menu: PopupMenu, window: &Window) -> PopupMenu {
-    const WIDEST: Pixels = px(880.);
+    const WIDEST: Pixels = px(1000.);
     let room = window.viewport_size().width - px(16.);
     menu.max_w(if room < WIDEST { room } else { WIDEST })
 }

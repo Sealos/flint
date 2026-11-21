@@ -54,7 +54,7 @@ const REASON_WIDTH: Pixels = px(460.);
 pub(in crate::ui) const MENU_NOTE: &str = "row-menu-note";
 
 /// The most of a pod's name the Shell entry shows, with its key, inside the menu's width.
-const SHELL_POD_NAME: usize = 36;
+const SHELL_POD_NAME: usize = 28;
 
 /// Whether rows of `kind` get the menu: pods and workloads.
 pub fn has_row_actions(kind: &KindId) -> bool {
@@ -264,12 +264,12 @@ fn say(menu: PopupMenu, text: &str) -> PopupMenu {
     let text = SharedString::from(text.to_owned());
     menu.item(
         PopupMenuItem::element(move |_, _| {
-            // A custom item has no accessible name of its own: its text carries it.
+            // A custom item has no accessible name of its own: it takes it from this label's value.
             div()
                 .id(MENU_NOTE)
                 .test_support()
                 .role(Role::Label)
-                .aria_label(text.clone())
+                .aria_value(text.clone())
                 .max_w(REASON_WIDTH)
                 .child(text.clone())
         })
