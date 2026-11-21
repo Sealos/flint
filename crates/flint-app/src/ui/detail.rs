@@ -505,6 +505,7 @@ impl DetailView {
                             .on_click(registry::on_click(Close)),
                     ),
             )
+            .children(self.render_managed_by(theme))
             .children(self.render_captions(theme))
             .child(
                 TabBar::new("detail-tabs")
@@ -525,6 +526,32 @@ impl DetailView {
                         }
                     }),
             )
+    }
+
+    /// "managed by Argo CD: shop" or "managed by Flux: flux-system/apps", for a loaded object a
+    /// GitOps controller manages, on its own line so it never crowds the header's buttons. Long
+    /// names are cut; the tooltip has the whole text.
+    fn render_managed_by(&self, theme: &Theme) -> Option<AnyElement> {
+        let Fetch::Loaded { overview, .. } = &self.fetch else {
+            return None;
+        };
+        let text = format!("managed by {}", overview.managed_by.as_ref()?);
+        let full: SharedString = text.clone().into();
+        Some(
+            div()
+                .id("detail-managed-by")
+                .px_3()
+                .pb_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .truncate()
+                .child(text.clone())
+                .test_text(text)
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                .test_support()
+                .into_any_element(),
+        )
     }
 
     /// For pods: Logs, with a container picker when the pod has several containers or a

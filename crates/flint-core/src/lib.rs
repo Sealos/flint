@@ -15,6 +15,7 @@ pub mod display;
 pub mod env_path;
 pub mod events;
 pub mod exec;
+pub mod gitops;
 pub mod handle;
 pub mod kubeconfig;
 mod logging;
