@@ -910,7 +910,13 @@ impl DetailView {
                     .id("yaml-edit-editor")
                     .test_support()
                     .size_full()
-                    .child(Editor::new(&edit.editor).bordered(false).h_full())
+                    .child(
+                        Editor::new(&edit.editor)
+                            // What Review sent is what its diff shows.
+                            .readonly(matches!(edit.phase, edit::Phase::Reviewing))
+                            .bordered(false)
+                            .h_full(),
+                    )
                     .into_any_element(),
             },
         }
@@ -920,13 +926,13 @@ impl DetailView {
     fn render_edit_message(&self, theme: &Theme) -> Option<AnyElement> {
         let edit = self.edit.as_ref()?;
         let conflict = matches!(edit.phase, edit::Phase::Conflict);
-        let text = if conflict {
-            "This object changed since you opened it, so nothing was applied. Reload keeps your \
+        let text = match (&edit.error, conflict) {
+            (Some(error), _) => error.clone(),
+            (None, true) => "This object changed since you opened it, so nothing was applied. Reload keeps your \
              edit and shows its diff against the current object, including any change it would \
              undo."
-                .to_owned()
-        } else {
-            edit.error.clone()?
+                .to_owned(),
+            (None, false) => return None,
         };
         let color = if conflict {
             theme.warning

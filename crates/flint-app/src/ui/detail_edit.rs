@@ -6,6 +6,7 @@
 //! be written back.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use flint_core::ObjectDetail;
 use flint_core::write::WriteTarget;
@@ -62,16 +63,44 @@ pub(super) fn editable_yaml(object: &Value) -> Result<String, String> {
     serde_saphyr::to_string(&shown).map_err(|e| format!("cannot render YAML: {e}"))
 }
 
-/// `yaml` with `metadata.resourceVersion` set to `version`, every other line as typed.
+/// `yaml` with `metadata.resourceVersion` set to `version`, every other line as typed. A form the
+/// line edit cannot reach (flow style, a quoted key) is rendered again from its parsed value.
 pub(super) fn with_resource_version(yaml: &str, version: &str) -> String {
+    let moved = replace_version_line(yaml, version);
+    let Ok(mut parsed) = serde_saphyr::from_str::<Value>(&moved) else {
+        // Not valid YAML: the review says so.
+        return moved;
+    };
+    let at = parsed.pointer("/metadata/resourceVersion");
+    if at.and_then(Value::as_str) == Some(version) {
+        return moved;
+    }
+    let Some(metadata) = parsed.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return moved;
+    };
+    metadata.insert("resourceVersion".to_owned(), version.into());
+    serde_saphyr::to_string(&parsed).unwrap_or(moved)
+}
+
+/// Rewrites the `resourceVersion:` line among `metadata`'s direct children, not a nested key.
+fn replace_version_line(yaml: &str, version: &str) -> String {
     let mut in_metadata = false;
+    let mut child_indent = None;
     let mut out = String::with_capacity(yaml.len() + version.len());
     for line in yaml.split_inclusive('\n') {
-        if !line.starts_with([' ', '\t', '#', '\n', '\r']) {
-            in_metadata = line.trim_end().trim_end_matches(' ') == "metadata:";
-        }
         let indent = line.len() - line.trim_start_matches(' ').len();
-        if in_metadata && indent > 0 && line[indent..].starts_with("resourceVersion:") {
+        let body = line[indent..].trim_end();
+        if body.is_empty() || body.starts_with('#') {
+            out.push_str(line);
+            continue;
+        }
+        if indent == 0 {
+            in_metadata = body == "metadata:";
+            child_indent = None;
+        } else if in_metadata && child_indent.is_none() {
+            child_indent = Some(indent);
+        }
+        if in_metadata && child_indent == Some(indent) && body.starts_with("resourceVersion:") {
             let end = if line.ends_with('\n') { "\n" } else { "" };
             out.push_str(&format!(
                 "{}resourceVersion: \"{version}\"{end}",
@@ -84,17 +113,33 @@ pub(super) fn with_resource_version(yaml: &str, version: &str) -> String {
     out
 }
 
-/// The review's change as a file for the diff view, or `None` if it changes nothing.
-fn diff_file(name: &str, before: &str, after: &str) -> Option<DiffFile> {
+/// Whether the text sets `status`, which a review cannot show: the editor opens without it.
+fn sets_status(yaml: &str) -> bool {
+    serde_saphyr::from_str::<Value>(yaml).is_ok_and(|value| value.get("status").is_some())
+}
+
+/// The longest a review's diff may take: past it, the diff is coarser but still correct.
+const DIFF_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The change as a unified patch, or `None` if it changes nothing. Off the UI thread: a large
+/// value replaced can take long.
+fn patch(name: &str, before: &str, after: &str) -> Option<String> {
     if before == after {
         return None;
     }
-    let patch = similar::TextDiff::from_lines(before, after)
+    let diff = similar::TextDiff::configure()
+        .timeout(DIFF_DEADLINE)
+        .diff_lines(before, after);
+    let patch = diff
         .unified_diff()
         .context_radius(3)
         .header(&format!("a/{name}.yaml"), &format!("b/{name}.yaml"))
         .to_string();
-    let file = DiffFile::parse(&patch).ok()?.into_iter().next()?;
+    Some(patch)
+}
+
+fn diff_file(patch: &str) -> Option<DiffFile> {
+    let file = DiffFile::parse(patch).ok()?.into_iter().next()?;
     Some(file.with_language("yaml"))
 }
 
@@ -225,26 +270,45 @@ impl DetailView {
             return;
         };
         let yaml = edit.editor.read(cx).value().to_string();
+        if sets_status(&yaml) {
+            edit.error = Some("Remove status: it cannot be edited here.".to_owned());
+            cx.notify();
+            return;
+        }
         edit.phase = Phase::Reviewing;
         edit.error = None;
         let run = core.review_write(edit.target.clone(), WriteProposal::ApplyYaml { yaml });
+        let name = self.object.name.clone();
         edit._task = cx.spawn(async move |this, cx| {
             let result = run.await;
-            let _ = this.update(cx, |view, cx| view.edit_reviewed(result, cx));
+            let shown = result
+                .as_ref()
+                .ok()
+                .and_then(texts)
+                .map(|(before, after)| (before.to_owned(), after.to_owned()));
+            let patch = cx
+                .background_spawn(async move {
+                    shown.and_then(|(before, after)| patch(&name, &before, &after))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| view.edit_reviewed(result, patch, cx));
         });
         cx.notify();
     }
 
-    fn edit_reviewed(&mut self, result: Result<WriteReview, WriteError>, cx: &mut Context<Self>) {
-        let name = self.object.name.clone();
+    fn edit_reviewed(
+        &mut self,
+        result: Result<WriteReview, WriteError>,
+        patch: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(edit) = &mut self.edit else {
             return;
         };
         match result {
             Ok(review) => {
                 edit.target = review.target().clone();
-                let file = texts(&review).and_then(|(a, b)| diff_file(&name, a, b));
-                match file {
+                match patch.as_deref().and_then(diff_file) {
                     Some(file) => {
                         edit.diff.update(cx, |diff, cx| diff.set_files([file], cx));
                         edit.phase = Phase::Reviewed(Box::new(review));
@@ -393,7 +457,7 @@ impl DetailView {
 mod tests {
     use serde_json::json;
 
-    use super::{diff_file, editable_yaml, with_resource_version};
+    use super::{editable_yaml, patch, sets_status, with_resource_version};
 
     // covers UP-51: the editor opens without status or managedFields, at its version.
     #[test]
@@ -426,7 +490,31 @@ mod tests {
 
     #[test]
     fn a_review_without_a_change_has_no_diff() {
-        assert!(diff_file("a", "x: 1\n", "x: 1\n").is_none());
-        assert!(diff_file("a", "x: 1\n", "x: 2\n").is_some());
+        assert!(patch("a", "x: 1\n", "x: 1\n").is_none());
+        assert!(patch("a", "x: 1\n", "x: 2\n").is_some());
+    }
+
+    #[test]
+    fn a_reload_leaves_a_nested_version_key() {
+        let yaml = "metadata:\n  annotations:\n    resourceVersion: keep\n  name: a\n  \
+                    resourceVersion: \"7\"\n";
+        let moved = with_resource_version(yaml, "8");
+        assert!(moved.contains("resourceVersion: keep"), "{moved}");
+        assert!(moved.contains("resourceVersion: \"8\""), "{moved}");
+    }
+
+    #[test]
+    fn a_reload_reaches_a_flow_style_version() {
+        let moved = with_resource_version("metadata: {name: a, resourceVersion: \"7\"}\n", "8");
+        let value: serde_json::Value = serde_saphyr::from_str(&moved).unwrap();
+        assert_eq!(value["metadata"]["resourceVersion"], "8", "{moved}");
+        assert_eq!(value["metadata"]["name"], "a", "{moved}");
+    }
+
+    // A review hides status, so an edit that sets it is not sent.
+    #[test]
+    fn an_edit_that_sets_status_is_recognised() {
+        assert!(sets_status("kind: X\nstatus:\n  phase: Ready\n"));
+        assert!(!sets_status("kind: X\nspec:\n  status: keep\n"));
     }
 }

@@ -151,12 +151,23 @@ struct EditFixture {
 
 impl EditFixture {
     fn create(kubeconfig: &std::path::Path) -> Result<EditFixture> {
+        let namespace = format!("flint-e2e-edit-{}", std::process::id());
+        let created = std::process::Command::new("kubectl")
+            .arg("--kubeconfig")
+            .arg(kubeconfig)
+            .args(["create", "namespace", &namespace])
+            .output()?;
+        // Before the guard exists: a namespace this run did not create is never deleted.
+        anyhow::ensure!(
+            created.status.success(),
+            "kubectl create namespace: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
         let fixture = EditFixture {
             kubeconfig: kubeconfig.to_owned(),
-            namespace: format!("flint-e2e-edit-{}", std::process::id()),
+            namespace,
         };
         let ns = fixture.namespace.clone();
-        fixture.kubectl(&["create", "namespace", &ns])?;
         fixture.kubectl(&[
             "create",
             "configmap",
@@ -229,6 +240,7 @@ fn up_51_52_edit_review_apply_and_conflict_on_kind() -> Result<()> {
     };
     // Refuses a context that is not a local cluster, and gives the app only that context.
     let cluster = TestCluster::kind(std::path::Path::new(&kubeconfig))?;
+    cluster.verify_local_kind()?;
     let fixture = EditFixture::create(&cluster.kubeconfig)?;
     let ns = fixture.namespace.as_str();
     let context = cluster.context.as_str();
