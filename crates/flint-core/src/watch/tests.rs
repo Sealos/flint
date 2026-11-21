@@ -584,6 +584,105 @@ async fn errors_back_off_and_show_reconnecting() {
     task.abort();
 }
 
+/// A server message with a quoted value, a token and a second line.
+const NOISY_MESSAGE: &str =
+    "denied value \"quoted-value\" Authorization: Bearer abcdefghijklmnop\nsecond line";
+
+fn assert_clean(text: &str) {
+    assert!(!text.contains("quoted-value"), "{text}");
+    assert!(!text.contains("abcdefghijklmnop"), "{text}");
+    assert!(!text.contains("second line"), "{text}");
+    assert!(!text.chars().any(char::is_control), "{text}");
+    assert!(text.contains("denied value"), "{text}");
+}
+
+fn reconnecting_error(snap: &KindSnapshot) -> Option<&str> {
+    match &snap.state {
+        SyncState::Reconnecting { error } => error.as_deref(),
+        _ => None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_error_event_in_a_stream_shows_clean_text() {
+    for (code, reason) in [
+        (500, "InternalError"),
+        (403, "Forbidden"),
+        (404, "NotFound"),
+    ] {
+        let fake = Fake::new();
+        fake.list(
+            "pods",
+            pod_table(&[("u1", "demo", "a", "Running")], true, "10"),
+        );
+        let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+        until(&mut rx, |s| s.state == SyncState::Synced).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fake.sender("pods")
+            .unwrap()
+            .send(event(
+                "ERROR",
+                json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+                       "message":NOISY_MESSAGE,"reason":reason,"code":code}),
+            ))
+            .unwrap();
+        let snap = until(&mut rx, |s| reconnecting_error(s).is_some()).await;
+        assert_clean(reconnecting_error(&snap).unwrap());
+        task.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_list_shows_clean_text() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", FetchError::Denied(NOISY_MESSAGE.into()));
+    }
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let snap = until(&mut rx, |s| reconnecting_error(s).is_some()).await;
+    assert_clean(reconnecting_error(&snap).unwrap());
+    let snap = until(&mut rx, |s| matches!(s.state, SyncState::Failed { .. })).await;
+    let SyncState::Failed { error } = &snap.state else {
+        unreachable!()
+    };
+    assert_clean(error);
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_namespace_limited_list_shows_clean_text() {
+    let fake = Fake::new();
+    for _ in 0..10 {
+        fake.list_error("pods", FetchError::Denied(NOISY_MESSAGE.into()));
+    }
+    let (_scope_tx, scope) = tokio::sync::watch::channel::<Arc<[String]>>(Arc::from(Vec::new()));
+    let (task, mut rx, _) = start_engine_with(&fake, pods(), Feed::Watch, Some(scope));
+    let snap = until(&mut rx, |s| {
+        matches!(s.state, SyncState::Failed { .. }) && s.limited_to.is_some()
+    })
+    .await;
+    let SyncState::Failed { error } = &snap.state else {
+        unreachable!()
+    };
+    assert_clean(error);
+    assert!(error.contains("namespace filter"), "{error}");
+    assert_clean(&snap.limited_to.as_ref().unwrap().reason);
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_very_long_list_error_is_cut() {
+    let fake = Fake::new();
+    // Enough failures in a row that one outlasts the publish interval.
+    for _ in 0..50 {
+        fake.list_error("pods", FetchError::Other("é".repeat(100_000)));
+    }
+    let (task, mut rx) = start_engine(&fake, pods(), Feed::Watch);
+    let snap = until(&mut rx, |s| reconnecting_error(s).is_some()).await;
+    assert!(reconnecting_error(&snap).unwrap().chars().count() <= 201);
+    task.abort();
+}
+
 // covers UP-28
 #[tokio::test(start_paused = true)]
 async fn apis_that_cannot_watch_are_polled() {
