@@ -1,16 +1,15 @@
 //! The bodies of the resource actions (UP-53): delete, scale, rollout restart, cordon, uncordon
 //! and drain.
 //!
-//! Every request that changes the cluster first asks the write gate ([`GatedWrites::client`]),
-//! so a drain stops at the next eviction once its cluster is locked. Each action names the object
+//! Every request first asks the write gate ([`ActionGate::client`]) and never keeps the client,
+//! so a drain stops at its next request once its cluster is locked. Each action names the object
 //! the user reviewed by its uid, and where the API allows it its `resourceVersion`: a conflict
 //! comes back as [`ActionError::Conflict`], for the review to open again. Nothing here retries.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
-use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, EvictParams, ListParams, Patch, PatchParams,
@@ -20,7 +19,7 @@ use kube::{Client, ResourceExt as _};
 use serde_json::json;
 
 use crate::cluster::ClusterError;
-use crate::protection::{GatedClient, WriteRefusal};
+use crate::protection::WriteRefusal;
 
 /// Who changed the object, as the API server records it.
 const FIELD_MANAGER: &str = "flint";
@@ -31,31 +30,10 @@ const RESTARTED_AT: &str = "kubectl.kubernetes.io/restartedAt";
 /// The annotation the kubelet puts on a static pod's mirror, which the API cannot evict.
 const MIRROR_POD: &str = "kubernetes.io/config.mirror";
 
-/// Asks the write gate whether the session's cluster may be changed now.
-pub(crate) type WriteCheck =
-    Arc<dyn Fn() -> BoxFuture<'static, Result<(), WriteRefusal>> + Send + Sync>;
-
-/// A client that passed the gate, and the check every write asks again.
-pub(crate) struct GatedWrites {
-    client: GatedClient,
-    check: WriteCheck,
-}
-
-impl GatedWrites {
-    pub(crate) fn new(client: GatedClient, check: WriteCheck) -> Self {
-        Self { client, check }
-    }
-
-    /// The client for one write, if the gate allows it now.
-    async fn client(&self) -> Result<Client, ActionError> {
-        (self.check)().await.map_err(ActionError::Refused)?;
-        Ok(self.client.clone().into_client())
-    }
-
-    /// The client for a request that only reads.
-    fn reader(&self) -> Client {
-        self.client.clone().into_client()
-    }
+/// The write gate, asked before each request of one action.
+pub(crate) trait ActionGate: Send {
+    /// A client for the next request, if the gate allows it now. Never keep it.
+    fn client(&mut self) -> impl Future<Output = Result<Client, ActionError>> + Send;
 }
 
 /// The object an action was reviewed for.
@@ -125,8 +103,11 @@ fn uid_precondition(uid: &str) -> Preconditions {
 }
 
 /// Deletes `object`, if it is still the one with its uid.
-pub(crate) async fn delete(writes: &GatedWrites, object: &ActionObject) -> Result<(), ActionError> {
-    let client = writes.client().await?;
+pub(crate) async fn delete(
+    gate: &mut impl ActionGate,
+    object: &ActionObject,
+) -> Result<(), ActionError> {
+    let client = gate.client().await?;
     let params = DeleteParams {
         preconditions: Some(uid_precondition(&object.uid)),
         ..Default::default()
@@ -141,11 +122,11 @@ pub(crate) async fn delete(writes: &GatedWrites, object: &ActionObject) -> Resul
 
 /// Sets `object`'s replicas through its `scale` subresource.
 pub(crate) async fn scale(
-    writes: &GatedWrites,
+    gate: &mut impl ActionGate,
     object: &ActionObject,
     replicas: u32,
 ) -> Result<(), ActionError> {
-    let client = writes.client().await?;
+    let client = gate.client().await?;
     let mut metadata = json!({ "uid": object.uid });
     if let Some(version) = &object.resource_version {
         metadata["resourceVersion"] = json!(version);
@@ -161,7 +142,7 @@ pub(crate) async fn scale(
 
 /// Restarts a Deployment's, DaemonSet's or StatefulSet's pods, as `kubectl rollout restart`.
 pub(crate) async fn rollout_restart(
-    writes: &GatedWrites,
+    gate: &mut impl ActionGate,
     object: &ActionObject,
 ) -> Result<(), ActionError> {
     let resource = &object.resource;
@@ -176,7 +157,7 @@ pub(crate) async fn rollout_restart(
             resource.plural
         )));
     }
-    let client = writes.client().await?;
+    let client = gate.client().await?;
     let now = jiff::Timestamp::now().to_string();
     let patch = json!({
         "metadata": { "uid": object.uid },
@@ -192,11 +173,11 @@ pub(crate) async fn rollout_restart(
 
 /// Marks a node unschedulable, or schedulable again.
 pub(crate) async fn set_cordoned(
-    writes: &GatedWrites,
+    gate: &mut impl ActionGate,
     node: &ActionObject,
     cordoned: bool,
 ) -> Result<(), ActionError> {
-    let client = writes.client().await?;
+    let client = gate.client().await?;
     // By uid only: a node's resourceVersion moves with every status update.
     let patch = json!({
         "metadata": { "uid": node.uid },
@@ -319,18 +300,25 @@ fn pod_name(pod: &Pod) -> PodName {
 /// Cordons `node` and evicts its pods through the Eviction API, one try each. Ends with what was
 /// done, also when the gate closes on the way.
 pub(crate) async fn drain(
-    writes: &GatedWrites,
+    gate: &mut impl ActionGate,
     node: &ActionObject,
     options: &DrainOptions,
 ) -> DrainReport {
     let mut report = DrainReport::default();
-    if let Err(error) = set_cordoned(writes, node, true).await {
+    if let Err(error) = set_cordoned(gate, node, true).await {
         report.stopped = Some(error);
         return report;
     }
     report.cordoned = true;
 
-    let listed = Api::<Pod>::all(writes.reader())
+    let client = match gate.client().await {
+        Ok(client) => client,
+        Err(error) => {
+            report.stopped = Some(error);
+            return report;
+        }
+    };
+    let listed = Api::<Pod>::all(client)
         .list(&ListParams::default().fields(&format!("spec.nodeName={}", node.name)))
         .await;
     let pods = match listed {
@@ -354,7 +342,7 @@ pub(crate) async fn drain(
     let mut pods = to_evict.into_iter();
     while let Some(pod) = pods.next() {
         let name = pod_name(&pod);
-        let client = match writes.client().await {
+        let client = match gate.client().await {
             Ok(client) => client,
             Err(error) => {
                 report.remaining.push(name);
@@ -380,7 +368,9 @@ pub(crate) async fn drain(
             }
         }
     }
-    report.terminating = wait_until_gone(writes.reader(), accepted, options).await;
+    let (terminating, stopped) = wait_until_gone(gate, accepted, options).await;
+    report.terminating = terminating;
+    report.stopped = stopped;
     report
 }
 
@@ -399,11 +389,27 @@ async fn evict(client: Client, pod: &Pod) -> Result<(), kube::Error> {
         .map(drop)
 }
 
-/// Waits for `pods` to go, or for their name to be someone else's. Returns those still there.
-async fn wait_until_gone(client: Client, pods: Vec<Pod>, options: &DrainOptions) -> Vec<PodName> {
+/// Waits for `pods` to go, or for their name to be someone else's. Returns those still there,
+/// and the refusal if the gate closed meanwhile.
+async fn wait_until_gone(
+    gate: &mut impl ActionGate,
+    pods: Vec<Pod>,
+    options: &DrainOptions,
+) -> (Vec<PodName>, Option<ActionError>) {
+    let names = |pods: &[Pod]| {
+        let names: BTreeSet<PodName> = pods.iter().map(pod_name).collect();
+        names.into_iter().collect::<Vec<_>>()
+    };
     let deadline = Instant::now() + options.wait;
     let mut left: Vec<Pod> = pods;
     loop {
+        if left.is_empty() {
+            return (Vec::new(), None);
+        }
+        let client = match gate.client().await {
+            Ok(client) => client,
+            Err(error) => return (names(&left), Some(error)),
+        };
         let mut still = Vec::new();
         for pod in left {
             let api = Api::<Pod>::namespaced(client.clone(), &pod.namespace().unwrap_or_default());
@@ -416,8 +422,7 @@ async fn wait_until_gone(client: Client, pods: Vec<Pod>, options: &DrainOptions)
         }
         left = still;
         if left.is_empty() || Instant::now() >= deadline {
-            let names: BTreeSet<PodName> = left.iter().map(pod_name).collect();
-            return names.into_iter().collect();
+            return (names(&left), None);
         }
         tokio::time::sleep(options.poll).await;
     }
@@ -425,16 +430,14 @@ async fn wait_until_gone(client: Client, pods: Vec<Pod>, options: &DrainOptions)
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use futures::FutureExt as _;
     use http::{Request, Response};
     use kube::client::Body;
     use serde_json::Value;
 
     use super::*;
-    use crate::protection::{Protection, WriteAccess};
 
     /// A request the fake API server saw.
     #[derive(Debug, Clone)]
@@ -474,15 +477,24 @@ mod tests {
         (Client::new(service, "default"), log)
     }
 
-    fn writes(client: Client, closed: Arc<AtomicBool>) -> GatedWrites {
-        let gated = WriteAccess::new(client)
-            .grant(Protection::Local, "dev")
-            .unwrap();
-        let check: WriteCheck = Arc::new(move || {
-            let closed = closed.load(Ordering::SeqCst);
-            async move { if closed { Err(refusal()) } else { Ok(()) } }.boxed()
-        });
-        GatedWrites::new(gated, check)
+    /// A gate the test closes with its flag.
+    struct TestGate {
+        client: Client,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl ActionGate for TestGate {
+        async fn client(&mut self) -> Result<Client, ActionError> {
+            if self.closed.load(Ordering::SeqCst) {
+                Err(ActionError::Refused(refusal()))
+            } else {
+                Ok(self.client.clone())
+            }
+        }
+    }
+
+    fn writes(client: Client, closed: Arc<AtomicBool>) -> TestGate {
+        TestGate { client, closed }
     }
 
     fn refusal() -> WriteRefusal {
@@ -548,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn delete_sends_the_uid() {
         let (client, log) = fake(Arc::new(ok));
-        delete(&writes(client, open()), &deployment())
+        delete(&mut writes(client, open()), &deployment())
             .await
             .unwrap();
         let seen = log.lock().unwrap();
@@ -565,12 +577,12 @@ mod tests {
     #[tokio::test]
     async fn a_conflict_comes_back_without_a_retry() {
         let (client, log) = fake(Arc::new(|_| (409, status(409, "Conflict"))));
-        let gated = writes(client, open());
+        let mut gated = writes(client, open());
         for result in [
-            delete(&gated, &deployment()).await,
-            scale(&gated, &deployment(), 3).await,
-            rollout_restart(&gated, &deployment()).await,
-            set_cordoned(&gated, &node(), true).await,
+            delete(&mut gated, &deployment()).await,
+            scale(&mut gated, &deployment(), 3).await,
+            rollout_restart(&mut gated, &deployment()).await,
+            set_cordoned(&mut gated, &node(), true).await,
         ] {
             assert!(
                 matches!(result, Err(ActionError::Conflict(_))),
@@ -584,13 +596,13 @@ mod tests {
     #[tokio::test]
     async fn a_closed_gate_sends_nothing() {
         let (client, log) = fake(Arc::new(ok));
-        let gated = writes(client, Arc::new(AtomicBool::new(true)));
+        let mut gated = writes(client, Arc::new(AtomicBool::new(true)));
         let refused = Err(ActionError::Refused(refusal()));
-        assert_eq!(delete(&gated, &deployment()).await, refused);
-        assert_eq!(scale(&gated, &deployment(), 1).await, refused);
-        assert_eq!(rollout_restart(&gated, &deployment()).await, refused);
-        assert_eq!(set_cordoned(&gated, &node(), true).await, refused);
-        let report = drain(&gated, &node(), &DrainOptions::default()).await;
+        assert_eq!(delete(&mut gated, &deployment()).await, refused);
+        assert_eq!(scale(&mut gated, &deployment(), 1).await, refused);
+        assert_eq!(rollout_restart(&mut gated, &deployment()).await, refused);
+        assert_eq!(set_cordoned(&mut gated, &node(), true).await, refused);
+        let report = drain(&mut gated, &node(), &DrainOptions::default()).await;
         assert!(!report.cordoned);
         assert_eq!(report.stopped, Some(ActionError::Refused(refusal())));
         assert!(log.lock().unwrap().is_empty());
@@ -607,7 +619,7 @@ mod tests {
             )
         });
         let (client, log) = fake(reply);
-        scale(&writes(client, open()), &deployment(), 3)
+        scale(&mut writes(client, open()), &deployment(), 3)
             .await
             .unwrap();
         let seen = log.lock().unwrap();
@@ -632,8 +644,8 @@ mod tests {
             )
         });
         let (client, log) = fake(reply);
-        let gated = writes(client, open());
-        rollout_restart(&gated, &deployment()).await.unwrap();
+        let mut gated = writes(client, open());
+        rollout_restart(&mut gated, &deployment()).await.unwrap();
         {
             let seen = log.lock().unwrap();
             assert_eq!(
@@ -651,7 +663,7 @@ mod tests {
             ..deployment()
         };
         assert!(matches!(
-            rollout_restart(&gated, &pod).await,
+            rollout_restart(&mut gated, &pod).await,
             Err(ActionError::Unsupported(_))
         ));
         assert_eq!(log.lock().unwrap().len(), 1, "nothing sent for a pod");
@@ -667,9 +679,9 @@ mod tests {
             )
         });
         let (client, log) = fake(reply);
-        let gated = writes(client, open());
-        set_cordoned(&gated, &node(), true).await.unwrap();
-        set_cordoned(&gated, &node(), false).await.unwrap();
+        let mut gated = writes(client, open());
+        set_cordoned(&mut gated, &node(), true).await.unwrap();
+        set_cordoned(&mut gated, &node(), false).await.unwrap();
         let seen = log.lock().unwrap();
         assert_eq!(seen[0].path, "/api/v1/nodes/worker");
         assert_eq!(seen[0].body["spec"]["unschedulable"], true);
@@ -773,7 +785,7 @@ mod tests {
             pod("done", None, json!({"status": {"phase": "Succeeded"}})),
         ];
         let (client, log) = fake(drain_server(pods, |_| accepted()));
-        let report = drain(&writes(client, open()), &node(), &quick()).await;
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
 
         assert!(report.cordoned);
         assert_eq!(report.evicted, [named("web"), named("done")]);
@@ -820,7 +832,7 @@ mod tests {
             delete_emptydir_data: true,
             ..quick()
         };
-        let report = drain(&writes(client, open()), &node(), &options).await;
+        let report = drain(&mut writes(client, open()), &node(), &options).await;
         assert_eq!(report.evicted, [named("bare"), named("cache")]);
         assert!(report.blocked.is_empty());
     }
@@ -840,7 +852,7 @@ mod tests {
                 accepted()
             }
         }));
-        let report = drain(&writes(client, open()), &node(), &quick()).await;
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
         assert_eq!(
             report.blocked,
             [(named("guarded"), BlockedReason::DisruptionBudget)]
@@ -870,7 +882,7 @@ mod tests {
             closing.store(true, Ordering::SeqCst);
             accepted()
         }));
-        let report = drain(&writes(client, closed), &node(), &quick()).await;
+        let report = drain(&mut writes(client, closed), &node(), &quick()).await;
         assert!(report.cordoned);
         assert_eq!(report.evicted, [named("one")]);
         assert_eq!(report.remaining, [named("two"), named("three")]);
@@ -884,6 +896,22 @@ mod tests {
         assert_eq!(evictions, 1);
     }
 
+    // covers UP-54: the gate closing while evicted pods terminate ends the wait, saying so.
+    #[tokio::test]
+    async fn a_closed_gate_ends_the_wait_for_terminating_pods() {
+        let pods = vec![pod("one", Some("ReplicaSet"), json!({}))];
+        let closed = open();
+        let closing = closed.clone();
+        let (client, _log) = fake(drain_server(pods, move |_| {
+            closing.store(true, Ordering::SeqCst);
+            accepted()
+        }));
+        let report = drain(&mut writes(client, closed), &node(), &quick()).await;
+        assert_eq!(report.evicted, [named("one")]);
+        assert_eq!(report.terminating, [named("one")]);
+        assert_eq!(report.stopped, Some(ActionError::Refused(refusal())));
+    }
+
     // covers UP-53: a pod replaced since it was listed is reported, and one already gone is not.
     #[tokio::test]
     async fn changed_and_gone_pods_during_a_drain() {
@@ -895,7 +923,7 @@ mod tests {
             "moved" => (409, status(409, "Conflict")),
             _ => (404, status(404, "NotFound")),
         }));
-        let report = drain(&writes(client, open()), &node(), &quick()).await;
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
         assert_eq!(report.blocked, [(named("moved"), BlockedReason::Changed)]);
         assert!(report.evicted.is_empty());
     }
@@ -932,7 +960,7 @@ mod tests {
             ),
         });
         let (client, _log) = fake(reply);
-        let report = drain(&writes(client, open()), &node(), &quick()).await;
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
         assert_eq!(report.terminating, [named("slow")]);
         assert!(reads.load(Ordering::SeqCst) > 1, "it polled");
     }
