@@ -223,7 +223,6 @@ impl ResourceList {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
                 this.select_first_in = None;
-                this.remeasure = true;
                 this.recompute(cx);
             }
         });
@@ -518,7 +517,8 @@ impl ResourceList {
                 let _ = gate.recv().await;
             }
             let rows = view.await;
-            let widths = list_model::measure_columns(&job_snapshot, &rows, unix_now());
+            let measured = list_model::rows_to_measure(&job_snapshot, &namespaces);
+            let widths = list_model::measure_columns(&job_snapshot, &measured, unix_now());
             let scoped = list_model::rows_in_namespaces(&job_snapshot, &namespaces);
             let position = selected_uid.as_ref().and_then(|uid| {
                 rows.iter()

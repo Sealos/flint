@@ -240,3 +240,25 @@ fn the_gitops_warning_comes_from_the_live_object() {
 
 #[path = "write_timeout_tests.rs"]
 mod timeout;
+
+#[test]
+fn a_write_error_shows_reduced_server_text() {
+    let message = "denied: password \"hunter2-secret\" Authorization: Bearer abcdefghijklmnop";
+    let status = serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+        "code": 403, "reason": "Forbidden", "message": message,
+    }))
+    .unwrap();
+    let text = write_error(kube::Error::Api(status)).to_string();
+    assert!(!text.contains("hunter2-secret"), "{text}");
+    assert!(!text.contains("abcdefghijklmnop"), "{text}");
+}
+
+#[test]
+fn a_masked_looking_tracking_id_on_a_live_object_warns() {
+    let live = json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {
+        "name": "web", "namespace": "demo",
+        "annotations": {"argocd.argoproj.io/tracking-id": "shop\u{2022}:apps/Deployment:demo/web"},
+    }});
+    assert_eq!(warnings_for(&live).len(), 1);
+}

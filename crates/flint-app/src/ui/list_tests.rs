@@ -239,17 +239,17 @@ async fn the_name_column_takes_the_spare_width(cx: &mut TestAppContext) {
     assert!(name >= 61. * 8.5 + 16. - 0.5, "Name is {name} wide");
 }
 
-// covers UP-21: typing a filter fits the columns to the rows it leaves, so a long name it hides
-// no longer holds the Name column wide.
+// covers UP-21: typing a filter leaves every column where it was, even when the row it hides is
+// the widest; choosing a namespace still fits the columns to that namespace.
 #[gpui_kit::test]
-async fn a_text_filter_fits_the_columns_to_the_rows_it_shows(cx: &mut TestAppContext) {
+async fn a_text_filter_keeps_the_column_widths(cx: &mut TestAppContext) {
     let (core, _dir) = core();
     let long = "podinfo-frontend-canary-7b9c8d5f4-abcde-with-a-long-suffix-xy";
     let (window, list) = open_sized(cx, core, "Pods", 1000.);
     list.update(cx, |list, cx| {
         list.set_snapshot(
             pods(
-                &[("demo", long, 0), ("demo", "api", 0)],
+                &[("demo", long, 0), ("other", "api", 0)],
                 SyncState::Synced,
                 1,
             ),
@@ -262,12 +262,28 @@ async fn a_text_filter_fits_the_columns_to_the_rows_it_shows(cx: &mut TestAppCon
             .is_some_and(|h| f32::from(h.bounds().size.width) > 500.)
     })
     .await;
+    cx.run_until_parked();
+    let headers = ["Name", "Namespace", "Restarts"];
+    let before = headers.map(|column| header_width(cx, window, column));
     cx.update_window(window, |_, window, cx| {
         window.click("list-filter", cx);
         window.input("api", cx);
     })
     .unwrap();
-    // Back to the Name column's minimum (16 characters): "api" is all that is shown.
+    let long_uid = format!("uid-{long}");
+    cx.wait_for(window, WAIT, move |window, _| {
+        visible_rows(window, &["uid-api", &long_uid]) == ["uid-api"]
+    })
+    .await;
+    let state = list.read_with(cx, |list, _| list.view_state());
+    assert_eq!(state.rows.len(), 1, "the filter leaves one row");
+    let after = headers.map(|column| header_width(cx, window, column));
+    assert_eq!(after, before, "columns moved while filtering");
+
+    list.update(cx, |list, cx| {
+        list.set_namespaces(vec!["other".to_owned()], cx)
+    });
+    // Back to the Name column's minimum (16 characters): "api" is all that namespace has.
     cx.wait_for(window, WAIT, |window, _| {
         window
             .try_find("sort-Name")

@@ -42,6 +42,7 @@ impl Workspace {
         let model = self.model.read(cx);
         let active = model.active.clone();
         let names = model.names();
+        let states = self.nav.read(cx).states();
 
         let clusters = model
             .clusters
@@ -57,7 +58,7 @@ impl Workspace {
                     label: names.of(&cluster.info.name),
                     active: is_active,
                     connection: state_name(&cluster.state),
-                    presence: Presence::of(&cluster.state, is_active).name(),
+                    presence: Presence::of(&cluster.state, is_active, states).name(),
                     error,
                     ai: match model.ai_exposure(cluster) {
                         AiExposureState::Hidden => "hidden",

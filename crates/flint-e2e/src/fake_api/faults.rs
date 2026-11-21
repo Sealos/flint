@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::fixtures::Gvr;
 use super::route::{Route, Verb};
+use super::state::ApiError;
 
 /// What happens to a matching request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,12 +32,27 @@ pub enum Effect {
     /// server's 400 "Upgrade request required". Like [`Effect::RefuseUpgrade`], only upgrades
     /// match it.
     StripUpgrade,
+    /// The 409 a write gets when the object changed since it was read. Only writes match it.
+    Conflict,
+    /// An admission webhook refuses the write, with the 403 webhooks commonly answer. Only
+    /// writes match it.
+    AdmissionDenied {
+        /// The webhook's name.
+        webhook: String,
+        /// Why it refused.
+        message: String,
+    },
 }
 
 impl Effect {
     /// Only WebSocket upgrades match it.
     fn upgrades_only(&self) -> bool {
         matches!(self, Effect::RefuseUpgrade | Effect::StripUpgrade)
+    }
+
+    /// Only writes match it: reads of the same object pass it by, uncounted.
+    fn writes_only(&self) -> bool {
+        matches!(self, Effect::Conflict | Effect::AdmissionDenied { .. })
     }
 }
 
@@ -102,6 +118,19 @@ impl Fault {
     /// Strips WebSocket upgrades of their headers on the way ([`Effect::StripUpgrade`]).
     pub fn strip_upgrade() -> Self {
         Fault::new(Effect::StripUpgrade)
+    }
+
+    /// Answers writes with a 409 ([`Effect::Conflict`]).
+    pub fn conflict() -> Self {
+        Fault::new(Effect::Conflict)
+    }
+
+    /// An admission webhook refuses writes ([`Effect::AdmissionDenied`]).
+    pub fn admission_denied(webhook: &str, message: &str) -> Self {
+        Fault::new(Effect::AdmissionDenied {
+            webhook: webhook.to_owned(),
+            message: message.to_owned(),
+        })
     }
 
     /// Only requests about this resource.
@@ -187,18 +216,65 @@ impl Faults {
         self.0.clear();
     }
 
-    /// The effect for a request, counting it against the fault's limit. A refused upgrade only
-    /// or stripped upgrade only matches (and counts) a WebSocket `upgrade` request.
-    pub fn take(&mut self, verb: Verb, route: &Route, upgrade: bool) -> Option<Effect> {
-        let fault = self
-            .0
-            .iter_mut()
-            .find(|f| f.matches(verb, route) && (upgrade || !f.effect.upgrades_only()))?;
+    /// The effect for a request, counting it against the fault's limit. A refused or stripped
+    /// upgrade only matches (and counts) a WebSocket `upgrade` request, and a conflict or an
+    /// admission refusal only a `write`.
+    pub fn take(
+        &mut self,
+        verb: Verb,
+        route: &Route,
+        upgrade: bool,
+        write: bool,
+    ) -> Option<Effect> {
+        let fault = self.0.iter_mut().find(|f| {
+            f.matches(verb, route)
+                && (upgrade || !f.effect.upgrades_only())
+                && (write || !f.effect.writes_only())
+        })?;
         if let Some(n) = &mut fault.remaining {
             *n -= 1;
         }
         Some(fault.effect.clone())
     }
+}
+
+/// A resource as a `schema.GroupResource` prints: `resource.group`, or `resource` in the core
+/// group.
+fn qualified(gvr: &Gvr) -> String {
+    if gvr.group.is_empty() {
+        gvr.resource.clone()
+    } else {
+        format!("{}.{}", gvr.resource, gvr.group)
+    }
+}
+
+/// The 409 of `NewConflict` around the optimistic-lock error.
+pub fn conflict(route: &Route) -> ApiError {
+    let name = route.name().unwrap_or_default();
+    let resource = route.gvr().map(qualified).unwrap_or_default();
+    let mut error = ApiError::new(
+        409,
+        "Conflict",
+        format!(
+            "Operation cannot be fulfilled on {resource} \"{name}\": the object has been \
+             modified; please apply your changes to the latest version and try again"
+        ),
+    );
+    if let Some(gvr) = route.gvr() {
+        error.body["details"] = serde_json::json!({
+            "name": name, "group": gvr.group, "kind": gvr.resource,
+        });
+    }
+    error
+}
+
+/// The refusal of an admission webhook, worded as the API server wraps it.
+pub fn admission_denied(webhook: &str, message: &str) -> ApiError {
+    ApiError::new(
+        403,
+        "Forbidden",
+        format!("admission webhook \"{webhook}\" denied the request: {message}"),
+    )
 }
 
 /// The message the API server sends when RBAC refuses a request: `NewForbidden` around
@@ -222,15 +298,9 @@ pub fn forbidden_message_as(verb: &str, route: &Route) -> String {
         Some(ns) => format!("in the namespace \"{ns}\""),
         None => "at the cluster scope".to_owned(),
     };
-    // A schema.GroupResource prints as `resource.group`, or `resource` in the core group.
-    let qualified = if gvr.group.is_empty() {
-        gvr.resource.clone()
-    } else {
-        format!("{}.{}", gvr.resource, gvr.group)
-    };
     let subject = match route.name() {
-        Some(name) => format!("{qualified} \"{name}\""),
-        None => qualified,
+        Some(name) => format!("{} \"{name}\"", qualified(gvr)),
+        None => qualified(gvr),
     };
     let resource = match route.subresource() {
         Some(sub) => format!("{}/{sub}", gvr.resource),
@@ -290,32 +360,69 @@ mod tests {
         faults.add(Fault::drop_connection().times(1));
         faults.add(Fault::forbidden());
         assert_eq!(
-            faults.take(Verb::List, &route, false),
+            faults.take(Verb::List, &route, false, false),
             Some(Effect::DropConnection)
         );
         assert_eq!(
-            faults.take(Verb::List, &route, false),
+            faults.take(Verb::List, &route, false, false),
             Some(Effect::Forbidden)
         );
         faults.clear();
-        assert_eq!(faults.take(Verb::List, &route, false), None);
+        assert_eq!(faults.take(Verb::List, &route, false, false), None);
         // A refused upgrade waits for an upgrade, other requests pass it by.
         faults.add(Fault::refuse_upgrade().times(1));
-        assert_eq!(faults.take(Verb::List, &route, false), None);
+        assert_eq!(faults.take(Verb::List, &route, false, false), None);
         assert_eq!(
-            faults.take(Verb::Get, &route, true),
+            faults.take(Verb::Get, &route, true, false),
             Some(Effect::RefuseUpgrade)
         );
-        assert_eq!(faults.take(Verb::Get, &route, true), None);
+        assert_eq!(faults.take(Verb::Get, &route, true, false), None);
         faults.add(Fault::strip_upgrade());
         faults.add(Fault::forbidden_as("create"));
         assert_eq!(
-            faults.take(Verb::Get, &route, false),
+            faults.take(Verb::Get, &route, false, false),
             Some(Effect::ForbiddenAs("create".into()))
         );
         assert_eq!(
-            faults.take(Verb::Get, &route, true),
+            faults.take(Verb::Get, &route, true, false),
             Some(Effect::StripUpgrade)
+        );
+    }
+
+    #[test]
+    fn conflicts_and_admission_refusals_only_match_writes() {
+        let route = Route::parse("/apis/apps/v1/namespaces/demo/deployments/web");
+        let mut faults = Faults::default();
+        faults.add(Fault::conflict().times(1));
+        faults.add(Fault::admission_denied("policy.example.com", "no").times(1));
+        assert_eq!(faults.take(Verb::Get, &route, false, false), None);
+        assert_eq!(
+            faults.take(Verb::Other, &route, false, true),
+            Some(Effect::Conflict)
+        );
+        assert!(matches!(
+            faults.take(Verb::Other, &route, false, true),
+            Some(Effect::AdmissionDenied { .. })
+        ));
+        assert_eq!(faults.take(Verb::Other, &route, false, true), None);
+        let refused = conflict(&route);
+        assert_eq!(refused.code, 409);
+        assert_eq!(refused.body["reason"], "Conflict");
+        assert_eq!(refused.body["details"]["group"], "apps");
+        assert!(
+            refused.body["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Operation cannot be fulfilled on deployments.apps \"web\"")
+        );
+        let denied = admission_denied("policy.example.com", "no");
+        assert_eq!(
+            (denied.code, &denied.body["reason"]),
+            (403, &"Forbidden".into())
+        );
+        assert_eq!(
+            denied.body["message"],
+            "admission webhook \"policy.example.com\" denied the request: no"
         );
     }
 

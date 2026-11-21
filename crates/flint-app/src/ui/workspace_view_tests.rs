@@ -10,8 +10,12 @@ use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::json;
 
 use crate::ui::registry;
-use crate::ui::support_tests::{TestWorkspace, WAIT, open_empty_workspace, open_workspace};
+use crate::ui::support_tests::{
+    TestWorkspace, WAIT, kubeconfig_yaml, open_empty_workspace, open_workspace, open_workspace_with,
+};
 use crate::ui::view_state::{AppState, Main};
+
+use super::actions::resource_actions_tests::LocalApi;
 
 fn state(cx: &mut TestAppContext, t: &TestWorkspace) -> AppState {
     let workspace = t.workspace.clone();
@@ -109,6 +113,48 @@ async fn an_inactive_connected_cluster_is_idle_not_live(cx: &mut TestAppContext)
         ("idle", "live")
     );
     assert!(shown(cx, &t, "cluster-dot-alpha"));
+}
+
+#[gpui_kit::test]
+async fn the_active_cluster_shows_reconnecting_until_a_watch_recovers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = open_workspace_with(cx, dir.path(), |dir, _| {
+        let path = dir.join("kubeconfig");
+        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &api.url)])).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, "alpha").await;
+
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, |_, cx| {
+        let states = model.read(cx).core().sync_states("alpha");
+        api.open_watches() == 3
+            && states
+                .iter()
+                .filter(|(_, state)| state.is_current())
+                .count()
+                == 3
+    })
+    .await;
+    assert_eq!(presence(&state(cx, &t), "alpha"), "live");
+
+    for (down, status, tooltip) in [
+        (true, "reconnecting", "Reconnecting: "),
+        (false, "live", "Connected, Kubernetes v1.33.1"),
+    ] {
+        api.set_watches_down(down);
+        cx.wait_for(t.window, WAIT, |window, _| {
+            window.try_find("cluster-alpha").is_some_and(|row| {
+                row.description()
+                    .and_then(|description| description.lines().nth(2))
+                    .is_some_and(|line| line.starts_with(tooltip))
+            })
+        })
+        .await;
+        assert_eq!(presence(&state(cx, &t), "alpha"), status);
+    }
 }
 
 // covers UP-04: a failed cluster's header has no namespace filter or watch mode (neither can
