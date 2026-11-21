@@ -238,7 +238,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-30 Command palette
 - **When** I press Cmd-Shift-P (Ctrl-Shift-P on Linux) and type part of an action name.
 - **Then** only actions that can run now are listed, each with its category and shortcut, the ones I ran recently
-  first; typing filters them as I type, loosely ("opl" finds Open Logs), and the closest match comes first. The arrows
+  first; typing filters them as I type, loosely ("opl" finds Open Logs), and the closest match comes first. Quit and
+  Close Window come last and are not selected for me, unless what I typed clearly names them: at least three
+  characters that start the name or a word in it ("quit", "close w"). A query that only starts a later word ("flint")
+  lists every other match first. When a short or scattered query lists only them,
+  Enter does nothing until an arrow key selects one. The arrows
   or Ctrl-N and Ctrl-P move the selection, Enter (or a click) runs it where focus was before the palette opened, and
   Esc closes the palette and puts focus back. An action that needs something asks for it next: a cluster, a namespace
   (one I type is fine, and what I typed comes first), a kind, a column or a container from a list, or typed text such
