@@ -383,6 +383,64 @@ pub struct ResolvedKinds {
     /// The names that resolved to no kind, to several, or to one that a group missing from
     /// discovery could change.
     pub unmatched: Vec<String>,
+    /// The scope names kinds, and part of discovery could not be read: a name without a group
+    /// grants nothing until it can be.
+    pub discovery_incomplete: bool,
+}
+
+/// What `list_clusters` could tell about a scope on a cluster. Reports only what the scope itself
+/// names, and counts: which API groups are failing is not in scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeCheck {
+    /// Kinds the scope names that resolved to nothing.
+    pub unmatched_kinds: Vec<String>,
+    /// Namespaces the scope names that do not exist.
+    pub unmatched_namespaces: Vec<String>,
+    /// Namespaces of the scope not looked up (past the limit, out of time) or whose lookup
+    /// failed. Any of them may be missing.
+    pub unchecked_namespaces: usize,
+    /// Part of API discovery could not be read.
+    pub discovery_incomplete: bool,
+    /// The check could not run at all.
+    pub not_run: bool,
+}
+
+impl ScopeCheck {
+    /// A check that could not run on a scope.
+    pub fn not_run(scope: &AiScope) -> Self {
+        ScopeCheck {
+            unchecked_namespaces: scope.namespaces.len(),
+            not_run: true,
+            ..ScopeCheck::default()
+        }
+    }
+
+    /// What the check could not cover, in a sentence or two, if anything.
+    pub fn incomplete(&self) -> Option<String> {
+        if self.not_run {
+            return Some(
+                "The scope could not be checked against this cluster: names that match nothing \
+                 are not listed. It is enforced all the same."
+                    .to_owned(),
+            );
+        }
+        let mut notes = Vec::new();
+        if self.unchecked_namespaces > 0 {
+            notes.push(format!(
+                "{} of the scope's namespaces could not be checked, so one that does not exist \
+                 may not be listed.",
+                self.unchecked_namespaces
+            ));
+        }
+        if self.discovery_incomplete {
+            notes.push(
+                "Part of API discovery is failing: a kind written without its group grants \
+                 nothing and is listed as unmatched until it recovers."
+                    .to_owned(),
+            );
+        }
+        (!notes.is_empty()).then(|| notes.join(" "))
+    }
 }
 
 /// The id of the one kind a hand-written scope name surely means. `name.group` stays bound to
@@ -412,7 +470,8 @@ fn scope_kind_id(name: &str, kinds: &[KindInfo], skipped: &[String]) -> Option<S
 
 /// Resolves `scope`'s kind names as the tools resolve theirs
 /// ([`flint_core::read::resolve_kind`]): `pod`, `Deployment` and `deploy` name the kind they do
-/// for `kubectl get`. `skipped` lists the API groups discovery could not read.
+/// for `kubectl get`. `skipped` lists the API groups discovery could not read, or reports as
+/// stale.
 pub fn resolve_scope_kinds(
     scope: &AiScope,
     kinds: &[KindInfo],
@@ -436,6 +495,7 @@ pub fn resolve_scope_kinds(
     ResolvedKinds {
         scope: AiScope::new(scope.namespaces.clone(), names),
         unmatched,
+        discovery_incomplete: !skipped.is_empty() && !scope.kinds.is_empty(),
     }
 }
 
@@ -1182,6 +1242,53 @@ mod tests {
         let missing =
             resolve_scope_kinds(&scoped(&[], &["widget.b.example.com"]), &kinds, &skipped);
         assert_eq!(missing.unmatched, ["widget.b.example.com"]);
+    }
+
+    // covers UP-14: a resolved scope says when discovery was incomplete, only if it names kinds.
+    #[test]
+    fn resolving_says_when_discovery_was_incomplete() {
+        let kinds = [kind("", "v1", "Pod", "pods", true)];
+        let stale = ["metrics.k8s.io".to_owned()];
+        assert!(resolve_scope_kinds(&scoped(&[], &["pods"]), &kinds, &stale).discovery_incomplete);
+        assert!(!resolve_scope_kinds(&scoped(&["a"], &[]), &kinds, &stale).discovery_incomplete);
+        assert!(!resolve_scope_kinds(&scoped(&[], &["pods"]), &kinds, &[]).discovery_incomplete);
+    }
+
+    // covers UP-14: what a scope check could not cover is said, and no API group is named.
+    #[test]
+    fn a_scope_check_says_what_it_could_not_cover() {
+        assert_eq!(ScopeCheck::default().incomplete(), None);
+        let unmatched = ScopeCheck {
+            unmatched_kinds: vec!["nope".into()],
+            unmatched_namespaces: vec!["gone".into()],
+            ..ScopeCheck::default()
+        };
+        assert_eq!(unmatched.incomplete(), None, "complete, with findings");
+
+        let partial = ScopeCheck {
+            unchecked_namespaces: 6,
+            ..ScopeCheck::default()
+        };
+        assert!(
+            partial
+                .incomplete()
+                .unwrap()
+                .starts_with("6 of the scope's")
+        );
+
+        let both = ScopeCheck {
+            unchecked_namespaces: 1,
+            discovery_incomplete: true,
+            ..ScopeCheck::default()
+        };
+        let note = both.incomplete().unwrap();
+        assert!(note.contains("could not be checked"), "{note}");
+        assert!(note.contains("API discovery is failing"), "{note}");
+
+        let scope = scoped(&["a", "b"], &[]);
+        let not_run = ScopeCheck::not_run(&scope);
+        assert_eq!(not_run.unchecked_namespaces, 2);
+        assert!(not_run.incomplete().unwrap().contains("enforced"));
     }
 
     // covers UP-14: the scope comes from the cluster's entry; one without a scope is whole.

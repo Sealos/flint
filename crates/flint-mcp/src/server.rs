@@ -163,9 +163,9 @@ impl Conn {
 
 type ToolResult = Result<CallToolResult, rmcp::ErrorData>;
 
-/// What `list_clusters` learned of a cluster: its version or why not, and what its scope names
-/// that the cluster does not have (kinds, namespaces), when that could be checked.
-type Probed = (Result<String, String>, Option<(Vec<String>, Vec<String>)>);
+/// What `list_clusters` learned of a cluster: its version or why not, and how its scope checked
+/// out, if the cluster could be reached.
+type Probed = (Result<String, String>, Option<policy::ScopeCheck>);
 
 /// What a tool call named, as the agent wrote it: recorded in the activity log.
 #[derive(Debug, Default, Clone)]
@@ -976,12 +976,13 @@ impl FlintMcp {
         let discovered = slot
             .cell
             .get_or_try_init(|| async {
-                read::discover_kinds(&conn.client)
-                    .await
-                    .map(|found| Discovered {
+                read::discover_kinds(&conn.client).await.map(|found| {
+                    let skipped_groups = Arc::new(found.incomplete_groups());
+                    Discovered {
                         kinds: Arc::new(found.kinds),
-                        skipped_groups: Arc::new(found.skipped_groups),
-                    })
+                        skipped_groups,
+                    }
+                })
             })
             .await
             .map_err(|e| conn.fail(e))?;
@@ -1009,32 +1010,33 @@ impl FlintMcp {
         Ok(Arc::new(policy::kinds_in_scope(&resolved.scope, &kinds)))
     }
 
-    /// What in `conn`'s scope matches nothing on the cluster, for `list_clusters`. Each result
-    /// is logged once. A namespace the server does not let us read is not reported.
-    async fn unmatched_scope(
-        &self,
-        cluster: &str,
-        conn: &Conn,
-    ) -> Option<(Vec<String>, Vec<String>)> {
+    /// What in `conn`'s scope matches nothing on the cluster, and what could not be checked, for
+    /// `list_clusters`. Each result is logged once. A namespace whose lookup fails is counted as
+    /// unchecked, not reported as missing.
+    async fn unmatched_scope(&self, cluster: &str, conn: &Conn) -> Option<policy::ScopeCheck> {
         if conn.scope.is_everything() {
             return None;
         }
         // One limit for the whole check, so a stalled lookup keeps what was already found.
         let until = tokio::time::Instant::now() + PROBE_TIMEOUT;
-        let (kinds, resolved) = tokio::time::timeout_at(until, self.resolved_scope(cluster, conn))
-            .await
-            .ok()?
-            .ok()?;
+        let resolved = tokio::time::timeout_at(until, self.resolved_scope(cluster, conn)).await;
+        let Ok(Ok((kinds, resolved))) = resolved else {
+            return Some(policy::ScopeCheck::not_run(&conn.scope));
+        };
+        let discovery_incomplete = resolved.discovery_incomplete;
         let unmatched_kinds = resolved.unmatched;
         let mut unmatched_namespaces = Vec::new();
+        let scoped = &conn.scope.namespaces;
+        let mut unchecked_namespaces = scoped.len();
         let namespaces = kinds
             .iter()
             .find(|k| k.group().is_empty() && k.plural() == "namespaces");
         if let Some(namespaces) = namespaces {
-            for name in conn.scope.namespaces.iter().take(SCOPE_NAMESPACES_CHECKED) {
+            for name in scoped.iter().take(SCOPE_NAMESPACES_CHECKED) {
                 // Never sent: it goes into the request path, and no namespace has such a name.
                 if !policy::is_label_name(name) {
                     unmatched_namespaces.push(name.clone());
+                    unchecked_namespaces -= 1;
                     continue;
                 }
                 let lookup = read::get(&conn.client, namespaces, None, name);
@@ -1042,8 +1044,11 @@ impl FlintMcp {
                     Err(_) => break,
                     Ok(Err(ClusterError::Api(text))) if text.starts_with("NotFound:") => {
                         unmatched_namespaces.push(name.clone());
+                        unchecked_namespaces -= 1;
                     }
-                    Ok(_) => {}
+                    Ok(Ok(_)) => unchecked_namespaces -= 1,
+                    // Not known either way: it stays unchecked.
+                    Ok(Err(_)) => {}
                 }
             }
         }
@@ -1064,7 +1069,13 @@ impl FlintMcp {
                 );
             }
         }
-        Some((unmatched_kinds, unmatched_namespaces))
+        Some(policy::ScopeCheck {
+            unmatched_kinds,
+            unmatched_namespaces,
+            unchecked_namespaces,
+            discovery_incomplete,
+            not_run: false,
+        })
     }
 
     /// The connection and the resolved kind. `check` (the names the call carries) runs once the
@@ -1152,13 +1163,19 @@ impl FlintMcp {
                     "namespaces": scope.namespaces,
                     "kinds": scope.kinds,
                 });
-                if let Some((kinds, namespaces)) = unmatched {
-                    if !kinds.is_empty() {
-                        row["scope"]["unmatched_kinds"] = json!(kinds);
-                    }
-                    if !namespaces.is_empty() {
-                        row["scope"]["unmatched_namespaces"] = json!(namespaces);
-                    }
+                let not_run = policy::ScopeCheck::not_run(scope);
+                let check = unmatched.unwrap_or(&not_run);
+                if !check.unmatched_kinds.is_empty() {
+                    row["scope"]["unmatched_kinds"] = json!(check.unmatched_kinds);
+                }
+                if !check.unmatched_namespaces.is_empty() {
+                    row["scope"]["unmatched_namespaces"] = json!(check.unmatched_namespaces);
+                }
+                if check.unchecked_namespaces > 0 {
+                    row["scope"]["unchecked_namespaces"] = json!(check.unchecked_namespaces);
+                }
+                if let Some(note) = check.incomplete() {
+                    row["scope"]["check_incomplete"] = json!(note);
                 }
             }
             rows.push(row);

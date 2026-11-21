@@ -127,6 +127,24 @@ pub struct DiscoveredKinds {
     /// whose backend is down, often metrics.k8s.io). Sorted. Only servers without aggregated
     /// discovery report these; aggregated discovery lists such groups as stale instead.
     pub skipped_groups: Vec<String>,
+    /// API groups aggregated discovery marks as stale: what they list, if anything, may not be
+    /// what they serve. Sorted.
+    pub stale_groups: Vec<String>,
+}
+
+impl DiscoveredKinds {
+    /// Every group whose kinds may be missing or out of date. Sorted.
+    pub fn incomplete_groups(&self) -> Vec<String> {
+        let mut groups: Vec<String> = self
+            .skipped_groups
+            .iter()
+            .chain(&self.stale_groups)
+            .cloned()
+            .collect();
+        groups.sort();
+        groups.dedup();
+        groups
+    }
 }
 
 /// Runs API discovery and returns every kind, CRDs included, at each group's preferred version.
@@ -151,10 +169,7 @@ async fn discover_kinds_within(
 ) -> Result<DiscoveredKinds, ClusterError> {
     let discover = async {
         match discover_aggregated(client, per_request).await? {
-            Some(kinds) => Ok(DiscoveredKinds {
-                kinds,
-                skipped_groups: Vec::new(),
-            }),
+            Some(found) => Ok(found),
             None => {
                 tracing::debug!("no aggregated discovery, discovering each group");
                 discover_per_group(client, per_request).await
@@ -209,7 +224,7 @@ fn aggregated_not_supported(err: &kube::Error) -> bool {
 async fn discover_aggregated(
     client: &Client,
     limit: Duration,
-) -> Result<Option<Vec<KindInfo>>, ClusterError> {
+) -> Result<Option<DiscoveredKinds>, ClusterError> {
     let core = match bounded(limit, client.list_core_api_versions_aggregated()).await? {
         // A server without aggregated discovery answers with the plain document, which parses
         // as an empty list. The core group is always served, so empty means "not supported".
@@ -223,14 +238,34 @@ async fn discover_aggregated(
         Err(e) if aggregated_not_supported(&e) => return Ok(None),
         Err(e) => return Err(ClusterError::kube(e)),
     };
-    Ok(Some(
-        core.items
-            .into_iter()
-            .take(1)
-            .chain(apis.items)
-            .flat_map(kinds_from_aggregated)
-            .collect(),
-    ))
+    let groups: Vec<APIGroupDiscovery> = core.items.into_iter().take(1).chain(apis.items).collect();
+    let mut stale_groups: Vec<String> = groups
+        .iter()
+        .filter(|group| is_stale(group))
+        .map(|group| {
+            group
+                .metadata
+                .as_ref()
+                .and_then(|m| m.name.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    stale_groups.sort();
+    stale_groups.dedup();
+    Ok(Some(DiscoveredKinds {
+        kinds: groups.into_iter().flat_map(kinds_from_aggregated).collect(),
+        skipped_groups: Vec::new(),
+        stale_groups,
+    }))
+}
+
+/// Whether any version of `group` is not reported as current. A server that says nothing about
+/// freshness (the beta API) counts as current.
+fn is_stale(group: &APIGroupDiscovery) -> bool {
+    group
+        .versions
+        .iter()
+        .any(|version| version.freshness.as_deref().is_some_and(|f| f != "Current"))
 }
 
 /// Whether `name` can be sent as one segment of a request path, as client-go's
@@ -350,6 +385,7 @@ async fn discover_per_group(
     Ok(DiscoveredKinds {
         kinds,
         skipped_groups,
+        stale_groups: Vec::new(),
     })
 }
 
@@ -1348,6 +1384,43 @@ mod tests {
         let ids: Vec<String> = found.kinds.iter().map(|k| k.id().to_string()).collect();
         assert_eq!(ids, ["pods", "deployments.apps"]);
         assert!(found.skipped_groups.is_empty());
+    }
+
+    // covers UP-14: aggregated discovery marks a group whose backend is down as stale, often with
+    // no resources: it is reported, whatever else is current.
+    #[tokio::test]
+    async fn stale_groups_are_reported() {
+        use serde_json::json;
+        let group = |name: &str, freshness: Option<&str>, resources: serde_json::Value| {
+            let mut version = json!({"version": "v1", "resources": resources});
+            if let Some(freshness) = freshness {
+                version["freshness"] = json!(freshness);
+            }
+            json!({"metadata": {"name": name}, "versions": [version]})
+        };
+        let pods = json!([{"resource": "pods", "responseKind": {"kind": "Pod"},
+                           "scope": "Namespaced", "verbs": ["list"]}]);
+        let (client, _) = fake_api(vec![
+            (
+                "/api",
+                200,
+                json!({"items": [group("", Some("Current"), pods.clone())]}),
+            ),
+            (
+                "/apis",
+                200,
+                json!({"items": [
+                    group("metrics.k8s.io", Some("Stale"), json!([])),
+                    group("a.example.com", None, json!([])),
+                    group("b.example.com", Some("Current"), json!([])),
+                ]}),
+            ),
+        ])
+        .await;
+        let found = discover_kinds(&client).await.unwrap();
+        assert_eq!(found.stale_groups, ["metrics.k8s.io"]);
+        assert!(found.skipped_groups.is_empty());
+        assert_eq!(found.incomplete_groups(), ["metrics.k8s.io"]);
     }
 
     // covers UP-04

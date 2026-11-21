@@ -117,6 +117,7 @@ Kinds are written as for `kubectl get`: plural, singular, Kind or short name (`p
 `.group` when needed. A name that matches no kind, or several, grants nothing, and so does a name without a group
 while part of API discovery is failing. `list_clusters` reports such names as
 `unmatched_kinds`, and namespaces that do not exist as `unmatched_namespaces`. The server logs them once to stderr.
+When it could not check everything, it says so in `check_incomplete`, with a count in `unchecked_namespaces`.
 
 An empty list (`namespaces = []`) means no limit, not no access: to keep agents away from a cluster, remove its entry.
 If the file already has `ai_exposed_clusters` as an inline array (`ai_exposed_clusters = [...]`), add the entry to
