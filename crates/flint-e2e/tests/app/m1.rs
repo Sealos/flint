@@ -411,7 +411,10 @@ fn up_27_recover_from_a_broken_watch() -> Result<()> {
     // In plain words ("the connection to https://… dropped"), not the client's chain
     // ("watch stream broke: ServiceError: error reading a body from connection").
     assert!(!banners.contains("ServiceError"), "{banners}");
-    assert!(banners.contains("the connection to https://"), "{banners}");
+    assert!(
+        banners.contains(&format!("the connection to {} dropped", fake.url())),
+        "{banners}"
+    );
     app.screenshot_themes("up27-reconnecting")?;
     assert_eq!(app.state()?["list"]["sync"], "reconnecting");
 
