@@ -141,17 +141,34 @@ impl LogBuffer {
     /// Drops whole blocks from the oldest end until the stored lines take at most `bytes` (the
     /// open tail block stays), for the shared budget ([`super::LogBudget`]). Returns whether any
     /// line was dropped.
+    #[cfg(test)]
     pub fn trim_to(&mut self, bytes: usize) -> bool {
         let mut trimmed = false;
-        while self.bytes > bytes
-            && let Some(block) = self.chunks.pop_front()
-        {
-            self.bytes -= block.bytes;
-            self.first = self.first.max(block.start + block.lines.len() as u64);
-            self.dropped += 1;
+        while self.detach_oldest(bytes).is_some() {
             trimmed = true;
         }
         trimmed
+    }
+
+    /// Takes the oldest sealed block out while the stored lines take more than `bytes`, without
+    /// freeing it: constant time, so it can run under the shared budget's lock, and the caller
+    /// lets go of the lines after that.
+    pub fn detach_oldest(&mut self, bytes: usize) -> Option<Arc<[LogLine]>> {
+        if self.bytes <= bytes {
+            return None;
+        }
+        let block = self.chunks.pop_front()?;
+        self.bytes -= block.bytes;
+        self.first = self.first.max(block.start + block.lines.len() as u64);
+        self.dropped += 1;
+        Some(block.lines)
+    }
+
+    /// Seals the open tail block: nothing more will be appended, so all of it can be given back.
+    pub fn seal_tail(&mut self) {
+        if !self.tail.is_empty() {
+            self.seal();
+        }
     }
 
     /// How many blocks were dropped so far; changes exactly when memory was released.
@@ -159,7 +176,7 @@ impl LogBuffer {
         self.dropped
     }
 
-    /// Bytes [`LogBuffer::trim_to`] can free: the sealed blocks.
+    /// Bytes [`LogBuffer::detach_oldest`] can free: the sealed blocks.
     pub fn trimmable_bytes(&self) -> usize {
         self.bytes - self.tail_bytes
     }

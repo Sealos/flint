@@ -328,7 +328,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   (logs) or Restart shell starts it again in a new tab beside it, keeping the ended one's output. An empty dock says
   how to open logs or a shell. Log tabs share one memory budget (`log_total_mib`): over it, the tabs I looked at least
   recently drop their oldest lines first, never the one shown, keep streaming, and say "Older lines dropped to save
-  memory".
+  memory". An ended tab can give back all its lines, and then says "All lines dropped to save memory."
 - Tests: unit, ui.
 
 ### UP-43 Spot errors in a log stream

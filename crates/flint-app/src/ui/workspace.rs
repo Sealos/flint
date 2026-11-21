@@ -284,6 +284,8 @@ impl Workspace {
                 if let Some(save) = save {
                     ui_state::save(save);
                 }
+                // A failed save logs a warning: it must reach the file before the process ends.
+                flint_core::bootstrap::flush_logs();
             }
         });
         let namespace_input =

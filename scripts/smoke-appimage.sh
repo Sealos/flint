@@ -23,6 +23,9 @@ trap 'rm -rf "$scratch"' EXIT
 # so concurrent launches sharing a TMPDIR could delete each other's files. Keep ours private.
 mkdir -p "$scratch/tmp"
 export TMPDIR=$scratch/tmp
+# The log file's location: never the real one when run locally.
+mkdir -p "$scratch/home"
+export HOME=$scratch/home XDG_STATE_HOME=$scratch/state
 
 got=$("$appimage" --version)
 if [ "$got" != "flint $version" ]; then
