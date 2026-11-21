@@ -229,6 +229,10 @@ pub enum ExecFailureKind {
     NotStartedMoved,
     /// Refused before the shell started: the context is gone. Nothing ran.
     NotStartedRemoved,
+    /// Refused before the shell started: its pin is out of date, on the same server. Nothing ran.
+    NotStartedStale,
+    /// Refused with its connection already open: its pin is out of date, on the same server.
+    EndedStale,
     /// Anything else: no cause Flint can name (the full text says what happened).
     Other,
 }
@@ -878,6 +882,8 @@ fn refused(refusal: &WriteRefusal, connected: bool) -> ExecFailure {
         }
         WriteRefusal::Moved { .. } => ExecFailureKind::NotStartedMoved,
         WriteRefusal::Removed { .. } => ExecFailureKind::NotStartedRemoved,
+        WriteRefusal::Stale { .. } if connected => ExecFailureKind::EndedStale,
+        WriteRefusal::Stale { .. } => ExecFailureKind::NotStartedStale,
         WriteRefusal::NotConnected { .. } | WriteRefusal::Stopped => ExecFailureKind::Unreachable,
     };
     ExecFailure::new(kind, refusal.to_string())
@@ -2875,6 +2881,20 @@ mod tests {
         let watch = ContextWatch::new(never, launch, CHECK_EVERY);
         tokio::spawn(run(launcher.clone(), request(), channels, watch));
         (session, closed)
+    }
+
+    // covers UP-06: a stale pin on the same server is refused without claiming the server moved.
+    #[test]
+    fn a_stale_refusal_does_not_say_the_server_moved() {
+        let stale = WriteRefusal::Stale {
+            cluster: "dev".into(),
+        };
+        assert_eq!(
+            refused(&stale, false).kind,
+            ExecFailureKind::NotStartedStale
+        );
+        assert_eq!(refused(&stale, true).kind, ExecFailureKind::EndedStale);
+        assert!(!stale.to_string().contains("another server"));
     }
 
     fn protected() -> WriteRefusal {
