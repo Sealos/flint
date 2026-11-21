@@ -150,3 +150,209 @@ async fn reads_kinds_and_objects() {
         "events are newest first"
     );
 }
+
+/// Before a test writes: `context` is a kind cluster on this machine, as `kind` knows it.
+fn assert_local_kind(ours: &kube::config::Kubeconfig, context: &str) {
+    use kube::config::Kubeconfig;
+
+    let name = context
+        .strip_prefix("kind-")
+        .unwrap_or_else(|| panic!("refusing to write to {context}: not a kind context"));
+    let output = std::process::Command::new("kind")
+        .args(["get", "kubeconfig", "--name", name])
+        .output()
+        .expect("running `kind` to check the cluster before writing to it");
+    assert!(output.status.success(), "kind knows no cluster {name:?}");
+    let kinds = Kubeconfig::from_yaml(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let cluster = |config: &Kubeconfig| {
+        let wanted = config
+            .contexts
+            .iter()
+            .find(|c| c.name == context)
+            .and_then(|c| c.context.as_ref())
+            .map(|c| c.cluster.clone())?;
+        config
+            .clusters
+            .iter()
+            .find(|c| c.name == wanted)
+            .and_then(|c| c.cluster.clone())
+    };
+    let (ours, theirs) = (
+        cluster(ours).expect("our cluster"),
+        cluster(&kinds).expect("kind's"),
+    );
+    assert!(
+        ours.proxy_url.is_none(),
+        "refusing to write through a proxy"
+    );
+    assert!(
+        ours.server.is_some() && ours.server == theirs.server,
+        "not kind's server"
+    );
+}
+
+// covers UP-54: against a real API server, a read-only client still reads, and nothing it refuses
+// changes the cluster.
+#[tokio::test]
+#[ignore = "needs the dev cluster: set FLINT_TEST_KUBECONFIG and pass --include-ignored"]
+async fn the_read_only_client_holds_against_a_real_server() {
+    use k8s_openapi::api::core::v1::Namespace;
+    use k8s_openapi::api::rbac::v1::ClusterRole;
+    use kube::Api;
+    use kube::api::{DeleteParams, ObjectMeta, PostParams};
+
+    let loaded = kubeconfig::load(&[test_kubeconfig()]);
+    let context = loaded.contexts.first().expect("a context").name.clone();
+    assert_local_kind(&loaded.merged, &context);
+    let reader = cluster::connect(&loaded.merged, &context).await.unwrap();
+    let admin = cluster::connect_unrestricted_for_tests(&loaded.merged, &context)
+        .await
+        .unwrap();
+
+    let suffix = std::process::id();
+    let namespace = format!("flint-read-only-{suffix}");
+    let role = format!("flint-read-only;{suffix}");
+    let namespaces: Api<Namespace> = Api::all(admin.clone());
+    let roles: Api<ClusterRole> = Api::all(admin.clone());
+    namespaces
+        .create(
+            &PostParams::default(),
+            &Namespace {
+                metadata: ObjectMeta {
+                    name: Some(namespace.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Nothing here panics, so the fixtures are always removed.
+    let mut failures = match probe_read_only(&reader, &admin, &namespace, &role).await {
+        Ok(failures) => failures,
+        Err(e) => vec![format!("setting up: {e}")],
+    };
+    let gone = |e: &kube::Error| matches!(e, kube::Error::Api(s) if s.code == 404);
+    if let Err(e) = roles.delete(&role, &DeleteParams::default()).await
+        && !gone(&e)
+    {
+        failures.push(format!("removing the role: {e}"));
+    }
+    if let Err(e) = namespaces
+        .delete(&namespace, &DeleteParams::default())
+        .await
+    {
+        failures.push(format!("removing the namespace: {e}"));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Makes the fixtures in the scratch `namespace`, and returns what the read-only client got wrong.
+async fn probe_read_only(
+    reader: &kube::Client,
+    admin: &kube::Client,
+    namespace: &str,
+    role: &str,
+) -> Result<Vec<String>, kube::Error> {
+    use http::{Method, Request};
+    use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+    use k8s_openapi::api::rbac::v1::ClusterRole;
+    use kube::Api;
+    use kube::api::{ListParams, ObjectMeta, PostParams};
+    use kube::client::Body;
+
+    let marker = "marker";
+    let absent = "absent";
+    let maps: Api<ConfigMap> = Api::namespaced(admin.clone(), namespace);
+    let before = maps
+        .create(
+            &PostParams::default(),
+            &ConfigMap {
+                metadata: ObjectMeta {
+                    name: Some(marker.to_owned()),
+                    labels: Some([("flint-test".to_owned(), "read-only".to_owned())].into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await?;
+    Api::<ClusterRole>::all(admin.clone())
+        .create(
+            &PostParams::default(),
+            &ClusterRole {
+                metadata: ObjectMeta {
+                    name: Some(role.to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let mut failures = Vec::new();
+    let pods: Api<Pod> = Api::namespaced(reader.clone(), namespace);
+    if let Err(e) = pods.list(&ListParams::default()).await {
+        failures.push(format!("listing pods failed: {e}"));
+    }
+    let readable: Api<ConfigMap> = Api::namespaced(reader.clone(), namespace);
+    if let Err(e) = readable.get(marker).await {
+        failures.push(format!("reading the marker failed: {e}"));
+    }
+
+    let collection = format!("/api/v1/namespaces/{namespace}/configmaps");
+    let map_path = format!("{collection}/{marker}");
+    let pod_path = format!("/api/v1/namespaces/{namespace}/pods/absent");
+    let body =
+        format!(r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"{absent}"}}}}"#);
+    let refused = [
+        (Method::POST, collection.clone(), body),
+        (Method::PUT, map_path.clone(), String::new()),
+        (Method::PATCH, map_path.clone(), "{}".to_owned()),
+        (Method::DELETE, map_path, String::new()),
+        (
+            Method::DELETE,
+            format!("{collection}?labelSelector=flint-test%3Dread-only"),
+            String::new(),
+        ),
+        (
+            Method::GET,
+            format!("{pod_path}/exec?command=true"),
+            String::new(),
+        ),
+        (Method::GET, format!("{pod_path}/attach"), String::new()),
+        (
+            Method::GET,
+            format!("{pod_path}/portforward?ports=80"),
+            String::new(),
+        ),
+        (Method::GET, format!("{pod_path}/proxy/"), String::new()),
+    ];
+    for (method, path, body) in refused {
+        let request = Request::builder()
+            .method(method.clone())
+            .uri(&path)
+            .body(Body::from(body.into_bytes()))
+            .expect("a valid request");
+        match reader.send(request).await {
+            Err(e) if e.to_string().contains("read-only") => {}
+            Err(e) => failures.push(format!("{method} {path}: other error: {e}")),
+            Ok(response) => failures.push(format!("{method} {path}: {}", response.status())),
+        }
+    }
+
+    match Api::<ClusterRole>::all(reader.clone()).get(role).await {
+        Err(e) if e.to_string().contains("name contains `;`") => {}
+        other => failures.push(format!("a role named with `;`: {other:?}")),
+    }
+    match maps.get(marker).await {
+        Ok(after) if after.metadata.resource_version == before.metadata.resource_version => {}
+        other => failures.push(format!("the marker changed: {other:?}")),
+    }
+    match maps.get_opt(absent).await {
+        Ok(None) => {}
+        other => failures.push(format!("a refused create reached the server: {other:?}")),
+    }
+    Ok(failures)
+}

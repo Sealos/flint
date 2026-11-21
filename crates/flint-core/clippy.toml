@@ -1,0 +1,10 @@
+# Every client is assembled in `cluster::build_client`, which puts the read-only rule on it.
+# Clippy cannot name one type's `TryFrom`: scripts/check-client-construction.sh covers that.
+disallowed-methods = [
+  { path = "kube::Client::new", reason = "clients are built in cluster::build_client" },
+  { path = "kube::Client::try_default", reason = "clients are built in cluster::build_client" },
+  { path = "core::convert::TryInto::try_into", reason = "could build a client outside cluster::build_client; use the target type's try_from" },
+]
+disallowed-types = [
+  { path = "kube::client::ClientBuilder", reason = "clients are built in cluster::build_client" },
+]

@@ -37,6 +37,7 @@ mod notice;
 mod object;
 mod palette;
 mod palette_model;
+mod quit_flush;
 mod registry;
 mod resource_actions;
 mod row_menu;
@@ -148,11 +149,8 @@ pub fn run(boot: Bootstrap) {
             registry::init(cx);
             install_menus(settings.appearance, cx);
             // On macOS a quit ends the process without returning from `run`.
-            cx.on_app_quit(|_| {
-                flint_core::bootstrap::flush_logs();
-                async {}
-            })
-            .detach();
+            cx.on_app_quit(|cx| quit_flush::QuitFlush::join(cx).finish())
+                .detach();
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

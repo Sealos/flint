@@ -136,7 +136,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   again.
 - **And** kinds written by hand resolve as `kubectl get` names them. A kind that matches nothing or several grants
   nothing. `list_clusters` reports it in `unmatched_kinds`, and a namespace that does not exist in
-  `unmatched_namespaces`.
+  `unmatched_namespaces`. When it could not check everything (too many namespaces, a refused or slow lookup, part of
+  API discovery failing), it says so in `check_incomplete`, without naming anything outside the scope.
 - Tests: unit (policy), mcp (fake API server), ui.
 
 ### UP-15 Credentials in logs don't reach the agent
