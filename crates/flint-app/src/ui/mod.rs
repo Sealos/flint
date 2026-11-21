@@ -14,6 +14,7 @@ mod automation;
 mod closing;
 #[cfg(test)]
 mod closing_tests;
+mod cluster_name;
 mod clusters;
 mod confirm;
 mod detail;

@@ -15,7 +15,7 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{HandleEdge, resize_handle};
 use gpui_kit::component::tag::Tag;
@@ -43,9 +43,9 @@ use super::nav::{NavEvent, NavPanel};
 use super::palette::CommandPalette;
 use super::registry::{
     self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
-    LockCluster, OnView, OpenView, RetryConnection, SelectCluster, ShowAgentActivity,
-    ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster,
-    UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    LockCluster, OnView, OpenView, RenameCluster, RetryConnection, SelectCluster,
+    ShowAgentActivity, ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster,
+    UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::row_menu;
 use super::scope_picker::{self, ScopePicker};
@@ -54,7 +54,7 @@ use super::terminal_model::ShellRequest;
 use super::terminal_view::{RestartBlocked, TerminalView};
 use super::theme;
 use super::ui_state::{self, UiState};
-use flint_core::display;
+use flint_core::display::{self, ClusterNames};
 
 /// The height of the main area's header and the list's toolbar.
 pub const HEADER_HEIGHT: f32 = 32.;
@@ -1123,6 +1123,7 @@ impl Workspace {
         }
         // The keyboard cursor shows only while the sidebar has focus.
         let cursor = focused.then(|| self.sidebar_cursor(cx)).flatten();
+        let names = model.names();
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
@@ -1134,7 +1135,7 @@ impl Workspace {
                 (is_active, ring),
                 exposure,
                 protection,
-                settings_ok,
+                (settings_ok, &names),
                 theme,
             ));
         }
@@ -1208,13 +1209,14 @@ impl Workspace {
         (is_active, ring): (bool, bool),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
-        settings_ok: bool,
+        (settings_ok, names): (bool, &ClusterNames),
         theme: &Theme,
     ) -> AnyElement {
         let name = cluster.info.name.clone();
         let server = cluster.info.server.clone();
-        let title = display::short_name(&name);
-        let subtitle = display::subtitle(&name, cluster.info.server_host());
+        let title = names.of(&name);
+        // With a custom name, it starts with the real one: the row always says which cluster.
+        let subtitle = names.subtitle(&name, cluster.info.server_host());
         let presence = Presence::of(&cluster.state, is_active);
         let state_text = match &cluster.state {
             ConnectionState::Connected(v) if presence == Presence::Idle => format!(
@@ -1262,7 +1264,8 @@ impl Workspace {
             .test_support();
 
         let tooltip = hover_text.clone();
-        h_flex()
+        let rename = name.clone();
+        let row = h_flex()
             .id(SharedString::from(format!("cluster-{name}")))
             // Named for assistive technology (and view tests): the short title, then the
             // tooltip's full context, server and state.
@@ -1356,9 +1359,23 @@ impl Workspace {
                 &trust,
                 settings_ok,
             ))
-            .child(self.render_exposure_toggle(&name, server, exposure, settings_ok))
-            .test_support()
-            .into_any_element()
+            .child(self.render_exposure_toggle(&name, server, exposure, settings_ok));
+        let row = row.test_support();
+        let row = div()
+            .id(SharedString::from(format!("cluster-menu-{name}")))
+            .w_full()
+            .child(row);
+        if !settings_ok {
+            return row.into_any_element();
+        }
+        row.context_menu(move |menu, _, _| {
+            menu.item(
+                PopupMenuItem::new("Rename…").on_click(registry::on_click(RenameCluster {
+                    cluster: rename.clone(),
+                })),
+            )
+        })
+        .into_any_element()
     }
 
     /// The Expose to AI button. Exposing asks for confirmation naming the context and server;
@@ -1486,7 +1503,7 @@ impl Workspace {
         let ns_summary = namespace_summary(&filter);
 
         let mut crumbs: Vec<(SharedString, String)> = vec![(
-            display::short_name(&name).into(),
+            self.model.read(cx).names().of(&name).into(),
             format!(
                 "{name}\n{}",
                 cluster.info.server.as_deref().unwrap_or("no server")
@@ -1976,19 +1993,21 @@ fn confirm_unlock(
     window: &mut Window,
     cx: &mut App,
     model: Entity<ClustersModel>,
+    shown: &str,
     context: String,
     server: String,
 ) {
-    let dialog = unlock_dialog(&context, &server);
+    let dialog = unlock_dialog(shown, &context, &server);
     confirm::open(window, cx, dialog, move |_, cx| {
         model.update(cx, |m, cx| m.unlock(&context, &server, cx));
     });
 }
 
-/// The unlock confirmation, naming the context and the server it points at.
-fn unlock_dialog(context: &str, server: &str) -> DialogText {
+/// The unlock confirmation, naming the context and the server it points at. `shown` is what the
+/// title calls it ([`ClusterNames::with_real`]).
+fn unlock_dialog(shown: &str, context: &str, server: &str) -> DialogText {
     DialogText {
-        title: format!("Unlock {}?", display::short_name(context)),
+        title: format!("Unlock {shown}?"),
         text: format!(
             "Until Flint quits, or until you lock it again, actions that change this cluster or \
              run code in it work without asking again: opening a shell, today. It stays unlocked \
@@ -2009,11 +2028,12 @@ fn confirm_trust(
     window: &mut Window,
     cx: &mut App,
     model: Entity<ClustersModel>,
+    shown: &str,
     context: String,
     server: String,
     previous: Option<String>,
 ) {
-    let dialog = trust_dialog(&context, &server, previous.as_deref());
+    let dialog = trust_dialog(shown, &context, &server, previous.as_deref());
     confirm::open(window, cx, dialog, move |_, cx| {
         model.update(cx, |m, _| m.trust_cluster(context.clone(), server.clone()));
     });
@@ -2021,7 +2041,7 @@ fn confirm_trust(
 
 /// The trust confirmation, naming the context and the server it points at (and the server it
 /// was trusted at before, when the context moved).
-fn trust_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogText {
+fn trust_dialog(shown: &str, context: &str, server: &str, previous: Option<&str>) -> DialogText {
     let mut text = format!(
         "A trusted cluster stays unlocked when Flint restarts: actions that change it or run \
          code in it work without asking. Trust is kept in settings.toml and pinned to this \
@@ -2034,7 +2054,7 @@ fn trust_dialog(context: &str, server: &str, previous: Option<&str>) -> DialogTe
         ));
     }
     DialogText {
-        title: format!("Trust {}?", display::short_name(context)),
+        title: format!("Trust {shown}?"),
         text,
         ok: "Trust".into(),
         cancel: "Cancel".into(),

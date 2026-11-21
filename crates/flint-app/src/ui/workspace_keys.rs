@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use flint_core::{KindId, NavEntry, WatchMode, display};
+use flint_core::{KindId, NavEntry, WatchMode};
 use gpui_kit::*;
 
 use super::super::focus::release_unfocused_input;
@@ -363,7 +363,7 @@ impl Workspace {
             cluster: self
                 .cluster
                 .as_deref()
-                .map(|c| SharedString::from(display::short_name(c).to_string())),
+                .map(|c| SharedString::from(self.model.read(cx).names().of(c))),
             cluster_id,
             index: Index::new(&entries, &[]),
             loading: self.cluster.is_some() && !entries.is_empty(),

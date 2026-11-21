@@ -206,6 +206,36 @@ impl Drop for AppliedSecret<'_> {
     }
 }
 
+// covers UP-10, UP-90: a custom cluster name is only what Flint shows. Agents keep the context
+// name, and the custom one does not reach the cluster.
+#[test]
+fn up_10_a_custom_cluster_name_does_not_change_mcp_output() -> Result<()> {
+    let Some(on) = Inspected::start()? else {
+        return Ok(());
+    };
+    on.expose()?;
+    let cluster = on.context();
+    let mut mcp = on.mcp()?;
+    let before = mcp.call_json("list_resources", json!({"cluster": cluster, "kind": "ns"}))?;
+    drop(mcp);
+
+    let custom = "custom-name-for-test";
+    let settings = format!(
+        "{}\n[cluster_names]\n{cluster:?} = {custom:?}\n",
+        exposing(cluster, &on.cluster.server)
+    );
+    on.scratch.write_settings(&settings)?;
+    let mut mcp = on.mcp()?;
+    let named = mcp.call_json("list_clusters", json!({}))?;
+    assert!(named.to_string().contains(cluster), "{named}");
+    assert!(!named.to_string().contains(custom), "{named}");
+    let after = mcp.call_json("list_resources", json!({"cluster": cluster, "kind": "ns"}))?;
+    assert_eq!(after["columns"], before["columns"]);
+    let refused = mcp.call("list_resources", json!({"cluster": custom, "kind": "ns"}))?;
+    assert!(refused.is_error, "{}", refused.text);
+    Ok(())
+}
+
 // covers UP-09
 #[test]
 fn up_09_agent_lists_only_exposed_clusters() -> Result<()> {

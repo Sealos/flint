@@ -112,6 +112,46 @@ fn refusal(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
         .read_with(cx, |ws, _| ws.action_error().map(str::to_owned))
 }
 
+// covers UP-01, UP-55: a custom name is what the sidebar shows, but the row, its tooltip and the
+// unlock confirmation still say which real cluster it is.
+#[gpui_kit::test]
+async fn a_custom_name_never_hides_the_real_cluster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let t = open_with_settings(cx, dir.path(), &settings).await;
+    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("main"));
+    let tip = t
+        .find(cx, "cluster-alpha")
+        .and_then(|row| row.description().map(str::to_owned))
+        .unwrap();
+    assert!(tip.starts_with(&format!("alpha\n{}\n", t.server)), "{tip}");
+    t.model.read_with(cx, |m, _| {
+        assert_eq!(m.names().subtitle("alpha", Some("host")), "alpha · host");
+    });
+
+    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    let wanted = unlock_dialog("main (alpha)", "alpha", &t.server);
+    assert_eq!(t.label(cx, "unlock-description"), Some(wanted.text.clone()));
+    assert!(
+        wanted
+            .text
+            .contains(&format!("Context: alpha\nServer: {}", t.server))
+    );
+    let shown = cx
+        .update_window(t.window, |_, window, cx| {
+            crate::ui::confirm::shown(window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.title, "Unlock main (alpha)?");
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    // Protection goes by the context, whatever it is called.
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+}
+
 // covers UP-54, UP-55: on a protected cluster Shell is disabled, saying why, and Unlock sits
 // beside it; Logs still work. Unlocking asks first, naming the cluster and its server; Esc
 // keeps it protected. Once unlocked, Shell opens; Lock Again protects it again, and Restart
@@ -146,7 +186,7 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "unlock-description"),
-        Some(unlock_dialog("alpha", &t.server).text)
+        Some(unlock_dialog("alpha", "alpha", &t.server).text)
     );
     assert_eq!(t.label(cx, "ok").as_deref(), Some("Unlock"));
     t.press(cx, "escape");
@@ -274,7 +314,7 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "trust-description"),
-        Some(trust_dialog("alpha", &t.server, None).text)
+        Some(trust_dialog("alpha", "alpha", &t.server, None).text)
     );
     assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
@@ -300,7 +340,7 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "trust-description"),
-        Some(trust_dialog("beta", &t.refused_server, Some(old)).text)
+        Some(trust_dialog("beta", "beta", &t.refused_server, Some(old)).text)
     );
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;

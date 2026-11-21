@@ -1169,8 +1169,7 @@ async fn shortcuts_are_the_ones_that_fire_there(cx: &mut TestAppContext) {
 }
 
 // covers UP-30: an exact stored value wins over what is shown for it, case first. With
-// contexts `cluster/prod` and an EKS ARN shown as `cluster/prod`, typing the name picks that
-// context; contexts `ABC` and `abc` each get their own.
+// contexts `prod` and an EKS ARN shown as `prod`, typing the name picks that context; contexts `ABC` and `abc` each get their own.
 #[gpui_kit::test]
 async fn exact_stored_values_win(cx: &mut TestAppContext) {
     use crate::ui::support_tests::{kubeconfig_yaml, open_workspace_with};
@@ -1182,7 +1181,7 @@ async fn exact_stored_values_win(cx: &mut TestAppContext) {
             &kubeconfig,
             kubeconfig_yaml(&[
                 (ARN, &servers.refused),
-                ("cluster/prod", &servers.refused),
+                ("prod", &servers.refused),
                 ("ABC", &servers.refused),
                 ("abc", &servers.refused),
             ]),
@@ -1191,11 +1190,7 @@ async fn exact_stored_values_win(cx: &mut TestAppContext) {
         vec![kubeconfig]
     })
     .await;
-    for (typed, wanted) in [
-        ("cluster/prod", "cluster/prod"),
-        ("abc", "abc"),
-        ("ABC", "ABC"),
-    ] {
+    for (typed, wanted) in [("prod", "prod"), ("abc", "abc"), ("ABC", "ABC")] {
         ask(cx, &t, "select cluster").await;
         t.type_text(cx, typed);
         t.press(cx, "enter");

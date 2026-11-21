@@ -348,6 +348,14 @@ pub struct UnlockCluster {
     pub cluster: String,
 }
 
+/// Choose the name Flint shows for a cluster: opens a dialog naming its context and server.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = workspace, no_json)]
+#[serde(deny_unknown_fields)]
+pub struct RenameCluster {
+    pub cluster: String,
+}
+
 /// Lock a cluster unlocked for this session again (Lock Again).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = workspace, no_json)]
@@ -1964,6 +1972,13 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Unlock Cluster…",
             "Let Flint change a protected cluster and open shells in it until Flint quits, after \
              a confirmation naming its server.",
+            CLUSTER,
+        )
+        .of(C::Cluster, S::Workspace),
+        Spec::with_args::<RenameCluster>(
+            "Rename Cluster…",
+            "Choose the name Flint shows for a cluster. kubeconfig is not changed, and AI agents \
+             and shells keep the context name.",
             CLUSTER,
         )
         .of(C::Cluster, S::Workspace),
