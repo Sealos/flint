@@ -750,7 +750,7 @@ impl ResourceList {
         let stale = !self.shown.state.is_current();
         // Secret rows show only identity columns, as the MCP server does: a printer column
         // added by an extension could show a value.
-        let secrets = self.kind.as_str() == "secrets";
+        let secrets = flint_core::redact::is_secret_list(self.kind.as_str());
         let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);

@@ -38,6 +38,18 @@ pub fn is_safe_secret_column(name: &str) -> bool {
     SAFE_SECRET_COLUMNS.contains(&name)
 }
 
+/// Whether a list of `kind` (a [`crate::KindId`] string) is of core Secrets, whose columns are
+/// masked. A CRD also named `secrets` has a group in its id, so it is not.
+pub fn is_secret_list(kind: &str) -> bool {
+    kind == "secrets"
+}
+
+/// Whether `column` of a list hides its values. Everything derived from such a column (text,
+/// filter matches, sort order, width) must not depend on its raw cells.
+pub fn is_masked_column(secret_list: bool, column: &str) -> bool {
+    secret_list && !is_safe_secret_column(column)
+}
+
 /// Whether `object` is a core v1 Secret.
 pub fn is_secret_object(object: &Value) -> bool {
     object.get("kind").and_then(Value::as_str) == Some("Secret")
