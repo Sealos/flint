@@ -416,6 +416,11 @@ impl App {
         &self.binary
     }
 
+    /// The process id of the running app.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("the app is running").id()
+    }
+
     /// The app's scratch `FLINT_CONFIG_DIR`, where `settings.toml` and `state.toml` live.
     pub fn config_dir(&self) -> PathBuf {
         self.scratch().config_dir()

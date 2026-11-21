@@ -1,8 +1,6 @@
 //! M1 user paths: browsing resources (docs/USER-PATHS.md).
 //!
-//! Not here: UP-26 (10,000 pods stay smooth, within a memory budget) is a load test with
-//! numbers recorded against kind (`crates/flint-core/tests/watch_load.rs`); an e2e pass or fail
-//! says nothing about smoothness.
+//! Not here: UP-26 (10,000 pods stay responsive) is the nightly load test in `load.rs`.
 
 use std::time::{Duration, Instant};
 
