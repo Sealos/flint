@@ -133,6 +133,9 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **Then** the agent sees only those namespaces and kinds. Asking for anything else returns the same "not found" error
   as an unexposed cluster. Cluster-scoped kinds are hidden unless I named them. Clearing the scope exposes everything
   again.
+- **And** kinds written by hand resolve as `kubectl get` names them. A kind that matches nothing or several grants
+  nothing. `list_clusters` reports it in `unmatched_kinds`, and a namespace that does not exist in
+  `unmatched_namespaces`.
 - Tests: unit (policy), mcp (fake API server), ui.
 
 ### UP-15 Credentials in logs don't reach the agent

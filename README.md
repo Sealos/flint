@@ -112,6 +112,11 @@ server = "https://staging.example.com:6443"
 # kinds = ["pods", "deployments.apps"]  # optional: only these kinds (missing or empty: all)
 ```
 
+Kinds are written as for `kubectl get`: plural, singular, Kind or short name (`pods`, `pod`, `Pod`, `po`), with
+`.group` when needed. A name that matches no kind, or several, grants nothing, and so does a name without a group
+while part of API discovery is failing. `list_clusters` reports such names as
+`unmatched_kinds`, and namespaces that do not exist as `unmatched_namespaces`. The server logs them once to stderr.
+
 An empty list (`namespaces = []`) means no limit, not no access: to keep agents away from a cluster, remove its entry.
 If the file already has `ai_exposed_clusters` as an inline array (`ai_exposed_clusters = [...]`), add the entry to
 that array instead; TOML doesn't allow both forms for one key, and an invalid file turns every exposure off.
