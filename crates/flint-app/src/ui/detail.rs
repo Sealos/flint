@@ -13,7 +13,7 @@ use flint_core::{ClusterId, CoreHandle, KindId, ObjectDetail, WorkloadKind};
 use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
@@ -27,6 +27,7 @@ use gpui_kit::*;
 use super::icons::FlintIcon;
 use super::list::tabular_figures;
 use super::log_view::LogRequest;
+use super::menu_fit::{fit_picker, picker_item};
 use super::menu_record;
 use super::notice::notice;
 use super::object::{self, MASK, Overview, PodContainer, SecretValue};
@@ -627,7 +628,7 @@ impl DetailView {
                                 .map(|c| menu_record::Entry::new(label(c), true))
                                 .collect()
                         });
-                        let mut menu = fit_container_names(menu, window).label("Container");
+                        let mut menu = fit_picker(menu, window).label("Container");
                         for c in &containers {
                             let (item, action) = log_item(c, false);
                             menu = menu.item(item.on_click(registry::on_click(action)));
@@ -763,7 +764,7 @@ impl DetailView {
                             })
                             .collect()
                     });
-                    let mut menu = fit_container_names(menu, window).label("Container");
+                    let mut menu = fit_picker(menu, window).label("Container");
                     for name in &containers {
                         let running = !not_running.contains(name);
                         let (item, action) = shell_item(name, *name == default, running);
@@ -1357,15 +1358,6 @@ fn key_value(
         .into_any_element()
 }
 
-/// A container picker, wide enough for its entries in full: names that differ only in the
-/// middle must stay apart, and menu items neither wrap nor shrink. A container's name is at most
-/// 63 characters; the picker never grows past the window.
-pub(in crate::ui) fn fit_container_names(menu: PopupMenu, window: &Window) -> PopupMenu {
-    const WIDEST: Pixels = px(1000.);
-    let room = window.viewport_size().width - px(16.);
-    menu.max_w(if room < WIDEST { room } else { WIDEST })
-}
-
 /// "5m" for an RFC 3339 timestamp five minutes ago.
 /// A container as a picker lists it: `app (default)`, `migrate (init)`. The default one is
 /// what the keys open (⌘L, ⇧⌘L, ⇧⌘E), so the picker says which it is.
@@ -1395,12 +1387,12 @@ pub(in crate::ui) fn log_item(
     c: &PodContainer,
     previous: bool,
 ) -> (PopupMenuItem, OpenContainerLogs) {
-    let item = PopupMenuItem::new(container_label(&c.name, c.init, c.default));
-    let item = match (c.default, previous) {
-        (true, false) => item.action(Box::new(OpenLogs)),
-        (true, true) => item.action(Box::new(OpenPreviousLogs)),
-        (false, _) => item,
+    let key: Option<Box<dyn Action>> = match (c.default, previous) {
+        (true, false) => Some(Box::new(OpenLogs)),
+        (true, true) => Some(Box::new(OpenPreviousLogs)),
+        (false, _) => None,
     };
+    let item = picker_item(container_label(&c.name, c.init, c.default), key);
     let action = OpenContainerLogs {
         container: c.name.clone(),
         previous,
@@ -1415,12 +1407,8 @@ pub(in crate::ui) fn shell_item(
     default: bool,
     running: bool,
 ) -> (PopupMenuItem, OpenContainerShell) {
-    let item = PopupMenuItem::new(shell_label(name, default, running)).disabled(!running);
-    let item = if default {
-        item.action(Box::new(OpenShell))
-    } else {
-        item
-    };
+    let key: Option<Box<dyn Action>> = default.then(|| Box::new(OpenShell) as Box<dyn Action>);
+    let item = picker_item(shell_label(name, default, running), key).disabled(!running);
     let action = OpenContainerShell {
         container: name.to_owned(),
     };

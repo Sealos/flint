@@ -84,6 +84,17 @@ async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Val
             Ok(json!({"handled": handled}))
         }
         Command::RightClick { id } => right_click(target, cx, &id).await,
+        Command::ResizeWindow { width, height } => {
+            let viewport = in_window(target, cx, |window, _| {
+                window.resize(size(px(width), px(height)));
+                window.viewport_size()
+            })?;
+            settle(target, cx).await;
+            Ok(json!({
+                "width": f32::from(viewport.width),
+                "height": f32::from(viewport.height),
+            }))
+        }
         Command::State => state(target, cx),
         Command::Actions => actions(target, cx),
         Command::WaitFor {

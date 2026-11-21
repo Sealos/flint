@@ -30,6 +30,7 @@ mod list_model;
 mod list_sort_tests;
 mod log_model;
 mod log_view;
+mod menu_fit;
 mod menu_record;
 mod nav;
 mod notice;

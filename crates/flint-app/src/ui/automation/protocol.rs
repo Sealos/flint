@@ -31,6 +31,8 @@ pub enum Command {
     /// Right-click the drawn element named `id` (a row's `row-<uid>`), as the mouse does: for
     /// opening a context menu.
     RightClick { id: String },
+    /// Resize the window to `width` by `height` points, to check narrow and short layouts.
+    ResizeWindow { width: f32, height: f32 },
     /// The visible view tree.
     State,
     /// Wait until `predicate` holds on `state`, or fail after `timeout_ms`.
@@ -58,6 +60,17 @@ struct Request {
     cmd: String,
     #[serde(default)]
     args: Value,
+}
+
+/// The window sizes `resize_window` takes, in points.
+const MIN_WINDOW: f32 = 100.;
+const MAX_WINDOW: f32 = 8000.;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SizeArgs {
+    width: f32,
+    height: f32,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +263,20 @@ fn command(cmd: &str, args: Value) -> Result<Command, Error> {
             let a: ElementArgs = args_of(cmd, args)?;
             Command::RightClick { id: a.id }
         }
+        "resize_window" => {
+            let a: SizeArgs = args_of(cmd, args)?;
+            let sizes = MIN_WINDOW..=MAX_WINDOW;
+            if !sizes.contains(&a.width) || !sizes.contains(&a.height) {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgs,
+                    format!("resize_window: width and height are {MIN_WINDOW} to {MAX_WINDOW}"),
+                ));
+            }
+            Command::ResizeWindow {
+                width: a.width,
+                height: a.height,
+            }
+        }
         "state" => {
             no_args(cmd, &args)?;
             Command::State
@@ -385,6 +412,13 @@ mod tests {
                 id: "row-uid-web".into()
             }
         );
+        assert_eq!(
+            ok(r#"{"cmd":"resize_window","args":{"width":420,"height":320}}"#),
+            Command::ResizeWindow {
+                width: 420.,
+                height: 320.
+            }
+        );
         assert_eq!(ok(r#"{"id":"s","cmd":"state"}"#), Command::State);
         assert_eq!(ok(r#"{"cmd":"actions"}"#), Command::Actions);
         assert_eq!(
@@ -442,6 +476,10 @@ mod tests {
         assert_eq!(
             err(r#"{"id":3,"cmd":"right_click","args":{}}"#),
             (json!(3), ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            err(r#"{"id":4,"cmd":"resize_window","args":{"width":1,"height":320}}"#),
+            (json!(4), ErrorCode::InvalidArgs)
         );
     }
 

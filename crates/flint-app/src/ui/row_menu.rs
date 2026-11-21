@@ -31,9 +31,10 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 
 use super::detail::{
-    Opening, PROTECTED_NOTE, ShellPod, Subject, fit_container_names, log_item, protected_reason,
-    reason, refused, shell_item,
+    Opening, PROTECTED_NOTE, ShellPod, Subject, log_item, protected_reason, reason, refused,
+    shell_item,
 };
+use super::menu_fit::{fit_menu, fit_picker, note_width, wrapped_label};
 use super::object::PodContainer;
 use super::registry::{
     self, OpenContainerLogs, OpenLogs, OpenPreviousLogs, OpenShell, UnlockCluster,
@@ -48,13 +49,6 @@ pub type RowMenu = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) ->
 /// The longest reason an action gives that the menu shows; the rest is cut. Long enough for a
 /// long context name and all that is said about it: reasons wrap ([`say`]).
 const MAX_REASON: usize = 200;
-
-/// How wide a reason is before it wraps: inside the menu's default 31.25 rem, at Flint's 15 px
-/// rem, less its padding.
-const REASON_WIDTH: Pixels = px(440.);
-
-/// The element holding a note's text ([`say`]), inside its menu item.
-pub(in crate::ui) const MENU_NOTE: &str = "row-menu-note";
 
 /// The most of a pod's name the Shell entry shows, with its key, inside the menu's width.
 const SHELL_POD_NAME: usize = 28;
@@ -225,7 +219,7 @@ fn fill(
     let Some(a) = actions else {
         return menu;
     };
-    let mut menu = menu;
+    let mut menu = fit_menu(menu, window);
     if let Some(why) = &a.blocked {
         menu = say(menu, why).separator();
     }
@@ -276,7 +270,7 @@ fn fill(
         // The container picker.
         Some(shell) if a.shell_picker && a.blocked.is_none() => {
             menu.submenu(label, window, cx, move |sub, window, _| {
-                let sub = fit_container_names(sub, window).label("Container");
+                let sub = fit_picker(sub, window).label("Container");
                 shell.containers.iter().fold(sub, |sub, name| {
                     let running = !shell.not_running.contains(name);
                     let (item, action) = shell_item(name, *name == shell.default, running);
@@ -300,10 +294,11 @@ fn fill(
             let label = SharedString::from(unlock_label(&name));
             let tip = SharedString::from(tip);
             menu.item(
-                PopupMenuItem::element(move |_, _| {
+                PopupMenuItem::element(move |window, _| {
                     let tip = tip.clone();
                     div()
                         .id("menu-unlock")
+                        .max_w(note_width(window))
                         .role(Role::MenuItem)
                         .aria_label(label.clone())
                         .aria_description(tip.clone())
@@ -323,15 +318,8 @@ fn fill(
 fn say(menu: PopupMenu, text: &str) -> PopupMenu {
     let text = SharedString::from(text.to_owned());
     menu.item(
-        PopupMenuItem::element(move |_, _| {
-            // A custom item has no accessible name of its own: it takes it from this label's value.
-            div()
-                .id(MENU_NOTE)
-                .test_support()
-                .role(Role::Label)
-                .aria_value(text.clone())
-                .max_w(REASON_WIDTH)
-                .child(text.clone())
+        PopupMenuItem::element(move |window, _| {
+            wrapped_label(text.clone()).max_w(note_width(window))
         })
         .disabled(true),
     )
@@ -366,7 +354,7 @@ fn log_picker(
 ) -> PopupMenu {
     let workspace = workspace.clone();
     menu.submenu(label, window, cx, move |sub, window, _| {
-        let sub = fit_container_names(sub, window).label("Container");
+        let sub = fit_picker(sub, window).label("Container");
         containers.iter().fold(sub, |sub, c| {
             let (item, action) = log_item(c, previous);
             sub.item(item.on_click(registry::on_click_or(
