@@ -429,6 +429,15 @@ pub enum Presence<'a> {
     Failed,
 }
 
+/// The shape of a cluster's presence marker. Shape carries the state without colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DotShape {
+    Filled,
+    Ring,
+    /// A short horizontal bar.
+    Dash,
+}
+
 impl<'a> Presence<'a> {
     pub fn of(
         state: &ConnectionState,
@@ -444,15 +453,33 @@ impl<'a> Presence<'a> {
         }
     }
 
-    pub fn dot(self, theme: &Theme) -> (Hsla, bool) {
+    /// The marker's colour and shape. Both are set here, so they change in one place.
+    pub fn dot(self, theme: &Theme) -> (Hsla, DotShape) {
         match self {
-            // Solid, not dimmed: faded it fell under 3:1. A filled grey is still not the hollow
-            // green of idle.
-            Presence::NotConnected => (theme.muted_foreground, true),
-            Presence::Connecting | Presence::Reconnecting { .. } => (theme.warning, true),
-            Presence::Live => (theme.success, true),
-            Presence::Idle => (theme.success, false),
-            Presence::Failed => (theme.danger, true),
+            // Solid, not dimmed: faded it fell under 3:1. A dash, not a disc: in grayscale the
+            // grey disc matches the live, connecting and failed ones (UP-32).
+            Presence::NotConnected => (theme.muted_foreground, DotShape::Dash),
+            Presence::Connecting | Presence::Reconnecting { .. } => {
+                (theme.warning, DotShape::Filled)
+            }
+            Presence::Live => (theme.success, DotShape::Filled),
+            Presence::Idle => (theme.success, DotShape::Ring),
+            Presence::Failed => (theme.danger, DotShape::Filled),
+        }
+    }
+
+    /// The row's marker, in the footprint of a dot, so rows do not shift between states.
+    pub fn marker(self, theme: &Theme) -> Div {
+        let (color, shape) = self.dot(theme);
+        match shape {
+            DotShape::Filled => super::theme::status_dot(color, true).size_2(),
+            DotShape::Ring => super::theme::status_dot(color, false).size_2(),
+            DotShape::Dash => div()
+                .size_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(div().w_2().h(px(2.)).rounded_full().bg(color)),
         }
     }
 
@@ -623,6 +650,19 @@ mod tests {
         assert_eq!(startup_cluster("KIND-FLINT-DEV", &clusters), None);
         assert_eq!(startup_cluster("", &clusters), None);
         assert_eq!(startup_cluster("prod", &[]), None);
+    }
+
+    // covers UP-32: not connected reads without colour or a tooltip, by its shape.
+    #[test]
+    fn not_connected_has_its_own_shape() {
+        let theme = gpui_kit::component::Theme::default();
+        let shape = |p: Presence| p.dot(&theme).1;
+        let not_connected = shape(Presence::NotConnected);
+        assert_ne!(not_connected, shape(Presence::Live));
+        assert_ne!(not_connected, shape(Presence::Connecting));
+        assert_ne!(not_connected, shape(Presence::Failed));
+        assert_ne!(not_connected, shape(Presence::Idle));
+        assert_ne!(shape(Presence::Live), shape(Presence::Idle));
     }
 
     // covers UP-24: a cluster switched away from stops its watches, so its dot must not say live.
