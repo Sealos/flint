@@ -700,8 +700,9 @@ fn mask_secret_fields(object: &mut Value) {
     }
 }
 
-/// Masks a Secret held in a string. JSON is parsed and only the Secret's values change. Anything
-/// else that reads as a Secret manifest (YAML, or JSON too deep or invalid) is replaced whole.
+/// Masks a Secret held in a string. JSON is parsed and only the Secret's values change. YAML is
+/// parsed under [`parse_yaml`]'s limits and replaced whole when it holds Secret values. Text that
+/// cannot be parsed is replaced whole when it still reads as a Secret manifest.
 fn mask_serialized(text: &mut String, depth: usize) -> bool {
     if depth < MAX_SERIALIZED_DEPTH
         && text.trim_start().starts_with(['{', '['])
@@ -717,6 +718,20 @@ fn mask_serialized(text: &mut String, depth: usize) -> bool {
         }
         return true;
     }
+    if depth < MAX_SERIALIZED_DEPTH
+        && let Some(documents) = parse_yaml(text)
+    {
+        let mut masked = documents.clone();
+        for document in &mut masked {
+            mask_nested_secrets(document, depth + 1);
+        }
+        // A reference to a Secret has no values, so nothing changes and the text is kept.
+        let changed = masked != documents;
+        if changed {
+            REDACTED.clone_into(text);
+        }
+        return changed;
+    }
     let manifest = names_secret_manifest(text);
     if manifest {
         REDACTED.clone_into(text);
@@ -724,22 +739,74 @@ fn mask_serialized(text: &mut String, depth: usize) -> bool {
     manifest
 }
 
+/// Largest string parsed as YAML. Longer text is matched by [`names_secret_manifest`].
+const MAX_YAML_BYTES: usize = OBJECT_BYTES;
+/// Nesting limit for YAML held in a string.
+const MAX_YAML_DEPTH: usize = 32;
+/// Node limit for YAML held in a string, also the cap on events replayed from aliases.
+const MAX_YAML_NODES: usize = 20_000;
+/// Limit on aliases, anchors and merge keys in YAML held in a string.
+const MAX_YAML_ALIASES: usize = 256;
+
+/// The YAML documents in `text`, within the limits above. `None` when it is not YAML, breaks a
+/// limit, or is one plain scalar with no structure to check.
+fn parse_yaml(text: &str) -> Option<Vec<Value>> {
+    if text.len() > MAX_YAML_BYTES || !text.contains(':') {
+        return None;
+    }
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_reader_input_bytes: Some(MAX_YAML_BYTES),
+            max_depth: MAX_YAML_DEPTH,
+            max_nodes: MAX_YAML_NODES,
+            max_events: MAX_YAML_NODES * 2,
+            max_documents: 64,
+            max_aliases: MAX_YAML_ALIASES,
+            max_anchors: MAX_YAML_ALIASES,
+            max_merge_keys: MAX_YAML_ALIASES,
+            max_total_scalar_bytes: MAX_YAML_BYTES,
+        },
+        alias_limits: serde_saphyr::alias_limits! {
+            max_total_replayed_events: MAX_YAML_NODES,
+            max_replay_stack_depth: MAX_YAML_DEPTH,
+            max_alias_expansions_per_anchor: MAX_YAML_ALIASES,
+        },
+    };
+    serde_saphyr::from_multiple_with_options::<Value>(text, options)
+        .ok()
+        .filter(|documents| !matches!(documents.as_slice(), [Value::String(s)] if s == text))
+}
+
 /// Whether `text` has a `kind: Secret` or `kind: SecretList` pair, in any quoting or escaping,
-/// and mentions `data`. Errs toward yes.
+/// with the value on the same line or a later one, and mentions `data`. Errs toward yes.
 fn names_secret_manifest(text: &str) -> bool {
-    const SKIPPED: [char; 5] = ['"', '\'', '\\', ' ', '\t'];
     let lower = text.to_ascii_lowercase();
     lower.contains("data")
         && lower.match_indices("kind").any(|(at, _)| {
-            let rest = lower[at + "kind".len()..].trim_start_matches(SKIPPED);
+            let rest = skip_separators(&lower[at + "kind".len()..]);
             let Some(rest) = rest.strip_prefix(':') else {
                 return false;
             };
-            let Some(after) = rest.trim_start_matches(SKIPPED).strip_prefix("secret") else {
+            let Some(after) = skip_separators(rest).strip_prefix("secret") else {
                 return false;
             };
             after.starts_with("list") || !after.starts_with(|c: char| c.is_ascii_alphanumeric())
         })
+}
+
+/// `text` after any quotes, whitespace and backslash escapes of whitespace (lowercase).
+fn skip_separators(mut text: &str) -> &str {
+    loop {
+        let rest = text.trim_start_matches(['"', '\'', ' ', '\t', '\r', '\n']);
+        let rest = ["\\n", "\\r", "\\t", "\\"]
+            .iter()
+            .find_map(|escape| rest.strip_prefix(escape))
+            .unwrap_or(rest);
+        if rest.len() == text.len() {
+            return rest;
+        }
+        text = rest;
+    }
 }
 
 /// Whether an object field holds free text that a workload or controller wrote: an Event's
@@ -856,6 +923,14 @@ pub fn redact_text(text: &mut String) -> usize {
     count
 }
 
+/// Redacts free text from a list cell or event message: a Secret held in it as JSON or YAML,
+/// then credentials. Returns how many credentials were replaced; masked Secret values are not
+/// counted.
+pub fn redact_free_text(text: &mut String) -> usize {
+    mask_serialized(text, 0);
+    redact_text(text)
+}
+
 /// Cuts `text` to at most `max_bytes`, at a line boundary when possible. Returns whether it cut.
 pub fn truncate_bytes(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
@@ -901,15 +976,17 @@ pub struct LogOutput {
 
 /// The last `max_lines` lines of `fetched`, with credentials redacted, then cut to `max_bytes`
 /// at a line boundary. Redacting everything fetched first sees each value next to its label and
-/// each block with its opening line, and the caps then apply to the text actually returned.
+/// each block with its opening line. Lines are counted in `fetched`, since a redacted block is
+/// shorter than the lines it replaces; the byte cap applies to the text actually returned.
 /// `older` says the log may go on before `fetched`: leading lines that continue a block whose
 /// start is out of reach are then left out (`leading_cut_off_lines`).
 pub fn log_output(fetched: &str, max_lines: usize, max_bytes: usize, older: bool) -> LogOutput {
     let redacted = flint_core::redact::redact_credentials(fetched);
     let all = &*redacted.text;
     let safe_start = if older { leading_cut_off_lines(all) } else { 0 };
-    let (tail, cut_lines) = tail_lines(all, max_lines);
-    let window = &all[(all.len() - tail.len()).max(safe_start)..];
+    let (tail, cut_lines) = tail_lines(fetched, max_lines);
+    let skipped = fetched[..fetched.len() - tail.len()].matches('\n').count();
+    let window = &all[redacted_line_start(fetched, all, skipped).max(safe_start)..];
     let (kept, cut_bytes) = tail_bytes(window, max_bytes);
     // Only markers the redactor wrote into the kept lines, not ones the workload logged.
     let count = redacted.count_from(all.len() - kept.len());
@@ -933,6 +1010,38 @@ pub fn log_output(fetched: &str, max_lines: usize, max_bytes: usize, older: bool
         redacted: count,
         note,
     }
+}
+
+/// The byte offset in `redacted` of line `skipped` of `original`. Redaction keeps lines one to
+/// one, except that a private key body becomes one marker line up to its END line (or the end of
+/// the text). A line inside such a body maps to the marker.
+fn redacted_line_start(original: &str, redacted: &str, skipped: usize) -> usize {
+    const MARKER: &str = "[REDACTED:private-key]";
+    let lines: Vec<&str> = original.split_inclusive('\n').collect();
+    let mut line = 0;
+    let mut offset = 0;
+    for shown in redacted.split_inclusive('\n') {
+        if line >= skipped {
+            return offset;
+        }
+        if shown.trim() == MARKER && lines.get(line).is_none_or(|l| l.trim() != MARKER) {
+            while line < lines.len() && !closes_private_key(lines[line]) {
+                line += 1;
+            }
+            if line > skipped {
+                return offset;
+            }
+        } else {
+            line += 1;
+        }
+        offset += shown.len();
+    }
+    offset
+}
+
+/// Whether `line` holds the END line of a private key.
+fn closes_private_key(line: &str) -> bool {
+    line.contains("-----END ") && line.contains("PRIVATE KEY")
 }
 
 /// How many lines to request first for a tail of `lines`: the look-behind, plus one to learn
@@ -959,22 +1068,84 @@ fn leading_cut_off_lines(text: &str) -> usize {
 }
 
 /// The end of the run of key-shaped lines at the start of `text`, optionally after a log prefix.
-/// The run counts when one line has a key's width and mix of characters, or an END line follows.
+/// The run counts when an END line follows it, or when it has the shape of a PEM body
+/// ([`PemBody`]).
 fn leading_key_lines(text: &str) -> usize {
     let mut end = 0;
-    let mut wide = false;
+    let mut body = PemBody::default();
     for line in text.split_inclusive('\n') {
         let Some(token) = key_token(line) else {
-            let closes = line.contains("-----END ") && line.contains("PRIVATE KEY");
-            return if wide || (end > 0 && closes) { end } else { 0 };
+            let closes = closes_private_key(line);
+            return if body.is_complete() || (end > 0 && closes) {
+                end
+            } else {
+                0
+            };
         };
-        wide |= token.len() >= 40
-            && token.bytes().any(|b| b.is_ascii_uppercase())
-            && token.bytes().any(|b| b.is_ascii_lowercase())
-            && token.bytes().any(|b| b.is_ascii_digit());
+        body.push(line, token);
         end += line.len();
     }
-    if wide { end } else { 0 }
+    if body.is_complete() { end } else { 0 }
+}
+
+/// Line widths PEM encoders wrap base64 at.
+const PEM_WIDTHS: [usize; 2] = [64, 76];
+/// Full-width lines a run needs to count as a PEM body when no END line is in reach.
+const MIN_PEM_LINES: usize = 2;
+
+/// Tracks whether a run of lines reads as a PEM body: full lines of one standard width with a
+/// mix of base64 characters, then at most one shorter line, each alone after a log prefix.
+#[derive(Default)]
+struct PemBody {
+    width: usize,
+    full_lines: usize,
+    ended: bool,
+    broken: bool,
+}
+
+impl PemBody {
+    fn push(&mut self, line: &str, token: &str) {
+        let width = token.len();
+        let padding_inside = token.trim_end_matches('=').contains('=');
+        if self.broken || self.ended || padding_inside || !is_log_prefix(line) {
+            self.broken = true;
+        } else if self.width == 0 {
+            self.width = width;
+            self.broken = !PEM_WIDTHS.contains(&width) || !mixed_base64(token);
+            self.full_lines = 1;
+        } else if width == self.width {
+            self.broken = !mixed_base64(token);
+            self.full_lines += 1;
+        } else if width < self.width {
+            self.ended = true;
+        } else {
+            self.broken = true;
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.broken && self.full_lines >= MIN_PEM_LINES
+    }
+}
+
+/// Whether `token` has upper case, lower case and digits, as base64 of random bytes does.
+fn mixed_base64(token: &str) -> bool {
+    token.bytes().any(|b| b.is_ascii_uppercase())
+        && token.bytes().any(|b| b.is_ascii_lowercase())
+        && token.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Whether what comes before the last word of `line` is nothing, a bare timestamp, or a prefix
+/// closed by `|`, `]` or `>`, rather than a message the word belongs to.
+fn is_log_prefix(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    let word = trimmed.split_whitespace().next_back().unwrap_or("");
+    let prefix = trimmed[..trimmed.len() - word.len()].trim_end();
+    prefix.is_empty()
+        || prefix.ends_with(['|', ']', '>'])
+        || prefix.bytes().all(|b| {
+            b.is_ascii_digit() || matches!(b, b'-' | b':' | b'.' | b'+' | b'T' | b'Z' | b' ')
+        })
 }
 
 /// The last word of `line` when it could be a line of base64 key material.
@@ -994,18 +1165,22 @@ fn key_token(line: &str) -> Option<&str> {
 fn leading_cookie_items(text: &str) -> usize {
     let mut end = 0;
     for line in text.split_inclusive('\n') {
-        let item = line.find('"').map(|at| line[at..].trim_end());
-        let item = item.map(|item| item.strip_suffix(',').unwrap_or(item));
+        let trimmed = line.trim_end();
+        let trimmed = trimmed.strip_suffix(',').unwrap_or(trimmed);
+        let (body, closes) = match trimmed.strip_suffix(']') {
+            Some(body) => (body.trim_end(), true),
+            None => (trimmed, false),
+        };
+        let body = body.strip_suffix(',').unwrap_or(body);
+        let item = body.find('"').map(|at| &body[at..]);
         if item.is_some_and(|i| i.len() > 2 && i.ends_with('"') && i.contains('=')) {
             end += line.len();
+            if closes {
+                return end;
+            }
             continue;
         }
-        let trimmed = line.trim_end();
-        return if trimmed.ends_with(']') || trimmed.ends_with("],") {
-            end
-        } else {
-            0
-        };
+        return if closes { end } else { 0 };
     }
     end
 }

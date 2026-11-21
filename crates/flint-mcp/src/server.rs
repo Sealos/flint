@@ -762,7 +762,7 @@ impl FlintMcp {
 #[tool_handler(
     router = self.tool_router,
     name = "flint",
-    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Values of Secret objects are redacted, also when a Secret is nested in another object or held in a string as JSON or YAML; other custom resource fields are shown as stored. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
+    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Values of Secret objects are redacted, also when a Secret is nested in another object or held as JSON or YAML in an object field, list cell or event message; pod logs get credential redaction only, and other custom resource fields are shown as stored. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
 impl ServerHandler for FlintMcp {
     /// Every call, with its own `CALL` note, within the [`Limits`]: admitted (or refused at
@@ -1498,7 +1498,7 @@ impl FlintMcp {
                     "namespace": e.metadata.namespace,
                     "count": e.count,
                     "message": e.message.clone().map(|mut m| {
-                        redacted += policy::redact_text(&mut m);
+                        redacted += policy::redact_free_text(&mut m);
                         m
                     }),
                 })
@@ -1673,9 +1673,9 @@ fn merge_page(merged: &mut TablePage, page: TablePage) {
 /// Column names and rows for list_resources. Each row is `{name, namespace, created, cells}`,
 /// with `cells` in column order as `kubectl get` prints them (ages computed from `now`).
 /// Wide (priority > 0) columns are marked with `"wide": true`. Rows stop once they add up to
-/// `max_bytes` of JSON; the flag says whether any were dropped. Cells pass through the
-/// credential redactor (printer columns can show event and status messages); the last value
-/// is how many credentials it replaced.
+/// `max_bytes` of JSON; the flag says whether any were dropped. Cells pass through
+/// [`policy::redact_free_text`] (printer columns can show event and status messages); the last
+/// value is how many credentials it replaced.
 fn table_rows(
     page: &TablePage,
     is_secret: bool,
@@ -1707,7 +1707,7 @@ fn table_rows(
                         policy::REDACTED.to_owned()
                     } else {
                         let mut text = text.into_owned();
-                        row_redacted += policy::redact_text(&mut text);
+                        row_redacted += policy::redact_free_text(&mut text);
                         text
                     }
                 })
@@ -2137,6 +2137,21 @@ mod tests {
                 "pull from https://bot:[REDACTED:password]@registry.example.com failed"
             ])
         );
+    }
+
+    // covers UP-15
+    #[test]
+    fn row_cells_holding_a_serialized_secret_are_masked() {
+        let manifest = "apiVersion: v1\nkind:\n  Secret\ndata:\n  k: placeholder-value\n";
+        let page = page(
+            vec![
+                col("Name", ColumnRole::Name, 0),
+                col("Source", ColumnRole::Value, 0),
+            ],
+            vec![Cell::Name, Cell::Text(manifest.into())],
+        );
+        let (_, rows, _, _) = table_rows(&page, false, 1_000, policy::LIST_BYTES);
+        assert_eq!(rows[0]["cells"], json!(["web", policy::REDACTED]));
     }
 
     // covers UP-10

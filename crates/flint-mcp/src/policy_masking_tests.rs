@@ -213,3 +213,123 @@ fn the_fetch_stays_bounded_and_keeps_the_requested_lines() {
     assert_eq!(next_log_tail(101, 100, 80), 50);
     assert_eq!(next_log_tail(2, 100, 0), 1);
 }
+
+#[test]
+fn yaml_with_the_kind_on_the_next_line_is_masked() {
+    let text = format!("apiVersion: v1\nkind:\n  Secret\ndata:\n  k: {VALUE}\n");
+    let mut value = json!({"spec": {"blob": text}});
+    sanitize(&mut value);
+    assert_eq!(value["spec"]["blob"], REDACTED);
+}
+
+#[test]
+fn yaml_structure_decides_what_is_a_secret() {
+    for text in [
+        format!("base: &k Secret\nkind: *k\ndata:\n  k: {VALUE}\n"),
+        format!("---\nkind: ConfigMap\n---\nkind: Secret\nstringData:\n  k: {VALUE}\n"),
+        format!("{{kind: Secret, data: {{k: {VALUE}}}}}"),
+        format!("kind: Bundle\nresources:\n  - kind: Secret\n    data:\n      k: {VALUE}\n"),
+    ] {
+        let mut value = json!({"spec": {"blob": text.clone()}});
+        sanitize(&mut value);
+        assert_eq!(value["spec"]["blob"], REDACTED, "{text}");
+    }
+    for text in [
+        format!("apiVersion: example.io/v1\nkind: Secret\ndata:\n  k: {VALUE}\n"),
+        "secretRef:\n  kind: Secret\n  name: s\n".to_owned(),
+    ] {
+        let mut value = json!({"spec": {"blob": text.clone()}});
+        sanitize(&mut value);
+        assert_eq!(value["spec"]["blob"], text.as_str());
+    }
+}
+
+#[test]
+fn yaml_past_the_parse_limits_that_names_a_secret_is_replaced_whole() {
+    let mut aliases = String::from("a0: &a0 [x, x]\n");
+    for i in 1..40 {
+        let p = i - 1;
+        aliases.push_str(&format!("a{i}: &a{i} [*a{p}, *a{p}, *a{p}, *a{p}]\n"));
+    }
+    let long = "x".repeat(MAX_YAML_BYTES);
+    let deep = "[".repeat(MAX_YAML_DEPTH + 1);
+    for text in [
+        format!("{aliases}kind: Secret\ndata:\n  k: {VALUE}\n"),
+        format!("kind:\n  Secret\ndata:\n  k: {VALUE}\n# {long}\n"),
+        format!("{deep}kind: Secret\ndata: {VALUE}\n"),
+        format!("kind: Secret\ndata: {VALUE}\n  broken: [\n"),
+    ] {
+        let mut value = json!({"spec": {"blob": text}});
+        sanitize(&mut value);
+        assert_eq!(value["spec"]["blob"], REDACTED);
+    }
+}
+
+#[test]
+fn free_text_holding_a_secret_is_masked() {
+    for mut text in [
+        secret().to_string(),
+        format!("apiVersion: v1\nkind:\n  Secret\ndata:\n  k: {VALUE}\n"),
+    ] {
+        redact_free_text(&mut text);
+        assert!(!text.contains(VALUE), "{text}");
+    }
+    let mut plain = "Back-off pulling image: example.io/app:1.0".to_owned();
+    assert_eq!(redact_free_text(&mut plain), 0);
+    assert_eq!(plain, "Back-off pulling image: example.io/app:1.0");
+}
+
+#[test]
+fn a_final_cookie_item_on_the_closing_line_is_left_out() {
+    for close in ["]", "],", " ]", ",]"] {
+        let log = format!("  \"session={VALUE}; Path=/\",\n  \"id={VALUE}\"{close}\nnext\n");
+        let out = log_output(&log, 100, 64 * 1024, true);
+        assert_eq!(out.text, "next\n", "{close}");
+    }
+}
+
+#[test]
+fn the_tail_counts_the_lines_of_the_fetched_log() {
+    let log = format!("ordinary\n{}one\ntwo\n", pem("", 8));
+    let out = log_output(&log, 3, 64 * 1024, false);
+    assert_eq!(out.text, "-----END PRIVATE KEY-----\none\ntwo\n");
+    assert!(out.truncated);
+
+    let inside = log_output(&log, 5, 64 * 1024, false);
+    assert!(!inside.text.contains("BEGIN"), "{inside:?}");
+    assert!(!inside.text.contains(KEY_LINE), "{inside:?}");
+    assert!(
+        inside.text.starts_with("[REDACTED:private-key]\n"),
+        "{inside:?}"
+    );
+    assert!(inside.truncated);
+
+    let whole = log_output(&log, 100, 64 * 1024, false);
+    assert!(whole.text.starts_with("ordinary\n") && !whole.truncated);
+}
+
+#[test]
+fn checksum_logs_are_kept_when_the_start_was_not_fetched() {
+    let mut log = String::new();
+    for i in 0..6 {
+        log.push_str(&format!(
+            "2026-01-01T00:00:0{i}Z app verified block {i} checksum {KEY_LINE}\n"
+        ));
+    }
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!((out.text.as_str(), out.truncated), (log.as_str(), false));
+
+    let digest = "Q2hlY2tzdW1QbGFjZWhvbGRlcjAxMjM0NTY3ODlhYmNk";
+    let digests = format!("{digest}\n{digest}\n{digest}\n");
+    let out = log_output(&digests, 100, 64 * 1024, true);
+    assert_eq!(out.text, digests);
+}
+
+#[test]
+fn a_cut_off_body_with_a_prefix_and_a_short_last_line_is_left_out() {
+    let prefix = "2026-01-01T00:00:00Z app | ";
+    let log = format!("{prefix}{KEY_LINE}\n{prefix}{KEY_LINE}\n{prefix}ExampleLastLine0123\n");
+    let out = log_output(&log, 100, 64 * 1024, true);
+    assert_eq!(out.text, "");
+    assert!(out.truncated);
+}
