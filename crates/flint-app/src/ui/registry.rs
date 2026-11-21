@@ -199,7 +199,9 @@ actions!(
         /// Let new pods land on the selected node again, after a review and a confirmation.
         UncordonNode,
         /// Ask what a drain of the selected node may evict, then review and confirm it.
-        DrainNode
+        DrainNode,
+        /// Open the report of the latest drain that ended.
+        ShowDrainReport
     ]
 );
 actions!(
@@ -2303,6 +2305,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<DrainNode>(
             "Drain Selected Node",
             "Choose what a drain of the selected node may evict, then review and confirm it.",
+        )
+        .of(C::Detail, S::Workspace),
+        Spec::unit::<ShowDrainReport>(
+            "Show Drain Report",
+            "Open what the latest drain did, also when it stopped early.",
         )
         .of(C::Detail, S::Workspace),
         Spec::with_args::<ToggleDrainOption>(

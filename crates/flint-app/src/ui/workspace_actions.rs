@@ -45,7 +45,7 @@ use super::super::registry::{
     ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{
-    CordonNode, DeleteObject, DrainNode, RestartObject, ScaleObject, UncordonNode,
+    CordonNode, DeleteObject, DrainNode, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
 };
 use super::super::registry::{EditAiScope, ShowAgentActivity};
 use super::super::registry::{
@@ -111,6 +111,7 @@ impl Workspace {
         .bind::<DrainNode>(|this, _, window, cx| {
             resource_actions::request(this, ResourceAction::Drain, window, cx)
         })
+        .bind::<ShowDrainReport>(|_, _, window, cx| resource_actions::show_drain_report(window, cx))
         .bind::<RetryConnection>(Self::retry_connection)
         .bind::<WatchAllKinds>(|this, _, _, cx| this.set_watch_mode(true, Some(WatchMode::All), cx))
         .bind::<WatchOpenViewsOnly>(|this, _, _, cx| {
@@ -327,6 +328,7 @@ impl Workspace {
             .when::<DrainNode>(|ws, cx| {
                 resource_actions::available(ws, ResourceAction::Drain, cx).is_ok()
             })
+            .when::<ShowDrainReport>(|_, cx| resource_actions::has_drain_result(cx))
             .add::<OpenSelectorLogs>(
                 |ws, cx| ws.cluster.is_some() && ws.sessions_open_here(cx),
                 |_, a, _| check_selector(a),

@@ -46,6 +46,7 @@ use super::registry::{
     ShowAgentActivity, ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster,
     UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::resource_actions;
 use super::row_menu;
 use super::scope_picker::{self, ScopePicker};
 use super::startup::StartupView;
@@ -372,6 +373,8 @@ impl Workspace {
             _list_subscriptions: Vec::new(),
             _detail_subscriptions: Vec::new(),
             _subscriptions: vec![
+                // A write that starts or ends, in any window, changes what the menu offers.
+                cx.observe_global::<resource_actions::RunningWrites>(|_, cx| cx.notify()),
                 observe,
                 appearance,
                 on_namespace_input,
@@ -2408,6 +2411,7 @@ impl Render for Workspace {
                         theme,
                         cx,
                     )))
+                    .children(resource_actions::drain_strips(theme, cx))
                     .when_some(self.action_error.clone(), |el, why| {
                         el.child(refusal_strip(why, theme))
                     })

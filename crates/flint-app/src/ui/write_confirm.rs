@@ -45,6 +45,11 @@ const CAREFUL: Wording = Wording {
     deliberate: true,
 };
 
+/// What a drain does whatever its options: as `kubectl drain`, it removes pods that have ended,
+/// also without a controller or with `emptyDir` volumes.
+pub(in crate::ui) const COMPLETED_PODS: &str =
+    "Completed and failed pods are removed whatever these options say.";
+
 /// How a resource action is worded. Delete and Drain cannot be got back: Enter cancels them.
 fn change_wording(change: &ResourceChange) -> Wording {
     let (title, ok, deliberate) = match change {
@@ -88,16 +93,17 @@ fn change_lines(change: &ResourceChange) -> Vec<String> {
         } => {
             let mut lines = vec![
                 "Cordons the node and evicts its pods. DaemonSet and mirror pods stay.".to_owned(),
+                COMPLETED_PODS.to_owned(),
             ];
             lines.push(if *delete_emptydir_data {
                 "Pods with emptyDir volumes are evicted: their emptyDir data is lost.".to_owned()
             } else {
-                "Pods with emptyDir volumes stay, and are reported.".to_owned()
+                "Other pods with emptyDir volumes stay, and are reported.".to_owned()
             });
             lines.push(if *force {
                 "Pods without a controller are evicted: nothing recreates them.".to_owned()
             } else {
-                "Pods without a controller stay, and are reported.".to_owned()
+                "Other pods without a controller stay, and are reported.".to_owned()
             });
             lines
         }
@@ -186,10 +192,12 @@ pub fn open(
     names: &ClusterNames,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
-    open_noted(window, cx, core, review, names, None, on_done);
+    open_noted(window, cx, core, review, names, None, |_| true, on_done);
 }
 
-/// [`open`], first saying `note`: why this review was opened again.
+/// [`open`], first saying `note` (why this review was opened again). Confirming asks `begin`
+/// right before the write: `false` runs nothing and does not call `on_done`.
+#[allow(clippy::too_many_arguments)]
 pub fn open_noted(
     window: &mut Window,
     cx: &mut App,
@@ -197,6 +205,7 @@ pub fn open_noted(
     review: WriteReview,
     names: &ClusterNames,
     note: Option<&str>,
+    begin: impl Fn(&mut App) -> bool + 'static,
     on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
 ) {
     let shown = names.with_real(&review.target().cluster);
@@ -214,6 +223,9 @@ pub fn open_noted(
     );
     let on_done = Rc::new(on_done);
     confirm::open(window, cx, text, move |_, cx| {
+        if !begin(cx) {
+            return;
+        }
         let run = core.run_write(review.clone().into_intent());
         let on_done = on_done.clone();
         cx.spawn(async move |cx| {
@@ -345,6 +357,26 @@ mod tests {
         .join("\n");
         assert!(without.contains("emptyDir volumes stay"), "{without}");
         assert!(without.contains("without a controller stay"), "{without}");
+    }
+
+    // covers UP-53: with or without its options, a drain says it removes pods that have ended.
+    #[test]
+    fn a_drain_says_completed_pods_are_removed() {
+        for (delete_emptydir_data, force) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let lines = change_lines(&ResourceChange::Drain {
+                delete_emptydir_data,
+                force,
+            });
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l
+                        == "Completed and failed pods are removed whatever these options say."),
+                "{lines:?}"
+            );
+        }
     }
 
     // covers UP-51, UP-53: warnings come first, then what the action does, then the object.

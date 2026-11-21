@@ -423,9 +423,10 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I delete, scale, rollout-restart, cordon, uncordon or drain from a row's context menu.
 - **Then** a confirmation names the cluster, server, namespace and object, after any GitOps warning. Delete and Drain
   take the button: Enter cancels them. Scale asks for the count first and shows from and to. Drain first offers two
-  unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost. If the object
-  changed, nothing is run again: a new review opens, saying so. Drain reports what it did, also when it stopped early:
-  cordoned, evicted, blocked and why (a PodDisruptionBudget is named), skipped, not tried, still terminating.
+  unchecked options (delete emptyDir data, force pods without a controller), each saying what is lost; completed and
+  failed pods are removed whatever they say. If the object changed, nothing is run again: a new review opens, saying
+  so. Drain reports what it did, also when it stopped early:
+  cordoned, evicted, blocked and why (a PodDisruptionBudget is named), skipped, not tried, may still be terminating.
 - Tests: cluster, ui.
 
 ---

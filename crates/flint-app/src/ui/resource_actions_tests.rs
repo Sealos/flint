@@ -2,10 +2,12 @@
 //! cluster, the scale and drain dialogs, and a whole write against a small local API server
 //! whose first write answers with a conflict.
 
+use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use flint_core::{ConnectionState, Event, KindId, ObjectDetail, SyncState};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
@@ -14,6 +16,8 @@ use serde_json::{Value, json};
 
 use super::row_actions_tests::{draw, menu, right_click, show_fetched};
 use crate::ui::confirm;
+use crate::ui::registry;
+use crate::ui::resource_actions::{ResourceAction, WriteKey, claim, release, request, running_on};
 use crate::ui::row_menu;
 use crate::ui::support_tests::{
     CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects,
@@ -269,26 +273,49 @@ async fn a_refused_review_says_why(cx: &mut TestAppContext) {
     assert!(!t.has_dialog(cx), "no confirmation without a review");
 }
 
-/// A small local API server: a Deployment `web` with 2 replicas. Its first PATCH
-/// answers with a conflict, as when someone else changed the object first.
+/// How the local API server answers.
+#[derive(Default)]
+struct Control {
+    /// PATCH requests received.
+    patches: AtomicUsize,
+    /// The status of the next PATCH requests; 200 once empty.
+    statuses: Mutex<VecDeque<u16>>,
+    /// PATCH requests wait while this is set, so a write stays running.
+    hold: AtomicBool,
+    /// A drain's list of the node's pods fails.
+    fail_pods: AtomicBool,
+}
+
+/// A small local API server: a Deployment `web` with 2 replicas and a Node `node-1`.
 struct LocalApi {
     url: String,
-    patches: Arc<AtomicUsize>,
+    control: Arc<Control>,
 }
 
 impl LocalApi {
-    fn start() -> Self {
+    fn start(statuses: &[u16]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let patches = Arc::new(AtomicUsize::new(0));
-        let counted = patches.clone();
+        let control = Arc::new(Control {
+            statuses: Mutex::new(statuses.iter().copied().collect()),
+            ..Default::default()
+        });
+        let shared = control.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let counted = counted.clone();
-                std::thread::spawn(move || serve(stream, &counted));
+                let shared = shared.clone();
+                std::thread::spawn(move || serve(stream, &shared));
             }
         });
-        LocalApi { url, patches }
+        LocalApi { url, control }
+    }
+
+    fn patches(&self) -> usize {
+        self.control.patches.load(Ordering::SeqCst)
+    }
+
+    fn hold(&self, held: bool) {
+        self.control.hold.store(held, Ordering::SeqCst);
     }
 }
 
@@ -302,7 +329,7 @@ fn deployment() -> Value {
 }
 
 /// Answers one connection's requests.
-fn serve(stream: TcpStream, patches: &AtomicUsize) {
+fn serve(stream: TcpStream, control: &Control) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut stream = stream;
     loop {
@@ -337,7 +364,7 @@ fn serve(stream: TcpStream, patches: &AtomicUsize) {
             let _ = reader.read_to_end(&mut Vec::new());
             return;
         }
-        let (status, answer) = answer(method, path, patches);
+        let (status, answer) = answer(method, path, query, control);
         let text = answer.to_string();
         let head = format!(
             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -350,12 +377,14 @@ fn serve(stream: TcpStream, patches: &AtomicUsize) {
     }
 }
 
-fn answer(method: &str, path: &str, patches: &AtomicUsize) -> (u16, Value) {
+fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Value) {
     let resource = |name: &str, kind: &str, namespaced: bool| {
         json!({"name": name, "singularName": kind.to_lowercase(), "namespaced": namespaced,
                "kind": kind, "verbs": ["get", "list", "watch", "patch", "delete"]})
     };
     const WEB: &str = "/apis/apps/v1/namespaces/demo/deployments/web";
+    const WEB_SCALE: &str = "/apis/apps/v1/namespaces/demo/deployments/web/scale";
+    const NODE: &str = "/api/v1/nodes/node-1";
     match (method, path) {
         ("GET", "/version") => (
             200,
@@ -381,15 +410,39 @@ fn answer(method: &str, path: &str, patches: &AtomicUsize) -> (u16, Value) {
                    "resources": [resource("deployments", "Deployment", true)]}),
         ),
         ("GET", WEB) => (200, deployment()),
-        ("PATCH", WEB) => {
-            if patches.fetch_add(1, Ordering::SeqCst) == 0 {
-                (
-                    409,
+        ("GET", NODE) => (
+            200,
+            json!({"apiVersion": "v1", "kind": "Node",
+                   "metadata": {"name": "node-1", "uid": "uid-node-1", "resourceVersion": "3"},
+                   "spec": {}}),
+        ),
+        ("GET", "/api/v1/pods")
+            if query.contains("fieldSelector") && control.fail_pods.load(Ordering::SeqCst) =>
+        {
+            (
+                500,
+                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                       "reason": "InternalError", "code": 500, "message": "pods unavailable"}),
+            )
+        }
+        ("PATCH", WEB | WEB_SCALE | NODE) => {
+            control.patches.fetch_add(1, Ordering::SeqCst);
+            while control.hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let status = control.statuses.lock().unwrap().pop_front().unwrap_or(200);
+            match status {
+                200 if path == NODE => (
+                    200,
+                    json!({"apiVersion": "v1", "kind": "Node",
+                           "metadata": {"name": "node-1", "uid": "uid-node-1"}, "spec": {}}),
+                ),
+                200 => (200, deployment()),
+                code => (
+                    code,
                     json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
-                           "reason": "Conflict", "code": 409, "message": "it changed"}),
-                )
-            } else {
-                (200, deployment())
+                           "reason": "Conflict", "code": code, "message": "it changed"}),
+                ),
             }
         }
         ("GET", _) => (
@@ -405,21 +458,41 @@ fn answer(method: &str, path: &str, patches: &AtomicUsize) -> (u16, Value) {
     }
 }
 
-/// Waits until the open confirmation's text contains `wanted`, and returns it.
+/// Waits until an open confirmation's text contains `wanted`, and returns it.
 async fn wait_for_confirmation(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
     wanted: &'static str,
 ) -> String {
-    cx.wait_for(t.window, WAIT, move |window, _| {
+    let matching = move |window: &gpui_kit::Window| {
         window
-            .try_find("write-confirm-description")
-            .and_then(|e| e.label().map(|l| l.contains(wanted)))
-            == Some(true)
+            .find_all("write-confirm-description")
+            .iter()
+            .filter_map(|e| e.label().map(str::to_owned))
+            .find(|l| l.contains(wanted))
+    };
+    cx.wait_for(t.window, WAIT, move |window, _| matching(window).is_some())
+        .await;
+    draw(cx, t);
+    cx.update_window(t.window, |_, window, _| matching(window))
+        .unwrap()
+        .expect("the confirmation")
+}
+
+/// Waits until only one dialog's OK button is drawn: one that closed is gone.
+async fn wait_for_one_ok(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.wait_for(t.window, WAIT, |window, _| window.find_all("ok").len() == 1)
+        .await;
+    draw(cx, t);
+}
+
+/// Waits until no dialog is open.
+async fn wait_for_no_dialog(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.wait_for(t.window, WAIT, |window, cx| {
+        !gpui_kit::component::WindowExt::has_active_dialog(window, cx)
     })
     .await;
     draw(cx, t);
-    t.label(cx, "write-confirm-description").unwrap()
 }
 
 // covers UP-52, UP-53: a write the server answers with a conflict is not run again: a new
@@ -427,7 +500,7 @@ async fn wait_for_confirmation(
 #[gpui_kit::test]
 async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let api = LocalApi::start();
+    let api = LocalApi::start(&[409]);
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir.path(), move |dir, _| {
         let path = dir.join("kubeconfig");
@@ -470,28 +543,334 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     t.click(cx, "ok");
     let first = wait_for_confirmation(cx, &t, "Replicas: 2 to 5.").await;
     assert!(!first.contains("changed since"), "{first}");
-    assert_eq!(api.patches.load(Ordering::SeqCst), 0, "nothing ran yet");
+    assert_eq!(api.patches(), 0, "nothing ran yet");
 
+    wait_for_one_ok(cx, &t).await;
     t.click(cx, "ok");
     let again = wait_for_confirmation(cx, &t, "changed since the last review").await;
     assert!(again.contains("Replicas: 2 to 5."), "{again}");
-    assert_eq!(
-        api.patches.load(Ordering::SeqCst),
-        1,
-        "the conflict is not retried"
-    );
+    assert_eq!(api.patches(), 1, "the conflict is not retried");
     let shown = cx
         .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
         .unwrap()
         .expect("the new review");
     assert_eq!(shown.title, "Scale web on alpha?");
 
+    wait_for_one_ok(cx, &t).await;
     t.click(cx, "ok");
-    let patches = api.patches.clone();
+    let control = api.control.clone();
     cx.wait_for(t.window, WAIT, move |_, _| {
-        patches.load(Ordering::SeqCst) == 2
+        control.patches.load(Ordering::SeqCst) == 2
     })
     .await;
     draw(cx, &t);
     assert!(!t.has_dialog(cx));
+}
+
+fn web_key() -> WriteKey {
+    WriteKey::new(
+        "alpha",
+        &KindId::new("apps", "deployments"),
+        Some("demo"),
+        "web",
+    )
+}
+
+fn node_key(name: &str) -> WriteKey {
+    WriteKey::new("alpha", &KindId::new("", "nodes"), None, name)
+}
+
+/// Every resource action the selected row's menu has, with why it cannot run.
+fn writes(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(ResourceAction, Result<(), String>)> {
+    t.workspace.read_with(cx, |ws, cx| {
+        row_menu::row_actions(ws, cx)
+            .unwrap()
+            .writes
+            .into_iter()
+            .map(|w| (w.action, w.can))
+            .collect()
+    })
+}
+
+/// The workspace connected for real to `api`, its discovery in.
+async fn connected(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    api: &LocalApi,
+) -> TestWorkspace {
+    let url = api.url.clone();
+    let t = open_workspace_with(cx, dir, move |dir, _| {
+        let path = dir.join("kubeconfig");
+        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        vec![path]
+    })
+    .await;
+    t.activate(cx, "alpha").await;
+    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
+        .await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .discovered("alpha")
+            .is_some_and(|d| d.discovery.is_some())
+    })
+    .await;
+    t
+}
+
+/// Selects `web`, or `node-1`, and waits for its object.
+async fn select_loaded(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
+    right_click(cx, t, name).await;
+    t.press(cx, "escape");
+    let detail = t.detail(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let d = detail.read(cx);
+        d.replicas().is_some() || d.node_cordoned().is_ok()
+    })
+    .await;
+    draw(cx, t);
+}
+
+/// Confirms the dialog on top, as Enter does.
+fn confirm_top(cx: &mut TestAppContext, t: &TestWorkspace) {
+    cx.update_window(t.window, |_, window, cx| {
+        registry::dispatch("ui::Confirm", Value::Null, window, cx)
+    })
+    .unwrap()
+    .unwrap();
+    cx.run_until_parked();
+}
+
+async fn wait_running(cx: &mut TestAppContext, t: &TestWorkspace, key: WriteKey, running: bool) {
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        running_on(&key, cx).is_some() == running
+    })
+    .await;
+    draw(cx, t);
+}
+
+// covers UP-53: while a write runs on an object, every action on it says so, in the menu, the
+// guards and the handler; it is available again once the write ended.
+#[gpui_kit::test]
+async fn a_second_action_is_disabled_while_one_runs(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_deletable(cx, &t).await;
+    open_deployments(cx, &t).await;
+    right_click(cx, &t, "web").await;
+    t.press(cx, "escape");
+    cx.update(|cx| claim(&web_key(), ResourceAction::Scale, cx))
+        .unwrap();
+    draw(cx, &t);
+    let shown = writes(cx, &t);
+    assert_eq!(shown.len(), 3);
+    for (action, can) in shown {
+        assert_eq!(can, Err("web is being scaled".to_owned()), "{action:?}");
+    }
+    assert!(
+        t.dispatch(cx, "workspace::DeleteObject", Value::Null)
+            .is_err()
+    );
+    right_click(cx, &t, "web").await;
+    assert!(
+        menu(cx, &t).iter().any(|r| r == "web is being scaled"),
+        "the menu says why"
+    );
+    t.press(cx, "escape");
+    assert_eq!(
+        cx.update(|cx| claim(&web_key(), ResourceAction::Delete, cx)),
+        Err("web is being scaled".to_owned()),
+        "a claim on a claimed object fails"
+    );
+    cx.update(|cx| release(&web_key(), cx));
+    draw(cx, &t);
+    assert!(writes(cx, &t).iter().all(|(_, can)| can.is_ok()));
+}
+
+// covers UP-53: during a drain nothing else runs on that node, and another node stays available.
+#[gpui_kit::test]
+async fn a_draining_node_blocks_every_action_on_it_only(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_alpha(cx, dir.path(), "").await;
+    connect_deletable(cx, &t).await;
+    let nodes = objects(
+        KindId::new("", "nodes"),
+        &[("", "node-1", 0), ("", "node-2", 0)],
+        SyncState::Synced,
+        1,
+    );
+    t.open_kind(cx, "nodes", nodes).await;
+    cx.update(|cx| claim(&node_key("node-1"), ResourceAction::Drain, cx))
+        .unwrap();
+    right_click(cx, &t, "node-1").await;
+    t.press(cx, "escape");
+    show_fetched(cx, &t, node("node-1", true));
+    for (action, can) in writes(cx, &t) {
+        assert_eq!(can, Err("node-1 is being drained".to_owned()), "{action:?}");
+    }
+    right_click(cx, &t, "node-2").await;
+    t.press(cx, "escape");
+    show_fetched(cx, &t, node("node-2", false));
+    assert!(writes(cx, &t).iter().all(|(_, can)| can.is_ok()));
+    assert_eq!(
+        t.label(cx, "drain-status").as_deref(),
+        Some("Draining node-1…")
+    );
+}
+
+// covers UP-53: two confirmations open for one object run one write: the second is refused at
+// the moment it is confirmed, saying what runs.
+#[gpui_kit::test]
+async fn two_confirmations_run_one_write(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_deployments(cx, &t).await;
+    select_loaded(cx, &t, "web").await;
+    api.hold(true);
+
+    t.dispatch(cx, "workspace::RestartObject", Value::Null)
+        .unwrap();
+    wait_for_confirmation(cx, &t, "Replaces its pods").await;
+    // A second review of the object, as another window would open: this window's open dialog
+    // keeps its own keys and menus from asking.
+    let workspace = t.workspace.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            request(ws, ResourceAction::RolloutRestart, window, cx)
+        })
+    })
+    .unwrap();
+    cx.wait_for(t.window, WAIT, |window, _| {
+        window.find_all("write-confirm-description").len() == 2
+    })
+    .await;
+    draw(cx, &t);
+
+    confirm_top(cx, &t);
+    wait_running(cx, &t, web_key(), true).await;
+    let control = api.control.clone();
+    cx.wait_for(t.window, WAIT, move |_, _| {
+        control.patches.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_for_one_ok(cx, &t).await;
+    t.click(cx, "ok");
+    draw(cx, &t);
+    let why = t
+        .workspace
+        .read_with(cx, |ws, _| ws.action_error().map(str::to_owned));
+    assert_eq!(
+        why.as_deref(),
+        Some("Can't restart it: web is being restarted.")
+    );
+    assert_eq!(api.patches(), 1, "the second confirmation sent nothing");
+
+    api.hold(false);
+    wait_running(cx, &t, web_key(), false).await;
+    assert_eq!(api.patches(), 1, "exactly one write");
+}
+
+// covers UP-53: a claim ends with its write, on success, on failure and on a conflict, and a
+// conflict's new review can run.
+#[gpui_kit::test]
+async fn the_claim_is_released_however_a_write_ends(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[200, 500, 409]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_deployments(cx, &t).await;
+    select_loaded(cx, &t, "web").await;
+
+    for (ix, status) in [200, 500, 409].into_iter().enumerate() {
+        api.hold(true);
+        t.dispatch(cx, "workspace::RestartObject", Value::Null)
+            .unwrap();
+        wait_for_confirmation(cx, &t, "Replaces its pods").await;
+        confirm_top(cx, &t);
+        wait_for_no_dialog(cx, &t).await;
+        wait_running(cx, &t, web_key(), true).await;
+        let control = api.control.clone();
+        cx.wait_for(t.window, WAIT, move |_, _| {
+            control.patches.load(Ordering::SeqCst) == ix + 1
+        })
+        .await;
+        api.hold(false);
+        wait_running(cx, &t, web_key(), false).await;
+        assert!(
+            writes(cx, &t).iter().all(|(_, can)| can.is_ok()),
+            "after {status}"
+        );
+    }
+    let again = wait_for_confirmation(cx, &t, "changed since the last review").await;
+    assert!(again.contains("Replaces its pods"), "{again}");
+    confirm_top(cx, &t);
+    let control = api.control.clone();
+    cx.wait_for(t.window, WAIT, move |_, _| {
+        control.patches.load(Ordering::SeqCst) == 4
+    })
+    .await;
+    wait_running(cx, &t, web_key(), false).await;
+}
+
+/// Starts a drain of `node-1` through its two dialogs.
+async fn start_drain(cx: &mut TestAppContext, t: &TestWorkspace) {
+    t.dispatch(cx, "workspace::DrainNode", Value::Null).unwrap();
+    t.wait_for_element(cx, "drain-emptydir").await;
+    draw(cx, t);
+    t.click(cx, "ok");
+    wait_for_confirmation(cx, t, "DaemonSet and mirror pods stay").await;
+    wait_for_one_ok(cx, t).await;
+    t.click(cx, "ok");
+    wait_for_no_dialog(cx, t).await;
+    wait_running(cx, t, node_key("node-1"), true).await;
+}
+
+// covers UP-53: a running drain shows in a strip; its end replaces it with a button, no dialog
+// opens by itself, and the button opens the report, for a finished and for a stopped drain.
+#[gpui_kit::test]
+async fn a_drain_shows_in_a_strip_then_offers_its_report(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_nodes(cx, &t).await;
+    select_loaded(cx, &t, "node-1").await;
+
+    for (fails, ends, says) in [
+        (false, "Drain of node-1 finished", "Drained node-1"),
+        (true, "Drain of node-1 stopped", "Drain of node-1 stopped"),
+    ] {
+        api.control.fail_pods.store(fails, Ordering::SeqCst);
+        api.hold(true);
+        start_drain(cx, &t).await;
+        t.wait_for_label(cx, "drain-status", "Draining node-1…")
+            .await;
+        api.hold(false);
+        wait_running(cx, &t, node_key("node-1"), false).await;
+        t.wait_for_label(cx, "drain-result", ends).await;
+        assert!(
+            t.find(cx, "drain-status").is_none(),
+            "the strip is replaced"
+        );
+        assert!(!t.has_dialog(cx), "nothing pops up by itself");
+
+        t.click(cx, "drain-view-result");
+        t.wait_for_element(cx, "drain-report-description").await;
+        draw(cx, &t);
+        let shown = cx
+            .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
+            .unwrap()
+            .expect("the report");
+        assert_eq!(shown.title, says);
+        assert!(shown.text.contains("Cordoned: yes."), "{}", shown.text);
+        assert_eq!(
+            shown.text.contains("Stopped early:"),
+            fails,
+            "{}",
+            shown.text
+        );
+        confirm_top(cx, &t);
+        wait_for_no_dialog(cx, &t).await;
+        assert!(t.find(cx, "drain-result").is_none(), "viewed");
+    }
 }

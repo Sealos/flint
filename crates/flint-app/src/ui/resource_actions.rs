@@ -8,6 +8,12 @@
 //!
 //! A write is never run again by itself: when the object changed, a new review opens, saying so,
 //! and it takes a new confirmation.
+//!
+//! One write runs per object, across windows ([`RunningWrites`]). Two confirmations can be open
+//! for one object, so the object is claimed as a confirmation runs, right before the write, and
+//! released when the write ends, whatever became of the window it started in.
+
+use std::collections::BTreeMap;
 
 use flint_core::KindId;
 use flint_core::redact::first_line;
@@ -16,17 +22,19 @@ use flint_core::write::{
     WriteTarget,
 };
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::confirm::{self, DialogText};
 use super::detail::{DetailView, Opening, Subject, protected_reason, refused};
+use super::notice::{notice, notice_with};
 use super::registry::{
     self, Bind, CordonNode, DeleteObject, DrainNode, DrainOption, OnView, RestartObject,
-    ScaleObject, ToggleDrainOption, UncordonNode,
+    ScaleObject, ShowDrainReport, ToggleDrainOption, UncordonNode,
 };
 use super::row_menu::Availability;
 use super::workspace::Workspace;
@@ -43,6 +51,9 @@ const REPORT_REASONS: usize = 6;
 
 /// The longest reason from the server a drain's report quotes.
 const REPORT_REASON_LEN: usize = 120;
+
+/// How many running drains the strip names; the rest are counted.
+const STRIP_NAMES: usize = 3;
 
 /// A resource action, as the row menu and the guards know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +106,18 @@ impl ResourceAction {
         .find_map(|(is, resource)| is.then_some(resource))
     }
 
+    /// What is done to an object while this runs ("web is being scaled").
+    fn doing(self) -> &'static str {
+        match self {
+            ResourceAction::Delete => "deleted",
+            ResourceAction::Scale => "scaled",
+            ResourceAction::RolloutRestart => "restarted",
+            ResourceAction::Cordon => "cordoned",
+            ResourceAction::Uncordon => "uncordoned",
+            ResourceAction::Drain => "drained",
+        }
+    }
+
     /// What could not be done, as a refusal's sentence starts.
     pub(in crate::ui) fn cant(self) -> &'static str {
         match self {
@@ -106,6 +129,87 @@ impl ResourceAction {
             ResourceAction::Drain => "Can't drain the node",
         }
     }
+}
+
+/// The object a write runs on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::ui) struct WriteKey {
+    cluster: String,
+    kind: KindId,
+    namespace: Option<String>,
+    name: String,
+}
+
+impl WriteKey {
+    pub(in crate::ui) fn new(
+        cluster: &str,
+        kind: &KindId,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Self {
+        WriteKey {
+            cluster: cluster.to_owned(),
+            kind: kind.clone(),
+            namespace: namespace.map(str::to_owned),
+            name: name.to_owned(),
+        }
+    }
+
+    fn of(target: &WriteTarget) -> Self {
+        Self::new(
+            &target.cluster,
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+        )
+    }
+
+    /// Why no other action can run on this object while `running` does.
+    fn busy(&self, running: ResourceAction) -> String {
+        format!("{} is being {}", self.name, running.doing())
+    }
+}
+
+/// A drain that ended, until its report is viewed or a newer one replaces it.
+struct FinishedDrain {
+    node: String,
+    report: DrainReport,
+}
+
+/// The writes running now, in every window, and the latest drain's result.
+#[derive(Default)]
+pub(in crate::ui) struct RunningWrites {
+    running: BTreeMap<WriteKey, ResourceAction>,
+    finished: Option<FinishedDrain>,
+}
+
+impl Global for RunningWrites {}
+
+/// What runs on `key` now, if anything.
+pub(in crate::ui) fn running_on(key: &WriteKey, cx: &App) -> Option<ResourceAction> {
+    cx.try_global::<RunningWrites>()?.running.get(key).copied()
+}
+
+/// Claims `key` for `action`. `Err` says what runs on it already.
+pub(in crate::ui) fn claim(
+    key: &WriteKey,
+    action: ResourceAction,
+    cx: &mut App,
+) -> Result<(), String> {
+    if let Some(running) = running_on(key, cx) {
+        return Err(key.busy(running));
+    }
+    cx.update_default_global::<RunningWrites, _>(|writes, _| {
+        writes.running.insert(key.clone(), action);
+    });
+    Ok(())
+}
+
+/// Ends the claim on `key`.
+pub(in crate::ui) fn release(key: &WriteKey, cx: &mut App) {
+    cx.update_default_global::<RunningWrites, _>(|writes, _| {
+        writes.running.remove(key);
+    });
 }
 
 fn is_scalable(kind: &KindId) -> bool {
@@ -169,10 +273,19 @@ pub(in crate::ui) fn available(ws: &Workspace, action: ResourceAction, cx: &App)
         return Err("no object is selected".to_owned());
     };
     let detail = detail.read(cx);
+    let object = detail.object();
+    let key = WriteKey::new(
+        &object.cluster,
+        &object.kind,
+        object.namespace.as_deref(),
+        &object.name,
+    );
+    if let Some(running) = running_on(&key, cx) {
+        return Err(key.busy(running));
+    }
     if !offered(ws, detail, cx).contains(&action) {
         return Err(not_offered(action, detail));
     }
-    let object = detail.object();
     if let Some(why) = ws.sessions_blocked(&object.cluster, cx) {
         return Err(why);
     }
@@ -316,6 +429,19 @@ fn confirm_review(
     let names = ws.cluster_names(cx);
     let this = cx.weak_entity();
     let handle = window.window_handle();
+    let key = WriteKey::of(&request.target);
+    let begin = {
+        let (key, this, action) = (key.clone(), this.clone(), request.action);
+        move |cx: &mut App| match claim(&key, action, cx) {
+            Ok(()) => true,
+            Err(why) => {
+                let _ = this.update(cx, |ws, cx| {
+                    ws.refuse(refused(Opening::Write(action), &why), cx)
+                });
+                false
+            }
+        }
+    };
     write_confirm::open_noted(
         window,
         cx,
@@ -323,7 +449,23 @@ fn confirm_review(
         review,
         &names,
         note.as_deref(),
+        begin,
         move |result, cx| {
+            // First, and outside the window: a closed one must not keep the object claimed.
+            release(&key, cx);
+            if let Ok(WriteOutcome {
+                drain: Some(report),
+                ..
+            }) = &result
+            {
+                let finished = FinishedDrain {
+                    node: request.target.name.clone(),
+                    report: report.clone(),
+                };
+                cx.update_default_global::<RunningWrites, _>(|writes, _| {
+                    writes.finished = Some(finished);
+                });
+            }
             let request = request.clone();
             let this = this.clone();
             let _ = cx.update_window(handle, |_, window, cx| {
@@ -333,7 +475,7 @@ fn confirm_review(
     );
 }
 
-/// What follows a write that ran.
+/// What follows a write that ran, in the window it started in. A drain's result is in the strip.
 fn written(
     ws: &mut Workspace,
     request: Request,
@@ -342,16 +484,7 @@ fn written(
     cx: &mut Context<Workspace>,
 ) {
     match result {
-        Ok(outcome) => {
-            if let Some(report) = &outcome.drain {
-                confirm::open(
-                    window,
-                    cx,
-                    drain_report(&request.target.name, report),
-                    |_, _| {},
-                );
-            }
-        }
+        Ok(_) => {}
         // Never run again by itself: a new review, and a new confirmation.
         Err(WriteError::Conflict | WriteError::Replaced) => {
             let note = changed_note(&request.target.name);
@@ -362,6 +495,100 @@ fn written(
             cx,
         ),
     }
+}
+
+/// Whether a drain's report is waiting to be viewed.
+pub(in crate::ui) fn has_drain_result(cx: &App) -> bool {
+    cx.try_global::<RunningWrites>()
+        .is_some_and(|w| w.finished.is_some())
+}
+
+/// Opens the latest drain's report; viewing it takes it off the strip.
+pub(in crate::ui) fn show_drain_report(window: &mut Window, cx: &mut App) {
+    let finished = cx.update_default_global::<RunningWrites, _>(|writes, _| writes.finished.take());
+    if let Some(finished) = finished {
+        let text = drain_report(&finished.node, &finished.report);
+        confirm::open(window, cx, text, |_, _| {});
+    }
+}
+
+/// The strip's line for the drains running: each is named, up to [`STRIP_NAMES`], then counted.
+/// Across clusters a name says which.
+fn draining_text(keys: &[&WriteKey]) -> Option<String> {
+    let across = keys.windows(2).any(|w| w[0].cluster != w[1].cluster);
+    let name = |key: &&WriteKey| match across {
+        true => format!(
+            "{}/{}",
+            flint_core::display::short_name(&key.cluster),
+            key.name
+        ),
+        false => key.name.clone(),
+    };
+    match keys {
+        [] => None,
+        [one] => Some(format!("Draining {}…", name(one))),
+        many => {
+            let names: Vec<String> = many.iter().take(STRIP_NAMES).map(name).collect();
+            let more = match many.len().saturating_sub(STRIP_NAMES) {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            Some(format!(
+                "Draining {} nodes: {}{more}…",
+                many.len(),
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// What the strip says of a drain that ended.
+fn finished_text(finished: &FinishedDrain) -> String {
+    let how = match finished.report.stopped {
+        Some(_) => "stopped",
+        None => "finished",
+    };
+    format!("Drain of {} {how}", finished.node)
+}
+
+/// The workspace's strips for drains: those running, and the latest result with its button.
+pub(in crate::ui) fn drain_strips(theme: &Theme, cx: &App) -> Vec<AnyElement> {
+    let Some(writes) = cx.try_global::<RunningWrites>() else {
+        return Vec::new();
+    };
+    let mut strips = Vec::new();
+    let draining: Vec<&WriteKey> = writes
+        .running
+        .iter()
+        .filter(|(_, action)| **action == ResourceAction::Drain)
+        .map(|(key, _)| key)
+        .collect();
+    if let Some(text) = draining_text(&draining) {
+        strips.push(
+            notice("drain-status", text.clone(), theme.info)
+                .aria_label(text)
+                .test_support()
+                .into_any_element(),
+        );
+    }
+    if let Some(finished) = &writes.finished {
+        let text = finished_text(finished);
+        let color = match finished.report.stopped {
+            Some(_) => theme.warning,
+            None => theme.info,
+        };
+        let view = Button::new("drain-view-result")
+            .label("View result")
+            .xsmall()
+            .on_click(registry::on_click(ShowDrainReport));
+        strips.push(
+            notice_with("drain-result", text.clone(), color, view)
+                .aria_label(text)
+                .test_support()
+                .into_any_element(),
+        );
+    }
+    strips
 }
 
 /// What a review opened again says first.
@@ -495,8 +722,10 @@ fn drain_dialog(target: &WriteTarget) -> DialogText {
     DialogText {
         title: format!("Drain {}", target.name),
         text: format!(
-            "Cordons the node and evicts its pods. Pods the options below do not cover stay on \
-             the node and are reported. The next step shows the change to confirm.\n\n{}",
+            "Cordons the node and evicts its pods. {}\nOther pods the options below do not \
+             cover stay on the node and are reported. The next step shows the change to \
+             confirm.\n\n{}",
+            write_confirm::COMPLETED_PODS,
             object_lines(target)
         ),
         ok: "Continue".into(),
@@ -722,7 +951,7 @@ fn drain_report(node: &str, report: &DrainReport) -> DialogText {
         &report.skipped,
     );
     line(&mut lines, "Not tried,", &report.remaining);
-    line(&mut lines, "Still terminating,", &report.terminating);
+    line(&mut lines, "May still be terminating,", &report.terminating);
     DialogText {
         title,
         text: lines.join("\n"),
@@ -744,7 +973,8 @@ mod tests {
     use flint_core::write::{BlockedReason, DrainReport, PodName, WriteError};
 
     use super::{
-        REPORT_NAMES, ResourceAction as A, changed_note, drain_report, offered_for, parse_replicas,
+        REPORT_NAMES, ResourceAction as A, WriteKey, changed_note, drain_report, draining_text,
+        offered_for, parse_replicas,
     };
 
     fn pod(name: &str) -> PodName {
@@ -862,7 +1092,7 @@ mod tests {
             "Blocked, 1 pod (no controller would recreate them): demo/d",
             "Blocked, 1 pod (their emptyDir data would be lost): demo/e",
             "Skipped (DaemonSet or mirror), 1 pod: demo/ds",
-            "Still terminating, 1 pod: demo/a",
+            "May still be terminating, 1 pod: demo/a",
         ] {
             assert!(
                 shown.text.lines().any(|l| l == line),
@@ -870,6 +1100,25 @@ mod tests {
                 shown.text
             );
         }
+    }
+
+    // covers UP-53: the options dialog says, before any choice, that ended pods are removed.
+    #[test]
+    fn the_drain_dialog_says_completed_pods_are_removed() {
+        let target = flint_core::write::WriteTarget {
+            cluster: "alpha".into(),
+            server: None,
+            kind: KindId::new("", "nodes"),
+            namespace: None,
+            name: "node-1".into(),
+            uid: None,
+            resource_version: None,
+        };
+        let text = super::drain_dialog(&target).text;
+        assert!(
+            text.contains("Completed and failed pods are removed whatever these options say."),
+            "{text}"
+        );
     }
 
     // covers UP-53: a drain that stopped says why first, and what it did not get to.
@@ -913,6 +1162,26 @@ mod tests {
         assert_eq!(shown.title, "Drained node-1");
         assert!(shown.text.contains("and 3 more"), "{}", shown.text);
         assert!(!shown.text.contains("p7"), "{}", shown.text);
+    }
+
+    // covers UP-53: every running drain is named or counted, and clusters are told apart.
+    #[test]
+    fn the_strip_names_or_counts_running_drains() {
+        let nodes = KindId::new("", "nodes");
+        let key = |cluster, name| WriteKey::new(cluster, &nodes, None, name);
+        let (a, b, c, d) = (key("x", "a"), key("x", "b"), key("x", "c"), key("x", "d"));
+        assert_eq!(draining_text(&[]), None);
+        assert_eq!(draining_text(&[&a]).unwrap(), "Draining a…");
+        assert_eq!(draining_text(&[&a, &b]).unwrap(), "Draining 2 nodes: a, b…");
+        assert_eq!(
+            draining_text(&[&a, &b, &c, &d]).unwrap(),
+            "Draining 4 nodes: a, b, c and 1 more…"
+        );
+        let other = key("y", "a");
+        assert_eq!(
+            draining_text(&[&a, &other]).unwrap(),
+            "Draining 2 nodes: x/a, y/a…"
+        );
     }
 
     // covers UP-52: a review opened again says the object changed and that nothing ran.
