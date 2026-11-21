@@ -22,7 +22,7 @@ use super::super::clusters::ClustersModel;
 use super::super::confirm::{self, DialogText};
 use super::super::detail::{DetailView, Opening, refused};
 use super::super::dock::{Dock, DockTab, TabKey};
-use super::super::focus::{cycle_focus_within, release_unfocused_input};
+use super::super::focus::release_unfocused_input;
 use super::super::list::ResourceList;
 use super::super::log_view::{LogRequest, LogView};
 use super::super::nav::NavPanel;
@@ -140,10 +140,10 @@ impl Workspace {
             cx.notify();
         })
         .bind::<NamespacePickerNext>(|this, _, window, cx| {
-            cycle_focus_within(&this.namespace_picker_focus, true, window, cx)
+            this.move_in_namespace_picker(true, window, cx)
         })
         .bind::<NamespacePickerPrevious>(|this, _, window, cx| {
-            cycle_focus_within(&this.namespace_picker_focus, false, window, cx)
+            this.move_in_namespace_picker(false, window, cx)
         })
         .bind::<SetPaneWidth>(Self::set_pane_width)
         .bind::<OpenSelectorLogs>(Self::open_selector_logs)
@@ -668,12 +668,25 @@ impl Workspace {
     /// Gives focus back after it left with a closed view (or a hidden dock): to the open list,
     /// or the workspace.
     pub(super) fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The picker's focused row left it (a namespace unchecked and not listed): it keeps focus,
+        // and hands it to its first control as it draws. After this draw, since a focus change
+        // during one schedules no frame.
+        if self.namespace_popover_open && self.namespace_filter_shown(cx) {
+            let lost = window.focused(cx);
+            cx.defer_in(window, move |this, window, cx| {
+                if window.focused(cx) != lost {
+                    return;
+                }
+                if this.namespace_popover_open {
+                    window.focus(&this.namespace_picker_focus, cx);
+                    release_unfocused_input(window, cx);
+                } else {
+                    this.reclaim_focus(window, cx);
+                }
+            });
+            return;
+        }
         let focus = match &self.list {
-            // The picker's focused row left it (a namespace unchecked and not listed): it keeps
-            // focus, and hands it to its first control as it draws.
-            _ if self.namespace_popover_open && self.namespace_filter_shown(cx) => {
-                self.namespace_picker_focus.clone()
-            }
             Some(list) => list.read(cx).focus_handle().clone(),
             None => self.focus.clone(),
         };

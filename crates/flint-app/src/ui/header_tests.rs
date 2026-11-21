@@ -6,7 +6,7 @@ use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
-use crate::ui::registry::ActionError;
+use crate::ui::registry::{ActionError, ToggleNamespace};
 use crate::ui::support_tests::{
     TestWorkspace, WAIT, objects, open_workspace, pods, standard_sections,
 };
@@ -359,6 +359,97 @@ async fn focus_stays_in_the_picker_when_its_row_goes(cx: &mut TestAppContext) {
     t.press(cx, "escape");
     assert!(t.find(cx, "ns-all").is_none());
     assert_focus(cx, &t, "namespace-filter-button");
+}
+
+// covers UP-33: the handoff from a removed row waits for the draw to finish: a focus change made
+// during a draw schedules no frame, which would leave the picker with no focus ring.
+#[gpui_kit::test]
+async fn a_removed_row_hands_focus_on_after_the_draw(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_picker_rows(cx, dir.path()).await;
+    t.dispatch(cx, "workspace::OpenNamespaceFilter", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "ns-all").await;
+    assert_focus(cx, &t, "ns-all");
+    t.press(cx, "tab");
+    assert_focus(cx, &t, "ns-demo");
+    // What Space does, without the frame a test key press draws after it.
+    cx.update_window(t.window, |_, window, cx| {
+        let namespace = "demo".to_owned();
+        window.dispatch_action(Box::new(ToggleNamespace { namespace }), cx);
+    })
+    .unwrap();
+
+    let picker = t
+        .workspace
+        .read_with(cx, |ws, _| ws.namespace_picker_focus.clone());
+    cx.update_window(t.window, |_, window, cx| {
+        // The frame without the row.
+        window.draw(cx).clear(cx);
+        assert!(window.try_find("ns-demo").is_none(), "the row is gone");
+        assert!(!picker.is_focused(window), "focus moved during the draw");
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_focus(cx, &t, "ns-all");
+}
+
+// covers UP-33: with more namespaces than fit, each keyboard move shows the row it lands on, in
+// both directions and across the wraparound.
+#[gpui_kit::test]
+async fn keyboard_moves_keep_the_focused_namespace_in_view(cx: &mut TestAppContext) {
+    const ROW_COUNT: usize = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_picker_rows(cx, dir.path()).await;
+    let names: Vec<String> = (0..ROW_COUNT).map(|i| format!("ns{i:02}")).collect();
+    let ids: Vec<&'static str> = names
+        .iter()
+        .map(|n| &*String::leak(format!("ns-{n}")))
+        .collect();
+    t.dispatch(cx, "workspace::ShowAllNamespaces", Value::Null)
+        .unwrap();
+    t.workspace.update(cx, |ws, cx| {
+        ws.namespaces = names.clone();
+        cx.notify();
+    });
+    t.dispatch(cx, "workspace::OpenNamespaceFilter", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "ns-all").await;
+    assert_focus(cx, &t, "ns-all");
+
+    let assert_shown = |cx: &mut TestAppContext, id: &'static str| {
+        assert_focus(cx, &t, id);
+        // The scroll lands in the frame after the move.
+        let row = t.find(cx, id).unwrap().bounds();
+        let list = t
+            .workspace
+            .read_with(cx, |ws, _| ws.namespace_list_scroll.bounds());
+        assert!(
+            row.top() >= list.top() && row.bottom() <= list.bottom(),
+            "{id} at {row:?} is outside {list:?}"
+        );
+    };
+    for id in &ids {
+        t.press(cx, "down");
+        assert_shown(cx, id);
+    }
+    t.press(cx, "tab");
+    assert_focus(cx, &t, "ns-add");
+    t.press(cx, "tab");
+    assert_focus(cx, &t, "ns-all");
+    // Back round the wrap, onto the last row from the field.
+    t.press(cx, "shift-tab");
+    assert_focus(cx, &t, "ns-add");
+    for id in ids.iter().rev() {
+        t.press(cx, "shift-tab");
+        assert_shown(cx, id);
+    }
+    t.press(cx, "up");
+    assert_focus(cx, &t, "ns-all");
+    t.press(cx, "up");
+    assert_focus(cx, &t, "ns-add");
+    t.press(cx, "up");
+    assert_shown(cx, ids[ROW_COUNT - 1]);
 }
 
 // covers UP-33: Esc closes the picker from a checkbox or its field, and focus is on its button.

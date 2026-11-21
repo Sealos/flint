@@ -848,6 +848,42 @@ async fn a_dialog_closes_the_namespace_picker(cx: &mut TestAppContext) {
     assert_eq!(button.focused(), Some(true), "focus is back on the button");
 }
 
+// covers UP-33: a dialog that opened with focus in the picker's text field gives it back to the
+// button, whichever key dismisses it, also after the dialog's delayed focus restore.
+#[gpui_kit::test]
+async fn dismissing_a_dialog_does_not_refocus_the_hidden_picker_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    for key in ["escape", "enter"] {
+        t.click(cx, "namespace-filter-button");
+        t.wait_for_element(cx, "ns-all").await;
+        draw(cx, &t);
+        t.click(cx, "ns-add");
+        draw(cx, &t);
+        t.dispatch(cx, "flint::About", Value::Null).unwrap();
+        wait_for_dialog(cx, &t, true).await;
+        draw(cx, &t);
+        assert!(t.find(cx, "ns-all").is_none(), "{key}: the picker closed");
+
+        t.press(cx, key);
+        wait_for_dialog(cx, &t, false).await;
+        // Past the dialog's closing delay, when it restores the focus it saved.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        draw(cx, &t);
+        draw(cx, &t);
+        assert!(t.find(cx, "ns-all").is_none(), "{key}: stays closed");
+        let button = t.find(cx, "namespace-filter-button").unwrap();
+        assert_eq!(
+            button.focused(),
+            Some(true),
+            "{key}: focus is on the button"
+        );
+    }
+}
+
 const SERVER_WITH_USERINFO: &str = "https://admin:hunter2@prod.example:6443/?token=abc";
 const CLEANED_SERVER: &str = "https://prod.example:6443";
 

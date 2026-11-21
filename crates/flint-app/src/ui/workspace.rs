@@ -176,6 +176,20 @@ fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: b
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
+/// The key context entry holding a namespace row's index in the picker's list.
+const NAMESPACE_ROW: &str = "namespace_row";
+
+/// How focus comes back after a dialog closed the namespace picker.
+#[derive(Clone, Copy)]
+enum PickerDialogFocus {
+    /// Nothing to do.
+    Settled,
+    /// The dialog is up; focus moves to the picker's button when it goes.
+    DialogOpen,
+    /// The dialog has gone and may still hand focus back to a picker control, now hidden.
+    Restoring,
+}
+
 pub struct Workspace {
     model: Entity<ClustersModel>,
     /// `FLINT_APPEARANCE`, a development aid that wins over the setting.
@@ -223,8 +237,10 @@ pub struct Workspace {
     namespace_picker_focus: FocusHandle,
     /// The namespace filter's button, where focus returns when the picker closes.
     namespace_button_focus: FocusHandle,
-    /// A dialog closed the picker: focus goes back to its button once the dialog is gone.
-    namespace_focus_after_dialog: bool,
+    /// Where focus stands after a dialog closed the picker.
+    namespace_focus_after_dialog: PickerDialogFocus,
+    /// The picker's list of namespaces, scrolled to keep the focused row in view.
+    namespace_list_scroll: ScrollHandle,
     /// Pane widths, as dragged.
     panes: PaneWidths,
     /// `FLINT_VIEW`, until it has been opened.
@@ -372,7 +388,8 @@ impl Workspace {
             namespace_popover_open: false,
             namespace_picker_focus: cx.focus_handle(),
             namespace_button_focus: cx.focus_handle(),
-            namespace_focus_after_dialog: false,
+            namespace_focus_after_dialog: PickerDialogFocus::Settled,
+            namespace_list_scroll: ScrollHandle::new(),
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
@@ -1667,6 +1684,7 @@ impl Workspace {
         let on_open = this.clone();
         let picker = self.namespace_picker_focus.clone();
         let button = self.namespace_button_focus.clone();
+        let list_scroll = self.namespace_list_scroll.clone();
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
             .track_focus(&picker)
@@ -1747,6 +1765,7 @@ impl Workspace {
                             .id("ns-list")
                             .max_h(px(360.))
                             .overflow_y_scroll()
+                            .track_scroll(&list_scroll)
                             .gap_1()
                             .when(names.is_empty(), |el| {
                                 el.child(
@@ -1757,12 +1776,18 @@ impl Workspace {
                                         .child(empty_text),
                                 )
                             })
-                            .children(names.into_iter().map(|ns| {
+                            .children(names.into_iter().enumerate().map(|(row, ns)| {
                                 let checked = filter.contains(&ns);
-                                Checkbox::new(SharedString::from(format!("ns-{ns}")))
-                                    .label(ns.clone())
-                                    .checked(checked)
-                                    .on_click(registry::on_click(ToggleNamespace { namespace: ns }))
+                                let mut context = KeyContext::default();
+                                context.set(NAMESPACE_ROW, row.to_string());
+                                div().key_context(context).child(
+                                    Checkbox::new(SharedString::from(format!("ns-{ns}")))
+                                        .label(ns.clone())
+                                        .checked(checked)
+                                        .on_click(registry::on_click(ToggleNamespace {
+                                            namespace: ns,
+                                        })),
+                                )
                             })),
                     )
                     .child(div().h_px().bg(theme.border))
@@ -1778,21 +1803,65 @@ impl Workspace {
         })
     }
 
+    /// Moves focus to the picker's next or previous control, and scrolls a row into view.
+    pub(super) fn move_in_namespace_picker(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cycle_focus_within(&self.namespace_picker_focus, forward, window, cx);
+        let row = window
+            .context_stack()
+            .iter()
+            .rev()
+            .find_map(|context| context.get(NAMESPACE_ROW)?.parse().ok());
+        if let Some(row) = row {
+            self.namespace_list_scroll.scroll_to_item(row);
+            cx.notify();
+        }
+    }
+
     /// A dialog closes the picker, which is drawn above everything. Once the dialog is gone,
     /// focus returns to the button, or to the workspace if the button is no longer shown.
+    ///
+    /// The dialog gives focus back to what had it, at once or after its closing delay, so a
+    /// hidden picker control that gets it then is sent on to the same place.
     fn sync_namespace_picker_with_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
             if self.namespace_popover_open {
                 self.namespace_popover_open = false;
-                self.namespace_focus_after_dialog = true;
+                self.namespace_focus_after_dialog = PickerDialogFocus::DialogOpen;
             }
-        } else if std::mem::take(&mut self.namespace_focus_after_dialog) {
+            return;
+        }
+        if self.namespace_popover_open {
+            self.namespace_focus_after_dialog = PickerDialogFocus::Settled;
+            return;
+        }
+        let move_focus = match self.namespace_focus_after_dialog {
+            PickerDialogFocus::Settled => false,
+            PickerDialogFocus::DialogOpen => {
+                self.namespace_focus_after_dialog = PickerDialogFocus::Restoring;
+                true
+            }
+            PickerDialogFocus::Restoring => {
+                self.namespace_picker_focus.is_focused(window)
+                    || self
+                        .namespace_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+            }
+        };
+        if move_focus {
             let target = if self.namespace_filter_shown(cx) {
                 self.namespace_button_focus.clone()
             } else {
                 self.focus.clone()
             };
-            window.focus(&target, cx);
+            // After this draw: a focus change during one schedules no frame.
+            window.defer(cx, move |window, cx| window.focus(&target, cx));
         }
     }
 
