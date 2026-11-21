@@ -273,7 +273,7 @@ A Rust crate of helpers and integration tests: the fake API server (below), and 
   way does not soften the check. A launch that fails is not checked. The exceptions are explicit:
   `App::select_cluster` marks the cluster selected, `App::mark_selected` does so for a selection made another way
   (the switcher, the palette), a cluster the test exposes to AI, or a request the test sends itself,
-  `App::edit_kubeconfig(|| …)` wraps the test's own kubeconfig changes (UP-06), and
+  `App::edit_kubeconfig(files, || …)` wraps the test's own changes to the files it names (UP-06), and
   `AppOptions::cluster_at_startup` sets `FLINT_CLUSTER` and counts that cluster as selected from the launch
   (`AppOptions::env` refuses `FLINT_CLUSTER`). `tests/app/harness.rs` breaks UP-90 and UP-91 on purpose in the app
   (including a delayed request, a file added through settings and a handled timeout) and asserts that the test
@@ -646,8 +646,7 @@ milestone T; feature tests are in their feature's milestone.
 
 ### P1: before 1.0
 
-- **Harness (T):** teardown checks for UP-90 and UP-91 run in every app test (#127; its strict `TODO(#98)` wording
-  for UP-04 and UP-27 waits for #98); drift guard: UP-09 and UP-10 on both backends in `cluster-e2e` and a nightly fixture diff (#128, done); fake writes,
+- **Harness (T):** teardown checks for UP-90 and UP-91 run in every app test (#127); drift guard: UP-09 and UP-10 on both backends in `cluster-e2e` and a nightly fixture diff (#128, done); fake writes,
   a remote-looking cluster for protection, metrics, fixture variants, a fake `claude` and clock control (#129); the
   nightly memory soak test (#126).
 - **Gaps in M0 to M2:** missing and hanging exec plugins (UP-04, #130); a kubeconfig held half-written past the
