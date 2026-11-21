@@ -652,6 +652,40 @@ pub const TRIMMED_TEXT: &str = "Older lines dropped to save memory";
 pub const TRIMMED_TOOLTIP: &str = "Older lines were dropped to keep all log tabs within \
                                    log_total_mib; the tab shown is trimmed last";
 
+/// What an ended tab says once the shared budget dropped every line it had.
+pub const ALL_LINES_DROPPED: &str = "All lines dropped to save memory.";
+
+/// Whether `snapshot` is an ended tab whose lines the budget dropped, all of them. A paused tab
+/// whose frozen view emptied while newer lines wait is not: they show when it resumes.
+pub fn all_lines_dropped(snapshot: &flint_core::LogSnapshot) -> bool {
+    matches!(snapshot.state, flint_core::LogState::Ended { .. })
+        && snapshot.trimmed
+        && snapshot.lines.is_empty()
+        && snapshot.held_back == 0
+}
+
+/// An empty ended tab's `text` and `detail`, its lines having all been dropped. A failure keeps
+/// its explanation, with the notice under it; otherwise the notice is the headline, and what
+/// else the tab says (the pod was deleted) stays.
+pub fn with_lines_dropped(
+    text: String,
+    detail: Option<String>,
+    failed: bool,
+) -> (String, Option<String>) {
+    if failed {
+        let detail = match detail {
+            Some(detail) => format!("{detail}\n{ALL_LINES_DROPPED}"),
+            None => ALL_LINES_DROPPED.to_owned(),
+        };
+        return (text, Some(detail));
+    }
+    let detail = match detail {
+        Some(detail) => format!("{detail} {TRIMMED_TOOLTIP}"),
+        None => TRIMMED_TOOLTIP.to_owned(),
+    };
+    (ALL_LINES_DROPPED.to_owned(), Some(detail))
+}
+
 /// What the pause indicator says: why it is paused, and how many lines wait.
 pub fn pause_text(held_back: u64, by_selection: bool) -> String {
     let why = if by_selection {
@@ -1617,5 +1651,62 @@ mod tests {
                 "{scope:?}"
             );
         }
+    }
+
+    // covers UP-40, UP-42: a failed stream keeps its explanation when its lines are dropped.
+    #[test]
+    fn a_failure_stays_visible_when_all_lines_were_dropped() {
+        let (text, detail) = with_lines_dropped(
+            "The stream ended.".into(),
+            Some("server said no".into()),
+            true,
+        );
+        assert_eq!(text, "The stream ended.");
+        let detail = detail.unwrap();
+        assert!(detail.contains("server said no") && detail.contains(ALL_LINES_DROPPED));
+
+        let (text, detail) = with_lines_dropped(
+            "No log lines.".into(),
+            Some("The pod was deleted.".into()),
+            false,
+        );
+        assert_eq!(text, ALL_LINES_DROPPED);
+        assert!(detail.unwrap().starts_with("The pod was deleted."));
+    }
+
+    // covers UP-42: only an ended tab that lost every line says so. A paused one with newer
+    // lines waiting shows them on resume.
+    #[test]
+    fn all_lines_dropped_only_when_nothing_is_left_to_show() {
+        use flint_core::{LogSnapshot, LogState};
+        let ended = LogSnapshot {
+            lines: Default::default(),
+            state: LogState::Ended {
+                error: None,
+                pod_deleted: true,
+            },
+            paused: false,
+            held_back: 0,
+            version: 1,
+            pods: None,
+            trimmed: true,
+        };
+        assert!(all_lines_dropped(&ended));
+        let never_trimmed = LogSnapshot {
+            trimmed: false,
+            ..ended.clone()
+        };
+        assert!(!all_lines_dropped(&never_trimmed));
+        let lines_wait = LogSnapshot {
+            paused: true,
+            held_back: 3,
+            ..ended.clone()
+        };
+        assert!(!all_lines_dropped(&lines_wait));
+        let running = LogSnapshot {
+            state: LogState::Streaming,
+            ..ended
+        };
+        assert!(!all_lines_dropped(&running));
     }
 }
