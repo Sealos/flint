@@ -302,11 +302,14 @@ tokio::task_local! {
 }
 
 /// What a call's raw arguments name, for a call rejected before its tool ran: only string
-/// values, under the names the tools use. [`activity::append`] caps their length.
+/// values without control characters, under the names the tools use. [`activity::append`] caps
+/// their length.
 fn named_in(arguments: Option<&serde_json::Map<String, Value>>) -> Named {
     let text = |keys: &[&str]| {
         keys.iter()
-            .find_map(|k| arguments?.get(*k)?.as_str().map(str::to_owned))
+            .find_map(|k| arguments?.get(*k)?.as_str())
+            .filter(|value| !value.chars().any(char::is_control))
+            .map(str::to_owned)
     };
     Named {
         cluster: text(&["cluster"]),
@@ -369,13 +372,21 @@ fn to_json<T: Serialize>(value: &T) -> Result<String, ToolError> {
     Ok(serde_json::to_string_pretty(value)?)
 }
 
+/// `list_clusters` takes no arguments, and says so in its schema.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("properties" = {}))]
+pub struct ListClustersParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListResourcesParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -398,6 +409,7 @@ pub struct ListResourcesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetResourceParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -414,6 +426,7 @@ pub struct GetResourceParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetEventsParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -428,6 +441,7 @@ pub struct GetEventsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetPodLogsParams {
     /// Cluster name, as returned by list_clusters.
     pub cluster: String,
@@ -441,6 +455,69 @@ pub struct GetPodLogsParams {
     pub previous: Option<bool>,
     /// Only lines newer than this many seconds. 0 or omitted means no time limit.
     pub since_seconds: Option<u32>,
+}
+
+/// How many unsupported arguments a refusal names, and how much of each: their names come from
+/// the client and can be any length.
+const UNSUPPORTED_NAMED: usize = 5;
+const UNSUPPORTED_NAME_CHARS: usize = 64;
+/// A longer name is not read at all: redacting it would hold a worker for as long as the client
+/// likes, and a prefix of it could hold part of a credential.
+const UNSUPPORTED_NAME_BYTES: usize = 1024;
+
+/// The refusal for `arguments` that `tool`'s schema does not have, naming them and the accepted
+/// ones. A tool that dropped them would answer as if a filter it never applied had matched.
+/// `_meta` is not among them: it sits beside the arguments in the request.
+fn unsupported_arguments(
+    tool: &rmcp::model::Tool,
+    arguments: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
+    let accepted = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    // One past what is shown, to say there are more: the work stays bounded by the schema.
+    let unsupported: Vec<&String> = arguments?
+        .keys()
+        .filter(|name| !accepted.is_some_and(|a| a.contains_key(name.as_str())))
+        .take(UNSUPPORTED_NAMED + 1)
+        .collect();
+    let named: Vec<String> = unsupported
+        .iter()
+        .take(UNSUPPORTED_NAMED)
+        .map(|name| {
+            if name.len() > UNSUPPORTED_NAME_BYTES {
+                return "<a name too long to show>".to_owned();
+            }
+            // Whole, before it is cut: a rule can need what comes after the cut. On its own, so
+            // a rule that takes the rest of the line cannot take the accepted arguments too.
+            let mut name = (*name).clone();
+            policy::redact_text(&mut name);
+            let short: String = name.chars().take(UNSUPPORTED_NAME_CHARS).collect();
+            // Quoted with escapes: control characters never reach the reply.
+            format!("{short:?}")
+        })
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    let mut names = named.join(", ");
+    if unsupported.len() > UNSUPPORTED_NAMED {
+        names.push_str(" and more");
+    }
+    let accepted: Vec<&str> = accepted
+        .into_iter()
+        .flat_map(|a| a.keys().map(String::as_str))
+        .collect();
+    Some(if accepted.is_empty() {
+        format!("{} takes no arguments. Unsupported: {names}.", tool.name)
+    } else {
+        format!(
+            "{} does not support {names}. Accepted arguments: {}.",
+            tool.name,
+            accepted.join(", ")
+        )
+    })
 }
 
 #[tool_router]
@@ -527,7 +604,7 @@ impl FlintMcp {
         server URL and whether a connection works.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn list_clusters(&self) -> ToolResult {
+    async fn list_clusters(&self, Parameters(_): Parameters<ListClustersParams>) -> ToolResult {
         let result = self.do_list_clusters().await;
         self.finish("list_clusters", Named::default(), result).await
     }
@@ -624,7 +701,7 @@ impl ServerHandler for FlintMcp {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
-        let named = named_in(request.arguments.as_ref());
+        let mut named = named_in(request.arguments.as_ref());
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         // Until this handler ends, the call counts as unanswered, cancelled or not: it may
@@ -650,33 +727,45 @@ impl ServerHandler for FlintMcp {
             ),
             Some(Err(busy)) => (failed(&busy.to_string()), None, CallNote::default()),
             Some(Ok(turn)) => {
-                let call =
-                    rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-                CALL.scope(std::cell::RefCell::default(), async {
-                    // Dropping the call's future ends its Kubernetes requests.
-                    let (result, finished) = tokio::select! {
-                        result = self.tool_router.call(call) => (result, true),
-                        () = cancelled.cancelled() => {
-                            (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
-                        }
-                        () = tokio::time::sleep(deadline) => {
-                            let server = CALL.with(|c| c.borrow().server.clone());
-                            let mut text =
-                                ClusterError::timeout(deadline, server.as_deref()).for_agent();
-                            // As every reply: a server URL's path can hold anything.
-                            policy::redact_text(&mut text);
-                            (failed(&text), false)
-                        }
-                    };
+                let refused = self
+                    .tool_router
+                    .get(&request.name)
+                    .and_then(|tool| unsupported_arguments(tool, request.arguments.as_ref()));
+                if let Some(text) = refused {
                     drop(turn);
-                    let (record, note) = CALL.with(|c| {
-                        let mut c = c.borrow_mut();
-                        let record = c.record.take().filter(|_| finished);
-                        (record, std::mem::take(&mut *c))
-                    });
-                    (result, record, note)
-                })
-                .await
+                    // Its arguments are unvalidated: none is recorded, or trusted to say which
+                    // cluster the call was about.
+                    named = Named::default();
+                    (failed(&text), None, CallNote::default())
+                } else {
+                    let call =
+                        rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                    CALL.scope(std::cell::RefCell::default(), async {
+                        // Dropping the call's future ends its Kubernetes requests.
+                        let (result, finished) = tokio::select! {
+                            result = self.tool_router.call(call) => (result, true),
+                            () = cancelled.cancelled() => {
+                                (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
+                            }
+                            () = tokio::time::sleep(deadline) => {
+                                let server = CALL.with(|c| c.borrow().server.clone());
+                                let mut text =
+                                    ClusterError::timeout(deadline, server.as_deref()).for_agent();
+                                // As every reply: a server URL's path can hold anything.
+                                policy::redact_text(&mut text);
+                                (failed(&text), false)
+                            }
+                        };
+                        drop(turn);
+                        let (record, note) = CALL.with(|c| {
+                            let mut c = c.borrow_mut();
+                            let record = c.record.take().filter(|_| finished);
+                            (record, std::mem::take(&mut *c))
+                        });
+                        (result, record, note)
+                    })
+                    .await
+                }
             }
         };
         let (record, reached) = record.unwrap_or_else(|| {
@@ -1684,6 +1773,117 @@ mod tests {
         let (_, rows, _, _) = table_rows(&merged, true, 1_000, policy::LIST_BYTES);
         let text = serde_json::to_string(&rows).unwrap();
         assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    fn arguments(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    // covers UP-10
+    #[test]
+    fn every_tool_schema_refuses_other_arguments() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 6);
+        for tool in tools {
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&json!(false)),
+                "{}",
+                tool.name
+            );
+            assert!(
+                tool.input_schema
+                    .get("properties")
+                    .is_some_and(Value::is_object),
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    // covers UP-10
+    #[test]
+    fn a_refusal_names_the_unsupported_and_the_accepted_arguments() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let list = server.tool_router.get("list_resources").unwrap();
+        let known = arguments(json!({"cluster": "c", "kind": "pods", "continue": "t"}));
+        assert_eq!(unsupported_arguments(list, Some(&known)), None);
+        assert_eq!(unsupported_arguments(list, None), None);
+
+        let text = unsupported_arguments(
+            list,
+            Some(&arguments(json!({"cluster": "c", "field_selector": "x"}))),
+        )
+        .unwrap();
+        assert!(text.contains("\"field_selector\""), "{text}");
+        assert!(
+            text.contains("label_selector") && text.contains("continue"),
+            "{text}"
+        );
+
+        let clusters = server.tool_router.get("list_clusters").unwrap();
+        let text = unsupported_arguments(clusters, Some(&arguments(json!({"a": 1})))).unwrap();
+        assert_eq!(
+            text,
+            "list_clusters takes no arguments. Unsupported: \"a\"."
+        );
+    }
+
+    // covers UP-10: argument names come from the client.
+    #[test]
+    fn a_refusal_bounds_and_redacts_what_the_client_sent() {
+        let server = FlintMcp::new(PathBuf::from("/nonexistent"), Vec::new(), None);
+        let tool = server.tool_router.get("list_clusters").unwrap();
+        let mut many = serde_json::Map::new();
+        for i in 0..8 {
+            many.insert(format!("{i}{}", "x".repeat(500)), json!(1));
+        }
+        let text = unsupported_arguments(tool, Some(&many)).unwrap();
+        assert!(text.len() < 500, "{text}");
+        assert!(text.ends_with(" and more."), "{text}");
+        many.remove(many.keys().next().unwrap().clone().as_str());
+        many.remove(many.keys().next().unwrap().clone().as_str());
+        many.remove(many.keys().next().unwrap().clone().as_str());
+        let five = unsupported_arguments(tool, Some(&many)).unwrap();
+        assert!(!five.contains("and more"), "{five}");
+
+        let control = arguments(json!({"a\nb\u{1b}[2J\u{7f}\u{202e}c": 1}));
+        let text = unsupported_arguments(tool, Some(&control)).unwrap();
+        assert!(
+            !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{text:?}"
+        );
+
+        // A value with control characters is not kept for the activity log.
+        let named = named_in(Some(&arguments(
+            json!({"cluster": "a\u{1b}[2Jb", "kind": "pods"}),
+        )));
+        assert_eq!(named.cluster, None);
+        assert_eq!(named.kind.as_deref(), Some("pods"));
+
+        // A name past the limit is not read or echoed, not even its start.
+        let huge = format!("hunter2{}", "x".repeat(UNSUPPORTED_NAME_BYTES));
+        let text = unsupported_arguments(tool, Some(&arguments(json!({ huge: 1 })))).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("too long"), "{text}");
+
+        // A password whose closing `@` lies past the cut is still recognized.
+        let url = format!("https://user:{}@example.com", "p".repeat(100));
+        let text = unsupported_arguments(tool, Some(&arguments(json!({ url: 1 })))).unwrap();
+        assert!(!text.contains("ppp"), "{text}");
+
+        // A rule that takes the rest of the line leaves the accepted arguments in place.
+        let list = server.tool_router.get("list_resources").unwrap();
+        let header = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345";
+        let text = unsupported_arguments(list, Some(&arguments(json!({ header: 1 })))).unwrap();
+        assert!(!text.contains("abcdefghijkl"), "{text}");
+        assert!(text.contains("Accepted arguments:"), "{text}");
+        assert!(text.contains("label_selector"), "{text}");
+
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        let text = unsupported_arguments(tool, Some(&arguments(json!({ token: 1 })))).unwrap();
+        assert!(!text.contains(token), "{text}");
     }
 
     // covers UP-15
