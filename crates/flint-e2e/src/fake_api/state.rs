@@ -493,6 +493,18 @@ impl State {
         self.change(gvr, ty, row)
     }
 
+    /// Replaces a full object as a `PUT` does: metadata the new object omits is gone from its
+    /// row too. The returned change carries the object as stored, at its new version.
+    pub(crate) fn replace_object(
+        &mut self,
+        gvr: &Gvr,
+        mut object: Value,
+    ) -> Result<Change, String> {
+        let mut row = self.row_for_object(gvr, &mut object, &[])?;
+        row.replace_metadata(&object["metadata"]);
+        Ok(self.apply_object(gvr, "MODIFIED", object, row))
+    }
+
     /// The full object held for `namespace`/`name`, if one was recorded or set (not one made
     /// from a row).
     pub fn held_object(&self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> Option<&Value> {
