@@ -160,22 +160,8 @@ pub fn run(boot: Bootstrap) {
 
             let model = cx.new(|cx| ClustersModel::new(core, settings, startup_cluster, cx));
             handle_appearance_menu(&model, cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1280.), px(800.)),
-                    cx,
-                ))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Flint".into()),
-                    ..Default::default()
-                }),
-                // Linux desktops match the window to `flint.desktop` (packaging/linux) by this
-                // id (Wayland app_id, X11 WM_CLASS), for its icon and taskbar grouping.
-                app_id: Some("flint".into()),
-                ..Default::default()
-            };
-            match gpui_kit::open_window(options, cx, |window, cx| {
+            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            match gpui_kit::open_window(window_options(bounds), cx, |window, cx| {
                 cx.new(|cx| {
                     Workspace::new(model, ui_state, startup_view, forced_appearance, window, cx)
                 })
@@ -193,6 +179,24 @@ pub fn run(boot: Bootstrap) {
             }
             cx.activate(true);
         });
+}
+
+/// The main window's options, opening at `bounds`. It cannot be made smaller than
+/// [`workspace::MIN_WINDOW_SIZE`], the smallest size the layout works at.
+fn window_options(bounds: Bounds<Pixels>) -> WindowOptions {
+    let (width, height) = workspace::MIN_WINDOW_SIZE;
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(width), px(height))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Flint".into()),
+            ..Default::default()
+        }),
+        // Linux desktops match the window to `flint.desktop` (packaging/linux) by this id
+        // (Wayland app_id, X11 WM_CLASS), for its icon and taskbar grouping.
+        app_id: Some("flint".into()),
+        ..Default::default()
+    }
 }
 
 /// The standard macOS menus, every item a registered action (their keys come from the registry):
