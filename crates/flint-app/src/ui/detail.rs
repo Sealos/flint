@@ -1500,7 +1500,9 @@ mod actions;
 #[path = "detail_pods.rs"]
 mod pods;
 
-pub(in crate::ui) use actions::{Opening, ShellPod, protected_reason, reason, refused};
+pub(in crate::ui) use actions::{
+    Opening, PROTECTED_NOTE, ShellPod, protected_reason, reason, refused,
+};
 pub(in crate::ui) use pods::Pods;
 #[cfg(test)]
 pub(in crate::ui) use pods::RELIST_DELAY;

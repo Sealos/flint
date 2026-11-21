@@ -1044,7 +1044,7 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
     the namespace and container ones) asks for each required one in turn: a list of the clusters, namespaces, kinds
     the active cluster serves, columns drawn or the shown pod's containers, or typed text (a label selector). Values
     equal to the text typed come first: a stored value as typed, then ignoring case, then a shown label (so contexts
-    `cluster/prod` and an EKS ARN shown as `cluster/prod` do not collide, nor `ABC` and `abc`), and the action always
+    `prod` and an EKS ARN shown as `prod` do not collide, nor `ABC` and `abc`), and the action always
     gets the stored value; else, where a typed value is allowed (a namespace not listed, a selector), the text typed
     is the first row and selected. Typed text is trimmed, a picked value never is. Open Container Shell… offers only
     the running app containers a shell can open in (a workload's first ready pod's), Open Container Logs… every

@@ -62,7 +62,7 @@ fn up_01_launch_and_see_my_clusters() -> Result<()> {
     );
     // The short name is drawn; the full context (its tooltip) stays the cluster's name. The
     // tooltip itself is not in `state`.
-    assert_eq!(sidebar(&state, ARN)["label"], "cluster/payments");
+    assert_eq!(sidebar(&state, ARN)["label"], "payments");
     assert_eq!(sidebar(&state, ARN)["name"], ARN);
     assert_eq!(sidebar(&state, TwoClusters::A)["label"], TwoClusters::A);
     assert_eq!(state["active_cluster"], Value::Null);

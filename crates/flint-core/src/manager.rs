@@ -373,6 +373,12 @@ impl ClusterManager {
                 })
                 .await
             }
+            Command::SetClusterName { cluster, name } => {
+                self.write_settings("the cluster name", move |dir| {
+                    settings::set_cluster_name(dir, &cluster, name.as_deref())
+                })
+                .await
+            }
             Command::SetAppearance(appearance) => {
                 self.write_settings("the appearance", move |dir| {
                     settings::set_appearance(dir, appearance)

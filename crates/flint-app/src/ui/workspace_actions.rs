@@ -45,7 +45,9 @@ use super::super::registry::{
     ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::super::registry::{EditAiScope, ShowAgentActivity};
-use super::super::registry::{LockCluster, TrustCluster, UnlockCluster, UntrustCluster};
+use super::super::registry::{
+    LockCluster, RenameCluster, TrustCluster, UnlockCluster, UntrustCluster,
+};
 use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
@@ -83,6 +85,7 @@ impl Workspace {
         .bind::<EditAiScope>(Self::edit_ai_scope)
         .bind::<ShowAgentActivity>(Self::show_agent_activity)
         .bind::<UnlockCluster>(Self::unlock_cluster)
+        .bind::<RenameCluster>(Self::rename_cluster)
         .bind::<LockCluster>(Self::lock_cluster)
         .bind::<TrustCluster>(Self::trust_cluster)
         .bind::<UntrustCluster>(Self::untrust_cluster)
@@ -166,6 +169,9 @@ impl Workspace {
                 |ws, a, cx| ws.check_cluster::<ShowAgentActivity>(&a.cluster, cx),
             )
             .add::<UnlockCluster>(|_, _| true, |ws, a, cx| ws.unlock_target(a, cx).map(drop))
+            .add::<RenameCluster>(Self::settings_ok, |ws, a, cx| {
+                ws.check_cluster::<RenameCluster>(&a.cluster, cx)
+            })
             .add::<LockCluster>(|_, _| true, |ws, a, cx| ws.check_lock(a, cx))
             .add::<TrustCluster>(Self::settings_ok, |ws, a, cx| {
                 ws.trust_change(a, cx).map(drop)
@@ -490,21 +496,22 @@ impl Workspace {
         let model = self.model.read(cx);
         let choices = |items: Vec<Choice>| ArgInput::Choices { items, free: false };
         match arg.kind {
-            ArgKind::Cluster => choices(
+            ArgKind::Cluster => choices({
+                let names = model.names();
                 model
                     .clusters
                     .iter()
                     .map(|c| {
                         let name = c.info.name.clone();
-                        let short = flint_core::display::short_name(&name).to_string();
+                        let short = names.of(&name);
                         Choice {
                             detail: (short != name).then(|| name.clone()),
                             label: short,
                             value: name,
                         }
                     })
-                    .collect(),
-            ),
+                    .collect()
+            }),
             // Also one the user may not list (Add Namespace to Filter).
             ArgKind::Namespace => ArgInput::Choices {
                 items: self.namespaces.iter().map(Choice::plain).collect(),
@@ -610,7 +617,7 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
-    pub(super) fn cluster_summary<'a>(
+    pub(in crate::ui) fn cluster_summary<'a>(
         &self,
         name: &str,
         cx: &'a App,
@@ -1023,10 +1030,34 @@ impl Workspace {
         match self.unlock_target(action, cx) {
             Ok(server) => {
                 let model = self.model.clone();
-                confirm_unlock(window, cx, model, action.cluster.clone(), server);
+                let shown = self.cluster_names(cx).with_real(&action.cluster);
+                confirm_unlock(window, cx, model, &shown, action.cluster.clone(), server);
             }
             Err(e) => tracing::warn!("{e}"),
         }
+    }
+
+    /// What each cluster is called on screen.
+    pub(in crate::ui) fn cluster_names(&self, cx: &App) -> flint_core::display::ClusterNames {
+        self.model.read(cx).names()
+    }
+
+    /// Opens the dialog that names `action.cluster`, showing its context and server.
+    fn rename_cluster(
+        &mut self,
+        action: &RenameCluster,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.check_cluster::<RenameCluster>(&action.cluster, cx) {
+            tracing::warn!("{e}");
+            return;
+        }
+        let server = self
+            .cluster_summary(&action.cluster, cx)
+            .and_then(|c| c.info.server.clone());
+        let model = self.model.clone();
+        super::super::cluster_name::open(window, cx, model, action.cluster.clone(), server);
     }
 
     fn lock_cluster(&mut self, action: &LockCluster, _: &mut Window, cx: &mut Context<Self>) {
@@ -1047,7 +1078,16 @@ impl Workspace {
         match self.trust_change(action, cx) {
             Ok((server, previous)) => {
                 let model = self.model.clone();
-                confirm_trust(window, cx, model, action.cluster.clone(), server, previous);
+                let shown = self.cluster_names(cx).with_real(&action.cluster);
+                confirm_trust(
+                    window,
+                    cx,
+                    model,
+                    &shown,
+                    action.cluster.clone(),
+                    server,
+                    previous,
+                );
             }
             Err(e) => tracing::warn!("{e}"),
         }
