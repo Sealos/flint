@@ -597,6 +597,72 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
     );
 }
 
+/// The palette as it shows `query`, opened for it and closed again.
+async fn showing(cx: &mut TestAppContext, t: &TestWorkspace, query: &str) -> PaletteState {
+    open_palette(cx, t).await;
+    t.type_text(cx, query);
+    let palette = shown(cx, t);
+    t.press(cx, "escape");
+    palette
+}
+
+/// The selected row's label, if a row is selected.
+fn preselected(state: &PaletteState) -> Option<&str> {
+    state.selected.map(|at| state.rows[at].label.as_str())
+}
+
+// covers UP-30 (#407): opening the palette and pressing Enter never quits or closes the window.
+// They rank last until the query clearly names them; a short or scattered match that lists only
+// them selects nothing until an arrow key picks one.
+#[gpui_kit::test]
+async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
+    const ENDING: [&str; 2] = ["Quit Flint", "Close Window"];
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_palette(cx, &t).await;
+    let palette = shown(cx, &t);
+    assert!(!ENDING.contains(&selected(&palette)), "{palette:?}");
+    let all = labels(&palette);
+    assert_eq!(all.len(), palette.total, "every row is reported");
+    let mut last_two = all[all.len() - 2..].to_vec();
+    last_two.sort_unstable();
+    assert_eq!(last_two, ["Close Window", "Quit Flint"], "{all:?}");
+    t.press(cx, "escape");
+
+    // Short or scattered: not selected. "flint" is only a later word of Quit Flint, so About
+    // Flint comes first.
+    for query in ["q", "qt", "qu", "flint"] {
+        let palette = showing(cx, &t, query).await;
+        let first = preselected(&palette);
+        assert!(
+            !first.is_some_and(|l| ENDING.contains(&l)),
+            "{query}: {palette:?}"
+        );
+    }
+    // Clearly named: selected, so Enter runs it.
+    for (query, label) in [
+        ("qui", "Quit Flint"),
+        ("quit", "Quit Flint"),
+        ("quit flint", "Quit Flint"),
+        ("close w", "Close Window"),
+    ] {
+        let palette = showing(cx, &t, query).await;
+        assert_eq!(preselected(&palette), Some(label), "{query}: {palette:?}");
+    }
+
+    // A scattered match listing only Quit: Enter runs nothing until an arrow key selects it.
+    open_palette(cx, &t).await;
+    t.type_text(cx, "qtf");
+    let palette = shown(cx, &t);
+    assert_eq!(labels(&palette), ["Quit Flint"]);
+    assert_eq!(palette.selected, None, "{palette:?}");
+    t.press(cx, "enter");
+    assert_eq!(shown(cx, &t).query, "qtf", "Enter ran nothing");
+    t.press(cx, "down");
+    assert_eq!(selected(&shown(cx, &t)), "Quit Flint");
+    t.press(cx, "escape");
+}
+
 /// A pod `name` in `demo` with containers `app` and `sidecar`, selected and shown in the detail
 /// pane.
 async fn show_pod(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {

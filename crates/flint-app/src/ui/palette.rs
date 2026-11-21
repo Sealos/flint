@@ -30,9 +30,9 @@ use serde_json::{Map, Value};
 
 use super::palette_model::{self, Candidate, Recents};
 use super::registry::{
-    self, ActionError, ActionSpec, Arg, ArgKind, Bind, OnView, OpenObject, OpenView, PaletteBack,
-    PaletteConfirm, PaletteDismiss, PaletteDown, PalettePick, PaletteUp, PasteText, Scope,
-    ToggleCommandPalette, ToggleResourceSwitcher, Visibility,
+    self, ActionError, ActionSpec, Arg, ArgKind, Bind, CloseWindow, OnView, OpenObject, OpenView,
+    PaletteBack, PaletteConfirm, PaletteDismiss, PaletteDown, PalettePick, PaletteUp, PasteText,
+    Quit, Scope, ToggleCommandPalette, ToggleResourceSwitcher, Visibility,
 };
 use super::switcher_model::{Index, Search};
 
@@ -539,6 +539,7 @@ impl CommandPalette {
                 label: e.spec.label.to_owned(),
                 alt: Some(format!("{} {}", e.spec.category.name(), e.spec.label)),
                 recent: recents.and_then(|r| r.0.rank(e.spec.name)),
+                last: ends_the_app(e.spec),
             })
             .collect();
         self.step = Step::Actions;
@@ -702,12 +703,32 @@ impl CommandPalette {
         cx.notify();
     }
 
+    /// Only Quit or Close Window is listed, the query does not clearly name the best row, and no
+    /// key or click chose it: no row is selected, and Enter runs nothing.
+    fn nothing_selected(&self) -> bool {
+        !self.chosen
+            && matches!(
+                self.rows.get(self.selected),
+                Some(Row::Action { entry, .. })
+                    if ends_the_app(self.entries[*entry].spec)
+                        && !palette_model::clear_match(
+                            &self.query_text,
+                            self.entries[*entry].spec.label,
+                        )
+            )
+    }
+
     fn move_by(&mut self, step: isize, cx: &mut Context<Self>) {
         // With no rows to move through, nothing was chosen: a kept item stays kept.
         if self.rows.is_empty() {
             return;
         }
-        self.selected = palette_model::step(self.selected, self.rows.len(), step);
+        self.selected = if self.nothing_selected() {
+            // No row is highlighted, so the first key lands on an end of the list.
+            if step > 0 { 0 } else { self.rows.len() - 1 }
+        } else {
+            palette_model::step(self.selected, self.rows.len(), step)
+        };
         self.chosen = true;
         self.kept = None;
         self.scroll
@@ -722,6 +743,8 @@ impl CommandPalette {
         }
         if action.row < self.rows.len() {
             self.selected = action.row;
+            // A click on an action is a choice, Quit included.
+            self.chosen |= matches!(self.step, Step::Actions);
             self.confirm(window, cx);
         }
     }
@@ -729,6 +752,9 @@ impl CommandPalette {
     /// Enter: runs the selected action, or asks for its first argument; in an argument step,
     /// takes the selected (or typed) value and asks for the next one, or runs the action.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nothing_selected() {
+            return;
+        }
         let Some(row) = self.rows.get(self.selected).cloned() else {
             // A typed argument with nothing typed says what to type; an empty pick list says so
             // in the footer already.
@@ -1036,7 +1062,7 @@ impl CommandPalette {
         range
             .filter_map(|ix| {
                 let texts = self.row_texts(ix)?;
-                let selected = ix == self.selected;
+                let selected = ix == self.selected && !self.nothing_selected();
                 let runs = texts
                     .ranges
                     .iter()
@@ -1127,6 +1153,9 @@ impl CommandPalette {
             return Some((resources_footer(resources, self.rows.len()), false));
         }
         match (&self.step, self.rows.get(self.selected)) {
+            (Step::Actions, Some(_)) if self.nothing_selected() => {
+                Some(("Press an arrow key to select it, then Enter".into(), false))
+            }
             (Step::Actions, Some(Row::Action { entry, .. })) => {
                 Some((self.entries[*entry].spec.description.into(), false))
             }
@@ -1186,7 +1215,7 @@ impl CommandPalette {
                 })
                 .collect(),
             total: self.rows.len(),
-            selected: (!self.rows.is_empty()).then_some(self.selected),
+            selected: (!self.rows.is_empty() && !self.nothing_selected()).then_some(self.selected),
             footer: self.footer().map(|(text, _)| text.to_string()),
             note: match (&self.step, &self.resources) {
                 (Step::Resources, Some(resources)) => {
@@ -1283,6 +1312,11 @@ fn resources_footer(resources: &Resources, rows: usize) -> SharedString {
     .into()
 }
 
+/// Quit and Close Window: never the row Enter runs without a choice (#407).
+fn ends_the_app(spec: &ActionSpec) -> bool {
+    spec.name == Quit::name_for_type() || spec.name == CloseWindow::name_for_type()
+}
+
 /// What the query is matched against for an argument: each choice's label, and its stored
 /// value too where that differs.
 fn candidates_of(input: &ArgInput) -> Vec<Candidate> {
@@ -1293,6 +1327,7 @@ fn candidates_of(input: &ArgInput) -> Vec<Candidate> {
                 label: c.label.clone(),
                 alt: (c.value != c.label).then(|| c.value.clone()),
                 recent: None,
+                last: false,
             })
             .collect(),
         ArgInput::Text => Vec::new(),
