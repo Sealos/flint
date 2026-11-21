@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use flint_core::display::{
     CUSTOM_NAME_PUNCTUATION, ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name, short_name,
 };
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -70,7 +71,15 @@ impl Render for NameField {
             .gap_1()
             .child(Input::new(&self.input).id("rename-cluster-input").small())
             .when_some(self.error.clone(), |el, error| {
-                el.child(div().text_xs().text_color(danger).child(error))
+                el.child(
+                    div()
+                        .id("rename-cluster-error")
+                        .aria_label(error.clone())
+                        .text_xs()
+                        .text_color(danger)
+                        .child(error)
+                        .test_support(),
+                )
             })
     }
 }

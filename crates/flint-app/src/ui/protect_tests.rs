@@ -10,6 +10,7 @@ use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
 use super::super::{trust_dialog, unlock_dialog};
+use super::row_actions_tests::right_click;
 use crate::ui::dock::{DockItem as _, TabStatus};
 use crate::ui::registry::ActionError;
 use crate::ui::support_tests::{
@@ -110,6 +111,192 @@ async fn show_web(cx: &mut TestAppContext, t: &TestWorkspace) {
 fn refusal(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
     t.workspace
         .read_with(cx, |ws, _| ws.action_error().map(str::to_owned))
+}
+
+/// The custom names in the settings the app holds.
+fn custom_names(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(String, String)> {
+    t.model.read_with(cx, |m, _| {
+        m.settings
+            .cluster_names
+            .iter()
+            .map(|(c, n)| (c.clone(), n.clone()))
+            .collect()
+    })
+}
+
+async fn wait_for_name(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    cluster: &'static str,
+    name: Option<&'static str>,
+) {
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model
+            .read(cx)
+            .settings
+            .cluster_names
+            .get(cluster)
+            .map(String::as_str)
+            == name
+    })
+    .await;
+}
+
+async fn open_rename(cx: &mut TestAppContext, t: &TestWorkspace, cluster: &str) {
+    t.dispatch(
+        cx,
+        "workspace::RenameCluster",
+        json!({ "cluster": cluster }),
+    )
+    .unwrap();
+    wait_for_dialog(cx, t, true).await;
+    draw(cx, t);
+}
+
+// covers UP-01: the Rename dialog names the real cluster; its button and Enter save, an empty
+// field removes the name.
+#[gpui_kit::test]
+async fn the_rename_dialog_saves_with_its_button_and_with_enter(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+
+    open_rename(cx, &t, "alpha").await;
+    let text = t.label(cx, "rename-cluster-description").unwrap();
+    assert!(
+        text.contains(&format!("Context: alpha\nServer: {}", t.server)),
+        "{text}"
+    );
+    t.type_text(cx, "main");
+    t.click(cx, "ok");
+    wait_for_dialog(cx, &t, false).await;
+    wait_for_name(cx, &t, "alpha", Some("main")).await;
+    draw(cx, &t);
+    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("main"));
+    let file = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+    assert!(
+        file.contains("[cluster_names]") && file.contains("alpha = \"main\""),
+        "{file}"
+    );
+
+    open_rename(cx, &t, "beta").await;
+    t.type_text(cx, "blue");
+    t.press(cx, "enter");
+    wait_for_dialog(cx, &t, false).await;
+    wait_for_name(cx, &t, "beta", Some("blue")).await;
+
+    // The field starts with the current name; emptied, the context name comes back.
+    open_rename(cx, &t, "alpha").await;
+    t.press(cx, "secondary-a");
+    t.press(cx, "backspace");
+    t.click(cx, "ok");
+    wait_for_dialog(cx, &t, false).await;
+    wait_for_name(cx, &t, "alpha", None).await;
+    draw(cx, &t);
+    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("alpha"));
+}
+
+// covers UP-01: cancelling leaves the settings as they were.
+#[gpui_kit::test]
+async fn cancelling_the_rename_dialog_changes_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let t = open_with_settings(cx, dir.path(), &settings).await;
+    let path = dir.path().join("settings.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    for cancel in ["escape", "button"] {
+        open_rename(cx, &t, "alpha").await;
+        t.type_text(cx, "-changed");
+        match cancel {
+            "escape" => t.press(cx, "escape"),
+            _ => t.click(cx, "cancel"),
+        }
+        wait_for_dialog(cx, &t, false).await;
+        draw(cx, &t);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{cancel}");
+        assert_eq!(
+            custom_names(cx, &t),
+            [("alpha".to_owned(), "main".to_owned())]
+        );
+    }
+}
+
+// covers UP-01: a name that is not valid, or could pass for another cluster, keeps the dialog
+// open, saying why, and writes nothing.
+#[gpui_kit::test]
+async fn the_rename_dialog_refuses_an_invalid_name(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let t = open_with_settings(cx, dir.path(), &settings).await;
+    let path = dir.path().join("settings.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    open_rename(cx, &t, "beta").await;
+    for (typed, says) in [("MAIN", "already goes by"), ("!", "at most")] {
+        t.press(cx, "secondary-a");
+        t.press(cx, "backspace");
+        t.type_text(cx, typed);
+        t.click(cx, "ok");
+        draw(cx, &t);
+        assert!(
+            cx.update_window(t.window, |_, window, cx| {
+                gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+            })
+            .unwrap(),
+            "{typed}: the dialog stays open"
+        );
+        let error = t.label(cx, "rename-cluster-error").unwrap();
+        assert!(error.contains(says), "{typed}: {error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{typed}");
+    }
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    assert_eq!(
+        custom_names(cx, &t),
+        [("alpha".to_owned(), "main".to_owned())]
+    );
+}
+
+// covers UP-54, UP-55: the row menu's Unlock entry, clicked for real, opens the confirmation with
+// the full context and server, and nothing unlocks until it is confirmed.
+#[gpui_kit::test]
+async fn the_row_menu_unlock_entry_asks_before_unlocking(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let t = open_with_settings(cx, dir.path(), &settings).await;
+    show_web(cx, &t).await;
+    let wanted = unlock_dialog("main (alpha)", "alpha", &t.server);
+
+    right_click(cx, &t, "web").await;
+    draw(cx, &t);
+    let entry = t.find(cx, "menu-unlock").expect("the Unlock entry");
+    assert_eq!(entry.label(), Some("Unlock main (alpha)…"));
+    assert_eq!(
+        entry.description().map(str::to_owned),
+        Some(format!("alpha\n{}", t.server))
+    );
+    t.click(cx, "menu-unlock");
+    wait_for_dialog(cx, &t, true).await;
+    assert_eq!(t.label(cx, "unlock-description"), Some(wanted.text.clone()));
+    assert!(
+        wanted
+            .text
+            .contains(&format!("Context: alpha\nServer: {}", t.server))
+    );
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    draw(cx, &t);
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+
+    right_click(cx, &t, "web").await;
+    draw(cx, &t);
+    t.click(cx, "menu-unlock");
+    wait_for_dialog(cx, &t, true).await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    t.click(cx, "ok");
+    wait_for_dialog(cx, &t, false).await;
+    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
 }
 
 // covers UP-01, UP-55: a custom name is what the sidebar shows, but the row, its tooltip and the
