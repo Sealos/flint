@@ -91,15 +91,32 @@ fn event_message<'a>(reply: &'a Value, message_start: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no message starting {message_start:?}: {reply}"))
 }
 
-/// The cells of the row `name` in a `list_resources` reply, joined.
-fn row_text(reply: &Value, name: &str) -> String {
-    let row = reply["rows"]
+/// The row `name` in a `list_resources` reply.
+fn row<'a>(reply: &'a Value, name: &str) -> &'a Value {
+    reply["rows"]
         .as_array()
         .unwrap()
         .iter()
         .find(|r| r["name"] == name)
-        .unwrap_or_else(|| panic!("no row {name}: {reply}"));
-    row["cells"].to_string()
+        .unwrap_or_else(|| panic!("no row {name}: {reply}"))
+}
+
+/// The cells of the row `name` in a `list_resources` reply, joined.
+fn row_text(reply: &Value, name: &str) -> String {
+    row(reply, name)["cells"].to_string()
+}
+
+/// The `Message` cell of the row `name` in a `list_resources` reply.
+fn message_cell<'a>(reply: &'a Value, name: &str) -> &'a str {
+    let column = reply["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c["name"] == "Message")
+        .unwrap_or_else(|| panic!("no Message column: {reply}"));
+    row(reply, name)["cells"][column]
+        .as_str()
+        .unwrap_or_else(|| panic!("no message in row {name}: {reply}"))
 }
 
 // covers UP-15: a token, a password pair, a cloud key and a private key in a log are each
@@ -197,10 +214,11 @@ fn up_15_a_secret_held_in_a_list_cell_is_masked() -> Result<()> {
     )?;
     assert_no_credential(&listed.to_string());
     assert!(row_text(&listed, "plain").contains(plain), "{listed}");
-    assert!(
-        row_text(&listed, "held-json").contains("Secret"),
-        "{listed}"
-    );
+    let held_json: Value = serde_json::from_str(message_cell(&listed, "held-json"))?;
+    assert_eq!(held_json["kind"], "Secret", "{listed}");
+    assert_eq!(held_json["metadata"]["name"], "held", "{listed}");
+    assert_eq!(held_json["data"]["value"], "<redacted>", "{listed}");
+    assert_eq!(message_cell(&listed, "held-yaml"), "<redacted>", "{listed}");
     Ok(())
 }
 
@@ -312,6 +330,24 @@ fn up_15_a_key_opening_past_the_look_behind_is_left_out() -> Result<()> {
     assert_no_credential(text);
     assert!(text.ends_with("after one\nafter two\n"), "{text}");
     assert_eq!(got["truncated"], true, "{got}");
+    Ok(())
+}
+
+// covers UP-15: with neither marker of a key in what the server fetched, its body is still left
+// out and the ordinary lines after it are kept.
+#[test]
+fn up_15_an_unfinished_key_past_the_look_behind_is_left_out() -> Result<()> {
+    let setup = Setup::exposed()?;
+    let mut log = "-----BEGIN PRIVATE KEY-----\n".to_owned();
+    log.push_str(&format!("{KEY_BODY}\n").repeat(400));
+    log.push_str("after one\nafter two\n");
+    setup.api.set_log(NAMESPACE, POD, &log);
+    let mut mcp = setup.mcp()?;
+
+    let got = mcp.call_json("get_pod_logs", logs(json!({"tail_lines": 10})))?;
+    assert_eq!(got["log"], "after one\nafter two\n", "{got}");
+    assert_eq!(got["truncated"], true, "{got}");
+    assert_no_credential(&got.to_string());
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use crate::support::{EXPOSED, HIDDEN, NAMESPACE, POD, Setup};
 
 const OTHER_NAMESPACE: &str = "kube-system";
+const MISSING_NAMESPACE: &str = "no-such-namespace";
 
 fn out_of_scope() -> String {
     format!(
@@ -29,7 +30,7 @@ fn up_14_scope_limits_what_an_agent_reads() -> Result<()> {
     );
     setup.expose(&[NAMESPACE], &["pods"])?;
     let mut mcp = setup.mcp()?;
-    let before = setup.api.requests().len();
+    let before = setup.api.arrivals().len();
 
     let object = |namespace: &str, name: &str| json!({"cluster": EXPOSED, "kind": "pods", "namespace": namespace, "name": name});
     let logs = |namespace: &str, pod: &str| json!({"cluster": EXPOSED, "namespace": namespace, "pod": pod});
@@ -40,7 +41,7 @@ fn up_14_scope_limits_what_an_agent_reads() -> Result<()> {
         ),
         (
             "list_resources",
-            json!({"cluster": EXPOSED, "kind": "pods", "namespace": "no-such-namespace"}),
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": MISSING_NAMESPACE}),
         ),
         ("get_resource", object(OTHER_NAMESPACE, "exists")),
         ("get_resource", object(OTHER_NAMESPACE, "missing")),
@@ -56,14 +57,18 @@ fn up_14_scope_limits_what_an_agent_reads() -> Result<()> {
         assert!(got.is_error, "{tool} {args}: {}", got.text);
         assert_eq!(got.text, out_of_scope(), "{tool} {args}");
     }
-    let sent = setup.api.requests();
-    assert!(
-        sent[before..]
-            .iter()
-            .all(|r| !r.path.contains(OTHER_NAMESPACE)),
-        "{:?}",
-        &sent[before..]
-    );
+    // Arrivals include requests still in flight. Discovery may run; nothing may name either
+    // namespace, in its path or its query.
+    let arrived = setup.api.arrivals();
+    let targeting: Vec<_> = arrived[before..]
+        .iter()
+        .filter(|r| {
+            [OTHER_NAMESPACE, MISSING_NAMESPACE]
+                .iter()
+                .any(|ns| r.path.contains(ns) || r.query.contains(ns))
+        })
+        .collect();
+    assert!(targeting.is_empty(), "{targeting:?}");
 
     // Another kind in the namespace in scope, a cluster-scoped kind not named, and a missing one.
     for kind in ["services", "nodes", "gizmos"] {
@@ -143,8 +148,31 @@ fn up_14_every_tool_is_declared_read_only() -> Result<()> {
             assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
             assert_ne!(tool["annotations"]["destructiveHint"], true, "{tool}");
         }
+
+        // What the annotations declare, the traffic of every tool shows.
+        let before = setup.api.arrivals().len();
+        let cluster = json!({"cluster": EXPOSED});
+        let pods = json!({"cluster": EXPOSED, "kind": "pods", "namespace": NAMESPACE});
+        let pod = json!({"cluster": EXPOSED, "kind": "pods", "namespace": NAMESPACE, "name": POD});
+        let logs = json!({"cluster": EXPOSED, "namespace": NAMESPACE, "pod": POD});
+        let events = json!({"cluster": EXPOSED, "namespace": NAMESPACE});
+        for (tool, args) in [
+            ("list_clusters", json!({})),
+            ("list_resource_kinds", cluster),
+            ("list_resources", pods),
+            ("get_resource", pod),
+            ("get_pod_logs", logs),
+            ("get_events", events),
+        ] {
+            let got = mcp.call(tool, args)?;
+            assert!(!got.is_error, "{tool}: {}", got.text);
+        }
+        let arrived = setup.api.arrivals();
+        let traffic = &arrived[before..];
+        assert!(!traffic.is_empty(), "{namespaces:?}");
+        assert!(traffic.iter().all(|r| r.method == "GET"), "{traffic:?}");
     }
-    let writes = setup.api.requests();
-    assert!(writes.iter().all(|r| r.method == "GET"), "{writes:?}");
+    let writes = setup.api.writes();
+    assert!(writes.is_empty(), "{writes:?}");
     Ok(())
 }
