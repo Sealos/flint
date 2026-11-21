@@ -3,12 +3,13 @@
 //! minimum window size.
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, Pixels, Render,
     Styled as _, TestAppContext, VisualTestContext, Window, div, px, size,
 };
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::ui::confirm::{self, DialogText};
 use crate::ui::support_tests::{TestWorkspace, open_workspace};
@@ -255,6 +256,226 @@ async fn controls_under_a_long_text_fit_the_minimum_window(cx: &mut TestAppConte
         "{controls:?} above {ok:?}"
     );
     assert!(ok.bottom() <= px(480.), "{ok:?}");
+}
+
+/// Asserts the target lines are inside the open dialog and Confirm is on screen.
+fn assert_target_shown(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let surface = bounds(cx, t, "surface");
+    let target = bounds(cx, t, "confirm-target");
+    let ok = bounds(cx, t, "ok");
+    assert!(target.size.height > px(0.), "{target:?}");
+    assert!(
+        target.origin.y >= surface.origin.y && target.bottom() <= surface.bottom(),
+        "{target:?} inside {surface:?}"
+    );
+    assert!(target.bottom() <= ok.origin.y, "{target:?} above {ok:?}");
+    assert!(
+        ok.origin.y >= surface.origin.y && ok.bottom() <= surface.bottom().min(px(480.)),
+        "{ok:?} inside {surface:?}"
+    );
+}
+
+// #421: a write confirmation always shows its context, server, namespace and object, at the
+// minimum size and with the longest warnings, and the warnings scroll by keyboard.
+#[gpui_kit::test]
+async fn a_write_confirmation_keeps_its_target_on_show(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+    let warnings = vec!["Managed by a controller; this will likely be reverted."; 200].join("\n");
+    let long = "a-very-long-generated-name-".repeat(6);
+    let delete = "Context: alpha\nServer: https://alpha.example.invalid:6443\nNamespace: demo\n\
+                  Object: pods web"
+        .to_owned();
+    // A node has no namespace.
+    let drain = format!(
+        "Context: {long}\nServer: https://alpha.example.invalid:6443\nObject: nodes {long}"
+    );
+    for (title, ok, target, pinned) in [
+        ("Delete web?", "Delete", delete, 4),
+        ("Drain node-1?", "Drain", drain, 3),
+    ] {
+        let confirmed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let set = confirmed.clone();
+        let dialog = DialogText {
+            title: title.into(),
+            text: format!("{warnings}\n\n{target}"),
+            ok: ok.into(),
+            cancel: "Cancel".into(),
+            id: "write-confirm-description",
+            default_cancel: true,
+        };
+        cx.update_window(t.window, |_, window, cx| {
+            confirm::open_pinned(window, cx, dialog, pinned, move |_, _| set.set(true))
+        })
+        .unwrap();
+        draw(cx, &t);
+        assert_target_shown(cx, &t);
+
+        // Tab reaches the warnings, and the keys scroll them under the pinned lines.
+        let before = bounds(cx, &t, "confirm-text-body").origin.y;
+        t.press(cx, "tab");
+        draw(cx, &t);
+        let focused = cx
+            .update_window(t.window, |_, window, _| {
+                window.find("confirm-text").focused()
+            })
+            .unwrap();
+        assert_eq!(focused, Some(true), "the warnings are a Tab stop");
+        t.press(cx, "pagedown");
+        draw(cx, &t);
+        assert!(bounds(cx, &t, "confirm-text-body").origin.y < before);
+        t.press(cx, "end");
+        draw(cx, &t);
+        assert_target_shown(cx, &t);
+        t.press(cx, "home");
+        draw(cx, &t);
+        assert_eq!(bounds(cx, &t, "confirm-text-body").origin.y, before);
+
+        // Enter on the warnings cancels a deliberate action, as it does everywhere in it.
+        t.press(cx, "enter");
+        draw(cx, &t);
+        assert!(!t.has_dialog(cx));
+        assert!(!confirmed.get(), "{title}");
+    }
+}
+
+// #421: right-clicking a row in a narrow window selects it and leaves it drawn, with its menu.
+#[gpui_kit::test]
+async fn a_right_click_keeps_the_row_and_its_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    resize(cx, &t, 760., 480.);
+    cx.update_window(t.window, |_, window, cx| {
+        window.right_click("row-uid-web", cx)
+    })
+    .unwrap();
+    cx.wait_for(t.window, Duration::from_secs(5), |window, _| {
+        window.try_find("popup-menu").is_some()
+    })
+    .await;
+    draw(cx, &t);
+    assert!(shown(cx, &t, "popup-menu"), "the menu stays open");
+    assert_eq!(t.selected(cx).as_deref(), Some("web"));
+    assert!(shown(cx, &t, "row-uid-web"), "the row stays");
+    assert!(!shown(cx, &t, "detail-back"));
+
+    // A plain click on it still opens the detail.
+    t.press(cx, "escape");
+    draw(cx, &t);
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"));
+}
+
+// #421: Back's key is a letter, which native key events report the same on every platform.
+#[test]
+fn the_back_key_survives_key_normalization() {
+    let spec = crate::ui::registry::find("workspace::BackToList").unwrap();
+    assert_eq!(spec.keys, ["secondary-shift-b"]);
+}
+
+// #421: Edit YAML from behind the list brings the detail forward, with its editor.
+#[gpui_kit::test]
+async fn editing_from_behind_the_list_shows_the_detail(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+    let object = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "web", "namespace": "demo", "uid": "uid-web", "resourceVersion": "1"},
+    });
+    let fetched = flint_core::ObjectDetail {
+        yaml: serde_saphyr::to_string(&object).unwrap(),
+        object,
+        managed_fields: None,
+        events: Vec::new(),
+        events_truncated: false,
+        events_error: None,
+    };
+    let view = t.detail(cx).unwrap();
+    cx.update_window(t.window, |_, window, cx| {
+        view.update(cx, |view, cx| view.show_fetched(fetched, window, cx))
+    })
+    .unwrap();
+    draw(cx, &t);
+    t.click(cx, "detail-back");
+    draw(cx, &t);
+    assert!(!shown(cx, &t, "detail-back"));
+    t.dispatch(cx, "detail::EditYaml", Value::Null).unwrap();
+    draw(cx, &t);
+    assert!(shown(cx, &t, "detail-back"), "the detail is in front");
+    assert_eq!(focus(cx, &t), Focus::DetailYaml);
+}
+
+// #421 (UP-33): opening the current kind again brings its list in front of the detail.
+#[gpui_kit::test]
+async fn reopening_the_current_kind_shows_the_list(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    detail_alone(cx, &t).await;
+    t.dispatch(
+        cx,
+        "workspace::OpenView",
+        serde_json::json!({"kind": "pods"}),
+    )
+    .unwrap();
+    draw(cx, &t);
+    assert!(shown(cx, &t, "row-uid-web"));
+    assert!(!shown(cx, &t, "detail-back"));
+    assert_eq!(focus(cx, &t), Focus::List);
+    assert!(t.detail(cx).is_some(), "the detail stays open behind it");
+}
+
+// #421: a control focused before a dialog, in a pane hidden while it was open, does not keep
+// focus once the dialog closes: the keys keep working from the pane on show.
+#[gpui_kit::test]
+async fn closing_a_dialog_over_a_hidden_pane_restores_focus(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    t.dispatch(cx, "resource_list::FocusFilter", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    assert_eq!(focus(cx, &t), Focus::ListFilter);
+    let dialog = DialogText {
+        title: "Asked".into(),
+        text: "Asked this.".into(),
+        ok: "Go".into(),
+        cancel: "Cancel".into(),
+        id: "test-description",
+        default_cancel: false,
+    };
+    cx.update_window(t.window, |_, window, cx| {
+        confirm::open(window, cx, dialog, |_, _| {})
+    })
+    .unwrap();
+    draw(cx, &t);
+    resize(cx, &t, 760., 480.);
+    t.press(cx, "escape");
+    draw(cx, &t);
+    assert!(!t.has_dialog(cx));
+    assert!(shown(cx, &t, "detail-back"));
+    assert_eq!(focus(cx, &t), Focus::Detail);
+}
+
+// #421: outside the detail-only layout Back's key does nothing and is left to others.
+#[gpui_kit::test]
+async fn the_back_key_only_acts_on_the_detail_alone(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, ROWS).await;
+    t.click(cx, "row-uid-web");
+    draw(cx, &t);
+    t.press(cx, "tab");
+    assert_eq!(focus(cx, &t), Focus::Detail, "side by side, on the detail");
+    t.press_key_of(cx, "workspace::BackToList");
+    assert_eq!(focus(cx, &t), Focus::Detail, "focus stays where it was");
+    assert!(!t.available(cx).contains(&"workspace::BackToList"));
 }
 
 // #421: the main window cannot be made smaller than the layout supports.

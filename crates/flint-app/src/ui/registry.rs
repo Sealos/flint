@@ -2154,7 +2154,7 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "In a narrow window, return from the detail to the list, keeping the selection.",
         )
         .of(C::View, S::Workspace)
-        .keys(&["secondary-shift-["], Some(WORKSPACE)),
+        .keys(&["secondary-shift-b"], Some(WORKSPACE)),
         // Tab and Shift-Tab, outside text fields: a field keeps them for moving between
         // controls, and a shell tab sends them to the shell.
         Spec::unit::<FocusNextPane>(

@@ -3,10 +3,11 @@
 //! dialog says (`shown`): GPUI keeps only a builder for a dialog, and nothing can read its text
 //! back.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -37,6 +38,12 @@ pub const DEFAULT_CANCEL: &str = "DefaultCancel";
 const DESCRIPTION_MAX_SHARE: f32 = 0.45;
 /// The same for a confirmation with controls under its text (the drain options).
 const DESCRIPTION_MAX_SHARE_OVER_CONTROLS: f32 = 0.3;
+/// The share of the window's height the pinned lines and the text under them may take together.
+const PINNED_DESCRIPTION_MAX_SHARE: f32 = 0.6;
+/// The least height the text under pinned lines keeps, however much they wrap.
+const MIN_TEXT_HEIGHT: f32 = 48.;
+/// How far one arrow key scrolls a long text.
+const SCROLL_LINE: f32 = 20.;
 
 /// Opens a confirmation saying `dialog`; confirming runs `on_ok` and closes it. Test builds open
 /// it at once, without the entrance animation, so automation sees it without waiting.
@@ -52,6 +59,21 @@ pub fn open(
     });
 }
 
+/// [`open`], with the last `pinned` lines of the text always on show above the rest, which
+/// scrolls: what a write confirmation names as its target must be read without scrolling.
+pub fn open_pinned(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    pinned: usize,
+    on_ok: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    open_dialog(window, cx, dialog, pinned, None, move |window, cx| {
+        on_ok(window, cx);
+        true
+    });
+}
+
 /// [`open`], with `content` (a view of its own, such as pickers) drawn under the text, and an
 /// `on_ok` that may keep the dialog open (`false`), when the content says why it cannot be
 /// confirmed yet.
@@ -59,6 +81,17 @@ pub fn open_with(
     window: &mut Window,
     cx: &mut App,
     dialog: DialogText,
+    content: Option<AnyView>,
+    on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
+) {
+    open_dialog(window, cx, dialog, 0, content, on_ok);
+}
+
+fn open_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    dialog: DialogText,
+    pinned: usize,
     content: Option<AnyView>,
     on_ok: impl Fn(&mut Window, &mut App) -> bool + 'static,
 ) {
@@ -73,15 +106,25 @@ pub fn open_with(
             .0
             .push(focus.downgrade());
     }
-    window.open_alert_dialog(cx, move |alert, window, _| {
+    let (scrolling, target) = split_pinned(&dialog.text, pinned);
+    let (scrolling, target) = (SharedString::from(scrolling), SharedString::from(target));
+    let scroll = ScrollHandle::new();
+    let text_focus = cx.focus_handle();
+    let target_height = Rc::new(Cell::new(px(0.)));
+    window.open_alert_dialog(cx, move |alert, window, cx| {
         let on_ok = on_ok.clone();
         // A long text scrolls, so it cannot push the buttons or its last lines out of the dialog.
-        let share = if content.is_some() {
-            DESCRIPTION_MAX_SHARE_OVER_CONTROLS
+        let viewport = window.viewport_size().height;
+        let text_height = if pinned > 0 {
+            (viewport * PINNED_DESCRIPTION_MAX_SHARE - target_height.get()).max(px(MIN_TEXT_HEIGHT))
+        } else if content.is_some() {
+            viewport * DESCRIPTION_MAX_SHARE_OVER_CONTROLS
         } else {
-            DESCRIPTION_MAX_SHARE
+            viewport * DESCRIPTION_MAX_SHARE
         };
-        let text_height = window.viewport_size().height * share;
+        // A Tab stop only when there is something to scroll to.
+        let overflows = scroll.max_offset().y > px(0.);
+        let ring = text_focus.is_focused(window).then(|| cx.theme().ring);
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
         alert
@@ -91,14 +134,39 @@ pub fn open_with(
                 div()
                     .id(dialog.id)
                     .aria_label(dialog.text.clone())
+                    // First, so that nothing can push it out of the dialog.
+                    .when(!target.is_empty(), |this| {
+                        this.child(pinned_target(target.clone(), target_height.clone()))
+                    })
                     // Only the text scrolls: controls under it stay in place and clickable.
-                    .child(
-                        div()
-                            .id("confirm-text")
-                            .max_h(text_height)
-                            .overflow_y_scroll()
-                            .child(dialog.text.clone()),
-                    )
+                    .when(!scrolling.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .id("confirm-text")
+                                .max_h(text_height)
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll)
+                                .test_support()
+                                .track_focus(&text_focus.clone().tab_stop(overflows))
+                                .border_1()
+                                .when_some(ring, |this, ring| this.border_color(ring))
+                                .when(ring.is_none(), |this| {
+                                    this.border_color(transparent_black())
+                                })
+                                .on_key_down({
+                                    let scroll = scroll.clone();
+                                    move |event, window, cx| {
+                                        scroll_by_key(&scroll, &event.keystroke, window, cx)
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .id("confirm-text-body")
+                                        .child(scrolling.clone())
+                                        .test_support(),
+                                ),
+                        )
+                    })
                     .when_some(content.clone(), |this, content| this.child(content))
                     .when_some(default_cancel.as_ref(), |this, focus| {
                         this.track_focus(focus).key_context(DEFAULT_CANCEL)
@@ -117,6 +185,72 @@ pub fn open_with(
     // The dialog took focus as it opened: hand it on to the description.
     if let Some(focus) = focus {
         focus.focus(window, cx);
+    }
+    // Whether the text overflows is known once it is laid out.
+    window.on_next_frame(|window, _| window.refresh());
+}
+
+/// `text` split into what scrolls and its last `pinned` lines, without the blank line between.
+fn split_pinned(text: &str, pinned: usize) -> (String, String) {
+    if pinned == 0 {
+        return (text.to_owned(), String::new());
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.len().saturating_sub(pinned);
+    (
+        lines[..at].join("\n").trim_end().to_owned(),
+        lines[at..].join("\n"),
+    )
+}
+
+/// The lines that stay on show, measured so the text under them takes only the height left.
+fn pinned_target(target: SharedString, height: Rc<Cell<Pixels>>) -> impl IntoElement {
+    div()
+        .id("confirm-target")
+        .relative()
+        .flex_none()
+        .mb_2()
+        .child(target)
+        .child(
+            canvas(
+                move |bounds, window, _| {
+                    if height.replace(bounds.size.height) != bounds.size.height {
+                        window.on_next_frame(|window, _| window.refresh());
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .test_support()
+}
+
+/// Where `key` moves a text scrolled to `y` (zero or negative) of at most `max`, showing `page`
+/// at a time; `None` for any other key.
+fn scrolled_to(key: &Keystroke, y: f32, max: f32, page: f32) -> Option<f32> {
+    if key.modifiers.modified() {
+        return None;
+    }
+    let to = match key.key.as_str() {
+        "up" => y + SCROLL_LINE,
+        "down" => y - SCROLL_LINE,
+        "pageup" => y + page,
+        "pagedown" => y - page,
+        "home" => 0.,
+        "end" => -max,
+        _ => return None,
+    };
+    Some(to.clamp(-max, 0.))
+}
+
+fn scroll_by_key(scroll: &ScrollHandle, key: &Keystroke, window: &mut Window, cx: &mut App) {
+    let offset = scroll.offset();
+    let (max, page) = (scroll.max_offset().y, scroll.bounds().size.height);
+    if let Some(y) = scrolled_to(key, offset.y.into(), max.into(), page.into()) {
+        scroll.set_offset(point(offset.x, px(y)));
+        window.refresh();
+        cx.stop_propagation();
     }
 }
 
@@ -247,7 +381,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{DialogText, open, shown};
+    use super::{DialogText, open, scrolled_to, shown, split_pinned};
     use crate::ui::registry;
 
     fn text(title: &str) -> DialogText {
@@ -295,6 +429,34 @@ mod tests {
         let dialog = text(title);
         cx.update_window(window, |_, window, cx| open(window, cx, dialog, |_, _| {}))
             .unwrap();
+    }
+
+    // The pinned lines are the last ones; what scrolls keeps the rest, without the blank line.
+    #[test]
+    fn the_last_lines_are_pinned() {
+        let split = |pinned| split_pinned("warning\n\nContext: a\nObject: b", pinned);
+        assert_eq!(
+            split(2),
+            ("warning".to_owned(), "Context: a\nObject: b".to_owned())
+        );
+        assert_eq!(split(0).1, "");
+        assert_eq!(split(9).0, "");
+    }
+
+    // The keys move a long text within its range, and leave every other key alone.
+    #[test]
+    fn keys_scroll_a_long_text() {
+        let to = |key: &'static str, y| {
+            scrolled_to(&gpui_kit::Keystroke::parse(key).unwrap(), y, 100., 40.)
+        };
+        assert_eq!(to("down", 0.), Some(-20.));
+        assert_eq!(to("up", 0.), Some(0.));
+        assert_eq!(to("pagedown", -80.), Some(-100.));
+        assert_eq!(to("pageup", -50.), Some(-10.));
+        assert_eq!(to("home", -50.), Some(0.));
+        assert_eq!(to("end", 0.), Some(-100.));
+        assert_eq!(to("enter", 0.), None);
+        assert_eq!(to("shift-down", 0.), None);
     }
 
     // The open confirmation says what it was opened with, and nothing once it closed.

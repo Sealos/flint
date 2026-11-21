@@ -42,8 +42,8 @@ use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
 use super::palette::CommandPalette;
 use super::registry::{
-    self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi,
-    FocusFilter, HideFromAi, LockCluster, OnView, OpenObject, OpenView, RenameCluster,
+    self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, EditYaml,
+    ExposeToAi, FocusFilter, HideFromAi, LockCluster, OnView, OpenObject, OpenView, RenameCluster,
     RetryConnection, SelectCluster, SelectRow, ShowAgentActivity, ShowAllNamespaces,
     ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
     WatchAllKinds, WatchOpenViewsOnly,
@@ -239,6 +239,15 @@ pub struct Workspace {
     narrow: bool,
     /// In a narrow window, the list is in front of the open detail.
     list_in_front: bool,
+    /// A right button went down since the last draw: the row it selects stays on show, as it
+    /// hosts the context menu.
+    right_press: bool,
+    /// A right-click selected a row whose detail has not opened yet: the list stays in front
+    /// when it does.
+    menu_row_pending: bool,
+    /// What last had focus in the list or the detail with no dialog open, and the layout that
+    /// hides it: a dialog gives focus back to it, though it may have been hidden meanwhile.
+    pane_focus: Option<(WeakFocusHandle, MainPanes)>,
     /// The bottom dock. It does not change with the active cluster.
     dock: Entity<Dock>,
     /// The command palette (or the resource switcher), while it is open.
@@ -408,6 +417,9 @@ impl Workspace {
             detail: None,
             narrow: false,
             list_in_front: false,
+            right_press: false,
+            menu_row_pending: false,
+            pane_focus: None,
             dock,
             palette: None,
             _switcher: Task::ready(()),
@@ -1030,8 +1042,11 @@ impl Workspace {
         self._detail_subscriptions.clear();
     }
 
+    /// Opens `entry`'s list at the user's asking, in front of any detail in a narrow window.
     fn open_kind(&mut self, entry: &NavEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_in_front = true;
         self.show_kind(entry, true, true, window, cx);
+        cx.notify();
     }
 
     /// Opens `entry`'s list on its own (the view last open on the cluster, `FLINT_VIEW`), not
@@ -1117,6 +1132,7 @@ impl Workspace {
     ) {
         match event {
             ListEvent::Selected(None) => {
+                self.menu_row_pending = false;
                 self.clear_action_error(cx);
                 self.detail = None;
                 self._detail_subscriptions.clear();
@@ -1997,6 +2013,11 @@ impl Workspace {
 
     /// Brings the list in front of the detail, which stays open with its selection.
     fn back_to_list(&mut self, _: &BackToList, window: &mut Window, cx: &mut Context<Self>) {
+        // A key reaches this without the registry's guard.
+        if self.main_panes(cx) != MainPanes::DetailAlone {
+            cx.propagate();
+            return;
+        }
         self.list_in_front = true;
         if let Some(list) = &self.list {
             let focus = list.read(cx).focus_handle().clone();
@@ -2016,7 +2037,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.narrow = too_narrow_for_split(window_width);
-        if !self.narrow || self.detail.is_none() {
+        self.right_press = false;
+        if self.detail.is_some() {
+            self.menu_row_pending = false;
+        }
+        if !self.narrow || (self.detail.is_none() && !self.menu_row_pending) {
             self.list_in_front = false;
         }
         let (Some(list), Some(detail)) = (&self.list, &self.detail) else {
@@ -2024,12 +2049,35 @@ impl Workspace {
         };
         let list = list.read(cx).focus_handle().clone();
         let detail = detail.read(cx).focus_handle().clone();
-        let (hidden, shown) = match self.main_panes(cx) {
+        let dialog = gpui_kit::component::WindowExt::has_active_dialog(window, cx);
+        if !dialog {
+            let hidden_in = if list.contains_focused(window, cx) {
+                Some(MainPanes::DetailAlone)
+            } else if detail.contains_focused(window, cx) {
+                Some(MainPanes::ListAlone)
+            } else {
+                None
+            };
+            if let (Some(hidden_in), Some(focused)) = (hidden_in, window.focused(cx)) {
+                self.pane_focus = Some((focused.downgrade(), hidden_in));
+            }
+        }
+        let panes = self.main_panes(cx);
+        let (hidden, shown) = match panes {
             MainPanes::Split => return,
             MainPanes::DetailAlone => (list, detail),
             MainPanes::ListAlone => (detail, list),
         };
-        if hidden.contains_focused(window, cx) {
+        // A dialog gave focus back to a control of a pane hidden while it was open: no longer
+        // drawn, it is not found inside the pane.
+        let restored_hidden = !dialog
+            && self
+                .pane_focus
+                .as_ref()
+                .is_some_and(|(focused, hidden_in)| {
+                    *hidden_in == panes && focused.upgrade().is_some_and(|f| f.is_focused(window))
+                });
+        if hidden.contains_focused(window, cx) || restored_hidden {
             // After this draw: a focus change during one schedules no frame.
             window.defer(cx, move |window, cx| {
                 window.focus(&shown, cx);
@@ -2736,9 +2784,18 @@ impl Render for Workspace {
             .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
             // Captured, as the list reports no change for the row already selected: asking for
-            // a row or object shows the detail, and asking for the filter shows the list.
-            .capture_action(cx.listener(|this, _: &SelectRow, _, _| this.list_in_front = false))
+            // a row or object shows the detail, and asking for the filter shows the list. A
+            // right-click selects its row without leaving it: the row hosts the context menu.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
+                this.right_press = event.button == MouseButton::Right;
+            }))
+            .capture_action(cx.listener(|this, _: &SelectRow, _, _| {
+                let right_click = std::mem::take(&mut this.right_press);
+                this.list_in_front = right_click;
+                this.menu_row_pending = right_click;
+            }))
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| this.list_in_front = false))
+            .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
             .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
             .child(
                 // The fallback focus target: zero-sized, so no click lands on it.
