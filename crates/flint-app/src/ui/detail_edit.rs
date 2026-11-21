@@ -29,6 +29,7 @@ pub(super) enum Phase {
     Conflict,
 }
 
+#[cfg(any(test, feature = "automation"))]
 impl Phase {
     pub(super) fn name(&self) -> &'static str {
         match self {
