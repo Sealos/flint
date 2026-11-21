@@ -562,6 +562,24 @@ impl State {
         }
     }
 
+    /// Whether a metrics list with `query` returns `namespace`/`name`, in a Table or plain. A
+    /// target with no row yet is judged by its name and namespace, all it will have.
+    pub(crate) fn metrics_selected(
+        &self,
+        gvr: &Gvr,
+        namespace: Option<&str>,
+        name: &str,
+        query: &Query,
+        table: bool,
+    ) -> bool {
+        let object = match self.row(gvr, namespace, name) {
+            Some(row) if table => row.as_json()["object"].clone(),
+            Some(row) => self.object_of(gvr, &row),
+            None => json!({"metadata": {"name": name, "namespace": namespace}}),
+        };
+        matches(&object, None, query)
+    }
+
     /// A Table list.
     pub fn list_table(
         &self,

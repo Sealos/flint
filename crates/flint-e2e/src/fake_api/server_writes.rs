@@ -45,6 +45,31 @@ pub(super) async fn read(req: Request<Incoming>) -> Result<WriteRequest, ApiErro
     })
 }
 
+/// The `DeleteOptions` a delete or an eviction carries in its body.
+pub(super) fn delete_options<'a>(
+    method: &Method,
+    route: &Route,
+    body: &'a Value,
+) -> Option<&'a Value> {
+    match route {
+        Route::Object { .. } if method == Method::DELETE => Some(body),
+        Route::Subresource {
+            gvr, subresource, ..
+        } if method == Method::POST && *gvr == Gvr::core("pods") && subresource == "eviction" => {
+            body.get("deleteOptions")
+        }
+        _ => None,
+    }
+}
+
+/// Whether `DeleteOptions` ask for a dry run: `"dryRun": ["All"]`.
+pub(super) fn asks_dry_run(options: &Value) -> bool {
+    options
+        .get("dryRun")
+        .and_then(Value::as_array)
+        .is_some_and(|stages| stages.iter().any(|stage| stage == "All"))
+}
+
 /// Whether this server applies this write.
 pub(super) fn handles(inner: &Inner, method: &Method, route: &Route) -> bool {
     match route {
@@ -103,11 +128,13 @@ pub(super) fn serve(
         let content_type = write.content_type.as_str();
         return patch(inner, gvr, namespace, name, content_type, &body, dry_run);
     }
-    let (options, code) = if write.method == Method::POST {
-        (body.get("deleteOptions").unwrap_or(&Value::Null), 201)
+    let options = delete_options(&write.method, route, &body).unwrap_or(&Value::Null);
+    let code = if write.method == Method::POST {
+        201
     } else {
-        (&body, 200)
+        200
     };
+    let dry_run = dry_run || asks_dry_run(options);
     remove(inner, gvr, namespace, name, options, dry_run)?;
     Ok(json_with(
         code,
@@ -126,6 +153,13 @@ fn create(
     dry_run: bool,
 ) -> Result<Response<Body>, ApiError> {
     let resource = known(inner, gvr, namespace)?;
+    if resource.namespaced && namespace.is_none() {
+        return Err(ApiError::new(
+            405,
+            "MethodNotAllowed",
+            format!("{} are created in a namespace", gvr.resource),
+        ));
+    }
     if !resource.supports("create") {
         return Err(ApiError::new(
             405,
@@ -256,6 +290,10 @@ fn patch(
         }
         merge(&mut object, body);
     }
+    // Checked first, so a dry run refuses what the write would, and a refusal moves no version.
+    state
+        .row_for_object(gvr, &mut object, &[])
+        .map_err(|e| ApiError::new(400, "BadRequest", e))?;
     if dry_run {
         drop(state);
         return Ok(rebased(inner, object));

@@ -142,9 +142,13 @@ impl WriteRecord {
         Query::parse(Some(&self.query))
     }
 
-    /// Whether it was sent with `dryRun=All`.
+    /// Whether it was sent with `dryRun=All`, in the query or in its delete options.
     pub fn is_dry_run(&self) -> bool {
         self.parsed_query().dry_run
+            || self.json().is_some_and(|body| {
+                writes::delete_options(&self.method, &Route::parse(&self.path), &body)
+                    .is_some_and(writes::asks_dry_run)
+            })
     }
 
     /// The body as JSON, if it is.
@@ -784,6 +788,8 @@ async fn handle(
     let _in_flight = InFlight::enter(&inner);
     let upgrade = remote::is_websocket_upgrade(req.headers());
     let is_write = writes::is_write(req.method(), &route, upgrade);
+    // Before the body is awaited: a slow upload keeps its place for a counted fault.
+    let effect = lock(&inner.faults).take(verb, &route, upgrade, is_write);
     let mut write_index = None;
     let call = if is_write {
         let write = writes::read(req).await;
@@ -794,7 +800,6 @@ async fn handle(
     } else {
         Call::Read(req)
     };
-    let effect = lock(&inner.faults).take(verb, &route, upgrade, is_write);
     let response = match effect {
         Some(Effect::DropConnection) => {
             lock(&inner.requests).push(record);
@@ -1029,9 +1034,6 @@ fn respond(
             "the fake API server is read-only",
         ));
     }
-    if matches!(verb, Verb::List | Verb::Get) {
-        metrics::advance(inner, route);
-    }
     let fixtures = &inner.fixtures;
     let table_for =
         |gvr: &Gvr| accept.contains("as=Table") && !inner.options.plain_only.contains(gvr);
@@ -1087,8 +1089,13 @@ fn respond(
                         "sendInitialEvents: Forbidden: sendInitialEvents is forbidden for list",
                     ))
                 } else {
-                    let state = lock(&inner.state);
-                    let body = if table_for(gvr) {
+                    let table = table_for(gvr);
+                    if table {
+                        State::check_table_fields(query)?;
+                    }
+                    let mut state = lock(&inner.state);
+                    metrics::advance(&mut state, inner, route, query, table);
+                    let body = if table {
                         state.list_table(gvr, ns, query)
                     } else {
                         state.list_objects(gvr, ns, query)
@@ -1102,9 +1109,11 @@ fn respond(
             namespace,
             name,
         } => known(inner, gvr, namespace.as_deref()).and_then(|_| {
-            let state = lock(&inner.state);
+            let table = table_for(gvr);
+            let mut state = lock(&inner.state);
+            metrics::advance(&mut state, inner, route, &Query::default(), table);
             let ns = namespace.as_deref();
-            let body = if table_for(gvr) {
+            let body = if table {
                 state.table_object(gvr, ns, name)
             } else {
                 state.object(gvr, ns, name)

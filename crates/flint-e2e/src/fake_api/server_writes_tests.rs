@@ -1,6 +1,11 @@
 //! Writes over real HTTPS: what is recorded, created, dry-run and refused.
 
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Pod;
+use kube::Api;
+use kube::api::{DeleteParams, EvictParams};
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::*;
 
@@ -114,7 +119,7 @@ async fn every_write_is_recorded_with_its_exact_body_and_answer() {
 }
 
 #[tokio::test]
-async fn a_dropped_or_delayed_write_is_recorded_unanswered() {
+async fn a_dropped_write_is_recorded_unanswered() {
     let server = FakeApiServer::start().await.unwrap();
     let client = server.unrestricted_client().await.unwrap();
     server.inject(Fault::drop_connection().verb(Verb::Other).times(1));
@@ -125,28 +130,182 @@ async fn a_dropped_or_delayed_write_is_recorded_unanswered() {
     let writes = server.writes();
     assert_eq!(writes.len(), 1);
     assert_eq!((writes[0].status, writes[0].json()), (None, Some(patch)));
+}
 
+/// The test holds the state lock, so the handler cannot answer until the test has seen the
+/// pending record. It waits on the blocking thread of the test, not on a worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_write_is_recorded_before_it_is_answered() {
+    let server = FakeApiServer::start().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     server.inject(
-        Fault::delay(Duration::from_millis(300))
+        Fault::delay(Duration::from_millis(1))
             .verb(Verb::Other)
             .times(1),
     );
     let slow = json!({"metadata": {"labels": {"c": "d"}}});
-    let (answered, seen) = tokio::join!(send(&client, Method::PATCH, WEB, MERGE, &slow), async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(write) = server.writes().get(1).cloned() {
-                    return write;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap()
+    let held = lock(&server.inner.state);
+    let answered = tokio::spawn({
+        let slow = slow.clone();
+        async move { send(&client, Method::PATCH, WEB, MERGE, &slow).await }
     });
-    answered.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let seen = loop {
+        if let Some(write) = server.writes().first().cloned() {
+            break write;
+        }
+        assert!(std::time::Instant::now() < deadline, "never recorded");
+        std::thread::yield_now();
+    };
     assert_eq!((seen.status, seen.json()), (None, Some(slow)));
-    assert_eq!(server.writes()[1].status, Some(200));
+    drop(held);
+    answered.await.unwrap().unwrap();
+    assert_eq!(server.writes()[0].status, Some(200));
+}
+
+#[tokio::test]
+async fn delete_options_in_the_body_dry_run_through_the_kube_client() {
+    let server = FakeApiServer::start().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
+    let deployments = Gvr::new("apps", "v1", "deployments");
+    let pods = Gvr::core("pods");
+    let pod = server.rows(&pods)[0].clone();
+    let namespace = pod.namespace().unwrap().to_owned();
+    let before = version(&server);
+
+    Api::<Deployment>::namespaced(client.clone(), "demo")
+        .delete("web", &DeleteParams::default().dry_run())
+        .await
+        .unwrap();
+    let evict = EvictParams {
+        delete_options: Some(DeleteParams::default().dry_run()),
+        ..EvictParams::default()
+    };
+    Api::<Pod>::namespaced(client, &namespace)
+        .evict(pod.name(), &evict)
+        .await
+        .unwrap();
+
+    assert_eq!(version(&server), before, "no version moved");
+    assert!(server.row(&deployments, Some("demo"), "web").is_some());
+    assert!(server.row(&pods, Some(&namespace), pod.name()).is_some());
+    let writes = server.writes();
+    assert_eq!(writes.len(), 2);
+    assert!(writes.iter().all(WriteRecord::is_dry_run), "{writes:?}");
+}
+
+#[tokio::test]
+async fn a_create_of_a_namespaced_resource_needs_a_namespace() {
+    let server = creating_server().await;
+    let client = server.unrestricted_client().await.unwrap();
+    let before = version(&server);
+    let mut named = configmap("nowhere");
+    named["metadata"]["namespace"] = "demo".into();
+    for body in [configmap("nowhere"), named] {
+        let refused = send(
+            &client,
+            Method::POST,
+            "/api/v1/configmaps",
+            "application/json",
+            &body,
+        )
+        .await;
+        assert_eq!(code(refused), 405);
+    }
+    assert_eq!(version(&server), before, "the state was not touched");
+    assert!(
+        server
+            .rows(&Gvr::core("configmaps"))
+            .iter()
+            .all(|row| row.name() != "nowhere")
+    );
+    // A cluster-scoped resource is still created at the cluster level.
+    let namespace = json!({"apiVersion": "v1", "kind": "Namespace",
+                           "metadata": {"name": "made-here"}});
+    send(
+        &client,
+        Method::POST,
+        "/api/v1/namespaces",
+        "application/json",
+        &namespace,
+    )
+    .await
+    .unwrap();
+    assert!(
+        server
+            .row(&Gvr::core("namespaces"), None, "made-here")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_patch_is_refused_as_the_write_would_be() {
+    let server = FakeApiServer::start().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
+    let deployments = Gvr::new("apps", "v1", "deployments");
+    let stored = server.object(&deployments, Some("demo"), "web").unwrap();
+    let before = version(&server);
+    let unnamed = json!({"metadata": {"name": null}});
+    for path in [format!("{WEB}?dryRun=All"), WEB.to_owned()] {
+        let refused = send(&client, Method::PATCH, &path, MERGE, &unnamed).await;
+        assert_eq!(code(refused), 400, "{path}");
+        assert_eq!(version(&server), before, "{path} moved the version");
+    }
+    let after = server.object(&deployments, Some("demo"), "web").unwrap();
+    assert_eq!(after, stored);
+}
+
+/// The first write's headers arrive and its body is held back while a second write runs. On the
+/// test's single thread, `handle` has run up to the body read once its arrival is logged.
+#[tokio::test]
+async fn a_write_still_uploading_keeps_the_counted_fault_it_arrived_for() {
+    let server = FakeApiServer::start().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
+    let deployments = Gvr::new("apps", "v1", "deployments");
+    server.inject(Fault::conflict().on(&deployments).named("web").times(1));
+
+    let (mut far, near) = tokio::io::duplex(4096);
+    let inner = server.inner.clone();
+    tokio::spawn(async move {
+        let service = service_fn(move |req| handle(inner.clone(), req, 0));
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(near), service)
+            .await
+    });
+    let first = json!({"metadata": {"labels": {"first": "yes"}}}).to_string();
+    let head = format!(
+        "PATCH {WEB} HTTP/1.1\r\nhost: fake\r\nconnection: close\r\n\
+         content-type: {MERGE}\r\ncontent-length: {}\r\n\r\n",
+        first.len()
+    );
+    far.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !lock(&server.inner.arrivals)
+            .iter()
+            .any(|r| r.connection == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let second = json!({"metadata": {"labels": {"second": "yes"}}});
+    send(&client, Method::PATCH, WEB, MERGE, &second)
+        .await
+        .unwrap();
+    far.write_all(first.as_bytes()).await.unwrap();
+    let mut answer = String::new();
+    far.read_to_string(&mut answer).await.unwrap();
+    assert!(answer.starts_with("HTTP/1.1 409"), "{answer}");
+
+    let web = server.object(&deployments, Some("demo"), "web").unwrap();
+    assert_eq!(web["metadata"]["labels"]["second"], "yes");
+    assert!(web["metadata"]["labels"].get("first").is_none());
+    let writes = server.writes();
+    assert_eq!(writes[0].status, Some(200));
+    assert_eq!(writes[1].status, Some(409));
+    assert_eq!(writes[1].body, first.as_bytes());
 }
 
 #[tokio::test]
