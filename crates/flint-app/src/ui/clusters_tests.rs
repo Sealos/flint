@@ -77,7 +77,7 @@ async fn the_sidebar_lists_every_context_once_without_connecting(cx: &mut TestAp
 
     // The ARN's row: its short name, and the full context, server and state in the tooltip.
     let row = t.find(cx, format!("cluster-{EKS}")).unwrap();
-    assert_eq!(row.label(), Some("cluster/payments-prod"));
+    assert_eq!(row.label(), Some("payments-prod"));
     let tip = row.description().unwrap();
     assert!(
         tip.starts_with(&format!("{EKS}\nhttps://127.0.0.1:9\nNot connected\n")),

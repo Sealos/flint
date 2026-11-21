@@ -39,6 +39,11 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - **When** I open Flint.
 - **Then** the sidebar lists every context once, with the first definition winning across files. Long EKS ARNs show a short
   name, with the full context in a tooltip. **No network request is made.**
+- A cluster can have a custom name (right-click it, or Rename Cluster… in the palette), kept in `settings.toml` by context
+  name; kubeconfig is never written (UP-90). The row's second line still starts with the real name, the tooltip has the
+  full context and server, and an unlock or trust confirmation names both. A name that reads like another context's name
+  or short name, or another custom name, is not used. Shell tab chips, MCP, `FLINT_CLUSTER`, exposure and trust keep the
+  context name.
 - Tests: unit (merge, dedupe), ui.
 
 ### UP-02 Launch with no usable kubeconfig
