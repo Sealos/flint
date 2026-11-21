@@ -97,6 +97,17 @@ fn open_sized(
     label: &'static str,
     width: f32,
 ) -> (AnyWindowHandle, Entity<ResourceList>) {
+    open_kind(cx, core, "pods", label, width)
+}
+
+/// A list of the core kind `plural` titled `label`, in a window `width` wide.
+fn open_kind(
+    cx: &mut TestAppContext,
+    core: CoreHandle,
+    plural: &'static str,
+    label: &'static str,
+    width: f32,
+) -> (AnyWindowHandle, Entity<ResourceList>) {
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -115,7 +126,7 @@ fn open_sized(
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    let entry = crate::ui::support_tests::entry("", "pods", "Pod", label, true);
+                    let entry = crate::ui::support_tests::entry("", plural, "Pod", label, true);
                     let mut list = ResourceList::new(
                         core,
                         "test".into(),
@@ -314,6 +325,125 @@ async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
         names.iter().all(|n| n.contains('…')),
         "names are not cut: {names:?}"
     );
+}
+
+/// The texts painted in the window's last frame.
+fn painted_texts(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> {
+    cx.update_window(window, |_, window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .map(|t| t.text().to_owned())
+            .collect()
+    })
+    .unwrap()
+}
+
+/// Moves the pointer over `row`'s cell in `column` (cells line up with their headers), lets a
+/// tooltip's delay pass, and returns the text of the tooltips built meanwhile.
+fn hover_cell(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    row: &str,
+    column: &str,
+) -> Vec<String> {
+    super::CELL_TOOLTIPS.with_borrow_mut(Vec::clear);
+    let (row, header) = (format!("row-{row}"), format!("sort-{column}"));
+    cx.update_window(window, |_, window, cx| {
+        let row = window.find(row).bounds();
+        let header = window.find(header).bounds();
+        let at = Point::new(
+            header.origin.x + header.size.width / 2.,
+            row.origin.y + row.size.height / 2.,
+        );
+        window.simulate_mouse_move(at, cx);
+    })
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    super::CELL_TOOLTIPS.with_borrow(Clone::clone)
+}
+
+// covers UP-20: a Secret list shows only identity columns; a printer column added by an
+// extension could hold a value, so it is masked.
+#[gpui_kit::test]
+async fn a_secret_list_masks_its_non_safe_columns(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_kind(cx, core, "secrets", "Secrets", 900.);
+    let columns: Arc<[Column]> = vec![
+        column("Name", ColumnRole::Name, ColumnType::String, 0),
+        column("Type", ColumnRole::Value, ColumnType::String, 0),
+        column("Token", ColumnRole::Value, ColumnType::String, 0),
+    ]
+    .into();
+    let row = Arc::new(Row {
+        uid: "uid-creds".into(),
+        name: "creds".into(),
+        namespace: Some("demo".into()),
+        resource_version: "1".into(),
+        generation: None,
+        created: Some(0),
+        labels: Box::new([]),
+        cells: Box::new([
+            Cell::Name,
+            Cell::Text("Opaque".into()),
+            Cell::Text("printed-value".into()),
+        ]),
+    });
+    let snapshot = Arc::new(KindSnapshot {
+        cluster: "test".into(),
+        kind: KindId::new("", "secrets"),
+        namespaced: true,
+        columns,
+        rows: vec![row],
+        state: SyncState::Synced,
+        version: 1,
+        ..Default::default()
+    });
+    list.update(cx, |list, cx| list.set_snapshot(snapshot, cx));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-creds").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    let texts = painted_texts(cx, window);
+    assert!(texts.iter().any(|t| t == "creds"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "Opaque"), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t == crate::ui::object::MASK),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("printed-value")),
+        "{texts:?}"
+    );
+}
+
+// covers UP-23: a cell that is cut offers its full text in a tooltip; one that fits has none.
+#[gpui_kit::test]
+async fn a_cut_cell_has_a_tooltip_and_a_fitting_cell_has_none(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let name = "podinfo-frontend-canary-7b9c8d5f4-abcde";
+    let row = format!("uid-{name}");
+    let (window, list) = open_sized(cx, core, "Pods", 360.);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[("demo", name, 0)], SyncState::Synced, 1), cx)
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Restarts").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    let painted = painted_texts(cx, window);
+    assert!(!painted.iter().any(|t| t == name), "not cut: {painted:?}");
+    let fitting = hover_cell(cx, window, &row, "Restarts");
+    assert!(
+        fitting.is_empty(),
+        "a fitting cell has a tooltip: {fitting:?}"
+    );
+    let cut = hover_cell(cx, window, &row, "Name");
+    assert_eq!(cut.last().map(String::as_str), Some(name), "{cut:?}");
 }
 
 // covers UP-20, UP-21
