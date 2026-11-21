@@ -42,8 +42,9 @@ pub fn is_safe_secret_column(columns: &[Column], index: usize) -> bool {
 }
 
 /// [`is_safe_secret_column`] for a Table's raw definitions, as `(name, format)`. Raw cells are
-/// still the server's text, even under a metadata role, so a repeated `Age` is not safe here: a
-/// caller keeps a `Name` or the first `Age` only by replacing it from the object's metadata.
+/// still the server's text, even under a metadata role, so any header that appears more than
+/// once, ignoring ASCII case, is not safe. A caller keeps a `Name` or `Age` only by replacing it
+/// from the object's metadata.
 pub fn safe_secret_wire_columns(definitions: &[(&str, &str)]) -> Vec<bool> {
     let columns: Vec<(&str, ColumnRole)> = definitions
         .iter()
@@ -53,7 +54,10 @@ pub fn safe_secret_wire_columns(definitions: &[(&str, &str)]) -> Vec<bool> {
     (0..columns.len())
         .map(|index| {
             is_safe_at(columns.len(), |i| columns[i], index)
-                && !columns[..index].contains(&columns[index])
+                && columns
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| i == index || !c.0.eq_ignore_ascii_case(columns[index].0))
         })
         .collect()
 }
@@ -348,7 +352,18 @@ mod tests {
         ];
         assert_eq!(
             safe_secret_wire_columns(&repeated),
-            [true, false, false, true, false, false, false, false, false]
+            [false; 9],
+            "every header in this table is repeated"
+        );
+        // The first `Age` has format `name`, so the two have different roles.
+        assert_eq!(
+            safe_secret_wire_columns(&[("Age", "name"), ("Age", "")]),
+            [false, false]
+        );
+        // Case does not make a header different: both of these get the Age role.
+        assert_eq!(
+            safe_secret_wire_columns(&[("Name", ""), ("Age", ""), ("age", "")]),
+            [true, false, false]
         );
         // A first column of format `name` holds the object's name, but its header is not safe.
         assert_eq!(safe_secret_wire_columns(&[("Token", "name")]), [false]);

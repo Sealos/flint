@@ -593,6 +593,30 @@ mod tests {
         normalize_age_cells(named_age.as_object_mut().unwrap());
         assert_eq!(named_age["rows"][0]["cells"], json!([CREDENTIAL_MARKER]));
 
+        // An `Age` of format `name`, then a plain `Age`: neither raw cell survives recording.
+        let mut age_as_name = json!({
+            "columnDefinitions": [{"name": "Age", "format": "name"}, {"name": "Age"}],
+            "rows": [{"cells": ["hunter2", "hunter3"]}],
+        });
+        scrub_secret_table(&mut age_as_name);
+        normalize_age_cells(age_as_name.as_object_mut().unwrap());
+        assert_eq!(
+            age_as_name["rows"][0]["cells"],
+            json!([CREDENTIAL_MARKER, CREDENTIAL_MARKER])
+        );
+
+        // A standard Secret Table is recorded unchanged.
+        let mut standard = json!({
+            "columnDefinitions": [
+                {"name": "Name", "format": "name"}, {"name": "Type"}, {"name": "Data"},
+                {"name": "Age"},
+            ],
+            "rows": [{"cells": ["s", "Opaque", 2, "1d"], "object": {"metadata": {"name": "s"}}}],
+        });
+        let before = standard.clone();
+        scrub_secret_table(&mut standard);
+        assert_eq!(standard, before);
+
         // With no object to take the name from, the Name cell is hidden too.
         let mut no_object = json!({
             "columnDefinitions": [{"name": "Name"}],
@@ -615,7 +639,7 @@ mod tests {
         let m = CREDENTIAL_MARKER;
         assert_eq!(
             repeated["rows"][0]["cells"],
-            json!(["s", m, m, "1d", m, m, m, m, m])
+            json!([m, m, m, m, m, m, m, m, m])
         );
         assert_eq!(
             table["rows"][0]["object"]["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"],
