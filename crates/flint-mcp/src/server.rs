@@ -470,33 +470,34 @@ fn unsupported_arguments(
         .input_schema
         .get("properties")
         .and_then(Value::as_object);
-    let unsupported: Vec<&String> = arguments?
+    let mut unsupported = arguments?
         .keys()
-        .filter(|name| !accepted.is_some_and(|a| a.contains_key(name.as_str())))
-        .collect();
-    if unsupported.is_empty() {
-        return None;
-    }
-    let mut names = unsupported
-        .iter()
+        .filter(|name| !accepted.is_some_and(|a| a.contains_key(name.as_str())));
+    let named: Vec<String> = unsupported
+        .by_ref()
         .take(UNSUPPORTED_NAMED)
         .map(|name| {
+            // Whole, before it is cut: a rule can need what comes after the cut. On its own, so
+            // a rule that takes the rest of the line cannot take the accepted arguments too.
+            let mut name = name.clone();
+            policy::redact_text(&mut name);
             let short: String = name.chars().take(UNSUPPORTED_NAME_CHARS).collect();
             format!("{short:?}")
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    if unsupported.len() > UNSUPPORTED_NAMED {
-        names.push_str(&format!(
-            " and {} more",
-            unsupported.len() - UNSUPPORTED_NAMED
-        ));
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    let mut names = named.join(", ");
+    let more = unsupported.count();
+    if more > 0 {
+        names.push_str(&format!(" and {more} more"));
     }
     let accepted: Vec<&str> = accepted
         .into_iter()
         .flat_map(|a| a.keys().map(String::as_str))
         .collect();
-    let mut text = if accepted.is_empty() {
+    Some(if accepted.is_empty() {
         format!("{} takes no arguments. Unsupported: {names}.", tool.name)
     } else {
         format!(
@@ -504,10 +505,7 @@ fn unsupported_arguments(
             tool.name,
             accepted.join(", ")
         )
-    };
-    // As every reply: a client's argument name can hold anything.
-    policy::redact_text(&mut text);
-    Some(text)
+    })
 }
 
 #[tool_router]
@@ -692,10 +690,6 @@ impl ServerHandler for FlintMcp {
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
         let named = named_in(request.arguments.as_ref());
-        let unsupported = self
-            .tool_router
-            .get(&request.name)
-            .and_then(|tool| unsupported_arguments(tool, request.arguments.as_ref()));
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         // Until this handler ends, the call counts as unanswered, cancelled or not: it may
@@ -720,39 +714,43 @@ impl ServerHandler for FlintMcp {
                 CallNote::default(),
             ),
             Some(Err(busy)) => (failed(&busy.to_string()), None, CallNote::default()),
-            Some(Ok(turn)) if unsupported.is_some() => {
-                drop(turn);
-                let text = unsupported.unwrap_or_default();
-                (failed(&text), None, CallNote::default())
-            }
             Some(Ok(turn)) => {
-                let call =
-                    rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-                CALL.scope(std::cell::RefCell::default(), async {
-                    // Dropping the call's future ends its Kubernetes requests.
-                    let (result, finished) = tokio::select! {
-                        result = self.tool_router.call(call) => (result, true),
-                        () = cancelled.cancelled() => {
-                            (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
-                        }
-                        () = tokio::time::sleep(deadline) => {
-                            let server = CALL.with(|c| c.borrow().server.clone());
-                            let mut text =
-                                ClusterError::timeout(deadline, server.as_deref()).for_agent();
-                            // As every reply: a server URL's path can hold anything.
-                            policy::redact_text(&mut text);
-                            (failed(&text), false)
-                        }
-                    };
+                let refused = self
+                    .tool_router
+                    .get(&request.name)
+                    .and_then(|tool| unsupported_arguments(tool, request.arguments.as_ref()));
+                if let Some(text) = refused {
                     drop(turn);
-                    let (record, note) = CALL.with(|c| {
-                        let mut c = c.borrow_mut();
-                        let record = c.record.take().filter(|_| finished);
-                        (record, std::mem::take(&mut *c))
-                    });
-                    (result, record, note)
-                })
-                .await
+                    (failed(&text), None, CallNote::default())
+                } else {
+                    let call =
+                        rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                    CALL.scope(std::cell::RefCell::default(), async {
+                        // Dropping the call's future ends its Kubernetes requests.
+                        let (result, finished) = tokio::select! {
+                            result = self.tool_router.call(call) => (result, true),
+                            () = cancelled.cancelled() => {
+                                (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
+                            }
+                            () = tokio::time::sleep(deadline) => {
+                                let server = CALL.with(|c| c.borrow().server.clone());
+                                let mut text =
+                                    ClusterError::timeout(deadline, server.as_deref()).for_agent();
+                                // As every reply: a server URL's path can hold anything.
+                                policy::redact_text(&mut text);
+                                (failed(&text), false)
+                            }
+                        };
+                        drop(turn);
+                        let (record, note) = CALL.with(|c| {
+                            let mut c = c.borrow_mut();
+                            let record = c.record.take().filter(|_| finished);
+                            (record, std::mem::take(&mut *c))
+                        });
+                        (result, record, note)
+                    })
+                    .await
+                }
             }
         };
         let (record, reached) = record.unwrap_or_else(|| {
@@ -1833,6 +1831,19 @@ mod tests {
         let line = arguments(json!({"a\nb": 1}));
         let text = unsupported_arguments(tool, Some(&line)).unwrap();
         assert!(!text.contains('\n'), "{text}");
+
+        // A password whose closing `@` lies past the cut is still recognized.
+        let url = format!("https://user:{}@example.com", "p".repeat(100));
+        let text = unsupported_arguments(tool, Some(&arguments(json!({ url: 1 })))).unwrap();
+        assert!(!text.contains("ppp"), "{text}");
+
+        // A rule that takes the rest of the line leaves the accepted arguments in place.
+        let list = server.tool_router.get("list_resources").unwrap();
+        let header = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345";
+        let text = unsupported_arguments(list, Some(&arguments(json!({ header: 1 })))).unwrap();
+        assert!(!text.contains("abcdefghijkl"), "{text}");
+        assert!(text.contains("Accepted arguments:"), "{text}");
+        assert!(text.contains("label_selector"), "{text}");
 
         let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
         let text = unsupported_arguments(tool, Some(&arguments(json!({ token: 1 })))).unwrap();
