@@ -105,7 +105,11 @@ impl ResourceList {
             SyncState::Idle | SyncState::Loading if snapshot.rows.is_empty() => Some("loading"),
             SyncState::Unavailable => Some("unavailable"),
             SyncState::Failed { .. } if snapshot.rows.is_empty() => Some("failed"),
-            SyncState::Reconnecting { .. } if snapshot.rows.is_empty() => Some("reconnecting"),
+            SyncState::Reconnecting { .. } | SyncState::RetryingRefusal { .. }
+                if snapshot.rows.is_empty() =>
+            {
+                Some("reconnecting")
+            }
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (snapshot.namespaced && !self.query.namespaces.is_empty());
@@ -139,13 +143,13 @@ impl ResourceList {
             ));
         }
         let state = match &snapshot.state {
-            SyncState::Reconnecting { error } => Some((
-                Level::Warning,
-                match error {
-                    Some(e) => format!("Reconnecting: {}", error_text(e)),
-                    None => "Reconnecting".to_owned(),
-                },
-            )),
+            SyncState::Reconnecting { error: Some(e) }
+            | SyncState::RetryingRefusal { error: e } => {
+                Some((Level::Warning, format!("Reconnecting: {}", error_text(e))))
+            }
+            SyncState::Reconnecting { error: None } => {
+                Some((Level::Warning, "Reconnecting".to_owned()))
+            }
             SyncState::Failed { error } if !snapshot.rows.is_empty() => {
                 Some((Level::Danger, format!("Failed: {}", error_text(error))))
             }
