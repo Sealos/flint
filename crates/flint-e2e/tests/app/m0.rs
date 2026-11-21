@@ -275,7 +275,7 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
     // A context is added (written in two steps, as a slow writer does): fake-b appears, and
     // fake-a never disappears on the way.
     let half = &both[..both.len() / 2];
-    app.edit_kubeconfig(|| {
+    app.edit_kubeconfig([&kubeconfig], || {
         std::fs::write(&kubeconfig, half)?;
         std::thread::sleep(Duration::from_millis(30));
         Ok(std::fs::write(&kubeconfig, &both)?)
@@ -300,7 +300,7 @@ fn up_06_kubeconfig_changes_on_disk() -> Result<()> {
     }
 
     // The active cluster is removed: it is deselected, with a notice.
-    app.edit_kubeconfig(|| {
+    app.edit_kubeconfig([&kubeconfig], || {
         flint_e2e::fake_api::write_kubeconfigs(&kubeconfig, &[(&two.b, TwoClusters::B, None)])
     })?;
     let state = app.wait_for("/active_cluster", Equals(Value::Null))?;
