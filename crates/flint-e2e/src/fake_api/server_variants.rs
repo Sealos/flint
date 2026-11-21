@@ -136,10 +136,10 @@ pub(super) fn openapi_document(fixtures: &Fixtures, hidden: &[Gvr], path: &str) 
         if let ["watch", tail @ ..] = rest {
             rest = tail;
         }
-        if let ["namespaces", "{namespace}", tail @ ..] = rest {
-            if !tail.is_empty() {
-                rest = tail;
-            }
+        if let ["namespaces", "{namespace}", tail @ ..] = rest
+            && !tail.is_empty()
+        {
+            rest = tail;
         }
         !rest.first().is_some_and(|r| hidden_plurals.contains(r))
     });
@@ -171,10 +171,10 @@ fn prune_schemas(document: &mut Value) {
     refs(&document["paths"], &mut pending);
     let mut keep = std::collections::BTreeSet::new();
     while let Some(name) = pending.pop() {
-        if keep.insert(name.clone()) {
-            if let Some(schema) = document.pointer(&format!("/components/schemas/{name}")) {
-                refs(schema, &mut pending);
-            }
+        if keep.insert(name.clone())
+            && let Some(schema) = document.pointer(&format!("/components/schemas/{name}"))
+        {
+            refs(schema, &mut pending);
         }
     }
     if let Some(schemas) = document
