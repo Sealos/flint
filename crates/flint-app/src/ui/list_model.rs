@@ -120,10 +120,10 @@ const AGE_CHARS: usize = 7;
 const SAMPLE_ROWS: usize = 2_000;
 
 /// Each column's width in characters: the longest of its header and the cells of the sampled
-/// `rows` (indexes into `snapshot.rows`: the rows passing the filters, so a namespace filter
-/// leaves out the widths of rows it hides), within limits. The name column is measured up to
-/// the longest name. A Secret's masked column is as wide as the mask, whatever its value. Runs
-/// on a background thread; it is the only per-row work outside `compute_view`.
+/// `rows` (indexes into `snapshot.rows`: [`rows_to_measure`], so a namespace filter leaves out
+/// the widths of rows it hides and a text filter moves nothing), within limits. The name column
+/// is measured up to the longest name. A Secret's masked column is as wide as the mask, whatever
+/// its value. Runs on a background thread; it is the only per-row work outside `compute_view`.
 pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<usize> {
     let step = (rows.len() / SAMPLE_ROWS).max(1);
     // Sampled in snapshot order, not display order: a sort must not change which rows are
@@ -167,6 +167,21 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
             cells.max(header).clamp(MIN_CHARS, max)
         })
         .collect()
+}
+
+/// The rows that set the column widths, in snapshot order: those in `namespaces` (all of them
+/// when the filter is empty or the kind is cluster-scoped), whatever the text filter hides.
+pub fn rows_to_measure(snapshot: &KindSnapshot, namespaces: &[String]) -> Vec<u32> {
+    if namespaces.is_empty() || !snapshot.namespaced {
+        return (0..snapshot.rows.len() as u32).collect();
+    }
+    let mut ranges: Vec<_> = namespaces
+        .iter()
+        .map(|namespace| snapshot.namespace_range(namespace))
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    ranges.dedup();
+    ranges.into_iter().flatten().map(|row| row as u32).collect()
 }
 
 /// How many rows of `snapshot` are in `namespaces` (all of them when the filter is empty or the
@@ -228,7 +243,7 @@ pub struct ColumnWidths {
 
 impl ColumnWidths {
     /// Folds a measurement of `columns` in. `restart` drops the widths so far, for when other
-    /// rows are shown (a filter changed), so columns fit the rows now shown.
+    /// rows are measured (the namespace filter changed), so columns fit them.
     pub fn update(&mut self, columns: &Arc<[Column]>, measured: &[usize], restart: bool) {
         let same = self
             .columns
@@ -811,9 +826,9 @@ mod tests {
         );
         assert_eq!(widths.wanted(1, &columns[1]), 11);
 
-        // Only the rows shown are measured: "a" alone is narrower than the "Name" header.
+        // Only the rows given are measured: "a" alone is narrower than the "Name" header.
         assert_eq!(measure_columns(&snapshot, &[0], 10)[0], 6);
-        // A restart (another filter) lets columns shrink to the rows now shown.
+        // A restart (another namespace) lets columns shrink to the rows now measured.
         widths.update(&columns, &[6, 11, 5], true);
         assert_eq!(widths.chars(2, &columns[2]), 5);
 
