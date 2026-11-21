@@ -137,9 +137,15 @@ fn evicts_managed_text(pods: &[String]) -> String {
     )
 }
 
-/// What a warning says.
-fn warning_text(warning: &WriteWarning) -> String {
+/// What a warning about a change to `target` says. A review reads the live object, so for a
+/// Secret it does not name the manager: the detail view and MCP show no annotation value of one.
+fn warning_text(target: &WriteTarget, warning: &WriteWarning) -> String {
     match warning {
+        WriteWarning::LikelyReverted(_)
+            if flint_core::redact::is_secret_list(target.kind.as_str()) =>
+        {
+            "Managed by GitOps. This change will likely be reverted on the next sync.".to_owned()
+        }
         WriteWarning::LikelyReverted(managed) => {
             format!("Managed by {managed}. This change will likely be reverted on the next sync.")
         }
@@ -176,7 +182,10 @@ fn dialog_text_saying(
     saying: &[String],
     shown: &str,
 ) -> DialogText {
-    let mut lines: Vec<String> = warnings.iter().map(warning_text).collect();
+    let mut lines: Vec<String> = warnings
+        .iter()
+        .map(|warning| warning_text(target, warning))
+        .collect();
     if !lines.is_empty() {
         lines.push(String::new());
     }
@@ -456,12 +465,40 @@ mod tests {
         };
         let warning = WriteWarning::LikelyReverted(managed);
         assert_eq!(
-            warning_text(&warning),
+            warning_text(&target(), &warning),
             "Managed by Flux: flux-system/apps. This change will likely be reverted on the next \
              sync."
         );
         let text = dialog_text(&target(), APPLY, &[warning], "prod").text;
         assert!(text.starts_with("Managed by Flux"), "{text}");
         assert!(text.contains("\n\nContext: "), "{text}");
+    }
+
+    // covers UP-51: a Secret's warning stays, in words that name no manager. A custom kind also
+    // called `secrets` is not a Secret.
+    #[test]
+    fn a_secret_warning_names_no_manager() {
+        let warning = WriteWarning::LikelyReverted(ManagedBy {
+            manager: Manager::ArgoCd,
+            name: "marker-value".to_owned(),
+            namespace: None,
+        });
+        let secret = WriteTarget {
+            kind: KindId::new("", "secrets"),
+            ..target()
+        };
+        let text = dialog_text(&secret, APPLY, std::slice::from_ref(&warning), "prod").text;
+        assert!(
+            text.starts_with(
+                "Managed by GitOps. This change will likely be reverted on the next sync."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("marker-value"), "{text}");
+        let custom = WriteTarget {
+            kind: KindId::new("example.com", "secrets"),
+            ..target()
+        };
+        assert!(warning_text(&custom, &warning).contains("marker-value"));
     }
 }
