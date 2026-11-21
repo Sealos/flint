@@ -9,6 +9,10 @@ const ARGO_INSTANCE: &str = "argocd.argoproj.io/instance";
 const APP_INSTANCE: &str = "app.kubernetes.io/instance";
 /// What names an Argo CD application whose name cannot be read from its tracking id.
 const UNNAMED_APP: &str = "unknown application";
+/// What names a Flux Kustomization whose name cannot be read.
+const UNNAMED_KUSTOMIZATION: &str = "unknown kustomization";
+/// What names a Flux HelmRelease whose name cannot be read.
+const UNNAMED_RELEASE: &str = "unknown release";
 const FLUX_KUSTOMIZE: (&str, &str) = (
     "kustomize.toolkit.fluxcd.io/name",
     "kustomize.toolkit.fluxcd.io/namespace",
@@ -146,7 +150,8 @@ pub fn managed_by<'a>(
 }
 
 /// [`managed_by`] for an object as the API server returned it. Nothing has masked such an object,
-/// so an id that looks masked is an unreadable one.
+/// so an id that looks masked is an unreadable one, and any other marker that is present but
+/// cannot be read still counts, as an unknown manager.
 pub(crate) fn managed_by_live<'a>(
     object: &Identity<'_>,
     read: impl Fn(&str) -> Option<&'a str>,
@@ -155,7 +160,33 @@ pub(crate) fn managed_by_live<'a>(
         Tracking::Masked => Tracking::Unreadable,
         other => other,
     });
-    manager_from(tracked, read)
+    manager_from(tracked, &read).or_else(|| unreadable_marker(&read))
+}
+
+/// The manager a present marker points to when none could be named. The common instance label
+/// is not a marker: alone it says nothing.
+fn unreadable_marker<'a>(read: &impl Fn(&str) -> Option<&'a str>) -> Option<ManagedBy> {
+    let unnamed = |manager, name: &str| ManagedBy {
+        manager,
+        name: name.to_owned(),
+        namespace: None,
+    };
+    if read(ARGO_INSTANCE).is_some() {
+        return Some(unnamed(Manager::ArgoCd, UNNAMED_APP));
+    }
+    [
+        (
+            Manager::FluxKustomization,
+            FLUX_KUSTOMIZE,
+            UNNAMED_KUSTOMIZATION,
+        ),
+        (Manager::FluxHelmRelease, FLUX_HELM, UNNAMED_RELEASE),
+    ]
+    .into_iter()
+    .find(|(_, (name_key, namespace_key), _)| {
+        read(name_key).is_some() || read(namespace_key).is_some()
+    })
+    .map(|(manager, _, name)| unnamed(manager, name))
 }
 
 fn manager_from<'a>(
@@ -212,8 +243,22 @@ pub fn managed_by_object(object: &Value) -> Option<ManagedBy> {
 pub(crate) fn managed_by_live_object(object: &Value) -> Option<ManagedBy> {
     let metadata = object.get("metadata")?;
     managed_by_live(&Identity::of(object), |key| {
-        label_or_annotation(metadata, key)
+        live_label_or_annotation(metadata, key)
     })
+}
+
+/// A marker on a live object: an empty label gives way to an annotation of the same key, and a
+/// value that is not text is present but empty.
+fn live_label_or_annotation<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
+    let field = |map: &str| {
+        let value = metadata.get(map)?.get(key)?;
+        Some(value.as_str().unwrap_or_default())
+    };
+    let label = field("labels");
+    label
+        .filter(|value| !value.is_empty())
+        .or_else(|| field("annotations"))
+        .or(label)
 }
 
 fn label_or_annotation<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
@@ -401,6 +446,70 @@ mod tests {
         );
         let none = object(json!({}), json!({}));
         assert_eq!(managed_by_live_object(&none), None);
+    }
+
+    fn live(object: &Value) -> Option<String> {
+        managed_by_live_object(object).map(|m| m.to_string())
+    }
+
+    // covers UP-51: a marker that is present but cannot be read counts on a live object, and
+    // stays out of what is shown from a redacted one.
+    #[test]
+    fn a_live_marker_that_cannot_be_read_is_an_unknown_manager() {
+        for (key, expected) in [
+            (ARGO_INSTANCE, "Argo CD: unknown application"),
+            (FLUX_KUSTOMIZE.0, "Flux: unknown kustomization"),
+            (FLUX_KUSTOMIZE.1, "Flux: unknown kustomization"),
+            (FLUX_HELM.0, "Flux HelmRelease: unknown release"),
+            (FLUX_HELM.1, "Flux HelmRelease: unknown release"),
+        ] {
+            for value in [json!("team/shop"), json!("a b"), json!(""), json!(7)] {
+                for marked in [
+                    object(json!({key: value}), json!({})),
+                    object(json!({}), json!({key: value})),
+                ] {
+                    assert_eq!(live(&marked).as_deref(), Some(expected), "{key}: {value}");
+                    assert_eq!(shown(&marked), None, "{key}: {value}");
+                }
+            }
+        }
+    }
+
+    // covers UP-51: a readable marker still names the manager beside an unreadable one.
+    #[test]
+    fn a_readable_marker_wins_over_an_unreadable_one() {
+        let both = object(
+            json!({ARGO_INSTANCE: "team/shop", FLUX_KUSTOMIZE.0: "apps"}),
+            json!({}),
+        );
+        assert_eq!(live(&both).as_deref(), Some("Flux: apps"));
+        let helm = object(
+            json!({FLUX_KUSTOMIZE.0: "a b", FLUX_HELM.0: "web"}),
+            json!({}),
+        );
+        assert_eq!(live(&helm).as_deref(), Some("Flux HelmRelease: web"));
+    }
+
+    // covers UP-51: an empty label gives way to the annotation of the same key on a live object.
+    #[test]
+    fn an_empty_live_label_does_not_hide_an_annotation() {
+        let marked = object(json!({ARGO_INSTANCE: ""}), json!({ARGO_INSTANCE: "shop"}));
+        assert_eq!(live(&marked).as_deref(), Some("Argo CD: shop"));
+        assert_eq!(shown(&marked), None, "the shown result reads as before");
+        let tracked = object(
+            json!({ARGO_TRACKING_ID: ""}),
+            json!({ARGO_TRACKING_ID: "shop:apps/Deployment:demo/web"}),
+        );
+        assert_eq!(live(&tracked).as_deref(), Some("Argo CD: shop"));
+    }
+
+    // covers UP-23: the common instance label alone is no marker, whatever it holds.
+    #[test]
+    fn a_lone_instance_label_gives_no_live_warning() {
+        for value in ["shop", "team/shop", ""] {
+            let lone = object(json!({APP_INSTANCE: value}), json!({}));
+            assert_eq!(live(&lone), None, "{value}");
+        }
     }
 
     // covers UP-23

@@ -735,8 +735,19 @@ fn every_action(server: &FakeApiServer) -> Vec<(WriteTarget, WriteProposal, Gvr,
 
 /// Adds Flux's label to the object `target` names.
 fn add_marker(server: &FakeApiServer, gvr: &Gvr, namespace: Option<&str>, name: &str) {
+    set_labels(server, gvr, namespace, name, json!({FLUX_LABEL: "apps"}));
+}
+
+/// Replaces the labels of an object, keeping its `resourceVersion`.
+fn set_labels(
+    server: &FakeApiServer,
+    gvr: &Gvr,
+    namespace: Option<&str>,
+    name: &str,
+    labels: Value,
+) {
     let mut object = server.object(gvr, namespace, name).expect("the object");
-    object["metadata"]["labels"] = json!({FLUX_LABEL: "apps"});
+    object["metadata"]["labels"] = labels;
     server.set_object(gvr, object);
 }
 
@@ -779,6 +790,109 @@ async fn a_marker_added_after_the_review_is_a_conflict() {
         let seen = since(&server, from);
         assert_eq!(writes_in(&seen), 0, "{seen:?}");
         assert_eq!(seen[0], (http::Method::GET, path.to_owned()));
+    }
+}
+
+// covers UP-51: every action on a marked object, a node included, warns that it will likely be
+// reverted, and can still go ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_action_on_a_marked_object_warns() {
+    for action in 0..ACTIONS {
+        let server = FakeApiServer::start().await.unwrap();
+        workload(&server, 2);
+        node(&server);
+        let core = Core::start(&server, Settings::default()).await;
+        let (target, proposal, gvr, path) = every_action(&server).swap_remove(action);
+        add_marker(&server, &gvr, target.namespace.as_deref(), &target.name);
+        let review = core.handle.review_write(target, proposal).await.unwrap();
+        match review.warnings() {
+            [WriteWarning::LikelyReverted(managed)] => {
+                assert_eq!(managed.to_string(), "Flux: apps", "{path}");
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+        core.handle.run_write(review.into_intent()).await.unwrap();
+    }
+}
+
+// covers UP-51: a marker that cannot be read warns as an unknown manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_marker_warns_as_an_unknown_manager() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    set_labels(
+        &server,
+        &deployments(),
+        Some("demo"),
+        "act",
+        json!({"argocd.argoproj.io/instance": "team/shop"}),
+    );
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 3 })
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::LikelyReverted(managed)] => {
+            assert_eq!(managed.to_string(), "Argo CD: unknown application");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// covers UP-51, UP-53: a marker that appears after a YAML review changes the object, so the
+// reviewed edit ends in a conflict and the object keeps what it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_added_after_a_yaml_review_is_a_conflict() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(workload_target(&server), edit())
+        .await
+        .unwrap();
+    assert!(review.warnings().is_empty());
+    let mut changed = live(&server);
+    changed["metadata"]["labels"] = json!({FLUX_LABEL: "apps"});
+    changed["metadata"]["resourceVersion"] = json!("5002");
+    server.set_object(&deployments(), changed);
+
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    let after = live(&server);
+    assert_eq!(after["spec"]["replicas"], 2, "nothing was written");
+    assert_eq!(after["metadata"]["labels"][FLUX_LABEL], "apps");
+}
+
+// covers UP-51, UP-53: a marker removed or a manager changed after the review is a conflict for
+// every action, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_changed_after_the_review_is_a_conflict() {
+    for labels in [json!({}), json!({FLUX_LABEL: "other"})] {
+        for action in 0..ACTIONS {
+            let server = FakeApiServer::start().await.unwrap();
+            workload(&server, 2);
+            node(&server);
+            let core = Core::start(&server, Settings::default()).await;
+            let (target, proposal, gvr, path) = every_action(&server).swap_remove(action);
+            let namespace = target.namespace.clone();
+            let name = target.name.clone();
+            add_marker(&server, &gvr, namespace.as_deref(), &name);
+            let review = core.handle.review_write(target, proposal).await.unwrap();
+            assert_eq!(review.warnings().len(), 1, "{path}");
+            set_labels(&server, &gvr, namespace.as_deref(), &name, labels.clone());
+            let from = server.requests().len();
+            let result = core.handle.run_write(review.into_intent()).await;
+            assert_eq!(
+                result.unwrap_err(),
+                WriteError::Conflict,
+                "{path}: {labels}"
+            );
+            let seen = since(&server, from);
+            assert_eq!(writes_in(&seen), 0, "{seen:?}");
+        }
     }
 }
 
