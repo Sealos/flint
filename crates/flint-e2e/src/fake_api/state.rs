@@ -505,6 +505,27 @@ impl State {
         Ok(self.apply_object(gvr, "MODIFIED", object, row))
     }
 
+    /// Stores a metrics row and its object. metrics.k8s.io has no resource versions and no
+    /// watches, so this changes neither the version nor the change log.
+    pub(crate) fn put_metrics(&mut self, gvr: &Gvr, row: FakeRow, object: Value) {
+        self.objects
+            .entry(gvr.clone())
+            .or_default()
+            .insert(key_of(&object), object);
+        let table = self.tables.entry(gvr.clone()).or_insert_with(|| TableData {
+            columns: json!([]),
+            rows: Vec::new(),
+        });
+        match table
+            .rows
+            .iter_mut()
+            .find(|r| r.is(row.namespace(), row.name()))
+        {
+            Some(existing) => *existing = row,
+            None => table.rows.push(row),
+        }
+    }
+
     /// The full object held for `namespace`/`name`, if one was recorded or set (not one made
     /// from a row).
     pub fn held_object(&self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> Option<&Value> {
