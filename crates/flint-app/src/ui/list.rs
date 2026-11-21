@@ -759,7 +759,7 @@ impl ResourceList {
 
     /// The columns to draw and their widths, for a pane `available` points wide (unknown
     /// before the first layout). Wide columns that do not fit are left out, then Ready and
-    /// Namespace if Name and Status still lack room; spare width goes to the Name column first.
+    /// Namespace as [`list_model::shed_columns`] allows; spare width goes to the Name column.
     fn layout(&self, available: Option<f32>) -> (Vec<(usize, f32)>, usize) {
         let columns = &self.shown.columns;
         let width = |chars: usize| chars as f32 * CHAR_WIDTH + CELL_PADDING;
@@ -773,9 +773,19 @@ impl ResourceList {
             let name_min = width(list_model::NAME_MIN_CHARS);
             let namespace_min = width(SQUEEZED_NAMESPACE_CHARS);
             let sort = self.query.sort.as_ref();
-            list_model::shed_columns(&mut drawn, columns, room, name_min, namespace_min, |i| {
-                sort.is_some_and(|s| columns[i].key() == s.column)
-            });
+            let rules = list_model::ShedRules {
+                ready_repeats_status: list_model::ready_repeats_status(self.kind.as_str()),
+                one_namespace: self.query.namespaces.len() == 1,
+            };
+            list_model::shed_columns(
+                &mut drawn,
+                columns,
+                room,
+                name_min,
+                namespace_min,
+                rules,
+                |i| sort.is_some_and(|s| columns[i].key() == s.column),
+            );
             list_model::squeeze_identity(&mut drawn, columns, room, name_min, namespace_min);
             if let Some(name) = columns.iter().position(|c| c.role == ColumnRole::Name) {
                 let wanted = width(self.widths.wanted(name, &columns[name]));
@@ -801,6 +811,10 @@ impl ResourceList {
         let health = list_model::has_health_columns(self.kind.as_str());
         let selected_uid = self.selected.as_ref().map(|s| &*s.uid);
         let ncols = self.shown.columns.len().max(1);
+        let namespace_hidden = !self
+            .drawn
+            .iter()
+            .any(|&(col, _)| self.shown.columns[col].role == ColumnRole::Namespace);
         let mut elements = Vec::with_capacity(range.len());
         for ix in range {
             let Some(&row_ix) = self.rows.get(ix) else {
@@ -859,6 +873,13 @@ impl ResourceList {
                         ..flags
                     },
                 );
+                // With its column hidden, the Name cell is where the namespace can be read.
+                let tooltip = match row.namespace.as_deref() {
+                    Some(namespace) if namespace_hidden && column.role == ColumnRole::Name => {
+                        Some(SharedString::from(format!("{namespace}/{}", row.name)))
+                    }
+                    _ => tooltip,
+                };
                 let cell = div()
                     .id(("cell", ix * ncols + col))
                     .h_full()
