@@ -5,7 +5,7 @@
 //! The silent cluster never answers, so the core's fetch fails ("not connected"). Tests check
 //! that failure, then show an object as a finished fetch would ([`show_fetched`]).
 
-use flint_core::{KindId, ObjectDetail, SyncState};
+use flint_core::{KindId, KindSnapshot, ObjectDetail, SyncState};
 use gpui_kit::component::input::EditorState;
 use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
@@ -86,7 +86,7 @@ fn view(cx: &mut TestAppContext, t: &TestWorkspace) -> Entity<DetailView> {
     t.detail(cx).expect("the detail pane is open")
 }
 
-/// Opens `kind` on a connected `alpha` with `rows`, and selects `name` in `demo`.
+/// Opens `kind` on a connected `kind-alpha` with `rows`, and selects `name` in `demo`.
 async fn open_and_select(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -388,6 +388,239 @@ async fn banners_mark_a_stale_or_deleted_object(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx), None);
 }
 
+/// Publishes `state` for Pods on `kind-alpha` as a watch would. Keep the value while the test runs.
+fn publish_sync(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    state: SyncState,
+) -> impl Sized + use<> {
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    core.store_for_tests(KindSnapshot {
+        cluster: "kind-alpha".into(),
+        kind: KindId::pods(),
+        state,
+        ..Default::default()
+    })
+}
+
+fn stale_banner(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    view(cx, t).read_with(cx, |v, _| {
+        v.view_state()
+            .banners
+            .into_iter()
+            .find(|b| b.id == "detail-stale")
+            .map(|b| b.text)
+    })
+}
+
+/// Waits until the stale notice contains `text`.
+async fn wait_for_stale(cx: &mut TestAppContext, t: &TestWorkspace, text: &'static str) {
+    let v = view(cx, t);
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        v.read(cx)
+            .view_state()
+            .banners
+            .iter()
+            .any(|b| b.id == "detail-stale" && b.text.contains(text))
+    })
+    .await;
+}
+
+// covers UP-20, UP-23: while the kind is not current, an open pod says it may be out of date and
+// when it last updated, on every state that is not current. The return of the connection fetches
+// it again, and the notice stays until a fetch has succeeded. Nothing about editing changes.
+#[gpui_kit::test]
+async fn a_pod_open_through_an_outage_stays_marked_until_fetched(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    assert_eq!(stale_banner(cx, &t), None);
+    let v = view(cx, &t);
+    let editable = v.read_with(cx, |v, _| v.can_start_edit());
+
+    let _sync = publish_sync(
+        cx,
+        &t,
+        SyncState::Reconnecting {
+            error: Some("connection refused".into()),
+        },
+    );
+    wait_for_stale(cx, &t, "connection refused").await;
+    let text = stale_banner(cx, &t).unwrap();
+    assert!(text.contains("may be out of date"), "{text}");
+    assert!(text.contains("Last updated"), "{text}");
+    assert_eq!(v.read_with(cx, |v, _| v.can_start_edit()), editable);
+
+    let _sync = publish_sync(
+        cx,
+        &t,
+        SyncState::RetryingRefusal {
+            error: "forbidden for now".into(),
+        },
+    );
+    wait_for_stale(cx, &t, "forbidden for now").await;
+
+    // Back: the fetch runs and fails here, so the copy is still not known to be current.
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    let fetched = v.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let v = fetched.read(cx);
+        !v.fetching
+            && v.refresh_error
+                .as_deref()
+                .is_some_and(|e| e.contains("not connected"))
+    })
+    .await;
+    assert!(stale_banner(cx, &t).is_some(), "not fetched since");
+    assert!(t.find(cx, "detail-retry").is_some());
+
+    show_fetched(cx, &t, pod("api"));
+    assert_eq!(stale_banner(cx, &t), None);
+}
+
+// covers UP-20, UP-23: a pane that failed during an outage fetches again when the connection
+// returns, and its error has a Retry.
+#[gpui_kit::test]
+async fn a_failed_pane_refetches_when_the_connection_returns(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    let v = view(cx, &t);
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    cx.run_until_parked();
+    assert!(t.find(cx, "detail-retry").is_some());
+
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    wait_for_failed_fetch(cx, &t).await;
+
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    cx.run_until_parked();
+    t.click(cx, "detail-retry");
+    wait_for_failed_fetch(cx, &t).await;
+}
+
+/// `pod(name)` as the object that took the name after the first one was deleted.
+fn replacement(name: &str) -> ObjectDetail {
+    let mut detail = pod(name);
+    detail.object["metadata"]["uid"] = "uid-replacement".into();
+    detail.object["metadata"]["labels"]["replacement"] = "yes".into();
+    detail
+}
+
+// covers UP-20, UP-23: a pod deleted and recreated under its name during an outage: the fetch on
+// the return finds the new pod. The old copy stays, marked deleted, and no edit can start from it.
+#[gpui_kit::test]
+async fn a_replacement_under_the_same_name_is_not_shown(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    let v = view(cx, &t);
+    let before = v.read_with(cx, |v, _| v.yaml_text.clone());
+
+    show_fetched(cx, &t, replacement("api"));
+
+    v.read_with(cx, |v, _| {
+        assert!(v.gone);
+        assert_eq!(v.yaml_text, before);
+        assert!(!v.yaml_text.contains("replacement"));
+        let Fetch::Loaded { detail, .. } = &v.fetch else {
+            panic!("the old copy stays");
+        };
+        assert_eq!(detail.object["metadata"]["uid"], "uid-api");
+        assert!(!v.can_start_edit());
+        assert_eq!(v.edit_blocked().as_deref(), Some("This object was deleted"));
+    });
+}
+
+// covers UP-20, UP-23: with no copy to keep, the replacement is still not shown as the object.
+#[gpui_kit::test]
+async fn a_replacement_is_not_shown_in_a_pane_with_no_copy(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+
+    show_fetched(cx, &t, replacement("api"));
+
+    let v = view(cx, &t);
+    v.read_with(cx, |v, _| {
+        assert!(v.gone);
+        assert!(matches!(&v.fetch, Fetch::Failed(e) if e.contains("new one")));
+        assert!(!v.can_start_edit());
+    });
+}
+
+// covers UP-20: a list that publishes rows while another namespace loads does not make a fetched
+// copy read as current.
+#[gpui_kit::test]
+async fn a_fetched_copy_is_stale_while_the_kind_loads(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+
+    let _sync = publish_sync(cx, &t, SyncState::Loading);
+    wait_for_stale(cx, &t, "Still loading").await;
+}
+
+// covers UP-20, UP-23: an outage the subscription skipped (it only saw the kind current again)
+// still retries a held error, and further updates during a lasting failure wait their turn.
+#[gpui_kit::test]
+async fn a_held_error_retries_on_a_skipped_outage_within_a_limit(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    let v = view(cx, &t);
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::ui::detail::sync::error_retry_delay(16));
+    cx.run_until_parked();
+    wait_for_failed_fetch(cx, &t).await;
+
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    wait_for_failed_fetch(cx, &t).await;
+
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    cx.run_until_parked();
+    assert!(
+        v.read_with(cx, |v, _| {
+            matches!(&v.fetch, Fetch::Failed(e) if e == "connection refused")
+        }),
+        "the next retry waits"
+    );
+    cx.executor()
+        .advance_clock(crate::ui::detail::sync::error_retry_delay(16));
+    wait_for_failed_fetch(cx, &t).await;
+}
+
+// covers UP-20: the state's notice keeps the time after a long server error, with its values
+// hidden.
+#[gpui_kit::test]
+async fn the_stale_state_keeps_the_time_after_a_long_error(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+
+    let error = format!("refused \"hidden-value\" {}", "long ".repeat(200));
+    let _sync = publish_sync(cx, &t, SyncState::Reconnecting { error: Some(error) });
+    wait_for_stale(cx, &t, "Last updated").await;
+    let text = stale_banner(cx, &t).unwrap();
+    assert!(!text.contains("hidden-value"), "{text}");
+    assert!(text.ends_with("Ages are as of then."), "{text}");
+}
+
 // covers UP-04, UP-23: Cmd-R (Refresh and Retry Connection share it) fetches the shown object
 // again on a connected cluster, and retries the connection on a failed one.
 #[gpui_kit::test]
@@ -399,7 +632,7 @@ async fn the_refresh_key_refetches_or_retries(cx: &mut TestAppContext) {
     show_fetched(cx, &t, pod("api"));
     let v = view(cx, &t);
     assert!(v.read_with(cx, |v, _| v.refresh_error.is_none()));
-    let attempts = t.connection_attempts("alpha");
+    let attempts = t.connection_attempts("kind-alpha");
 
     t.press_key_of(cx, "detail::Refresh");
     let refetched = v.clone();
@@ -407,17 +640,21 @@ async fn the_refresh_key_refetches_or_retries(cx: &mut TestAppContext) {
         refetched.read(cx).refresh_error.is_some()
     })
     .await;
-    assert_eq!(t.connection_attempts("alpha"), attempts, "no reconnect");
+    assert_eq!(
+        t.connection_attempts("kind-alpha"),
+        attempts,
+        "no reconnect"
+    );
 
-    t.activate(cx, "beta").await;
-    t.wait_for_state(cx, "beta", |s| {
+    t.activate(cx, "kind-beta").await;
+    t.wait_for_state(cx, "kind-beta", |s| {
         matches!(s, flint_core::ConnectionState::Failed(_))
     })
     .await;
-    let attempts = t.connection_attempts("beta");
+    let attempts = t.connection_attempts("kind-beta");
     t.focus_workspace(cx);
     t.press_key_of(cx, "workspace::RetryConnection");
-    t.wait_for_attempts(cx, "beta", attempts + 1).await;
+    t.wait_for_attempts(cx, "kind-beta", attempts + 1).await;
 }
 
 /// Shows the open pane's YAML and moves focus into it, as a click to select and copy does, so the
@@ -504,7 +741,7 @@ async fn a_detail_pane_replaced_from_the_dock_is_released(cx: &mut TestAppContex
     cx.update_window(t.window, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             let request = LogRequest {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 subject: LogSubject::Pod(LogTarget {
                     namespace: "demo".into(),
                     pod: "api".into(),

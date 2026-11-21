@@ -236,17 +236,19 @@ impl ClusterError {
     }
 
     /// What the app shows and logs ([`SafeErrorText`]): Flint's own wording whole (the server
-    /// URL and plugin name are already safe, [`Target`]); a server's `Status` on one line, its
-    /// quoted names kept; and other text from kube or the kubeconfig reduced to one line with
-    /// quoted values hidden ([`redact::safe_error_summary`]).
+    /// URL and plugin name are already safe, [`Target`]); text from a server or kube with its
+    /// values hidden whole ([`redact::hide_server_values`]) and only then cut to one line; and
+    /// kubeconfig text reduced to one line with quoted values hidden
+    /// ([`redact::safe_error_summary`]). For display only: classify on the raw error.
     pub fn summary(&self) -> SafeErrorText {
         SafeErrorText(match self {
-            ClusterError::Kube(message) => redact::safe_error_summary(message),
+            ClusterError::Kube(message) | ClusterError::Api(message) => {
+                redact::first_line(&redact::hide_server_values(message), SHOWN_CHARS)
+            }
             ClusterError::Config { context, message } => format!(
                 "invalid kubeconfig for context \"{context}\": {}",
                 redact::safe_error_summary(message)
             ),
-            ClusterError::Api(message) => redact::first_line(message, SHOWN_CHARS),
             other => other.to_string(),
         })
     }
@@ -959,6 +961,26 @@ mod tests {
             "the API server failed with an internal error (500 Internal Server Error); try \
              again, or check the API server's logs"
         );
+    }
+
+    // covers UP-04
+    #[test]
+    fn a_long_status_message_is_shortened_after_its_values_are_hidden() {
+        let padding = "p".repeat(150);
+        let value = "placeholder-value-".repeat(5);
+        let status = kube::core::Status {
+            code: 403,
+            reason: "Forbidden".into(),
+            message: format!("{padding} https://placeholder:{value}@api.example.invalid/ denied"),
+            ..Default::default()
+        };
+        let err = ClusterError::kube(kube::Error::Api(Box::new(status)));
+
+        let shown = err.summary();
+        assert!(!shown.as_str().contains("placeholder-value"), "{shown}");
+        assert!(shown.as_str().chars().count() <= SHOWN_CHARS + 1, "{shown}");
+        assert!(shown.as_str().starts_with("Forbidden: "), "{shown}");
+        assert!(err.to_string().contains(&value), "the raw error is kept");
     }
 
     // covers UP-04

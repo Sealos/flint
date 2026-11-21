@@ -46,6 +46,8 @@ const WEB: &str = "web-69c6f74b8b-qv4xv";
 const PODINFO: &str = "podinfo-c6497595d-b8chj";
 /// A pod the tests add, with three containers.
 const MULTI: &str = "multi-1";
+/// The fake API context's name as a dock chip shows it, shortened in the middle.
+const FAKE_CHIP: &str = "kind-fl…e2e-fake";
 
 /// The index of tab `id` in the state's dock.
 fn tab_index(state: &Value, id: u64) -> Result<usize> {
@@ -302,7 +304,7 @@ fn up_41_shell_into_a_container() -> Result<()> {
     assert_eq!(tab["title"], format!("Shell: {WEB} · nginx"));
     // The tab names its cluster.
     assert_eq!(tab["cluster"]["context"], cluster.context.as_str());
-    assert_eq!(tab["cluster"]["chip"], cluster.context.as_str());
+    assert_eq!(tab["cluster"]["chip"], FAKE_CHIP);
     assert_eq!(tab["shell"]["live"], true);
     assert_eq!(state["dock"]["visible"], true);
     let prompt = format!("root@{WEB}:/#");
@@ -457,10 +459,7 @@ fn up_41_shell_into_a_container() -> Result<()> {
     assert_eq!(j, i + 1, "beside the ended tab");
     let state = app.wait_for(&at(j, "status/state"), Equals("running".into()))?;
     assert_eq!(tab_ids(&state), [shell, restarted, logs]);
-    assert_eq!(
-        tab_at(&state, j)["cluster"]["chip"],
-        cluster.context.as_str()
-    );
+    assert_eq!(tab_at(&state, j)["cluster"]["chip"], FAKE_CHIP);
     assert_eq!(
         tab_at(&state, i)["status"],
         json!({"state": "exited", "code": 3})
@@ -794,15 +793,19 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     app.select_row(Some("demo"), WEB)?;
     app.wait_for("/detail/fetch", Equals("loaded".into()))?;
 
-    // A log tab and a shell tab on fake-a.
+    // A log tab and a shell tab on kind-fake-a.
     let (logs, l) = new_tab(&app, &[], || {
         app.dispatch("detail::OpenLogs", Value::Null)?;
         Ok(())
     })?;
     app.wait_for(&at(l, "status/state"), Equals("streaming".into()))?;
-    until("fake-a's log stream", || a.open_log_streams(), |n| *n == 1)?;
+    until(
+        "kind-fake-a's log stream",
+        || a.open_log_streams(),
+        |n| *n == 1,
+    )?;
     let (shell, s) = open_web_shell(&app)?;
-    let exec = a.last_exec().context("fake-a's exec")?;
+    let exec = a.last_exec().context("kind-fake-a's exec")?;
     let state = app.state()?;
     for i in [l, s] {
         assert_eq!(tab_at(&state, i)["cluster"]["context"], TwoClusters::A);
@@ -828,7 +831,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     let state = app.wait_for("/dock/visible", Equals(true.into()))?;
     assert_eq!(tab_ids(&state), [logs, shell]);
 
-    // Over to fake-b, with a log tab of its own: fake-a's sessions keep running there.
+    // Over to kind-fake-b, with a log tab of its own: kind-fake-a's sessions keep running there.
     connect(&app, TwoClusters::B)?;
     open_live(&app, "pods", 17)?;
     app.select_row(Some("demo"), WEB)?;
@@ -843,7 +846,11 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     for i in [l, s] {
         assert_eq!(tab_at(&state, i)["cluster"]["chip"], TwoClusters::A);
     }
-    until("fake-b's log stream", || b.open_log_streams(), |n| *n == 1)?;
+    until(
+        "kind-fake-b's log stream",
+        || b.open_log_streams(),
+        |n| *n == 1,
+    )?;
     assert_eq!(a.append_log(&web, "after the cluster switch\n"), 1);
     wait_for_line(&app, l, "after the cluster switch")?;
     assert!(exec.print("\r\nprinted after the cluster switch\r\n"));
@@ -868,7 +875,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     let state = app.wait_for("/dock/tabs", Test::at_most(2))?;
     assert_eq!(tab_ids(&state), [logs, b_logs]);
     until(
-        "fake-a's exec to close",
+        "kind-fake-a's exec to close",
         || a.open_exec_sessions(),
         |n| *n == 0,
     )?;
@@ -885,7 +892,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
         "the window stays, with the other tab"
     );
     until(
-        "fake-b's log stream to close",
+        "kind-fake-b's log stream to close",
         || b.open_log_streams(),
         |n| *n == 0,
     )?;
@@ -894,7 +901,7 @@ fn up_42_sessions_outlive_navigation() -> Result<()> {
     let state = app.wait_for("/dock/tabs", Equals(json!([])))?;
     assert_eq!(state["dock"]["visible"], false);
     until(
-        "fake-a's log stream to close",
+        "kind-fake-a's log stream to close",
         || a.open_log_streams(),
         |n| *n == 0,
     )?;

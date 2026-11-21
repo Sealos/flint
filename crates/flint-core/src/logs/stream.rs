@@ -19,7 +19,7 @@ use tokio::time::Sleep;
 
 use super::line::{LineSource, LogLine};
 use super::session::{
-    ContainerWait, LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE,
+    ContainerWait, FailedHop, LogOptions, LogSince, LogState, LogTarget, PREVIOUS_NOT_AVAILABLE,
 };
 use super::source::{
     AfterEnd, CRASH_LOOP, ErrorKind, LogError, LogRequest, LogSource, RawLine, RawLines,
@@ -79,6 +79,7 @@ impl Retry {
         let delay = self.backoff.delay(self.attempts);
         Reconnect {
             state: LogState::Reconnecting {
+                hop: error.map_or(FailedHop::Unknown, |e| e.hop),
                 error: error.map(|e| e.message.clone()),
                 attempt: self.attempts,
                 back_off,
@@ -351,7 +352,7 @@ impl Stream {
             // Before anything else, even a drain or a deleted pod: the session must hear of it.
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_cluster() => {
                 self.cluster_error = true;
-                self.end(Some(e.message))
+                self.end_with(e)
             }
             // The pod by this name is not the stream's pod any more: nothing of it is read.
             Step::Opened(Err(e)) if e.kind == ErrorKind::PodGone => self.end(None),
@@ -395,9 +396,7 @@ impl Stream {
             Step::AfterEnd(Err(_) | Ok(AfterEnd::Restarts)) if starting.is_some() => {
                 self.wait_for_container(ContainerWait::NotStarted(None))
             }
-            Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => {
-                self.end(Some(e.message))
-            }
+            Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) if e.is_fatal() => self.end_with(e),
             Step::Opened(Err(e)) | Step::AfterEnd(Err(e)) | Step::Line(Err(e)) => {
                 self.retry(Some(e))
             }
@@ -614,6 +613,16 @@ impl Stream {
     fn end(&mut self, error: Option<String>) -> Phase {
         self.finish(LogState::Ended {
             error,
+            hop: FailedHop::Unknown,
+            pod_deleted: false,
+        })
+    }
+
+    /// Ends on `error`, keeping the hop it failed at.
+    fn end_with(&mut self, error: LogError) -> Phase {
+        self.finish(LogState::Ended {
+            error: Some(error.message),
+            hop: error.hop,
             pod_deleted: false,
         })
     }
@@ -622,6 +631,7 @@ impl Stream {
     fn end_deleted(&mut self) -> Phase {
         self.finish(LogState::Ended {
             error: None,
+            hop: FailedHop::Unknown,
             pod_deleted: true,
         })
     }
@@ -779,6 +789,7 @@ mod tests {
         assert_eq!(
             retry.fail(Some(&LogError::retry("reset")), false).state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("reset".into()),
                 attempt: 1,
                 back_off: false,
@@ -787,6 +798,7 @@ mod tests {
         assert_eq!(
             retry.fail(None, true).state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: None,
                 attempt: 2,
                 back_off: true,
@@ -819,6 +831,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -861,6 +874,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             },
@@ -880,6 +894,7 @@ mod tests {
         assert_eq!(
             single.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             }
@@ -917,6 +932,7 @@ mod tests {
         assert_eq!(
             once.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some(notice.into()),
                 pod_deleted: false
             }
@@ -1000,6 +1016,7 @@ mod tests {
         assert_eq!(
             finished.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some(notice.into()),
                 pod_deleted: false
             }
@@ -1010,7 +1027,7 @@ mod tests {
         assert!(drain(&mut restarts).await.is_empty());
         assert!(matches!(
             restarts.state(),
-            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false } if e == notice
+            LogState::Reconnecting { attempt: 1, error: Some(e), back_off: false, .. } if e == notice
         ));
     }
 
@@ -1060,6 +1077,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1075,6 +1093,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Reconnecting {
+                hop: Default::default(),
                 error: None,
                 attempt: 1,
                 back_off: true
@@ -1319,6 +1338,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("reset".into()),
                 attempt: 1,
                 back_off: false,
@@ -1353,6 +1373,7 @@ mod tests {
         assert!(!s.is_done() && matches!(s.phase, Phase::Connect(_)));
         s.handle(Step::Eof, &mut |_| {});
         let deleted = LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         };
@@ -1372,6 +1393,7 @@ mod tests {
         assert_eq!(
             member.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1385,9 +1407,11 @@ mod tests {
             Step::Opened(Err(LogError {
                 message: "NotFound: pods \"p\" not found".into(),
                 kind: ErrorKind::NotFound,
+                hop: FailedHop::Unknown,
             }))
         };
         let deleted = LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         };
@@ -1416,7 +1440,8 @@ mod tests {
             never.state(),
             LogState::Ended {
                 error: Some(_),
-                pod_deleted: false
+                pod_deleted: false,
+                ..
             }
         ));
     }
@@ -1439,6 +1464,7 @@ mod tests {
         assert_eq!(
             d.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1465,6 +1491,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1498,6 +1525,7 @@ mod tests {
         assert_eq!(
             s.state(),
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some("re-pointed".into()),
                 pod_deleted: false,
             }

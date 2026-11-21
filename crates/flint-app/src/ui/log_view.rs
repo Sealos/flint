@@ -1499,7 +1499,12 @@ impl LogView {
     /// An ended session's error, over lines it read: what it means in plain words, and the
     /// server's text under it, wrapped. (Without lines, the empty state says it.)
     fn render_banner(&self, theme: &Theme) -> Option<AnyElement> {
-        let LogState::Ended { error, pod_deleted } = &self.snapshot.state else {
+        let LogState::Ended {
+            error,
+            hop,
+            pod_deleted,
+        } = &self.snapshot.state
+        else {
             return None;
         };
         // A failure, or a followed stream that stopped on its own; a deleted pod's end shows in
@@ -1517,7 +1522,7 @@ impl LogView {
                 Some(said.to_owned()),
             ),
             (Some(error), None) => {
-                let explained = log_model::explain(error, !self.is_workload());
+                let explained = log_model::explain(error, *hop, !self.is_workload());
                 (
                     theme.danger,
                     format!("The stream ended. {}", explained.headline),
@@ -1593,13 +1598,18 @@ impl LogView {
                 log_model::wait_text(wait),
                 Some(log_model::WAITING_DETAIL.to_owned()),
             ),
-            LogState::Reconnecting { error, attempt, .. } => (
+            LogState::Reconnecting {
+                error,
+                hop,
+                attempt,
+                ..
+            } => (
                 true,
                 theme.warning,
                 "Reconnecting…".into(),
                 Some(match error {
                     Some(e) => {
-                        let explained = log_model::explain(e, pod);
+                        let explained = log_model::explain(e, *hop, pod);
                         format!(
                             "Attempt {attempt}. {} {}",
                             explained.headline,
@@ -1609,23 +1619,25 @@ impl LogView {
                     None => format!("Attempt {attempt}"),
                 }),
             ),
-            state @ LogState::Ended { error: Some(e), .. } => {
-                match state.previous_not_available() {
-                    Some(kubelet) => (
-                        false,
-                        theme.warning,
-                        log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
-                        Some(format!(
-                            "The container may still be restarting. {} said: {kubelet}",
-                            log_model::previous_speaker(kubelet)
-                        )),
-                    ),
-                    None => {
-                        let explained = log_model::explain(e, pod);
-                        (false, theme.danger, explained.headline, explained.detail)
-                    }
+            state @ LogState::Ended {
+                error: Some(e),
+                hop,
+                ..
+            } => match state.previous_not_available() {
+                Some(kubelet) => (
+                    false,
+                    theme.warning,
+                    log_model::PREVIOUS_NOT_AVAILABLE.to_owned(),
+                    Some(format!(
+                        "The container may still be restarting. {} said: {kubelet}",
+                        log_model::previous_speaker(kubelet)
+                    )),
+                ),
+                None => {
+                    let explained = log_model::explain(e, *hop, pod);
+                    (false, theme.danger, explained.headline, explained.detail)
                 }
-            }
+            },
             // The log was read; the pod just logged nothing before it was deleted.
             LogState::Ended {
                 pod_deleted: true, ..

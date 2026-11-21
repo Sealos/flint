@@ -30,7 +30,7 @@ fn scope_of(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<AiScope> {
     t.model.read_with(cx, |m, _| {
         m.clusters
             .iter()
-            .find(|c| c.info.name == "alpha")
+            .find(|c| c.info.name == "kind-alpha")
             .and_then(|c| m.ai_scope(c))
     })
 }
@@ -41,7 +41,7 @@ async fn wait_for_scope(cx: &mut TestAppContext, t: &TestWorkspace, wanted: AiSc
         let m = model.read(cx);
         m.clusters
             .iter()
-            .find(|c| c.info.name == "alpha")
+            .find(|c| c.info.name == "kind-alpha")
             .and_then(|c| m.ai_scope(c))
             == Some(wanted.clone())
     })
@@ -67,12 +67,16 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
         ws.namespaces = vec!["demo".into(), "shop".into()];
     });
 
-    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::ExposeToAi",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "expose-description"),
-        Some(expose_dialog("alpha", &t.server, None).text)
+        Some(expose_dialog("kind-alpha", &t.server, None).text)
     );
     for id in [
         "scope-ns-all",
@@ -93,7 +97,7 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     click(cx, &t, "scope-kind-pods");
     click(cx, &t, "scope-kind-deployments.apps");
     // Nothing is written before confirming.
-    assert!(!t.settings_toml().contains("alpha"));
+    assert!(!t.settings_toml().contains("kind-alpha"));
     t.click(cx, "ok");
     wait_for_scope(cx, &t, scope(&["shop"], &["deployments.apps", "nodes"])).await;
     wait_for_dialog(cx, &t, false).await;
@@ -104,20 +108,20 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     );
 
     // The AI tag says what agents may read, and opens the scope again with it checked.
-    let tip = t.description(cx, "ai-scope-alpha").unwrap_or_default();
+    let tip = t.description(cx, "ai-scope-kind-alpha").unwrap_or_default();
     assert!(
         tip.contains("namespaces shop; kinds deployments.apps, nodes"),
         "{tip}"
     );
-    assert_eq!(t.label(cx, "ai-scope-alpha").as_deref(), Some("AI·"));
-    t.click(cx, "ai-scope-alpha");
+    assert_eq!(t.label(cx, "ai-scope-kind-alpha").as_deref(), Some("AI·"));
+    t.click(cx, "ai-scope-kind-alpha");
     t.wait_for_element(cx, "activity-edit-scope").await;
     t.click(cx, "activity-edit-scope");
     wait_for_dialog(cx, &t, true).await;
     let saved = scope(&["shop"], &["deployments.apps", "nodes"]);
     assert_eq!(
         t.label(cx, "scope-description"),
-        Some(scope_dialog("alpha", &t.server, &saved).text)
+        Some(scope_dialog("kind-alpha", &t.server, &saved).text)
     );
     assert_eq!(t.label(cx, "ok").as_deref(), Some("Save"));
     // Escape keeps the scope.
@@ -126,8 +130,12 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     assert_eq!(scope_of(cx, &t), Some(saved));
 
     // Clearing both pickers exposes everything again.
-    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::EditAiScope",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     click(cx, &t, "scope-ns-all");
     click(cx, &t, "scope-kind-all");
@@ -135,10 +143,10 @@ async fn the_expose_dialog_limits_what_agents_read(cx: &mut TestAppContext) {
     wait_for_scope(cx, &t, AiScope::default()).await;
     let toml = t.settings_toml();
     assert!(
-        !toml.contains("namespaces") && toml.contains("alpha"),
+        !toml.contains("namespaces") && toml.contains("kind-alpha"),
         "{toml}"
     );
-    assert_eq!(t.label(cx, "ai-scope-alpha").as_deref(), Some("AI"));
+    assert_eq!(t.label(cx, "ai-scope-kind-alpha").as_deref(), Some("AI"));
 }
 
 // covers UP-14: only an exposed cluster has a scope to edit; a cluster that is not connected
@@ -148,17 +156,25 @@ async fn edit_ai_scope_needs_an_exposed_cluster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     assert!(matches!(
-        t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"})),
+        t.dispatch(
+            cx,
+            "workspace::EditAiScope",
+            json!({"cluster": "kind-alpha"})
+        ),
         Err(ActionError::Rejected { .. })
     ));
-    assert!(t.find(cx, "ai-scope-alpha").is_none());
+    assert!(t.find(cx, "ai-scope-kind-alpha").is_none());
     let server = t.server.clone();
     t.model.update(cx, |m, _| {
-        m.expose_to_ai("alpha".into(), server, scope(&["shop"], &["pods"]))
+        m.expose_to_ai("kind-alpha".into(), server, scope(&["shop"], &["pods"]))
     });
     wait_for_scope(cx, &t, scope(&["shop"], &["pods"])).await;
-    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::EditAiScope",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     for id in ["scope-ns-shop", "scope-kind-pods"] {
         assert!(t.find(cx, id).is_some(), "{id}");
@@ -172,8 +188,12 @@ async fn edit_ai_scope_needs_an_exposed_cluster(cx: &mut TestAppContext) {
 async fn a_namespace_can_be_typed(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::ExposeToAi",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     assert!(t.find(cx, "scope-ns-empty").is_some());
     click(cx, &t, "scope-ns-add");
@@ -198,7 +218,7 @@ async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("settings.toml"),
-        "[[ai_exposed_clusters]]\ncontext = \"alpha\"\nserver = \"https://10.0.0.1:6443\"\n\
+        "[[ai_exposed_clusters]]\ncontext = \"kind-alpha\"\nserver = \"https://10.0.0.1:6443\"\n\
          namespaces = [\"shop\"]\nkinds = [\"pods\"]\n",
     )
     .unwrap();
@@ -209,16 +229,25 @@ async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) 
     )
     .await;
     assert_eq!(scope_of(cx, &t), None, "re-pointed: not exposed");
-    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::ExposeToAi",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
     wait_for_scope(cx, &t, scope(&["shop"], &["pods"])).await;
 
-    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::EditAiScope",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
-    t.model.update(cx, |m, _| m.hide_from_ai("alpha".into()));
+    t.model
+        .update(cx, |m, _| m.hide_from_ai("kind-alpha".into()));
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model.read(cx).settings.ai_exposed_clusters.is_empty()
@@ -235,7 +264,7 @@ async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) 
         t.model
             .read_with(cx, |m, _| m.settings.ai_exposed_clusters.is_empty())
     );
-    assert!(!t.settings_toml().contains("alpha"));
+    assert!(!t.settings_toml().contains("kind-alpha"));
 }
 
 // covers UP-14: confirming with a namespace still typed in the field adds it first; one that is
@@ -244,8 +273,12 @@ async fn a_scope_is_never_widened_or_re_exposed_unseen(cx: &mut TestAppContext) 
 async fn text_left_in_the_namespace_field_is_never_dropped(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.dispatch(cx, "workspace::ExposeToAi", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::ExposeToAi",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     click(cx, &t, "scope-ns-add");
     t.type_text(cx, "Not/A Namespace");
@@ -273,16 +306,20 @@ async fn a_scope_changed_on_disk_is_not_overwritten(cx: &mut TestAppContext) {
     let t = open_workspace(cx, dir.path()).await;
     let server = t.server.clone();
     t.model.update(cx, |m, _| {
-        m.expose_to_ai("alpha".into(), server, scope(&["shop"], &[]))
+        m.expose_to_ai("kind-alpha".into(), server, scope(&["shop"], &[]))
     });
     wait_for_scope(cx, &t, scope(&["shop"], &[])).await;
-    t.dispatch(cx, "workspace::EditAiScope", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::EditAiScope",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     // Meanwhile, another change of the scope lands (by hand, or another Flint).
     let server = t.server.clone();
     t.model.update(cx, |m, _| {
-        m.expose_to_ai("alpha".into(), server, scope(&["billing"], &[]))
+        m.expose_to_ai("kind-alpha".into(), server, scope(&["billing"], &[]))
     });
     wait_for_scope(cx, &t, scope(&["billing"], &[])).await;
     click(cx, &t, "scope-ns-all");

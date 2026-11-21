@@ -53,19 +53,23 @@ async fn the_cluster_changed_badge_leaves_the_server_its_room(cx: &mut TestAppCo
     let t = open_workspace(cx, dir.path()).await;
     t.model.update(cx, |model, cx| {
         model.settings = Arc::new(Settings {
-            ai_exposed_clusters: vec![AiExposure::new("alpha", "https://10.0.0.1:6443")],
+            ai_exposed_clusters: vec![AiExposure::new("kind-alpha", "https://10.0.0.1:6443")],
             ..Default::default()
         });
         cx.notify();
     });
     render(cx, &t);
     let state = state(cx, &t);
-    let alpha = state.clusters.iter().find(|c| c.name == "alpha").unwrap();
+    let alpha = state
+        .clusters
+        .iter()
+        .find(|c| c.name == "kind-alpha")
+        .unwrap();
     assert_eq!(alpha.ai, "server_changed");
     cx.update_window(t.window, |_, window, _| {
-        let server = window.find("cluster-server-alpha").bounds();
-        let badge = window.find("cluster-changed-alpha").bounds();
-        let title_room = window.find("cluster-server-beta").bounds().size.width;
+        let server = window.find("cluster-server-kind-alpha").bounds();
+        let badge = window.find("cluster-changed-kind-alpha").bounds();
+        let title_room = window.find("cluster-server-kind-beta").bounds().size.width;
         assert!(
             badge.origin.y >= server.origin.y + server.size.height,
             "the badge is beside the server, not below it: {badge:?} vs {server:?}"
@@ -97,22 +101,22 @@ async fn an_inactive_connected_cluster_is_idle_not_live(cx: &mut TestAppContext)
             cx.notify();
         });
     };
-    connect(cx, Some("alpha"));
+    connect(cx, Some("kind-alpha"));
     render(cx, &t);
     let s = state(cx, &t);
     assert_eq!(
-        (presence(&s, "alpha"), presence(&s, "beta")),
+        (presence(&s, "kind-alpha"), presence(&s, "kind-beta")),
         ("live", "idle")
     );
-    // Switched to beta: alpha's watches stop, and so does its live dot.
-    connect(cx, Some("beta"));
+    // Switched to kind-beta: kind-alpha's watches stop, and so does its live dot.
+    connect(cx, Some("kind-beta"));
     render(cx, &t);
     let s = state(cx, &t);
     assert_eq!(
-        (presence(&s, "alpha"), presence(&s, "beta")),
+        (presence(&s, "kind-alpha"), presence(&s, "kind-beta")),
         ("idle", "live")
     );
-    assert!(shown(cx, &t, "cluster-dot-alpha"));
+    assert!(shown(cx, &t, "cluster-dot-kind-alpha"));
 }
 
 #[gpui_kit::test]
@@ -121,15 +125,15 @@ async fn the_active_cluster_shows_reconnecting_until_a_watch_recovers(cx: &mut T
     let api = LocalApi::start(&[]);
     let t = open_workspace_with(cx, dir.path(), |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &api.url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &api.url)])).unwrap();
         vec![path]
     })
     .await;
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
 
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, |_, cx| {
-        let states = model.read(cx).core().sync_states("alpha");
+        let states = model.read(cx).core().sync_states("kind-alpha");
         api.open_watches() == 3
             && states
                 .iter()
@@ -138,7 +142,7 @@ async fn the_active_cluster_shows_reconnecting_until_a_watch_recovers(cx: &mut T
                 == 3
     })
     .await;
-    assert_eq!(presence(&state(cx, &t), "alpha"), "live");
+    assert_eq!(presence(&state(cx, &t), "kind-alpha"), "live");
 
     for (down, status, tooltip) in [
         (true, "reconnecting", "Reconnecting: "),
@@ -146,14 +150,14 @@ async fn the_active_cluster_shows_reconnecting_until_a_watch_recovers(cx: &mut T
     ] {
         api.set_watches_down(down);
         cx.wait_for(t.window, WAIT, |window, _| {
-            window.try_find("cluster-alpha").is_some_and(|row| {
+            window.try_find("cluster-kind-alpha").is_some_and(|row| {
                 row.description()
                     .and_then(|description| description.lines().nth(2))
                     .is_some_and(|line| line.starts_with(tooltip))
             })
         })
         .await;
-        assert_eq!(presence(&state(cx, &t), "alpha"), status);
+        assert_eq!(presence(&state(cx, &t), "kind-alpha"), status);
     }
 }
 
@@ -166,7 +170,7 @@ async fn a_failed_cluster_offers_one_retry_and_no_dead_controls(cx: &mut TestApp
     cx.update_window(t.window, |_, window, cx| {
         registry::dispatch(
             "workspace::SelectCluster",
-            json!({"cluster": "beta"}),
+            json!({"cluster": "kind-beta"}),
             window,
             cx,
         )
@@ -196,7 +200,7 @@ async fn a_failed_cluster_offers_one_retry_and_no_dead_controls(cx: &mut TestApp
     cx.update_window(t.window, |_, window, cx| {
         registry::dispatch(
             "workspace::SelectCluster",
-            json!({"cluster": "alpha"}),
+            json!({"cluster": "kind-alpha"}),
             window,
             cx,
         )
@@ -205,7 +209,7 @@ async fn a_failed_cluster_offers_one_retry_and_no_dead_controls(cx: &mut TestApp
     .unwrap();
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).cluster.as_deref() == Some("alpha")
+        workspace.read(cx).cluster.as_deref() == Some("kind-alpha")
     })
     .await;
     render(cx, &t);
@@ -270,8 +274,8 @@ async fn the_state_names_each_connection(cx: &mut TestAppContext) {
         t.model.update(cx, |model, cx| {
             for cluster in &mut model.clusters {
                 cluster.state = match cluster.info.name.as_str() {
-                    "alpha" => alpha.clone(),
-                    "beta" => beta.clone(),
+                    "kind-alpha" => alpha.clone(),
+                    "kind-beta" => beta.clone(),
                     _ => continue,
                 };
             }
@@ -279,7 +283,7 @@ async fn the_state_names_each_connection(cx: &mut TestAppContext) {
         });
         render(cx, &t);
         let s = state(cx, &t);
-        let got = ["alpha", "beta"].map(|name| {
+        let got = ["kind-alpha", "kind-beta"].map(|name| {
             let c = s.clusters.iter().find(|c| c.name == name).unwrap();
             (c.connection, c.error.clone())
         });

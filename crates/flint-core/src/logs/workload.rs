@@ -27,7 +27,7 @@ use tokio::time::Sleep;
 
 use super::line::LineSource;
 use super::pods::{ContainerInfo, PodEvent, PodEvents, PodInfo, PodSet, PodSource, WorkloadTarget};
-use super::session::{Feed, LogOptions, LogState, LogTarget, Output, SessionConfig};
+use super::session::{FailedHop, Feed, LogOptions, LogState, LogTarget, Output, SessionConfig};
 use super::source::{LogError, LogSource};
 use super::stream::{Member, Retry, Stream};
 use crate::recheck::{RECHECK_EVERY, Recheck};
@@ -244,7 +244,7 @@ impl WorkloadFeed {
             | WatchStep::Opened(Err(e))
             | WatchStep::Event(Some(Err(e))) => {
                 if e.is_fatal() {
-                    self.fail(e.message);
+                    self.fail_at(e.message, e.hop);
                 } else {
                     self.retry_watch(Some(e));
                 }
@@ -278,7 +278,13 @@ impl WorkloadFeed {
     /// Ends the session: an error retrying cannot fix (the workload does not exist, access is
     /// denied, the context now points elsewhere). Every stream stops; the lines stay.
     fn fail(&mut self, error: String) {
+        self.fail_at(error, FailedHop::Unknown);
+    }
+
+    /// Like [`Self::fail`], for an error that shows which part failed.
+    fn fail_at(&mut self, error: String, hop: FailedHop) {
         self.state = LogState::Ended {
+            hop,
             error: Some(error),
             pod_deleted: false,
         };
@@ -468,6 +474,7 @@ impl WorkloadFeed {
             && !matches!(self.state, LogState::Ended { .. })
         {
             self.state = LogState::Ended {
+                hop: FailedHop::Unknown,
                 error: None,
                 pod_deleted: false,
             };
@@ -1016,6 +1023,7 @@ mod tests {
         assert_eq!(
             status.streams[1].state,
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("Forbidden: pods \"web-b\" is forbidden".into()),
                 pod_deleted: false,
             }
@@ -1045,6 +1053,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 back_off: false,
                 error: Some("watch reset".into()),
                 attempt: 1
@@ -1100,6 +1109,7 @@ mod tests {
             assert_eq!(
                 s.state,
                 LogState::Reconnecting {
+                    hop: Default::default(),
                     back_off: false,
                     error: Some("watch reset".into()),
                     attempt: n
@@ -1165,6 +1175,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 back_off: false,
                 error: None,
                 attempt: 1
@@ -1214,6 +1225,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("NotFound: deployments.apps \"web\" not found".into()),
                 pod_deleted: false,
             }
@@ -1263,6 +1275,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("\"dev\" now points to a different API server".into()),
                 pod_deleted: false,
             }
@@ -1288,6 +1301,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("\"dev\" now points to a different API server".into()),
                 pod_deleted: false,
             }
@@ -1324,6 +1338,7 @@ mod tests {
         assert_eq!(
             s.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
