@@ -170,7 +170,7 @@ Flint is in early development.
 - Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
-- Cluster sets and warm clusters for instant switching, and AI log analysis.
+- Cluster sets, then problem alerts and guarded fleet actions across them.
 - A signed and notarized app with a Homebrew cask.
 - [Regex search](https://github.com/Sealos/flint/issues/309) and [log time ranges](https://github.com/Sealos/flint/issues/265).
 
