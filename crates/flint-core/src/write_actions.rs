@@ -1617,6 +1617,22 @@ mod tests {
         assert_eq!(evictions, 1);
     }
 
+    // covers UP-53: an identity refusal after an eviction keeps the partial report, and its text
+    // speaks of the next request only.
+    #[test]
+    fn a_credential_refusal_does_not_deny_earlier_changes() {
+        for refused in [
+            WriteError::IdentityUnverified,
+            WriteError::IdentityUnavailable,
+        ] {
+            let stopped = WriteError::from(ActionError::Credential(refused.clone()));
+            assert_eq!(stopped, refused);
+            let text = stopped.to_string();
+            assert!(text.contains("the next request was refused"), "{text}");
+            assert!(!text.contains("nothing was changed"), "{text}");
+        }
+    }
+
     // covers UP-54: the gate closing while evicted pods terminate ends the wait, saying so.
     #[tokio::test]
     async fn a_closed_gate_ends_the_wait_for_terminating_pods() {

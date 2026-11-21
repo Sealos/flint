@@ -446,6 +446,49 @@ async fn a_plugin_credential_without_an_identity_check_is_refused() {
     assert_eq!(live(&server)["spec"]["replicas"], 2);
 }
 
+// covers UP-54: client files an exec plugin's certificate replaces are not part of the binding,
+// so a missing one does not stop the review at the files: it reaches the identity check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_files_a_plugin_replaces_are_not_bound() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    std::fs::write(&ca, server.ca_pem()).unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["client".to_owned()]).unwrap();
+    let output = dir.path().join("output");
+    std::fs::write(
+        &output,
+        json!({
+            "apiVersion": "client.authentication.k8s.io/v1",
+            "kind": "ExecCredential",
+            "status": {
+                "clientCertificateData": pair.cert.pem(),
+                "clientKeyData": pair.signing_key.serialize_pem(),
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let plugin = dir.path().join("plugin");
+    std::fs::write(&plugin, format!("cat {}\n", output.display())).unwrap();
+    let missing = dir.path().join("missing");
+    let user = format!(
+        "    client-certificate: {missing}\n    client-key: {missing}\n    exec:\n      \
+         apiVersion: client.authentication.k8s.io/v1\n      command: /bin/sh\n      args:\n      \
+         - {plugin}\n      interactiveMode: Never\n",
+        missing = missing.display(),
+        plugin = plugin.display(),
+    );
+    let core = core_with_user(&server, dir, &ca, &user).await;
+
+    let refused = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 5 })
+        .await;
+    assert_eq!(refused.unwrap_err(), WriteError::IdentityUnavailable);
+}
+
 // covers UP-53: scaling from zero goes through the scale subresource too, which omits the count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scale_from_zero() {

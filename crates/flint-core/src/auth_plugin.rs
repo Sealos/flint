@@ -87,13 +87,21 @@ pub(crate) enum Credential {
     None,
 }
 
+/// What [`resolve`] left for the client.
+#[derive(Default)]
+pub(crate) struct Resolved {
+    /// A token with an expiry, for the client stack ([`TokenLayer`]), which refreshes it.
+    pub(crate) token: Option<RefreshingToken>,
+    /// The plugin's certificate and key replaced any the kubeconfig names.
+    pub(crate) replaced_certificate: bool,
+}
+
 /// Runs the exec plugin of `config`'s user, if kube would, and puts its credential in `config`
-/// in place of the plugin. A token with an expiry comes back as a [`RefreshingToken`] for the
-/// client stack ([`TokenLayer`]), which refreshes it. Cancel-safe: dropping the future kills the plugin.
+/// in place of the plugin. Cancel-safe: dropping the future kills the plugin.
 pub(crate) async fn resolve(
     config: &mut kube::Config,
     context: &str,
-) -> Result<Option<RefreshingToken>, AuthError> {
+) -> Result<Resolved, AuthError> {
     let auth = &config.auth_info;
     // kube's precedence (`Auth::try_from`): all of these win over an exec plugin.
     let other = auth.auth_provider.is_some()
@@ -101,10 +109,10 @@ pub(crate) async fn resolve(
         || auth.token.is_some()
         || auth.token_file.is_some();
     if other || auth.exec.is_none() {
-        return Ok(None);
+        return Ok(Resolved::default());
     }
     let Some(exec) = config.auth_info.exec.take() else {
-        return Ok(None);
+        return Ok(Resolved::default());
     };
     let auth = &mut config.auth_info;
     let terminal = Terminal::acquire(exec.interactive_mode == Some(ExecInteractiveMode::Always));
@@ -116,30 +124,36 @@ pub(crate) async fn resolve(
             auth.client_key_data = Some(SecretString::from(base64.encode(key.expose_secret())));
             auth.client_certificate = None;
             auth.client_key = None;
-            None
+            Resolved {
+                token: None,
+                replaced_certificate: true,
+            }
         }
         Credential::Token {
             token,
             expires: None,
         } => {
             auth.token = Some(token);
-            None
+            Resolved::default()
         }
         Credential::Token {
             token,
             expires: Some(expires),
-        } => Some(RefreshingToken(Arc::new(TokenShared {
-            task: std::sync::Mutex::default(),
-            state: Arc::new(tokio::sync::Mutex::new(TokenState {
-                context: context.to_owned(),
-                exec,
-                token,
-                expires,
-                refreshing: None,
-                resting: None,
-            })),
-        }))),
-        Credential::None => None,
+        } => Resolved {
+            token: Some(RefreshingToken(Arc::new(TokenShared {
+                task: std::sync::Mutex::default(),
+                state: Arc::new(tokio::sync::Mutex::new(TokenState {
+                    context: context.to_owned(),
+                    exec,
+                    token,
+                    expires,
+                    refreshing: None,
+                    resting: None,
+                })),
+            }))),
+            replaced_certificate: false,
+        },
+        Credential::None => Resolved::default(),
     })
 }
 

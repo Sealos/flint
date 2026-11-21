@@ -12,9 +12,9 @@
 //!   from those bytes. The binding holds their digest and the digest of the files as they are now,
 //!   so a file replaced while a confirmation is open refuses the write.
 //! - **Exec plugins and auth providers.** Their output may rotate at any time, so what is bound
-//!   is who the server says the credential is (`SelfSubjectReview`). A refreshing token is taken
-//!   once for each request, and that same value is sent for both the identity check and the
-//!   request.
+//!   is who the server says the credential is (`SelfSubjectReview`). A refreshing token or an
+//!   auth provider's header is taken once for each request, and that same value is sent for both
+//!   the identity check and the request, past the client's own auth, which would resolve it again.
 //!
 //! Digests are keyed with a random key that lives in this process's memory only, so one is of no
 //! use outside it. Nothing here logs, shows or stores a credential or a digest.
@@ -23,17 +23,23 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use http::header::AUTHORIZATION;
 use http::{HeaderValue, Request};
 use k8s_openapi::api::authentication::v1::SelfSubjectReview;
 use kube::api::{Api, PostParams};
+use kube::client::Body;
+use kube::client::middleware::AuthLayer;
 use kube::config::{AuthInfo, Kubeconfig};
 use kube::{Client, Error};
 use ring::hmac;
 use secrecy::SecretString;
+use tower::{BoxError, Layer as _, Service, ServiceExt as _};
 
 use crate::api_error::ApiError;
 use crate::auth_plugin::RefreshingToken;
@@ -43,6 +49,9 @@ use crate::write::WriteError;
 const FILE_CAP: u64 = 1024 * 1024;
 /// How long the identity check of one request may take.
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// An `extra` the server issues anew with each token. It says which token, not who, so a rotated
+/// token of the same identity keeps its binding.
+const CREDENTIAL_ID: &str = "authentication.kubernetes.io/credential-id";
 
 /// This process's digest key. `None` if the system has no randomness to give: every write is
 /// refused then.
@@ -123,14 +132,16 @@ pub(crate) enum CredentialSource {
     /// In the kubeconfig entry, or none: the connection definition covers it.
     Definition,
     TokenFile(PathBuf),
-    /// An exec plugin or an auth provider.
+    /// An exec plugin.
     Plugin,
+    /// An auth provider, which kube's auth layer resolves.
+    AuthProvider,
 }
 
 impl CredentialSource {
     pub(crate) fn of(auth: &AuthInfo) -> Self {
         if auth.auth_provider.is_some() {
-            return CredentialSource::Plugin;
+            return CredentialSource::AuthProvider;
         }
         if (auth.username.is_some() && auth.password.is_some()) || auth.token.is_some() {
             return CredentialSource::Definition;
@@ -152,6 +163,24 @@ impl CredentialSource {
 pub(crate) struct HeldFile {
     path: PathBuf,
     held: Option<HeldDigest>,
+    role: FileRole,
+}
+
+/// What a held file is to the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileRole {
+    Authority,
+    /// A client certificate or key, which an exec plugin's own pair replaces.
+    ClientIdentity,
+}
+
+/// The files of `files` the client was built from, once an exec plugin has run:
+/// `plugin_certificate` says its certificate and key replaced the kubeconfig's.
+pub(crate) fn files_in_use(files: Vec<HeldFile>, plugin_certificate: bool) -> Vec<HeldFile> {
+    files
+        .into_iter()
+        .filter(|file| !plugin_certificate || file.role != FileRole::ClientIdentity)
+        .collect()
 }
 
 /// [`Digest`] in a [`HeldFile`], which derives `Debug`.
@@ -185,7 +214,7 @@ pub(crate) fn hold_credential_files(kubeconfig: &mut Kubeconfig, context: &str) 
         .and_then(|n| n.cluster.as_mut())
         && cluster.certificate_authority_data.is_none()
         && let Some(path) = cluster.certificate_authority.clone()
-        && let Some(bytes) = hold(&mut files, &path)
+        && let Some(bytes) = hold(&mut files, &path, FileRole::Authority)
     {
         cluster.certificate_authority_data = Some(base64.encode(bytes));
         cluster.certificate_authority = None;
@@ -200,14 +229,14 @@ pub(crate) fn hold_credential_files(kubeconfig: &mut Kubeconfig, context: &str) 
     if let Some(auth) = user {
         if auth.client_certificate_data.is_none()
             && let Some(path) = auth.client_certificate.clone()
-            && let Some(bytes) = hold(&mut files, &path)
+            && let Some(bytes) = hold(&mut files, &path, FileRole::ClientIdentity)
         {
             auth.client_certificate_data = Some(base64.encode(bytes));
             auth.client_certificate = None;
         }
         if auth.client_key_data.is_none()
             && let Some(path) = auth.client_key.clone()
-            && let Some(bytes) = hold(&mut files, &path)
+            && let Some(bytes) = hold(&mut files, &path, FileRole::ClientIdentity)
         {
             auth.client_key_data = Some(SecretString::from(base64.encode(bytes)));
             auth.client_key = None;
@@ -217,11 +246,11 @@ pub(crate) fn hold_credential_files(kubeconfig: &mut Kubeconfig, context: &str) 
 }
 
 /// Reads `path` and records it in `files`, with a digest if it could be read.
-fn hold(files: &mut Vec<HeldFile>, path: &str) -> Option<Vec<u8>> {
+fn hold(files: &mut Vec<HeldFile>, path: &str, role: FileRole) -> Option<Vec<u8>> {
     let path = PathBuf::from(path);
     let bytes = read_file(&path).ok();
     let held = bytes.as_deref().and_then(digest_of).map(HeldDigest);
-    files.push(HeldFile { path, held });
+    files.push(HeldFile { path, held, role });
     bytes.filter(|_| held.is_some())
 }
 
@@ -255,6 +284,8 @@ enum TokenSource {
     Fixed,
     File(PathBuf),
     Refreshing(RefreshingToken),
+    /// Kube's auth layer for an auth provider. `None` if it has none: no write goes out.
+    Provider(Option<Arc<AuthLayer>>),
 }
 
 /// A connection's credential, as its write client presents it.
@@ -279,10 +310,15 @@ impl WriteCredential {
         files: Vec<HeldFile>,
         source: CredentialSource,
         refreshing: Option<RefreshingToken>,
+        auth: Option<Arc<AuthLayer>>,
     ) -> Self {
-        let check_identity = source == CredentialSource::Plugin;
+        let check_identity = matches!(
+            source,
+            CredentialSource::Plugin | CredentialSource::AuthProvider
+        );
         let token = match (source, refreshing) {
             (CredentialSource::TokenFile(path), _) => TokenSource::File(path),
+            (CredentialSource::AuthProvider, _) => TokenSource::Provider(auth),
             (CredentialSource::Plugin, Some(token)) => TokenSource::Refreshing(token),
             _ => TokenSource::Fixed,
         };
@@ -318,6 +354,9 @@ impl WriteCredential {
                     .await
                     .map_err(|_| WriteError::IdentityUnverified)?,
             ),
+            TokenSource::Provider(layer) => Some(
+                provider_header(layer.as_deref().ok_or(WriteError::IdentityUnverified)?).await?,
+            ),
         };
         let client = match header {
             Some(header) => crate::cluster::sending_credential(client, BoundHeader(header)),
@@ -347,16 +386,75 @@ fn file_token_header(bytes: Vec<u8>) -> Result<HeaderValue, WriteError> {
     Ok(value)
 }
 
-/// The `Authorization` a request must go out with, whatever the client's own auth would set.
+/// The `Authorization` value `layer` sets now, resolved once. Nothing is sent to get it.
+async fn provider_header(layer: &AuthLayer) -> Result<HeaderValue, WriteError> {
+    let read = tower::service_fn(|request: Request<Body>| {
+        // Handed back in a response: the auth layer only wraps a service that answers with one.
+        let mut answer = http::Response::new(());
+        if let Some(header) = request.headers().get(AUTHORIZATION) {
+            answer.headers_mut().insert(AUTHORIZATION, header.clone());
+        }
+        std::future::ready(Ok::<_, BoxError>(answer))
+    });
+    // Boxed here, so the future of `present` does not name the layer's service types.
+    let resolving: BoxFuture<'static, Result<http::Response<()>, BoxError>> = layer
+        .layer(read)
+        .oneshot(Request::new(Body::empty()))
+        .boxed();
+    let resolved = tokio::time::timeout(IDENTITY_TIMEOUT, resolving)
+        .await
+        .map_err(|_| WriteError::IdentityUnverified)?
+        .map_err(|_| WriteError::IdentityUnverified)?;
+    let mut value = resolved
+        .headers()
+        .get(AUTHORIZATION)
+        .cloned()
+        .ok_or(WriteError::IdentityUnverified)?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+/// The `Authorization` a request must go out with. Only [`sending_credential`] sets it.
+///
+/// [`sending_credential`]: crate::cluster::sending_credential
 #[derive(Clone)]
 pub(crate) struct BoundHeader(pub(crate) HeaderValue);
 
-/// The step of the client stack, below its auth, that applies a [`BoundHeader`].
-pub(crate) fn apply_bound_header<B>(mut request: Request<B>) -> Request<B> {
-    if let Some(BoundHeader(value)) = request.extensions().get::<BoundHeader>().cloned() {
-        request.headers_mut().insert(AUTHORIZATION, value);
+/// The step of the client stack that picks a request's credential: one with a [`BoundHeader`]
+/// goes to `direct` with that header and resolves nothing, and any other goes through `authed`.
+#[derive(Clone)]
+pub(crate) struct AuthUnlessBound<A, S> {
+    pub(crate) authed: A,
+    pub(crate) direct: S,
+}
+
+impl<A, S, B> Service<Request<B>> for AuthUnlessBound<A, S>
+where
+    A: Service<Request<B>, Response = S::Response, Error = BoxError> + Clone + Send + 'static,
+    A::Future: Send,
+    S: Service<Request<B>, Error = BoxError> + Clone + Send + 'static,
+    S::Response: Send,
+    S::Future: Send,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<S::Response, BoxError>>;
+
+    // Each call drives a clone of the service it picks to readiness.
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        Poll::Ready(Ok(()))
     }
-    request
+
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        match request.extensions().get::<BoundHeader>().cloned() {
+            Some(BoundHeader(value)) => {
+                request.headers_mut().insert(AUTHORIZATION, value);
+                self.direct.clone().oneshot(request).boxed()
+            }
+            None => self.authed.clone().oneshot(request).boxed(),
+        }
+    }
 }
 
 /// Who the server says `client`'s credential is, as a digest.
@@ -379,7 +477,8 @@ async fn authenticated_identity(client: &Client) -> Result<Digest, WriteError> {
         .ok_or(WriteError::IdentityUnverified)?;
     let mut groups = user.groups.unwrap_or_default();
     groups.sort();
-    let extra: BTreeMap<_, _> = user.extra.unwrap_or_default();
+    let mut extra: BTreeMap<_, _> = user.extra.unwrap_or_default();
+    extra.remove(CREDENTIAL_ID);
     let mut digester = Digester::new().ok_or(WriteError::IdentityUnverified)?;
     digester.add(username.as_bytes());
     digester.add(user.uid.unwrap_or_default().as_bytes());
@@ -410,53 +509,114 @@ fn identity_error(error: &Error) -> WriteError {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::sync::Mutex;
 
     use http::Response;
-    use kube::client::Body;
-    use tower::ServiceBuilder;
+    use kube::client::ConfigExt as _;
+    use kube::config::AuthProviderConfig;
+    use tower::util::BoxCloneService;
 
     use super::*;
 
     type Seen = Arc<Mutex<Vec<String>>>;
+    type Transport = BoxCloneService<Request<Body>, Response<Body>, BoxError>;
 
     /// A client whose API answers a `SelfSubjectReview` with `answer(authorization)`, and keeps
     /// the `Authorization` of every request.
-    #[allow(clippy::disallowed_methods)] // No cluster and no credentials: a stub transport.
     fn api(answer: impl Fn(&str) -> (u16, String) + Send + Clone + 'static) -> (Client, Seen) {
+        api_behind(|transport| transport, answer)
+    }
+
+    /// [`api`], with `auth` as the client's own auth over the transport.
+    #[allow(clippy::disallowed_methods)] // No cluster and no credentials: a stub transport.
+    fn api_behind<A>(
+        auth: impl FnOnce(Transport) -> A,
+        answer: impl Fn(&str) -> (u16, String) + Send + Clone + 'static,
+    ) -> (Client, Seen)
+    where
+        A: Service<Request<Body>, Response = Response<Body>, Error = BoxError>
+            + Clone
+            + Send
+            + 'static,
+        A::Future: Send,
+    {
         let seen = Seen::default();
         let kept = seen.clone();
-        let service = ServiceBuilder::new()
-            .map_request(apply_bound_header::<Body>)
-            .service(tower::service_fn(move |request: Request<Body>| {
-                let authorization = request
-                    .headers()
-                    .get(AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned();
-                kept.lock().unwrap().push(authorization.clone());
-                let (code, body) = answer(&authorization);
-                std::future::ready(Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(code)
-                        .header("content-type", "application/json")
-                        .body(Body::from(body.into_bytes()))
-                        .unwrap(),
-                ))
-            }));
+        let direct = BoxCloneService::new(tower::service_fn(move |request: Request<Body>| {
+            let authorization = request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            kept.lock().unwrap().push(authorization.clone());
+            let (code, body) = answer(&authorization);
+            std::future::ready(Ok::<_, BoxError>(
+                Response::builder()
+                    .status(code)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.into_bytes()))
+                    .unwrap(),
+            ))
+        }));
+        let authed = auth(direct.clone());
+        let service = AuthUnlessBound { authed, direct };
         (Client::new(service, "default"), seen)
     }
 
     fn review_of(name: &str) -> (u16, String) {
+        review_with(serde_json::json!({"username": name, "groups": ["b", "a"]}))
+    }
+
+    fn review_with(user: serde_json::Value) -> (u16, String) {
         let body = serde_json::json!({
             "apiVersion": "authentication.k8s.io/v1",
             "kind": "SelfSubjectReview",
             "metadata": {},
-            "status": {"userInfo": {"username": name, "groups": ["b", "a"]}},
+            "status": {"userInfo": user},
         });
         (201, body.to_string())
+    }
+
+    /// Kube's auth layer for a provider whose command prints a new token at each run, already
+    /// expired so that every resolution runs it, and the file that counts the runs.
+    fn rotating_provider(dir: &Path) -> (Arc<AuthLayer>, PathBuf) {
+        let (script, count) = (dir.join("provider"), dir.join("count"));
+        std::fs::write(
+            &script,
+            format!(
+                "n=$(cat {count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {count}; printf \
+                 '{{\"token\":\"token-%s\",\"expiry\":\"2020-01-01T00:00:00Z\"}}' $n\n",
+                count = count.display(),
+            ),
+        )
+        .unwrap();
+        let settings = [
+            ("cmd-path", "/bin/sh".to_owned()),
+            ("cmd-args", script.display().to_string()),
+            ("token-key", "{.token}".to_owned()),
+            ("expiry-key", "{.expiry}".to_owned()),
+        ];
+        let mut config = kube::Config::new("https://example.invalid".parse().unwrap());
+        config.auth_info.auth_provider = Some(AuthProviderConfig {
+            name: "gcp".to_owned(),
+            config: settings
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+            other: Default::default(),
+        });
+        (Arc::new(config.auth_layer().unwrap().unwrap()), count)
+    }
+
+    fn runs(count: &Path) -> String {
+        std::fs::read_to_string(count).unwrap().trim().to_owned()
+    }
+
+    async fn send_review(client: Client) -> Result<SelfSubjectReview, Error> {
+        Api::all(client)
+            .create(&PostParams::default(), &SelfSubjectReview::default())
+            .await
     }
 
     fn status(code: u16) -> (u16, String) {
@@ -469,11 +629,15 @@ mod tests {
 
     fn token_file(path: &Path) -> WriteCredential {
         let source = CredentialSource::TokenFile(path.to_owned());
-        WriteCredential::new(Vec::new(), source, None)
+        WriteCredential::new(Vec::new(), source, None, None)
     }
 
     fn plugin() -> WriteCredential {
-        WriteCredential::new(Vec::new(), CredentialSource::Plugin, None)
+        WriteCredential::new(Vec::new(), CredentialSource::Plugin, None, None)
+    }
+
+    fn provider(layer: Option<Arc<AuthLayer>>) -> WriteCredential {
+        WriteCredential::new(Vec::new(), CredentialSource::AuthProvider, None, layer)
     }
 
     #[tokio::test]
@@ -557,6 +721,135 @@ mod tests {
         assert_eq!(refused.err(), Some(WriteError::IdentityUnverified));
     }
 
+    #[tokio::test]
+    async fn a_provider_token_is_resolved_once_for_the_check_and_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (layer, count) = rotating_provider(dir.path());
+        assert_eq!(runs(&count), "1");
+        let auth = layer.clone();
+        let (client, seen) = api_behind(move |t| auth.layer(t), review_of);
+
+        let presented = provider(Some(layer)).present(client).await.unwrap();
+        send_review(presented.client).await.unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["Bearer token-2", "Bearer token-2"]
+        );
+        assert_eq!(runs(&count), "2", "resolved once for both requests");
+    }
+
+    #[tokio::test]
+    async fn a_provider_token_of_another_identity_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (layer, _count) = rotating_provider(dir.path());
+        let auth = layer.clone();
+        let (client, _) = api_behind(move |t| auth.layer(t), review_of);
+        let credential = provider(Some(layer));
+
+        let reviewed = credential.present(client.clone()).await.unwrap().binding;
+        let now = credential.present(client).await.unwrap().binding;
+        assert_eq!(reviewed.holds(&now), Err(WriteError::CredentialChanged));
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_a_header_is_refused() {
+        let (client, seen) = api(|_| review_of("someone"));
+        let refused = provider(None).present(client).await;
+        assert_eq!(refused.err(), Some(WriteError::IdentityUnverified));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_bound_request_skips_the_client_auth() {
+        let failing = |_: Transport| {
+            tower::service_fn(|_: Request<Body>| {
+                std::future::ready(Err::<Response<Body>, BoxError>("no credential".into()))
+            })
+        };
+        let (client, seen) = api_behind(failing, |_| review_of("someone"));
+
+        assert!(send_review(client.clone()).await.is_err());
+        assert!(seen.lock().unwrap().is_empty(), "an unbound request stops");
+
+        let mut value = HeaderValue::from_static("Bearer bound");
+        value.set_sensitive(true);
+        let bound = crate::cluster::sending_credential(client, BoundHeader(value));
+        send_review(bound).await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), ["Bearer bound"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_credential_id_keeps_the_binding() {
+        let user = |id: &str| {
+            serde_json::json!({
+                "username": "someone", "uid": "1", "groups": ["a"],
+                "extra": {CREDENTIAL_ID: [id], "other": ["kept"]},
+            })
+        };
+        let (first, _) = api(move |_| review_with(user("one")));
+        let (second, _) = api(move |_| review_with(user("two")));
+        let credential = plugin();
+        let reviewed = credential.present(first).await.unwrap().binding;
+        let rotated = credential.present(second).await.unwrap().binding;
+        reviewed.holds(&rotated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_other_identity_field_stays_bound() {
+        let base = serde_json::json!({
+            "username": "someone", "uid": "1", "groups": ["a"],
+            "extra": {CREDENTIAL_ID: ["one"], "other": ["kept"]},
+        });
+        let credential = plugin();
+        let answer = base.clone();
+        let (client, _) = api(move |_| review_with(answer.clone()));
+        let reviewed = credential.present(client).await.unwrap().binding;
+        for (field, value) in [
+            ("username", serde_json::json!("another")),
+            ("uid", serde_json::json!("2")),
+            ("groups", serde_json::json!(["a", "b"])),
+            (
+                "extra",
+                serde_json::json!({CREDENTIAL_ID: ["one"], "other": ["changed"]}),
+            ),
+            ("extra", serde_json::json!({CREDENTIAL_ID: ["one"]})),
+        ] {
+            let mut changed = base.clone();
+            changed[field] = value;
+            let (client, _) = api(move |_| review_with(changed.clone()));
+            let now = credential.present(client).await.unwrap().binding;
+            assert_eq!(
+                reviewed.holds(&now),
+                Err(WriteError::CredentialChanged),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_files_in_use_stay_bound() {
+        let file = |name: &str, role| HeldFile {
+            path: PathBuf::from(name),
+            held: None,
+            role,
+        };
+        let files = || {
+            vec![
+                file("ca", FileRole::Authority),
+                file("cert", FileRole::ClientIdentity),
+                file("key", FileRole::ClientIdentity),
+            ]
+        };
+        let paths = |files: Vec<HeldFile>| files.into_iter().map(|f| f.path).collect::<Vec<_>>();
+        assert_eq!(
+            paths(files_in_use(files(), true)),
+            [PathBuf::from("ca")],
+            "a plugin's pair replaces the client files"
+        );
+        assert_eq!(paths(files_in_use(files(), false)).len(), 3);
+    }
+
     #[test]
     fn the_source_follows_the_order_of_precedence() {
         let file = AuthInfo {
@@ -585,6 +878,19 @@ mod tests {
         assert_eq!(
             CredentialSource::of(&AuthInfo::default()),
             CredentialSource::Definition
+        );
+        let provided = AuthInfo {
+            auth_provider: Some(AuthProviderConfig {
+                name: "gcp".to_owned(),
+                config: Default::default(),
+                other: Default::default(),
+            }),
+            token: Some(SecretString::from("t")),
+            ..AuthInfo::default()
+        };
+        assert_eq!(
+            CredentialSource::of(&provided),
+            CredentialSource::AuthProvider
         );
     }
 

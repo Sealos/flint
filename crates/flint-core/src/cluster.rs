@@ -436,19 +436,24 @@ async fn connect_gated(
     .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?;
     let ready = prepare(&held, context).await?;
     let target = ready.target;
-    let writes = WriteCredential::new(files, ready.source, ready.token.clone());
-    let (config, token) = (ready.config, ready.token);
+    let files = credential::files_in_use(files, ready.replaced_certificate);
+    let (config, token, source) = (ready.config, ready.token, ready.source);
     tokio::task::spawn_blocking(move || {
         // Once: making it can run a credential command, which both clients then share.
-        let auth = kube::client::ConfigExt::auth_layer(&config)?;
-        let read = build_client(&config, token.clone(), auth.as_ref(), Access::ReadOnly)?;
-        let write = build_client(&config, token, auth.as_ref(), Access::Unrestricted)?;
+        let auth = kube::client::ConfigExt::auth_layer(&config)?.map(std::sync::Arc::new);
+        let read = build_client(&config, token.clone(), auth.as_deref(), Access::ReadOnly)?;
+        let write = build_client(
+            &config,
+            token.clone(),
+            auth.as_deref(),
+            Access::Unrestricted,
+        )?;
         Ok::<_, kube::Error>(GatedConnection {
             clients: ClusterClients {
                 read,
                 writes: WriteAccess::new(write),
             },
-            credential: writes,
+            credential: WriteCredential::new(files, source, token, auth),
         })
     })
     .await
@@ -481,6 +486,8 @@ struct Prepared {
     token: Option<crate::auth_plugin::RefreshingToken>,
     /// Where the credential comes from, read before an exec plugin is replaced by its output.
     source: CredentialSource,
+    /// An exec plugin's certificate and key replaced any the kubeconfig names.
+    replaced_certificate: bool,
     target: Target,
 }
 
@@ -514,13 +521,14 @@ async fn prepare(kubeconfig: &Kubeconfig, context: &str) -> Result<Prepared, Clu
         });
     }
     let source = CredentialSource::of(&config.auth_info);
-    let token = crate::auth_plugin::resolve(&mut config, context)
+    let resolved = crate::auth_plugin::resolve(&mut config, context)
         .await
         .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
     Ok(Prepared {
         config,
-        token,
+        token: resolved.token,
         source,
+        replaced_certificate: resolved.replaced_certificate,
         target,
     })
 }
@@ -622,6 +630,14 @@ fn build_client(
     let http: hyper_util::client::legacy::Client<_, kube::client::Body> =
         hyper_util::client::legacy::Builder::new(hyper_util::rt::TokioExecutor::new())
             .build(connector);
+    let transport = ServiceBuilder::new()
+        .layer(config.extra_headers_layer()?)
+        .map_err(tower::BoxError::from)
+        .service(http);
+    let authed = ServiceBuilder::new()
+        .option_layer(auth)
+        .option_layer(token.map(crate::auth_plugin::TokenLayer::new))
+        .service(transport.clone());
     let service = ServiceBuilder::new()
         // Outermost, so it judges the path as asked for, before a server URL's prefix is added.
         .option_layer((access == Access::ReadOnly).then(crate::read_only::layer))
@@ -631,13 +647,11 @@ fn build_client(
                 .default_retry
                 .then(|| RetryLayer::new(ReadRetry(RetryPolicy::server_retry()))),
         )
-        .option_layer(auth)
-        .option_layer(token.map(crate::auth_plugin::TokenLayer::new))
-        // Below the auth layers: a write's checked credential is the one that goes out.
-        .map_request(credential::apply_bound_header::<kube::client::Body>)
-        .layer(config.extra_headers_layer()?)
-        .map_err(tower::BoxError::from)
-        .service(http);
+        // A write's checked credential goes out as it is, with no auth layer resolving another.
+        .service(credential::AuthUnlessBound {
+            authed,
+            direct: transport,
+        });
     Ok(kube::client::ClientBuilder::new(service, config.default_namespace.clone()).build())
 }
 

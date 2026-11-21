@@ -288,15 +288,15 @@ pub enum WriteError {
     CredentialUnreadable,
     /// The server did not say who the credential authenticates as.
     #[error(
-        "Flint could not confirm who this cluster sees you as, so nothing was changed; review \
-         the change again"
+        "Flint could not confirm who this cluster sees you as, so the next request was refused; \
+         review the change again"
     )]
     IdentityUnverified,
     /// The credential comes from a plugin and the server has no `SelfSubjectReview`.
     #[error(
         "this cluster does not serve SelfSubjectReview (Kubernetes 1.28 or later), which Flint \
-         needs to confirm a plugin's identity, so nothing was changed; review the change again \
-         once it does"
+         needs to confirm a plugin's identity, so the next request was refused; review the \
+         change again once it does"
     )]
     IdentityUnavailable,
     /// The server refused it (validation, an admission webhook, RBAC).
