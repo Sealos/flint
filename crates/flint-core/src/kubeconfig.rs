@@ -59,6 +59,8 @@ pub struct LoadedKubeconfig {
     /// The file whose entry won each cluster name: a context and its cluster can come from
     /// different files, and the server shown is the cluster entry's.
     pub cluster_sources: HashMap<String, PathBuf>,
+    /// The same for each user entry, which can come from yet another file.
+    pub user_sources: HashMap<String, PathBuf>,
 }
 
 impl LoadedKubeconfig {
@@ -162,9 +164,17 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     let mut errors = Vec::new();
     let mut defines = Vec::new();
     let mut cluster_sources = HashMap::new();
+    let mut user_sources = HashMap::new();
     for path in paths {
-        if !path.exists() {
-            continue;
+        // A path that can't be checked may hold a file: it counts as one that failed to load.
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => continue,
+            Err(e) => {
+                errors.push((path.clone(), e.to_string()));
+                continue;
+            }
         }
         let mut config = match Kubeconfig::read_from(path) {
             Ok(config) => config,
@@ -185,6 +195,11 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         for cluster in &config.clusters {
             cluster_sources
                 .entry(cluster.name.clone())
+                .or_insert_with(|| path.clone());
+        }
+        for user in &config.auth_infos {
+            user_sources
+                .entry(user.name.clone())
                 .or_insert_with(|| path.clone());
         }
         let known: HashSet<String> = merged.contexts.iter().map(|c| c.name.clone()).collect();
@@ -234,6 +249,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         errors,
         defines,
         cluster_sources,
+        user_sources,
     }
 }
 
@@ -281,6 +297,35 @@ mod tests {
             s += &format!("- name: {name}\n  context:\n    cluster: {cluster}\n    user: {user}\n");
         }
         s
+    }
+
+    // covers UP-06: a path that can't be checked is reported as failed, and the files after it
+    // still load. A path that is really absent is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_checked_is_a_failed_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let hidden = write(locked.as_path(), "a", &config(&[], &[]));
+        let shown = write(
+            dir.path(),
+            "b",
+            &config(&[("dev", "c1", "u1")], &[("c1", "https://one")]),
+        );
+        let absent = dir.path().join("absent");
+        let under_file = shown.join("nested");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::metadata(&hidden).is_err();
+        let loaded = load(&[hidden.clone(), absent, under_file, shown]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !denied {
+            return; // Running as a user that permissions don't apply to.
+        }
+        let failed: Vec<_> = loaded.errors.iter().map(|(p, _)| p).collect();
+        assert_eq!(failed, [&hidden]);
+        assert!(loaded.context("dev").is_some());
     }
 
     // covers UP-06: what each file defines is kept, shadowed names included, so a removal

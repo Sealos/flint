@@ -107,6 +107,7 @@ fn a_review_binds_to_the_live_object() {
 fn reviewed() -> ReviewedEdit {
     ReviewedEdit {
         bound: target(),
+        pin: crate::recheck::ContextHistory::default().pin("dev", None),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
         before: String::new(),
         after: String::new(),

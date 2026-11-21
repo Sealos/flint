@@ -1,6 +1,7 @@
 //! The resource actions (UP-53, UP-54) through `review_write` and `run_write`, against the fake
 //! API server: delete, scale, rollout restart, cordon, uncordon and drain. No cluster needed.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use flint_core::WriteRefusal;
@@ -27,6 +28,11 @@ impl Core {
         let dir = tempfile::tempdir().unwrap();
         let kubeconfig = dir.path().join("kubeconfig");
         server.write_kubeconfig(&kubeconfig, Some("demo")).unwrap();
+        Core::start_on(dir, vec![kubeconfig], settings).await
+    }
+
+    /// A core reading the kubeconfig files `paths`, in order, with its config in `dir`.
+    async fn start_on(dir: tempfile::TempDir, paths: Vec<PathBuf>, settings: Settings) -> Core {
         let handle = CoreHandle::start(CoreConfig {
             config_dir: dir.path().join("config"),
             settings: Settings {
@@ -34,7 +40,7 @@ impl Core {
                 ..settings
             },
             settings_error: None,
-            kubeconfig_base: vec![kubeconfig],
+            kubeconfig_base: paths,
             home: None,
             watch_files: false,
             watch_timing: WatchTiming {
@@ -524,6 +530,68 @@ async fn a_marker_added_after_the_review_is_a_conflict() {
         let seen = since(&server, from);
         assert_eq!(writes_in(&seen), 0, "{seen:?}");
         assert_eq!(seen[0], (http::Method::GET, path.to_owned()));
+    }
+}
+
+/// Runs `review` once the core has reconnected after a reload.
+async fn run_when_connected(
+    core: &Core,
+    review: &flint_core::write::WriteReview,
+) -> Result<WriteOutcome, WriteError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let result = core.handle.run_write(review.clone().into_intent()).await;
+        let waiting = matches!(
+            &result,
+            Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+                | Err(WriteError::NotServed(_))
+        );
+        if !waiting || tokio::time::Instant::now() > deadline {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+// covers UP-54: every action is bound to the connection definition it was reviewed on. A changed
+// user entry, or a definition a file that can't be read could change, sends no request for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_or_provisional_definition_sends_no_action() {
+    for provisional in [false, true] {
+        for action in 0..ACTIONS {
+            let server = FakeApiServer::start().await.unwrap();
+            workload(&server, 2);
+            node(&server);
+            let dir = tempfile::tempdir().unwrap();
+            let (first, kubeconfig) = (dir.path().join("first"), dir.path().join("kubeconfig"));
+            std::fs::write(&first, "apiVersion: v1\nkind: Config\n").unwrap();
+            server.write_kubeconfig(&kubeconfig, Some("demo")).unwrap();
+            let paths = vec![first.clone(), kubeconfig.clone()];
+            let core = Core::start_on(dir, paths, Settings::default()).await;
+            let (target, proposal, _, path) = every_action(&server).swap_remove(action);
+            let review = core.handle.review_write(target, proposal).await.unwrap();
+
+            if provisional {
+                std::fs::write(&first, "not: [valid").unwrap();
+            } else {
+                let text = std::fs::read_to_string(&kubeconfig).unwrap();
+                assert!(text.contains("user: {}"), "{text}");
+                let edited = text.replace("user: {}", "user:\n    token: another");
+                std::fs::write(&kubeconfig, edited).unwrap();
+            }
+            core.handle.reload_kubeconfig().await.unwrap();
+            let from = server.requests().len();
+            let result = run_when_connected(&core, &review).await;
+            let expected = if provisional {
+                WriteError::KubeconfigUnreadable
+            } else {
+                WriteError::ConnectionChanged
+            };
+            assert_eq!(result.unwrap_err(), expected, "{path}");
+            let seen = since(&server, from);
+            assert_eq!(writes_in(&seen), 0, "{path}: {seen:?}");
+            assert!(!seen.iter().any(|(_, p)| p == path), "{path}: {seen:?}");
+        }
     }
 }
 
