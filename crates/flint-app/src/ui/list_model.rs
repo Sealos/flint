@@ -122,8 +122,8 @@ const SAMPLE_ROWS: usize = 2_000;
 /// Each column's width in characters: the longest of its header and the cells of the sampled
 /// `rows` (indexes into `snapshot.rows`: [`rows_to_measure`], so a namespace filter leaves out
 /// the widths of rows it hides and a text filter moves nothing), within limits. The name column
-/// is measured up to the longest name. A Secret's masked column is as wide as the mask, whatever its value. Runs
-/// on a background thread; it is the only per-row work outside `compute_view`.
+/// is measured up to the longest name. A Secret's masked column is as wide as the mask, whatever
+/// its value. Runs on a background thread; it is the only per-row work outside `compute_view`.
 pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<usize> {
     let step = (rows.len() / SAMPLE_ROWS).max(1);
     // Sampled in snapshot order, not display order: a sort must not change which rows are
