@@ -611,23 +611,32 @@ impl TestWorkspace {
         std::fs::read_to_string(self.dir.join("settings.toml")).unwrap_or_default()
     }
 
-    /// Waits for the next connection to the silent server (`alpha`'s) and returns it. While it
-    /// is held, open and unanswered, the attempt that made it neither fails nor retries.
-    pub async fn wait_for_contact(&self, cx: &mut TestAppContext) -> TcpStream {
+    /// Waits until `alpha`'s connection attempt has reached the silent server, returning that
+    /// connection, or has failed without reaching it. While the connection is held, open and
+    /// unanswered, the attempt neither fails nor retries.
+    pub async fn wait_for_alpha_attempt(&self, cx: &mut TestAppContext) -> Option<TcpStream> {
         let listener = self.listener.try_clone().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let states = self.states.clone();
         let accepted: Rc<RefCell<Option<TcpStream>>> = Rc::default();
         let slot = accepted.clone();
-        cx.wait_for(self.window, WAIT, move |_, _| match listener.accept() {
-            Ok((stream, _)) => {
-                *slot.borrow_mut() = Some(stream);
-                true
+        cx.wait_for(self.window, WAIT, move |_, _| {
+            // Read before accepting, so a connection made by an attempt seen as failed is taken.
+            let failed = states
+                .borrow()
+                .iter()
+                .any(|(name, s)| name == "alpha" && matches!(s, ConnectionState::Failed(_)));
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    *slot.borrow_mut() = Some(stream);
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => failed,
+                Err(e) => panic!("accept: {e}"),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(e) => panic!("accept: {e}"),
         })
         .await;
-        accepted.take().expect("a connection was accepted")
+        accepted.take()
     }
 
     /// Whether anything has connected to the silent server (`alpha`'s) so far.
