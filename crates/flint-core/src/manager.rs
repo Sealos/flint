@@ -2007,12 +2007,18 @@ mod tests {
         }
     }
 
-    /// Records a clean load showing [`context`], for a manager whose slot a test added by hand.
+    /// A kubeconfig file in `dir` defining [`context`]'s server, as the list of files to read.
+    fn kubeconfig_file(dir: &Path) -> Vec<PathBuf> {
+        let path = dir.join("kubeconfig");
+        std::fs::write(&path, kubeconfig_with("https://dev")).unwrap();
+        vec![path]
+    }
+
+    /// Records a clean load of the manager's files, for a manager whose slot a test added by
+    /// hand.
     fn record_load(manager: &mut ClusterManager) {
-        manager.contexts.record(&kubeconfig::LoadedKubeconfig {
-            contexts: vec![context(None)],
-            ..Default::default()
-        });
+        let loaded = kubeconfig::load(&manager.kubeconfig_paths);
+        manager.contexts.record(&loaded);
     }
 
     // covers UP-21
@@ -2169,7 +2175,7 @@ mod tests {
             config_dir: dir.path().to_owned(),
             settings: Settings::default(),
             settings_error: None,
-            kubeconfig_base: Vec::new(),
+            kubeconfig_base: kubeconfig_file(dir.path()),
             home: None,
             watch_files: false,
             watch_timing: Default::default(),
@@ -3314,7 +3320,7 @@ mod tests {
                 config_dir: dir.path().to_owned(),
                 settings: Settings::default(),
                 settings_error: None,
-                kubeconfig_base: Vec::new(),
+                kubeconfig_base: kubeconfig_file(dir.path()),
                 home: None,
                 watch_files: false,
                 watch_timing: Default::default(),
