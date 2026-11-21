@@ -812,9 +812,7 @@ impl ServerHandler for FlintMcp {
                     CALL.scope(std::cell::RefCell::default(), async {
                         // Dropping the call's future ends its Kubernetes requests.
                         let (result, finished) = tokio::select! {
-                            result = self.tool_router.call(call) => {
-                                (without_argument_values(result), true)
-                            }
+                            result = self.tool_router.call(call) => (result, true),
                             () = cancelled.cancelled() => {
                                 (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
                             }
@@ -833,6 +831,13 @@ impl ServerHandler for FlintMcp {
                             let record = c.record.take().filter(|_| finished);
                             (record, std::mem::take(&mut *c))
                         });
+                        // A tool that ran left its record: its text is the cluster's, not rmcp's
+                        // error for arguments that never reached it.
+                        let result = if finished && record.is_none() {
+                            without_argument_values(result)
+                        } else {
+                            result
+                        };
                         (result, record, note)
                     })
                     .await
