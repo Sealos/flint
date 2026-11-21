@@ -974,12 +974,7 @@ pub(crate) async fn run(
                 session.set_state(ExecState::Closed);
                 return;
             }
-            Outcome::Done(state) => {
-                // An exit code means the command ran, even if it printed nothing.
-                session.input_not_replayed |=
-                    input_not_replayed && matches!(state, ExecState::Exited { code: Some(_) });
-                session.set_state(state);
-            }
+            Outcome::Done(state) => session.set_state(state),
         }
         break;
     }
@@ -1547,7 +1542,15 @@ impl Session {
             }
         };
         let early = (early.len() <= EARLY_OUTPUT).then_some(early.as_slice());
-        outcome(status.as_ref(), result, executable, saw_output, early)
+        let ended = outcome(status.as_ref(), result, executable, saw_output, early);
+        // An exit code shows the command ran, even if it printed nothing. A runtime can report
+        // 126 or 127 for a command it could not start, so those need output that shows it did.
+        if let Outcome::Done(ExecState::Exited { code: Some(code) }) = ended
+            && (started || !matches!(code, 126 | 127))
+        {
+            self.input_not_replayed |= input_not_replayed;
+        }
+        ended
     }
 
     /// After the command is gone: keeps the screen scrollable and selectable until the front end
