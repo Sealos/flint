@@ -752,17 +752,45 @@ impl Workspace {
         let core = self.model.read(cx).core().clone();
         let names = self.cluster_names(cx);
         let handle = window.window_handle();
-        let started = detail.clone();
-        write_confirm::open_with(
+        // The same claim as the row actions: one write at a time per object.
+        let key = resource_actions::WriteKey::of(review.target());
+        let begin = {
+            let (key, detail) = (key.clone(), detail.clone());
+            move |cx: &mut App| match resource_actions::claim(
+                &key,
+                resource_actions::RunningWrite::YamlEdit,
+                cx,
+            ) {
+                Ok(()) => {
+                    let _ = detail.update(cx, |d, cx| d.edit_applying(cx));
+                    true
+                }
+                Err(why) => {
+                    let detail = detail.clone();
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = detail.update(cx, |d, cx| {
+                            d.edit_applied(
+                                Err(flint_core::write::WriteError::Failed(why)),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                    false
+                }
+            }
+        };
+        write_confirm::open_noted(
             window,
             cx,
             core,
             review.clone(),
             &names,
-            move |cx| {
-                let _ = started.update(cx, |d, cx| d.edit_applying(cx));
-            },
+            None,
+            begin,
             move |result, cx| {
+                // First, and outside the window: a closed one must not keep the object claimed.
+                resource_actions::release(&key, cx);
                 let detail = detail.clone();
                 let _ = handle.update(cx, |_, window, cx| {
                     let _ = detail.update(cx, |d, cx| d.edit_applied(result, window, cx));

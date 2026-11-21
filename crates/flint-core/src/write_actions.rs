@@ -187,18 +187,23 @@ fn drain_options(change: &ResourceChange) -> Option<DrainOptions> {
     }
 }
 
-/// Reads the live object once. Another uid or GitOps manager than the review saw is a conflict,
-/// and a failed read refuses the action.
+/// Reads the live object once. Another uid or GitOps manager than the review saw, or a Deployment
+/// paused for a restart, is a conflict, and a failed read refuses the action.
 async fn recheck(
     gate: &mut impl ActionGate,
     kind: &KindInfo,
     target: &WriteTarget,
+    change: &ResourceChange,
     reviewed: &Reviewed,
 ) -> Result<(), WriteError> {
     let client = gate.client().await?;
     let live = read_live(&client, kind, target).await?;
     let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
-    if uid != target.uid.as_deref() || gitops::managed_by_object(&live) != reviewed.managed {
+    let paused = live.pointer("/spec/paused").and_then(Value::as_bool) == Some(true);
+    if uid != target.uid.as_deref()
+        || gitops::managed_by_object(&live) != reviewed.managed
+        || (paused && *change == ResourceChange::RolloutRestart)
+    {
         return Err(WriteError::Conflict);
     }
     Ok(())
@@ -225,7 +230,7 @@ pub(crate) async fn run(
         resource_version: None,
         drain,
     };
-    recheck(gate, kind, target, reviewed).await?;
+    recheck(gate, kind, target, change, reviewed).await?;
     match change {
         ResourceChange::Delete => delete(gate, &object).await?,
         ResourceChange::Scale { from, to } => scale(gate, &object, *from, *to).await?,
@@ -537,6 +542,8 @@ pub enum BlockedReason {
     Changed,
     /// A GitOps controller's marker on it is not the one reviewed.
     ManagedSinceReview,
+    /// The API server is limiting requests.
+    Throttled,
     Failed(String),
 }
 
@@ -644,7 +651,8 @@ async fn managed_pods(
 }
 
 /// Reads `pod` just before its eviction: `false` if it is gone, and why to leave it if it is
-/// another pod now, or not what the review warned about.
+/// another pod now, the drain's options no longer cover it, or it is not what the review warned
+/// about.
 async fn still_evictable(
     client: Client,
     pod: &Pod,
@@ -654,8 +662,12 @@ async fn still_evictable(
     match timed(api.get_opt(&pod.name_any())).await {
         Ok(None) => Ok(false),
         Ok(Some(now)) if now.uid() != pod.uid() => Err(BlockedReason::Changed),
-        Ok(Some(now)) if is_unwarned(&now, options) => Err(BlockedReason::ManagedSinceReview),
-        Ok(Some(_)) => Ok(true),
+        Ok(Some(now)) => match plan(&now, options) {
+            PodPlan::Evict if is_unwarned(&now, options) => Err(BlockedReason::ManagedSinceReview),
+            PodPlan::Evict => Ok(true),
+            PodPlan::Block(reason) => Err(reason),
+            PodPlan::Skip => Err(BlockedReason::Changed),
+        },
         Err(error) => Err(BlockedReason::Failed(WriteError::from(error).to_string())),
     }
 }
@@ -784,7 +796,8 @@ pub(crate) async fn drain(
             }
             Err(error) => {
                 let reason = match api_code(&error) {
-                    Some(429) => BlockedReason::DisruptionBudget,
+                    Some(429) if is_disruption_budget(&error) => BlockedReason::DisruptionBudget,
+                    Some(429) => BlockedReason::Throttled,
                     Some(409) => BlockedReason::Changed,
                     _ => BlockedReason::Failed(ClusterError::kube(error).summary().to_string()),
                 };
@@ -796,6 +809,21 @@ pub(crate) async fn drain(
     report.terminating = terminating;
     report.stopped = stopped.map(Into::into);
     report
+}
+
+/// Whether a 429 from the Eviction API is a PodDisruptionBudget's, not a rate limit.
+fn is_disruption_budget(error: &kube::Error) -> bool {
+    let kube::Error::Api(status) = error else {
+        return false;
+    };
+    status
+        .details
+        .as_ref()
+        .is_some_and(|d| d.causes.iter().any(|c| c.reason == "DisruptionBudget"))
+        || status
+            .message
+            .to_ascii_lowercase()
+            .contains("disruption budget")
 }
 
 /// Whether `pod` is confirmed gone: no pod has its name, or another one does.
@@ -1471,7 +1499,9 @@ mod tests {
         ];
         let (client, log) = fake(drain_server(pods, |name| {
             if name == "guarded" {
-                (429, status(429, "TooManyRequests"))
+                let mut refused = status(429, "TooManyRequests");
+                refused["details"] = json!({"causes": [{"reason": "DisruptionBudget"}]});
+                (429, refused)
             } else {
                 accepted()
             }
@@ -1624,6 +1654,33 @@ mod tests {
         let report = drain(&mut writes(client, open()), &node(), &quick()).await;
         assert_eq!(report.blocked, [(named("moved"), BlockedReason::Changed)]);
         assert!(report.evicted.is_empty());
+    }
+
+    // covers UP-53: a 429 with no budget behind it is rate limiting, reported once, and the drain
+    // goes on to the next pod.
+    #[tokio::test]
+    async fn a_rate_limited_eviction_is_not_a_disruption_budget() {
+        let pods = vec![
+            pod("limited", Some("ReplicaSet"), json!({})),
+            pod("web", Some("ReplicaSet"), json!({})),
+        ];
+        let (client, log) = fake(drain_server(pods, |name| match name {
+            "limited" => (429, status(429, "TooManyRequests")),
+            _ => accepted(),
+        }));
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
+        assert_eq!(
+            report.blocked,
+            [(named("limited"), BlockedReason::Throttled)]
+        );
+        assert_eq!(report.evicted, [named("web")]);
+        let tries = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path.ends_with("/limited/eviction"))
+            .count();
+        assert_eq!(tries, 1, "not retried");
     }
 
     // covers UP-51, UP-53: a pod is read just before its eviction. One whose GitOps manager was

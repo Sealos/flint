@@ -131,6 +131,28 @@ impl ResourceAction {
     }
 }
 
+/// What runs on an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ui) enum RunningWrite {
+    Action(ResourceAction),
+    YamlEdit,
+}
+
+impl From<ResourceAction> for RunningWrite {
+    fn from(action: ResourceAction) -> Self {
+        RunningWrite::Action(action)
+    }
+}
+
+impl RunningWrite {
+    fn doing(self) -> &'static str {
+        match self {
+            RunningWrite::Action(action) => action.doing(),
+            RunningWrite::YamlEdit => "edited",
+        }
+    }
+}
+
 /// The object a write runs on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::ui) struct WriteKey {
@@ -155,7 +177,7 @@ impl WriteKey {
         }
     }
 
-    fn of(target: &WriteTarget) -> Self {
+    pub(in crate::ui) fn of(target: &WriteTarget) -> Self {
         Self::new(
             &target.cluster,
             &target.kind,
@@ -165,7 +187,7 @@ impl WriteKey {
     }
 
     /// Why no other action can run on this object while `running` does.
-    fn busy(&self, running: ResourceAction) -> String {
+    fn busy(&self, running: RunningWrite) -> String {
         format!("{} is being {}", self.name, running.doing())
     }
 }
@@ -179,28 +201,28 @@ struct FinishedDrain {
 /// The writes running now, in every window, and the latest drain's result.
 #[derive(Default)]
 pub(in crate::ui) struct RunningWrites {
-    running: BTreeMap<WriteKey, ResourceAction>,
+    running: BTreeMap<WriteKey, RunningWrite>,
     finished: Option<FinishedDrain>,
 }
 
 impl Global for RunningWrites {}
 
 /// What runs on `key` now, if anything.
-pub(in crate::ui) fn running_on(key: &WriteKey, cx: &App) -> Option<ResourceAction> {
+pub(in crate::ui) fn running_on(key: &WriteKey, cx: &App) -> Option<RunningWrite> {
     cx.try_global::<RunningWrites>()?.running.get(key).copied()
 }
 
 /// Claims `key` for `action`. `Err` says what runs on it already.
 pub(in crate::ui) fn claim(
     key: &WriteKey,
-    action: ResourceAction,
+    write: impl Into<RunningWrite>,
     cx: &mut App,
 ) -> Result<(), String> {
     if let Some(running) = running_on(key, cx) {
         return Err(key.busy(running));
     }
     cx.update_default_global::<RunningWrites, _>(|writes, _| {
-        writes.running.insert(key.clone(), action);
+        writes.running.insert(key.clone(), write.into());
     });
     Ok(())
 }
@@ -560,7 +582,7 @@ pub(in crate::ui) fn drain_strips(theme: &Theme, cx: &App) -> Vec<AnyElement> {
     let draining: Vec<&WriteKey> = writes
         .running
         .iter()
-        .filter(|(_, action)| **action == ResourceAction::Drain)
+        .filter(|(_, write)| **write == RunningWrite::Action(ResourceAction::Drain))
         .map(|(key, _)| key)
         .collect();
     if let Some(text) = draining_text(&draining) {
@@ -867,6 +889,7 @@ fn blocked_reason(reason: &BlockedReason) -> String {
         BlockedReason::Unmanaged => "no controller would recreate them".to_owned(),
         BlockedReason::LocalStorage => "their emptyDir data would be lost".to_owned(),
         BlockedReason::Changed => "they were replaced since they were listed".to_owned(),
+        BlockedReason::Throttled => "the API server is limiting requests".to_owned(),
         BlockedReason::ManagedSinceReview => {
             "their GitOps manager is not the one reviewed".to_owned()
         }

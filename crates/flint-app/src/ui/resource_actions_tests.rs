@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use super::row_actions_tests::{draw, menu, right_click, show_fetched};
 use crate::ui::confirm;
 use crate::ui::registry;
-use crate::ui::resource_actions::{ResourceAction, WriteKey, claim, release, request, running_on};
+use crate::ui::resource_actions::{
+    ResourceAction, RunningWrite, WriteKey, claim, release, request, running_on,
+};
 use crate::ui::row_menu;
 use crate::ui::support_tests::{
     CURRENT_GENERATION, TestWorkspace, WAIT, discovery, kubeconfig_yaml, objects,
@@ -878,4 +880,23 @@ async fn a_drain_shows_in_a_strip_then_offers_its_report(cx: &mut TestAppContext
         wait_for_no_dialog(cx, &t).await;
         assert!(t.find(cx, "drain-result").is_none(), "viewed");
     }
+}
+
+// covers UP-53: a YAML edit and a row action share one claim per object.
+#[gpui_kit::test]
+async fn a_yaml_edit_and_a_row_action_cannot_overlap(cx: &mut TestAppContext) {
+    cx.update(|cx| claim(&web_key(), RunningWrite::YamlEdit, cx))
+        .unwrap();
+    assert_eq!(
+        cx.update(|cx| claim(&web_key(), ResourceAction::Delete, cx)),
+        Err("web is being edited".to_owned())
+    );
+    cx.update(|cx| release(&web_key(), cx));
+    cx.update(|cx| claim(&web_key(), ResourceAction::Scale, cx))
+        .unwrap();
+    assert_eq!(
+        cx.update(|cx| claim(&web_key(), RunningWrite::YamlEdit, cx)),
+        Err("web is being scaled".to_owned())
+    );
+    cx.update(|cx| release(&web_key(), cx));
 }

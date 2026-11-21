@@ -322,7 +322,7 @@ async fn drain_reports_pods_a_budget_protects() {
     server.add_pod(pod_on_node("web", "ReplicaSet"));
     let core = Core::start(&server, Settings::default()).await;
     server.inject(
-        Fault::status(429)
+        Fault::disruption_budget()
             .on(&Gvr::core("pods"))
             .named("guarded")
             .subresource("eviction"),
@@ -601,7 +601,7 @@ async fn a_drain_warns_about_the_managed_pods_it_evicts() {
         other => panic!("{other:?}"),
     }
     server.inject(
-        Fault::status(429)
+        Fault::disruption_budget()
             .on(&Gvr::core("pods"))
             .named("guarded")
             .subresource("eviction"),
@@ -659,4 +659,72 @@ async fn a_pod_marked_after_the_review_stops_the_drain() {
     let seen = since(&server, from);
     assert_eq!(writes_in(&seen), 0, "{seen:?}");
     assert!(server.object(&nodes(), None, NODE).unwrap()["spec"]["unschedulable"].is_null());
+}
+
+// covers UP-53: a Deployment paused after the review is a conflict, and no patch is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deployment_paused_after_the_review_is_not_restarted() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::RolloutRestart)
+        .await
+        .unwrap();
+    let mut paused = live(&server);
+    paused["spec"]["paused"] = json!(true);
+    server.set_object(&deployments(), paused);
+    let from = server.requests().len();
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    let seen = since(&server, from);
+    assert_eq!(writes_in(&seen), 0, "{seen:?}");
+}
+
+// covers UP-53: a pod the confirmed options no longer cover when its turn comes stays, and no
+// eviction is sent for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_that_lost_its_controller_is_not_evicted() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("pod-a")
+            .subresource("eviction")
+            .times(1),
+    );
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let first = "/api/v1/namespaces/demo/pods/pod-a/eviction";
+        while !server.arrivals().iter().any(|r| r.path == first) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first eviction");
+    let pods = Gvr::core("pods");
+    let mut orphan = server.object(&pods, Some("demo"), "pod-b").unwrap();
+    orphan["metadata"]["ownerReferences"] = json!([]);
+    server.set_object(&pods, orphan);
+
+    let drained = report(running.await.unwrap().unwrap());
+    assert_eq!(drained.evicted, [named("pod-a")]);
+    assert_eq!(
+        drained.blocked,
+        [(named("pod-b"), BlockedReason::Unmanaged)]
+    );
+    assert_eq!(evictions(&server, "pod-b"), 0);
+    assert!(server.object(&pods, Some("demo"), "pod-b").is_some());
 }
