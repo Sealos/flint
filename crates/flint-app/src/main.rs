@@ -185,6 +185,7 @@ fn main() -> ExitCode {
         Ok(boot) => boot,
         Err(e) => {
             eprintln!("flint: {e}");
+            bootstrap::log_startup_failure(&format!("flint: {e}"));
             return ExitCode::FAILURE;
         }
     };

@@ -57,7 +57,10 @@ EOF
 
 init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
 # The server exits when stdin closes; timeout guards against a hang.
-answer=$(echo "$init" | KUBECONFIG=$scratch/kubeconfig FLINT_CONFIG_DIR=$scratch/config FLINT_LOG=warn \
+# HOME and XDG_STATE_HOME place the log file: never the real one when run locally.
+mkdir -p "$scratch/home"
+answer=$(echo "$init" | HOME=$scratch/home XDG_STATE_HOME=$scratch/state \
+  KUBECONFIG=$scratch/kubeconfig FLINT_CONFIG_DIR=$scratch/config FLINT_LOG=warn \
   timeout 60 "$binary" | head -n 1)
 if ! grep -q '"serverInfo":{[^}]*"name":"flint"' <<<"$answer"; then
   echo "error: flint-mcp did not answer initialize: $answer" >&2

@@ -30,6 +30,7 @@ pub unsafe fn serve_stdio_main(program: &str, verbose: bool) -> ExitCode {
         Ok(boot) => boot,
         Err(e) => {
             eprintln!("{program}: {e}");
+            bootstrap::log_startup_failure(&format!("{program}: {e}"));
             return ExitCode::FAILURE;
         }
     };
