@@ -530,14 +530,17 @@ impl App {
 
     /// Writes the app's `settings.toml` (see [`crate::scratch::write_settings`]). Kubeconfig
     /// files the new settings add (`kubeconfig_paths`) are snapshotted first, with the request
-    /// counts of the servers they name, before the app can read them (UP-90, UP-91). Tests
+    /// counts of the servers the new file list names, before the app can read them, and a
+    /// selected context the new order moves is checked from that moment (UP-90, UP-91). Tests
     /// change settings through this, not by writing the file.
     pub fn write_settings(&self, settings: &str) -> Result<()> {
         let staged = tempfile::tempdir()?;
         crate::scratch::write_settings(staged.path(), settings)?;
         let files = kubeconfig_files_in(self.kubeconfig.as_deref(), &self.home(), staged.path());
-        self.teardown().expect_files(files);
-        crate::scratch::write_settings(&self.config_dir(), settings)
+        self.teardown().settings_writing(files);
+        let written = crate::scratch::write_settings(&self.config_dir(), settings);
+        self.teardown().settings_written();
+        written
     }
 
     /// Says the test is failing with an error it is about to return: dropping the app then

@@ -62,6 +62,9 @@ impl Server {
 /// The kubeconfig files the app reads now (its settings can add some during a test).
 pub type Files = Box<dyn Fn() -> Vec<PathBuf> + Send>;
 
+/// What had reached each unselected server at some moment, by URL.
+type Arrived = BTreeMap<String, Vec<RequestRecord>>;
+
 /// The state the teardown checks need, kept from the app's launch.
 pub struct Teardown {
     files: Files,
@@ -74,10 +77,13 @@ pub struct Teardown {
     servers: BTreeMap<String, Server>,
     /// The contexts the test has selected.
     selected: BTreeSet<String>,
-    /// What had reached each unselected server when the test's kubeconfig edit began: a context
-    /// the edit moves onto one is checked against this, since the app may react to the edit
-    /// before the harness reads it.
-    before_edit: BTreeMap<String, Vec<RequestRecord>>,
+    /// How many of the test's kubeconfig edits and settings writes are under way.
+    changes: usize,
+    /// For each selected context, while a change is under way: what had reached each unselected
+    /// server when the context could first be moved. A selected context the change moves onto
+    /// one is checked against this, since the app may follow the move before the harness reads
+    /// it. An explicit selection is always checked against the live arrivals.
+    move_baselines: BTreeMap<String, Arrived>,
     violations: Vec<String>,
 }
 
@@ -91,7 +97,8 @@ impl Teardown {
             contexts: BTreeMap::new(),
             servers: BTreeMap::new(),
             selected: BTreeSet::new(),
-            before_edit: BTreeMap::new(),
+            changes: 0,
+            move_baselines: BTreeMap::new(),
             violations: Vec::new(),
         };
         teardown.snapshot_kubeconfigs();
@@ -102,67 +109,124 @@ impl Teardown {
     /// The test is about to change the kubeconfig `files` on purpose (UP-06): a named file that
     /// already differs from its baseline was changed by something else.
     pub fn kubeconfig_editing(&mut self, files: &[PathBuf]) {
+        let named: Vec<PathBuf> = files.iter().map(|f| resolved(f)).collect();
         for (path, before) in &self.kubeconfigs {
-            if files.contains(path)
+            if (files.contains(path) || named.contains(&resolved(path)))
                 && let Some(violation) = changed(path, before)
             {
                 self.violations.push(violation);
             }
         }
-        self.before_edit = self
-            .servers
-            .iter()
-            .filter(|(_, server)| !server.selected)
-            .map(|(url, server)| (url.clone(), server.requests()))
-            .collect();
+        self.change_begins();
     }
 
     /// The test has changed the kubeconfig `files`: their new bytes are the ones checked at the
-    /// end. Other files keep their baseline.
+    /// end, under every path that leads to them. Other files keep their baseline.
     pub fn kubeconfig_edited(&mut self, files: &[PathBuf]) {
         for path in files {
-            let bytes = std::fs::read(path).ok();
-            match self.kubeconfigs.iter_mut().find(|(p, _)| p == path) {
-                Some((_, baseline)) => *baseline = bytes,
-                None => self.kubeconfigs.push((path.clone(), bytes)),
+            let target = resolved(path);
+            let mut watched = false;
+            for (known, baseline) in &mut self.kubeconfigs {
+                if known == path || resolved(known) == target {
+                    *baseline = std::fs::read(&*known).ok();
+                    watched = true;
+                }
+            }
+            if !watched {
+                let bytes = std::fs::read(path).ok();
+                self.kubeconfigs.push((path.clone(), bytes));
             }
         }
-        self.refresh_contexts();
-        self.before_edit.clear();
+        self.change_ends();
     }
 
-    /// The app is about to read `files` (settings the test is about to write list them): their
-    /// bytes, and the request counts of the fake servers they name, are taken now, before the
-    /// app can read or contact them.
-    pub fn expect_files(&mut self, files: Vec<PathBuf>) {
-        for path in files {
-            if !self.kubeconfigs.iter().any(|(p, _)| *p == path) {
-                let bytes = std::fs::read(&path).ok();
-                self.kubeconfigs.push((path, bytes));
+    /// The test is about to publish settings under which the app reads `files`, in this order:
+    /// their bytes, and the request counts of the fake servers they name together, are taken
+    /// now, before the app can read or contact them. Ends with [`Teardown::settings_written`].
+    pub fn settings_writing(&mut self, files: Vec<PathBuf>) {
+        for path in &files {
+            if !self.kubeconfigs.iter().any(|(p, _)| p == path) {
+                let bytes = std::fs::read(path).ok();
+                self.kubeconfigs.push((path.clone(), bytes));
             }
         }
         self.refresh_contexts();
+        // Together, in order: a context in one file can use a cluster defined in another.
+        for (name, url) in named_servers(&files) {
+            self.track(&url);
+            self.contexts.entry(name).or_default().insert(url);
+        }
+        self.change_begins();
+    }
+
+    /// The settings of [`Teardown::settings_writing`] are published: a selected context they
+    /// moved to another server makes that server selected.
+    pub fn settings_written(&mut self) {
+        self.change_ends();
+    }
+
+    /// A kubeconfig edit or settings write starts: selected contexts may move from here on.
+    fn change_begins(&mut self) {
+        self.changes += 1;
+        let arrived = self.arrived();
+        for context in self.selected.clone() {
+            self.keep_move_baseline(&context, &arrived);
+        }
+    }
+
+    /// The change is complete: moves it made are checked, and the last one to end drops the
+    /// baselines.
+    fn change_ends(&mut self) {
+        self.refresh_contexts();
+        self.changes = self.changes.saturating_sub(1);
+        if self.changes == 0 {
+            self.move_baselines.clear();
+        }
+    }
+
+    /// What has reached each unselected server so far.
+    fn arrived(&self) -> Arrived {
+        self.servers
+            .iter()
+            .filter(|(_, server)| !server.selected)
+            .map(|(url, server)| (url.clone(), server.requests()))
+            .collect()
+    }
+
+    /// Records `arrived` as what `context` may be moved against; an earlier record stands.
+    fn keep_move_baseline(&mut self, context: &str, arrived: &Arrived) {
+        let baseline = self.move_baselines.entry(context.to_owned()).or_default();
+        for (url, requests) in arrived {
+            baseline
+                .entry(url.clone())
+                .or_insert_with(|| requests.clone());
+        }
     }
 
     /// The test selects `context` now, as the current kubeconfig search order resolves it:
     /// checks that the app has not contacted its server yet, and allows requests to it from here
-    /// on.
+    /// on. A context the current kubeconfig does not have is not selected: adding it later
+    /// allows nothing.
     pub fn selecting(&mut self, context: &str) {
         self.refresh_contexts();
-        self.selected.insert(context.to_owned());
         let current = flint_core::kubeconfig::load(&(self.files)());
-        if let Some(url) = current
-            .context(context)
-            .and_then(|c| c.server.as_deref())
-            .map(server_key)
-        {
-            self.checkpoint(context, &url);
+        let Some(found) = current.context(context) else {
+            return;
+        };
+        if let Some(url) = found.server.as_deref().map(server_key) {
+            self.checkpoint(context, &url, None);
+        }
+        self.selected.insert(context.to_owned());
+        if self.changes > 0 {
+            let arrived = self.arrived();
+            self.keep_move_baseline(context, &arrived);
         }
     }
 
     /// `context` now names the server at `url`: the first time that makes the server selected,
-    /// anything that had already reached it is a violation.
-    fn checkpoint(&mut self, context: &str, url: &str) {
+    /// anything that had already reached it is a violation. That is what `baseline` holds when
+    /// a change moved the context there, and the live arrivals otherwise.
+    fn checkpoint(&mut self, context: &str, url: &str, baseline: Option<Vec<RequestRecord>>) {
         let Some(server) = self.servers.get_mut(url) else {
             return;
         };
@@ -170,11 +234,7 @@ impl Teardown {
             return;
         }
         server.selected = true;
-        let requests = self
-            .before_edit
-            .get(url)
-            .cloned()
-            .unwrap_or_else(|| server.requests());
+        let requests = baseline.unwrap_or_else(|| server.requests());
         if !requests.is_empty() {
             self.violations.push(unexpected(
                 &format!("before the test selected {context:?}"),
@@ -256,7 +316,12 @@ impl Teardown {
         }
         for (name, url) in current {
             if self.selected.contains(&name) {
-                self.checkpoint(&name, &url);
+                let baseline = self
+                    .move_baselines
+                    .get(&name)
+                    .and_then(|arrived| arrived.get(&url))
+                    .cloned();
+                self.checkpoint(&name, &url, baseline);
             }
         }
     }
@@ -315,6 +380,28 @@ fn server_key(url: &str) -> String {
             format!("https://127.0.0.1:{}", &url[LOCALHOST.len()..])
         }
         _ => url.to_owned(),
+    }
+}
+
+/// The file `path` leads to, through symlinks. A missing file resolves through its directory,
+/// and a dangling symlink to the file it would create.
+fn resolved(path: &Path) -> PathBuf {
+    const MAX_LINKS: usize = 40;
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        if let Ok(real) = std::fs::canonicalize(&path) {
+            return real;
+        }
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        path = path.parent().unwrap_or(Path::new("")).join(target);
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            std::fs::canonicalize(parent).map_or_else(|_| path.clone(), |dir| dir.join(name))
+        }
+        _ => path,
     }
 }
 
@@ -573,7 +660,8 @@ mod tests {
         write_kubeconfigs(&only_a, &[(&two.a, "a", None)]).unwrap();
         let mut teardown = files(vec![only_a]);
         // Settings are about to add the file with b: its bytes and b's count are taken now.
-        teardown.expect_files(vec![path.clone()]);
+        teardown.settings_writing(vec![path.clone()]);
+        teardown.settings_written();
         two.contact(&two.b);
         std::fs::write(&path, "rewritten").unwrap();
         let violations = teardown.finish(ok(), &two.dir.path().join("no-socket"));
