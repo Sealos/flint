@@ -17,10 +17,17 @@ use kube::api::{
     Preconditions,
 };
 use kube::{Client, ResourceExt as _};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::cluster::ClusterError;
 use crate::protection::WriteRefusal;
+use crate::read::KindInfo;
+use crate::write::{
+    RequestGate, ResourceChange, WriteError, WriteOutcome, WriteProposal, WriteTarget,
+};
+
+/// How long one request of an action may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Who changed the object, as the API server records it.
 const FIELD_MANAGER: &str = "flint";
@@ -35,6 +42,158 @@ const MIRROR_POD: &str = "kubernetes.io/config.mirror";
 pub(crate) trait ActionGate: Send {
     /// A client for the next request, if the gate allows it now. Never keep it.
     fn client(&mut self) -> impl Future<Output = Result<Client, ActionError>> + Send;
+}
+
+impl ActionGate for RequestGate {
+    async fn client(&mut self) -> Result<Client, ActionError> {
+        RequestGate::client(self)
+            .await
+            .map_err(|error| match error {
+                WriteError::Refused(refusal) => ActionError::Refused(refusal),
+                other => ActionError::Failed(other.to_string()),
+            })
+    }
+}
+
+/// `request`, bounded by [`REQUEST_TIMEOUT`].
+async fn timed<T>(request: impl Future<Output = Result<T, kube::Error>>) -> Result<T, ActionError> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
+        Ok(result) => result.map_err(ActionError::of),
+        Err(_) => Err(ActionError::Failed(timed_out())),
+    }
+}
+
+fn timed_out() -> String {
+    format!(
+        "the API server did not answer within {} s; the change may or may not have applied",
+        REQUEST_TIMEOUT.as_secs()
+    )
+}
+
+fn is_scalable(kind: &ApiResource) -> bool {
+    match kind.group.as_str() {
+        "apps" => matches!(
+            kind.plural.as_str(),
+            "deployments" | "statefulsets" | "replicasets"
+        ),
+        "" => kind.plural == "replicationcontrollers",
+        _ => false,
+    }
+}
+
+fn is_restartable(kind: &ApiResource) -> bool {
+    kind.group == "apps"
+        && matches!(
+            kind.plural.as_str(),
+            "deployments" | "daemonsets" | "statefulsets"
+        )
+}
+
+fn is_node(kind: &ApiResource) -> bool {
+    kind.group.is_empty() && kind.plural == "nodes"
+}
+
+/// What `proposal` does to the live object, if its kind has that action.
+pub(crate) fn review(
+    kind: &KindInfo,
+    live: &Value,
+    proposal: WriteProposal,
+) -> Result<ResourceChange, WriteError> {
+    let resource = &kind.resource;
+    let refuse = |action: &str| {
+        Err(WriteError::Rejected(format!(
+            "{} cannot be {action}",
+            resource.plural
+        )))
+    };
+    match proposal {
+        WriteProposal::Delete => Ok(ResourceChange::Delete),
+        WriteProposal::Scale { .. } if !is_scalable(resource) => refuse("scaled"),
+        WriteProposal::Scale { to } => {
+            let from = live
+                .pointer("/spec/replicas")
+                .and_then(Value::as_u64)
+                .and_then(|replicas| u32::try_from(replicas).ok())
+                .ok_or_else(|| WriteError::Failed("the object has no replica count".to_owned()))?;
+            Ok(ResourceChange::Scale { from, to })
+        }
+        WriteProposal::RolloutRestart if !is_restartable(resource) => refuse("restarted"),
+        WriteProposal::RolloutRestart => Ok(ResourceChange::RolloutRestart),
+        WriteProposal::Cordon | WriteProposal::Uncordon | WriteProposal::Drain { .. }
+            if !is_node(resource) =>
+        {
+            refuse("cordoned or drained")
+        }
+        WriteProposal::Cordon => Ok(ResourceChange::Cordon),
+        WriteProposal::Uncordon => Ok(ResourceChange::Uncordon),
+        WriteProposal::Drain {
+            delete_emptydir_data,
+            force,
+        } => Ok(ResourceChange::Drain {
+            delete_emptydir_data,
+            force,
+        }),
+        _ => refuse("changed this way"),
+    }
+}
+
+/// Runs a reviewed action on `target`.
+pub(crate) async fn run(
+    gate: &mut impl ActionGate,
+    kind: &KindInfo,
+    target: &WriteTarget,
+    change: &ResourceChange,
+) -> Result<WriteOutcome, WriteError> {
+    let object = ActionObject {
+        resource: kind.resource.clone(),
+        namespace: target.namespace.clone().filter(|_| kind.namespaced),
+        name: target.name.clone(),
+        uid: target
+            .uid
+            .clone()
+            .ok_or_else(|| WriteError::Failed("the object has no uid".to_owned()))?,
+    };
+    let done = |drain| WriteOutcome {
+        resource_version: None,
+        drain,
+    };
+    match change {
+        ResourceChange::Delete => delete(gate, &object).await?,
+        ResourceChange::Scale { from, to } => scale(gate, &object, *from, *to).await?,
+        ResourceChange::RolloutRestart => rollout_restart(gate, &object).await?,
+        ResourceChange::Cordon => set_cordoned(gate, &object, true).await?,
+        ResourceChange::Uncordon => set_cordoned(gate, &object, false).await?,
+        ResourceChange::Drain {
+            delete_emptydir_data,
+            force,
+        } => {
+            let options = DrainOptions {
+                delete_emptydir_data: *delete_emptydir_data,
+                force: *force,
+                ..Default::default()
+            };
+            let mut report = drain(gate, &object, &options).await;
+            if !report.cordoned
+                && let Some(error) = report.stopped.take()
+            {
+                return Err(error);
+            }
+            return Ok(done(Some(report)));
+        }
+    }
+    Ok(done(None))
+}
+
+impl From<ActionError> for WriteError {
+    fn from(error: ActionError) -> Self {
+        match error {
+            ActionError::Refused(refusal) => WriteError::Refused(refusal),
+            ActionError::Conflict(_) => WriteError::Conflict,
+            ActionError::Gone(_) => WriteError::Gone,
+            ActionError::Unsupported(message) => WriteError::Rejected(message),
+            ActionError::Failed(message) => WriteError::Failed(message),
+        }
+    }
 }
 
 /// The object an action was reviewed for.
@@ -126,12 +285,9 @@ pub(crate) async fn delete(
         preconditions: Some(uid_precondition(&object.uid)),
         ..Default::default()
     };
-    object
-        .api(client)
-        .delete(&object.name, &params)
+    timed(object.api(client).delete(&object.name, &params))
         .await
         .map(drop)
-        .map_err(ActionError::of)
 }
 
 /// Changes a workload's replicas from `from`, the count reviewed, to `to`. A JSON Patch tests the
@@ -145,15 +301,7 @@ pub(crate) async fn scale(
     to: u32,
 ) -> Result<(), ActionError> {
     let resource = &object.resource;
-    let scalable = match resource.group.as_str() {
-        "apps" => matches!(
-            resource.plural.as_str(),
-            "deployments" | "statefulsets" | "replicasets"
-        ),
-        "" => resource.plural == "replicationcontrollers",
-        _ => false,
-    };
-    if !scalable {
+    if !is_scalable(resource) {
         return Err(ActionError::Unsupported(format!(
             "{} cannot be scaled",
             resource.plural
@@ -175,7 +323,11 @@ pub(crate) async fn scale(
         .header(http::header::ACCEPT, "application/json")
         .body(patch.to_string().into_bytes())
         .map_err(|e| ActionError::Failed(e.to_string()))?;
-    match client.request_text(request).await {
+    let sent = tokio::time::timeout(REQUEST_TIMEOUT, client.request_text(request)).await;
+    let Ok(result) = sent else {
+        return Err(ActionError::Failed(timed_out()));
+    };
+    match result {
         Ok(_) => Ok(()),
         Err(error) if is_failed_patch_test(&error) => Err(ActionError::Conflict(
             "the replica count or the object changed since it was reviewed".to_owned(),
@@ -199,12 +351,7 @@ pub(crate) async fn rollout_restart(
     object: &ActionObject,
 ) -> Result<(), ActionError> {
     let resource = &object.resource;
-    if resource.group != "apps"
-        || !matches!(
-            resource.plural.as_str(),
-            "deployments" | "daemonsets" | "statefulsets"
-        )
-    {
+    if !is_restartable(resource) {
         return Err(ActionError::Unsupported(format!(
             "{} cannot be restarted",
             resource.plural
@@ -216,12 +363,13 @@ pub(crate) async fn rollout_restart(
         "metadata": { "uid": object.uid },
         "spec": { "template": { "metadata": { "annotations": { RESTARTED_AT: now } } } },
     });
-    object
-        .api(client)
-        .patch(&object.name, &patch_params(), &Patch::Merge(&patch))
-        .await
-        .map(drop)
-        .map_err(ActionError::of)
+    timed(
+        object
+            .api(client)
+            .patch(&object.name, &patch_params(), &Patch::Merge(&patch)),
+    )
+    .await
+    .map(drop)
 }
 
 /// Marks a node unschedulable, or schedulable again.
@@ -235,11 +383,12 @@ pub(crate) async fn set_cordoned(
         "metadata": { "uid": node.uid },
         "spec": { "unschedulable": cordoned },
     });
-    node.api(client)
-        .patch(&node.name, &patch_params(), &Patch::Merge(&patch))
-        .await
-        .map(drop)
-        .map_err(ActionError::of)
+    timed(
+        node.api(client)
+            .patch(&node.name, &patch_params(), &Patch::Merge(&patch)),
+    )
+    .await
+    .map(drop)
 }
 
 /// What a drain may evict beyond what `kubectl drain` does by default, and how long it waits.
@@ -267,14 +416,15 @@ impl Default for DrainOptions {
 
 /// A pod, by namespace and name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PodName {
-    pub(crate) namespace: String,
-    pub(crate) name: String,
+pub struct PodName {
+    pub namespace: String,
+    pub name: String,
 }
 
 /// Why a drain left a pod on the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlockedReason {
+#[non_exhaustive]
+pub enum BlockedReason {
     /// A PodDisruptionBudget does not allow it now.
     DisruptionBudget,
     /// No controller would recreate it.
@@ -288,20 +438,21 @@ pub(crate) enum BlockedReason {
 
 /// What a drain did, however it ended.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DrainReport {
-    pub(crate) cordoned: bool,
+#[non_exhaustive]
+pub struct DrainReport {
+    pub cordoned: bool,
     /// Evictions the API server accepted.
-    pub(crate) evicted: Vec<PodName>,
+    pub evicted: Vec<PodName>,
     /// Pods left on the node, and why.
-    pub(crate) blocked: Vec<(PodName, BlockedReason)>,
+    pub blocked: Vec<(PodName, BlockedReason)>,
     /// DaemonSet and mirror pods, which a drain leaves.
-    pub(crate) skipped: Vec<PodName>,
+    pub skipped: Vec<PodName>,
     /// Pods not tried, because the drain stopped first.
-    pub(crate) remaining: Vec<PodName>,
+    pub remaining: Vec<PodName>,
     /// Evicted pods still terminating when the wait ended.
-    pub(crate) terminating: Vec<PodName>,
+    pub terminating: Vec<PodName>,
     /// Why the drain stopped early.
-    pub(crate) stopped: Option<ActionError>,
+    pub stopped: Option<WriteError>,
 }
 
 /// What a drain does with a pod.
@@ -358,7 +509,7 @@ pub(crate) async fn drain(
 ) -> DrainReport {
     let mut report = DrainReport::default();
     if let Err(error) = set_cordoned(gate, node, true).await {
-        report.stopped = Some(error);
+        report.stopped = Some(error.into());
         return report;
     }
     report.cordoned = true;
@@ -366,17 +517,17 @@ pub(crate) async fn drain(
     let client = match gate.client().await {
         Ok(client) => client,
         Err(error) => {
-            report.stopped = Some(error);
+            report.stopped = Some(error.into());
             return report;
         }
     };
-    let listed = Api::<Pod>::all(client)
-        .list(&ListParams::default().fields(&format!("spec.nodeName={}", node.name)))
-        .await;
+    let params = ListParams::default().fields(&format!("spec.nodeName={}", node.name));
+    let api = Api::<Pod>::all(client);
+    let listed = timed(api.list(&params)).await;
     let pods = match listed {
         Ok(list) => list.items,
         Err(error) => {
-            report.stopped = Some(ActionError::of(error));
+            report.stopped = Some(error.into());
             return report;
         }
     };
@@ -399,11 +550,18 @@ pub(crate) async fn drain(
             Err(error) => {
                 report.remaining.push(name);
                 report.remaining.extend(pods.map(|p| pod_name(&p)));
-                report.stopped = Some(error);
+                report.stopped = Some(error.into());
                 return report;
             }
         };
-        match evict(client, &pod).await {
+        let evicted = tokio::time::timeout(REQUEST_TIMEOUT, evict(client, &pod)).await;
+        let Ok(evicted) = evicted else {
+            report
+                .blocked
+                .push((name, BlockedReason::Failed(timed_out())));
+            continue;
+        };
+        match evicted {
             Ok(()) => {
                 report.evicted.push(name);
                 accepted.push(pod);
@@ -422,7 +580,7 @@ pub(crate) async fn drain(
     }
     let (terminating, stopped) = wait_until_gone(gate, accepted, options).await;
     report.terminating = terminating;
-    report.stopped = stopped;
+    report.stopped = stopped.map(Into::into);
     report
 }
 
@@ -465,7 +623,7 @@ async fn wait_until_gone(
         let mut still = Vec::new();
         for pod in left {
             let api = Api::<Pod>::namespaced(client.clone(), &pod.namespace().unwrap_or_default());
-            match api.get_opt(&pod.name_any()).await {
+            match timed(api.get_opt(&pod.name_any())).await {
                 Ok(Some(now)) if now.uid() == pod.uid() => still.push(pod),
                 Ok(_) => {}
                 // Not known to be gone.
@@ -606,6 +764,63 @@ mod tests {
         Arc::new(AtomicBool::new(false))
     }
 
+    fn kind_info(resource: ApiResource) -> KindInfo {
+        KindInfo {
+            resource,
+            namespaced: true,
+            verbs: Vec::new(),
+            singular: String::new(),
+            short_names: Vec::new(),
+        }
+    }
+
+    // covers UP-53: a review reads the count it changes from, and each action is for its kinds.
+    #[test]
+    fn a_review_reads_the_count_and_checks_the_kind() {
+        let deployments = kind_info(resource("apps", "v1", "Deployment", "deployments"));
+        let nodes = kind_info(resource("", "v1", "Node", "nodes"));
+        let live = json!({"spec": {"replicas": 2}});
+        assert_eq!(
+            review(&deployments, &live, WriteProposal::Scale { to: 5 }),
+            Ok(ResourceChange::Scale { from: 2, to: 5 })
+        );
+        assert!(matches!(
+            review(
+                &deployments,
+                &json!({"spec": {}}),
+                WriteProposal::Scale { to: 5 }
+            ),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(matches!(
+            review(&nodes, &live, WriteProposal::Scale { to: 5 }),
+            Err(WriteError::Rejected(_))
+        ));
+        assert!(matches!(
+            review(&nodes, &live, WriteProposal::RolloutRestart),
+            Err(WriteError::Rejected(_))
+        ));
+        assert!(matches!(
+            review(&deployments, &live, WriteProposal::Cordon),
+            Err(WriteError::Rejected(_))
+        ));
+        let drain = WriteProposal::Drain {
+            delete_emptydir_data: true,
+            force: false,
+        };
+        assert_eq!(
+            review(&nodes, &live, drain),
+            Ok(ResourceChange::Drain {
+                delete_emptydir_data: true,
+                force: false
+            })
+        );
+        assert_eq!(
+            review(&deployments, &live, WriteProposal::Delete),
+            Ok(ResourceChange::Delete)
+        );
+    }
+
     // covers UP-53: delete names the reviewed object by uid.
     #[tokio::test]
     async fn delete_sends_the_uid() {
@@ -686,7 +901,7 @@ mod tests {
         assert_eq!(set_cordoned(&mut gated, &node(), true).await, refused);
         let report = drain(&mut gated, &node(), &DrainOptions::default()).await;
         assert!(!report.cordoned);
-        assert_eq!(report.stopped, Some(ActionError::Refused(refusal())));
+        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
         assert!(log.lock().unwrap().is_empty());
     }
 
@@ -1004,7 +1219,7 @@ mod tests {
         assert!(report.cordoned);
         assert_eq!(report.evicted, [named("one")]);
         assert_eq!(report.remaining, [named("two"), named("three")]);
-        assert_eq!(report.stopped, Some(ActionError::Refused(refusal())));
+        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
         let evictions = log
             .lock()
             .unwrap()
@@ -1027,7 +1242,7 @@ mod tests {
         let report = drain(&mut writes(client, closed), &node(), &quick()).await;
         assert_eq!(report.evicted, [named("one")]);
         assert_eq!(report.terminating, [named("one")]);
-        assert_eq!(report.stopped, Some(ActionError::Refused(refusal())));
+        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
     }
 
     // covers UP-53: a pod replaced since it was listed is reported, and one already gone is not.

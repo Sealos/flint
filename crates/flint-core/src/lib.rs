@@ -34,10 +34,6 @@ pub mod terminal;
 pub mod view;
 mod watch;
 pub mod write;
-#[allow(
-    dead_code,
-    reason = "the action bodies; `write::run_write` calls them when it lands"
-)]
 mod write_actions;
 
 pub use cluster::{ClusterId, SafeErrorText, ServerVersion};
