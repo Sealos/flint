@@ -972,7 +972,7 @@ async fn list_shows_loading_stale_and_failed_states(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_denied_list_checks_access_then_says_no_access(cx: &mut TestAppContext) {
     let (core, _dir) = core();
-    let (_window, list) = open(cx, core);
+    let (window, list) = open(cx, core);
     let refused = |retrying: bool, cause| {
         let error = "pods is forbidden".to_owned();
         if retrying {
@@ -1028,18 +1028,19 @@ async fn a_denied_list_checks_access_then_says_no_access(cx: &mut TestAppContext
         list.update(cx, |list, cx| {
             list.set_snapshot(pods(shown, state.clone(), version as u64 + 1), cx)
         });
-        cx.run_until_parked();
-        let view = list.read_with(cx, |list, _| list.view_state());
-        assert_eq!(view.sync, chip, "{state:?}");
-        assert_eq!(view.placeholder, placeholder, "{state:?}");
-        let text = view.banners.iter().find(|b| b.id == "list-banner");
-        match banner {
-            Some(start) => {
-                let text = &text.expect("a banner").text;
-                assert!(text.starts_with(start), "{state:?}: {text}");
-            }
-            None => assert!(text.is_none(), "{state:?}: {text:?}"),
-        }
+        // The rows and the state drawn with them land when the recompute does.
+        cx.wait_for(window, WAIT, |_, cx| {
+            let view = list.read(cx).view_state();
+            let text = view.banners.iter().find(|b| b.id == "list-banner");
+            view.sync == chip
+                && view.total == shown.len()
+                && view.placeholder == placeholder
+                && match banner {
+                    Some(start) => text.is_some_and(|b| b.text.starts_with(start)),
+                    None => text.is_none(),
+                }
+        })
+        .await;
     }
 }
 
