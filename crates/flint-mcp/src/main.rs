@@ -20,10 +20,10 @@ Same server as `flint mcp`, without the desktop app. Where Flint is installed, r
 in AI clients; elsewhere, this binary. It serves only the clusters that ai_exposed_clusters in
 settings.toml exposes.
 
-settings.toml is read from the first of:
-  $FLINT_CONFIG_DIR
-  $XDG_CONFIG_HOME/flint (Linux)
-  ~/.config/flint (Linux), ~/Library/Application Support/Flint (macOS)";
+settings.toml is read from one directory, chosen without checking that the file exists:
+  $FLINT_CONFIG_DIR, if set and not empty
+  else on Linux: $XDG_CONFIG_HOME/flint, if that is an absolute path, else ~/.config/flint
+  else on macOS: ~/Library/Application Support/Flint";
 
 /// `Ok(verbose)` to serve; `Err` holds what to print and the exit code. Program name excluded.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<bool, (String, u8)> {
