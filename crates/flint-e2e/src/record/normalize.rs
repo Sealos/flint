@@ -262,6 +262,9 @@ fn normalize_age_cells(table: &mut Map<String, Value>) {
     {
         for (i, cell) in cells.iter_mut().enumerate() {
             let Value::String(text) = cell else { continue };
+            if text == CREDENTIAL_MARKER {
+                continue;
+            }
             if ages.contains(&i) {
                 if Some(i) == age {
                     // The fake server renders Age from the creation time.
@@ -322,17 +325,19 @@ pub fn scrub_helm_configmaps(list: &mut Value) {
 
 /// Hides annotation values and every cell outside the safe columns of a Secret Table.
 pub fn scrub_secret_table(table: &mut Value) {
-    let safe: Vec<bool> = table
+    let definitions: Vec<(&str, &str)> = table
         .get("columnDefinitions")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .map(|c| {
-            c.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(redact::is_safe_secret_column)
+            let text = |field| c.get(field).and_then(Value::as_str).unwrap_or_default();
+            (text("name"), text("format"))
         })
         .collect();
+    let safe = redact::safe_secret_wire_columns(&definitions);
+    let name_first = definitions.first().is_some_and(|d| d.0 == "Name");
+    let age_at = definitions.iter().position(|d| d.0 == "Age");
     for row in table
         .get_mut("rows")
         .and_then(Value::as_array_mut)
@@ -342,9 +347,20 @@ pub fn scrub_secret_table(table: &mut Value) {
         if let Some(object) = row.get_mut("object") {
             redact::mask_secret(object, SECRET_MARKER);
         }
+        // The Name cell is the server's text: keep the object's own name instead.
+        let name = row
+            .pointer("/object/metadata/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let Some(cells) = row.get_mut("cells").and_then(Value::as_array_mut) {
             for (i, cell) in cells.iter_mut().enumerate() {
-                if !safe.get(i).copied().unwrap_or(false) {
+                if i == 0 && name_first {
+                    let shown = name.clone().filter(|_| safe[0]);
+                    *cell = Value::String(shown.unwrap_or_else(|| CREDENTIAL_MARKER.to_owned()));
+                } else if !safe.get(i).copied().unwrap_or(false)
+                    // A string Age is replaced when ages are normalized; nothing else is.
+                    || (Some(i) == age_at && !cell.is_string())
+                {
                     *cell = Value::String(CREDENTIAL_MARKER.to_owned());
                 }
             }
@@ -564,12 +580,86 @@ mod tests {
         let mut table = json!({
             "columnDefinitions": [{"name": "Name"}, {"name": "Type"}, {"name": "Value"}],
             "rows": [{"cells": ["s", "Opaque", "hunter2"],
-                      "object": {"metadata": {"annotations": {"kubectl.kubernetes.io/last-applied-configuration": "{}"}}}}],
+                      "object": {"metadata": {"name": "s", "annotations": {"kubectl.kubernetes.io/last-applied-configuration": "{}"}}}}],
         });
         scrub_secret_table(&mut table);
         assert_eq!(
             table["rows"][0]["cells"],
             json!(["s", "Opaque", CREDENTIAL_MARKER])
+        );
+
+        // A hidden cell stays hidden when ages are normalized, even under an `Age` header.
+        let mut named_age = json!({
+            "columnDefinitions": [{"name": "Age", "format": "name"}],
+            "rows": [{"cells": ["hunter2"]}],
+        });
+        scrub_secret_table(&mut named_age);
+        normalize_age_cells(named_age.as_object_mut().unwrap());
+        assert_eq!(named_age["rows"][0]["cells"], json!([CREDENTIAL_MARKER]));
+
+        // An `Age` of format `name`, then a plain `Age`: neither raw cell survives recording.
+        let mut age_as_name = json!({
+            "columnDefinitions": [{"name": "Age", "format": "name"}, {"name": "Age"}],
+            "rows": [{"cells": ["hunter2", "hunter3"]}],
+        });
+        scrub_secret_table(&mut age_as_name);
+        normalize_age_cells(age_as_name.as_object_mut().unwrap());
+        assert_eq!(
+            age_as_name["rows"][0]["cells"],
+            json!([CREDENTIAL_MARKER, CREDENTIAL_MARKER])
+        );
+
+        // An Age cell that is not a string is hidden by the scrub alone.
+        for raw in [
+            json!({"token": "hunter2"}),
+            json!(12345678),
+            json!(null),
+            json!(true),
+            json!(["hunter2"]),
+        ] {
+            let mut table = json!({
+                "columnDefinitions": [{"name": "Name"}, {"name": "Age"}],
+                "rows": [{"cells": ["s", raw], "object": {"metadata": {"name": "s"}}}],
+            });
+            scrub_secret_table(&mut table);
+            assert_eq!(table["rows"][0]["cells"], json!(["s", CREDENTIAL_MARKER]));
+        }
+
+        // A standard Secret Table is recorded unchanged.
+        let mut standard = json!({
+            "columnDefinitions": [
+                {"name": "Name", "format": "name"}, {"name": "Type"}, {"name": "Data"},
+                {"name": "Age"},
+            ],
+            "rows": [{"cells": ["s", "Opaque", 2, "1d"], "object": {"metadata": {"name": "s"}}}],
+        });
+        let before = standard.clone();
+        scrub_secret_table(&mut standard);
+        assert_eq!(standard, before);
+
+        // With no object to take the name from, the Name cell is hidden too.
+        let mut no_object = json!({
+            "columnDefinitions": [{"name": "Name"}],
+            "rows": [{"cells": ["hunter2"]}],
+        });
+        scrub_secret_table(&mut no_object);
+        assert_eq!(no_object["rows"][0]["cells"], json!([CREDENTIAL_MARKER]));
+
+        // A column is not safe because of its header alone.
+        let mut repeated = json!({
+            "columnDefinitions": [
+                {"name": "Name"}, {"name": "Type"}, {"name": "Data"}, {"name": "Age"},
+                {"name": "Name"}, {"name": "Namespace"}, {"name": "Type"}, {"name": "Data"},
+                {"name": "Age"},
+            ],
+            "rows": [{"cells": ["wire-text", "Opaque", 1, "1d", "a", "b", "c", "d", "e"],
+                      "object": {"metadata": {"name": "s"}}}],
+        });
+        scrub_secret_table(&mut repeated);
+        let m = CREDENTIAL_MARKER;
+        assert_eq!(
+            repeated["rows"][0]["cells"],
+            json!([m, m, m, m, m, m, m, m, m])
         );
         assert_eq!(
             table["rows"][0]["object"]["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"],

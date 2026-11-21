@@ -1,6 +1,9 @@
 //! What the MCP server may show (ADR-0009): opt-in clusters, their scopes (ADR-0013),
 //! redaction, and output bounds. Everything here is pure so it can be tested without a cluster.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use flint_core::Settings;
 use flint_core::kubeconfig::{ContextInfo, LoadedKubeconfig};
 use flint_core::read::{KindInfo, is_dns1123_label, is_dns1123_subdomain, is_path_segment};
@@ -93,8 +96,28 @@ pub fn changed_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> 
         .count()
 }
 
-/// A hint for the agent when list_clusters has nothing useful to show.
-pub fn list_clusters_hint(exposed: usize, changed: usize) -> Option<String> {
+/// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
+/// the count is reported, not their names.
+pub fn missing_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> usize {
+    settings
+        .ai_exposed_clusters
+        .iter()
+        .map(|exposure| exposure.context.as_str())
+        .filter(|name| !kubeconfig.contexts.iter().any(|c| c.name == *name))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// A hint for the agent when list_clusters has nothing useful to show. For the `missing`
+/// exposures, `paths` are the kubeconfig files this server checked, and `load_failed` says some of
+/// them could not be loaded: the context may be in one, where adding the file again would not help.
+pub fn list_clusters_hint(
+    exposed: usize,
+    changed: usize,
+    missing: usize,
+    paths: &[PathBuf],
+    load_failed: bool,
+) -> Option<String> {
     let changed_note = match changed {
         0 => String::new(),
         1 => " One cluster the user exposed now points to a different API server, so it is hidden \
@@ -105,13 +128,48 @@ pub fn list_clusters_hint(exposed: usize, changed: usize) -> Option<String> {
              hidden until they expose them again in Flint."
         ),
     };
-    if exposed == 0 {
+    let missing_note = match missing {
+        0 => String::new(),
+        n => {
+            let clusters = if n == 1 {
+                "One cluster the user exposed is".to_owned()
+            } else {
+                format!("{n} clusters the user exposed are")
+            };
+            let files = paths
+                .iter()
+                .map(|path| {
+                    // One path at a time: a redacted value runs to the end of its line.
+                    let mut shown = path.display().to_string();
+                    redact_text(&mut shown);
+                    shown
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let advice = if load_failed {
+                "Some of these files could not be loaded (see kubeconfig_errors): ask the user \
+                 to fix them. If the cluster is in none of them, ask the user to add its \
+                 kubeconfig file to kubeconfig_paths in Flint's settings.toml."
+            } else {
+                "Ask the user to add the missing kubeconfig file to kubeconfig_paths in Flint's \
+                 settings.toml."
+            };
+            format!(
+                " {clusters} not in the kubeconfig files this server checked ({files}). {advice}"
+            )
+        }
+    };
+    if exposed == 0 && missing == 0 {
         Some(format!(
             "No clusters are exposed to AI agents. Ask the user to open Flint and turn on \
              Expose to AI (the robot button) next to a cluster in the sidebar.{changed_note}"
         ))
-    } else if changed > 0 {
-        Some(changed_note.trim_start().to_owned())
+    } else if changed > 0 || missing > 0 {
+        Some(
+            format!("{changed_note}{missing_note}")
+                .trim_start()
+                .to_owned(),
+        )
     } else {
         None
     }
@@ -546,16 +604,83 @@ mod tests {
         let unknown = exposed_cluster(&s, &kc, "nope").unwrap_err().to_string();
         assert_eq!(changed.replace("dev", "X"), unknown.replace("nope", "X"));
         assert_eq!(changed_exposures(&s, &kc), 1);
-        let hint = list_clusters_hint(0, 1).unwrap();
+        let hint = list_clusters_hint(0, 1, 0, &[], false).unwrap();
         assert!(hint.contains("Expose to AI") && hint.contains("different API server"));
     }
 
     // covers UP-09
     #[test]
     fn hint_only_when_useful() {
-        assert!(list_clusters_hint(0, 0).unwrap().contains("Expose to AI"));
-        assert_eq!(list_clusters_hint(2, 0), None);
-        assert!(list_clusters_hint(1, 2).unwrap().starts_with("2 clusters"));
+        assert!(
+            list_clusters_hint(0, 0, 0, &[], false)
+                .unwrap()
+                .contains("Expose to AI")
+        );
+        assert_eq!(list_clusters_hint(2, 0, 0, &[], false), None);
+        assert!(
+            list_clusters_hint(1, 2, 0, &[], false)
+                .unwrap()
+                .starts_with("2 clusters")
+        );
+    }
+
+    // covers UP-09
+    #[test]
+    fn an_exposed_context_missing_from_the_kubeconfig_is_counted_once() {
+        let kc = kubeconfig(&["dev"]);
+        let mut s = settings(&["dev", "ghost", "other"]);
+        s.ai_exposed_clusters
+            .push(AiExposure::new("ghost", "https://moved-ghost"));
+        assert_eq!(missing_exposures(&s, &kc), 2);
+        // A loaded context on another server is "changed", not missing.
+        let moved = Settings {
+            ai_exposed_clusters: vec![AiExposure::new("dev", "https://old-dev")],
+            ..Default::default()
+        };
+        assert_eq!(missing_exposures(&moved, &kc), 0);
+    }
+
+    // covers UP-09
+    #[test]
+    fn missing_hint_lists_the_files_read_and_never_the_context() {
+        let paths = [PathBuf::from("/a/config"), PathBuf::from("/b/config")];
+        let hint = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        assert!(hint.starts_with("One cluster"), "{hint}");
+        assert!(hint.contains("/a/config, /b/config"), "{hint}");
+        assert!(hint.contains("kubeconfig_paths"), "{hint}");
+        // It is already exposed, so the advice to turn that on would be wrong.
+        assert!(!hint.contains("turn on"), "{hint}");
+
+        let both = list_clusters_hint(1, 1, 2, &paths, false).unwrap();
+        assert!(both.contains("different API server"), "{both}");
+        assert!(
+            both.contains("2 clusters the user exposed are not"),
+            "{both}"
+        );
+    }
+
+    // covers UP-09
+    #[test]
+    fn missing_hint_points_at_files_that_failed_to_load() {
+        let paths = [PathBuf::from("/a/config")];
+        let hint = list_clusters_hint(0, 0, 1, &paths, true).unwrap();
+        assert!(hint.contains("could not be loaded"), "{hint}");
+        assert!(hint.contains("kubeconfig_errors"), "{hint}");
+        let clean = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        assert!(!clean.contains("kubeconfig_errors"), "{clean}");
+    }
+
+    // covers UP-09
+    #[test]
+    fn missing_hint_redacts_credentials_in_paths_and_keeps_the_advice() {
+        let paths = [
+            PathBuf::from("/home/me/password=hunter2"),
+            PathBuf::from("/b/config"),
+        ];
+        let hint = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        assert!(!hint.contains("hunter2"), "{hint}");
+        assert!(hint.contains("/b/config"), "{hint}");
+        assert!(hint.contains("kubeconfig_paths"), "{hint}");
     }
 
     // covers UP-09

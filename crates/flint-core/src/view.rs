@@ -45,13 +45,7 @@ pub fn compute(snapshot: &KindSnapshot, query: &ViewQuery, now: i64) -> Vec<u32>
     };
     let secret = is_secret_list(snapshot.kind.as_str());
     // A cell with no declared column has no name to allow, so a Secret's stays hidden.
-    let masked = |column: usize| {
-        secret
-            && snapshot
-                .columns
-                .get(column)
-                .is_none_or(|c| is_masked_column(secret, &c.name))
-    };
+    let masked = |column: usize| is_masked_column(secret, &snapshot.columns, column);
     let needle = query.text.trim().to_ascii_lowercase();
     if !needle.is_empty() {
         picked.retain(|&i| matches_text(&snapshot.rows[i as usize], &needle, now, masked));
@@ -325,6 +319,88 @@ mod tests {
         // What the list shows still matches.
         assert_eq!(text(&s, "b"), ["b"]);
         assert_eq!(text(&s, "opaque"), ["a", "b", "c"]);
+    }
+
+    /// A Secret list with the standard columns, then one more column under each safe header.
+    fn with_repeated_headers(values: [&str; 3]) -> KindSnapshot {
+        let col = |n: &str, role| Column {
+            name: n.into(),
+            ty: ColumnType::String,
+            format: "".into(),
+            description: "".into(),
+            priority: 0,
+            role,
+        };
+        let rows = ["a", "b", "c"]
+            .into_iter()
+            .zip(values)
+            .map(|(name, value)| {
+                Arc::new(Row {
+                    uid: name.into(),
+                    name: name.into(),
+                    namespace: Some("ns".into()),
+                    resource_version: "1".into(),
+                    generation: None,
+                    created: Some(0),
+                    labels: Box::new([]),
+                    cells: vec![
+                        Cell::Name,
+                        Cell::Namespace,
+                        Cell::Text("Opaque".into()),
+                        Cell::Int(1),
+                        Cell::Age,
+                        Cell::Text(format!("raw-name-{value}").into()),
+                        Cell::Text(format!("raw-namespace-{value}").into()),
+                        Cell::Text(format!("raw-type-{value}").into()),
+                        Cell::Text(format!("raw-data-{value}").into()),
+                        Cell::Age,
+                    ]
+                    .into(),
+                })
+            })
+            .collect();
+        KindSnapshot {
+            kind: crate::KindId::new("", "secrets"),
+            namespaced: true,
+            columns: vec![
+                col("Name", ColumnRole::Name),
+                col("Namespace", ColumnRole::Namespace),
+                col("Type", ColumnRole::Value),
+                col("Data", ColumnRole::Value),
+                col("Age", ColumnRole::Age),
+                col("Name", ColumnRole::Value),
+                col("Namespace", ColumnRole::Value),
+                col("Type", ColumnRole::Value),
+                col("Data", ColumnRole::Value),
+                col("Age", ColumnRole::Age),
+            ]
+            .into(),
+            rows,
+            ..Default::default()
+        }
+    }
+
+    // covers UP-21: a column is not safe because of its header alone.
+    #[test]
+    fn a_repeated_safe_header_is_not_searched_or_sorted() {
+        let s = with_repeated_headers(["x1", "x2", "x3"]);
+        for needle in ["raw-name", "raw-namespace", "raw-type", "raw-data", "x2"] {
+            assert!(text(&s, needle).is_empty(), "{needle} matched");
+        }
+        // Type and Data are ambiguous once repeated, so neither copy is searched.
+        assert!(text(&s, "opaque").is_empty());
+        let reversed = with_repeated_headers(["x3", "x2", "x1"]);
+        for column in [2, 3, 5, 6, 7, 8] {
+            assert_eq!(sorted(&s, column, true), ["a", "b", "c"], "{column}");
+            assert_eq!(
+                sorted(&reversed, column, false),
+                ["a", "b", "c"],
+                "{column}"
+            );
+        }
+        // The object's own identity still matches and sorts.
+        assert_eq!(text(&s, "b"), ["b"]);
+        assert_eq!(sorted(&s, 0, true), ["c", "b", "a"]);
     }
 
     // covers UP-21

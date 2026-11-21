@@ -42,7 +42,7 @@ impl ResourceList {
                 let cells: Vec<String> = columns
                     .iter()
                     .map(|&col| {
-                        if is_masked_column(secrets, &snapshot.columns[col].name) {
+                        if is_masked_column(secrets, &snapshot.columns, col) {
                             MASK.to_owned()
                         } else {
                             cell_text(row, col, now).to_string()

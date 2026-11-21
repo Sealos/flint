@@ -205,10 +205,10 @@ pub fn input_refused(refused: InputRefused, paste: bool) -> String {
     )
 }
 
-/// What a shell tab says when what was typed while the first shell was tried was too large to
-/// keep for the shell that started ([`flint_core::ExecSnapshot::input_not_replayed`]).
-pub const INPUT_NOT_REPLAYED: &str = "What was typed while the first shell was tried was too \
-    large to keep, so this shell did not get it. Type it again.";
+/// What a shell tab says when input could not be replayed to the shell that started
+/// ([`flint_core::ExecSnapshot::input_not_replayed`]).
+pub const INPUT_NOT_REPLAYED: &str =
+    "This shell did not receive what was typed while the first shell was tried. Type it again.";
 
 fn byte_size(bytes: usize) -> String {
     const KB: usize = 1024;

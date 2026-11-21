@@ -2,8 +2,8 @@
 
 What a person checks after a release is published. Cutting the release is automatic (see
 [Releases](../README.md#releases)): merging the release PR tags it, the `release-please` workflow builds and attaches
-every file, and its `publish` job publishes the release. The checks below catch what that workflow cannot see: a
-release page that looks wrong, and the first launch of the app on a Mac that has never run it.
+every file, and its `publish` job publishes the release. Check the release page, first launch on a clean Mac, and
+whether the README and website reflect what shipped.
 
 Work through it for every published release, top to bottom, and note the result on the release PR. A failed step
 becomes an issue before anything else.
@@ -121,6 +121,15 @@ use for testing is at hand, and always when a release changes how Flint reads `P
   use `~/.kube/config`.
 - [ ] Open Flint from Finder or the Dock, select the cluster, and check that it connects.
 
-## 4. After the checks
+## 4. README and website
+
+- [ ] Compare the published release and its `CHANGELOG.md` entry with the [README status](../README.md#status) and
+  the [website roadmap](https://flintkube.dev/#roadmap) in [`site/index.html`](../site/index.html). Move shipped
+  features out of the upcoming lists and keep planned features there.
+- [ ] Check the README's install steps and key bindings against the release assets and the tagged action registry.
+  Check that the site's install instructions match the published packages without naming a version and that the
+  download link points to `/releases/latest`.
+
+## 5. After the checks
 
 The reviews and the refactor pass that follow every release are listed under [Releases](../README.md#releases).

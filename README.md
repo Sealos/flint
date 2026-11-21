@@ -43,10 +43,11 @@ See [Add it to an agent](#add-it-to-an-agent) for the steps and other MCP client
 - **Bounded.** Lists, events and logs have default and maximum sizes, and when output is cut short the result says
   so. At most 16 calls run at once (more wait, and past 64 they are refused), each for at most 60 seconds, and an
   agent that stops reading replies stops getting new calls run.
-- **Recorded.** Every call is written to an activity log in Flint's config directory: when, which cluster and tool,
-  what it named (kind, namespace, object, container), how much came back, and whether it was cut short or denied.
-  What came back is never stored. Click a cluster's "AI" badge (or run Show Agent Activity… from the palette) to see its calls; the view
-  updates while the agent works.
+- **Best-effort activity log.** Flint records call metadata in its config directory, including when the call ran,
+  the cluster and tool, what it named (kind, namespace, object, container), how much came back, and whether it was
+  cut short or denied. A writer that cannot acquire the log lock within one second skips the record. The log stores
+  only metadata. Click a cluster's "AI" badge or run Show Agent Activity… from the palette to see its calls as they
+  are recorded.
 
 Redaction is pattern matching, so a credential in an unusual format can still get through. Everything else,
 including ConfigMaps and `env` values in pod specs, is sent as the cluster returns it. Only expose clusters whose
@@ -79,6 +80,11 @@ claude mcp add flint -- sh -c 'd=$(mktemp -d) || exit 1; TMPDIR=$d APPIMAGE_EXTR
 ```
 
 Other MCP clients (Claude Desktop, Cursor) take the same command: `/path/to/flint mcp`.
+
+The app and an agent can read different kubeconfig files: an app opened from Finder ignores a `KUBECONFIG` exported in
+your shell, and an agent started from a terminal inherits it. If a cluster you exposed is in none of the files the
+server read, `list_clusters` says so and lists those files. Add the missing file to `kubeconfig_paths` in
+`settings.toml`, which the app and the server both read.
 
 Where the app cannot run, for example on a Linux server or in a devcontainer, install the
 [static `flint-mcp`](#linux-mcp-server-only-flint-mcp) and register it the same way, without `mcp`:
@@ -141,23 +147,25 @@ Flint is in early development.
 - Every kind the cluster serves, CRDs included, from the cluster's own discovery: live lists with the `kubectl get`
   columns, a namespace and text filter, and a detail view with metadata, conditions, events and read-only YAML.
 - A bottom dock with pod and workload logs (follow, search, timestamps, previous logs, save to a file) and shells into
-  containers. Open them from a row's context menu, the detail pane or the keyboard.
+  containers. Open them from a row's context menu, the detail pane or the keyboard. Log tabs have matching-lines-only
+  and errors-only (warnings and errors) filters, with adjustable context lines.
 - Protected clusters: every cluster not on your machine is read-only in Flint until you unlock it for the session
   or trust it (the lock button in the sidebar, or the palette). Today that means shells; editing joins it.
 - A command palette (⇧⌘P) that runs any action by name and shows its shortcut (see [Keys](#keys)).
+- A resource switcher (⌘P) for the active cluster's kinds and cached objects, Go Back (⌘[) to return to the previous
+  kind and object, and Tab and Shift-Tab to move focus between panes outside text fields and shells.
 - Light and dark themes that follow the system (View > Appearance, or the `appearance` setting, overrides it).
 - A read-only MCP server, `flint mcp`, for AI agents, limited to the clusters you expose.
 - Builds for macOS (Apple Silicon and Intel) and, best effort, Linux (x86_64 and arm64).
 
 **Coming next:**
 
-- A resource switcher.
-- Log filters (matching lines only, regex, errors only) and time ranges.
 - Editing: YAML with dry-run and diff; delete, scale, restart, cordon and drain, all behind the cluster protection.
 - Curated views for core kinds, CPU and memory from metrics-server, and cluster dashboards.
 - Port-forwarding and Helm releases.
 - Cluster sets and warm clusters for instant switching, and AI log analysis.
 - A signed and notarized app with a Homebrew cask.
+- [Regex search](https://github.com/Sealos/flint/issues/309) and [log time ranges](https://github.com/Sealos/flint/issues/265).
 
 ## Install from a release
 
@@ -308,6 +316,9 @@ label selector). Cmd-P opens the resource switcher: type part of a kind or objec
 press Enter to open the kind's list, or the object selected with its details; it searches only what Flint already
 holds in memory, so it never asks the cluster. These are the default keys on macOS; on Linux, Cmd is Ctrl.
 
+With a log tab focused, run **Set Context Lines…** from the command palette to choose how many lines appear before
+and after each filtered match.
+
 | Key | Action | Where |
 |---|---|---|
 | ⇧⌘P | Show Command Palette (again to close it) | anywhere |
@@ -327,7 +338,7 @@ holds in memory, so it never asks the cluster. These are the default keys on mac
 | ⌘J, ⇧⌘J | Toggle Dock, Show Dock Tabs | anywhere |
 | ⌃⇥, ⌃⇧⇥ | Next, Previous Dock Tab | the dock |
 | ⌘W, ⇧⌘W | Close Dock Tab (the window when no tab is shown), Close Window | anywhere |
-| ␣, T, P, W | Toggle Pause, Timestamps, Pod Prefix, Line Wrap | a log tab |
+| ␣, T, P, W, M, E | Toggle Pause, Timestamps, Pod Prefix, Line Wrap, Matching Lines Only, Errors Only | a log tab outside the search field |
 | ⌘F, ⌘G, ⇧⌘G | Search Logs, Next Match, Previous Match | a log tab |
 | ⌘S, ⇧⌘S, ⌥⌘S | Save Logs, Save Matching Lines, Save Selected Lines | a log tab |
 | ↑ ↓, ⇧↑ ⇧↓, ⌘A, ⌘C, ⎋ | Select a line, extend the selection, select all, copy, clear | a log tab |

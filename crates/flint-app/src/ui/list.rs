@@ -694,16 +694,17 @@ impl ResourceList {
         list_model::map_drawn(&self.shown.columns, &drawn, columns)
     }
 
-    /// Whether this list hides `column`'s values, so nothing may be derived from them.
-    pub(super) fn is_masked(&self, column: &flint_core::Column) -> bool {
-        is_masked_column(is_secret_list(self.kind.as_str()), &column.name)
+    /// Whether this list hides the values of the column at `index`, so nothing may be derived
+    /// from them.
+    pub(super) fn is_masked(&self, columns: &[flint_core::Column], index: usize) -> bool {
+        is_masked_column(is_secret_list(self.kind.as_str()), columns, index)
     }
 
     /// The drawn columns of `columns` a sort may apply to: a remembered sort on a masked column
     /// stays suspended, with no arrow, since its rows are not ordered by it.
     fn sortable_in(&self, columns: &[flint_core::Column]) -> Vec<usize> {
         let mut drawn = self.drawn_in(columns);
-        drawn.retain(|&col| !self.is_masked(&columns[col]));
+        drawn.retain(|&col| !self.is_masked(columns, col));
         drawn
     }
 
@@ -713,7 +714,7 @@ impl ResourceList {
             .drawn
             .iter()
             .map(|&(col, _)| col)
-            .filter(|&col| !self.is_masked(&self.shown.columns[col]))
+            .filter(|&col| !self.is_masked(&self.shown.columns, col))
             .collect();
         list_model::sort_column(&self.shown.columns, self.query.sort.as_ref(), &drawn)
     }
@@ -812,7 +813,7 @@ impl ResourceList {
                 stale,
                 health,
                 finished,
-                masked: secrets,
+                masked: false,
             };
             for &(col, width) in &self.drawn {
                 let column = &self.shown.columns[col];
@@ -822,7 +823,15 @@ impl ResourceList {
                     tone,
                     numeric,
                     mono,
-                } = list_model::CellStyle::of(column, || cell_text(row, col, now), width, flags);
+                } = list_model::CellStyle::of(
+                    column,
+                    || cell_text(row, col, now),
+                    width,
+                    list_model::RowFlags {
+                        masked: is_masked_column(secrets, &self.shown.columns, col),
+                        ..flags
+                    },
+                );
                 let cell = div()
                     .id(("cell", ix * ncols + col))
                     .h_full()
@@ -897,7 +906,7 @@ impl ResourceList {
                 .then(|| self.query.sort.as_ref().map(|s| s.descending))
                 .flatten();
             let numeric = list_model::is_numeric(column);
-            let sortable = !self.is_masked(column);
+            let sortable = !self.is_masked(&self.shown.columns, col);
             let tip = if column.description.is_empty() {
                 name.clone()
             } else {
