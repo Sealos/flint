@@ -160,6 +160,12 @@ pub fn safe_error_summary(error: &str) -> String {
     redact_quoted(&crate::kubeconfig::error_summary(error))
 }
 
+/// What may be shown of an API server's error text about a write: [`safe_error_summary`] of it
+/// with credentials hidden first, so that the cut to one short line cannot split a value.
+pub fn safe_server_error(text: &str) -> String {
+    safe_error_summary(&redact_credentials(text).text)
+}
+
 /// The first non-empty line of `text`, trimmed, cut to `max_chars` characters (with `…`).
 pub fn first_line(text: &str, max_chars: usize) -> String {
     let line = text
@@ -394,6 +400,23 @@ mod tests {
         assert!(!is_secret_object(
             &json!({"apiVersion": "v2", "kind": "Secret"})
         ));
+    }
+
+    #[test]
+    fn server_error_text_hides_quoted_values_and_credentials() {
+        let text = "denied: password \"hunter2-secret\" Authorization: Bearer abcdefghijklmnop";
+        let shown = safe_server_error(text);
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
+        assert!(!shown.contains("abcdefghijklmnop"), "{shown}");
+        assert!(shown.starts_with("denied: password"), "{shown}");
+    }
+
+    #[test]
+    fn server_error_text_hides_a_credential_past_the_summary_cut() {
+        let token = "abcd1234".repeat(8);
+        let text = format!("{} Authorization: Bearer {token}", "x".repeat(170));
+        let shown = safe_server_error(&text);
+        assert!(!shown.contains("abcd1234"), "{shown}");
     }
 
     #[test]

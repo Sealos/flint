@@ -24,6 +24,7 @@ use crate::cluster::ClusterError;
 use crate::gitops::{self, Identity, ManagedBy};
 use crate::protection::WriteRefusal;
 use crate::read::KindInfo;
+use crate::redact;
 use crate::write::{
     RequestGate, ResourceChange, WriteError, WriteOutcome, WriteProposal, WriteTarget, read_live,
 };
@@ -169,7 +170,7 @@ pub(crate) async fn reviewed(
         None => Vec::new(),
     };
     Ok(Reviewed {
-        managed: gitops::managed_by_object(live),
+        managed: gitops::managed_by_live_object(live),
         pods,
     })
 }
@@ -203,7 +204,7 @@ async fn recheck(
     let uid = live.pointer("/metadata/uid").and_then(Value::as_str);
     let paused = live.pointer("/spec/paused").and_then(Value::as_bool) == Some(true);
     if uid != target.uid.as_deref()
-        || gitops::managed_by_object(&live) != reviewed.managed
+        || gitops::managed_by_live_object(&live) != reviewed.managed
         || (paused && *change == ResourceChange::RolloutRestart)
     {
         return Err(WriteError::Conflict);
@@ -326,13 +327,22 @@ impl ActionError {
     fn of(error: kube::Error) -> Self {
         let code = api_code(&error);
         let replaced = names_another_uid(&error);
-        let message = ClusterError::kube(error).summary().to_string();
+        let message = error_text(error);
         match code {
             Some(409) => Self::Conflict(message),
             Some(422) if replaced => Self::Conflict(message),
             Some(404) => Self::Gone(message),
             _ => Self::Failed(message),
         }
+    }
+}
+
+/// What may be shown of `error`: text from the server goes through
+/// [`redact::safe_server_error`] whole, before anything shortens it.
+fn error_text(error: kube::Error) -> String {
+    match ClusterError::kube(error) {
+        ClusterError::Api(text) | ClusterError::Kube(text) => redact::safe_server_error(&text),
+        other => other.summary().to_string(),
     }
 }
 
@@ -622,7 +632,7 @@ fn pod_manager(pod: &Pod) -> Option<ManagedBy> {
         namespace: namespace.as_deref(),
         name: &name,
     };
-    gitops::managed_by(&identity, |key| {
+    gitops::managed_by_live(&identity, |key| {
         pod.labels()
             .get(key)
             .or_else(|| pod.annotations().get(key))
@@ -723,10 +733,17 @@ pub(crate) async fn drain(
         }
     };
     let params = ListParams::default().fields(&format!("spec.nodeName={}", node.name));
-    let api = Api::<Pod>::all(client.clone());
+    let api = Api::<Pod>::all(client);
     let listed = timed(api.list(&params)).await;
     let pods = match listed {
         Ok(list) => list.items,
+        Err(error) => {
+            report.stopped = Some(error.into());
+            return report;
+        }
+    };
+    let client = match gate.client().await {
+        Ok(client) => client,
         Err(error) => {
             report.stopped = Some(error.into());
             return report;
@@ -783,7 +800,7 @@ pub(crate) async fn drain(
                 return report;
             }
         };
-        let evicted = tokio::time::timeout(REQUEST_TIMEOUT, evict(client.clone(), &pod)).await;
+        let evicted = tokio::time::timeout(REQUEST_TIMEOUT, evict(client, &pod)).await;
         let Ok(evicted) = evicted else {
             report
                 .blocked
@@ -797,8 +814,15 @@ pub(crate) async fn drain(
             }
             // Nothing left to do for it, if it is really gone: a proxy can answer 404 too.
             Err(error) if api_code(&error) == Some(404) => {
+                let client = match gate.client().await {
+                    Ok(client) => client,
+                    Err(refused) => {
+                        stop_at(&mut report, name, pods, &accepted, refused);
+                        return report;
+                    }
+                };
                 if !is_gone(client, &pod).await {
-                    let why = ClusterError::kube(error).summary().to_string();
+                    let why = error_text(error);
                     report.blocked.push((name, BlockedReason::Failed(why)));
                 }
             }
@@ -807,7 +831,7 @@ pub(crate) async fn drain(
                     Some(429) if is_disruption_budget(&error) => BlockedReason::DisruptionBudget,
                     Some(429) => BlockedReason::Throttled,
                     Some(409) => BlockedReason::Changed,
-                    _ => BlockedReason::Failed(ClusterError::kube(error).summary().to_string()),
+                    _ => BlockedReason::Failed(error_text(error)),
                 };
                 report.blocked.push((name, reason));
             }
@@ -877,13 +901,18 @@ async fn wait_until_gone(
         if left.is_empty() {
             return (Vec::new(), None);
         }
-        let client = match gate.client().await {
-            Ok(client) => client,
-            Err(error) => return (sorted_names(&left), Some(error)),
-        };
         let mut still = Vec::new();
-        for pod in left {
-            let api = Api::<Pod>::namespaced(client.clone(), &pod.namespace().unwrap_or_default());
+        let mut polling = left.into_iter();
+        while let Some(pod) = polling.next() {
+            let client = match gate.client().await {
+                Ok(client) => client,
+                Err(error) => {
+                    still.push(pod);
+                    still.extend(polling);
+                    return (sorted_names(&still), Some(error));
+                }
+            };
+            let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
             // Within what is left of the wait: a slow server must not hold the report.
             let budget = deadline
                 .saturating_duration_since(Instant::now())
@@ -1646,6 +1675,105 @@ mod tests {
         assert_eq!(report.evicted, [named("one")]);
         assert_eq!(report.terminating, [named("one")]);
         assert_eq!(report.remaining, [named("two")]);
+    }
+
+    // covers UP-53: the gate is asked again before the node is read after the list.
+    #[tokio::test]
+    async fn a_gate_closed_after_the_pod_list_stops_before_the_node_read() {
+        let closed = open();
+        let closing = closed.clone();
+        let inner = drain_server(vec![pod("one", Some("ReplicaSet"), json!({}))], |_| {
+            accepted()
+        });
+        let (client, log) = fake(Arc::new(move |seen| {
+            if seen.path == "/api/v1/pods" {
+                closing.store(true, Ordering::SeqCst);
+            }
+            inner(seen)
+        }));
+        let report = drain(&mut writes(client, closed), &node(), &quick()).await;
+        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
+        assert!(report.evicted.is_empty());
+        let seen = log.lock().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|s| s.path == "/api/v1/nodes/worker" && s.method == "GET")
+        );
+    }
+
+    // covers UP-53: the gate is asked again before a 404 from the Eviction API is checked.
+    #[tokio::test]
+    async fn a_gate_closed_on_an_eviction_404_stops_before_the_check() {
+        let pods = vec![
+            pod("one", Some("ReplicaSet"), json!({})),
+            pod("two", Some("ReplicaSet"), json!({})),
+        ];
+        let closed = open();
+        let closing = closed.clone();
+        let (client, log) = fake(drain_server(pods, move |_| {
+            closing.store(true, Ordering::SeqCst);
+            (404, status(404, "NotFound"))
+        }));
+        let report = drain(&mut writes(client, closed), &node(), &quick()).await;
+        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
+        assert_eq!(report.remaining, [named("one"), named("two")]);
+        let seen = log.lock().unwrap();
+        let reads_of_one = seen
+            .iter()
+            .filter(|s| s.method == "GET" && s.path.ends_with("/pods/one"))
+            .count();
+        assert_eq!(reads_of_one, 1, "only the read before the eviction");
+    }
+
+    // covers UP-53: a lock during a poll is in the report, with the pods not yet confirmed gone.
+    #[tokio::test]
+    async fn a_gate_closed_during_a_poll_appears_in_the_report() {
+        let pods = vec![
+            pod("one", Some("ReplicaSet"), json!({})),
+            pod("two", Some("ReplicaSet"), json!({})),
+        ];
+        let evictions = Arc::new(AtomicUsize::new(0));
+        let counted = evictions.clone();
+        let inner = drain_server(pods, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            accepted()
+        });
+        let closed = open();
+        let closing = closed.clone();
+        let (client, log) = fake(Arc::new(move |seen| {
+            if seen.method == "GET" && evictions.load(Ordering::SeqCst) == 2 {
+                closing.store(true, Ordering::SeqCst);
+            }
+            inner(seen)
+        }));
+        let report = drain(&mut writes(client, closed), &node(), &quick()).await;
+        assert_eq!(report.evicted, [named("one"), named("two")]);
+        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
+        assert_eq!(report.terminating, [named("two")]);
+        let seen = log.lock().unwrap();
+        let reads_of_two = seen
+            .iter()
+            .filter(|s| s.method == "GET" && s.path.ends_with("/pods/two"))
+            .count();
+        assert_eq!(reads_of_two, 1, "only the read before the eviction");
+    }
+
+    // covers UP-54: server text in an action's error is reduced like any other.
+    #[tokio::test]
+    async fn an_action_error_shows_reduced_server_text() {
+        let message = "denied: password \"hunter2-secret\" Authorization: Bearer abcdefghijklmnop";
+        let body = json!({
+            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+            "code": 403, "reason": "Forbidden", "message": message,
+        });
+        let (client, _log) = fake(Arc::new(move |_| (403, body.clone())));
+        let result = scale(&mut writes(client, open()), &deployment(), 2, 3).await;
+        let Err(ActionError::Failed(text)) = result else {
+            panic!("{result:?}");
+        };
+        assert!(!text.contains("hunter2-secret"), "{text}");
+        assert!(!text.contains("abcdefghijklmnop"), "{text}");
     }
 
     // covers UP-53: a pod replaced since it was listed is reported, and one already gone is not.
