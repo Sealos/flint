@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::closing;
-use super::clusters::{ClustersModel, Presence, state_label};
+use super::clusters::{ClustersModel, Presence, reconnecting_text, state_label};
 use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -307,8 +307,7 @@ impl Workspace {
                 }
             },
         );
-        // Once a second: refresh the navigation's per-kind watch states (a short lock in the
-        // core, no network).
+        // Refresh the watch states shared by the navigation and the cluster sidebar.
         let tick = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -317,7 +316,9 @@ impl Workspace {
                         return;
                     };
                     let states = this.model.read(cx).core().sync_states(&cluster);
-                    this.nav.update(cx, |nav, cx| nav.set_states(states, cx));
+                    if this.nav.update(cx, |nav, cx| nav.set_states(states, cx)) {
+                        cx.notify();
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -843,7 +844,8 @@ impl Workspace {
             .cloned()
             .unwrap_or_default();
         let generation = model.active_cluster().map(|c| c.generation);
-        if active != self.cluster || generation != self.generation {
+        let cluster_changed = active != self.cluster || generation != self.generation;
+        if cluster_changed {
             self.generation = generation;
             // Switching clusters closes the old cluster's views; dropping the list drops its
             // subscription (UP-24).
@@ -876,7 +878,10 @@ impl Workspace {
                 discovered.discovery.clone(),
                 discovered.error.clone(),
                 cx,
-            )
+            );
+            if cluster_changed {
+                nav.set_states(Vec::new(), cx);
+            }
         });
         // An open switcher follows the active cluster and its discovery.
         self.refresh_switcher(cx);
@@ -1208,15 +1213,17 @@ impl Workspace {
         // The keyboard cursor shows only while the sidebar has focus.
         let cursor = focused.then(|| self.sidebar_cursor(cx)).flatten();
         let names = model.names();
+        let states = self.nav.read(cx).states();
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
+            let presence = Presence::of(&cluster.state, is_active, states);
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
             let protection = (model.protection(cluster), model.trust(cluster));
             let ring = cursor.as_deref() == Some(cluster.info.name.as_str());
             list = list.child(self.render_cluster_row(
                 cluster,
-                (is_active, ring),
+                (is_active, ring, presence),
                 exposure,
                 protection,
                 (settings_ok, &names),
@@ -1290,7 +1297,7 @@ impl Workspace {
         &self,
         cluster: &ClusterSummary,
         // Whether it is the active cluster, and whether the sidebar's cursor is on it.
-        (is_active, ring): (bool, bool),
+        (is_active, ring, presence): (bool, bool, Presence<'_>),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust): (Protection, TrustState),
         (settings_ok, names): (bool, &ClusterNames),
@@ -1301,15 +1308,17 @@ impl Workspace {
         let title = names.of(&name);
         // With a custom name, it starts with the real one: the row always says which cluster.
         let subtitle = names.subtitle(&name, cluster.info.server_host());
-        let presence = Presence::of(&cluster.state, is_active);
-        let state_text = match &cluster.state {
-            ConnectionState::Connected(v) if presence == Presence::Idle => format!(
+        let state_text = match (presence, &cluster.state) {
+            (Presence::Reconnecting { error }, _) => reconnecting_text(error),
+            (Presence::Idle, ConnectionState::Connected(v)) => format!(
                 "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
                 v.git_version
             ),
-            ConnectionState::Connected(v) => format!("Connected, Kubernetes {}", v.git_version),
-            ConnectionState::Failed(message) => format!("Connection failed: {message}"),
-            other => state_label(other).to_owned(),
+            (_, ConnectionState::Connected(v)) => {
+                format!("Connected, Kubernetes {}", v.git_version)
+            }
+            (_, ConnectionState::Failed(message)) => format!("Connection failed: {message}"),
+            (_, other) => state_label(other).to_owned(),
         };
         let exposure_text = match &exposure {
             AiExposureState::Hidden => "Hidden from AI agents".to_owned(),
@@ -1332,15 +1341,7 @@ impl Workspace {
             cluster.info.source.display()
         );
         let changed = matches!(exposure, AiExposureState::ServerChanged { .. });
-        // Filled while live (or failing, or connecting); a ring while idle: connected, but not
-        // watched.
-        let (color, filled) = match presence {
-            Presence::NotConnected => (theme.muted_foreground.opacity(0.4), true),
-            Presence::Connecting => (theme.warning, true),
-            Presence::Live => (theme.success, true),
-            Presence::Idle => (theme.success, false),
-            Presence::Failed => (theme.danger, true),
-        };
+        let (color, filled) = presence.dot(theme);
         let dot = super::theme::status_dot(color, filled)
             .id(SharedString::from(format!("cluster-dot-{name}")))
             .size_2()

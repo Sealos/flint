@@ -22,6 +22,13 @@
 //! containers lack bash ([`FakeApiServer::set_exec_image`]), and refuse or strip upgrades
 //! ([`Fault::refuse_upgrade`], [`Fault::strip_upgrade`]).
 //!
+//! Writes change the state and tell watches. Every write is recorded with its body
+//! ([`FakeApiServer::writes`]), `dryRun=All` stores nothing, and [`Fault::conflict`] and
+//! [`Fault::admission_denied`] refuse them. Creating objects is opt-in
+//! ([`Options::accept_creates`]). Tests set what metrics.k8s.io reports
+//! ([`FakeApiServer::set_metrics`], [`FakeApiServer::script_metrics`]) or drop it
+//! ([`Options::no_metrics`]).
+//!
 //! ```no_run
 //! # async fn example() -> anyhow::Result<()> {
 //! use flint_e2e::fake_api::{FakeApiServer, Fault, Gvr, Verb, WatchStep};
@@ -68,6 +75,7 @@ pub use pods::FakePod;
 pub use route::{Query, Verb};
 pub use row::FakeRow;
 pub use server::{
-    FakeApiServer, Options, RequestRecord, arrivals_at, connection_mark_at, write_kubeconfigs,
+    FakeApiServer, MetricsSample, MetricsTarget, Options, RequestRecord, WriteRecord, arrivals_at,
+    connection_mark_at, write_kubeconfigs,
 };
 pub use watch::WatchStep;

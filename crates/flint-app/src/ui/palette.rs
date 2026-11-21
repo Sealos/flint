@@ -682,16 +682,15 @@ impl CommandPalette {
                         hits = keyed.into_iter().map(|(_, h)| h).collect();
                     }
                 }
-                // Else what was typed comes first when it may be used as is: Enter on "kube"
-                // takes "kube", not "kube-system".
-                offer_typed
-                    .then(|| Row::Typed(typed.to_owned()))
-                    .into_iter()
-                    .chain(hits.into_iter().map(|h| Row::Choice {
-                        index: h.index,
-                        ranges: h.ranges,
-                    }))
-                    .collect()
+                // Else the listed matches come first and what was typed follows them, so Enter
+                // on "kube" takes "kube-system" and not a namespace that may not exist. With no
+                // match, what was typed is the only row.
+                let listed = hits.into_iter().map(|h| Row::Choice {
+                    index: h.index,
+                    ranges: h.ranges,
+                });
+                let typed_row = offer_typed.then(|| Row::Typed(typed.to_owned()));
+                listed.chain(typed_row).collect()
             }
             Step::Resources => Vec::new(),
         };
