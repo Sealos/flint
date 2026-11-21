@@ -1084,6 +1084,25 @@ async fn a_conflict_is_reported_and_never_retried() {
     assert_eq!(replicas(&server), 1);
 }
 
+// covers UP-52: a retryable answer to the write is reported, and the write is sent only once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_answered_503_is_sent_once() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let core = Core::start(&server, Some("demo")).await;
+    let review = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+    server.inject(Fault::status(503).on(&deployments()));
+    let result = core.handle.run_write(review.into_intent()).await;
+    server.clear_faults();
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(puts(&server), (1, 1), "one attempt");
+    assert_eq!(replicas(&server), 1);
+}
+
 // covers UP-54: a cluster locked after the review refuses the write before it reaches the
 // server, and a protected cluster refuses the review too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
