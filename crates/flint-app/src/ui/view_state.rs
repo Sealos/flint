@@ -449,6 +449,8 @@ pub enum TabStatusState {
         back_off: bool,
         reason: Option<String>,
     },
+    /// A log stream's container has not started; `reason` is what its tab says.
+    Waiting { reason: String },
     /// Nothing more will come, and nothing failed: all lines read, the pod deleted, or a shell
     /// the tab ended itself (`reason` says why).
     Ended {

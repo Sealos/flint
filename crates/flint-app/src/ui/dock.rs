@@ -100,6 +100,10 @@ pub trait DockItem {
     fn tab_title(&self) -> SharedString;
     fn tab_tooltip(&self) -> SharedString;
     fn tab_status(&self) -> TabStatus;
+    /// The status as the tab list says it: what the tab itself shows, if it says more.
+    fn tab_status_text(&self) -> String {
+        self.tab_status().word().to_owned()
+    }
     /// Focused when the tab is shown.
     fn tab_focus(&self) -> FocusHandle;
     /// Whether Reconnect Logs or Restart Shell can start its session again: once it ended or
@@ -370,7 +374,7 @@ impl Dock {
         Some(dock_model::list_label(
             &item.tab_title(),
             &self.label(&tab.cluster.context),
-            item.tab_status(),
+            &item.tab_status_text(),
         ))
     }
 
