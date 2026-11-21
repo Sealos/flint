@@ -598,6 +598,46 @@ fn up_15_credentials_in_logs_and_events_do_not_reach_the_agent() -> Result<()> {
 }
 
 // covers UP-10, UP-15
+// covers UP-10: `get_resource` names the GitOps controller that manages an object, and nothing
+// for an object it does not manage or a tracking id copied from another object.
+#[test]
+fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
+    let two = Two::start()?;
+    two.scratch
+        .write_settings(&exposing(EXPOSED, &two.a.url()))?;
+    let config_maps = two.a.gvr("configmaps");
+    let object = |name: &str, annotations: Value| {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": name, "namespace": "demo", "annotations": annotations},
+        })
+    };
+    let tracking = "argocd.argoproj.io/tracking-id";
+    for (name, annotations) in [
+        ("managed", json!({tracking: "shop:/ConfigMap:demo/managed"})),
+        ("copied", json!({tracking: "shop:/ConfigMap:demo/managed"})),
+        ("plain", json!({})),
+    ] {
+        two.a.set_object(&config_maps, object(name, annotations));
+    }
+    let mut mcp = two.mcp()?;
+    for (name, marked) in [("managed", true), ("copied", false), ("plain", false)] {
+        let got = mcp.call(
+            "get_resource",
+            json!({"cluster": EXPOSED, "kind": "configmaps", "namespace": "demo", "name": name}),
+        )?;
+        assert!(!got.is_error, "{}", got.text);
+        assert_eq!(
+            got.text.starts_with("# managed_by=Argo CD: shop\n"),
+            marked,
+            "{name}: {}",
+            got.text
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn up_10_names_that_are_not_single_path_segments_are_never_sent() -> Result<()> {
     let two = Two::start()?;

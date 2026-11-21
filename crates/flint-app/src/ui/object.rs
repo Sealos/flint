@@ -1,6 +1,7 @@
 //! What the generic detail view shows of an object, read from its JSON. GPUI-free so it can be
 //! unit tested.
 
+use flint_core::gitops::{self, ManagedBy};
 use flint_core::redact::{self, is_safe_secret_annotation};
 use serde_json::Value;
 
@@ -24,6 +25,8 @@ pub struct Overview {
     pub secret: Option<SecretData>,
     /// For Pods: the containers whose logs can be read, init containers first.
     pub containers: Vec<PodContainer>,
+    /// The Argo CD or Flux object that manages this one, from its labels and shown annotations.
+    pub managed_by: Option<ManagedBy>,
 }
 
 /// One container of a Pod, for the Logs action and its container picker.
@@ -163,6 +166,25 @@ pub fn overview(object: &Value, is_secret: bool) -> Overview {
                 .collect()
         })
         .unwrap_or_default();
+    let labels = string_map(meta.get("labels"));
+    let mut annotations = string_map(meta.get("annotations"));
+    if is_secret {
+        mask_secret_annotations(&mut annotations);
+    }
+    let managed_by = gitops::managed_by(
+        object
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        str_at(meta, &["name"]).unwrap_or_default(),
+        |key| {
+            labels
+                .iter()
+                .chain(&annotations)
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        },
+    );
     Overview {
         name: str_at(meta, &["name"]).unwrap_or_default().to_owned(),
         namespace: str_at(meta, &["namespace"]).map(str::to_owned),
@@ -172,14 +194,8 @@ pub fn overview(object: &Value, is_secret: bool) -> Overview {
         created: str_at(meta, &["creationTimestamp"]).map(str::to_owned),
         resource_version: text(meta, "resourceVersion"),
         generation: meta.get("generation").and_then(Value::as_i64),
-        labels: string_map(meta.get("labels")),
-        annotations: {
-            let mut annotations = string_map(meta.get("annotations"));
-            if is_secret {
-                mask_secret_annotations(&mut annotations);
-            }
-            annotations
-        },
+        labels,
+        annotations,
         finalizers: meta
             .get("finalizers")
             .and_then(Value::as_array)
@@ -198,6 +214,7 @@ pub fn overview(object: &Value, is_secret: bool) -> Overview {
         } else {
             Vec::new()
         },
+        managed_by,
     }
 }
 

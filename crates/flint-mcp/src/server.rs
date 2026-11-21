@@ -637,7 +637,7 @@ impl FlintMcp {
     }
 
     #[tool(
-        description = "Get one object as YAML. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
+        description = "Get one object as YAML. A first line `# managed_by=` names the Argo CD or Flux object that manages it, whose next sync will likely revert a change. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_resource(&self, Parameters(p): Parameters<GetResourceParams>) -> ToolResult {
@@ -1205,6 +1205,10 @@ impl FlintMcp {
         let yaml = serde_saphyr::to_string(&value)?;
         let (text, truncated) = policy::truncate_bytes(&yaml, policy::OBJECT_BYTES);
         let mut out = String::new();
+        // Read after redaction, so a masked annotation names nothing.
+        if let Some(manager) = flint_core::gitops::managed_by_object(&value) {
+            out.push_str(&format!("# managed_by={manager}\n"));
+        }
         if redacted > 0 {
             out.push_str(&format!(
                 "# redacted={redacted}: credentials were replaced with [REDACTED:<kind>] markers\n"

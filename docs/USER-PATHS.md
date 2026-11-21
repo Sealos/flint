@@ -98,7 +98,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-10 Agent inspects a cluster
 - **When** the agent lists kinds and resources, gets an object, and reads events and pod logs on an exposed cluster.
 - **Then** results are correct and bounded. Long lists say they were truncated and give a continue token. Secret values
-  and copies of them in annotations are redacted. `managedFields` is removed. Errors are readable sentences, not
+  and copies of them in annotations are redacted. `managedFields` is removed. `get_resource` names the Argo CD or Flux
+  object that manages the object, on a `# managed_by=` first line. Errors are readable sentences, not
   debug dumps. A name, pod, namespace or container that is not a single valid path segment (`a/b`, `..`, `%2F`) is
   refused before any request, with the same not-found error as a missing object.
 - An argument a tool does not have is refused with an error naming it and the accepted arguments, so a filter Flint
@@ -187,7 +188,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ### UP-23 Inspect an object
 - **When** I open an object.
 - **Then** I see its metadata, labels, owners, conditions, related events, and read-only YAML with syntax highlighting.
-  `managedFields` is hidden.
+  `managedFields` is hidden. An object Argo CD or Flux manages says so in the header, naming the application or
+  Kustomization or HelmRelease, read from its labels and annotations.
 - Tests: cluster, ui.
 
 ### UP-24 Switch clusters
