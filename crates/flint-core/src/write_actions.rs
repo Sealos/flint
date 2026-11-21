@@ -699,6 +699,16 @@ fn stop_at(
     error: ActionError,
 ) {
     report.remaining.push(name);
+    stop_before(report, rest, accepted, error);
+}
+
+/// Ends a drain with `rest` not tried.
+fn stop_before(
+    report: &mut DrainReport,
+    rest: impl Iterator<Item = Pod>,
+    accepted: &[Pod],
+    error: ActionError,
+) {
     report.remaining.extend(rest.map(|pod| pod_name(&pod)));
     report.terminating = sorted_names(accepted);
     report.stopped = Some(error.into());
@@ -745,7 +755,8 @@ pub(crate) async fn drain(
     let client = match gate.client().await {
         Ok(client) => client,
         Err(error) => {
-            report.stopped = Some(error.into());
+            report.remaining = pods.iter().map(pod_name).collect();
+            report.stopped = Some(WriteError::NodeNotRechecked(Box::new(error.into())));
             return report;
         }
     };
@@ -817,7 +828,11 @@ pub(crate) async fn drain(
                 let client = match gate.client().await {
                     Ok(client) => client,
                     Err(refused) => {
-                        stop_at(&mut report, name, pods, &accepted, refused);
+                        let why = "the eviction was sent, but its outcome could not be verified";
+                        report
+                            .blocked
+                            .push((name, BlockedReason::Failed(why.to_owned())));
+                        stop_before(&mut report, pods, &accepted, refused);
                         return report;
                     }
                 };
@@ -904,24 +919,31 @@ async fn wait_until_gone(
         let mut still = Vec::new();
         let mut polling = left.into_iter();
         while let Some(pod) = polling.next() {
-            let client = match gate.client().await {
-                Ok(client) => client,
-                Err(error) => {
+            // The gate and the read share what is left of the wait: neither may hold the report.
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REQUEST_TIMEOUT);
+            if budget.is_zero() {
+                still.push(pod);
+                still.extend(polling);
+                return (sorted_names(&still), None);
+            }
+            let read = tokio::time::timeout(budget, async {
+                let client = gate.client().await?;
+                let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
+                Ok::<_, ActionError>(api.get_opt(&pod.name_any()).await)
+            })
+            .await;
+            match read {
+                Ok(Err(error)) => {
                     still.push(pod);
                     still.extend(polling);
                     return (sorted_names(&still), Some(error));
                 }
-            };
-            let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
-            // Within what is left of the wait: a slow server must not hold the report.
-            let budget = deadline
-                .saturating_duration_since(Instant::now())
-                .min(REQUEST_TIMEOUT);
-            match tokio::time::timeout(budget, api.get_opt(&pod.name_any())).await {
-                Ok(Ok(Some(now))) if now.uid() == pod.uid() => still.push(pod),
-                Ok(Ok(_)) => {}
+                Ok(Ok(Ok(Some(now)))) if now.uid() == pod.uid() => still.push(pod),
+                Ok(Ok(Ok(_))) => {}
                 // Not known to be gone.
-                Ok(Err(_)) | Err(_) => still.push(pod),
+                Ok(Ok(Err(_))) | Err(_) => still.push(pod),
             }
         }
         left = still;
@@ -1692,14 +1714,21 @@ mod tests {
             inner(seen)
         }));
         let report = drain(&mut writes(client, closed), &node(), &quick()).await;
-        assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
+        let stopped = report.stopped.expect("the drain stopped");
+        assert_eq!(
+            stopped,
+            WriteError::NodeNotRechecked(Box::new(WriteError::Refused(refusal())))
+        );
+        assert!(stopped.to_string().contains("could not be checked again"));
         assert!(report.evicted.is_empty());
+        assert_eq!(report.remaining, [named("one")]);
         let seen = log.lock().unwrap();
         assert!(
             !seen
                 .iter()
                 .any(|s| s.path == "/api/v1/nodes/worker" && s.method == "GET")
         );
+        assert!(!seen.iter().any(|s| s.method == "POST"));
     }
 
     // covers UP-53: the gate is asked again before a 404 from the Eviction API is checked.
@@ -1717,13 +1746,71 @@ mod tests {
         }));
         let report = drain(&mut writes(client, closed), &node(), &quick()).await;
         assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
-        assert_eq!(report.remaining, [named("one"), named("two")]);
+        assert_eq!(report.remaining, [named("two")]);
+        assert!(
+            matches!(
+                &report.blocked[..],
+                [(pod, BlockedReason::Failed(why))]
+                    if *pod == named("one") && why.contains("could not be verified")
+            ),
+            "{:?}",
+            report.blocked
+        );
         let seen = log.lock().unwrap();
+        assert_eq!(seen.iter().filter(|s| s.method == "POST").count(), 1);
         let reads_of_one = seen
             .iter()
             .filter(|s| s.method == "GET" && s.path.ends_with("/pods/one"))
             .count();
         assert_eq!(reads_of_one, 1, "only the read before the eviction");
+    }
+
+    /// A gate that never answers once `stalled` is set, counting the calls made since.
+    struct StallingGate {
+        client: Client,
+        stalled: Arc<AtomicBool>,
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl ActionGate for StallingGate {
+        async fn client(&mut self) -> Result<Client, ActionError> {
+            if self.stalled.load(Ordering::SeqCst) {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+            Ok(self.client.clone())
+        }
+    }
+
+    // covers UP-53: a gate that does not answer during the wait ends it on time, is not asked
+    // past the deadline, and the pods it could not confirm are named.
+    #[tokio::test]
+    async fn a_stalled_gate_ends_the_wait_on_time() {
+        let pods = vec![
+            pod("one", Some("ReplicaSet"), json!({})),
+            pod("two", Some("ReplicaSet"), json!({})),
+        ];
+        let stalled = open();
+        let stalling = stalled.clone();
+        let evictions = AtomicUsize::new(0);
+        let (client, _log) = fake(drain_server(pods, move |_| {
+            if evictions.fetch_add(1, Ordering::SeqCst) == 1 {
+                stalling.store(true, Ordering::SeqCst);
+            }
+            accepted()
+        }));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut gate = StallingGate {
+            client,
+            stalled,
+            asked: asked.clone(),
+        };
+        let started = Instant::now();
+        let report = drain(&mut gate, &node(), &quick()).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(report.evicted, [named("one"), named("two")]);
+        assert_eq!(report.terminating, [named("one"), named("two")]);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
     }
 
     // covers UP-53: a lock during a poll is in the report, with the pods not yet confirmed gone.

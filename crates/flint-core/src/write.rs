@@ -268,6 +268,9 @@ pub enum WriteError {
     Rejected(String),
     #[error("{0}")]
     Failed(String),
+    /// A drain stopped between listing a node's pods and checking the node again.
+    #[error("{0}; the node could not be checked again, so its listed pods were not tried")]
+    NodeNotRechecked(Box<WriteError>),
 }
 
 /// The write gate, asked before each request of one action. The context must stay as it was at
