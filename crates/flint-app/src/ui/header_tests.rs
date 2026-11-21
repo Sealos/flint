@@ -269,7 +269,10 @@ fn assert_focus(cx: &mut TestAppContext, t: &TestWorkspace, id: &'static str) {
         let workspace = t.workspace.clone();
         cx.update_window(t.window, |_, window, cx| {
             window.render_frame(cx);
-            workspace.update(cx, |ws, cx| ws.view_state(window, cx)).focus == Focus::NamespaceInput
+            workspace
+                .update(cx, |ws, cx| ws.view_state(window, cx))
+                .focus
+                == Focus::NamespaceInput
         })
         .unwrap()
     } else {
