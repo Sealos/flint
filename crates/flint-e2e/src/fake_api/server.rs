@@ -64,6 +64,15 @@ pub struct Options {
     /// Serves no metrics.k8s.io: it is gone from discovery and its paths answer 404, as on a
     /// cluster without metrics-server.
     pub no_metrics: bool,
+    /// What `/version` reports instead of the recording, as a `gitVersion` such as `v1.31.4` or
+    /// `v1.31.4-eks-1a2b3c`; `major` and `minor` follow it. A version that does not start with
+    /// `v<major>.<minor>.<patch>` fails the server's start.
+    pub version: Option<String>,
+    /// Resources this server does not have: gone from discovery, every path under them answers
+    /// 404, and an OpenAPI document with nothing left is gone. Hiding every version of a custom
+    /// resource also removes its CustomResourceDefinition. Naming a resource the fixtures do not
+    /// serve fails the server's start.
+    pub hidden: Vec<Gvr>,
 }
 
 impl Default for Options {
@@ -76,6 +85,8 @@ impl Default for Options {
             kubelet_websockets: true,
             accept_creates: false,
             no_metrics: false,
+            version: None,
+            hidden: Vec::new(),
         }
     }
 }
@@ -172,6 +183,8 @@ type Scripts = HashMap<(Gvr, Option<String>), VecDeque<Vec<WatchStep>>>;
 struct Inner {
     fixtures: Arc<Fixtures>,
     options: Options,
+    /// What `/version` answers: the recording, or [`Options::version`].
+    version: Value,
     clock: Clock,
     state: Arc<Mutex<State>>,
     /// Pod logs and their open streams. Locked after `state` when both are needed.
@@ -320,6 +333,8 @@ impl FakeApiServer {
                 bail!("Options::plain_only names {gvr}, which the fixtures do not serve");
             }
         }
+        variants::check_hidden(&fixtures, &options.hidden)?;
+        let version = variants::version(&fixtures.version, options.version.as_deref())?;
         let tls = tls::generate()?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -327,8 +342,11 @@ impl FakeApiServer {
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown) = watch::channel(());
         let clock = Clock::new(options.now);
+        let mut state = State::new(&fixtures);
+        variants::remove_hidden_crds(&mut state, &fixtures, &options.hidden);
         let inner = Arc::new(Inner {
-            state: Arc::new(Mutex::new(State::new(&fixtures))),
+            state: Arc::new(Mutex::new(state)),
+            version,
             logs: Mutex::new(Logs::new(clock.clone())),
             execs: Mutex::default(),
             clock,
@@ -433,6 +451,10 @@ impl FakeApiServer {
 
     /// Panics unless the fixtures serve `gvr`, suggesting what was meant.
     fn require(&self, gvr: &Gvr) {
+        assert!(
+            !self.inner.options.hidden.contains(gvr),
+            "this fake API server hides {gvr} (Options::hidden)"
+        );
         let resources = &self.inner.fixtures.resources;
         if resources.get(gvr).is_some() {
             return;
@@ -449,7 +471,10 @@ impl FakeApiServer {
     pub fn gvr(&self, plural: &str) -> Gvr {
         let resources = &self.inner.fixtures.resources;
         match resources.by_plural(plural) {
-            Some(r) => r.gvr.clone(),
+            Some(r) => {
+                self.require(&r.gvr);
+                r.gvr.clone()
+            }
             None => {
                 let hint = resources
                     .suggest(plural)
@@ -885,6 +910,14 @@ fn answer(
     query: &Query,
     accept: &str,
 ) -> Response<Body> {
+    if route
+        .gvr()
+        .is_some_and(|gvr| inner.options.hidden.contains(gvr))
+    {
+        return error(&ApiError::not_found(
+            "the server could not find the requested resource",
+        ));
+    }
     match call {
         Call::Read(req) => serve(inner, req, upgrade, route, verb, query, accept),
         Call::Write(Err(e)) => error(&e),
@@ -1038,16 +1071,17 @@ fn respond(
     let table_for =
         |gvr: &Gvr| accept.contains("as=Table") && !inner.options.plain_only.contains(gvr);
     let result = match route {
-        Route::Version => Ok(json_with(200, "application/json", &fixtures.version)),
+        Route::Version => Ok(json_with(200, "application/json", &inner.version)),
         Route::DiscoveryCore | Route::DiscoveryGroups => {
             if accept.contains("as=APIGroupDiscoveryList") {
-                let body = if *route == Route::DiscoveryCore {
+                let mut body = if *route == Route::DiscoveryCore {
                     fixtures.discovery_core.clone()
                 } else if inner.options.no_metrics {
                     metrics::without_metrics(&fixtures.discovery_groups)
                 } else {
                     fixtures.discovery_groups.clone()
                 };
+                variants::hide_from_discovery(&mut body, &inner.options.hidden);
                 Ok(json_with(200, DISCOVERY_CONTENT_TYPE, &body))
             } else {
                 Err(ApiError::not_found(
@@ -1055,10 +1089,15 @@ fn respond(
                 ))
             }
         }
-        Route::OpenApiIndex => Ok(json_with(200, "application/json", &fixtures.openapi_index)),
+        Route::OpenApiIndex => Ok(json_with(
+            200,
+            "application/json",
+            &variants::openapi_index(fixtures, &inner.options.hidden),
+        )),
         Route::OpenApiDocument(path) => fixtures
             .openapi
             .get(path)
+            .filter(|_| !variants::openapi_hidden(fixtures, &inner.options.hidden, path))
             .map(|d| json_with(200, "application/json", d))
             .ok_or_else(|| ApiError::not_found(format!("OpenAPI document {path} is not recorded"))),
         Route::Collection { gvr, namespace } => {
@@ -1320,6 +1359,9 @@ mod writes;
 #[path = "server_metrics.rs"]
 mod metrics;
 pub use metrics::{MetricsSample, MetricsTarget};
+
+#[path = "server_variants.rs"]
+mod variants;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]
