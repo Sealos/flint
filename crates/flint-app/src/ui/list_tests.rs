@@ -1323,3 +1323,18 @@ async fn a_list_closed_by_a_switch_from_the_dock_is_released(cx: &mut TestAppCon
     list.assert_released();
     filter.assert_released();
 }
+
+#[gpui_kit::test]
+async fn a_missing_namespace_is_named_with_a_way_out(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open(cx, core);
+    list.update(cx, |list, cx| {
+        list.set_snapshot(pods(&[("demo", "web", 0)], SyncState::Synced, 1), cx);
+        list.set_namespaces(vec!["dem".to_owned()], cx);
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("list-placeholder").is_some()
+            && window.try_find("show-all-namespaces").is_some()
+    })
+    .await;
+}
