@@ -263,15 +263,25 @@ async fn http_errors_say_what_the_status_means() {
              renew the credentials"
         )
     );
-    // A Status that explains itself is kept, once: RBAC names the user and the path.
+    // A Status that explains itself is kept, once. The agent's text keeps the quoted names; the
+    // summary hides them.
     let forbidden = answering_json(
         "403 Forbidden",
         r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden: User \"jane\" cannot get path \"/version\"","reason":"Forbidden","code":403}"#,
     )
     .await;
+    let kc = kubeconfig(&format!("http://{forbidden}"), None);
+    let err = cluster::connect_and_check(&kc, "ctx", std::time::Duration::from_secs(20))
+        .await
+        .err()
+        .unwrap();
     assert_eq!(
-        connect_error(&format!("http://{forbidden}"), None).await,
+        err.for_agent(),
         "forbidden: User \"jane\" cannot get path \"/version\""
+    );
+    assert_eq!(
+        err.summary().as_str(),
+        "forbidden: User \"…\" cannot get path \"…\""
     );
 }
 

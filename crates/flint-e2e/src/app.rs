@@ -14,7 +14,7 @@
 //! use flint_e2e::app::{App, AppOptions, Test};
 //!
 //! let app = App::launch(AppOptions::new(kubeconfig))?;
-//! app.select_cluster("flint-e2e-fake")?;
+//! app.select_cluster("kind-flint-e2e-fake")?;
 //! app.wait_for("/main/view", Test::Equals("connected".into()))?;
 //! app.open_view("pods")?;
 //! app.wait_for("/list/rows", Test::at_least(3))?;

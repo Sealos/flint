@@ -1,7 +1,7 @@
 //! View tests for protected clusters (ADR-0015): Shell is disabled on a protected cluster,
 //! saying why, with the unlock in place; an unlock asks first, naming the server, and lasts
-//! until Lock Again; trust is kept in `settings.toml`, pinned to the server. The test servers
-//! are on this machine, so the tests turn on `protect_local_clusters` to see a protected one.
+//! until Lock Again; trust is kept in `settings.toml`, pinned to the server. The test contexts
+//! are known local clusters, so the tests turn on `protect_local_clusters` to see a protected one.
 
 use flint_core::settings::TrustState;
 use flint_core::{Event, ObjectDetail, Protection};
@@ -161,51 +161,54 @@ async fn the_rename_dialog_saves_with_its_button_and_with_enter(cx: &mut TestApp
     let dir = tempfile::tempdir().unwrap();
     let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
 
-    open_rename(cx, &t, "alpha").await;
+    open_rename(cx, &t, "kind-alpha").await;
     let text = t.label(cx, "rename-cluster-description").unwrap();
     assert!(
-        text.contains(&format!("Context: alpha\nServer: {}", t.server)),
+        text.contains(&format!("Context: kind-alpha\nServer: {}", t.server)),
         "{text}"
     );
     t.type_text(cx, "main");
     t.click(cx, "ok");
     wait_for_dialog(cx, &t, false).await;
-    wait_for_name(cx, &t, "alpha", Some("main")).await;
+    wait_for_name(cx, &t, "kind-alpha", Some("main")).await;
     draw(cx, &t);
-    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("main"));
+    assert_eq!(t.label(cx, "cluster-kind-alpha").as_deref(), Some("main"));
     let file = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
     assert!(
-        file.contains("[cluster_names]") && file.contains("alpha = \"main\""),
+        file.contains("[cluster_names]") && file.contains("kind-alpha = \"main\""),
         "{file}"
     );
 
-    open_rename(cx, &t, "beta").await;
+    open_rename(cx, &t, "kind-beta").await;
     t.type_text(cx, "blue");
     t.press(cx, "enter");
     wait_for_dialog(cx, &t, false).await;
-    wait_for_name(cx, &t, "beta", Some("blue")).await;
+    wait_for_name(cx, &t, "kind-beta", Some("blue")).await;
 
     // The field starts with the current name; emptied, the context name comes back.
-    open_rename(cx, &t, "alpha").await;
+    open_rename(cx, &t, "kind-alpha").await;
     t.press(cx, "secondary-a");
     t.press(cx, "backspace");
     t.click(cx, "ok");
     wait_for_dialog(cx, &t, false).await;
-    wait_for_name(cx, &t, "alpha", None).await;
+    wait_for_name(cx, &t, "kind-alpha", None).await;
     draw(cx, &t);
-    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("alpha"));
+    assert_eq!(
+        t.label(cx, "cluster-kind-alpha").as_deref(),
+        Some("kind-alpha")
+    );
 }
 
 // covers UP-01: cancelling leaves the settings as they were.
 #[gpui_kit::test]
 async fn cancelling_the_rename_dialog_changes_nothing(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nkind-alpha = \"main\"\n");
     let t = open_with_settings(cx, dir.path(), &settings).await;
     let path = dir.path().join("settings.toml");
     let before = std::fs::read_to_string(&path).unwrap();
     for cancel in ["escape", "button"] {
-        open_rename(cx, &t, "alpha").await;
+        open_rename(cx, &t, "kind-alpha").await;
         t.type_text(cx, "-changed");
         match cancel {
             "escape" => t.press(cx, "escape"),
@@ -216,7 +219,7 @@ async fn cancelling_the_rename_dialog_changes_nothing(cx: &mut TestAppContext) {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{cancel}");
         assert_eq!(
             custom_names(cx, &t),
-            [("alpha".to_owned(), "main".to_owned())]
+            [("kind-alpha".to_owned(), "main".to_owned())]
         );
     }
 }
@@ -226,11 +229,11 @@ async fn cancelling_the_rename_dialog_changes_nothing(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn the_rename_dialog_refuses_an_invalid_name(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nkind-alpha = \"main\"\n");
     let t = open_with_settings(cx, dir.path(), &settings).await;
     let path = dir.path().join("settings.toml");
     let before = std::fs::read_to_string(&path).unwrap();
-    open_rename(cx, &t, "beta").await;
+    open_rename(cx, &t, "kind-beta").await;
     for (typed, says) in [("MAIN", "already goes by"), ("!", "at most")] {
         t.press(cx, "secondary-a");
         t.press(cx, "backspace");
@@ -252,7 +255,7 @@ async fn the_rename_dialog_refuses_an_invalid_name(cx: &mut TestAppContext) {
     wait_for_dialog(cx, &t, false).await;
     assert_eq!(
         custom_names(cx, &t),
-        [("alpha".to_owned(), "main".to_owned())]
+        [("kind-alpha".to_owned(), "main".to_owned())]
     );
 }
 
@@ -261,26 +264,26 @@ async fn the_rename_dialog_refuses_an_invalid_name(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn the_row_menu_unlock_entry_asks_before_unlocking(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nkind-alpha = \"main\"\n");
     let t = open_with_settings(cx, dir.path(), &settings).await;
     show_web(cx, &t).await;
-    let wanted = unlock_dialog("main (alpha)", "alpha", &t.server);
+    let wanted = unlock_dialog("main (kind-alpha)", "kind-alpha", &t.server);
     // A refusal names the real cluster, whatever the menu's short note says.
     let shell = t.workspace.read_with(cx, |ws, cx| {
         crate::ui::row_menu::row_actions(ws, cx).unwrap().shell
     });
     assert_eq!(
         shell,
-        Err("alpha is protected (read-only in Flint) until you unlock it".to_owned())
+        Err("kind-alpha is protected (read-only in Flint) until you unlock it".to_owned())
     );
 
     right_click(cx, &t, "web").await;
     draw(cx, &t);
     let entry = t.find(cx, "menu-unlock").expect("the Unlock entry");
-    assert_eq!(entry.label(), Some("Unlock main (alpha)…"));
+    assert_eq!(entry.label(), Some("Unlock main (kind-alpha)…"));
     assert_eq!(
         entry.description().map(str::to_owned),
-        Some(format!("alpha\n{}", t.server))
+        Some(format!("kind-alpha\n{}", t.server))
     );
     t.click(cx, "menu-unlock");
     wait_for_dialog(cx, &t, true).await;
@@ -288,23 +291,23 @@ async fn the_row_menu_unlock_entry_asks_before_unlocking(cx: &mut TestAppContext
     assert!(
         wanted
             .text
-            .contains(&format!("Context: alpha\nServer: {}", t.server))
+            .contains(&format!("Context: kind-alpha\nServer: {}", t.server))
     );
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
 
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;
     draw(cx, &t);
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
 
     right_click(cx, &t, "web").await;
     draw(cx, &t);
     t.click(cx, "menu-unlock");
     wait_for_dialog(cx, &t, true).await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
     t.click(cx, "ok");
     wait_for_dialog(cx, &t, false).await;
-    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
 }
 
 // covers UP-01, UP-55: a custom name is what the sidebar shows, but the row, its tooltip and the
@@ -312,27 +315,37 @@ async fn the_row_menu_unlock_entry_asks_before_unlocking(cx: &mut TestAppContext
 #[gpui_kit::test]
 async fn a_custom_name_never_hides_the_real_cluster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nalpha = \"main\"\n");
+    let settings = format!("{PROTECT_LOCAL}\n[cluster_names]\nkind-alpha = \"main\"\n");
     let t = open_with_settings(cx, dir.path(), &settings).await;
-    assert_eq!(t.label(cx, "cluster-alpha").as_deref(), Some("main"));
+    assert_eq!(t.label(cx, "cluster-kind-alpha").as_deref(), Some("main"));
     let tip = t
-        .find(cx, "cluster-alpha")
+        .find(cx, "cluster-kind-alpha")
         .and_then(|row| row.description().map(str::to_owned))
         .unwrap();
-    assert!(tip.starts_with(&format!("alpha\n{}\n", t.server)), "{tip}");
+    assert!(
+        tip.starts_with(&format!("kind-alpha\n{}\n", t.server)),
+        "{tip}"
+    );
     t.model.read_with(cx, |m, _| {
-        assert_eq!(m.names().subtitle("alpha", Some("host")), "alpha · host");
+        assert_eq!(
+            m.names().subtitle("kind-alpha", Some("host")),
+            "kind-alpha · host"
+        );
     });
 
-    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::UnlockCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
-    let wanted = unlock_dialog("main (alpha)", "alpha", &t.server);
+    let wanted = unlock_dialog("main (kind-alpha)", "kind-alpha", &t.server);
     assert_eq!(t.label(cx, "unlock-description"), Some(wanted.text.clone()));
     assert!(
         wanted
             .text
-            .contains(&format!("Context: alpha\nServer: {}", t.server))
+            .contains(&format!("Context: kind-alpha\nServer: {}", t.server))
     );
     let shown = cx
         .update_window(t.window, |_, window, cx| {
@@ -340,11 +353,11 @@ async fn a_custom_name_never_hides_the_real_cluster(cx: &mut TestAppContext) {
         })
         .unwrap()
         .unwrap();
-    assert_eq!(shown.title, "Unlock main (alpha)?");
+    assert_eq!(shown.title, "Unlock main (kind-alpha)?");
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;
     // Protection goes by the context, whatever it is called.
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
 }
 
 // covers UP-54, UP-55: on a protected cluster Shell is disabled, saying why, and Unlock sits
@@ -356,8 +369,8 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     let dir = tempfile::tempdir().unwrap();
     let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
     show_web(cx, &t).await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
-    let why = "alpha is protected (read-only in Flint) until you unlock it";
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
+    let why = "kind-alpha is protected (read-only in Flint) until you unlock it";
     assert_eq!(disabled(cx, &t, "detail-shell"), Some(true));
     assert_eq!(disabled(cx, &t, "detail-logs"), Some(false));
     assert_eq!(disabled(cx, &t, "detail-unlock"), Some(false));
@@ -367,13 +380,17 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
         Err(ActionError::NotAvailable("detail::OpenShell".into()))
     );
     assert!(
-        t.description(cx, "lock-alpha")
+        t.description(cx, "lock-kind-alpha")
             .unwrap_or_default()
             .starts_with("Protected")
     );
     // Locking a protected cluster does nothing.
     assert!(matches!(
-        t.dispatch(cx, "workspace::LockCluster", json!({"cluster": "alpha"})),
+        t.dispatch(
+            cx,
+            "workspace::LockCluster",
+            json!({"cluster": "kind-alpha"})
+        ),
         Err(ActionError::Rejected { .. })
     ));
 
@@ -381,41 +398,41 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "unlock-description"),
-        Some(unlock_dialog("alpha", "alpha", &t.server).text)
+        Some(unlock_dialog("kind-alpha", "kind-alpha", &t.server).text)
     );
     assert_eq!(t.label(cx, "ok").as_deref(), Some("Unlock"));
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
     // Enter cancels too: only the Unlock button unlocks.
     t.click(cx, "detail-unlock");
     wait_for_dialog(cx, &t, true).await;
     t.press(cx, "enter");
     wait_for_dialog(cx, &t, false).await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
 
     t.click(cx, "detail-unlock");
     wait_for_dialog(cx, &t, true).await;
     t.click(cx, "ok");
-    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
     assert!(
         t.model.read_with(cx, |m, _| m
             .core()
             .unlocks()
-            .is_unlocked("alpha", &t.server)),
+            .is_unlocked("kind-alpha", &t.server)),
         "the core's gate sees the unlock"
     );
     assert_eq!(disabled(cx, &t, "detail-shell"), Some(false));
     assert_eq!(disabled(cx, &t, "detail-unlock"), None);
     assert!(captions(cx, &t).is_empty());
     assert!(
-        t.description(cx, "lock-alpha")
+        t.description(cx, "lock-kind-alpha")
             .unwrap_or_default()
             .starts_with("Unlocked")
     );
-    // Only alpha: beta is still protected, and the unlock is not written anywhere.
-    assert_eq!(protection(cx, &t, "beta"), Protection::Protected);
-    assert!(!t.settings_toml().contains("alpha"));
+    // Only kind-alpha: kind-beta is still protected, and the unlock is not written anywhere.
+    assert_eq!(protection(cx, &t, "kind-beta"), Protection::Protected);
+    assert!(!t.settings_toml().contains("kind-alpha"));
 
     // The shell opens (and fails at once: the test cluster never connects in the core).
     t.dispatch(cx, "detail::OpenShell", Value::Null).unwrap();
@@ -430,11 +447,15 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     })
     .await;
 
-    t.dispatch(cx, "workspace::LockCluster", json!({"cluster": "alpha"}))
-        .unwrap();
-    wait_for_protection(cx, &t, "alpha", Protection::Protected).await;
+    t.dispatch(
+        cx,
+        "workspace::LockCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Protected).await;
     assert!(!t.model.read_with(cx, |m, _| {
-        m.core().unlocks().is_unlocked("alpha", &t.server)
+        m.core().unlocks().is_unlocked("kind-alpha", &t.server)
     }));
     assert_eq!(disabled(cx, &t, "detail-shell"), Some(true));
     // The failed shell's Restart shell is disabled, saying why, with Unlock… beside it; the key
@@ -467,7 +488,7 @@ async fn a_protected_cluster_disables_shell_until_unlocked(cx: &mut TestAppConte
     t.click(cx, "terminal-unlock");
     wait_for_dialog(cx, &t, true).await;
     t.click(cx, "ok");
-    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
     assert_eq!(disabled(cx, &t, "terminal-restart"), Some(false));
     assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
 }
@@ -483,14 +504,19 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
         cx,
         dir.path(),
         &format!(
-            "{PROTECT_LOCAL}trusted_clusters = [{{ context = \"beta\", server = \"{old}\" }}]\n"
+            "{PROTECT_LOCAL}trusted_clusters = [{{ context = \"kind-beta\", server = \"{old}\" }}]\n"
         ),
     )
     .await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
-    assert_eq!(protection(cx, &t, "beta"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-beta"), Protection::Protected);
     let beta_trust = t.model.read_with(cx, |m, _| {
-        m.trust(m.clusters.iter().find(|c| c.info.name == "beta").unwrap())
+        m.trust(
+            m.clusters
+                .iter()
+                .find(|c| c.info.name == "kind-beta")
+                .unwrap(),
+        )
     });
     assert_eq!(
         beta_trust,
@@ -498,44 +524,56 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
             trusted_server: old.into()
         }
     );
-    let row = t.description(cx, "cluster-beta").unwrap_or_default();
+    let row = t.description(cx, "cluster-kind-beta").unwrap_or_default();
     assert!(
         row.contains(&format!("Cluster changed: trusted at {old}")),
         "{row}"
     );
 
-    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::TrustCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "trust-description"),
-        Some(trust_dialog("alpha", "alpha", &t.server, None).text)
+        Some(trust_dialog("kind-alpha", "kind-alpha", &t.server, None).text)
     );
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
-    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Trusted).await;
     let toml = t.settings_toml();
     assert!(
         toml.contains("trusted_clusters") && toml.contains(&t.server),
         "{toml}"
     );
     assert!(
-        t.description(cx, "lock-alpha")
+        t.description(cx, "lock-kind-alpha")
             .unwrap_or_default()
             .starts_with("Trusted")
     );
     assert!(matches!(
-        t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"})),
+        t.dispatch(
+            cx,
+            "workspace::TrustCluster",
+            json!({"cluster": "kind-alpha"})
+        ),
         Err(ActionError::Rejected { .. })
     ));
 
     // Beta, trusted at its old server: trusting again names both.
-    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "beta"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::TrustCluster",
+        json!({"cluster": "kind-beta"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     assert_eq!(
         t.label(cx, "trust-description"),
-        Some(trust_dialog("beta", "beta", &t.refused_server, Some(old)).text)
+        Some(trust_dialog("kind-beta", "kind-beta", &t.refused_server, Some(old)).text)
     );
     t.press(cx, "escape");
     wait_for_dialog(cx, &t, false).await;
@@ -543,13 +581,13 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
     // Stop Trusting protects it at once, through the gate the core shares, before the new
     // settings come back: the settings the app holds still trust it.
     let (trusted_still, now) = t.model.update(cx, |m, cx| {
-        m.untrust_cluster("alpha".into(), cx);
+        m.untrust_cluster("kind-alpha".into(), cx);
         (
             m.settings
                 .trusted_clusters
                 .iter()
-                .any(|p| p.context == "alpha"),
-            m.protection_of("alpha"),
+                .any(|p| p.context == "kind-alpha"),
+            m.protection_of("kind-alpha"),
         )
     });
     assert!(trusted_still);
@@ -561,19 +599,27 @@ async fn trust_is_kept_in_settings_and_pinned_to_the_server(cx: &mut TestAppCont
             .settings
             .trusted_clusters
             .iter()
-            .all(|p| p.context != "alpha")
+            .all(|p| p.context != "kind-alpha")
     })
     .await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
-    t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "beta"}))
-        .unwrap();
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
+    t.dispatch(
+        cx,
+        "workspace::UntrustCluster",
+        json!({"cluster": "kind-beta"}),
+    )
+    .unwrap();
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model.read(cx).settings.trusted_clusters.is_empty()
     })
     .await;
     assert!(matches!(
-        t.dispatch(cx, "workspace::UntrustCluster", json!({"cluster": "alpha"})),
+        t.dispatch(
+            cx,
+            "workspace::UntrustCluster",
+            json!({"cluster": "kind-alpha"})
+        ),
         Err(ActionError::Rejected { .. })
     ));
 }
@@ -644,30 +690,34 @@ async fn a_failed_stop_trusting_can_be_retried(cx: &mut TestAppContext) {
     let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
     let server = t.server.clone();
     t.model
-        .update(cx, |m, _| m.trust_cluster("alpha".into(), server));
-    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+        .update(cx, |m, _| m.trust_cluster("kind-alpha".into(), server));
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Trusted).await;
     // As after a Stop Trusting whose write did not land.
     t.model.update(cx, |m, cx| {
-        m.core().unlocks().revoke_trust("alpha");
+        m.core().unlocks().revoke_trust("kind-alpha");
         cx.notify();
     });
     cx.run_until_parked();
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
     assert!(
         t.model
             .read_with(cx, |m, _| !m.settings.trusted_clusters.is_empty())
     );
-    let tip = t.description(cx, "lock-alpha").unwrap_or_default();
+    let tip = t.description(cx, "lock-kind-alpha").unwrap_or_default();
     assert!(tip.contains("remove that trust"), "{tip}");
     let available = t.available(cx);
     for action in ["workspace::UntrustCluster", "workspace::TrustCluster"] {
         assert!(available.contains(&action), "{action}: {available:?}");
     }
-    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::TrustCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
-    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Trusted).await;
 }
 
 // covers UP-54: an ended shell whose context lost its server, or left kubeconfig, says so on
@@ -700,32 +750,37 @@ async fn a_shell_whose_context_is_gone_offers_no_unlock(cx: &mut TestAppContext)
     change(cx, &|clusters| {
         clusters
             .iter_mut()
-            .find(|c| c.info.name == "alpha")
+            .find(|c| c.info.name == "kind-alpha")
             .unwrap()
             .info
             .server = None
     });
     assert_eq!(
         blocked(cx),
-        Some(("alpha has no API server in kubeconfig".to_owned(), false))
+        Some((
+            "kind-alpha has no API server in kubeconfig".to_owned(),
+            false
+        ))
     );
     assert_eq!(disabled(cx, &t, "terminal-restart"), Some(true));
     assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
-    change(cx, &|clusters| clusters.retain(|c| c.info.name != "alpha"));
+    change(cx, &|clusters| {
+        clusters.retain(|c| c.info.name != "kind-alpha")
+    });
     assert_eq!(
         blocked(cx),
-        Some(("no kubeconfig context named alpha".to_owned(), false))
+        Some(("no kubeconfig context named kind-alpha".to_owned(), false))
     );
     assert_eq!(disabled(cx, &t, "terminal-restart"), Some(true));
     assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
 }
 
-/// Trusts `alpha` and waits until the core has finished that request.
+/// Trusts `kind-alpha` and waits until the core has finished that request.
 async fn trust_alpha(cx: &mut TestAppContext, t: &TestWorkspace) {
     let server = t.server.clone();
     t.model
-        .update(cx, |m, _| m.trust_cluster("alpha".into(), server));
-    wait_for_protection(cx, t, "alpha", Protection::Trusted).await;
+        .update(cx, |m, _| m.trust_cluster("kind-alpha".into(), server));
+    wait_for_protection(cx, t, "kind-alpha", Protection::Trusted).await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model.read(cx).trust_settled > 0
@@ -742,21 +797,24 @@ async fn stop_trusting_shows_protected_until_the_settings_arrive(cx: &mut TestAp
     trust_alpha(cx, &t).await;
 
     t.model.update(cx, |m, cx| {
-        m.untrust_cluster("alpha".into(), cx);
+        m.untrust_cluster("kind-alpha".into(), cx);
         // As once the core has written the change, before its event reaches this model.
         let unlocks = m.core().unlocks();
-        let request = unlocks.revoke_trust("alpha");
-        unlocks.trust_removed("alpha", request);
-        assert!(!unlocks.trust_revoked("alpha"), "the core is done with it");
+        let request = unlocks.revoke_trust("kind-alpha");
+        unlocks.trust_removed("kind-alpha", request);
+        assert!(
+            !unlocks.trust_revoked("kind-alpha"),
+            "the core is done with it"
+        );
         assert!(!m.settings.trusted_clusters.is_empty(), "the old settings");
-        assert_eq!(m.protection_of("alpha"), Protection::Protected);
+        assert_eq!(m.protection_of("kind-alpha"), Protection::Protected);
     });
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model.read(cx).settings.trusted_clusters.is_empty()
     })
     .await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Protected);
 
     // Trusting it again counts as soon as it is written.
     trust_alpha(cx, &t).await;
@@ -772,11 +830,11 @@ async fn a_merged_settings_event_ends_stop_trusting(cx: &mut TestAppContext) {
 
     t.model.update(cx, |m, cx| {
         let settings = m.settings.clone();
-        m.untrust_cluster("alpha".into(), cx);
+        m.untrust_cluster("kind-alpha".into(), cx);
         let unlocks = m.core().unlocks();
-        let request = unlocks.revoke_trust("alpha");
-        unlocks.trust_removed("alpha", request);
-        assert_eq!(m.protection_of("alpha"), Protection::Protected);
+        let request = unlocks.revoke_trust("kind-alpha");
+        unlocks.trust_removed("kind-alpha", request);
+        assert_eq!(m.protection_of("kind-alpha"), Protection::Protected);
         m.feed(
             Event::SettingsChanged {
                 settings,
@@ -785,19 +843,19 @@ async fn a_merged_settings_event_ends_stop_trusting(cx: &mut TestAppContext) {
             },
             cx,
         );
-        assert_eq!(m.protection_of("alpha"), Protection::Trusted);
+        assert_eq!(m.protection_of("kind-alpha"), Protection::Trusted);
     });
 }
 
-// covers UP-54: clusters on this machine start unlocked: no lock button, Shell enabled, and
+// covers UP-54: known local clusters start unlocked: no lock button, Shell enabled, and
 // nothing to unlock or trust.
 #[gpui_kit::test]
-async fn clusters_on_this_machine_start_unlocked(cx: &mut TestAppContext) {
+async fn known_local_clusters_start_unlocked(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_with_settings(cx, dir.path(), "").await;
     show_web(cx, &t).await;
-    assert_eq!(protection(cx, &t, "alpha"), Protection::Local);
-    assert_eq!(disabled(cx, &t, "lock-alpha"), None);
+    assert_eq!(protection(cx, &t, "kind-alpha"), Protection::Local);
+    assert_eq!(disabled(cx, &t, "lock-kind-alpha"), None);
     assert_eq!(disabled(cx, &t, "detail-shell"), Some(false));
     assert_eq!(disabled(cx, &t, "detail-unlock"), None);
     for action in [
@@ -811,14 +869,14 @@ async fn clusters_on_this_machine_start_unlocked(cx: &mut TestAppContext) {
                 t.dispatch(
                     cx,
                     &format!("workspace::{action}"),
-                    json!({"cluster": "alpha"})
+                    json!({"cluster": "kind-alpha"})
                 ),
                 Err(ActionError::Rejected { .. })
             ),
             "{action}"
         );
     }
-    let row = t.description(cx, "cluster-alpha").unwrap_or_default();
+    let row = t.description(cx, "cluster-kind-alpha").unwrap_or_default();
     assert!(row.contains("On this machine: unlocked"), "{row}");
 }
 
@@ -833,8 +891,12 @@ async fn a_dialog_closes_the_namespace_picker(cx: &mut TestAppContext) {
     t.click(cx, "namespace-filter-button");
     t.wait_for_element(cx, "ns-all").await;
     draw(cx, &t);
-    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::UnlockCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     draw(cx, &t);
     assert!(t.find(cx, "ns-all").is_none(), "the picker closed");
@@ -897,10 +959,16 @@ fn assert_cleaned(text: &str) {
 fn dialogs_show_the_cleaned_server_address() {
     let previous = "https://old:pass@old.example:6443";
     let texts = [
-        unlock_dialog("alpha", "alpha", SERVER_WITH_USERINFO).text,
-        trust_dialog("alpha", "alpha", SERVER_WITH_USERINFO, Some(previous)).text,
-        scope_dialog("alpha", SERVER_WITH_USERINFO, &Default::default()).text,
-        expose_dialog("alpha", SERVER_WITH_USERINFO, Some(previous)).text,
+        unlock_dialog("kind-alpha", "kind-alpha", SERVER_WITH_USERINFO).text,
+        trust_dialog(
+            "kind-alpha",
+            "kind-alpha",
+            SERVER_WITH_USERINFO,
+            Some(previous),
+        )
+        .text,
+        scope_dialog("kind-alpha", SERVER_WITH_USERINFO, &Default::default()).text,
+        expose_dialog("kind-alpha", SERVER_WITH_USERINFO, Some(previous)).text,
     ];
     for text in &texts {
         assert_cleaned(text);
@@ -916,7 +984,13 @@ fn dialogs_show_the_cleaned_server_address() {
 #[test]
 fn a_previous_server_that_shows_the_same_is_still_called_different() {
     let previous = "https://other:login@prod.example:6443";
-    let text = trust_dialog("alpha", "alpha", SERVER_WITH_USERINFO, Some(previous)).text;
+    let text = trust_dialog(
+        "kind-alpha",
+        "kind-alpha",
+        SERVER_WITH_USERINFO,
+        Some(previous),
+    )
+    .text;
     assert_cleaned(&text);
     assert!(!text.contains("other:login"), "{text}");
     assert!(
@@ -934,39 +1008,50 @@ async fn the_row_is_cleaned_while_pins_keep_the_exact_url(cx: &mut TestAppContex
     std::fs::write(dir.path().join("settings.toml"), PROTECT_LOCAL).unwrap();
     let t = open_workspace_with(cx, dir.path(), |dir, servers| {
         let kubeconfig = dir.join("kubeconfig");
-        let contexts = [("alpha", RAW), ("beta", servers.refused.as_str())];
+        let contexts = [("kind-alpha", RAW), ("kind-beta", servers.refused.as_str())];
         std::fs::write(&kubeconfig, kubeconfig_yaml(&contexts)).unwrap();
         vec![kubeconfig]
     })
     .await;
     draw(cx, &t);
 
-    let row = t.description(cx, "cluster-alpha").unwrap();
+    let row = t.description(cx, "cluster-kind-alpha").unwrap();
     assert_cleaned(&row);
-    assert!(row.starts_with(&format!("alpha\n{CLEANED}\n")), "{row}");
+    assert!(
+        row.starts_with(&format!("kind-alpha\n{CLEANED}\n")),
+        "{row}"
+    );
     assert_eq!(
-        t.label(cx, "cluster-server-alpha").as_deref(),
+        t.label(cx, "cluster-server-kind-alpha").as_deref(),
         Some("127.0.0.1:1")
     );
 
-    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::UnlockCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     assert_cleaned(&t.label(cx, "unlock-description").unwrap());
     t.click(cx, "ok");
-    wait_for_protection(cx, &t, "alpha", Protection::Unlocked).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Unlocked).await;
     wait_for_dialog(cx, &t, false).await;
     t.model.read_with(cx, |m, _| {
         let unlocks = m.core().unlocks();
-        assert!(unlocks.is_unlocked("alpha", RAW));
-        assert!(!unlocks.is_unlocked("alpha", CLEANED));
+        assert!(unlocks.is_unlocked("kind-alpha", RAW));
+        assert!(!unlocks.is_unlocked("kind-alpha", CLEANED));
     });
 
-    t.dispatch(cx, "workspace::TrustCluster", json!({"cluster": "alpha"}))
-        .unwrap();
+    t.dispatch(
+        cx,
+        "workspace::TrustCluster",
+        json!({"cluster": "kind-alpha"}),
+    )
+    .unwrap();
     wait_for_dialog(cx, &t, true).await;
     assert_cleaned(&t.label(cx, "trust-description").unwrap());
     t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
-    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+    wait_for_protection(cx, &t, "kind-alpha", Protection::Trusted).await;
     assert!(t.settings_toml().contains(RAW));
 }

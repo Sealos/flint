@@ -76,26 +76,26 @@ async fn the_ai_tag_shows_what_agents_asked_for(cx: &mut TestAppContext) {
     let t = open_workspace(cx, dir.path()).await;
     let server = t.server.clone();
     t.model.update(cx, |m, _| {
-        m.expose_to_ai("alpha".into(), server, AiScope::default())
+        m.expose_to_ai("kind-alpha".into(), server, AiScope::default())
     });
-    t.wait_for_element(cx, "ai-scope-alpha").await;
-    let tip = t.description(cx, "ai-scope-alpha").unwrap_or_default();
+    t.wait_for_element(cx, "ai-scope-kind-alpha").await;
+    let tip = t.description(cx, "ai-scope-kind-alpha").unwrap_or_default();
     assert!(tip.ends_with("Click to see what they asked for."), "{tip}");
     set_activity(
         cx,
         &t,
         vec![
-            record(1_000, "alpha", "list_resources"),
-            record(2_000, "beta", "get_events"),
+            record(1_000, "kind-alpha", "list_resources"),
+            record(2_000, "kind-beta", "get_events"),
             ActivityRecord {
                 name: Some("web-0".into()),
                 outcome: Outcome::Denied,
-                ..record(3_000, "alpha", "get_pod_logs")
+                ..record(3_000, "kind-alpha", "get_pod_logs")
             },
         ],
     );
 
-    t.click(cx, "ai-scope-alpha");
+    t.click(cx, "ai-scope-kind-alpha");
     t.wait_for_label(cx, "activity-count", "2 calls").await;
     let rows = row_labels(cx, &t);
     assert_eq!(rows.len(), 2, "{rows:?}");
@@ -112,7 +112,7 @@ async fn the_ai_tag_shows_what_agents_asked_for(cx: &mut TestAppContext) {
     // An agent calls again: the open tab shows it on top.
     t.model.update(cx, |m, cx| {
         let mut records = (*m.agent_activity).clone();
-        records.push(record(4_000, "alpha", "get_resource"));
+        records.push(record(4_000, "kind-alpha", "get_resource"));
         m.agent_activity = Arc::new(records);
         cx.notify();
     });
@@ -120,7 +120,7 @@ async fn the_ai_tag_shows_what_agents_asked_for(cx: &mut TestAppContext) {
     assert!(row_labels(cx, &t)[0].contains("get_resource"));
 
     // The tag shows the same tab again.
-    t.click(cx, "ai-scope-alpha");
+    t.click(cx, "ai-scope-kind-alpha");
     cx.run_until_parked();
     assert_eq!(dock_tabs(cx, &t), 1);
 
@@ -138,7 +138,7 @@ async fn the_ai_tag_shows_what_agents_asked_for(cx: &mut TestAppContext) {
     // The context now points at another server: this tab is for the old one, so it offers no
     // scope to edit (that would be the new server's).
     t.model.update(cx, |m, cx| {
-        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "alpha") {
+        if let Some(c) = m.clusters.iter_mut().find(|c| c.info.name == "kind-alpha") {
             c.info.server = Some("https://moved.example:6443".into());
         }
         cx.notify();
@@ -164,14 +164,18 @@ async fn show_agent_activity_works_for_any_context(cx: &mut TestAppContext) {
     t.dispatch(
         cx,
         "workspace::ShowAgentActivity",
-        json!({"cluster": "beta"}),
+        json!({"cluster": "kind-beta"}),
     )
     .unwrap();
     t.wait_for_element(cx, "activity-empty").await;
     assert_eq!(t.label(cx, "activity-count").as_deref(), Some("0 calls"));
     // Not exposed: no scope to edit from here.
     assert!(t.find(cx, "activity-edit-scope").is_none());
-    set_activity(cx, &t, vec![record(1_000, "beta", "list_resource_kinds")]);
+    set_activity(
+        cx,
+        &t,
+        vec![record(1_000, "kind-beta", "list_resource_kinds")],
+    );
     t.wait_for_label(cx, "activity-count", "1 call").await;
     assert!(t.find(cx, "activity-empty").is_none());
 }

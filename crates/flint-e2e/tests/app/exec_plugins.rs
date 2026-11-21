@@ -54,7 +54,7 @@ struct Plugin {
 }
 
 impl Plugin {
-    /// Sets `two`'s `fake-a` to authenticate with the plugin, which is not installed yet.
+    /// Sets `two`'s `kind-fake-a` to authenticate with the plugin, which is not installed yet.
     fn configure(two: &TwoClusters) -> Result<Plugin> {
         let dir = two.scratch.path().join("plugin");
         std::fs::create_dir(&dir)?;
@@ -66,7 +66,7 @@ impl Plugin {
             .iter_mut()
             .find(|user| user.name == TwoClusters::A)
             .and_then(|user| user.auth_info.as_mut())
-            .context("fake-a's user")?;
+            .context("kind-fake-a's user")?;
         user.exec = Some(serde_json::from_value::<ExecConfig>(json!({
             "apiVersion": "client.authentication.k8s.io/v1beta1",
             "command": plugin.path(),

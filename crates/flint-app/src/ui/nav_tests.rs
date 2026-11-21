@@ -37,10 +37,12 @@ fn open_kind(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<KindId> {
 async fn discovery_fills_the_navigation_and_kinds_open_from_it(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connecting))
-        .await;
-    let state = t.description(cx, "cluster-alpha").unwrap();
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connecting)
+    })
+    .await;
+    let state = t.description(cx, "cluster-kind-alpha").unwrap();
     assert!(state.contains("\nConnecting\n"), "{state}");
     // Connecting, before discovery: nothing to open yet.
     assert!(!nav(cx, &t).read_with(cx, |n, _| n.has_sections()));
@@ -50,7 +52,7 @@ async fn discovery_fills_the_navigation_and_kinds_open_from_it(cx: &mut TestAppC
     ));
 
     t.connect_alpha(cx, standard_sections()).await;
-    let state = t.description(cx, "cluster-alpha").unwrap();
+    let state = t.description(cx, "cluster-kind-alpha").unwrap();
     assert!(state.contains("Connected, Kubernetes v1.33.1"), "{state}");
     assert!(nav(cx, &t).read_with(cx, |n, _| n.has_sections()));
     assert_eq!(collapsed(cx, &t, "Workloads"), Some(false));
@@ -125,11 +127,11 @@ async fn discovery_fills_the_navigation_and_kinds_open_from_it(cx: &mut TestAppC
     ));
 }
 
-/// Waits until beta has started connecting `attempts` times, that attempt has failed, and the
+/// Waits until kind-beta has started connecting `attempts` times, that attempt has failed, and the
 /// main area's Retry button is drawn again.
 async fn retried(cx: &mut TestAppContext, t: &TestWorkspace, attempts: usize) {
-    t.wait_for_attempts(cx, "beta", attempts).await;
-    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+    t.wait_for_attempts(cx, "kind-beta", attempts).await;
+    t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
     t.wait_for_element(cx, "connection-retry").await;
 }
@@ -141,12 +143,12 @@ async fn retried(cx: &mut TestAppContext, t: &TestWorkspace, attempts: usize) {
 async fn failures_offer_a_retry(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     assert!(!t.available(cx).contains(&"workspace::RetryConnection"));
     assert!(t.find(cx, "nav-retry").is_none());
 
-    t.activate(cx, "beta").await;
-    t.wait_for_state(cx, "beta", |s| matches!(s, ConnectionState::Failed(_)))
+    t.activate(cx, "kind-beta").await;
+    t.wait_for_state(cx, "kind-beta", |s| matches!(s, ConnectionState::Failed(_)))
         .await;
     t.wait_for_element(cx, "connection-retry").await;
     assert!(t.find(cx, "nav-retry").is_none());
@@ -155,23 +157,25 @@ async fn failures_offer_a_retry(cx: &mut TestAppContext) {
     // Each Retry connects again, and this server refuses again. While that attempt runs the
     // cluster is "connecting" and no Retry button is drawn, so each step waits for the attempt
     // to start, then for it to fail and the button to be back.
-    let attempts = t.connection_attempts("beta");
+    let attempts = t.connection_attempts("kind-beta");
     t.click(cx, "connection-retry");
     retried(cx, &t, attempts + 1).await;
     t.dispatch(cx, "workspace::RetryConnection", Value::Null)
         .unwrap();
     retried(cx, &t, attempts + 2).await;
 
-    // Back on alpha, connected, a discovery that failed with nothing to show: the navigation's
+    // Back on kind-alpha, connected, a discovery that failed with nothing to show: the navigation's
     // Retry connects (and discovers) again.
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     assert!(t.find(cx, "nav-retry").is_none());
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connecting))
-        .await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connecting)
+    })
+    .await;
     t.feed(
         cx,
         Event::ConnectionChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             state: ConnectionState::Connected(flint_core::ServerVersion {
                 git_version: "v1.33.1".into(),
                 platform: "linux/arm64".into(),
@@ -181,7 +185,7 @@ async fn failures_offer_a_retry(cx: &mut TestAppContext) {
     t.feed(
         cx,
         Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: None,
             error: Some("the server could not find the requested resource".into()),
@@ -190,9 +194,9 @@ async fn failures_offer_a_retry(cx: &mut TestAppContext) {
     t.wait_for_element(cx, "nav-retry").await;
     assert!(t.available(cx).contains(&"workspace::RetryConnection"));
     assert!(!nav(cx, &t).read_with(cx, |n, _| n.has_sections()));
-    let attempts = t.connection_attempts("alpha");
+    let attempts = t.connection_attempts("kind-alpha");
     t.click(cx, "nav-retry");
-    t.wait_for_attempts(cx, "alpha", attempts + 1).await;
+    t.wait_for_attempts(cx, "kind-alpha", attempts + 1).await;
 }
 
 // covers UP-24: switching clusters closes the old cluster's list and detail pane, and the old
@@ -214,7 +218,7 @@ async fn switching_clusters_closes_views_and_reopens_the_last_kind(cx: &mut Test
     let old = t.list(cx).unwrap().downgrade();
     let old_id = old.entity_id();
 
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     assert!(t.list(cx).is_none());
     assert!(t.detail(cx).is_none());
     assert_eq!(nav_selected(cx, &t), None);

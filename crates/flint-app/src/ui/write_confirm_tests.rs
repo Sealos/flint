@@ -45,7 +45,7 @@ impl Flow {
 
 fn web(api: &LocalApi) -> WriteTarget {
     WriteTarget {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         server: Some(api.url.clone()),
         kind: KindId::new("apps", "deployments"),
         namespace: Some("demo".to_owned()),
@@ -153,20 +153,22 @@ async fn connected_unlocked(
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir, move |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
     })
     .await;
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
-    core.unlock("alpha", &api.url);
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
-        .await;
+    core.unlock("kind-alpha", &api.url);
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model
             .read(cx)
-            .discovered("alpha")
+            .discovered("kind-alpha")
             .is_some_and(|d| d.discovery.is_some())
     })
     .await;
@@ -470,7 +472,7 @@ async fn a_refused_write_is_reported_and_not_sent(cx: &mut TestAppContext) {
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
 
     let flow = open(cx, &t, &api, SCALE, true).await;
-    assert!(core.lock("alpha"), "it was unlocked");
+    assert!(core.lock("kind-alpha"), "it was unlocked");
     t.click(cx, "ok");
     wait_done(cx, &flow);
 
@@ -478,7 +480,7 @@ async fn a_refused_write_is_reported_and_not_sent(cx: &mut TestAppContext) {
     assert_eq!(
         flow.result(),
         Err(WriteError::Refused(WriteRefusal::Protected {
-            cluster: "alpha".to_owned()
+            cluster: "kind-alpha".to_owned()
         }))
     );
 }
@@ -559,12 +561,12 @@ async fn a_refused_confirmation_does_not_run_after_an_unlock(cx: &mut TestAppCon
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
 
     let (flow, confirmed) = handler(cx, &t, &api, true).await;
-    assert!(core.lock("alpha"));
+    assert!(core.lock("kind-alpha"));
     cx.update(|cx| confirmed(cx));
     wait_done(cx, &flow);
     assert!(matches!(flow.result(), Err(WriteError::Refused(_))));
 
-    core.unlock("alpha", &api.url);
+    core.unlock("kind-alpha", &api.url);
     assert_runs_once(cx, &api, &flow, &confirmed);
     assert_eq!(api.patches(), 0);
 }

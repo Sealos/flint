@@ -63,7 +63,7 @@ pub fn sidebar<'a>(state: &'a Value, name: &str) -> &'a Value {
         .unwrap_or(&Value::Null)
 }
 
-/// Two fake servers (contexts `fake-a` and `fake-b`) in one kubeconfig in `scratch`.
+/// Two fake servers (contexts `kind-fake-a` and `kind-fake-b`) in one kubeconfig in `scratch`.
 pub struct TwoClusters {
     pub a: FakeApiServer,
     pub b: FakeApiServer,
@@ -71,8 +71,8 @@ pub struct TwoClusters {
 }
 
 impl TwoClusters {
-    pub const A: &str = "fake-a";
-    pub const B: &str = "fake-b";
+    pub const A: &str = "kind-fake-a";
+    pub const B: &str = "kind-fake-b";
 
     pub fn start() -> Result<TwoClusters> {
         let a = FakeApiServer::start_blocking(Options::default())?;
