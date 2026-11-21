@@ -3102,6 +3102,35 @@ mod tests {
         assert!(snap.input_not_replayed);
     }
 
+    #[tokio::test]
+    async fn a_fallback_the_runtime_could_not_start_records_no_loss() {
+        let printed: [&[u8]; 2] = [b"", b"OCI runtime exec failed: permission denied\r\n"];
+        for output in printed {
+            let launcher = GatedLauncher::default();
+            let bash = launcher.gate();
+            let sh = launcher.gate();
+            let mut session =
+                open_watched(&launcher, request(), Arc::new(|| async { None }.boxed()));
+            let (bash_proc, mut bash_remote) = process();
+            let paste = "x".repeat(600 * 1024);
+            session.paste(paste.clone()).unwrap();
+            bash.send(bash_proc).ok().unwrap();
+            assert_eq!(bash_remote.read_stdin(paste.len()).await, paste.as_bytes());
+            queued(&session, 0).await;
+            bash_remote.exit(status("Failure", "InternalError", NOT_FOUND));
+
+            let (sh_proc, mut sh_remote) = process();
+            sh.send(sh_proc).ok().unwrap();
+            if !output.is_empty() {
+                sh_remote.print(output).await;
+            }
+            sh_remote.exit(exit_status("126"));
+            let snap = wait_for(&mut session, "sh ended", |s| s.state.is_finished()).await;
+            assert_eq!(snap.state, ExecState::Exited { code: Some(126) });
+            assert!(!snap.input_not_replayed);
+        }
+    }
+
     // covers UP-41 (#256): input sent while a shell may still turn out missing is kept for
     // the next one only while the budget has room for the copy.
     #[tokio::test]
