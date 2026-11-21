@@ -103,8 +103,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   refused before any request, with the same not-found error as a missing object.
 - An argument a tool does not have is refused with an error naming it and the accepted arguments, so a filter Flint
   cannot apply never returns unfiltered data. Standard request metadata (`_meta`) is not an argument.
-  The activity log records a refused call by tool and failure only, with no argument values or cluster, so it shows on
-  no cluster's Activity tab.
+  The activity log records a call refused for an unsupported argument by tool and failure only, with no argument
+  values or cluster, so it shows on no cluster's Activity tab.
 - Kinds are named as `kubectl get` takes them, ignoring case: Kind, plural, singular or short name (`Deployment`,
   `deployments`, `deployment`, `deploy`), optionally with `.group`. A Kind, plural or singular match beats a short
   name; then the core group beats built-in groups (`apps`, `*.k8s.io`), which beat CRDs. A name still matching
