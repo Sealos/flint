@@ -1129,6 +1129,11 @@ impl ResourceList {
                 error.clone(),
                 theme.warning,
             )),
+            SyncState::RetryingRefusal { error } if snapshot.rows.is_empty() => Some(message(
+                format!("Reconnecting to list {label}…"),
+                Some(error.clone()),
+                theme.warning,
+            )),
             _ if self.rows.is_empty() => {
                 let filtered = !self.query.text.trim().is_empty()
                     || (self.namespaced && !self.query.namespaces.is_empty());
@@ -1228,12 +1233,14 @@ impl ResourceList {
             );
         }
         let state = match &snapshot.state {
-            SyncState::Reconnecting { error } => Some((
+            SyncState::Reconnecting { error: Some(e) }
+            | SyncState::RetryingRefusal { error: e } => Some((
                 theme.warning,
-                match error {
-                    Some(e) => format!("Reconnecting. These rows may be out of date: {e}"),
-                    None => "Reconnecting. These rows may be out of date.".to_owned(),
-                },
+                format!("Reconnecting. These rows may be out of date: {e}"),
+            )),
+            SyncState::Reconnecting { error: None } => Some((
+                theme.warning,
+                "Reconnecting. These rows may be out of date.".to_owned(),
             )),
             SyncState::Failed { error } if !snapshot.rows.is_empty() => Some((
                 theme.danger,
@@ -1336,6 +1343,9 @@ fn state_chip(state: &SyncState, feed: Feed, theme: &Theme) -> AnyElement {
         SyncState::Idle => ("not watched", theme.muted_foreground, None),
         SyncState::Loading => ("loading", theme.muted_foreground, None),
         SyncState::Reconnecting { error } => ("reconnecting", theme.warning, error.clone()),
+        SyncState::RetryingRefusal { error } => {
+            ("reconnecting", theme.warning, Some(error.clone()))
+        }
         SyncState::Failed { error } => ("failed", theme.danger, Some(error.clone())),
         SyncState::Unavailable => ("unavailable", theme.muted_foreground, None),
     };

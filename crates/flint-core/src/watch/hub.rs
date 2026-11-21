@@ -238,7 +238,9 @@ impl HubRegistry {
                     c == cluster
                         && matches!(
                             hub.state(),
-                            SyncState::Synced | SyncState::Reconnecting { .. }
+                            SyncState::Synced
+                                | SyncState::Reconnecting { .. }
+                                | SyncState::RetryingRefusal { .. }
                         )
                 })
                 .map(|(_, hub)| hub.clone())

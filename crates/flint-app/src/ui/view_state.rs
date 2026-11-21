@@ -643,7 +643,7 @@ pub fn sync_word(state: &SyncState, polled: bool) -> &'static str {
         SyncState::Synced => "live",
         SyncState::Idle => "not watched",
         SyncState::Loading => "loading",
-        SyncState::Reconnecting { .. } => "reconnecting",
+        SyncState::Reconnecting { .. } | SyncState::RetryingRefusal { .. } => "reconnecting",
         SyncState::Failed { .. } => "failed",
         SyncState::Unavailable => "unavailable",
     }
@@ -692,6 +692,10 @@ mod tests {
     fn sync_words_match_the_chip() {
         assert_eq!(sync_word(&SyncState::Synced, false), "live");
         assert_eq!(sync_word(&SyncState::Synced, true), "polled");
+        assert_eq!(
+            sync_word(&SyncState::RetryingRefusal { error: "x".into() }, false),
+            "reconnecting"
+        );
         assert_eq!(
             sync_word(&SyncState::Failed { error: "x".into() }, false),
             "failed"

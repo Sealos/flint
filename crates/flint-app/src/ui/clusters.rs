@@ -520,6 +520,7 @@ fn reconnecting(states: &HashMap<KindId, SyncState>) -> Option<Presence<'_>> {
         .iter()
         .filter_map(|(kind, state)| match state {
             SyncState::Reconnecting { error } => Some((kind, error.as_deref())),
+            SyncState::RetryingRefusal { error } => Some((kind, Some(error.as_str()))),
             _ => None,
         })
         .min_by_key(|(kind, error)| (error.is_none(), *kind))?;
