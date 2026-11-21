@@ -27,6 +27,10 @@ pub enum SyncState {
     /// The watch broke and is being re-established, or a relist is running. Rows are the last
     /// known state and may be stale: show it.
     Reconnecting { error: Option<String> },
+    /// The server refused the list or watch (forbidden, not found), which can be transient, and
+    /// it is being retried soon. Becomes [`SyncState::Failed`] if a list keeps being refused.
+    /// Rows are the last known state and may be stale.
+    RetryingRefusal { error: String },
     /// The server refuses the list (forbidden, not found). Retried slowly. Rows may be empty.
     Failed { error: String },
     /// Discovery does not know this kind on this cluster.

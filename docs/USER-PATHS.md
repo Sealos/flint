@@ -294,7 +294,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   new lines, see the previous container's logs, search with highlighted matches and move between them, and pause
   following, with the number of lines held back shown. Scrolling up stops following; scrolling back to the bottom (or
   Jump to Newest Line) follows again; while it does not follow, the toolbar says "Not following" beside Jump. The tab
-  says whether it is connecting, streaming, reconnecting (and which attempt), waiting for a crash-looping container
+  says whether it is connecting, streaming, reconnecting (and which attempt), waiting for a pod that isn't scheduled
+  yet or a container that hasn't started (and why, such as `ImagePullBackOff`), waiting for a crash-looping container
   to restart (back-off) or ended, and why in plain words (no permission, can't reach the API server) with the
   server's text under them; an unreachable node is told apart from an unreachable API server. Once a stream has
   ended there is nothing to pause. A previous instance whose log cannot be read says so (the container may have
