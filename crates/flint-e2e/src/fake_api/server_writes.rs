@@ -13,7 +13,10 @@ pub(super) fn handles(method: &Method, route: &Route) -> bool {
         Route::Object { .. } => method == Method::PATCH || method == Method::DELETE,
         Route::Subresource {
             gvr, subresource, ..
-        } => method == Method::POST && *gvr == Gvr::core("pods") && subresource == "eviction",
+        } => {
+            (method == Method::POST && *gvr == Gvr::core("pods") && subresource == "eviction")
+                || (method == Method::PATCH && subresource == "scale")
+        }
         _ => false,
     }
 }
@@ -58,6 +61,9 @@ pub(super) async fn serve(
             .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?
     };
     if method == Method::PATCH {
+        if matches!(route, Route::Subresource { .. }) {
+            return patch_scale(inner, gvr, namespace, name, &body);
+        }
         return patch(inner, gvr, namespace, name, &content_type, &body);
     }
     let (options, code) = if method == Method::POST {
@@ -98,17 +104,7 @@ fn patch(
         let operations = body
             .as_array()
             .ok_or_else(|| ApiError::new(400, "BadRequest", "not a JSON Patch"))?;
-        for operation in operations {
-            let path = operation["path"].as_str().unwrap_or_default();
-            match operation["op"].as_str() {
-                Some("test") if object.pointer(path) == Some(&operation["value"]) => {}
-                Some("test") => return Err(failed_test()),
-                Some("replace") => {
-                    *object.pointer_mut(path).ok_or_else(failed_test)? = operation["value"].clone();
-                }
-                _ => return Err(ApiError::new(400, "BadRequest", "unsupported operation")),
-            }
-        }
+        apply_json_patch(&mut object, operations)?;
     } else {
         let uid = body.pointer("/metadata/uid");
         if uid.is_some() && uid != object.pointer("/metadata/uid") {
@@ -131,6 +127,74 @@ fn patch(
     tell_watches(inner, gvr, change);
     drop(state);
     Ok(rebased(inner, object))
+}
+
+/// A JSON Patch of `test`, `replace` and `add`.
+fn apply_json_patch(object: &mut Value, operations: &[Value]) -> Result<(), ApiError> {
+    for operation in operations {
+        let path = operation["path"].as_str().unwrap_or_default();
+        match operation["op"].as_str() {
+            Some("test") if object.pointer(path) == Some(&operation["value"]) => {}
+            Some("test") => return Err(failed_test()),
+            Some("replace") => {
+                *object.pointer_mut(path).ok_or_else(failed_test)? = operation["value"].clone();
+            }
+            Some("add") => {
+                let (parent, key) = path.rsplit_once('/').ok_or_else(failed_test)?;
+                let parent = object.pointer_mut(parent).and_then(Value::as_object_mut);
+                parent
+                    .ok_or_else(failed_test)?
+                    .insert(key.to_owned(), operation["value"].clone());
+            }
+            _ => return Err(ApiError::new(400, "BadRequest", "unsupported operation")),
+        }
+    }
+    Ok(())
+}
+
+/// A JSON Patch of the `scale` subresource. As on the API server, a `Scale` omits `replicas` at
+/// zero.
+fn patch_scale(
+    inner: &Arc<Inner>,
+    gvr: &Gvr,
+    namespace: Option<&str>,
+    name: &str,
+    body: &Value,
+) -> Result<Response<Body>, ApiError> {
+    let operations = body
+        .as_array()
+        .ok_or_else(|| ApiError::new(400, "BadRequest", "not a JSON Patch"))?;
+    let mut state = lock(&inner.state);
+    let mut object = state.object(gvr, namespace, name)?;
+    let replicas = object.pointer("/spec/replicas").and_then(Value::as_u64);
+    let spec = match replicas {
+        Some(count) if count > 0 => json!({ "replicas": count }),
+        _ => json!({}),
+    };
+    let mut scale = json!({
+        "apiVersion": "autoscaling/v1",
+        "kind": "Scale",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "uid": object.pointer("/metadata/uid"),
+            "resourceVersion": object.pointer("/metadata/resourceVersion"),
+        },
+        "spec": spec,
+    });
+    apply_json_patch(&mut scale, operations)?;
+    let to = scale.pointer("/spec/replicas").cloned().unwrap_or(json!(0));
+    object["spec"]["replicas"] = to;
+    let version = state.bump();
+    object["metadata"]["resourceVersion"] = version.to_string().into();
+    scale["metadata"]["resourceVersion"] = version.to_string().into();
+    let row = state
+        .row_for_object(gvr, &mut object, &[])
+        .map_err(|e| ApiError::new(400, "BadRequest", e))?;
+    let change = state.apply_object(gvr, "MODIFIED", object, row);
+    tell_watches(inner, gvr, change);
+    drop(state);
+    Ok(rebased(inner, scale))
 }
 
 /// A JSON Merge Patch.

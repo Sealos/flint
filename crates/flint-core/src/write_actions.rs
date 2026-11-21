@@ -118,6 +118,14 @@ pub(crate) fn review(
             Ok(ResourceChange::Scale { from, to })
         }
         WriteProposal::RolloutRestart if !is_restartable(resource) => refuse("restarted"),
+        // It would be accepted, and no pod would restart.
+        WriteProposal::RolloutRestart
+            if live.pointer("/spec/paused").and_then(Value::as_bool) == Some(true) =>
+        {
+            Err(WriteError::Rejected(
+                "this Deployment is paused: resume it before restarting it".to_owned(),
+            ))
+        }
         WriteProposal::RolloutRestart => Ok(ResourceChange::RolloutRestart),
         WriteProposal::Cordon | WriteProposal::Uncordon | WriteProposal::Drain { .. }
             if !is_node(resource) =>
@@ -292,8 +300,8 @@ pub(crate) async fn delete(
 
 /// Changes a workload's replicas from `from`, the count reviewed, to `to`. A JSON Patch tests the
 /// uid and the count, so another change to either is a conflict and a status update is not. It
-/// patches the workload: its `scale` subresource omits `replicas` at zero, which a test cannot
-/// match.
+/// goes through the `scale` subresource, which is what a scale-only role may patch. That
+/// subresource omits `replicas` at zero, so a count of zero is tested as an empty `spec`.
 pub(crate) async fn scale(
     gate: &mut impl ActionGate,
     object: &ActionObject,
@@ -308,13 +316,22 @@ pub(crate) async fn scale(
         )));
     }
     let client = gate.client().await?;
-    let patch = json!([
-        { "op": "test", "path": "/metadata/uid", "value": object.uid },
-        { "op": "test", "path": "/spec/replicas", "value": from },
-        { "op": "replace", "path": "/spec/replicas", "value": to },
-    ]);
+    let uid = json!({ "op": "test", "path": "/metadata/uid", "value": object.uid });
+    let patch = if from == 0 {
+        json!([
+            uid,
+            { "op": "test", "path": "/spec", "value": {} },
+            { "op": "add", "path": "/spec/replicas", "value": to },
+        ])
+    } else {
+        json!([
+            uid,
+            { "op": "test", "path": "/spec/replicas", "value": from },
+            { "op": "replace", "path": "/spec/replicas", "value": to },
+        ])
+    };
     let url = format!(
-        "{}/{}?fieldManager={FIELD_MANAGER}",
+        "{}/{}/scale?fieldManager={FIELD_MANAGER}",
         object.api(client.clone()).resource_url(),
         object.name
     );
@@ -449,7 +466,7 @@ pub struct DrainReport {
     pub skipped: Vec<PodName>,
     /// Pods not tried, because the drain stopped first.
     pub remaining: Vec<PodName>,
-    /// Evicted pods still terminating when the wait ended.
+    /// Evicted pods not confirmed gone when the drain ended: they may still be terminating.
     pub terminating: Vec<PodName>,
     /// Why the drain stopped early.
     pub stopped: Option<WriteError>,
@@ -522,7 +539,7 @@ pub(crate) async fn drain(
         }
     };
     let params = ListParams::default().fields(&format!("spec.nodeName={}", node.name));
-    let api = Api::<Pod>::all(client);
+    let api = Api::<Pod>::all(client.clone());
     let listed = timed(api.list(&params)).await;
     let pods = match listed {
         Ok(list) => list.items,
@@ -531,6 +548,18 @@ pub(crate) async fn drain(
             return report;
         }
     };
+    // The list goes by the node's name: it is of the node reviewed only if that still has it.
+    match timed(node.api(client).get(&node.name)).await {
+        Ok(now) if now.metadata.uid.as_deref() == Some(node.uid.as_str()) => {}
+        Ok(_) => {
+            report.stopped = Some(WriteError::Replaced);
+            return report;
+        }
+        Err(error) => {
+            report.stopped = Some(error.into());
+            return report;
+        }
+    }
 
     let mut to_evict = Vec::new();
     for pod in pods {
@@ -550,11 +579,12 @@ pub(crate) async fn drain(
             Err(error) => {
                 report.remaining.push(name);
                 report.remaining.extend(pods.map(|p| pod_name(&p)));
+                report.terminating = sorted_names(&accepted);
                 report.stopped = Some(error.into());
                 return report;
             }
         };
-        let evicted = tokio::time::timeout(REQUEST_TIMEOUT, evict(client, &pod)).await;
+        let evicted = tokio::time::timeout(REQUEST_TIMEOUT, evict(client.clone(), &pod)).await;
         let Ok(evicted) = evicted else {
             report
                 .blocked
@@ -566,8 +596,13 @@ pub(crate) async fn drain(
                 report.evicted.push(name);
                 accepted.push(pod);
             }
-            // Gone already: nothing left to do for it.
-            Err(error) if api_code(&error) == Some(404) => {}
+            // Nothing left to do for it, if it is really gone: a proxy can answer 404 too.
+            Err(error) if api_code(&error) == Some(404) => {
+                if !is_gone(client, &pod).await {
+                    let why = ClusterError::kube(error).summary().to_string();
+                    report.blocked.push((name, BlockedReason::Failed(why)));
+                }
+            }
             Err(error) => {
                 let reason = match api_code(&error) {
                     Some(429) => BlockedReason::DisruptionBudget,
@@ -582,6 +617,21 @@ pub(crate) async fn drain(
     report.terminating = terminating;
     report.stopped = stopped.map(Into::into);
     report
+}
+
+/// Whether `pod` is confirmed gone: no pod has its name, or another one does.
+async fn is_gone(client: Client, pod: &Pod) -> bool {
+    let api = Api::<Pod>::namespaced(client, &pod.namespace().unwrap_or_default());
+    match timed(api.get_opt(&pod.name_any())).await {
+        Ok(Some(now)) => now.uid() != pod.uid(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+fn sorted_names(pods: &[Pod]) -> Vec<PodName> {
+    let names: BTreeSet<PodName> = pods.iter().map(pod_name).collect();
+    names.into_iter().collect()
 }
 
 async fn evict(client: Client, pod: &Pod) -> Result<(), kube::Error> {
@@ -606,10 +656,6 @@ async fn wait_until_gone(
     pods: Vec<Pod>,
     options: &DrainOptions,
 ) -> (Vec<PodName>, Option<ActionError>) {
-    let names = |pods: &[Pod]| {
-        let names: BTreeSet<PodName> = pods.iter().map(pod_name).collect();
-        names.into_iter().collect::<Vec<_>>()
-    };
     let deadline = Instant::now() + options.wait;
     let mut left: Vec<Pod> = pods;
     loop {
@@ -618,21 +664,25 @@ async fn wait_until_gone(
         }
         let client = match gate.client().await {
             Ok(client) => client,
-            Err(error) => return (names(&left), Some(error)),
+            Err(error) => return (sorted_names(&left), Some(error)),
         };
         let mut still = Vec::new();
         for pod in left {
             let api = Api::<Pod>::namespaced(client.clone(), &pod.namespace().unwrap_or_default());
-            match timed(api.get_opt(&pod.name_any())).await {
-                Ok(Some(now)) if now.uid() == pod.uid() => still.push(pod),
-                Ok(_) => {}
+            // Within what is left of the wait: a slow server must not hold the report.
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REQUEST_TIMEOUT);
+            match tokio::time::timeout(budget, api.get_opt(&pod.name_any())).await {
+                Ok(Ok(Some(now))) if now.uid() == pod.uid() => still.push(pod),
+                Ok(Ok(_)) => {}
                 // Not known to be gone.
-                Err(_) => still.push(pod),
+                Ok(Err(_)) | Err(_) => still.push(pod),
             }
         }
         left = still;
         if left.is_empty() || Instant::now() >= deadline {
-            return (names(&left), None);
+            return (sorted_names(&left), None);
         }
         tokio::time::sleep(options.poll).await;
     }
@@ -661,11 +711,21 @@ mod tests {
 
     /// A client answered by `reply`, recording what it was sent.
     fn fake(reply: Reply) -> (Client, Arc<Mutex<Vec<Seen>>>) {
+        fake_slow(reply, Duration::ZERO)
+    }
+
+    /// [`fake`], taking `slow` to answer a read of one pod.
+    fn fake_slow(reply: Reply, slow: Duration) -> (Client, Arc<Mutex<Vec<Seen>>>) {
         let log: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let seen = log.clone();
         let service = tower::service_fn(move |request: Request<Body>| {
             let (seen, reply) = (seen.clone(), reply.clone());
             async move {
+                if request.method() == http::Method::GET
+                    && request.uri().path().contains("/namespaces/demo/pods/")
+                {
+                    tokio::time::sleep(slow).await;
+                }
                 let (parts, body) = request.into_parts();
                 let bytes = body.collect_bytes().await.unwrap();
                 let entry = Seen {
@@ -916,7 +976,7 @@ mod tests {
         assert_eq!(seen[0].method, "PATCH");
         assert_eq!(
             seen[0].path,
-            "/apis/apps/v1/namespaces/demo/deployments/web"
+            "/apis/apps/v1/namespaces/demo/deployments/web/scale"
         );
         assert_eq!(
             seen[0].body,
@@ -926,6 +986,34 @@ mod tests {
                 {"op": "replace", "path": "/spec/replicas", "value": 3},
             ])
         );
+    }
+
+    // covers UP-53: the scale subresource omits a count of zero, so that is an empty spec.
+    #[tokio::test]
+    async fn scale_from_zero_tests_an_empty_spec() {
+        let (client, log) = fake(Arc::new(ok));
+        scale(&mut writes(client, open()), &deployment(), 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            log.lock().unwrap()[0].body,
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": "uid-web"},
+                {"op": "test", "path": "/spec", "value": {}},
+                {"op": "add", "path": "/spec/replicas", "value": 3},
+            ])
+        );
+    }
+
+    // covers UP-53: a paused Deployment would accept a restart and restart nothing.
+    #[test]
+    fn a_paused_deployment_is_not_restarted() {
+        let deployments = kind_info(resource("apps", "v1", "Deployment", "deployments"));
+        let paused = json!({"spec": {"paused": true}});
+        assert!(matches!(
+            review(&deployments, &paused, WriteProposal::RolloutRestart),
+            Err(WriteError::Rejected(_))
+        ));
     }
 
     // covers UP-52: a failed test names no field and is a conflict; a validation error names
@@ -1086,8 +1174,13 @@ mod tests {
             ),
             "POST" => evict(evicted_pod(&seen.path).expect("an eviction")),
             _ if seen.path == "/api/v1/pods" => (200, pod_list(pods.clone())),
+            _ if seen.path == "/api/v1/nodes/worker" => (200, node_object("uid-node")),
             _ => (404, status(404, "NotFound")),
         })
+    }
+
+    fn node_object(uid: &str) -> Value {
+        json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "worker", "uid": uid}})
     }
 
     fn accepted() -> (u16, Value) {
@@ -1218,6 +1311,7 @@ mod tests {
         let report = drain(&mut writes(client, closed), &node(), &quick()).await;
         assert!(report.cordoned);
         assert_eq!(report.evicted, [named("one")]);
+        assert_eq!(report.terminating, [named("one")]);
         assert_eq!(report.remaining, [named("two"), named("three")]);
         assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
         let evictions = log
@@ -1243,6 +1337,79 @@ mod tests {
         assert_eq!(report.evicted, [named("one")]);
         assert_eq!(report.terminating, [named("one")]);
         assert_eq!(report.stopped, Some(WriteError::Refused(refusal())));
+    }
+
+    // covers UP-53: a node replaced under its name after the review has none of its pods evicted.
+    #[tokio::test]
+    async fn a_replaced_node_stops_the_drain_before_any_eviction() {
+        let pods = vec![pod("one", Some("ReplicaSet"), json!({}))];
+        let reply: Reply = Arc::new(move |seen| match seen.method.as_str() {
+            "PATCH" => (200, node_object("uid-node")),
+            "POST" => accepted(),
+            _ if seen.path == "/api/v1/pods" => (200, pod_list(pods.clone())),
+            _ => (200, node_object("uid-new-node")),
+        });
+        let (client, log) = fake(reply);
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
+        assert_eq!(report.stopped, Some(WriteError::Replaced));
+        assert!(report.evicted.is_empty());
+        assert!(!log.lock().unwrap().iter().any(|s| s.method == "POST"));
+    }
+
+    // covers UP-53: a 404 from the eviction is a failure while the pod is still there.
+    #[tokio::test]
+    async fn a_404_for_a_pod_still_there_is_reported() {
+        let listed = vec![pod("stuck", Some("ReplicaSet"), json!({}))];
+        let still = listed[0].clone();
+        let reply: Reply = Arc::new(move |seen| match seen.method.as_str() {
+            "PATCH" => (200, node_object("uid-node")),
+            "POST" => (404, status(404, "NotFound")),
+            _ if seen.path == "/api/v1/pods" => (200, pod_list(listed.clone())),
+            _ if seen.path == "/api/v1/nodes/worker" => (200, node_object("uid-node")),
+            _ => (200, still.clone()),
+        });
+        let (client, _log) = fake(reply);
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
+        assert!(report.evicted.is_empty());
+        assert!(
+            matches!(&report.blocked[..], [(pod, BlockedReason::Failed(_))] if *pod == named("stuck")),
+            "{:?}",
+            report.blocked
+        );
+    }
+
+    // covers UP-53: a server that stalls after the evictions does not hold the report past the
+    // wait, and the pods it could not confirm are named.
+    #[tokio::test]
+    async fn a_stalled_server_ends_the_wait_on_time() {
+        let pods = vec![
+            pod("one", Some("ReplicaSet"), json!({})),
+            pod("two", Some("ReplicaSet"), json!({})),
+        ];
+        let (client, _log) = fake_slow(drain_server(pods, |_| accepted()), Duration::from_secs(20));
+        let started = Instant::now();
+        let report = drain(&mut writes(client, open()), &node(), &quick()).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(report.terminating, [named("one"), named("two")]);
+    }
+
+    // covers UP-53: a drain stopped early still names evicted pods it could not confirm gone.
+    #[tokio::test]
+    async fn a_stopped_drain_keeps_unconfirmed_pods() {
+        let pods = vec![
+            pod("one", Some("ReplicaSet"), json!({})),
+            pod("two", Some("ReplicaSet"), json!({})),
+        ];
+        let closed = open();
+        let closing = closed.clone();
+        let (client, _log) = fake(drain_server(pods, move |_| {
+            closing.store(true, Ordering::SeqCst);
+            accepted()
+        }));
+        let report = drain(&mut writes(client, closed), &node(), &quick()).await;
+        assert_eq!(report.evicted, [named("one")]);
+        assert_eq!(report.terminating, [named("one")]);
+        assert_eq!(report.remaining, [named("two")]);
     }
 
     // covers UP-53: a pod replaced since it was listed is reported, and one already gone is not.
@@ -1279,6 +1446,7 @@ mod tests {
             ),
             "POST" => accepted(),
             _ if seen.path == "/api/v1/pods" => (200, pod_list(listed.clone())),
+            _ if seen.path == "/api/v1/nodes/worker" => (200, node_object("uid-node")),
             _ if seen.path.ends_with("/slow") => {
                 counted.fetch_add(1, Ordering::SeqCst);
                 (200, pod("slow", Some("ReplicaSet"), json!({})))

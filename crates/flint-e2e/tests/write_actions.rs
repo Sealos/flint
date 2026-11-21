@@ -211,6 +211,25 @@ async fn workload_actions_change_the_reviewed_object() {
     assert!(server.object(&deployments(), Some("demo"), "act").is_none());
 }
 
+// covers UP-53: scaling from zero goes through the scale subresource too, which omits the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scale_from_zero() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 0);
+    let core = Core::start(&server, Settings::default()).await;
+    core.act(workload_target(&server), WriteProposal::Scale { to: 2 })
+        .await
+        .unwrap();
+    assert_eq!(live(&server)["spec"]["replicas"], 2);
+    let path = "/apis/apps/v1/namespaces/demo/deployments/act/scale";
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.method == http::Method::PATCH && r.path == path)
+    );
+}
+
 // covers UP-52: a count changed after the review is a conflict, sent once; a change to anything
 // else, such as the status, is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
