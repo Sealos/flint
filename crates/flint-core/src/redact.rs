@@ -160,6 +160,105 @@ pub fn safe_error_summary(error: &str) -> String {
     redact_quoted(&crate::kubeconfig::error_summary(error))
 }
 
+/// What may be shown of an API server's error text about a write: [`safe_error_summary`] of it
+/// with credentials hidden first, so that the cut to one short line cannot split a value. The
+/// value after a bare `Bearer` is hidden too, whatever its characters.
+pub fn safe_server_error(text: &str) -> String {
+    safe_error_summary(&hide_bearer_values(&redact_credentials(text).text))
+}
+
+/// Stands for a value hidden after `Bearer`.
+const BEARER_MARKER: &str = "[REDACTED:bearer]";
+
+/// Words that can follow `Bearer` as a description of it, and lead to the next word.
+const BEARER_NOUNS: &[&str] = &[
+    "auth",
+    "authentication",
+    "authorization",
+    "credential",
+    "credentials",
+    "header",
+    "scheme",
+    "token",
+    "tokens",
+];
+
+/// Words that show the text after `Bearer` is a sentence. Anything else is taken for a value.
+const BEARER_SENTENCE_WORDS: &[&str] = &[
+    "and", "are", "cannot", "denied", "expired", "failed", "for", "from", "had", "has", "in",
+    "invalid", "is", "missing", "must", "not", "of", "on", "or", "rejected", "required", "to",
+    "was", "were", "with",
+];
+
+/// `text` with the value after each word `bearer`, in any case, replaced by [`BEARER_MARKER`].
+fn hide_bearer_values(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let (mut copied, mut from) = (0, 0);
+    while let Some(found) = lower[from..].find("bearer") {
+        let start = from + found;
+        from = start + "bearer".len();
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        if let Some(value) = bearer_value(text, from) {
+            out.push_str(&text[copied..value.start]);
+            out.push_str(BEARER_MARKER);
+            copied = value.end;
+            from = value.end;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Where the value after a `bearer` ending at `after` is, if what follows is not a sentence
+/// about it or a value already hidden.
+fn bearer_value(text: &str, after: usize) -> Option<std::ops::Range<usize>> {
+    let is_quote = |c: char| matches!(c, '"' | '\'' | '`');
+    let mut at = after;
+    loop {
+        let rest = &text[at..];
+        let word = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '=');
+        let first = word.chars().next()?;
+        if word.len() == rest.len() && !is_quote(first) {
+            return None;
+        }
+        if word.starts_with("[REDACTED:") {
+            return None;
+        }
+        let start = text.len() - word.len();
+        if is_quote(first) {
+            let inner = start + first.len_utf8();
+            let end = text[inner..]
+                .find(first)
+                .map_or(text.len(), |i| inner + i + first.len_utf8());
+            return Some(start..end);
+        }
+        let len = word
+            .find(|c: char| c.is_whitespace() || is_quote(c))
+            .unwrap_or(word.len());
+        let value = &word[..len];
+        let plain = value
+            .trim_end_matches(['.', ',', ';', '!', '?', ':', '=', ')', ']'])
+            .to_ascii_lowercase();
+        if BEARER_NOUNS.contains(&plain.as_str()) {
+            if value.ends_with(['.', ',', ';', '!', '?']) {
+                return None;
+            }
+            at = start + len;
+        } else if BEARER_SENTENCE_WORDS.contains(&plain.as_str()) {
+            return None;
+        } else {
+            return Some(start..start + len);
+        }
+    }
+}
+
 /// The first non-empty line of `text`, trimmed, cut to `max_chars` characters (with `…`).
 pub fn first_line(text: &str, max_chars: usize) -> String {
     let line = text
@@ -394,6 +493,59 @@ mod tests {
         assert!(!is_secret_object(
             &json!({"apiVersion": "v2", "kind": "Secret"})
         ));
+    }
+
+    #[test]
+    fn server_error_text_hides_quoted_values_and_credentials() {
+        let text = "denied: password \"hunter2-secret\" Authorization: Bearer abcdefghijklmnop";
+        let shown = safe_server_error(text);
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
+        assert!(!shown.contains("abcdefghijklmnop"), "{shown}");
+        assert!(shown.starts_with("denied: password"), "{shown}");
+    }
+
+    #[test]
+    fn server_error_text_hides_a_credential_past_the_summary_cut() {
+        let token = "abcd1234".repeat(8);
+        let text = format!("{} Authorization: Bearer {token}", "x".repeat(170));
+        let shown = safe_server_error(&text);
+        assert!(!shown.contains("abcd1234"), "{shown}");
+    }
+
+    #[test]
+    fn server_error_text_hides_the_value_after_a_bare_bearer() {
+        for (text, value) in [
+            (
+                "denied for Bearer abcdefghijklmnop upstream",
+                "abcdefghijklmnop",
+            ),
+            ("denied for bearer Xy upstream", "Xy"),
+            ("denied: BEARER ab12.cd-34_ef~5+/=", "ab12"),
+            ("denied: bearer: lettersonly", "lettersonly"),
+            ("denied: bearer=lettersonly", "lettersonly"),
+            ("denied: bearer 'two words'", "two words"),
+            ("denied: bearer token lettersonly", "lettersonly"),
+            ("denied: bearer auth token: lettersonly", "lettersonly"),
+        ] {
+            let shown = safe_server_error(text);
+            assert!(!shown.contains(value), "{text}: {shown}");
+            assert!(shown.starts_with("denied"), "{text}: {shown}");
+        }
+    }
+
+    #[test]
+    fn server_error_text_keeps_sentences_about_bearer_auth() {
+        for text in [
+            "missing bearer token in request",
+            "Bearer authentication is enabled",
+            "the bearer token expired",
+            "bearer token.",
+            "auth scheme Bearer",
+            "forbearer stays",
+            "Authorization: Bearer [REDACTED:authorization]",
+        ] {
+            assert_eq!(safe_server_error(text), text);
+        }
     }
 
     #[test]

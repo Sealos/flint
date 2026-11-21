@@ -268,6 +268,9 @@ pub enum WriteError {
     Rejected(String),
     #[error("{0}")]
     Failed(String),
+    /// A drain stopped between listing a node's pods and checking the node again.
+    #[error("{0}; the node could not be checked again, so its listed pods were not tried")]
+    NodeNotRechecked(Box<WriteError>),
 }
 
 /// The write gate, asked before each request of one action. The context must stay as it was at
@@ -410,14 +413,14 @@ fn write_error(error: kube::Error) -> WriteError {
         return match status.code {
             404 => WriteError::Gone,
             409 => WriteError::Conflict,
-            code => WriteError::Rejected(redact::safe_error_summary(
+            code => WriteError::Rejected(redact::safe_server_error(
                 &status
                     .explanation()
                     .unwrap_or_else(|| crate::api_error::status_meaning(code, None)),
             )),
         };
     }
-    WriteError::Failed(redact::safe_error_summary(&error.to_string()))
+    WriteError::Failed(redact::safe_server_error(&error.to_string()))
 }
 
 fn text_at<'a>(object: &'a Value, pointer: &str) -> Option<&'a str> {
@@ -441,7 +444,7 @@ fn bound_to_live(mut target: WriteTarget, live: &Value) -> Result<WriteTarget, W
 
 /// From the live object only: an edit cannot remove the warning by removing the label.
 fn warnings_for(live: &Value) -> Vec<WriteWarning> {
-    gitops::managed_by_object(live)
+    gitops::managed_by_live_object(live)
         .map(WriteWarning::LikelyReverted)
         .into_iter()
         .collect()
