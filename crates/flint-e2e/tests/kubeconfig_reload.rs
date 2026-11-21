@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::write::{WriteError, WriteProposal, WriteReview, WriteTarget};
+use flint_core::settings::{self, AiScope};
 use flint_core::{KindId, Settings, SyncState, WatchMode, WatchTiming, WriteRefusal, kubeconfig};
 use flint_e2e::fake_api::{CONTEXT, FakeApiServer, Gvr, Verb, write_kubeconfigs};
 
@@ -320,6 +321,16 @@ async fn core_with_deployment(
     dir: &std::path::Path,
     path: &std::path::Path,
 ) -> CoreHandle {
+    core_with_settings(server, dir, path, Settings::default()).await
+}
+
+/// [`core_with_deployment`], starting from `settings`.
+async fn core_with_settings(
+    server: &FakeApiServer,
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    settings: Settings,
+) -> CoreHandle {
     server.set_object(
         &deployments(),
         serde_json::json!({
@@ -339,7 +350,7 @@ async fn core_with_deployment(
         config_dir: dir.join("config"),
         settings: Settings {
             watch_mode: WatchMode::OnView,
-            ..Settings::default()
+            ..settings
         },
         settings_error: None,
         kubeconfig_base: vec![path.to_owned()],
@@ -357,6 +368,33 @@ async fn core_with_deployment(
     .await
     .expect("discovery in time");
     core
+}
+
+/// A core where the fake cluster, on this machine, is protected as a remote one would be, in
+/// `settings.toml` too, since saving a pin reads the file back.
+async fn protected_core(
+    server: &FakeApiServer,
+    dir: &std::path::Path,
+    path: &std::path::Path,
+) -> CoreHandle {
+    let config = dir.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join(settings::SETTINGS_FILE),
+        "protect_local_clusters = true\n",
+    )
+    .unwrap();
+    let settings = settings::load_settings(&config).unwrap();
+    assert!(settings.protect_local_clusters);
+    core_with_settings(server, dir, path, settings).await
+}
+
+fn expose(core: &CoreHandle, server: Option<String>) {
+    core.send(Command::SetAiExposed {
+        cluster: CONTEXT.to_owned(),
+        server,
+        scope: AiScope::default(),
+    });
 }
 
 /// Runs `review`, waiting out a reconnect after a reload.
@@ -446,4 +484,73 @@ async fn a_broken_kubeconfig_back_with_another_definition_refuses_the_old_review
     assert!(run_when_settled(&core, &review).await.is_err());
     assert_eq!(mutating(&server), before, "nothing sent to the old server");
     assert_eq!(mutating(&elsewhere), 0, "nothing sent to the new server");
+}
+
+// covers UP-06, UP-55: while its file can't be read a context takes no new Trust or exposure, so
+// a file back with other credentials at the same URL is still protected and gets no write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_context_takes_no_new_pin() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = protected_core(&server, dir.path(), &path).await;
+    let whole = std::fs::read_to_string(&path).unwrap();
+    assert!(whole.contains("user: {}"), "{whole}");
+
+    std::fs::write(&path, BROKEN).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    core.trust(CONTEXT, &server.url());
+    expose(&core, Some(server.url()));
+    core.reload_kubeconfig().await.unwrap();
+    let saved = settings::load_settings(&dir.path().join("config")).unwrap();
+    assert!(saved.trusted_clusters.is_empty());
+    assert!(saved.ai_exposed_clusters.is_empty());
+
+    std::fs::write(&path, whole.replace("user: {}", "user: {token: another}")).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    let refusal = tokio::time::timeout(WAIT, async {
+        loop {
+            match core.review_write(target(&server), proposal()).await {
+                Err(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+                | Err(WriteError::NotServed(_)) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                other => return other.err(),
+            }
+        }
+    })
+    .await
+    .expect("an answer in time");
+    assert_eq!(
+        refusal,
+        Some(WriteError::Refused(WriteRefusal::Protected {
+            cluster: CONTEXT.to_owned(),
+        }))
+    );
+    assert_eq!(mutating(&server), 0, "no mutating request");
+}
+
+// covers UP-06, UP-55: a pin made before the file broke can still be removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_context_can_lose_its_pins() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = protected_core(&server, dir.path(), &path).await;
+    let config = dir.path().join("config");
+    core.trust(CONTEXT, &server.url());
+    expose(&core, Some(server.url()));
+    core.reload_kubeconfig().await.unwrap();
+    let saved = settings::load_settings(&config).unwrap();
+    assert_eq!(saved.trusted_clusters.len(), 1);
+    assert_eq!(saved.ai_exposed_clusters.len(), 1);
+
+    std::fs::write(&path, BROKEN).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    core.untrust(CONTEXT);
+    expose(&core, None);
+    core.reload_kubeconfig().await.unwrap();
+    let saved = settings::load_settings(&config).unwrap();
+    assert!(saved.trusted_clusters.is_empty());
+    assert!(saved.ai_exposed_clusters.is_empty());
 }

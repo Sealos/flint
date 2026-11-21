@@ -767,6 +767,15 @@ impl ClusterManager {
     /// `settings.toml`. Returns whether the change was saved.
     async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
         if let Some(server) = &server {
+            // No load shows a held context's definition, so there is nothing to pin yet.
+            if self.held(&cluster) {
+                self.emit(Event::Error(format!(
+                    "\"{cluster}\" was not {}: a kubeconfig file that defines it can't be read. \
+                     Fix the file and try again.",
+                    pins.done()
+                )));
+                return false;
+            }
             // The user confirmed this server. If the context moved since, do not pin the new
             // one on the strength of that confirmation.
             let current = self
@@ -1317,18 +1326,22 @@ impl ClusterManager {
         self.reconcile(&id);
     }
 
-    /// Starts a connection unless one is up or in progress.
+    /// Starts a connection unless one is up or in progress. A held context waits: no load shows
+    /// a definition to connect with, and the load that does starts the attempt.
     fn ensure_connected(&mut self, id: &str) {
         let kubeconfig = self.kubeconfig.clone();
         let internal = self.internal_tx.clone();
         let attempt = self.next_attempt;
+        let held = self.held(id);
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        if matches!(
-            slot.state,
-            ConnectionState::Connecting | ConnectionState::Connected(_)
-        ) {
+        if held
+            || matches!(
+                slot.state,
+                ConnectionState::Connecting | ConnectionState::Connected(_)
+            )
+        {
             let state = slot.state.clone();
             self.emit(Event::ConnectionChanged {
                 cluster: id.to_owned(),
@@ -1440,7 +1453,7 @@ impl ClusterManager {
             let was_held = self.held(&info.name);
             let slot = match old.remove(&info.name) {
                 Some(mut existing) if existing.fingerprint == fingerprint => {
-                    // Back unchanged. A connection attempted while held had nothing to use.
+                    // Back unchanged. No connection starts while held, so start it now.
                     if was_held && self.active.as_deref() == Some(&info.name) {
                         changed_active = true;
                     }
@@ -1477,7 +1490,7 @@ impl ClusterManager {
             .contexts
             .iter()
             .map(|info| info.name.as_str())
-            .filter(|name| self.contexts.provisional(name))
+            .filter(|name| self.contexts.provisional(name) && !self.contexts.removed(name))
             .collect();
         // A file that failed to load masks the changes it could have made (UP-06).
         self.contexts.record(&loaded);
@@ -2471,6 +2484,46 @@ mod tests {
         let another = yaml.replace("user: {}", "user: {token: another}");
         rewrite_file(&mut manager, &path, &another).await;
         assert!(!manager.unlocks.is_unlocked("dev", "https://dev"));
+    }
+
+    // covers UP-55: an unlock lasts through a confirmed removal and re-add on the same server.
+    // A review made before does not.
+    #[tokio::test]
+    async fn a_context_removed_and_added_back_keeps_its_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        manager.unlocks.unlock("dev", "https://dev");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, NO_CONTEXTS).await;
+        assert!(manager.contexts.removed("dev"));
+        let another = yaml.replace("user: {}", "user: {token: another}");
+        rewrite_file(&mut manager, &path, &another).await;
+
+        assert!(manager.unlocks.is_unlocked("dev", "https://dev"));
+        assert!(manager.write_pin_gate("dev", &pin).is_err());
+    }
+
+    // covers UP-06: selecting a held context starts no connection; the load that shows it again
+    // does.
+    #[tokio::test]
+    async fn a_held_context_connects_once_its_file_is_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+        let path = dir.path().join("first");
+        rewrite_file(&mut manager, &path, UNREADABLE).await;
+
+        manager.activate("dev".to_owned());
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Disconnected));
+        let attempt = slot.attempt;
+
+        rewrite_file(&mut manager, &path, &yaml).await;
+        let slot = manager.cluster("dev").unwrap();
+        assert!(matches!(slot.state, ConnectionState::Connecting));
+        assert_ne!(slot.attempt, attempt);
     }
 
     // covers UP-06: once the broken file is valid without the context, it is gone.
