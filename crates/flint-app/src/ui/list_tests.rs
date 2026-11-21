@@ -297,7 +297,7 @@ async fn a_text_filter_keeps_the_column_widths(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
     let (core, _dir) = core();
-    let (window, list) = open_sized(cx, core, "Pods", 360.);
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
     list.update(cx, |list, cx| {
         list.set_snapshot(
             pods(
@@ -341,6 +341,188 @@ async fn a_narrow_list_cuts_names_in_the_middle(cx: &mut TestAppContext) {
         names.iter().all(|n| n.contains('…')),
         "names are not cut: {names:?}"
     );
+}
+
+/// One object of `plural` with the real pod columns.
+fn pod_like(plural: &str, name: &str, status: &str) -> Arc<KindSnapshot> {
+    let columns: Arc<[Column]> = vec![
+        column("Name", ColumnRole::Name, ColumnType::String, 0),
+        column("Namespace", ColumnRole::Namespace, ColumnType::String, 0),
+        column("Ready", ColumnRole::Value, ColumnType::String, 0),
+        column("Status", ColumnRole::Value, ColumnType::String, 0),
+        column("Restarts", ColumnRole::Value, ColumnType::Integer, 0),
+        column("Age", ColumnRole::Age, ColumnType::Date, 0),
+    ]
+    .into();
+    let row = Arc::new(Row {
+        uid: "uid-api".into(),
+        name: name.into(),
+        namespace: Some(NARROW_NAMESPACE.into()),
+        resource_version: "1".into(),
+        generation: None,
+        created: Some(0),
+        labels: Box::new([]),
+        cells: Box::new([
+            Cell::Name,
+            Cell::Namespace,
+            Cell::Text("0/1".into()),
+            Cell::Text(status.into()),
+            Cell::Int(12),
+            Cell::Age,
+        ]),
+    });
+    Arc::new(KindSnapshot {
+        cluster: "test".into(),
+        kind: KindId::new("", plural),
+        namespaced: true,
+        columns,
+        rows: vec![row],
+        state: SyncState::Synced,
+        version: 1,
+        ..Default::default()
+    })
+}
+
+const NARROW_NAMESPACE: &str = "local-path-storage";
+const LONG_POD: &str = "podinfo-frontend-7b9c8d5f4-abcde";
+
+/// Shows `snapshot`, scoped to `namespaces`, and waits for it to be laid out.
+async fn show_narrow(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    list: &Entity<ResourceList>,
+    snapshot: Arc<KindSnapshot>,
+    namespaces: &[&str],
+) {
+    let namespaces = namespaces.iter().map(|n| (*n).to_owned()).collect();
+    list.update(cx, |list, cx| {
+        list.set_namespaces(namespaces, cx);
+        list.set_snapshot(snapshot, cx);
+    });
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("row-uid-api").is_some()
+    })
+    .await;
+    cx.run_until_parked();
+}
+
+fn has_header(cx: &mut TestAppContext, window: AnyWindowHandle, column: &str) -> bool {
+    let id = format!("sort-{column}");
+    cx.update_window(window, |_, window, _| window.try_find(id).is_some())
+        .unwrap()
+}
+
+fn header_end(cx: &mut TestAppContext, window: AnyWindowHandle, column: &str) -> f32 {
+    let id = format!("sort-{column}");
+    cx.update_window(window, |_, window, _| {
+        let bounds = window.find(id).bounds();
+        f32::from(bounds.origin.x + bounds.size.width)
+    })
+    .unwrap()
+}
+
+// covers UP-20, UP-23: beside an open detail pane, in one namespace, Name and Status stay
+// readable: Ready and Namespace leave before Name is cut to a stub or Status runs off the pane.
+#[gpui_kit::test]
+async fn a_narrow_list_keeps_name_and_status_readable(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    // A 1280 px window less the default sidebar, navigation and detail panes.
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE]).await;
+    assert!(!has_header(cx, window, "Ready"));
+    assert!(!has_header(cx, window, "Namespace"));
+    let name = header_width(cx, window, "Name");
+    assert!(name >= 16. * 8.5 + 16. - 0.5, "Name is {name} wide");
+    let status_end = header_end(cx, window, "Status");
+    assert!(status_end <= 400., "Status ends at {status_end}");
+}
+
+// covers UP-20, UP-23: when the columns through Status fit, nothing is hidden: Restarts and Age
+// scroll instead.
+#[gpui_kit::test]
+async fn a_narrow_list_hides_nothing_when_status_fits(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 450.);
+    let pod = pod_like("pods", LONG_POD, "Running");
+    show_narrow(cx, window, &list, pod, &[NARROW_NAMESPACE]).await;
+    for column in ["Name", "Namespace", "Ready", "Status", "Restarts", "Age"] {
+        assert!(has_header(cx, window, column), "{column} is hidden");
+    }
+    let status_end = header_end(cx, window, "Status");
+    assert!(status_end <= 450., "Status ends at {status_end}");
+}
+
+// covers UP-20, UP-23: across namespaces, two rows could differ only by namespace, so its column
+// stays, at its minimum.
+#[gpui_kit::test]
+async fn a_narrow_list_across_namespaces_keeps_namespace(cx: &mut TestAppContext) {
+    for namespaces in [&[][..], &[NARROW_NAMESPACE, "demo"][..]] {
+        let (core, _dir) = core();
+        let (window, list) = open_sized(cx, core, "Pods", 400.);
+        let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+        show_narrow(cx, window, &list, pod, namespaces).await;
+        assert!(!has_header(cx, window, "Ready"), "{namespaces:?}");
+        let namespace = header_width(cx, window, "Namespace");
+        assert!(
+            (namespace - (11. * 8.5 + 16.)).abs() < 0.5,
+            "Namespace is {namespace} wide for {namespaces:?}"
+        );
+    }
+}
+
+// covers UP-20, UP-23: choosing one namespace hides the column only once that namespace's rows
+// are drawn: until then the old rows may differ by namespace alone.
+#[gpui_kit::test]
+async fn namespace_stays_until_the_scoped_rows_arrive(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod, &[]).await;
+    assert!(has_header(cx, window, "Namespace"));
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    list.update(cx, |list, cx| {
+        list.set_namespaces(vec![NARROW_NAMESPACE.to_owned()], cx)
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(has_header(cx, window, "Namespace"), "hidden over old rows");
+
+    permits.send(()).await.unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Namespace").is_none()
+    })
+    .await;
+}
+
+// covers UP-22: a CRD's own Ready printer column is never left out.
+#[gpui_kit::test]
+async fn a_narrow_list_keeps_a_custom_ready_column(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_kind(cx, core, "widgets", "Widgets", 400.);
+    let widget = pod_like("widgets", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, widget, &[NARROW_NAMESPACE]).await;
+    assert!(has_header(cx, window, "Ready"));
+}
+
+// covers UP-20, UP-23: with Namespace hidden, the Name cell's tooltip says it, even for a name
+// that fits. With the column shown, a name that fits has no tooltip.
+#[gpui_kit::test]
+async fn a_hidden_namespace_shows_in_the_name_tooltip(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", "api", "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod.clone(), &[NARROW_NAMESPACE]).await;
+    assert!(!has_header(cx, window, "Namespace"));
+    let tips = hover_cell(cx, window, "uid-api", "Name");
+    assert_eq!(tips, [format!("{NARROW_NAMESPACE}/api")]);
+
+    let (core, _dir) = self::core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    show_narrow(cx, window, &list, pod, &[]).await;
+    assert!(has_header(cx, window, "Namespace"));
+    assert!(hover_cell(cx, window, "uid-api", "Name").is_empty());
 }
 
 /// The texts painted in the window's last frame.
