@@ -243,6 +243,7 @@ async fn a_malformed_settings_file_shows_a_banner_and_disables_the_toggles(
         Event::SettingsChanged {
             settings: Arc::new(Settings::default()),
             error: None,
+            trust_settled: 0,
         },
     );
     assert!(t.find(cx, "settings-error").is_none());

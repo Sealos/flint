@@ -505,7 +505,7 @@ fn mcp_policy_without_a_cluster() {
     assert_eq!(clusters["clusters"], json!([]), "{clusters}");
     let hint = clusters["hint"].as_str().unwrap();
     assert!(
-        hint.contains("Expose to AI") && hint.contains("different API server"),
+        hint.contains("[[ai_exposed_clusters]]") && hint.contains("different API server"),
         "{hint}"
     );
     let errors = clusters["kubeconfig_errors"].as_array().unwrap();
@@ -558,6 +558,22 @@ fn mcp_policy_without_a_cluster() {
     assert!(is_error, "{text}");
     assert!(text.contains("settings.toml is invalid"), "{text}");
     assert!(!text.contains('\n'), "{text}");
+    assert!(!text.contains("Flint app"), "{text}");
+
+    // A misspelt key: the agent reads which one and where, and no value from the file.
+    std::fs::write(
+        &settings,
+        "[[ai_exposed_clusters]]\ncontext = \"dev\"\nserver = \"https://x\"\n\
+         namespace = [\"SECRETVALUE\"]\n",
+    )
+    .unwrap();
+    let (is_error, text) = server.call("list_clusters", json!({}));
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("unknown field namespace at line 4, column 1"),
+        "{text}"
+    );
+    assert!(!text.contains("SECRETVALUE"), "{text}");
 }
 
 // covers UP-08, UP-09, UP-10, UP-11
