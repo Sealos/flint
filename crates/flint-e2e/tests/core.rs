@@ -2,7 +2,7 @@
 //! a 410, 403s, log sessions on streaming logs through pod churn, and exec sessions over the
 //! fake's WebSocket. No cluster needed; these run in plain `cargo test`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,11 @@ impl Core {
         let dir = tempfile::tempdir().unwrap();
         let kubeconfig = dir.path().join("kubeconfig");
         server.write_kubeconfig(&kubeconfig, namespace).unwrap();
+        Core::start_on(dir, vec![kubeconfig], settings).await
+    }
+
+    /// A core reading the kubeconfig files `paths`, in order, with its config in `dir`.
+    async fn start_on(dir: tempfile::TempDir, paths: Vec<PathBuf>, settings: Settings) -> Core {
         let settings = Settings {
             watch_mode: WatchMode::OnView,
             ..settings
@@ -51,7 +56,7 @@ impl Core {
             config_dir: dir.path().join("config"),
             settings,
             settings_error: None,
-            kubeconfig_base: vec![kubeconfig],
+            kubeconfig_base: paths,
             home: None,
             watch_files: false,
             // The fake server answers at once; real waits would only slow the tests down.
@@ -1051,9 +1056,24 @@ async fn a_reviewed_edit_is_dry_run_then_applied_once() {
     assert!(edit.before().contains("replicas: 1"), "{}", edit.before());
     assert!(edit.after().contains("replicas: 3"), "{}", edit.after());
 
-    core.handle.run_write(review.into_intent()).await.unwrap();
+    let outcome = core.handle.run_write(review.into_intent()).await.unwrap();
     assert_eq!(puts(&server), (1, 1));
     assert_eq!(replicas(&server), 3);
+    let live = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+    assert_eq!(
+        outcome.resource_version.as_deref(),
+        live["metadata"]["resourceVersion"].as_str(),
+        "the write answers with the version it stored"
+    );
+    assert_eq!(live["metadata"]["uid"], "uid-edit");
+    let next = WriteTarget {
+        resource_version: outcome.resource_version,
+        ..write_target(&server)
+    };
+    core.handle
+        .review_write(next, three_replicas())
+        .await
+        .expect("the version a write returned is the live one");
     let written = server
         .requests()
         .into_iter()
@@ -1229,6 +1249,104 @@ async fn a_gitops_warning_survives_an_edit_that_removes_the_label() {
     }
     core.handle.run_write(review.into_intent()).await.unwrap();
     assert_eq!(replicas(&server), 3);
+    let live = server.object(&deployments(), Some("demo"), EDITED).unwrap();
+    assert_eq!(
+        live["metadata"].get("labels"),
+        None,
+        "the edit removed them"
+    );
+    let next = core
+        .handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .unwrap();
+    assert!(next.warnings().is_empty(), "{:?}", next.warnings());
+}
+
+/// Reloads the kubeconfig and waits until the context shows `server`, connected and discovered,
+/// as a `confirmed` definition or a fallback.
+async fn reload_until_shown(core: &Core, server: &FakeApiServer, confirmed: bool) {
+    let events = core.handle.events();
+    core.handle.send(Command::ReloadKubeconfig);
+    let url = server.url();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.expect("core running")
+                && snapshot.clusters.iter().any(|c| {
+                    c.info.name == CONTEXT
+                        && c.info.server.as_deref() == Some(url.as_str())
+                        && c.confirmed == confirmed
+                })
+            {
+                break;
+            }
+        }
+        while core.handle.discovery(CONTEXT).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the context shows the server");
+}
+
+// covers UP-06, UP-54: while a later file's definition shows because the first file can't be
+// read, its pin is stale from the first request. Neither a review there nor a write reviewed
+// before it reaches a server, and writes work again once the file is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_through_a_fallback_definition_is_refused() {
+    let (real, fallback) = (
+        FakeApiServer::start().await.unwrap(),
+        FakeApiServer::start().await.unwrap(),
+    );
+    for server in [&real, &fallback] {
+        server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    real.write_kubeconfig(&first, Some("demo")).unwrap();
+    fallback.write_kubeconfig(&second, Some("demo")).unwrap();
+    let whole = std::fs::read(&first).unwrap();
+    let paths = vec![first.clone(), second];
+    let core = Core::start_on(dir, paths, Settings::default()).await;
+    let reviewed = core
+        .handle
+        .review_write(write_target(&real), three_replicas())
+        .await
+        .unwrap();
+    assert_eq!(puts(&real), (1, 0));
+
+    std::fs::write(&first, "apiVersion: v1\nkind: Config\nclusters:\n- name: [").unwrap();
+    reload_until_shown(&core, &fallback, false).await;
+    let moved = WriteError::Refused(WriteRefusal::Moved {
+        cluster: CONTEXT.to_owned(),
+    });
+    let review = core
+        .handle
+        .review_write(write_target(&fallback), three_replicas())
+        .await;
+    assert_eq!(review.unwrap_err(), moved);
+    let write = core.handle.run_write(reviewed.into_intent()).await;
+    assert_eq!(write.unwrap_err(), moved);
+    assert_eq!(puts(&real), (1, 0), "the write never left");
+    assert_eq!(puts(&fallback), (0, 0));
+    assert!(
+        !fallback.requests().iter().any(|r| r.path.ends_with(EDITED)),
+        "the fallback's server was not even read"
+    );
+    assert_eq!(replicas(&real), 1);
+    assert_eq!(replicas(&fallback), 1);
+
+    std::fs::write(&first, whole).unwrap();
+    reload_until_shown(&core, &real, true).await;
+    let again = core
+        .handle
+        .review_write(write_target(&real), three_replicas())
+        .await
+        .unwrap();
+    core.handle.run_write(again.into_intent()).await.unwrap();
+    assert_eq!(replicas(&real), 3);
+    assert_eq!(replicas(&fallback), 1);
+    assert_eq!(puts(&fallback), (0, 0));
 }
 
 // covers UP-54, UP-55: the core refuses a shell on a protected cluster before anything reaches
