@@ -1470,5 +1470,9 @@ mod row_actions_tests;
 mod resource_actions_tests;
 
 #[cfg(test)]
+#[path = "write_confirm_tests.rs"]
+mod write_confirm_tests;
+
+#[cfg(test)]
 #[path = "dock_state_tests.rs"]
 mod dock_state_tests;

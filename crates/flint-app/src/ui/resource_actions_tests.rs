@@ -291,13 +291,13 @@ struct Control {
 }
 
 /// A small local API server: a Deployment `web` with 2 replicas and a Node `node-1`.
-struct LocalApi {
-    url: String,
+pub(super) struct LocalApi {
+    pub(super) url: String,
     control: Arc<Control>,
 }
 
 impl LocalApi {
-    fn start(statuses: &[u16]) -> Self {
+    pub(super) fn start(statuses: &[u16]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let control = Arc::new(Control {
@@ -314,11 +314,11 @@ impl LocalApi {
         LocalApi { url, control }
     }
 
-    fn patches(&self) -> usize {
+    pub(super) fn patches(&self) -> usize {
         self.control.patches.load(Ordering::SeqCst)
     }
 
-    fn hold(&self, held: bool) {
+    pub(super) fn hold(&self, held: bool) {
         self.control.hold.store(held, Ordering::SeqCst);
     }
 }
@@ -600,7 +600,7 @@ fn writes(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<(ResourceAction, Re
 }
 
 /// The workspace connected for real to `api`, its discovery in.
-async fn connected(
+pub(super) async fn connected(
     cx: &mut TestAppContext,
     dir: &std::path::Path,
     api: &LocalApi,
