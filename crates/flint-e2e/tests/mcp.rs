@@ -621,6 +621,13 @@ fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
     ] {
         two.a.set_object(&config_maps, object(name, annotations));
     }
+    // A message field is redacted, so this reply has a `# redacted=` line too.
+    let mut redacted = object(
+        "redacted",
+        json!({tracking: "shop:/ConfigMap:demo/redacted"}),
+    );
+    redacted["status"] = json!({"message": "password=flint-e2e-hidden"});
+    two.a.set_object(&config_maps, redacted);
     let mut mcp = two.mcp()?;
     for (name, marked) in [("managed", true), ("copied", false), ("plain", false)] {
         let got = mcp.call(
@@ -635,6 +642,24 @@ fn up_10_get_resource_names_the_gitops_manager() -> Result<()> {
             got.text
         );
     }
+    // The other header lines stay first.
+    let got = mcp.call(
+        "get_resource",
+        json!({"cluster": EXPOSED, "kind": "configmaps", "namespace": "demo", "name": "redacted"}),
+    )?;
+    let mut lines = got.text.lines();
+    assert!(
+        lines.next().unwrap_or_default().starts_with("# redacted="),
+        "{}",
+        got.text
+    );
+    assert_eq!(
+        lines.next(),
+        Some("# managed_by=Argo CD: shop"),
+        "{}",
+        got.text
+    );
+    assert!(!got.text.contains("flint-e2e-hidden"), "{}", got.text);
     Ok(())
 }
 

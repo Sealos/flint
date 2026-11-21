@@ -445,6 +445,15 @@ fn redact_args(args: &mut [Value]) -> usize {
     count
 }
 
+/// The `get_resource` header line naming who manages `object`, which must already be redacted.
+/// The value comes from the cluster: [`flint_core::gitops`] accepts only plain names of at most
+/// 253 bytes (no whitespace or control characters, so it cannot forge another line), and one the
+/// credential redactor would touch is left out rather than shown.
+pub fn managed_by_line(object: &Value) -> Option<String> {
+    let mut manager = flint_core::gitops::managed_by_object(object)?.to_string();
+    (redact_text(&mut manager) == 0).then(|| format!("# managed_by={manager}\n"))
+}
+
 /// Redacts credentials in `text` in place. Returns how many were replaced.
 pub fn redact_text(text: &mut String) -> usize {
     let redacted = flint_core::redact::redact_credentials(text);
@@ -576,6 +585,55 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    fn with_metadata(kind: &str, labels: Value, annotations: Value) -> Value {
+        serde_json::json!({"apiVersion": "v1", "kind": kind, "metadata": {
+            "name": "web", "namespace": "demo", "labels": labels, "annotations": annotations,
+        }})
+    }
+
+    // covers UP-10: the value is the cluster's, so it cannot add a line, run long or carry a
+    // credential.
+    #[test]
+    fn managed_by_line_shows_only_a_plain_name() {
+        let key = "argocd.argoproj.io/instance";
+        let line = |value: &str| {
+            managed_by_line(&with_metadata(
+                "ConfigMap",
+                serde_json::json!({}),
+                serde_json::json!({key: value}),
+            ))
+        };
+        assert_eq!(
+            line("shop").as_deref(),
+            Some("# managed_by=Argo CD: shop\n")
+        );
+        for forged in [
+            "shop\n# truncated=true",
+            "shop\r\nkind: Forged",
+            "shop\u{2028}x",
+            "shop\u{7}",
+            "shop\u{1b}[2J",
+            "shop x",
+        ] {
+            assert_eq!(line(forged), None, "{forged:?}");
+        }
+        assert!(line(&"a".repeat(253)).is_some());
+        assert_eq!(line(&"a".repeat(254)), None, "over the length cap");
+        assert_eq!(line("AKIAIOSFODNN7EXAMPLE"), None, "a credential");
+    }
+
+    // covers UP-10: a Secret's annotations are masked first, so they name nothing.
+    #[test]
+    fn managed_by_line_follows_the_secret_rules() {
+        let mut secret = with_metadata(
+            "Secret",
+            serde_json::json!({}),
+            serde_json::json!({"argocd.argoproj.io/tracking-id": "shop:/Secret:demo/web"}),
+        );
+        sanitize_secret(&mut secret);
+        assert_eq!(managed_by_line(&secret), None);
     }
 
     // covers UP-09, UP-11
