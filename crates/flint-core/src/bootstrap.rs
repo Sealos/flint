@@ -82,8 +82,10 @@ pub fn flush_logs() {
 }
 
 /// Records a startup failure in the log file, without printing it: the caller prints it. For a
-/// failure before [`init_logging`], such as a [`bootstrap`] error, which a launch from Finder or
-/// the Dock would otherwise leave no trace of. Call it at most once, instead of `init_logging`.
+/// failure before [`init_logging`], such as a [`bootstrap`] error. Call it at most once, instead
+/// of `init_logging`. It writes nothing when no log location is known: [`bootstrap`] fails only
+/// without a home directory, and on macOS the log file lives under it, so there only stderr has
+/// the error. On Linux an absolute `XDG_STATE_HOME` still places the file.
 pub fn log_startup_failure(message: &str) {
     let flint_log = std::env::var("FLINT_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
