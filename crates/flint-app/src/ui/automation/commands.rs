@@ -28,6 +28,8 @@ const TEXT_CHUNK: usize = 64;
 /// short animations (a tab underline, a dialog) finish: about half a second.
 const SCREENSHOT_FRAMES: u32 = 15;
 const FRAME: Duration = Duration::from_millis(33);
+/// How many frames `resize_window` waits for the platform to apply the size: about two seconds.
+const RESIZE_FRAMES: u32 = 60;
 
 /// The window commands act on.
 #[derive(Clone)]
@@ -84,6 +86,26 @@ async fn run(command: Command, target: &Target, cx: &mut AsyncApp) -> Result<Val
             Ok(json!({"handled": handled}))
         }
         Command::RightClick { id } => right_click(target, cx, &id).await,
+        Command::ResizeWindow { width, height } => {
+            in_window(target, cx, |window, _| {
+                window.resize(size(px(width), px(height)));
+            })?;
+            // The platform applies a resize later, from its own callback.
+            let wanted = size(px(width), px(height));
+            let mut viewport = in_window(target, cx, |window, _| window.viewport_size())?;
+            for _ in 0..RESIZE_FRAMES {
+                if viewport == wanted {
+                    break;
+                }
+                cx.background_executor().timer(FRAME).await;
+                viewport = in_window(target, cx, |window, _| window.viewport_size())?;
+            }
+            settle(target, cx).await;
+            Ok(json!({
+                "width": f32::from(viewport.width),
+                "height": f32::from(viewport.height),
+            }))
+        }
         Command::State => state(target, cx),
         Command::Actions => actions(target, cx),
         Command::WaitFor {
