@@ -7,6 +7,9 @@ have tests and pass.
 Paths describe what the user does and sees, not how it is built. When behavior changes, update the path in the same
 change.
 
+A path marked **Status: planned** is not built yet. It names the issue and milestone that track it, and gets no tests
+until it ships. Remove the marker in the change that ships it.
+
 ## How paths are tested
 
 The full strategy is in [`TESTING.md`](./TESTING.md).
@@ -408,6 +411,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ## M3: Editing and actions
 
 ### UP-50 Edit with inline validation
+- **Status:** planned (#31, After 1.0), not built yet.
 - **When** I edit an object's YAML.
 - **Then** syntax errors are underlined as I type (tree-sitter), and so are schema errors from the cluster's OpenAPI
   schema: unknown fields, wrong types, missing required fields.
@@ -458,6 +462,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ---
 
 ### UP-56 See only the kinds in use
+- **Status:** planned (#194, After 1.0), not built yet.
 - **Given** watch mode All, and a cluster where Replication Controllers, most of the Network section and two CRD groups
   have no objects.
 - **When** I connect, wait for the lists to load, and look at the resource tree.
@@ -481,6 +486,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit, ui, e2e (fake API server: slow first lists, reconnects, request log).
 
 ### UP-58 Read workload health at a glance
+- **Status:** planned (#196, After 1.0), not built yet.
 - **When** I open Deployments, StatefulSets, DaemonSets, ReplicaSets or Replication Controllers.
 - **Then** one Ready column shows "ready/desired" with a dot: green when all are ready (also "4/3" during a surge),
   amber when some are not or when none are yet while it rolls out, red when none are and it is not rolling out, grey
@@ -493,6 +499,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: unit (status rules per kind), mcp, ui, e2e (fake API server with full objects and a rollout, #129).
 
 ### UP-59 Old ReplicaSet revisions stay out of the way
+- **Status:** planned (#197, After 1.0), not built yet.
 - **Given** Deployments that have rolled out many times, one rollout still scaling its old ReplicaSet down, and one
   orphan ReplicaSet scaled to 0.
 - **When** I open Replica Sets.
@@ -536,6 +543,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 ---
 
 ### UP-65 See what's wrong when I connect
+- **Status:** planned (#101, v0.6), not built yet.
 - **When** I connect to a cluster, or pick Overview in the resource tree.
 - **Then** the dashboard shows counts of failing pods, not-ready nodes, recent Warning events, pending PVCs, failed Jobs
   and workloads short of replicas. Clicking a count opens the list filtered to exactly those objects. Counts update
@@ -561,6 +569,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 - Tests: ui, e2e.
 
 ### UP-69 Find the namespace that is broken or full
+- **Status:** planned (#195, After 1.0), not built yet.
 - **When** I open Namespaces.
 - **Then** besides Name, Status and Age, each row shows Problems (failing or crash-looping pods, and workloads short of
   replicas that are not rolling out, counted by the dashboard's rules), Pods, and CPU and Memory as "used / requested".
@@ -574,6 +583,7 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
 M4 used every number in the 6x block, so its later paths continue at UP-120.
 
 ### UP-120 Open a namespace's overview
+- **Status:** planned (#198, After 1.0), not built yet.
 - **When** I click the `demo` row in Namespaces.
 - **Then** an overview of `demo` opens in the main view in place of the list, and Back returns to it. It shows problem
   counts, recent Warning events and rollouts, CPU and memory usage against requests with sparklines, and
