@@ -489,36 +489,41 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
     );
 }
 
-// covers UP-16: a refused call is recorded as failed, without the unsupported argument's name or
-// value.
+// covers UP-16: a refused call's arguments are unvalidated, so its record holds the tool and the
+// failure only: no value, and no cluster to attribute it to.
 #[tokio::test]
-async fn a_refused_argument_is_not_recorded() {
+async fn a_refused_call_records_no_argument_values() {
     let dir = tempfile::tempdir().unwrap();
     let (url, _sockets) = silent_server().await;
     let server = server(dir.path(), Some(&url), Limits::default());
     let mut client = Client::start(&server, 64 * 1024).await;
-    client
-        .call(
-            1,
-            "list_resource_kinds",
-            json!({"cluster": "silent", "evil\u{1b}name": "raw-value"}),
-        )
-        .await;
-    let reply = client.next().await;
-    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-    assert!(!text(&reply).contains('\u{1b}'), "{reply}");
+    let calls = [
+        json!({"name": "raw-value"}),
+        json!({"cluster": "raw-value"}),
+    ];
+    for (id, arguments) in (1..).zip(calls) {
+        client.call(id, "list_clusters", arguments).await;
+        let reply = client.next().await;
+        assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+    }
     let records = || flint_core::activity::read(dir.path());
-    wait_for("the refused call is recorded", || records().len() == 1).await;
-    let record = records().remove(0);
-    assert_eq!(record.cluster.as_deref(), Some("silent"));
-    assert_eq!(record.outcome, flint_core::activity::Outcome::Failed);
+    wait_for("the refused calls are recorded", || records().len() == 2).await;
+    for record in records() {
+        assert_eq!(record.tool, "list_clusters");
+        assert_eq!(record.outcome, flint_core::activity::Outcome::Failed);
+        assert_eq!(record.cluster, None, "{record:?}");
+        assert_eq!(record.name, None, "{record:?}");
+        assert_eq!(record.kind, None, "{record:?}");
+        assert_eq!(record.namespace, None, "{record:?}");
+        assert_eq!(record.container, None, "{record:?}");
+    }
     let stored = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .collect::<String>();
+    assert!(!stored.is_empty());
     assert!(!stored.contains("raw-value"), "{stored}");
-    assert!(!stored.contains("evil"), "{stored}");
 }
 
 // covers UP-16: a `list_clusters` call ended by its deadline while it probes is still recorded

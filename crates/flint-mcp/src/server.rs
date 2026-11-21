@@ -701,7 +701,7 @@ impl ServerHandler for FlintMcp {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
-        let named = named_in(request.arguments.as_ref());
+        let mut named = named_in(request.arguments.as_ref());
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         // Until this handler ends, the call counts as unanswered, cancelled or not: it may
@@ -733,6 +733,9 @@ impl ServerHandler for FlintMcp {
                     .and_then(|tool| unsupported_arguments(tool, request.arguments.as_ref()));
                 if let Some(text) = refused {
                     drop(turn);
+                    // Its arguments are unvalidated: none is recorded, or trusted to say which
+                    // cluster the call was about.
+                    named = Named::default();
                     (failed(&text), None, CallNote::default())
                 } else {
                     let call =
