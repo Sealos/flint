@@ -24,6 +24,7 @@ use super::pods::{PodSource, WorkloadTarget};
 use super::source::LogSource;
 use super::stream::{Backoff, Stream};
 use super::workload::{PodSetStatus, WorkloadFeed};
+use crate::redact;
 
 /// Which container's logs to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,6 +100,47 @@ pub enum ContainerWait {
     NotStarted(Option<String>),
 }
 
+/// The part of a log request that failed, when the error shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FailedHop {
+    /// Not known, or the API server itself.
+    #[default]
+    Unknown,
+    /// The API server answered, but could not reach the kubelet it proxies the log from.
+    Node,
+}
+
+impl FailedHop {
+    /// Reads the hop from an error's full `raw` text. The kubelet is recognised by its port or
+    /// by the API server's `InternalError`; the failure itself must be in the words outside
+    /// quoted values, so a quoted name cannot stand for one.
+    pub(crate) fn of(raw: &str) -> Self {
+        let lower = raw.to_lowercase();
+        let names_kubelet = lower.starts_with("internalerror")
+            || [":10250/", ":10250\""].iter().any(|p| lower.contains(p));
+        let outside_quotes = redact::hide_server_values(raw).to_lowercase();
+        if names_kubelet && NETWORK_FAILURES.iter().any(|w| outside_quotes.contains(w)) {
+            FailedHop::Node
+        } else {
+            FailedHop::Unknown
+        }
+    }
+}
+
+/// Words of a failure to reach a server.
+pub const NETWORK_FAILURES: &[&str] = &[
+    "connection refused",
+    "could not resolve",
+    "tls handshake",
+    "connection reset",
+    "dropped",
+    "unreachable",
+    "timed out",
+    "could not reach",
+    "no route to host",
+    "i/o timeout",
+];
+
 /// Where a session is.
 ///
 /// In a workload session this is the state of the session as a whole (resolving the workload
@@ -117,6 +159,8 @@ pub enum LogState {
     /// restart back-off rather than a broken connection.
     Reconnecting {
         error: Option<String>,
+        /// Which part failed, read from the full error: `error` has its values hidden.
+        hop: FailedHop,
         attempt: u32,
         back_off: bool,
     },
@@ -130,6 +174,8 @@ pub enum LogState {
     /// with no `error`.
     Ended {
         error: Option<String>,
+        /// Which part failed, read from the full error: `error` has its values hidden.
+        hop: FailedHop,
         pod_deleted: bool,
     },
 }
@@ -840,6 +886,7 @@ mod tests {
 
         let mut ended = output_with(5);
         ended.set_state(&LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: false,
         });
@@ -864,6 +911,7 @@ mod tests {
     fn an_ended_tab_that_is_shown_keeps_its_log() {
         let mut ended = output_with(5);
         ended.set_state(&LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: true,
         });
@@ -898,6 +946,7 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -969,6 +1018,7 @@ mod tests {
         assert_eq!(
             broken.state,
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("still down".into()),
                 attempt: 2,
                 back_off: false,
@@ -1038,6 +1088,7 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }
@@ -1090,6 +1141,7 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             }
@@ -1110,6 +1162,7 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("NotFound: pods \"p\" not found".into()),
                 pod_deleted: false,
             }
@@ -1128,6 +1181,7 @@ mod tests {
         assert_eq!(
             snapshot.state,
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false
             }

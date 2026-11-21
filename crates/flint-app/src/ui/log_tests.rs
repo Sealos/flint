@@ -275,6 +275,7 @@ async fn an_ended_tab_says_when_all_its_lines_were_dropped(cx: &mut TestAppConte
         Arc::new(LogSnapshot {
             lines: Default::default(),
             state: LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false,
             },
@@ -351,6 +352,7 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
         &view,
         lines.snapshot(
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: Some("unexpected EOF".into()),
                 attempt: 2,
                 back_off: false,
@@ -365,6 +367,7 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
         &view,
         lines.snapshot(
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("container not found".into()),
                 pod_deleted: false,
             },
@@ -385,6 +388,7 @@ async fn a_log_tab_shows_its_state_and_follows_the_buffer(cx: &mut TestAppContex
         &view,
         lines.snapshot(
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             },
@@ -1123,6 +1127,7 @@ async fn an_ended_stream_has_no_pause(cx: &mut TestAppContext) {
         &view,
         lines.push(10, 14).snapshot(
             LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: false,
             },
@@ -1158,6 +1163,7 @@ async fn errors_are_said_in_plain_words_with_reconnect(cx: &mut TestAppContext) 
         &view,
         lines.push(0, 5).snapshot(
             LogState::Ended {
+                hop: Default::default(),
                 error: Some(forbidden.into()),
                 pod_deleted: false,
             },
@@ -1199,6 +1205,7 @@ async fn errors_are_said_in_plain_words_with_reconnect(cx: &mut TestAppContext) 
         &view,
         empty.snapshot(
             LogState::Ended {
+                hop: Default::default(),
                 error: Some(format!(
                     "{}: unable to retrieve container logs for containerd://c54f",
                     flint_core::logs::PREVIOUS_NOT_AVAILABLE
@@ -1314,6 +1321,7 @@ async fn a_waiting_tab_says_why_and_the_list_says_the_same(cx: &mut TestAppConte
         ),
         (
             LogState::Reconnecting {
+                hop: Default::default(),
                 error: None,
                 attempt: 4,
                 back_off: true,
@@ -1323,6 +1331,7 @@ async fn a_waiting_tab_says_why_and_the_list_says_the_same(cx: &mut TestAppConte
         ),
         (
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("Forbidden: pods \"web\" is forbidden".into()),
                 pod_deleted: false,
             },
@@ -1353,11 +1362,13 @@ async fn a_waiting_tab_says_why_and_the_list_says_the_same(cx: &mut TestAppConte
 async fn a_long_status_is_cut_inside_its_slot(cx: &mut TestAppContext) {
     for state in [
         LogState::Reconnecting {
+            hop: Default::default(),
             error: None,
             attempt: 4,
             back_off: true,
         },
         LogState::Reconnecting {
+            hop: Default::default(),
             error: Some("the log stream broke: an unexpected and long reason".into()),
             attempt: 12,
             back_off: false,
@@ -1454,6 +1465,7 @@ async fn the_overflow_menu_stays_reachable_and_holds_save(cx: &mut TestAppContex
         cx,
         &view,
         snapshot(LogState::Ended {
+            hop: Default::default(),
             error: None,
             pod_deleted: false,
         }),
@@ -1644,6 +1656,7 @@ async fn the_state_reports_lines_toggles_search_and_selection(cx: &mut TestAppCo
         &view,
         lines.snapshot(
             LogState::Ended {
+                hop: Default::default(),
                 error: Some("Forbidden: pods \"web-1\" is forbidden".into()),
                 pod_deleted: false,
             },
@@ -1683,6 +1696,7 @@ async fn the_state_reports_a_workloads_streams_and_sources(cx: &mut TestAppConte
             stream(
                 "web-2",
                 LogState::Ended {
+                    hop: Default::default(),
                     error: Some("Forbidden".into()),
                     pod_deleted: false,
                 },
