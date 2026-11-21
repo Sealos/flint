@@ -991,10 +991,11 @@ impl Workspace {
         }
         let model = self.model.clone();
         let cluster = action.cluster.clone();
-        let tab_cluster = self.tab_cluster(&cluster, cx);
+        let key = TabKey::Activity(cluster.clone());
+        let tab_cluster = self.tab_cluster(&key, cx);
         let server = tab_cluster.server.clone();
         self.open_tab(
-            TabKey::Activity(cluster.clone()),
+            key,
             tab_cluster,
             move |_, cx| {
                 DockTab::Activity(cx.new(|cx| ActivityView::new(model, cluster, server, cx)))

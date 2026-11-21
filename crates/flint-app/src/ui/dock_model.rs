@@ -110,6 +110,15 @@ pub struct TabCluster {
     pub context: ClusterId,
     /// The server URL without a trailing slash; `None` when the context names no cluster entry.
     pub server: Option<String>,
+    /// The context's confirmed definition when the tab opened, as far as its session depends on
+    /// it: [`ClusterSummary::definition`] for a shell, [`ClusterSummary::endpoint`] for logs, and
+    /// `0` for agent activity, which reads a file. A context moved and put back is another
+    /// definition at the same server, so the tab is not reused for it; an edit that keeps the
+    /// server keeps the definition.
+    ///
+    /// [`ClusterSummary::definition`]: flint_core::ClusterSummary::definition
+    /// [`ClusterSummary::endpoint`]: flint_core::ClusterSummary::endpoint
+    definition: u64,
 }
 
 impl TabCluster {
@@ -117,13 +126,32 @@ impl TabCluster {
         TabCluster {
             context: context.into(),
             server: server.map(normalize_server),
+            definition: 0,
         }
+    }
+
+    /// This tab cluster, opened on the context's confirmed `definition`.
+    pub fn defined_by(mut self, definition: u64) -> Self {
+        self.definition = definition;
+        self
     }
 
     /// Whether the context, now pointing at `server`, is still this tab's cluster.
     pub fn is_at(&self, server: Option<&str>) -> bool {
         self.server.as_deref() == server.map(normalize_server).as_deref()
     }
+}
+
+/// The server of each context whose server the core has confirmed. One that may be a fallback,
+/// showing only while a kubeconfig file can't be read, is left out, so its shells keep running.
+pub fn confirmed_servers(
+    clusters: &[flint_core::ClusterSummary],
+) -> HashMap<String, Option<String>> {
+    clusters
+        .iter()
+        .filter(|c| c.confirmed)
+        .map(|c| (c.info.name.clone(), c.info.server.clone()))
+        .collect()
 }
 
 /// What a context's chip says, for every context in kubeconfig: its cluster's name, short (an
@@ -292,6 +320,34 @@ pub fn repointed_note(context: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // covers UP-41: a server the core has not confirmed may be a fallback, so it is not a reason
+    // to end a shell.
+    #[test]
+    fn only_confirmed_servers_can_end_a_shell() {
+        let summary = |name: &str, confirmed| flint_core::ClusterSummary {
+            info: flint_core::kubeconfig::ContextInfo {
+                name: name.into(),
+                cluster: None,
+                user: None,
+                namespace: None,
+                server: Some("https://elsewhere".into()),
+                proxy_url: None,
+                source: "/k".into(),
+            },
+            state: flint_core::ConnectionState::Disconnected,
+            generation: 1,
+            definition: 1,
+            endpoint: 1,
+            confirmed,
+        };
+        let servers = confirmed_servers(&[summary("sure", true), summary("fallback", false)]);
+        assert_eq!(
+            servers.get("sure"),
+            Some(&Some("https://elsewhere".to_owned()))
+        );
+        assert!(!servers.contains_key("fallback"));
+    }
 
     // covers UP-42: a tab is pinned to its context and the server it pointed at.
     #[test]
