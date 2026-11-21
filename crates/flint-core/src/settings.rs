@@ -679,7 +679,11 @@ impl SettingsError {
 /// The key in serde's ``unknown field `key`, expected ...``, if it is a plain name that does not
 /// look like a credential. A key is the one thing such a message quotes that is not a value.
 fn unknown_field(message: &str) -> Option<&str> {
-    let (field, _) = message.strip_prefix("unknown field `")?.split_once('`')?;
+    let (field, rest) = message.strip_prefix("unknown field `")?.split_once('`')?;
+    // A quoted key can hold a backtick: then this is not the whole key.
+    if !(rest.is_empty() || rest.starts_with(',')) {
+        return None;
+    }
     let plain = (1..=64).contains(&field.len())
         && field
             .bytes()
@@ -1092,6 +1096,7 @@ mod safe_reason_tests {
         for message in [
             "unknown field `AKIAIOSFODNN7EXAMPLE`, expected",
             "unknown field `a b`, expected",
+            "unknown field `namespaces``, expected",
             "invalid type: string `namespace`",
         ] {
             assert_eq!(unknown_field(message), None, "{message}");

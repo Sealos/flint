@@ -148,9 +148,21 @@ impl Setup {
                 .to_owned(),
             Flavour::Headless => format!(
                 "Ask the user to add an [[ai_exposed_clusters]] entry with the cluster's context \
-                 and server to {}.",
+                 and server to {}. If the file already has an ai_exposed_clusters = [...] array, \
+                 the entry goes in that array instead.",
                 self.settings
             ),
+        }
+    }
+
+    /// The advice when nothing is exposed and `changed` entries point at another server. Without
+    /// the app, a new entry beside a re-pointed one would drop that entry's scope, so only the
+    /// note on updating it is given then.
+    fn nothing_exposed(&self, changed: usize) -> String {
+        if changed > 0 && self.flavour == Flavour::Headless {
+            String::new()
+        } else {
+            format!(" {}", self.expose())
         }
     }
 
@@ -251,8 +263,8 @@ pub fn list_clusters_hint(
     };
     if exposed == 0 && missing == 0 {
         Some(format!(
-            "No clusters are exposed to AI agents. {}{changed_note}",
-            setup.expose()
+            "No clusters are exposed to AI agents.{}{changed_note}",
+            setup.nothing_exposed(changed)
         ))
     } else if changed > 0 || missing > 0 {
         Some(
@@ -973,6 +985,13 @@ mod tests {
             assert!(!hint.contains("robot"), "{hint}");
             assert!(!hint.contains("in Flint."), "{hint}");
         }
+        // Adding an entry beside a re-pointed one would drop its scope: only updating is advised.
+        let repointed = list_clusters_hint(0, 1, 0, &[], false, &headless).unwrap();
+        assert!(repointed.contains("update the server"), "{repointed}");
+        assert!(!repointed.contains("add an"), "{repointed}");
+        // A file may already hold the inline form, where a table would be a second definition.
+        let first = list_clusters_hint(0, 0, 0, &[], false, &headless).unwrap();
+        assert!(first.contains("ai_exposed_clusters = [...]"), "{first}");
         let hint = list_clusters_hint(0, 1, 0, &[], false, &app()).unwrap();
         assert!(
             hint.contains("robot button") && hint.contains("again in Flint."),
