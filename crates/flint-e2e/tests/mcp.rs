@@ -347,11 +347,13 @@ fn up_09_agent_lists_only_exposed_clusters() -> Result<()> {
         ]
     );
 
-    // Nothing exposed: no clusters, and a hint pointing at the toggle in Flint.
+    // Nothing exposed: no clusters, and a hint this headless server's user can follow.
     let clusters = mcp.call_json("list_clusters", json!({}))?;
     assert_eq!(clusters["clusters"], json!([]), "{clusters}");
     let hint = clusters["hint"].as_str().unwrap_or_default();
-    assert!(hint.contains("Expose to AI"), "{clusters}");
+    assert!(hint.contains("[[ai_exposed_clusters]]"), "{clusters}");
+    assert!(hint.contains("settings.toml"), "{clusters}");
+    assert!(!hint.contains("robot button"), "{clusters}");
 
     // Exposed in settings (as the app writes it): listed, reachable, with its version.
     on.expose()?;
