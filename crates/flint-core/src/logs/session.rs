@@ -397,6 +397,11 @@ impl Budgeted {
         let wake = budget.register(id);
         Budgeted { budget, id, wake }
     }
+
+    /// Where the session's trim cutoff is published, for its front end.
+    pub fn cutoff(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.budget.cutoff_of(self.id)
+    }
 }
 
 impl Drop for Budgeted {
@@ -754,22 +759,20 @@ mod tests {
         };
         let feed = PodFeed::new(fake, target(), LogOptions::default(), &config);
         let budgeted = Budgeted::new(budget.clone(), 1);
+        let cutoff = budgeted.cutoff();
         tokio::spawn(run(Box::new(feed), config, tx, paused_rx, Some(budgeted)));
         for n in 0..crate::logs::CHUNK_LINES * 2 + 5 {
             lines.unbounded_send(format!("{n}")).unwrap();
         }
         let trimmed = snapshots.wait_for(|s| s.trimmed).await.unwrap().clone();
-        assert_eq!(budget.trim_cutoff(1), trimmed.lines.first_id());
+        assert_eq!(
+            cutoff.load(std::sync::atomic::Ordering::Acquire),
+            trimmed.lines.first_id()
+        );
+        let reports = budget.reports();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(snapshots.borrow().version, trimmed.version);
-        assert_eq!(
-            budget.total(),
-            trimmed
-                .lines
-                .iter()
-                .map(|(_, l)| l.heap_bytes())
-                .sum::<usize>()
-        );
+        assert_eq!(budget.reports(), reports + 1, "the next tick reports once");
     }
 
     fn output_with(lines: usize) -> Output {

@@ -398,6 +398,7 @@ impl LogView {
         let snapshot = if starts_before(&snapshot.lines, cutoff) {
             let kept = Arc::new(LogSnapshot {
                 lines: snapshot.lines.trimmed(cutoff),
+                trimmed: true,
                 ..(*snapshot).clone()
             });
             cx.background_spawn(async move { drop(snapshot) }).detach();

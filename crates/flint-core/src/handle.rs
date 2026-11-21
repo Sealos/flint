@@ -584,6 +584,8 @@ impl CoreHandle {
         rx.mark_changed();
         let (paused, paused_rx) = watch::channel(false);
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let budget = crate::logs::Budgeted::new(self.log_budget.clone(), id);
+        let trim_cutoff = budget.cutoff();
         let _ = self.requests.try_send(Request::OpenLogs {
             id,
             cluster: cluster.to_owned(),
@@ -592,7 +594,7 @@ impl CoreHandle {
             options: options.clone(),
             snapshots,
             paused: paused_rx,
-            budget: crate::logs::Budgeted::new(self.log_budget.clone(), id),
+            budget,
         });
         LogSession {
             id,
@@ -603,6 +605,7 @@ impl CoreHandle {
             paused,
             requests: self.requests.clone(),
             budget: self.log_budget.clone(),
+            trim_cutoff,
         }
     }
 
@@ -888,6 +891,7 @@ pub struct LogSession {
     paused: watch::Sender<bool>,
     requests: async_channel::Sender<Request>,
     budget: Arc<crate::logs::LogBudget>,
+    trim_cutoff: Arc<AtomicU64>,
 }
 
 impl LogSession {
@@ -960,8 +964,10 @@ impl LogSession {
 
     /// The first line the shared budget left this session. A snapshot older than the latest
     /// trim can still start before it, so a front end drops those rows before drawing them.
+    /// Takes no lock. Once [`LogSession::set_shown`] has returned, no trim of this tab is under
+    /// way, so the value read then holds for the frame drawn next.
     pub fn trim_cutoff(&self) -> u64 {
-        self.budget.trim_cutoff(self.id)
+        self.trim_cutoff.load(Ordering::Acquire)
     }
 
     /// Whether [`LogSession::set_shown`] last said this tab is shown (once the core has started

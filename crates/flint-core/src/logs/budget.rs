@@ -20,6 +20,7 @@
 //! per session, and up to 100 ms of lines), and the shown tab's own cap when it alone is over.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -37,6 +38,9 @@ struct Inner {
     /// Advances on every change of what is shown: the order of viewing.
     clock: u64,
     sessions: HashMap<u64, Entry>,
+    /// How many reports sessions made.
+    #[cfg(test)]
+    reports: usize,
 }
 
 #[derive(Debug)]
@@ -60,7 +64,8 @@ struct Entry {
     /// planned again. A trim under way stops when it moves.
     plan: u64,
     /// The session's oldest line after its latest trim, recorded in the step that detached it.
-    cutoff: u64,
+    /// Atomic so a frame can read it without waiting on this budget's lock.
+    cutoff: Arc<AtomicU64>,
     wake: Arc<Notify>,
 }
 
@@ -79,6 +84,8 @@ impl LogBudget {
                 limit,
                 clock: 0,
                 sessions: HashMap::new(),
+                #[cfg(test)]
+                reports: 0,
             }),
         })
     }
@@ -114,7 +121,7 @@ impl LogBudget {
                 trim_to: None,
                 in_flight: None,
                 plan: 0,
-                cutoff: 0,
+                cutoff: Arc::default(),
                 wake: wake.clone(),
             },
         );
@@ -146,11 +153,17 @@ impl LogBudget {
         }
     }
 
-    /// The first line session `id` still holds after its trims. Once [`LogBudget::set_shown`]
-    /// has returned for a shown tab, no trim is under way, so this cannot move past what a frame
-    /// drawn next reads.
-    pub fn trim_cutoff(&self, id: u64) -> u64 {
-        self.lock().sessions.get(&id).map_or(0, |e| e.cutoff)
+    /// Where session `id`'s cutoff is published: the first line it still holds after its trims.
+    pub(crate) fn cutoff_of(&self, id: u64) -> Arc<AtomicU64> {
+        self.lock()
+            .sessions
+            .get(&id)
+            .map_or_else(Arc::default, |e| e.cutoff.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports(&self) -> usize {
+        self.lock().reports
     }
 
     /// Whether session `id`'s tab is the one shown.
@@ -174,6 +187,10 @@ impl LogBudget {
     /// is or is not paused.
     pub(crate) fn report(&self, id: u64, bytes: usize, trimmable: usize, paused: bool) {
         let mut inner = self.lock();
+        #[cfg(test)]
+        {
+            inner.reports += 1;
+        }
         if let Some(entry) = inner.sessions.get_mut(&id) {
             entry.bytes = bytes;
             entry.trimmable = trimmable;
@@ -222,7 +239,9 @@ impl LogBudget {
         if entry.shown || entry.plan != plan.plan {
             return None;
         }
-        let (detached, freed) = detach(&mut entry.cutoff)?;
+        let mut cutoff = entry.cutoff.load(Ordering::Relaxed);
+        let (detached, freed) = detach(&mut cutoff)?;
+        entry.cutoff.store(cutoff, Ordering::Release);
         entry.bytes = entry.bytes.saturating_sub(freed);
         entry.trimmable = entry.trimmable.saturating_sub(freed);
         Some(detached)

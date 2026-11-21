@@ -249,6 +249,10 @@ async fn a_trim_cutoff_keeps_removed_rows_off_the_first_frame(cx: &mut TestAppCo
     feed(cx, &view, older);
     draw(cx, window);
     assert_eq!(view.read_with(cx, |v, _| v.snapshot().lines.first_id()), 3);
+    assert!(
+        view.read_with(cx, |v, _| v.snapshot().trimmed),
+        "it says lines were dropped"
+    );
     assert!(!drawn(cx, 2), "a queued snapshot brought a line back");
     assert!(drawn(cx, 3));
 
