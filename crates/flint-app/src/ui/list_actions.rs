@@ -118,6 +118,7 @@ impl ResourceList {
     }
 
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_first_in = None;
         let focus = self.filter.focus_handle(cx);
         window.focus(&focus, cx);
     }
@@ -129,7 +130,8 @@ impl ResourceList {
     }
 
     /// Down in the filter: back to the rows, on the first one if nothing is selected or waiting
-    /// to be. A selection the filter hides stays selected.
+    /// to be. A selection the filter hides stays selected. While the filter's rows are being
+    /// computed, the selection waits for them, so it never lands on a row the filter hides.
     fn select_from_filter(
         &mut self,
         _: &SelectFromFilter,
@@ -137,8 +139,10 @@ impl ResourceList {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
-        if self.selected.is_none() && self.pending_select.is_none() {
-            self.select_index(0, window, cx);
+        if self.computing {
+            self.select_first_in = Some(window.window_handle());
+        } else {
+            self.select_first_if_none(window, cx);
         }
         cx.notify();
     }
