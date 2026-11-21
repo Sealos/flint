@@ -482,6 +482,26 @@ const UNSUPPORTED_NAME_CHARS: usize = 64;
 /// likes, and a prefix of it could hold part of a credential.
 const UNSUPPORTED_NAME_BYTES: usize = 1024;
 
+/// `result` with an argument error's repeated value taken out ([`policy::argument_error`]). rmcp
+/// returns that error as a failed tool result.
+fn without_argument_values(
+    mut result: Result<rmcp::model::CallToolResponse, rmcp::ErrorData>,
+) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+    if let Ok(rmcp::model::CallToolResponse::Complete(done)) = &mut result
+        && done.is_error == Some(true)
+    {
+        for block in &mut done.content {
+            let safe = block
+                .as_text()
+                .and_then(|text| policy::argument_error(&text.text));
+            if let Some(safe) = safe {
+                *block = ContentBlock::text(safe);
+            }
+        }
+    }
+    result
+}
+
 /// The refusal for `arguments` that `tool`'s schema does not have, naming them and the accepted
 /// ones. A tool that dropped them would answer as if a filter it never applied had matched.
 /// `_meta` is not among them: it sits beside the arguments in the request.
@@ -792,7 +812,9 @@ impl ServerHandler for FlintMcp {
                     CALL.scope(std::cell::RefCell::default(), async {
                         // Dropping the call's future ends its Kubernetes requests.
                         let (result, finished) = tokio::select! {
-                            result = self.tool_router.call(call) => (result, true),
+                            result = self.tool_router.call(call) => {
+                                (without_argument_values(result), true)
+                            }
                             () = cancelled.cancelled() => {
                                 (Err(rmcp::ErrorData::internal_error("cancelled", None)), false)
                             }

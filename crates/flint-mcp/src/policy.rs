@@ -198,6 +198,24 @@ fn shown_path(path: &Path) -> String {
     shown
 }
 
+/// How rmcp starts the error for arguments that do not fit a tool's types.
+const ARGUMENT_ERROR: &str = "failed to deserialize parameters: ";
+
+/// `text` without the value it repeats, if it is such an error: serde's ``invalid type: string
+/// "...", expected u32`` keeps only what was expected. It is rebuilt rather than masked, because
+/// a value can hold the quotes a mask would look for. A missing or repeated field is left as it
+/// is: it names a field of the tool's schema and no value.
+pub fn argument_error(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(ARGUMENT_ERROR)?;
+    if rest.starts_with("missing field `") || rest.starts_with("duplicate field `") {
+        return None;
+    }
+    Some(match rest.rsplit_once(", expected ") {
+        Some((_, expected)) => format!("{ARGUMENT_ERROR}wrong type or value, expected {expected}"),
+        None => format!("{ARGUMENT_ERROR}wrong type or value"),
+    })
+}
+
 /// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
 /// the count is reported, not their names.
 pub fn missing_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> usize {
@@ -1396,6 +1414,36 @@ mod tests {
         sanitize(&mut list);
         assert_eq!(list["items"][0]["data"]["a"], REDACTED);
         assert!(list["items"][1]["metadata"].get("managedFields").is_none());
+    }
+
+    // covers UP-10: a wrong-type error names what was expected and repeats no value, even one
+    // holding the quotes a mask would rely on.
+    #[test]
+    fn argument_errors_repeat_no_value() {
+        let error = |rest: &str| format!("{ARGUMENT_ERROR}{rest}");
+        for (rest, expected) in [
+            (r#"invalid type: string "s3cret", expected u32"#, "u32"),
+            (r#"invalid type: string "a"s3cret"b", expected u32"#, "u32"),
+            ("invalid value: integer `-7`, expected u32", "u32"),
+            (
+                r#"invalid type: string "x, expected s3cret", expected a boolean"#,
+                "a boolean",
+            ),
+        ] {
+            let safe = argument_error(&error(rest)).unwrap();
+            assert_eq!(
+                safe,
+                error(&format!("wrong type or value, expected {expected}")),
+                "{rest}"
+            );
+        }
+        assert_eq!(
+            argument_error(&error("invalid s3cret")).unwrap(),
+            error("wrong type or value")
+        );
+        // Names a field of the schema, which the agent needs; and other text is not this error.
+        assert_eq!(argument_error(&error("missing field `kind`")), None);
+        assert_eq!(argument_error("NotFound: pods \"x\" not found"), None);
     }
 
     // covers UP-02, UP-09
