@@ -660,6 +660,66 @@ async fn locking_during_a_drain_stops_the_next_eviction() {
     assert_eq!(evictions(&server, "pod-c"), 0);
 }
 
+// covers UP-53: when the node cannot be read after the pod list, the listed pods are reported as
+// not tried and no eviction is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_node_check_reports_the_listed_pods_as_not_tried() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    // First match wins: the read before the cordon passes, and the check after the list fails.
+    let node_read = || {
+        Fault::delay(Duration::ZERO)
+            .on(&nodes())
+            .verb(Verb::Get)
+            .named(NODE)
+    };
+    server.inject(node_read().times(1));
+    server.inject(Fault::status(500).on(&nodes()).verb(Verb::Get).named(NODE));
+    let from = server.arrivals().len();
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+
+    let drained = report(running.await.unwrap().unwrap());
+    server.clear_faults();
+
+    assert!(drained.cordoned);
+    assert!(drained.evicted.is_empty());
+    assert_eq!(drained.remaining, [named("pod-a"), named("pod-b")]);
+    let stopped = drained.stopped.expect("the drain stopped");
+    assert!(
+        matches!(stopped, WriteError::NodeNotRechecked(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.to_string().contains("could not be checked again"));
+    assert_eq!(evictions(&server, "pod-a"), 0);
+    assert_eq!(evictions(&server, "pod-b"), 0);
+    let node_path = format!("/api/v1/nodes/{NODE}");
+    let seen = server.arrivals();
+    let order: Vec<_> = seen[from..]
+        .iter()
+        .filter(|r| r.path == node_path || r.path == "/api/v1/pods")
+        .map(|r| (r.method.clone(), r.path.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (http::Method::GET, node_path.as_str()),
+            (http::Method::GET, "/api/v1/pods"),
+            (http::Method::PATCH, node_path.as_str()),
+            (http::Method::GET, "/api/v1/pods"),
+            (http::Method::GET, node_path.as_str()),
+        ]
+    );
+}
+
 // covers UP-54: on a protected cluster an action is refused at review, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_protected_cluster_refuses_actions() {
