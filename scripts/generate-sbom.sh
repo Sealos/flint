@@ -4,8 +4,9 @@
 #   scripts/generate-sbom.sh <tag> <output-dir>
 #
 # Needs `cargo cyclonedx` and jq on PATH. The macOS tarball and DMG hold the same universal binary,
-# so they share two SBOMs, one per slice. SBOMs cover Rust crates only, not the non-Rust parts
-# bundled into an asset (the AppImage runtime, musl).
+# so they share two SBOMs, one per slice. SBOMs cover the Rust crates linked into the binary, not
+# build-time crates (build scripts, proc macros) or the non-Rust parts bundled into an asset (the
+# AppImage runtime, musl).
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -56,9 +57,10 @@ while read -r name package target; do
   ' "$file" >/dev/null || { echo "error: bad SBOM for $package on $target" >&2; exit 1; }
 
   # The tool resolves features across the whole workspace, which pulls in test-only crates. Keep
-  # what `cargo tree` says this package's release build uses on this target (proc macros included),
-  # and fail if the SBOM lacks any of it.
-  cargo tree --locked -p "$package" --target "$target" -e normal --prefix none --format '{p}' |
+  # what `cargo tree` says links into this package's binary on this target, and fail if the SBOM
+  # lacks any of it. Proc macros are left out: they run on the build host and are not linked, and
+  # `cargo tree` resolves their dependencies for the host, so they would vary with the runner.
+  cargo tree --locked -p "$package" --target "$target" -e normal,no-proc-macro --prefix none --format '{p}' |
     awk '{ print $1 " " substr($2, 2) }' | sort -u > "$shipped"
   jq --rawfile shipped "$shipped" '
     ($shipped | split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries) as $keep
