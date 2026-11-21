@@ -97,6 +97,7 @@ jobs:
         run: >-
           cargo test -p flint-e2e --test mcp --locked --no-fail-fast --
           --exact up_09_agent_lists_only_exposed_clusters up_10_agent_inspects_a_cluster
+          up_10_unsupported_arguments_are_refused
       # Tests create their objects in namespaces and a CRD group of their own and delete them.
       - name: Nothing left behind
         if: ${{ !cancelled() && steps.kind.outcome == 'success' }}

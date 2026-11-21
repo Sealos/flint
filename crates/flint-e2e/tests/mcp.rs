@@ -236,6 +236,97 @@ fn up_10_a_custom_cluster_name_does_not_change_mcp_output() -> Result<()> {
     Ok(())
 }
 
+// covers UP-10: an argument a tool does not have is refused, so a filter it cannot apply never
+// returns unfiltered data. Standard request metadata is not an argument and still works.
+#[test]
+fn up_10_unsupported_arguments_are_refused() -> Result<()> {
+    let Some(on) = Inspected::start()? else {
+        return Ok(());
+    };
+    on.expose()?;
+    let cluster = on.context();
+    let mut mcp = on.mcp()?;
+
+    let tools = mcp.request("tools/list", json!({}))?;
+    let tools = tools["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 6, "{tools:?}");
+    for tool in tools {
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"],
+            json!(false),
+            "{tool}"
+        );
+    }
+
+    let pod = "web-69c6f74b8b-qv4xv";
+    for (tool, args, unsupported, accepted) in [
+        (
+            "list_clusters",
+            json!({"verbose": true}),
+            "verbose",
+            "no arguments",
+        ),
+        (
+            "list_resource_kinds",
+            json!({"cluster": cluster, "group": "apps"}),
+            "group",
+            "cluster",
+        ),
+        (
+            "list_resources",
+            json!({"cluster": cluster, "kind": "pods", "namespace": "demo",
+                   "field_selector": "status.phase=Failed"}),
+            "field_selector",
+            "label_selector",
+        ),
+        (
+            "get_resource",
+            json!({"cluster": cluster, "kind": "pods", "namespace": "demo", "name": pod,
+                   "fields": "status"}),
+            "fields",
+            "api_version",
+        ),
+        (
+            "get_events",
+            json!({"cluster": cluster, "namespace": "demo", "reason": "Failed"}),
+            "reason",
+            "object_kind",
+        ),
+        (
+            "get_pod_logs",
+            json!({"cluster": cluster, "namespace": "demo", "pod": pod,
+                   "grep": "zzz-no-such-text"}),
+            "grep",
+            "tail_lines",
+        ),
+    ] {
+        let result = mcp.call(tool, args)?;
+        assert!(result.is_error, "{tool}: {}", result.text);
+        assert!(result.text.contains(unsupported), "{tool}: {}", result.text);
+        assert!(result.text.contains(accepted), "{tool}: {}", result.text);
+    }
+
+    // `_meta` sits beside the arguments in the request.
+    for (tool, args) in [
+        ("list_clusters", json!({})),
+        (
+            "list_resources",
+            json!({"cluster": cluster, "kind": "pods", "namespace": "demo"}),
+        ),
+    ] {
+        let result = mcp.request(
+            "tools/call",
+            json!({"name": tool, "arguments": args,
+                   "_meta": {"progressToken": "p-1", "example.com/trace": "t-1"}}),
+        )?;
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+    }
+    // A client may leave the arguments out of a tool that takes none.
+    let result = mcp.request("tools/call", json!({"name": "list_clusters"}))?;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    Ok(())
+}
+
 // covers UP-09
 #[test]
 fn up_09_agent_lists_only_exposed_clusters() -> Result<()> {
