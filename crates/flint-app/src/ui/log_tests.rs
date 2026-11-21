@@ -221,6 +221,45 @@ async fn a_trimmed_tab_says_older_lines_were_dropped(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.view_state().trimmed));
 }
 
+// covers UP-42: an ended tab whose every line the budget dropped says so; one that never had a
+// line does not.
+#[gpui_kit::test]
+async fn an_ended_tab_says_when_all_its_lines_were_dropped(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let ended = |trimmed, version| {
+        Arc::new(LogSnapshot {
+            lines: Default::default(),
+            state: LogState::Ended {
+                error: None,
+                pod_deleted: false,
+            },
+            paused: false,
+            held_back: 0,
+            version,
+            pods: None,
+            trimmed,
+        })
+    };
+    feed(cx, &view, ended(false, 1_000));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-empty").is_some()
+    })
+    .await;
+    let detail = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            window.try_find("log-empty-detail").is_some()
+        })
+        .unwrap()
+    };
+    assert!(!detail(cx), "no lines were ever dropped");
+    feed(cx, &view, ended(true, 1_001));
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("log-empty-detail").is_some()
+    })
+    .await;
+}
+
 // covers UP-40: the tab shows the session's state and its lines, and keeps the list in step
 // with the ring buffer as lines arrive and are evicted.
 #[gpui_kit::test]
