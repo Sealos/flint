@@ -45,11 +45,11 @@ use super::super::registry::{
     TogglePause, ToggleResourceSwitcher, ToggleSecretValue, ToggleSources, ToggleTimestamps,
     ToggleWide, ToggleWrap, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::super::registry::{BackToList, EditAiScope, ShowAgentActivity};
 use super::super::registry::{
     CordonNode, DeleteObject, DrainNode, NamespacePickerNext, NamespacePickerPrevious,
     OpenNamespaceFilter, RestartObject, ScaleObject, ShowDrainReport, UncordonNode,
 };
-use super::super::registry::{EditAiScope, ShowAgentActivity};
 use super::super::registry::{
     LockCluster, RenameCluster, TrustCluster, UnlockCluster, UntrustCluster,
 };
@@ -58,7 +58,8 @@ use super::super::scope_picker::ScopePicker;
 use super::super::terminal_view::TerminalView;
 use super::super::ui_state;
 use super::{
-    Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog, scope_dialog,
+    MainPanes, Pane, Workspace, confirm_expose, confirm_trust, confirm_unlock, expose_dialog,
+    scope_dialog,
 };
 
 /// A guard: the view `$view` returns (`log`, `shell`, `detail` or `list_wide`) is open and,
@@ -82,6 +83,7 @@ impl Workspace {
         .bind::<ToggleResourceSwitcher>(Self::toggle_switcher)
         .bind::<OpenObject>(Self::open_object)
         .bind::<GoBack>(Self::go_back)
+        .bind::<BackToList>(Self::back_to_list)
         .bind::<FocusNextPane>(|this, _, window, cx| this.focus_pane(1, window, cx))
         .bind::<FocusPreviousPane>(|this, _, window, cx| this.focus_pane(-1, window, cx))
         .bind::<About>(Self::about)
@@ -187,6 +189,7 @@ impl Workspace {
     pub(super) fn guards(this: WeakEntity<Self>) -> Guards<Self> {
         Guards::new(this)
             // macOS has these in its app menu; Linux desktops have nothing they would do.
+            .when::<BackToList>(|ws, cx| ws.main_panes(cx) == MainPanes::DetailAlone)
             .when::<Hide>(|_, _| cfg!(target_os = "macos"))
             .when::<HideOthers>(|_, _| cfg!(target_os = "macos"))
             .when::<ShowAll>(|_, _| cfg!(target_os = "macos"))

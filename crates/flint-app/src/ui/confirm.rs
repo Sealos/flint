@@ -32,6 +32,12 @@ pub struct DialogText {
 /// focus on the dialog's own node, [`init`] answers them.
 pub const DEFAULT_CANCEL: &str = "DefaultCancel";
 
+/// The share of the window's height a confirmation's text may take before it scrolls, leaving
+/// room for a wrapped title and the buttons at the minimum window size.
+const DESCRIPTION_MAX_SHARE: f32 = 0.45;
+/// The same for a confirmation with controls under its text (the drain options).
+const DESCRIPTION_MAX_SHARE_OVER_CONTROLS: f32 = 0.3;
+
 /// Opens a confirmation saying `dialog`; confirming runs `on_ok` and closes it. Test builds open
 /// it at once, without the entrance animation, so automation sees it without waiting.
 pub fn open(
@@ -67,8 +73,15 @@ pub fn open_with(
             .0
             .push(focus.downgrade());
     }
-    window.open_alert_dialog(cx, move |alert, _, _| {
+    window.open_alert_dialog(cx, move |alert, window, _| {
         let on_ok = on_ok.clone();
+        // A long text scrolls, so it cannot push the buttons or its last lines out of the dialog.
+        let share = if content.is_some() {
+            DESCRIPTION_MAX_SHARE_OVER_CONTROLS
+        } else {
+            DESCRIPTION_MAX_SHARE
+        };
+        let text_height = window.viewport_size().height * share;
         #[cfg(feature = "automation")]
         let alert = alert.entrance(gpui_kit::component::dialog::DialogEntrance::None);
         alert
@@ -78,7 +91,14 @@ pub fn open_with(
                 div()
                     .id(dialog.id)
                     .aria_label(dialog.text.clone())
-                    .child(dialog.text.clone())
+                    // Only the text scrolls: controls under it stay in place and clickable.
+                    .child(
+                        div()
+                            .id("confirm-text")
+                            .max_h(text_height)
+                            .overflow_y_scroll()
+                            .child(dialog.text.clone()),
+                    )
                     .when_some(content.clone(), |this, content| this.child(content))
                     .when_some(default_cancel.as_ref(), |this, focus| {
                         this.track_focus(focus).key_context(DEFAULT_CANCEL)

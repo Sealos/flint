@@ -42,10 +42,11 @@ use super::log_view::{LogRequest, LogView};
 use super::nav::{NavEvent, NavPanel};
 use super::palette::CommandPalette;
 use super::registry::{
-    self, AddNamespace, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi, HideFromAi,
-    LockCluster, OnView, OpenView, RenameCluster, RetryConnection, SelectCluster,
-    ShowAgentActivity, ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster,
-    UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
+    self, AddNamespace, BackToList, DefaultWatchAllKinds, DefaultWatchOpenViewsOnly, ExposeToAi,
+    FocusFilter, HideFromAi, LockCluster, OnView, OpenObject, OpenView, RenameCluster,
+    RetryConnection, SelectCluster, SelectRow, ShowAgentActivity, ShowAllNamespaces,
+    ToggleNamespace, TrustCluster, UnlockCluster, UntrustCluster, UseDefaultWatchMode,
+    WatchAllKinds, WatchOpenViewsOnly,
 };
 use super::resource_actions;
 use super::row_menu;
@@ -173,6 +174,33 @@ fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: b
     widths
 }
 
+/// The smallest window the layout works at (width, height).
+pub(in crate::ui) const MIN_WINDOW_SIZE: (f32, f32) = (760., 480.);
+
+/// The narrowest list worth showing beside the detail pane.
+const MIN_SPLIT_LIST_WIDTH: f32 = 260.;
+
+/// Whether a window this wide is too narrow for the list and the detail side by side, with every
+/// side pane at its minimum.
+fn too_narrow_for_split(window_width: f32) -> bool {
+    let side_panes: f32 = [Pane::Clusters, Pane::Navigation, Pane::Detail]
+        .map(|pane| pane.limits().0)
+        .iter()
+        .sum();
+    window_width < side_panes + MIN_SPLIT_LIST_WIDTH
+}
+
+/// What the main area shows of the list and the open detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainPanes {
+    /// Side by side, or the list alone with no detail open.
+    Split,
+    /// A narrow window, on the detail.
+    DetailAlone,
+    /// A narrow window, gone Back to the list; the detail stays open behind it.
+    ListAlone,
+}
+
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
@@ -207,6 +235,10 @@ pub struct Workspace {
     generation: Option<u64>,
     list: Option<Entity<ResourceList>>,
     detail: Option<Entity<DetailView>>,
+    /// The window is too narrow for the list and the detail side by side, as of the last draw.
+    narrow: bool,
+    /// In a narrow window, the list is in front of the open detail.
+    list_in_front: bool,
     /// The bottom dock. It does not change with the active cluster.
     dock: Entity<Dock>,
     /// The command palette (or the resource switcher), while it is open.
@@ -374,6 +406,8 @@ impl Workspace {
             generation: None,
             list: None,
             detail: None,
+            narrow: false,
+            list_in_front: false,
             dock,
             palette: None,
             _switcher: Task::ready(()),
@@ -1669,6 +1703,23 @@ impl Workspace {
             .gap_2()
             .border_b_1()
             .border_color(theme.border)
+            .when(self.main_panes(cx) == MainPanes::DetailAlone, |el| {
+                el.child(
+                    div().flex_none().child(
+                        Button::new("detail-back")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ChevronLeft)
+                            .label("Back")
+                            .tooltip_with_action(
+                                registry::label::<BackToList>(),
+                                &BackToList,
+                                Some(registry::WORKSPACE),
+                            )
+                            .on_click(registry::on_click(BackToList)),
+                    ),
+                )
+            })
             .child(breadcrumb)
             .when(controls.namespaces, |el| {
                 el.child(self.render_namespace_filter(&ns_summary, cx))
@@ -1924,7 +1975,67 @@ impl Workspace {
     /// The pane widths as shown now, with the panes that are showing.
     fn layout(&self, window_width: f32, cx: &App) -> Layout {
         let nav_shown = self.model.read(cx).active_cluster().is_some();
-        layout(&self.panes, window_width, nav_shown, self.detail.is_some())
+        let detail_shown = self.detail.is_some() && self.main_panes(cx) != MainPanes::ListAlone;
+        layout(&self.panes, window_width, nav_shown, detail_shown)
+    }
+
+    /// What the main area shows of the list and the open detail. A failed connection shows
+    /// neither, so there is nothing to go Back from.
+    fn main_panes(&self, cx: &App) -> MainPanes {
+        let failed = matches!(
+            self.model.read(cx).active_cluster().map(|c| &c.state),
+            Some(ConnectionState::Failed(_))
+        );
+        if !self.narrow || self.detail.is_none() || self.list.is_none() || failed {
+            MainPanes::Split
+        } else if self.list_in_front {
+            MainPanes::ListAlone
+        } else {
+            MainPanes::DetailAlone
+        }
+    }
+
+    /// Brings the list in front of the detail, which stays open with its selection.
+    fn back_to_list(&mut self, _: &BackToList, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_in_front = true;
+        if let Some(list) = &self.list {
+            let focus = list.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        }
+        // The detail's YAML field, if it had focus: it is no longer drawn.
+        release_unfocused_input(window, cx);
+        cx.notify();
+    }
+
+    /// Follows the window's width, and moves focus off a pane the narrow layout no longer draws
+    /// (the selected row takes focus when clicked, for one), so the keys keep working.
+    fn sync_narrow_layout(
+        &mut self,
+        window_width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.narrow = too_narrow_for_split(window_width);
+        if !self.narrow || self.detail.is_none() {
+            self.list_in_front = false;
+        }
+        let (Some(list), Some(detail)) = (&self.list, &self.detail) else {
+            return;
+        };
+        let list = list.read(cx).focus_handle().clone();
+        let detail = detail.read(cx).focus_handle().clone();
+        let (hidden, shown) = match self.main_panes(cx) {
+            MainPanes::Split => return,
+            MainPanes::DetailAlone => (list, detail),
+            MainPanes::ListAlone => (detail, list),
+        };
+        if hidden.contains_focused(window, cx) {
+            // After this draw: a focus change during one schedules no frame.
+            window.defer(cx, move |window, cx| {
+                window.focus(&shown, cx);
+                release_unfocused_input(window, cx);
+            });
+        }
     }
 
     fn render_main(&self, window_width: f32, theme: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -1965,27 +2076,46 @@ impl Workspace {
         };
         let content: AnyElement = match (&self.list, &cluster.state) {
             // A failed connection stops the watches; say why instead of an endless "Loading".
+            (Some(_), state)
+                if !matches!(state, ConnectionState::Failed(_))
+                    && self.main_panes(cx) == MainPanes::DetailAlone =>
+            {
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .children(
+                        self.detail
+                            .clone()
+                            .map(|detail| div().flex_1().min_w_0().h_full().child(detail)),
+                    )
+                    .into_any_element()
+            }
             (Some(list), state) if !matches!(state, ConnectionState::Failed(_)) => h_flex()
                 .flex_1()
                 .min_h_0()
                 .child(div().flex_1().min_w_0().h_full().child(list.clone()))
-                .when_some(self.detail.clone(), |el, detail| {
-                    el.child(
-                        div()
-                            .w(px(self.detail_width(window_width)))
-                            .h_full()
-                            .flex_none()
-                            .relative()
-                            .border_l_1()
-                            .border_color(theme.border)
-                            .child(detail)
-                            .child(pane_handle(
-                                "detail-edge",
-                                Pane::Detail,
-                                HandleEdge::Leading,
-                            )),
-                    )
-                })
+                .when_some(
+                    self.detail
+                        .clone()
+                        .filter(|_| self.main_panes(cx) == MainPanes::Split),
+                    |el, detail| {
+                        el.child(
+                            div()
+                                .w(px(self.detail_width(window_width)))
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                .border_l_1()
+                                .border_color(theme.border)
+                                .child(detail)
+                                .child(pane_handle(
+                                    "detail-edge",
+                                    Pane::Detail,
+                                    HandleEdge::Leading,
+                                )),
+                        )
+                    },
+                )
                 .into_any_element(),
             (None, ConnectionState::Connected(version)) => centered(
                 v_flex()
@@ -2596,6 +2726,7 @@ impl Render for Workspace {
         self.sync_namespace_picker_with_dialog(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
+        self.sync_narrow_layout(window_width, window, cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();
@@ -2604,6 +2735,11 @@ impl Render for Workspace {
             .id("workspace")
             .key_context(registry::WORKSPACE)
             .map(|el| self.register_actions(el, cx))
+            // Captured, as the list reports no change for the row already selected: asking for
+            // a row or object shows the detail, and asking for the filter shows the list.
+            .capture_action(cx.listener(|this, _: &SelectRow, _, _| this.list_in_front = false))
+            .capture_action(cx.listener(|this, _: &OpenObject, _, _| this.list_in_front = false))
+            .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
             .child(
                 // The fallback focus target: zero-sized, so no click lands on it.
                 div()
@@ -2753,6 +2889,10 @@ mod keyboard_tests;
 #[cfg(test)]
 #[path = "leak_tests.rs"]
 mod leak_tests;
+
+#[cfg(test)]
+#[path = "narrow_layout_tests.rs"]
+mod narrow_layout_tests;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "workspace_state.rs"]
