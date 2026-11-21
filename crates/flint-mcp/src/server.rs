@@ -728,10 +728,7 @@ impl ServerHandler for FlintMcp {
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         let deadline = admission.limits().deadline;
-        let turn = tokio::select! {
-            turn = admission.enter() => Some(turn),
-            () = cancelled.cancelled() => None,
-        };
+        let turn = admission.enter_unless(cancelled.cancelled()).await;
         let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
         // The reply, the record its tool left when it is the outcome, and what the call learned
         // on its way (for a record of its own otherwise).

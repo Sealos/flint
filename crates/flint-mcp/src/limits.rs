@@ -178,6 +178,19 @@ impl Admission {
             _admitted: admitted,
         })
     }
+
+    /// [`Admission::enter`], or `None` once `cancelled` resolves. A cancellation already signalled
+    /// wins over a turn that is free, so a cancelled call is never admitted.
+    pub(crate) async fn enter_unless(
+        &self,
+        cancelled: impl Future<Output = ()>,
+    ) -> Option<Result<Turn, Busy>> {
+        tokio::select! {
+            biased;
+            () = cancelled => None,
+            turn = self.enter() => Some(turn),
+        }
+    }
 }
 
 /// Bytes of replies handed to the transport and not written yet, and the requests read and not
