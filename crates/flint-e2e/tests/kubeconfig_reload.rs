@@ -331,6 +331,17 @@ async fn core_with_settings(
     path: &std::path::Path,
     settings: Settings,
 ) -> CoreHandle {
+    core_on_files(server, dir, &[path.to_owned()], settings).await
+}
+
+/// [`core_with_settings`] reading `paths` in order. The server's kubeconfig goes in the first;
+/// the others must exist already.
+async fn core_on_files(
+    server: &FakeApiServer,
+    dir: &std::path::Path,
+    paths: &[std::path::PathBuf],
+    settings: Settings,
+) -> CoreHandle {
     server.set_object(
         &deployments(),
         serde_json::json!({
@@ -345,7 +356,7 @@ async fn core_with_settings(
             "spec": {"replicas": 1},
         }),
     );
-    server.write_kubeconfig(path, Some("demo")).unwrap();
+    server.write_kubeconfig(&paths[0], Some("demo")).unwrap();
     let core = CoreHandle::start(CoreConfig {
         config_dir: dir.join("config"),
         settings: Settings {
@@ -353,7 +364,7 @@ async fn core_with_settings(
             ..settings
         },
         settings_error: None,
-        kubeconfig_base: vec![path.to_owned()],
+        kubeconfig_base: paths.to_vec(),
         home: None,
         watch_files: false,
         watch_timing: WatchTiming::default(),
@@ -377,6 +388,11 @@ async fn protected_core(
     dir: &std::path::Path,
     path: &std::path::Path,
 ) -> CoreHandle {
+    core_with_settings(server, dir, path, protected_settings(dir)).await
+}
+
+/// Settings that protect the fake cluster, written to `settings.toml` under `dir`.
+fn protected_settings(dir: &std::path::Path) -> Settings {
     let config = dir.join("config");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
@@ -386,7 +402,7 @@ async fn protected_core(
     .unwrap();
     let settings = settings::load_settings(&config).unwrap();
     assert!(settings.protect_local_clusters);
-    core_with_settings(server, dir, path, settings).await
+    settings
 }
 
 fn expose(core: &CoreHandle, server: Option<String>) {
@@ -575,4 +591,188 @@ async fn until_pins(config: &std::path::Path, count: usize) {
     })
     .await
     .expect("the pins saved in time");
+}
+
+fn namespaces(names: &[&str]) -> AiScope {
+    AiScope::new(names.iter().map(|n| (*n).to_owned()).collect(), Vec::new())
+}
+
+fn set_scope(core: &CoreHandle, server: &FakeApiServer, from: &AiScope, scope: &AiScope) {
+    core.send(Command::SetAiScope {
+        cluster: CONTEXT.to_owned(),
+        server: server.url(),
+        from: from.clone(),
+        scope: scope.clone(),
+    });
+}
+
+/// Waits until `settings.toml` exposes the context with `scope`.
+async fn until_scope(config: &std::path::Path, scope: &AiScope) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(saved) = settings::load_settings(config)
+                && saved
+                    .ai_exposed_clusters
+                    .first()
+                    .is_some_and(|e| e.scope() == *scope)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the scope saved in time");
+}
+
+/// Waits for an error notice containing `text`.
+async fn until_notice(events: &flint_core::events::Events, text: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::Error(notice) = events.recv().await.expect("core running")
+                && notice.contains(text)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the change refused in time");
+}
+
+/// With `core` unsettled: widening is refused and saves nothing, and narrowing is saved.
+async fn only_narrows(
+    core: &CoreHandle,
+    server: &FakeApiServer,
+    config: &std::path::Path,
+    wide: &AiScope,
+    narrow: &AiScope,
+) {
+    let events = core.events();
+    set_scope(core, server, wide, &AiScope::default());
+    until_notice(&events, "was not widened").await;
+    let saved = settings::load_settings(config).unwrap();
+    assert_eq!(saved.ai_exposed_clusters[0].scope(), *wide);
+    set_scope(core, server, wide, narrow);
+    until_scope(config, narrow).await;
+}
+
+// covers UP-06, UP-55: while its file can't be read, a held context's AI scope only narrows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_context_only_narrows_its_ai_scope() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = protected_core(&server, dir.path(), &path).await;
+    let whole = std::fs::read_to_string(&path).unwrap();
+    let config = dir.path().join("config");
+    let (wide, narrow) = (namespaces(&["demo", "other"]), namespaces(&["demo"]));
+    core.send(Command::SetAiExposed {
+        cluster: CONTEXT.to_owned(),
+        server: Some(server.url()),
+        scope: wide.clone(),
+    });
+    until_scope(&config, &wide).await;
+
+    std::fs::write(&path, BROKEN).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    only_narrows(&core, &server, &config, &wide, &narrow).await;
+
+    std::fs::write(&path, &whole).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    set_scope(&core, &server, &narrow, &wide);
+    until_scope(&config, &wide).await;
+}
+
+// covers UP-06, UP-55: a later file's fallback at the same server takes no new Trust and its AI
+// scope only narrows. Removing still works, and with the file back Trust does too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fallback_definition_refuses_new_trust_and_wider_scope() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    server.write_kubeconfig(&second, Some("demo")).unwrap();
+    let fallback = std::fs::read_to_string(&second)
+        .unwrap()
+        .replace("user: {}", "user: {token: fallback}");
+    std::fs::write(&second, fallback).unwrap();
+    let settings = protected_settings(dir.path());
+    let paths = [first.clone(), second];
+    let core = core_on_files(&server, dir.path(), &paths, settings).await;
+    let whole = std::fs::read_to_string(&first).unwrap();
+    let config = dir.path().join("config");
+    let (wide, narrow) = (namespaces(&["demo", "other"]), namespaces(&["demo"]));
+    core.send(Command::SetAiExposed {
+        cluster: CONTEXT.to_owned(),
+        server: Some(server.url()),
+        scope: wide.clone(),
+    });
+    until_scope(&config, &wide).await;
+
+    std::fs::write(&first, BROKEN).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    let events = core.events();
+    core.trust(CONTEXT, &server.url());
+    until_notice(&events, "was not trusted").await;
+    let saved = settings::load_settings(&config).unwrap();
+    assert!(saved.trusted_clusters.is_empty());
+    only_narrows(&core, &server, &config, &wide, &narrow).await;
+    expose(&core, None);
+    tokio::time::timeout(WAIT, async {
+        while !settings::load_settings(&config)
+            .unwrap()
+            .ai_exposed_clusters
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the exposure removed in time");
+
+    std::fs::write(&first, &whole).unwrap();
+    core.reload_kubeconfig().await.unwrap();
+    core.trust(CONTEXT, &server.url());
+    expose(&core, Some(server.url()));
+    until_pins(&config, 1).await;
+}
+
+// covers UP-06, UP-55: Trust, exposure and a wider scope are checked against the files as they
+// are now, with no reload since they changed. Narrowing still saves, and the same file allows
+// them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_access_increase_checks_the_files_as_they_are_now() {
+    let server = FakeApiServer::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kubeconfig");
+    let core = protected_core(&server, dir.path(), &path).await;
+    let whole = std::fs::read_to_string(&path).unwrap();
+    let config = dir.path().join("config");
+    let (wide, narrow) = (namespaces(&["demo", "other"]), namespaces(&["demo"]));
+    core.send(Command::SetAiExposed {
+        cluster: CONTEXT.to_owned(),
+        server: Some(server.url()),
+        scope: wide.clone(),
+    });
+    until_scope(&config, &wide).await;
+
+    let moved = whole.replace(&server.url(), "https://127.0.0.1:1");
+    assert_ne!(moved, whole);
+    for changed in [BROKEN, moved.as_str()] {
+        std::fs::write(&path, changed).unwrap();
+        let events = core.events();
+        core.trust(CONTEXT, &server.url());
+        until_notice(&events, "was not trusted").await;
+        expose(&core, Some(server.url()));
+        until_notice(&events, "was not exposed").await;
+        let saved = settings::load_settings(&config).unwrap();
+        assert!(saved.trusted_clusters.is_empty());
+        only_narrows(&core, &server, &config, &wide, &narrow).await;
+
+        std::fs::write(&path, &whole).unwrap();
+        set_scope(&core, &server, &narrow, &wide);
+        until_scope(&config, &wide).await;
+    }
+    core.trust(CONTEXT, &server.url());
+    until_pins(&config, 1).await;
 }

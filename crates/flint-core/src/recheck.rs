@@ -104,7 +104,7 @@ impl ContextPin {
 }
 
 /// A context's definition, as kubeconfig loads last saw it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Record {
     server: Option<String>,
     /// The file that defined it.
@@ -177,7 +177,7 @@ pub(crate) struct Shown {
 /// that way (a file before it already unreadable at startup) is recorded as unconfirmed, with
 /// its file, so its absence is masked the same way; sessions opened on it run, and a load that
 /// confirms it on the same server leaves them running.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ContextHistory {
     records: HashMap<String, Record>,
     /// The context names each file defined when it last loaded, shadowed ones included.
@@ -353,6 +353,19 @@ impl ContextHistory {
         self.records
             .get(context)
             .is_some_and(|r| r.present && !r.provisional && r.definition == pin.definition)
+    }
+
+    /// Whether `fresh`, a read of the files newer than the last recorded load, still gives
+    /// `context` the definition recorded for it at exactly `server`, with no file that failed
+    /// able to change it. Judged by the rules of [`Self::record`]; records nothing.
+    pub fn holds_in(&self, fresh: &LoadedKubeconfig, context: &str, server: &str) -> bool {
+        let pin = self.pin(context, Some(server));
+        let mut next = self.clone();
+        next.record(fresh);
+        pin.definition.is_some()
+            && next.check(Pinned::Shell, context, &pin).is_none()
+            && !next.gate_moved(context, &pin)
+            && next.definition_holds(context, &pin)
     }
 
     /// Whether a file that failed in the last load could define `context`, its cluster or its

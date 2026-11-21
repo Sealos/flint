@@ -639,12 +639,18 @@ fn pod_manager(pod: &Pod) -> Option<ManagedBy> {
         namespace: namespace.as_deref(),
         name: &name,
     };
-    gitops::managed_by_live(&identity, |key| {
-        pod.labels()
-            .get(key)
-            .or_else(|| pod.annotations().get(key))
-            .map(String::as_str)
-    })
+    let texts = |map: &std::collections::BTreeMap<String, String>| {
+        serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        )
+    };
+    let metadata = serde_json::json!({
+        "labels": texts(pod.labels()),
+        "annotations": texts(pod.annotations()),
+    });
+    gitops::managed_by_live_metadata(&identity, &metadata)
 }
 
 /// Whether a GitOps controller manages `pod` in a way the review did not warn about.

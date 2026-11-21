@@ -11,6 +11,7 @@ use flint_core::{
     ClusterId, ClusterSummary, ConnectionState, KindId, NavEntry, Protection, SyncState, WatchMode,
 };
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -34,7 +35,7 @@ use super::detail::{
 };
 use super::dock::{self, Dock, DockEvent, DockItem as _, DockTab, TabKey};
 use super::dock_model::{LiveSessions, TabCluster, confirmed_servers};
-use super::focus::release_unfocused_input;
+use super::focus::{cycle_focus_within, release_unfocused_input};
 use super::icons::FlintIcon;
 use super::list::{ListEvent, ResourceList};
 use super::log_view::{LogRequest, LogView};
@@ -175,6 +176,20 @@ fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: b
 /// Pane widths are written to `state.toml` once a drag has paused this long.
 const PANE_SAVE_DELAY: Duration = Duration::from_millis(400);
 
+/// The key context entry holding a namespace row's index in the picker's list.
+const NAMESPACE_ROW: &str = "namespace_row";
+
+/// How focus comes back after a dialog closed the namespace picker.
+#[derive(Clone, Copy)]
+enum PickerDialogFocus {
+    /// Nothing to do.
+    Settled,
+    /// The dialog is up; focus moves to the picker's button when it goes.
+    DialogOpen,
+    /// The dialog has gone and may still hand focus back to a picker control, now hidden.
+    Restoring,
+}
+
 pub struct Workspace {
     model: Entity<ClustersModel>,
     /// `FLINT_APPEARANCE`, a development aid that wins over the setting.
@@ -218,6 +233,14 @@ pub struct Workspace {
     /// Whether the namespace filter's popover is open: held here, so opening the palette can
     /// close it wherever focus is.
     namespace_popover_open: bool,
+    /// The namespace picker's content, which holds its keys.
+    namespace_picker_focus: FocusHandle,
+    /// The namespace filter's button, where focus returns when the picker closes.
+    namespace_button_focus: FocusHandle,
+    /// Where focus stands after a dialog closed the picker.
+    namespace_focus_after_dialog: PickerDialogFocus,
+    /// The picker's list of namespaces, scrolled to keep the focused row in view.
+    namespace_list_scroll: ScrollHandle,
     /// Pane widths, as dragged.
     panes: PaneWidths,
     /// `FLINT_VIEW`, until it has been opened.
@@ -363,6 +386,10 @@ impl Workspace {
             namespaces_state: SyncState::Idle,
             namespace_input,
             namespace_popover_open: false,
+            namespace_picker_focus: cx.focus_handle(),
+            namespace_button_focus: cx.focus_handle(),
+            namespace_focus_after_dialog: PickerDialogFocus::Settled,
+            namespace_list_scroll: ScrollHandle::new(),
             startup_yaml: startup_view.as_ref().is_some_and(|v| v.yaml),
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
@@ -1655,8 +1682,12 @@ impl Workspace {
         let this = cx.weak_entity();
         let input = self.namespace_input.clone();
         let on_open = this.clone();
+        let picker = self.namespace_picker_focus.clone();
+        let button = self.namespace_button_focus.clone();
+        let list_scroll = self.namespace_list_scroll.clone();
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
+            .track_focus(&picker)
             .open(self.namespace_popover_open)
             // After the change in hand: it may come while the workspace is being updated (the
             // palette dismissing it).
@@ -1676,9 +1707,20 @@ impl Workspace {
                     .xsmall()
                     .outline()
                     .label(summary.to_owned())
+                    .track_focus(&self.namespace_button_focus)
+                    .tab_stop(false)
                     .tooltip("Filter by namespace (remembered per cluster)"),
             )
-            .content(move |_, _, cx| {
+            .content(move |_, window, cx| {
+                // Just opened: its controls have tab stops once this frame is drawn.
+                if picker.is_focused(window) {
+                    let picker = picker.clone();
+                    window.defer(cx, move |window, cx| {
+                        if picker.is_focused(window) {
+                            cycle_focus_within(&picker, true, window, cx);
+                        }
+                    });
+                }
                 let theme = cx.theme().clone();
                 let Some(this) = this.upgrade() else {
                     return v_flex();
@@ -1699,7 +1741,16 @@ impl Workspace {
                 } else {
                     "Loading namespaces…"
                 };
+                let back = button.clone();
                 v_flex()
+                    .track_focus(&picker)
+                    .key_context(registry::NAMESPACE_PICKER)
+                    // Focus moves first, so the popover's own Cancel, next, leaves it there. The
+                    // workspace may be mid-update here (the palette dismissing the picker).
+                    .on_action(move |_: &Cancel, window, cx| {
+                        back.focus(window, cx);
+                        cx.propagate();
+                    })
                     .w(px(260.))
                     .gap_1()
                     .child(
@@ -1714,6 +1765,7 @@ impl Workspace {
                             .id("ns-list")
                             .max_h(px(360.))
                             .overflow_y_scroll()
+                            .track_scroll(&list_scroll)
                             .gap_1()
                             .when(names.is_empty(), |el| {
                                 el.child(
@@ -1724,17 +1776,93 @@ impl Workspace {
                                         .child(empty_text),
                                 )
                             })
-                            .children(names.into_iter().map(|ns| {
+                            .children(names.into_iter().enumerate().map(|(row, ns)| {
                                 let checked = filter.contains(&ns);
-                                Checkbox::new(SharedString::from(format!("ns-{ns}")))
-                                    .label(ns.clone())
-                                    .checked(checked)
-                                    .on_click(registry::on_click(ToggleNamespace { namespace: ns }))
+                                let mut context = KeyContext::default();
+                                context.set(NAMESPACE_ROW, row.to_string());
+                                div().key_context(context).child(
+                                    Checkbox::new(SharedString::from(format!("ns-{ns}")))
+                                        .label(ns.clone())
+                                        .checked(checked)
+                                        .on_click(registry::on_click(ToggleNamespace {
+                                            namespace: ns,
+                                        })),
+                                )
                             })),
                     )
                     .child(div().h_px().bg(theme.border))
                     .child(Input::new(&input).id("ns-add").small())
             })
+    }
+
+    /// Whether the header shows the namespace filter now.
+    fn namespace_filter_shown(&self, cx: &App) -> bool {
+        let model = self.model.read(cx);
+        model.active_cluster().is_some_and(|cluster| {
+            header_controls(cluster, self.list.as_ref().map(|l| l.read(cx))).namespaces
+        })
+    }
+
+    /// Moves focus to the picker's next or previous control, and scrolls a row into view.
+    pub(super) fn move_in_namespace_picker(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cycle_focus_within(&self.namespace_picker_focus, forward, window, cx);
+        let row = window
+            .context_stack()
+            .iter()
+            .rev()
+            .find_map(|context| context.get(NAMESPACE_ROW)?.parse().ok());
+        if let Some(row) = row {
+            self.namespace_list_scroll.scroll_to_item(row);
+            cx.notify();
+        }
+    }
+
+    /// A dialog closes the picker, which is drawn above everything. Once the dialog is gone,
+    /// focus returns to the button, or to the workspace if the button is no longer shown.
+    ///
+    /// The dialog gives focus back to what had it, at once or after its closing delay, so a
+    /// hidden picker control that gets it then is sent on to the same place.
+    fn sync_namespace_picker_with_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
+            if self.namespace_popover_open {
+                self.namespace_popover_open = false;
+                self.namespace_focus_after_dialog = PickerDialogFocus::DialogOpen;
+            }
+            return;
+        }
+        if self.namespace_popover_open {
+            self.namespace_focus_after_dialog = PickerDialogFocus::Settled;
+            return;
+        }
+        let move_focus = match self.namespace_focus_after_dialog {
+            PickerDialogFocus::Settled => false,
+            PickerDialogFocus::DialogOpen => {
+                self.namespace_focus_after_dialog = PickerDialogFocus::Restoring;
+                true
+            }
+            PickerDialogFocus::Restoring => {
+                self.namespace_picker_focus.is_focused(window)
+                    || self
+                        .namespace_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+            }
+        };
+        if move_focus {
+            let target = if self.namespace_filter_shown(cx) {
+                self.namespace_button_focus.clone()
+            } else {
+                self.focus.clone()
+            };
+            // After this draw: a focus change during one schedules no frame.
+            window.defer(cx, move |window, cx| window.focus(&target, cx));
+        }
     }
 
     /// The watch mode switch: this cluster's override, and the global default (ADR-0008).
@@ -1750,6 +1878,7 @@ impl Workspace {
             .ghost()
             .label(label)
             .disabled(!settings_ok)
+            .tab_stop(false)
             .tooltip("Which kinds Flint keeps live (watches) on this cluster")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
                 let settings = model.read(cx).settings.clone();
@@ -2464,6 +2593,7 @@ pub fn namespace_summary(filter: &[String]) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_namespace_picker_with_dialog(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         let cx: &Context<Self> = cx;

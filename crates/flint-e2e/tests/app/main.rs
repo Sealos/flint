@@ -11,6 +11,7 @@
 //! ```
 #![cfg(target_os = "macos")]
 
+mod exec_plugins;
 mod harness;
 mod load;
 mod m0;

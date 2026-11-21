@@ -735,8 +735,19 @@ fn every_action(server: &FakeApiServer) -> Vec<(WriteTarget, WriteProposal, Gvr,
 
 /// Adds Flux's label to the object `target` names.
 fn add_marker(server: &FakeApiServer, gvr: &Gvr, namespace: Option<&str>, name: &str) {
+    set_labels(server, gvr, namespace, name, json!({FLUX_LABEL: "apps"}));
+}
+
+/// Replaces the labels of an object, keeping its `resourceVersion`.
+fn set_labels(
+    server: &FakeApiServer,
+    gvr: &Gvr,
+    namespace: Option<&str>,
+    name: &str,
+    labels: Value,
+) {
     let mut object = server.object(gvr, namespace, name).expect("the object");
-    object["metadata"]["labels"] = json!({FLUX_LABEL: "apps"});
+    object["metadata"]["labels"] = labels;
     server.set_object(gvr, object);
 }
 
@@ -779,6 +790,109 @@ async fn a_marker_added_after_the_review_is_a_conflict() {
         let seen = since(&server, from);
         assert_eq!(writes_in(&seen), 0, "{seen:?}");
         assert_eq!(seen[0], (http::Method::GET, path.to_owned()));
+    }
+}
+
+// covers UP-51: every action on a marked object, a node included, warns that it will likely be
+// reverted, and can still go ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_action_on_a_marked_object_warns() {
+    for action in 0..ACTIONS {
+        let server = FakeApiServer::start().await.unwrap();
+        workload(&server, 2);
+        node(&server);
+        let core = Core::start(&server, Settings::default()).await;
+        let (target, proposal, gvr, path) = every_action(&server).swap_remove(action);
+        add_marker(&server, &gvr, target.namespace.as_deref(), &target.name);
+        let review = core.handle.review_write(target, proposal).await.unwrap();
+        match review.warnings() {
+            [WriteWarning::LikelyReverted(managed)] => {
+                assert_eq!(managed.to_string(), "Flux: apps", "{path}");
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+        core.handle.run_write(review.into_intent()).await.unwrap();
+    }
+}
+
+// covers UP-51: a marker that cannot be read warns as an unknown manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_marker_warns_as_an_unknown_manager() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    set_labels(
+        &server,
+        &deployments(),
+        Some("demo"),
+        "act",
+        json!({"argocd.argoproj.io/instance": "team/shop"}),
+    );
+    let review = core
+        .handle
+        .review_write(workload_target(&server), WriteProposal::Scale { to: 3 })
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::LikelyReverted(managed)] => {
+            assert_eq!(managed.to_string(), "Argo CD: unknown application");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// covers UP-51, UP-53: a marker that appears after a YAML review changes the object, so the
+// reviewed edit ends in a conflict and the object keeps what it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_added_after_a_yaml_review_is_a_conflict() {
+    let server = FakeApiServer::start().await.unwrap();
+    workload(&server, 2);
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(workload_target(&server), edit())
+        .await
+        .unwrap();
+    assert!(review.warnings().is_empty());
+    let mut changed = live(&server);
+    changed["metadata"]["labels"] = json!({FLUX_LABEL: "apps"});
+    changed["metadata"]["resourceVersion"] = json!("5002");
+    server.set_object(&deployments(), changed);
+
+    let result = core.handle.run_write(review.into_intent()).await;
+    assert_eq!(result.unwrap_err(), WriteError::Conflict);
+    let after = live(&server);
+    assert_eq!(after["spec"]["replicas"], 2, "nothing was written");
+    assert_eq!(after["metadata"]["labels"][FLUX_LABEL], "apps");
+}
+
+// covers UP-51, UP-53: a marker removed or a manager changed after the review is a conflict for
+// every action, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_changed_after_the_review_is_a_conflict() {
+    for labels in [json!({}), json!({FLUX_LABEL: "other"})] {
+        for action in 0..ACTIONS {
+            let server = FakeApiServer::start().await.unwrap();
+            workload(&server, 2);
+            node(&server);
+            let core = Core::start(&server, Settings::default()).await;
+            let (target, proposal, gvr, path) = every_action(&server).swap_remove(action);
+            let namespace = target.namespace.clone();
+            let name = target.name.clone();
+            add_marker(&server, &gvr, namespace.as_deref(), &name);
+            let review = core.handle.review_write(target, proposal).await.unwrap();
+            assert_eq!(review.warnings().len(), 1, "{path}");
+            set_labels(&server, &gvr, namespace.as_deref(), &name, labels.clone());
+            let from = server.requests().len();
+            let result = core.handle.run_write(review.into_intent()).await;
+            assert_eq!(
+                result.unwrap_err(),
+                WriteError::Conflict,
+                "{path}: {labels}"
+            );
+            let seen = since(&server, from);
+            assert_eq!(writes_in(&seen), 0, "{seen:?}");
+        }
     }
 }
 
@@ -976,6 +1090,62 @@ async fn a_pod_marked_after_the_review_stops_the_drain() {
     let seen = since(&server, from);
     assert_eq!(writes_in(&seen), 0, "{seen:?}");
     assert!(server.object(&nodes(), None, NODE).unwrap()["spec"]["unschedulable"].is_null());
+}
+
+// covers UP-51, UP-53: a pod whose marker is an annotation behind an empty label is named in the
+// review, and a change to that annotation after the checks that start the drain stops the drain
+// before the pod is evicted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_annotation_changed_during_the_drain_stops_the_eviction() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    server.add_pod(pod_on_node("first", "ReplicaSet"));
+    let mut pod = pod_json("web", "ReplicaSet");
+    pod["metadata"]["labels"] = json!({FLUX_LABEL: ""});
+    pod["metadata"]["annotations"] = json!({FLUX_LABEL: "apps"});
+    server.add_pod(FakePod::from_json(pod));
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    match review.warnings() {
+        [WriteWarning::EvictsManaged(pods)] => {
+            assert_eq!(pods[0].managed.to_string(), "Flux: apps");
+        }
+        other => panic!("{other:?}"),
+    }
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::Other)
+            .named("first")
+            .subresource("eviction")
+            .times(1),
+    );
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let first = "/api/v1/namespaces/demo/pods/first/eviction";
+        while !server.arrivals().iter().any(|r| r.path == first) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first eviction");
+    let pods = Gvr::core("pods");
+    let mut live = server.object(&pods, Some("demo"), "web").expect("the pod");
+    live["metadata"]["annotations"] = json!({FLUX_LABEL: "other"});
+    server.set_object(&pods, live);
+
+    let drained = report(running.await.unwrap().unwrap());
+    assert_eq!(drained.evicted, [named("first")]);
+    assert_eq!(
+        drained.blocked,
+        [(named("web"), BlockedReason::ManagedSinceReview)]
+    );
+    assert_eq!(evictions(&server, "web"), 0);
+    assert!(server.object(&pods, Some("demo"), "web").is_some());
 }
 
 // covers UP-53: a Deployment paused after the review is a conflict, and no patch is sent.
