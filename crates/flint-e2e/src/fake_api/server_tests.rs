@@ -697,3 +697,38 @@ fn several_servers_share_one_kubeconfig_and_run_without_a_runtime() {
         }
     });
 }
+
+// A replacement that omits them keeps what only the API server sets, so a terminating pod stays
+// terminating; `generation` goes up only with a new `spec`.
+#[test]
+fn a_replacement_keeps_the_metadata_the_server_owns() {
+    let current = json!({
+        "metadata": {
+            "name": "web", "namespace": "demo", "uid": "u1", "resourceVersion": "7",
+            "creationTimestamp": "2026-01-01T00:00:00Z", "generation": 4,
+            "deletionTimestamp": "2026-01-02T00:00:00Z", "deletionGracePeriodSeconds": 30,
+            "labels": {"app": "web"},
+        },
+        "spec": {"replicas": 1},
+    });
+    let replaced = |spec: Value| {
+        let mut object = json!({"metadata": {"name": "web", "generation": 99}, "spec": spec});
+        keep_server_metadata(&mut object, &current, Some("demo"));
+        object
+    };
+
+    let same = replaced(json!({"replicas": 1}));
+    assert_eq!(same["metadata"]["generation"], 4);
+    assert_eq!(same["metadata"]["namespace"], "demo");
+    assert_eq!(same["metadata"].get("labels"), None);
+    for field in SERVER_METADATA.into_iter().filter(|f| *f != "generation") {
+        assert_eq!(
+            same["metadata"][field], current["metadata"][field],
+            "{field}"
+        );
+    }
+    assert_eq!(
+        replaced(json!({"replicas": 3}))["metadata"]["generation"],
+        5
+    );
+}
