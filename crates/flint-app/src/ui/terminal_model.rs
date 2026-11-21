@@ -210,6 +210,10 @@ pub fn input_refused(refused: InputRefused, paste: bool) -> String {
 pub const INPUT_NOT_REPLAYED: &str =
     "This shell did not receive what was typed while the first shell was tried. Type it again.";
 
+/// The same, for a shell that had already ended when the tab learned of it.
+pub const INPUT_NOT_REPLAYED_ENDED: &str =
+    "This shell ended without receiving what was typed while the first shell was tried.";
+
 fn byte_size(bytes: usize) -> String {
     const KB: usize = 1024;
     const MB: usize = 1024 * KB;
