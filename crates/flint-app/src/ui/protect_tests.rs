@@ -720,6 +720,39 @@ async fn a_shell_whose_context_is_gone_offers_no_unlock(cx: &mut TestAppContext)
     assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
 }
 
+// covers UP-55: after Stop Trusting the cluster shows as protected until the new settings arrive,
+// however soon the core has finished with them.
+#[gpui_kit::test]
+async fn stop_trusting_shows_protected_until_the_settings_arrive(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, _| m.trust_cluster("alpha".into(), server.clone()));
+    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+
+    t.model.update(cx, |m, cx| {
+        m.untrust_cluster("alpha".into(), cx);
+        // As once the core has written the change, before its event reaches this model.
+        let unlocks = m.core().unlocks();
+        let request = unlocks.revoke_trust("alpha");
+        unlocks.trust_removed("alpha", request);
+        assert!(!m.settings.trusted_clusters.is_empty(), "the old settings");
+        assert_eq!(m.protection_of("alpha"), Protection::Protected);
+    });
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.trusted_clusters.is_empty()
+    })
+    .await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+
+    // Trusting it again counts as soon as it is written.
+    t.model
+        .update(cx, |m, _| m.trust_cluster("alpha".into(), server));
+    wait_for_protection(cx, &t, "alpha", Protection::Trusted).await;
+}
+
 // covers UP-54: clusters on this machine start unlocked: no lock button, Shell enabled, and
 // nothing to unlock or trust.
 #[gpui_kit::test]
