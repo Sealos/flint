@@ -293,7 +293,7 @@ async fn the_state_reports_the_dock_its_tabs_and_focus(cx: &mut TestAppContext) 
     assert_eq!(
         labels,
         [
-            "web · app — alpha · live",
+            "web · app — alpha · Streaming",
             "Shell: web · app — alpha · live"
         ]
     );
