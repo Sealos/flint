@@ -137,7 +137,7 @@ fn deployments(names: &[&str]) -> Arc<KindSnapshot> {
         })
         .collect();
     Arc::new(KindSnapshot {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         kind: KindId::new("apps", "deployments"),
         namespaced: true,
         columns: vec![
@@ -459,7 +459,7 @@ fn focus_list(cx: &mut TestAppContext, t: &TestWorkspace) {
 async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
 
     // No row selected: nothing to act on.
@@ -528,7 +528,7 @@ async fn a_pod_rows_menu_opens_logs_previous_logs_and_a_shell(cx: &mut TestAppCo
 async fn keys_open_the_default_container_and_the_menu_picks(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(
@@ -589,7 +589,7 @@ async fn keys_open_the_default_container_and_the_menu_picks(cx: &mut TestAppCont
 async fn keys_act_on_the_selected_pod_row(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(
         cx,
         &t,
@@ -669,7 +669,7 @@ async fn a_workload_rows_logs_merge_its_pods(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let _pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     // One wording for Logs, on pods and workloads alike: the menu, the pane and the palette.
     assert_eq!(
@@ -766,7 +766,7 @@ async fn a_workload_rows_shell_opens_in_a_ready_pod(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     select_row(cx, &t, "web");
     let_pods_list(cx, &t);
@@ -908,7 +908,7 @@ async fn pod_lists_are_lazy_joined_and_dropped(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(
         cx,
         &t,
@@ -967,7 +967,7 @@ async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     select_row(cx, &t, "web");
     let_pods_list(cx, &t);
@@ -987,7 +987,7 @@ async fn a_failed_pod_list_refuses_shell_saying_why(cx: &mut TestAppContext) {
 async fn a_container_shell_waits_for_the_pod(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_loading(cx, &t);
@@ -1022,7 +1022,7 @@ async fn a_container_shell_waits_for_the_pod(cx: &mut TestAppContext) {
 async fn a_finished_pod_has_no_shell(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "job-1", 0)]), "job-1").await;
     select_row(cx, &t, "job-1");
     let pod = |extra: Value| {
@@ -1070,7 +1070,7 @@ async fn a_finished_pod_has_no_shell(cx: &mut TestAppContext) {
 async fn an_open_menu_follows_its_row(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(cx, &t, pod_detail("web"));
@@ -1099,7 +1099,7 @@ async fn an_open_menu_follows_its_row(cx: &mut TestAppContext) {
 async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(
         cx,
         &t,
@@ -1128,7 +1128,7 @@ async fn right_clicking_another_row_acts_on_it(cx: &mut TestAppContext) {
 async fn a_late_action_keeps_focus_and_gives_up_in_time(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_loading(cx, &t);
@@ -1179,7 +1179,7 @@ async fn a_late_action_keeps_focus_and_gives_up_in_time(cx: &mut TestAppContext)
 async fn a_pending_action_on_a_failed_fetch_says_why(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_loading(cx, &t);
@@ -1213,7 +1213,7 @@ async fn selector_logs_open_from_the_palette(cx: &mut TestAppContext) {
         Err(ActionError::NotAvailable("logs::OpenSelectorLogs".into())),
         "no active cluster"
     );
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     assert!(matches!(
         dispatch(
             cx,
@@ -1242,7 +1242,7 @@ async fn selector_logs_open_from_the_palette(cx: &mut TestAppContext) {
 async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     dispatch(
         cx,
@@ -1270,7 +1270,7 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     assert_eq!(shell_button_disabled(cx, &t), Some(true));
     assert_eq!(
         captions(cx, &t),
-        ["Can't open the logs or a shell: alpha is not connected."]
+        ["Can't open the logs or a shell: kind-alpha is not connected."]
     );
     set_state(
         cx,
@@ -1281,7 +1281,7 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
         .read_with(cx, |ws, _| ws.detail.clone().unwrap());
     assert_eq!(
         detail_view.read_with(cx, |d, _| d.action_captions()),
-        ["Can't open the logs or a shell: alpha is not connected: connection refused."]
+        ["Can't open the logs or a shell: kind-alpha is not connected: connection refused."]
     );
     for action in [
         "detail::OpenLogs",
@@ -1300,14 +1300,14 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     }
     let reason = t
         .workspace
-        .read_with(cx, |ws, cx| ws.sessions_blocked("alpha", cx));
+        .read_with(cx, |ws, cx| ws.sessions_blocked("kind-alpha", cx));
     assert_eq!(
         reason.as_deref(),
-        Some("alpha is not connected: connection refused")
+        Some("kind-alpha is not connected: connection refused")
     );
     assert_eq!(dock_tabs(cx, &t).0, ["Shell: web · app"]);
     // Every entry is unavailable, saying why.
-    let why = "alpha is not connected: connection refused";
+    let why = "kind-alpha is not connected: connection refused";
     assert_eq!(
         actions(cx, &t),
         [
@@ -1326,7 +1326,7 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
         cx.notify();
     });
     let shown = actions(cx, &t)[0].reason.clone().unwrap();
-    assert_eq!(shown, format!("alpha is not connected: {summary}"));
+    assert_eq!(shown, format!("kind-alpha is not connected: {summary}"));
     assert!(!shown.contains('\n') && !shown.contains("xxx"), "{shown}");
     // A session asked for anyway (a pending action that loads late) is refused, saying why.
     let request = t.workspace.read_with(cx, |ws, cx| {
@@ -1345,7 +1345,7 @@ async fn a_cluster_that_is_not_connected_disables_the_actions(cx: &mut TestAppCo
     .unwrap();
     let why = refusal(cx, &t).unwrap();
     assert!(
-        why.starts_with("Can't open a shell: alpha is not connected"),
+        why.starts_with("Can't open a shell: kind-alpha is not connected"),
         "{why}"
     );
 }
@@ -1357,7 +1357,7 @@ async fn a_tab_opened_from_a_row_leaks_nothing_once_closed(cx: &mut TestAppConte
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let _pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     dispatch(
         cx,
@@ -1422,7 +1422,7 @@ fn select_row(cx: &mut TestAppContext, t: &TestWorkspace, name: &str) {
 async fn an_action_right_after_moving_rows_acts_on_the_new_row(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(
         cx,
         &t,
@@ -1472,7 +1472,7 @@ async fn a_deleted_object_has_no_shell(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let pods_listed = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     select_row(cx, &t, "web");
     let_pods_list(cx, &t);
@@ -1517,7 +1517,7 @@ async fn a_stale_or_failed_pod_list_does_not_disable_shell(cx: &mut TestAppConte
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     select_row(cx, &t, "web");
     let_pods_list(cx, &t);
@@ -1570,7 +1570,7 @@ async fn a_shell_that_gave_up_drops_its_list(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let pods = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, deployments_entry(), deployments(&["web"]), "web").await;
     select_row(cx, &t, "web");
     dispatch(cx, &t, "detail::OpenShell", Value::Null).unwrap();
@@ -1590,7 +1590,7 @@ async fn a_shell_that_gave_up_drops_its_list(cx: &mut TestAppContext) {
 async fn a_refusal_goes_when_it_no_longer_applies(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     let refuse = |cx: &mut TestAppContext| {
         let workspace = t.workspace.clone();
         workspace.update(cx, |ws, cx| ws.refuse("Shell: no".into(), cx));
@@ -1646,7 +1646,7 @@ async fn the_pane_says_why_under_its_buttons(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let lister = FakePods::install(cx);
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     // Loading: both wait, so both are enabled and nothing is said.
@@ -1687,7 +1687,7 @@ async fn the_pane_says_why_under_its_buttons(cx: &mut TestAppContext) {
 async fn a_deleted_pod_gets_no_caption(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(cx, &t, pod_detail("web"));
@@ -1707,7 +1707,7 @@ async fn a_deleted_pod_gets_no_caption(cx: &mut TestAppContext) {
 async fn pickers_show_the_keys_and_which_containers_run(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(
@@ -1792,7 +1792,7 @@ async fn pickers_show_the_keys_and_which_containers_run(cx: &mut TestAppContext)
 async fn the_key_refuses_a_default_container_that_is_not_running(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(
@@ -1832,7 +1832,7 @@ async fn the_key_refuses_a_default_container_that_is_not_running(cx: &mut TestAp
 async fn the_refusal_strip_covers_nothing(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(cx, &t, pod_detail("web"));
@@ -1869,7 +1869,7 @@ async fn the_refusal_strip_covers_nothing(cx: &mut TestAppContext) {
 async fn a_late_tab_opens_behind_the_dock_tab_in_use(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(
         cx,
         &t,
@@ -1918,7 +1918,7 @@ async fn a_late_tab_opens_behind_the_dock_tab_in_use(cx: &mut TestAppContext) {
 async fn logs_asked_for_at_startup_take_focus(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_loading(cx, &t);
@@ -1938,7 +1938,7 @@ async fn logs_asked_for_at_startup_take_focus(cx: &mut TestAppContext) {
 async fn a_dismissed_menu_is_not_built_again(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(cx, &t, pod_detail("web"));
@@ -1960,7 +1960,7 @@ async fn a_dismissed_menu_is_not_built_again(cx: &mut TestAppContext) {
 async fn a_refused_entry_says_why_in_words(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    activate(cx, &t, "alpha").await;
+    activate(cx, &t, "kind-alpha").await;
     open_list(cx, &t, pods_entry(), pods(&[("demo", "web", 1)]), "web").await;
     select_row(cx, &t, "web");
     show_fetched(cx, &t, pod_detail("web"));
@@ -1980,6 +1980,6 @@ async fn a_refused_entry_says_why_in_words(cx: &mut TestAppContext) {
     });
     assert_eq!(
         why,
-        "Can't open a shell: alpha is not connected: connection refused."
+        "Can't open a shell: kind-alpha is not connected: connection refused."
     );
 }

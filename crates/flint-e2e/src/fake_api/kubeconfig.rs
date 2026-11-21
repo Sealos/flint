@@ -9,7 +9,7 @@ use kube::config::{
 };
 
 /// The default context (and cluster and user) name in the kubeconfig.
-pub const CONTEXT: &str = "flint-e2e-fake";
+pub const CONTEXT: &str = "kind-flint-e2e-fake";
 
 /// A kubeconfig with one context named `context` (cluster and user share the name) for
 /// `server`, trusting `ca_pem`, without credentials (the fake server does not authenticate).

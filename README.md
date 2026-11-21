@@ -377,7 +377,7 @@ kubeconfig_paths = ["~/work/kubeconfig"]
 # path = "/opt/homebrew/bin:/usr/bin:/bin"   # override the PATH taken from your login shell
 # helm = "/opt/homebrew/bin/helm"
 watch_mode = "all"                # or "on_view"
-# protect_local_clusters = false  # true protects clusters on this machine too (see trusted_clusters)
+# protect_local_clusters = false  # true protects known local clusters too (see trusted_clusters)
 
 [cluster_watch_mode]
 # big-prod-cluster = "on_view"
@@ -398,13 +398,14 @@ watch_mode = "all"                # or "on_view"
 
 # Clusters Flint may change (and open shells in) without asking, written by Trust This Cluster in
 # the sidebar's lock menu. Pinned to the server like exposure: a re-pointed context is protected
-# again. Clusters on this machine (localhost or *.localhost, 127.x.x.x, ::1, Docker Desktop's
-# kubernetes.docker.internal: kind, OrbStack, minikube on macOS) are unlocked anyway. A local
-# cluster on another address, such as minikube's Docker driver on Linux (192.168.49.2), stays
-# protected: trust it once. Local ones stay unlocked unless protect_local_clusters is true: set it
-# when a local address is a tunnel to a remote cluster (an SSH, SSM or Teleport proxy). A context
-# whose cluster has a proxy-url is never treated as local. While settings.toml does not parse,
-# nothing is trusted and local clusters are protected too.
+# again. Known local clusters are unlocked anyway: a context named exactly kind, minikube,
+# docker-desktop or orbstack, or starting with kind-, whose server is on this machine (localhost or
+# *.localhost, 127.x.x.x, ::1, Docker Desktop's kubernetes.docker.internal). Any other context on
+# those addresses is protected: unlock or trust it. So is a local cluster on another address, such
+# as minikube's Docker driver on Linux (192.168.49.2). Known local clusters stay unlocked unless
+# protect_local_clusters is true. A context whose cluster has a proxy-url is never treated as
+# local. While settings.toml does not parse, nothing is trusted and local clusters are protected
+# too.
 # [[trusted_clusters]]
 # context = "staging"
 # server = "https://staging.example.com:6443"

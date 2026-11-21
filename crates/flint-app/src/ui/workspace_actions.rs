@@ -791,7 +791,7 @@ impl Workspace {
         let server = self.pinnable::<UnlockCluster>(&action.cluster, cx)?;
         let why = match self.model.read(cx).protection_of(&action.cluster) {
             Protection::Protected => return Ok(server),
-            Protection::Local => "the cluster is on this machine, so it is not protected",
+            Protection::Local => "the cluster is a known local cluster, so it is not protected",
             Protection::Unlocked => "the cluster is unlocked already",
             Protection::Trusted => "the cluster is trusted, so it is not protected",
         };
@@ -829,7 +829,7 @@ impl Workspace {
         let summary = self.cluster_summary(&action.cluster, cx).expect("checked");
         if model.protection(summary) == Protection::Local {
             return Err(ActionError::rejected::<TrustCluster>(
-                "the cluster is on this machine, so it is not protected",
+                "the cluster is a known local cluster, so it is not protected",
             ));
         }
         match model.trust(summary) {
