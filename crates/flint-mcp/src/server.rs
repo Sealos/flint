@@ -1017,9 +1017,13 @@ impl FlintMcp {
             rows.push(row);
         }
         let mut out = json!({ "clusters": rows });
-        if let Some(hint) =
-            policy::list_clusters_hint(exposed.len(), changed, missing, &kubeconfig_paths)
-        {
+        if let Some(hint) = policy::list_clusters_hint(
+            exposed.len(),
+            changed,
+            missing,
+            &kubeconfig_paths,
+            !kubeconfig_errors.is_empty(),
+        ) {
             out["hint"] = json!(hint);
         }
         if !kubeconfig_errors.is_empty() {
