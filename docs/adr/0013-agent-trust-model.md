@@ -7,8 +7,10 @@ everywhere an agent reads it, and a record of what the agent read. Flint adds th
 user can expose a production cluster and still know what an agent could see and did see.
 
 1. **Scoped exposure.** Each exposed cluster may list the namespaces and kinds an agent may read. Empty means
-   everything, as today. A request outside the scope fails with the same "not found" error as an unexposed cluster,
-   so an agent cannot probe what exists.
+   everything, as today. A request outside the scope gets one "outside the scope" error that names only the cluster,
+   byte for byte the same whether what it named exists or not, so an agent cannot probe what exists. A cluster that
+   is not exposed stays "not found". (Amended by #326: the scope error used to be that same "not found", which told
+   an agent a cluster `list_clusters` had just shown as reachable did not exist.)
 2. **Redacted logs and events.** Pod logs and event messages pass through a shared redactor in `flint-core` before
    they reach an agent. It replaces values that look like credentials: bearer and basic auth headers, JWTs,
    private key blocks, cloud access keys, vendor tokens, passwords in URLs, and `password=`, `token=` and `secret=`

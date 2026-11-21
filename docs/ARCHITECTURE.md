@@ -835,8 +835,9 @@ Rules:
     about a node or a Secret the scope hides;
   - `get_pod_logs` needs pods and the pod's namespace in scope.
 
-  Anything outside the scope, including a kind that does not exist on a scoped cluster, fails with the very error of
-  a cluster that is not exposed (`policy::out_of_scope`), so an agent cannot tell what exists beyond its scope. The
+  Anything outside the scope, including a kind that does not exist on a scoped cluster, fails with one
+  "outside the scope" error that names only the cluster (`policy::out_of_scope`), so an agent cannot tell what exists
+  beyond its scope. The
   app edits the scope in the Expose to AI dialog and in Edit AI Scope (`workspace::EditAiScope`, from the sidebar's
   "AI" badge, which reads "AI·" when the cluster is scoped, or the palette). Both show pickers
   (`ui/scope_picker.rs`): the cluster's listable kinds from discovery and, for the active cluster, its namespaces,
@@ -939,8 +940,8 @@ Rules:
 - **Activity log (UP-16, `flint_core::activity`):** every call is recorded as one JSON line in
   `agent-activity.jsonl` in the config directory: time, tool, cluster and the server it is exposed with, what the call
   named (kind, namespace, object, container), how many items and bytes came back, whether it was cut short, and
-  whether it ended, failed or was denied (a cluster not exposed, or outside its scope; the agent reads "not found"
-  either way). The count and the cut-short flag are read from the reply's own fields, so they are what the agent saw.
+  whether it ended, failed or was denied (a cluster not exposed, where the agent reads "not found", or a request
+  outside its scope, where it reads one "outside the scope" error whatever it named). The count and the cut-short flag are read from the reply's own fields, so they are what the agent saw.
   The returned content is never recorded. At 1 MiB the file is renamed to `agent-activity.1.jsonl` (replacing the one
   before) and a new one starts. Writers hold an exclusive `flock` on `agent-activity.lock` while they check, rotate
   and append, so several `flint mcp` processes (and concurrent calls in one) never rotate a file twice. Logging is
