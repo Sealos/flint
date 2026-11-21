@@ -166,7 +166,7 @@ fn dialog_text(
     dialog_text_saying(target, wording, warnings, &[], shown)
 }
 
-/// [`dialog_text`] with `saying` (why it is asked again, what the action does) after the
+/// The dialog for a change, with `saying` (why it is asked again, what the action does) after the
 /// warnings and before the object's details.
 fn dialog_text_saying(
     target: &WriteTarget,
