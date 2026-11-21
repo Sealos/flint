@@ -642,9 +642,49 @@ pub fn load_settings_or_fallback(dir: &Path) -> (Settings, Option<String>) {
         Ok(s) => (s, None),
         Err(e) => (
             Settings::default().unreadable_fallback(),
-            Some(e.to_string()),
+            Some(e.safe_reason()),
         ),
     }
+}
+
+impl SettingsError {
+    /// One line on what is wrong, safe to log or show to an agent: it never quotes a value from
+    /// the file. A parse error names the unknown field, if any, and the line and column, ahead
+    /// of the path, so cutting a long path keeps them.
+    pub fn safe_reason(&self) -> String {
+        let SettingsError::Parse { path, source } = self else {
+            return crate::redact::safe_error_summary(&self.to_string());
+        };
+        let what = unknown_field(source.message()).map_or_else(
+            || "invalid TOML".to_owned(),
+            |f| format!("unknown field {f}"),
+        );
+        let text = source.to_string();
+        let at = text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("TOML parse error at "))
+            .filter(|at| {
+                at.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b" ,".contains(&b))
+            });
+        let reason = match at {
+            Some(at) => format!("{what} at {at} in {}", path.display()),
+            None => format!("{what} in {}", path.display()),
+        };
+        crate::redact::safe_error_summary(&reason)
+    }
+}
+
+/// The key in serde's ``unknown field `key`, expected ...``, if it is a plain name that does not
+/// look like a credential. A key is the one thing such a message quotes that is not a value.
+fn unknown_field(message: &str) -> Option<&str> {
+    let (field, _) = message.strip_prefix("unknown field `")?.split_once('`')?;
+    let plain = (1..=64).contains(&field.len())
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    (plain && crate::redact::redact_credentials(field).count == 0).then_some(field)
 }
 
 pub fn load_state(dir: &Path) -> Result<State, SettingsError> {
@@ -989,6 +1029,73 @@ pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     match (path.strip_prefix("~"), home) {
         (Ok(rest), Some(home)) => home.join(rest),
         _ => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod safe_reason_tests {
+    use super::*;
+
+    fn reason(dir: &Path, text: &str) -> String {
+        std::fs::write(dir.join(SETTINGS_FILE), text).unwrap();
+        load_settings(dir).unwrap_err().safe_reason()
+    }
+
+    // covers UP-12: a misspelt key is named with its place, and no value from the file.
+    #[test]
+    fn a_misspelt_key_is_named_with_its_line_and_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = reason(
+            dir.path(),
+            "[[ai_exposed_clusters]]\ncontext = \"dev\"\nserver = \"https://x\"\n\
+             namespace = [\"SECRETVALUE\"]\n",
+        );
+        assert!(
+            text.starts_with("unknown field namespace at line 4, column 1"),
+            "{text}"
+        );
+        assert!(!text.contains("SECRETVALUE"), "{text}");
+    }
+
+    // covers UP-12: a value in a type error is not quoted.
+    #[test]
+    fn a_wrong_type_quotes_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = reason(
+            dir.path(),
+            "path = 1\nai_exposed_clusters = \"SECRETVALUE\"\n",
+        );
+        assert!(text.starts_with("invalid TOML at line"), "{text}");
+        assert!(!text.contains("SECRETVALUE"), "{text}");
+    }
+
+    // covers UP-12: the reason comes first, so a long path cannot cut it off.
+    #[test]
+    fn a_long_path_keeps_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("d".repeat(200)).join("e".repeat(200));
+        std::fs::create_dir_all(&long).unwrap();
+        let text = reason(&long, "[[ai_exposed_clusters]]\nnamespace = []\n");
+        assert!(
+            text.starts_with("unknown field namespace at line 2"),
+            "{text}"
+        );
+        assert!(text.chars().count() <= 201, "{text}");
+    }
+
+    #[test]
+    fn a_key_that_looks_like_a_credential_is_not_named() {
+        assert_eq!(
+            unknown_field("unknown field `namespace`, expected"),
+            Some("namespace")
+        );
+        for message in [
+            "unknown field `AKIAIOSFODNN7EXAMPLE`, expected",
+            "unknown field `a b`, expected",
+            "invalid type: string `namespace`",
+        ] {
+            assert_eq!(unknown_field(message), None, "{message}");
+        }
     }
 }
 

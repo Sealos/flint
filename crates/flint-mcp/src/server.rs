@@ -55,6 +55,8 @@ struct Inner {
     kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
     clients: SlotMap<Client>,
     discovery: SlotMap<Discovered>,
+    /// Which program this is, for advice that can be followed where it runs.
+    flavour: policy::Flavour,
     /// Unmatched scopes already logged, so each is logged once.
     warned_scopes: std::sync::Mutex<std::collections::HashSet<String>>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
@@ -550,8 +552,41 @@ impl FlintMcp {
         home: Option<PathBuf>,
         limits: Limits,
     ) -> Self {
+        Self::built(
+            config_dir,
+            kubeconfig_base,
+            home,
+            limits,
+            policy::Flavour::App,
+        )
+    }
+
+    /// [`FlintMcp::new`] for the program `flavour`, whose advice it gives.
+    pub fn with_flavour(
+        config_dir: PathBuf,
+        kubeconfig_base: Vec<PathBuf>,
+        home: Option<PathBuf>,
+        flavour: policy::Flavour,
+    ) -> Self {
+        Self::built(
+            config_dir,
+            kubeconfig_base,
+            home,
+            Limits::default(),
+            flavour,
+        )
+    }
+
+    fn built(
+        config_dir: PathBuf,
+        kubeconfig_base: Vec<PathBuf>,
+        home: Option<PathBuf>,
+        limits: Limits,
+        flavour: policy::Flavour,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                flavour,
                 config_dir,
                 kubeconfig_base,
                 home,
@@ -839,12 +874,13 @@ impl FlintMcp {
     async fn context(&self) -> Result<CallContext, ToolError> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            // The full TOML error quotes lines of settings.toml; give the agent one line.
+            // The full TOML error quotes lines of settings.toml; give the agent one safe line.
             let settings = settings::load_settings(&inner.config_dir).map_err(|e| {
+                let setup = policy::Setup::new(inner.flavour, &inner.config_dir);
                 ToolError::new(format!(
-                    "Flint's settings.toml is invalid ({}), so no cluster is exposed. Ask the \
-                     user to fix it; the Flint app shows the details.",
-                    flint_core::redact::safe_error_summary(&e.to_string())
+                    "Flint's settings.toml is invalid ({}), so no cluster is exposed. {}",
+                    e.safe_reason(),
+                    setup.fix_settings()
                 ))
             })?;
             let paths = kubeconfig::paths_for_settings(
@@ -1114,6 +1150,7 @@ impl FlintMcp {
             missing,
             &kubeconfig_paths,
             !kubeconfig_errors.is_empty(),
+            &policy::Setup::new(self.inner.flavour, &self.inner.config_dir),
         ) {
             out["hint"] = json!(hint);
         }

@@ -2,7 +2,7 @@
 //! redaction, and output bounds. Everything here is pure so it can be tested without a cluster.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flint_core::Settings;
 use flint_core::kubeconfig::{ContextInfo, LoadedKubeconfig};
@@ -105,6 +105,87 @@ pub fn changed_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> 
         .count()
 }
 
+/// Which program serves MCP: it decides what setup advice can be followed where it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    /// `flint mcp`: the app is installed, with its Expose to AI toggle.
+    App,
+    /// `flint-mcp`: no app, so clusters are exposed by editing `settings.toml`.
+    Headless,
+}
+
+impl Flavour {
+    /// The flavour of the program named `program`.
+    pub fn of_program(program: &str) -> Self {
+        if program == "flint" {
+            Flavour::App
+        } else {
+            Flavour::Headless
+        }
+    }
+}
+
+/// What a hint may tell the user to do: the flavour, and where its settings file is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setup {
+    flavour: Flavour,
+    settings: String,
+}
+
+impl Setup {
+    pub fn new(flavour: Flavour, config_dir: &Path) -> Self {
+        Self {
+            flavour,
+            settings: shown_path(&config_dir.join("settings.toml")),
+        }
+    }
+
+    /// How to expose a first cluster.
+    fn expose(&self) -> String {
+        match self.flavour {
+            Flavour::App => "Ask the user to open Flint and turn on Expose to AI (the robot \
+                             button) next to a cluster in the sidebar."
+                .to_owned(),
+            Flavour::Headless => format!(
+                "Ask the user to add an [[ai_exposed_clusters]] entry with the cluster's context \
+                 and server to {}.",
+                self.settings
+            ),
+        }
+    }
+
+    /// How to bring back clusters whose server changed, after "...so it is hidden until".
+    fn expose_again(&self, one: bool) -> String {
+        let (it, entry) = if one {
+            ("it", "its entry")
+        } else {
+            ("them", "their entries")
+        };
+        match self.flavour {
+            Flavour::App => format!("they expose {it} again in Flint."),
+            Flavour::Headless => format!(
+                "they update the server in {entry} under [[ai_exposed_clusters]] in {}.",
+                self.settings
+            ),
+        }
+    }
+
+    /// The end of the error for a settings file that cannot be read.
+    pub fn fix_settings(&self) -> &'static str {
+        match self.flavour {
+            Flavour::App => "Ask the user to fix it; the Flint app shows the details.",
+            Flavour::Headless => "Ask the user to fix that file.",
+        }
+    }
+}
+
+/// A path as an agent may read it: with anything like a credential redacted.
+fn shown_path(path: &Path) -> String {
+    let mut shown = path.display().to_string();
+    redact_text(&mut shown);
+    shown
+}
+
 /// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
 /// the count is reported, not their names.
 pub fn missing_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> usize {
@@ -126,15 +207,19 @@ pub fn list_clusters_hint(
     missing: usize,
     paths: &[PathBuf],
     load_failed: bool,
+    setup: &Setup,
 ) -> Option<String> {
     let changed_note = match changed {
         0 => String::new(),
-        1 => " One cluster the user exposed now points to a different API server, so it is hidden \
-              until they expose it again in Flint."
-            .to_owned(),
+        1 => format!(
+            " One cluster the user exposed now points to a different API server, so it is hidden \
+             until {}",
+            setup.expose_again(true)
+        ),
         n => format!(
             " {n} clusters the user exposed now point to a different API server, so they are \
-             hidden until they expose them again in Flint."
+             hidden until {}",
+            setup.expose_again(false)
         ),
     };
     let missing_note = match missing {
@@ -147,12 +232,8 @@ pub fn list_clusters_hint(
             };
             let files = paths
                 .iter()
-                .map(|path| {
-                    // One path at a time: a redacted value runs to the end of its line.
-                    let mut shown = path.display().to_string();
-                    redact_text(&mut shown);
-                    shown
-                })
+                // One path at a time: a redacted value runs to the end of its line.
+                .map(|path| shown_path(path))
                 .collect::<Vec<_>>()
                 .join(", ");
             let advice = if load_failed {
@@ -170,8 +251,8 @@ pub fn list_clusters_hint(
     };
     if exposed == 0 && missing == 0 {
         Some(format!(
-            "No clusters are exposed to AI agents. Ask the user to open Flint and turn on \
-             Expose to AI (the robot button) next to a cluster in the sidebar.{changed_note}"
+            "No clusters are exposed to AI agents. {}{changed_note}",
+            setup.expose()
         ))
     } else if changed > 0 || missing > 0 {
         Some(
@@ -745,7 +826,7 @@ mod tests {
         let unknown = exposed_cluster(&s, &kc, "nope").unwrap_err().to_string();
         assert_eq!(changed.replace("dev", "X"), unknown.replace("nope", "X"));
         assert_eq!(changed_exposures(&s, &kc), 1);
-        let hint = list_clusters_hint(0, 1, 0, &[], false).unwrap();
+        let hint = list_clusters_hint(0, 1, 0, &[], false, &app()).unwrap();
         assert!(hint.contains("Expose to AI") && hint.contains("different API server"));
     }
 
@@ -753,13 +834,13 @@ mod tests {
     #[test]
     fn hint_only_when_useful() {
         assert!(
-            list_clusters_hint(0, 0, 0, &[], false)
+            list_clusters_hint(0, 0, 0, &[], false, &app())
                 .unwrap()
                 .contains("Expose to AI")
         );
-        assert_eq!(list_clusters_hint(2, 0, 0, &[], false), None);
+        assert_eq!(list_clusters_hint(2, 0, 0, &[], false, &app()), None);
         assert!(
-            list_clusters_hint(1, 2, 0, &[], false)
+            list_clusters_hint(1, 2, 0, &[], false, &app())
                 .unwrap()
                 .starts_with("2 clusters")
         );
@@ -785,14 +866,14 @@ mod tests {
     #[test]
     fn missing_hint_lists_the_files_read_and_never_the_context() {
         let paths = [PathBuf::from("/a/config"), PathBuf::from("/b/config")];
-        let hint = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        let hint = list_clusters_hint(0, 0, 1, &paths, false, &app()).unwrap();
         assert!(hint.starts_with("One cluster"), "{hint}");
         assert!(hint.contains("/a/config, /b/config"), "{hint}");
         assert!(hint.contains("kubeconfig_paths"), "{hint}");
         // It is already exposed, so the advice to turn that on would be wrong.
         assert!(!hint.contains("turn on"), "{hint}");
 
-        let both = list_clusters_hint(1, 1, 2, &paths, false).unwrap();
+        let both = list_clusters_hint(1, 1, 2, &paths, false, &app()).unwrap();
         assert!(both.contains("different API server"), "{both}");
         assert!(
             both.contains("2 clusters the user exposed are not"),
@@ -804,10 +885,10 @@ mod tests {
     #[test]
     fn missing_hint_points_at_files_that_failed_to_load() {
         let paths = [PathBuf::from("/a/config")];
-        let hint = list_clusters_hint(0, 0, 1, &paths, true).unwrap();
+        let hint = list_clusters_hint(0, 0, 1, &paths, true, &app()).unwrap();
         assert!(hint.contains("could not be loaded"), "{hint}");
         assert!(hint.contains("kubeconfig_errors"), "{hint}");
-        let clean = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        let clean = list_clusters_hint(0, 0, 1, &paths, false, &app()).unwrap();
         assert!(!clean.contains("kubeconfig_errors"), "{clean}");
     }
 
@@ -818,7 +899,7 @@ mod tests {
             PathBuf::from("/home/me/password=hunter2"),
             PathBuf::from("/b/config"),
         ];
-        let hint = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        let hint = list_clusters_hint(0, 0, 1, &paths, false, &app()).unwrap();
         assert!(!hint.contains("hunter2"), "{hint}");
         assert!(hint.contains("/b/config"), "{hint}");
         assert!(hint.contains("kubeconfig_paths"), "{hint}");
@@ -873,6 +954,41 @@ mod tests {
             namespaces.iter().map(|s| (*s).to_owned()).collect(),
             kinds.iter().map(|s| (*s).to_owned()).collect(),
         )
+    }
+
+    fn app() -> Setup {
+        Setup::new(Flavour::App, Path::new("/config"))
+    }
+
+    // covers UP-09: each flavour gets advice it can follow where it runs.
+    #[test]
+    fn setup_advice_follows_the_flavour() {
+        assert_eq!(Flavour::of_program("flint"), Flavour::App);
+        assert_eq!(Flavour::of_program("flint-mcp"), Flavour::Headless);
+        let headless = Setup::new(Flavour::Headless, Path::new("/config"));
+        for (exposed, changed) in [(0, 0), (0, 1), (1, 2)] {
+            let hint = list_clusters_hint(exposed, changed, 0, &[], false, &headless).unwrap();
+            assert!(hint.contains("[[ai_exposed_clusters]]"), "{hint}");
+            assert!(hint.contains("/config/settings.toml"), "{hint}");
+            assert!(!hint.contains("robot"), "{hint}");
+            assert!(!hint.contains("in Flint."), "{hint}");
+        }
+        let hint = list_clusters_hint(0, 1, 0, &[], false, &app()).unwrap();
+        assert!(
+            hint.contains("robot button") && hint.contains("again in Flint."),
+            "{hint}"
+        );
+        assert!(!hint.contains("[[ai_exposed_clusters]]"), "{hint}");
+        assert!(headless.fix_settings().contains("fix that file"));
+        assert!(app().fix_settings().contains("Flint app"));
+    }
+
+    // covers UP-09: the settings path is cluster-independent but still redacted.
+    #[test]
+    fn the_settings_path_in_advice_is_redacted() {
+        let setup = Setup::new(Flavour::Headless, Path::new("/home/me/password=hunter2"));
+        let hint = list_clusters_hint(0, 0, 0, &[], false, &setup).unwrap();
+        assert!(!hint.contains("hunter2"), "{hint}");
     }
 
     // covers UP-14: a hand-written name resolves as it does for the tools.
