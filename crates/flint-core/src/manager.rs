@@ -223,6 +223,26 @@ impl Pins {
     }
 }
 
+/// Whether `to` could let agents read anything `from` does not. A scope that is not in its clean
+/// form ([`AiScope::new`]) can't be compared, so it counts as widening.
+///
+/// Under a namespace scope with no kinds, cluster-scoped kinds are closed, and naming any kind
+/// could open one: a kind id alone does not say whether it is cluster-scoped, so that counts too.
+fn scope_widens(from: &AiScope, to: &AiScope) -> bool {
+    let clean = |s: &AiScope| *s == AiScope::new(s.namespaces.clone(), s.kinds.clone());
+    if !clean(from) || !clean(to) {
+        return true;
+    }
+    let within = |to: &[String], from: &[String]| {
+        from.is_empty() || (!to.is_empty() && to.iter().all(|name| from.contains(name)))
+    };
+    let opens_cluster_kinds =
+        !from.namespaces.is_empty() && from.kinds.is_empty() && !to.kinds.is_empty();
+    !within(&to.namespaces, &from.namespaces)
+        || !within(&to.kinds, &from.kinds)
+        || opens_cluster_kinds
+}
+
 /// Which watched files changed.
 #[derive(Debug, Clone, Copy, Default)]
 struct Changed {
@@ -745,6 +765,14 @@ impl ClusterManager {
         from: AiScope,
         scope: AiScope,
     ) {
+        // Until a load settles the definition, a scope can only shrink.
+        if self.unsettled(&cluster) && scope_widens(&from, &scope) {
+            self.emit(Event::Error(format!(
+                "The AI scope of \"{cluster}\" was not widened: a kubeconfig file that could \
+                 define it can't be read. Fix the file and try again."
+            )));
+            return;
+        }
         let current = self
             .clusters
             .iter()
@@ -754,6 +782,13 @@ impl ClusterManager {
             self.emit(Event::Error(format!(
                 "\"{cluster}\" now points to a different server; its AI scope was not changed. \
                  Review it and try again."
+            )));
+            return;
+        }
+        if scope_widens(&from, &scope) && !self.files_still_show(&cluster, &server).await {
+            self.emit(Event::Error(format!(
+                "The AI scope of \"{cluster}\" was not widened: its kubeconfig files can't be \
+                 read or no longer match what is shown. Check them and try again."
             )));
             return;
         }
@@ -767,11 +802,11 @@ impl ClusterManager {
     /// `settings.toml`. Returns whether the change was saved.
     async fn set_pin(&mut self, pins: Pins, cluster: ClusterId, server: Option<String>) -> bool {
         if let Some(server) = &server {
-            // No load shows a held context's definition, so there is nothing to pin yet.
-            if self.held(&cluster) {
+            // No load shows a settled definition, so there is nothing to pin yet.
+            if self.unsettled(&cluster) {
                 self.emit(Event::Error(format!(
-                    "\"{cluster}\" was not {}: a kubeconfig file that defines it can't be read. \
-                     Fix the file and try again.",
+                    "\"{cluster}\" was not {}: a kubeconfig file that could define it can't be \
+                     read. Fix the file and try again.",
                     pins.done()
                 )));
                 return false;
@@ -797,6 +832,16 @@ impl ClusterManager {
                 "settings.toml must be fixed before {} can change: {}",
                 pins.what(),
                 crate::redact::safe_error_summary(error)
+            )));
+            return false;
+        }
+        if let Some(at) = &server
+            && !self.files_still_show(&cluster, at).await
+        {
+            self.emit(Event::Error(format!(
+                "\"{cluster}\" was not {}: its kubeconfig files can't be read or no longer match \
+                 what is shown. Check them and try again.",
+                pins.done()
             )));
             return false;
         }
@@ -1288,6 +1333,23 @@ impl ClusterManager {
     /// Whether `id`'s slot is only kept because a file that defined it can't be parsed.
     fn held(&self, id: &str) -> bool {
         self.held.contains(id)
+    }
+
+    /// Whether `id` is listed but a file that can't be parsed could still change its definition:
+    /// a held slot, or an entry that may be a later file's fallback.
+    fn unsettled(&self, id: &str) -> bool {
+        self.held(id) || (self.cluster(id).is_some() && self.contexts.provisional(id))
+    }
+
+    /// Reads the kubeconfig files now, ahead of the file watcher, and says whether they still
+    /// give `id` the definition the last load showed at `server`. Anything else is a no, a read
+    /// that fails included. What gives access checks this right before saving.
+    async fn files_still_show(&mut self, id: &str, server: &str) -> bool {
+        let paths = self.kubeconfig_paths.clone();
+        match tokio::task::spawn_blocking(move || kubeconfig::load(&paths)).await {
+            Ok(fresh) => self.contexts.holds_in(&fresh, id, server),
+            Err(_) => false,
+        }
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1945,6 +2007,20 @@ mod tests {
         }
     }
 
+    /// A kubeconfig file in `dir` defining [`context`]'s server, as the list of files to read.
+    fn kubeconfig_file(dir: &Path) -> Vec<PathBuf> {
+        let path = dir.join("kubeconfig");
+        std::fs::write(&path, kubeconfig_with("https://dev")).unwrap();
+        vec![path]
+    }
+
+    /// Records a clean load of the manager's files, for a manager whose slot a test added by
+    /// hand.
+    fn record_load(manager: &mut ClusterManager) {
+        let loaded = kubeconfig::load(&manager.kubeconfig_paths);
+        manager.contexts.record(&loaded);
+    }
+
     // covers UP-21
     #[test]
     fn namespace_limited_lists_use_the_filter_then_the_default_then_what_is_listable() {
@@ -2099,7 +2175,7 @@ mod tests {
             config_dir: dir.path().to_owned(),
             settings: Settings::default(),
             settings_error: None,
-            kubeconfig_base: Vec::new(),
+            kubeconfig_base: kubeconfig_file(dir.path()),
             home: None,
             watch_files: false,
             watch_timing: Default::default(),
@@ -2113,6 +2189,7 @@ mod tests {
             &hubs,
             &manager.engine_config,
         ));
+        record_load(&mut manager);
         let protected = Some(WriteRefusal::Protected {
             cluster: "dev".into(),
         });
@@ -2489,6 +2566,210 @@ mod tests {
         let another = yaml.replace("user: {}", "user: {token: another}");
         rewrite_file(&mut manager, &path, &another).await;
         assert!(!manager.unlocks.is_unlocked("dev", "https://dev"));
+    }
+
+    // covers UP-55: every way a scope can let agents read more, cluster-scoped kinds included.
+    #[test]
+    fn a_scope_change_is_widening_unless_it_only_shrinks() {
+        let scope = |namespaces: &[&str], kinds: &[&str]| {
+            let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect();
+            AiScope::new(names(namespaces), names(kinds))
+        };
+        let shrinks = [
+            (scope(&[], &[]), scope(&[], &[])),
+            (scope(&[], &[]), scope(&["a"], &[])),
+            (scope(&[], &[]), scope(&[], &["pods"])),
+            (scope(&[], &[]), scope(&["a"], &["nodes"])),
+            (scope(&["a", "b"], &[]), scope(&["a"], &[])),
+            (scope(&[], &["nodes", "pods"]), scope(&["a"], &["nodes"])),
+            (scope(&["a"], &["nodes", "pods"]), scope(&["a"], &["pods"])),
+        ];
+        for (from, to) in shrinks {
+            assert!(!scope_widens(&from, &to), "{from:?} to {to:?}");
+        }
+        let widens = [
+            (scope(&["a"], &[]), scope(&[], &[])),
+            (scope(&["a"], &[]), scope(&["a", "b"], &[])),
+            (scope(&["a"], &[]), scope(&["b"], &[])),
+            (scope(&[], &["pods"]), scope(&[], &[])),
+            (scope(&[], &["pods"]), scope(&["a"], &[])),
+            (scope(&[], &["pods"]), scope(&[], &["pods", "nodes"])),
+            (scope(&["a"], &["pods"]), scope(&["a"], &[])),
+            // Closed to cluster-scoped kinds; a named kind may be one.
+            (scope(&["a"], &[]), scope(&["a"], &["nodes"])),
+            (scope(&["a"], &[]), scope(&["a"], &["pods"])),
+        ];
+        for (from, to) in widens {
+            assert!(scope_widens(&from, &to), "{from:?} to {to:?}");
+        }
+        let raw = AiScope {
+            namespaces: vec![" a".into()],
+            kinds: vec![],
+        };
+        assert!(scope_widens(&scope(&["a"], &[]), &raw), "not comparable");
+        assert!(scope_widens(&raw, &scope(&["a"], &[])), "not comparable");
+    }
+
+    fn saved(dir: &Path) -> Settings {
+        settings::load_settings(&dir.join("config")).unwrap()
+    }
+
+    // covers UP-06, UP-55: a later file's fallback takes no new Trust or exposure, at its own
+    // server or any other, and a pin it already has can go. With the file back, pins work again.
+    #[tokio::test]
+    async fn a_fallback_definition_takes_no_new_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let fallback = kubeconfig_with("https://fallback");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &fallback).await;
+        manager.config.config_dir = dir.path().join("config");
+        let first = dir.path().join("first");
+        let at = Some("https://dev".to_owned());
+        assert!(manager.set_pin(Pins::Trust, "dev".into(), at).await);
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(!manager.held("dev") && manager.unsettled("dev"));
+
+        let at = Some("https://fallback".to_owned());
+        assert!(!manager.set_pin(Pins::Trust, "dev".into(), at.clone()).await);
+        let expose = Pins::AiExposure(AiScope::default());
+        assert!(!manager.set_pin(expose, "dev".into(), at).await);
+        let kept = saved(dir.path());
+        assert_eq!(kept.trusted_clusters.len(), 1, "only the earlier pin");
+        assert_eq!(kept.trusted_clusters[0].server, "https://dev");
+        assert!(kept.ai_exposed_clusters.is_empty());
+
+        assert!(manager.set_pin(Pins::Trust, "dev".into(), None).await);
+        assert!(saved(dir.path()).trusted_clusters.is_empty());
+
+        rewrite_file(&mut manager, &first, &yaml).await;
+        assert!(!manager.unsettled("dev"));
+        let at = Some("https://dev".to_owned());
+        assert!(manager.set_pin(Pins::Trust, "dev".into(), at.clone()).await);
+        let expose = Pins::AiExposure(AiScope::default());
+        assert!(manager.set_pin(expose, "dev".into(), at).await);
+        let back = saved(dir.path());
+        assert_eq!(back.trusted_clusters.len(), 1);
+        assert_eq!(back.ai_exposed_clusters.len(), 1);
+    }
+
+    // covers UP-06, UP-55: on a same-server fallback a scope can shrink and not grow; with the
+    // file back it can grow again.
+    #[tokio::test]
+    async fn a_fallback_definition_only_narrows_its_ai_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://dev");
+        let fallback = yaml.replace("user: {}", "user: {token: fallback}");
+        let mut manager = manager_reading_two(dir.path(), &yaml, &fallback).await;
+        manager.config.config_dir = dir.path().join("config");
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let wide = AiScope::new(names(&["a", "b"]), Vec::new());
+        let narrow = AiScope::new(names(&["a"]), Vec::new());
+        let server = "https://dev".to_owned();
+        let expose = Pins::AiExposure(wide.clone());
+        assert!(
+            manager
+                .set_pin(expose, "dev".into(), Some(server.clone()))
+                .await
+        );
+        let first = dir.path().join("first");
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(!manager.held("dev") && manager.unsettled("dev"));
+
+        let everything = AiScope::default();
+        manager
+            .set_ai_scope("dev".into(), server.clone(), wide.clone(), everything)
+            .await;
+        assert_eq!(saved(dir.path()).ai_exposed_clusters[0].scope(), wide);
+
+        manager
+            .set_ai_scope("dev".into(), server.clone(), wide.clone(), narrow.clone())
+            .await;
+        assert_eq!(saved(dir.path()).ai_exposed_clusters[0].scope(), narrow);
+
+        rewrite_file(&mut manager, &first, &yaml).await;
+        manager
+            .set_ai_scope("dev".into(), server, narrow, wide.clone())
+            .await;
+        assert_eq!(saved(dir.path()).ai_exposed_clusters[0].scope(), wide);
+
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(
+            manager
+                .set_pin(Pins::AiExposure(wide), "dev".into(), None)
+                .await
+        );
+        assert!(saved(dir.path()).ai_exposed_clusters.is_empty());
+    }
+
+    // covers UP-06, UP-55: what gives access reads the files as they are now, before any reload
+    // has seen them. Narrowing and removing need no read. An unchanged file allows it all.
+    #[tokio::test]
+    async fn an_access_increase_reads_the_files_first() {
+        let yaml = kubeconfig_with("https://dev");
+        let changes = [
+            UNREADABLE.to_owned(),
+            kubeconfig_with("https://moved"),
+            yaml.replace("user: {}", "user: {token: another}"),
+            NO_CONTEXTS.to_owned(),
+        ];
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let wide = AiScope::new(names(&["a", "b"]), Vec::new());
+        let narrow = AiScope::new(names(&["a"]), Vec::new());
+        let server = "https://dev".to_owned();
+        for changed in changes {
+            let dir = tempfile::tempdir().unwrap();
+            let mut manager = manager_reading_two(dir.path(), &yaml, NO_CONTEXTS).await;
+            manager.config.config_dir = dir.path().join("config");
+            let other = Some("https://other".to_owned());
+            assert!(manager.set_pin(Pins::Trust, "other".into(), other).await);
+            let expose = Pins::AiExposure(wide.clone());
+            let at = Some(server.clone());
+            assert!(manager.set_pin(expose, "dev".into(), at.clone()).await);
+            let before = saved(dir.path());
+
+            let first = dir.path().join("first");
+            std::fs::write(&first, &changed).unwrap();
+            assert!(!manager.unsettled("dev"), "no load has seen the change");
+
+            assert!(!manager.set_pin(Pins::Trust, "dev".into(), at.clone()).await);
+            let everything = Pins::AiExposure(AiScope::default());
+            assert!(!manager.set_pin(everything, "dev".into(), at.clone()).await);
+            manager
+                .set_ai_scope(
+                    "dev".into(),
+                    server.clone(),
+                    wide.clone(),
+                    AiScope::default(),
+                )
+                .await;
+            assert_eq!(saved(dir.path()), before, "nothing saved");
+
+            manager
+                .set_ai_scope("dev".into(), server.clone(), wide.clone(), narrow.clone())
+                .await;
+            assert_eq!(saved(dir.path()).ai_exposed_clusters[0].scope(), narrow);
+            let exposure = Pins::AiExposure(narrow.clone());
+            assert!(manager.set_pin(exposure, "dev".into(), None).await);
+            assert!(manager.set_pin(Pins::Trust, "other".into(), None).await);
+            let cleared = saved(dir.path());
+            assert!(cleared.ai_exposed_clusters.is_empty());
+            assert!(cleared.trusted_clusters.is_empty());
+
+            let new_pin = Pins::AiExposure(narrow.clone());
+            assert!(!manager.set_pin(new_pin, "dev".into(), at.clone()).await);
+            assert!(saved(dir.path()).ai_exposed_clusters.is_empty());
+
+            std::fs::write(&first, &yaml).unwrap();
+            assert!(manager.set_pin(Pins::Trust, "dev".into(), at.clone()).await);
+            let new_pin = Pins::AiExposure(narrow.clone());
+            assert!(manager.set_pin(new_pin, "dev".into(), at).await);
+            manager
+                .set_ai_scope("dev".into(), server.clone(), narrow.clone(), wide.clone())
+                .await;
+            let allowed = saved(dir.path());
+            assert_eq!(allowed.trusted_clusters.len(), 1);
+            assert_eq!(allowed.ai_exposed_clusters[0].scope(), wide);
+        }
     }
 
     // covers UP-55: an unlock lasts through a confirmed removal and re-add on the same server.
@@ -3044,7 +3325,7 @@ mod tests {
                 config_dir: dir.path().to_owned(),
                 settings: Settings::default(),
                 settings_error: None,
-                kubeconfig_base: Vec::new(),
+                kubeconfig_base: kubeconfig_file(dir.path()),
                 home: None,
                 watch_files: false,
                 watch_timing: Default::default(),
@@ -3058,6 +3339,7 @@ mod tests {
                 &hubs,
                 &manager.engine_config,
             ));
+            record_load(&mut manager);
             let file = dir.path().join(settings::SETTINGS_FILE);
             let mut requests: Vec<(bool, u64)> = Vec::new();
             let mut saved_text: Option<String> = None;
