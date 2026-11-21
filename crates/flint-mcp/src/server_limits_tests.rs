@@ -49,6 +49,8 @@ fn server(dir: &std::path::Path, silent: Option<&str>, limits: Limits) -> FlintM
 struct Client {
     write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     read: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    /// Ends when the server has shut down.
+    served: tokio::task::JoinHandle<()>,
 }
 
 impl Client {
@@ -60,9 +62,9 @@ impl Client {
                 tokio::io::split(theirs),
             );
         let counted = server.counted(transport);
-        let served = server.clone();
-        tokio::spawn(async move {
-            if let Ok(service) = served.serve(counted).await {
+        let tracked = server.tracked();
+        let served = tokio::spawn(async move {
+            if let Ok(service) = tracked.serve(counted).await {
                 let _ = service.waiting().await;
             }
         });
@@ -70,6 +72,7 @@ impl Client {
         let mut client = Client {
             write,
             read: BufReader::new(read),
+            served,
         };
         client
             .send(
@@ -253,7 +256,9 @@ async fn a_stalled_client_holds_the_reply_budget_at_most() {
     };
     let server = server(dir.path(), None, limits);
     let client = Client::start(&server, 1024).await;
-    let Client { mut write, read } = client;
+    let Client {
+        mut write, read, ..
+    } = client;
     let mut client_read = read;
     let calls = 200u64;
     // The writer blocks once the server stops reading; it runs on its own.
@@ -318,6 +323,7 @@ async fn refusals_to_a_stalled_client_stay_within_the_budget() {
     let Client {
         mut write,
         mut read,
+        ..
     } = client;
     // The writer blocks once the server stops reading; it runs on its own.
     let writer = tokio::spawn(async move {
@@ -410,6 +416,7 @@ async fn a_call_outliving_the_close_is_still_answered() {
     let Client {
         mut write,
         mut read,
+        ..
     } = client;
     let line = format!(
         "{}\n",
@@ -426,6 +433,60 @@ async fn a_call_outliving_the_close_is_still_answered() {
     let reply: Value = serde_json::from_str(&answer).unwrap();
     assert_eq!(reply["id"], json!(1), "{reply}");
     assert!(text(&reply).starts_with("timed out after 7s"), "{reply}");
+}
+
+// covers UP-08: rmcp rejects this call before `call_tool` (its protocol version is unsupported)
+// and, the cancellation having been read first, drops the error. The call must not keep its
+// place, and the server must still exit when stdin closes.
+#[tokio::test]
+async fn a_call_cancelled_before_call_tool_lets_go_and_shutdown_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path(), None, Limits::default());
+    let mut client = Client::start(&server, 64 * 1024).await;
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "list_clusters", "arguments": {},
+        "_meta": {"protocolVersion": "1900-01-01"},
+    }});
+    let cancel = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 1, "reason": "test"}});
+    // One write, so the cancellation is read before the handler task gets to run.
+    let lines = format!("{call}\n{cancel}\n");
+    client.write.write_all(lines.as_bytes()).await.unwrap();
+    client.write.flush().await.unwrap();
+    let replies = server.inner.admission.replies();
+    wait_for("the cancelled call let go", || {
+        replies.unanswered_count() == 0
+    })
+    .await;
+    client.write.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), client.served)
+        .await
+        .expect("the server exits")
+        .unwrap();
+}
+
+// covers UP-08: a client that closes stdin while it does not read stdout, with a reply stuck in
+// the pipe, cannot keep the server alive.
+#[tokio::test(start_paused = true)]
+async fn shutdown_finishes_when_the_client_stopped_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        reply_budget: 1,
+        deadline: Duration::from_secs(7),
+        ..Limits::default()
+    };
+    let server = server(dir.path(), None, limits);
+    let mut client = Client::start(&server, 256).await;
+    client
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let replies = server.inner.admission.replies();
+    wait_for("the reply is stuck", || replies.outstanding() > 1).await;
+    client.write.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), client.served)
+        .await
+        .expect("the server exits")
+        .unwrap();
 }
 
 // covers UP-08: at the limit of unanswered requests, a request is refused at once (and, a tool
