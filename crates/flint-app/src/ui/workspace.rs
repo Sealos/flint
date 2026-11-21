@@ -684,8 +684,17 @@ impl Workspace {
             .iter()
             .map(|c| c.info.name.clone())
             .collect();
-        self.dock
-            .update(cx, |dock, cx| dock.set_contexts(contexts, cx));
+        let generations: HashMap<String, u64> = self
+            .model
+            .read(cx)
+            .clusters
+            .iter()
+            .map(|c| (c.info.name.to_string(), c.generation))
+            .collect();
+        self.dock.update(cx, |dock, cx| {
+            dock.set_generations(generations);
+            dock.set_contexts(contexts, cx)
+        });
         if self.dock.read(cx).tab_count() == 0 {
             return;
         }

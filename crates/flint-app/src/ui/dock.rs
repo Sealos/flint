@@ -142,6 +142,8 @@ struct Tab {
     cluster: TabCluster,
     /// Its context was re-pointed at another server since it opened.
     repointed: bool,
+    /// Its context's slot generation when it opened, if known.
+    generation: Option<u64>,
     /// The title and status drawn, so the tab bar redraws only when they change, not for every
     /// snapshot of a chatty session.
     shown: (SharedString, TabStatus),
@@ -195,6 +197,8 @@ pub struct Dock {
     /// `None` until kubeconfig has been read.
     contexts: Option<Vec<String>>,
     labels: HashMap<String, String>,
+    /// Each context's slot generation now, as the workspace last told it.
+    generations: HashMap<String, u64>,
 }
 
 impl Dock {
@@ -212,6 +216,7 @@ impl Dock {
             tab_menu: None,
             contexts: None,
             labels: HashMap::new(),
+            generations: HashMap::new(),
         }
     }
 
@@ -303,6 +308,16 @@ impl Dock {
                 if t.cluster != *cluster || t.repointed {
                     return false;
                 }
+                // A context that started over may have been re-pointed and back before the list
+                // was read: a live shell may be on the other server, so it is left running but
+                // not reused.
+                if matches!(key, TabKey::Shell(_))
+                    && t.generation.is_some_and(|opened| {
+                        self.generations.get(&*t.cluster.context) != Some(&opened)
+                    })
+                {
+                    return false;
+                }
                 let item = t.tab.item(cx);
                 let reads_to_end = matches!(key, TabKey::Logs(request) if request.previous);
                 item.tab_key() == *key && dock_model::reopens(item.tab_status(), reads_to_end)
@@ -345,6 +360,7 @@ impl Dock {
                 id: new,
                 _observe: observe(&tab, new, cx),
                 tab,
+                generation: self.generations.get(&*cluster.context).copied(),
                 cluster,
                 repointed: false,
                 shown,
@@ -400,6 +416,12 @@ impl Dock {
         self.contexts = Some(contexts);
         self.relabel(cx);
         self.reveal_active();
+    }
+
+    /// Takes in each context's slot generation, which decides whether a shell may be reused
+    /// ([`Dock::find`]).
+    pub fn set_generations(&mut self, generations: HashMap<String, u64>) {
+        self.generations = generations;
     }
 
     /// Whether `context` has left kubeconfig (its tabs keep running).
@@ -530,6 +552,7 @@ impl Dock {
             id,
             _observe: observe(&tab, id, cx),
             tab,
+            generation: self.generations.get(&*cluster.context).copied(),
             cluster,
             repointed: false,
             shown,
