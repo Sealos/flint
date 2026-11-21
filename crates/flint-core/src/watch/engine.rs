@@ -31,6 +31,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::cluster::ClusterId;
 use crate::read::{KindId, KindInfo};
+use crate::redact;
 use crate::store::{Feed, KindSnapshot, NamespaceLimit, Store, SyncState};
 use crate::table::{Column, EventType, FetchError, ListFormat, unix_now};
 
@@ -438,11 +439,13 @@ impl Engine {
                 let final_ = self.denial_is_final();
                 self.denials += 1;
                 if final_ {
-                    self.set_state(SyncState::Failed { error: m.clone() });
+                    self.set_state(SyncState::Failed {
+                        error: sync_error_text(m),
+                    });
                     self.denied_wait.next()
                 } else {
                     self.set_state(SyncState::Reconnecting {
-                        error: Some(m.clone()),
+                        error: Some(sync_error_text(m)),
                     });
                     let n = self.denials.saturating_sub(1).min(8);
                     jittered(self.config.denied_backoff_min * 2u32.pow(n))
@@ -450,7 +453,7 @@ impl Engine {
             }
             other => {
                 self.set_state(SyncState::Reconnecting {
-                    error: Some(other.to_string()),
+                    error: Some(sync_error_text(&other.to_string())),
                 });
                 backoff.next()
             }
@@ -465,7 +468,7 @@ impl Engine {
         if !retrying && self.watch_denials < self.config.transient_denials {
             self.watch_denials += 1;
             self.set_state(SyncState::Reconnecting {
-                error: Some(error.to_string()),
+                error: Some(sync_error_text(&error.to_string())),
             });
             let n = self.watch_denials.saturating_sub(1).min(8);
             self.pause(jittered(self.config.denied_backoff_min * 2u32.pow(n)))
@@ -823,6 +826,7 @@ impl Engine {
         };
         tracing::info!(cluster = %self.cluster, kind = %self.id,
             "not allowed in all namespaces; listing namespace by namespace");
+        let reason = sync_error_text(&reason);
         self.store = Store::new(true);
         let changed = Arc::new(Notify::new());
         let mut lanes: BTreeMap<String, Lane> = BTreeMap::new();
@@ -1099,6 +1103,26 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
+/// The most characters of a server's error text a [`SyncState`] carries.
+const MAX_SYNC_ERROR_CHARS: usize = 200;
+
+/// What a [`SyncState`] may say of an error: [`redact::safe_server_error`] of it, on one line and
+/// cut to [`MAX_SYNC_ERROR_CHARS`]. The cut comes last because hiding a quoted value can lengthen
+/// the text. Decisions about an error read the [`FetchError`], never this text.
+fn sync_error_text(raw: &str) -> String {
+    let line: String = redact::safe_server_error(raw)
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    redact::first_line(&line, MAX_SYNC_ERROR_CHARS)
+}
+
 /// Whether a 400/422 is the server refusing streaming lists (feature off or unknown).
 fn is_streaming_rejection(message: &str) -> bool {
     ["sendInitialEvents", "resourceVersionMatch", "WatchList"]
@@ -1110,6 +1134,31 @@ fn is_streaming_rejection(message: &str) -> bool {
 mod tests {
     use super::*;
     use crate::table::{ColumnRole, ColumnType};
+
+    #[test]
+    fn sync_error_text_is_one_clean_line() {
+        let text = sync_error_text(
+            "Forbidden: value \"abc123\" with Authorization: Bearer abcdefghijklmnop\rmore\nnext",
+        );
+        assert!(!text.contains("abc123"), "{text}");
+        assert!(!text.contains("abcdefghijklmnop"), "{text}");
+        assert!(!text.contains("next"), "{text}");
+        assert!(!text.chars().any(char::is_control), "{text}");
+        assert!(text.starts_with("Forbidden: value"), "{text}");
+    }
+
+    #[test]
+    fn sync_error_text_is_capped_on_a_char_boundary() {
+        for long in ["é".repeat(5000), "\"\"".repeat(500), "x ".repeat(5000)] {
+            let text = sync_error_text(&long);
+            assert!(text.chars().count() <= MAX_SYNC_ERROR_CHARS + 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn sync_error_text_keeps_a_plain_message() {
+        assert_eq!(sync_error_text("connection refused"), "connection refused");
+    }
 
     fn lane(state: SyncState, rows: &[&str], columns: &Arc<[Column]>, ns: &str) -> Lane {
         let hub = super::super::hub::Hub::new("c".into(), KindId::pods());
