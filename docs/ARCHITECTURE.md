@@ -639,7 +639,9 @@ opens in a tab in the bottom dock.
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
     A change ends it with `ExecFailureKind::ContextChanged` and the reason (`recheck::reason`): removed, now on
     another server, or, when it points where it did (removed and added back, say), changed since the session
-    opened. A shell refused before it starts says it did not start (`NotStartedMoved`, `NotStartedRemoved`). A log
+    opened. A shell refused before it starts says it did not start (`NotStartedMoved`, `NotStartedRemoved`). A pin
+    refused while the context's recorded server is still its exact URL gets `WriteRefusal::Stale`, which does not
+    claim the server moved (`NotStartedStale`, or `EndedStale` once its connection is open). A log
     session opened on a removed context ends at once. Ending drops the exec connection, as closing
     the session does, so no stream stays open on the old server.
 - **Input budget (#256).** A session holds at most 1 MiB of input (`exec::INPUT_BUDGET`) that the pod has not read:

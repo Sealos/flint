@@ -1171,8 +1171,12 @@ impl ClusterManager {
         if self.contexts.check(Pinned::Shell, cluster, pin).is_some()
             || self.contexts.gate_moved(cluster, pin)
         {
-            return Err(WriteRefusal::Moved {
-                cluster: cluster.to_owned(),
+            // Refused either way: this only picks the words.
+            let cluster = cluster.to_owned();
+            return Err(if self.contexts.on_pinned_server(&cluster, pin) {
+                WriteRefusal::Stale { cluster }
+            } else {
+                WriteRefusal::Moved { cluster }
             });
         }
         self.gate_for_server(cluster, pin.server()).map(drop)
@@ -2102,7 +2106,10 @@ mod tests {
         .await;
         offline(&mut manager);
         unlocks.unlock("dev", "https://remote-a");
-        assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
+        let stale = Err(WriteRefusal::Stale {
+            cluster: "dev".into(),
+        });
+        assert_eq!(ask(&mut manager, &inbox, &check).await, stale);
 
         drop(inbox);
         assert_eq!(check().await, Err(WriteRefusal::Stopped));
