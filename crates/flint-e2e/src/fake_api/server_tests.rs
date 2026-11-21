@@ -58,7 +58,7 @@ fn names(table: &Value) -> Vec<&str> {
 #[tokio::test]
 async fn serves_version_discovery_and_openapi() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let version = client.apiserver_version().await.unwrap();
     assert_eq!(version.major, "1");
     let groups = client.list_api_groups_aggregated().await.unwrap();
@@ -88,7 +88,7 @@ async fn serves_version_discovery_and_openapi() {
 #[tokio::test]
 async fn serves_tables_lists_objects_and_logs() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let path = "/apis/apps/v1/namespaces/demo/deployments?includeObject=Metadata";
     let table = fetch(&client, path, TABLE).await.unwrap();
     assert_eq!(table["kind"], "Table");
@@ -193,7 +193,7 @@ async fn serves_tables_lists_objects_and_logs() {
 #[tokio::test]
 async fn objects_follow_rows_and_unrecorded_objects_are_made_up() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let pods = server.gvr("pods");
     let system = server
         .rows(&pods)
@@ -252,7 +252,7 @@ async fn quirks_plain_only_resources_and_metrics() {
     })
     .await
     .unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let list = fetch(&client, "/api/v1/configmaps", TABLE).await.unwrap();
     assert_eq!(list["kind"], "ConfigMapList");
     server.script_watch(&configmaps, vec![WatchStep::End]);
@@ -278,7 +278,7 @@ async fn quirks_plain_only_resources_and_metrics() {
 #[tokio::test]
 async fn injects_forbidden_status_and_slow_responses() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let secrets = Gvr::core("secrets");
     server.inject(
         Fault::forbidden()
@@ -323,7 +323,7 @@ async fn injects_forbidden_status_and_slow_responses() {
 #[tokio::test]
 async fn drops_connections() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     server.inject(Fault::drop_connection().verb(Verb::List).times(1));
     let err = fetch(&client, "/api/v1/pods", TABLE).await.unwrap_err();
     assert!(!matches!(err, kube::Error::Api(_)), "{err}");
@@ -339,7 +339,7 @@ async fn drops_connections() {
 #[tokio::test]
 async fn scripted_watches_send_every_event_type() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let configmaps = Gvr::core("configmaps");
     let fresh = server.new_row(&configmaps, Some("demo"), "fresh", &[("Data", "1")]);
     let data = server.column(&configmaps, "Data").unwrap();
@@ -420,7 +420,7 @@ async fn scripted_watches_send_every_event_type() {
 #[tokio::test]
 async fn a_watch_without_version_starts_with_the_current_state() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let deployments = server.gvr("deployments");
     server.script_watch_in(&deployments, "demo", vec![WatchStep::End]);
     server.script_watch(&deployments, vec![WatchStep::Drop]);
@@ -451,7 +451,7 @@ async fn a_watch_without_version_starts_with_the_current_state() {
 #[tokio::test]
 async fn streaming_lists_send_initial_rows_then_an_end_marker() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let deployments = Gvr::new("apps", "v1", "deployments");
     let path = "/apis/apps/v1/namespaces/demo/deployments?watch=1&sendInitialEvents=true\
                 &resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true";
@@ -503,7 +503,7 @@ async fn streaming_lists_send_initial_rows_then_an_end_marker() {
 #[tokio::test]
 async fn live_events_reach_matching_open_watches_and_drops_break_them() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let configmaps = Gvr::core("configmaps");
     let start = "resourceVersion=1000";
     let all = tokio::spawn({
@@ -588,7 +588,7 @@ async fn live_events_reach_matching_open_watches_and_drops_break_them() {
 #[tokio::test]
 async fn silent_changes_show_in_the_next_list_only() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let deployments = Gvr::new("apps", "v1", "deployments");
     let ready = server.column(&deployments, "Ready").unwrap();
     let web = server.row(&deployments, Some("demo"), "web").unwrap();

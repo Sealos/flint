@@ -363,10 +363,10 @@ impl FakeApiServer {
         Ok(flint_core::cluster::connect(&self.kubeconfig(None), kubeconfig::CONTEXT).await?)
     }
 
-    /// A client that can reach this server's exec endpoints, for tests of them. Flint's own
-    /// sessions get theirs from the write gate.
+    /// A client with no read-only rule, for tests of what this server answers to requests
+    /// Flint's read paths never make. Flint's own sessions get theirs from the write gate.
     #[cfg(test)]
-    pub(crate) async fn exec_client(&self) -> Result<kube::Client> {
+    pub(crate) async fn unrestricted_client(&self) -> Result<kube::Client> {
         Ok(flint_core::cluster::connect_unrestricted_for_tests(
             &self.kubeconfig(None),
             kubeconfig::CONTEXT,

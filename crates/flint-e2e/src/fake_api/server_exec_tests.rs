@@ -94,7 +94,7 @@ const PROMPT: &str = "\x1b[?2004hroot@web-69c6f74b8b-qv4xv:/# ";
 #[tokio::test]
 async fn a_bash_session_echoes_resizes_and_exits_with_its_code() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let mut process = exec(&client, WEB, &["bash"]).await;
     let mut stdin = process.stdin().unwrap();
     let mut stdout = process.stdout().unwrap();
@@ -163,7 +163,7 @@ async fn a_bash_session_echoes_resizes_and_exits_with_its_code() {
 #[tokio::test]
 async fn a_container_without_bash_reports_it_on_the_status_channel() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let mut process = exec(&client, PODINFO, &["bash"]).await;
     let mut stdout = process.stdout().unwrap();
     let status = status_of(&mut process).await.unwrap();
@@ -212,7 +212,7 @@ async fn a_container_without_bash_reports_it_on_the_status_channel() {
 #[tokio::test]
 async fn refusals_before_the_upgrade_match_the_api_server_and_kubelet() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let tty = AttachParams::interactive_tty();
     let refused = |result: Result<AttachedProcess, kube::Error>| match result {
         Ok(_) => panic!("the exec started"),
@@ -305,7 +305,7 @@ async fn refusals_before_the_upgrade_match_the_api_server_and_kubelet() {
 #[tokio::test]
 async fn the_server_can_end_close_or_break_a_session() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
 
     let mut process = exec(&client, WEB, &["bash"]).await;
     let mut stdout = process.stdout().unwrap();
@@ -346,7 +346,7 @@ async fn the_server_can_end_close_or_break_a_session() {
 #[tokio::test]
 async fn stdin_close_ends_a_shell_only_without_a_tty() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     // With a TTY: nothing happens (the shell keeps its prompt).
     let mut process = exec(&client, WEB, &["bash"]).await;
     let mut stdout = process.stdout().unwrap();
@@ -390,7 +390,7 @@ async fn stdin_close_ends_a_shell_only_without_a_tty() {
 #[tokio::test]
 async fn floods_stream_until_done_or_interrupted() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let mut process = exec(&client, WEB, &["seq", "100000"]).await;
     let mut stdout = process.stdout().unwrap();
     let out = read_to_end(&mut stdout).await;
@@ -417,7 +417,7 @@ async fn floods_stream_until_done_or_interrupted() {
 #[tokio::test]
 async fn frames_come_in_the_recorded_order() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let request = http::Request::get(format!(
         "/api/v1/namespaces/demo/pods/{WEB}/exec?command=sh&command=-c&command=exit+3\
          &stdin=true&stdout=true&tty=true"
@@ -462,7 +462,7 @@ type Ws2 = tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>
 #[tokio::test]
 async fn a_session_stuck_writing_still_ends_when_dropped_or_the_server_stops() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     // `yes` fills every buffer on the way to a client that never reads.
     let _stuck = unread(&client, "command=yes").await;
     server.wait_for_exec_sessions(1, SHORT).await.unwrap();
@@ -496,7 +496,7 @@ async fn a_session_stuck_writing_still_ends_when_dropped_or_the_server_stops() {
 #[tokio::test]
 async fn a_stalled_session_goes_silent_until_dropped() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let mut process = exec(&client, WEB, &["bash"]).await;
     let mut stdout = process.stdout().unwrap();
     let mut stdin = process.stdin().unwrap();
@@ -523,7 +523,7 @@ async fn a_stalled_session_goes_silent_until_dropped() {
 #[tokio::test]
 async fn stdin_after_the_end_is_recorded_though_nothing_reads_it() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let mut ws = unread(&client, "command=sh&command=-c&command=exit+3").await;
     // The empty frame, then the status: the command is over.
     for _ in 0..2 {
@@ -545,7 +545,7 @@ async fn kubelet_refusals_come_after_the_upgrade_when_the_api_server_holds_the_w
     })
     .await
     .unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let mut process = exec(&client, "fixture-job-qd9jf", &["sh"]).await;
     let status = status_of(&mut process).await.unwrap();
     assert_eq!(status.code, Some(500));
@@ -579,7 +579,7 @@ async fn kubelet_refusals_come_after_the_upgrade_when_the_api_server_holds_the_w
 #[tokio::test]
 async fn proxies_that_strip_the_upgrade_and_create_rbac_refuse_as_the_api_server_does() {
     let server = FakeApiServer::start().await.unwrap();
-    let client = server.exec_client().await.unwrap();
+    let client = server.unrestricted_client().await.unwrap();
     let tty = AttachParams::interactive_tty();
     server.inject(Fault::strip_upgrade().times(1));
     match exec_with(&client, WEB, &["sh"], &tty).await {
