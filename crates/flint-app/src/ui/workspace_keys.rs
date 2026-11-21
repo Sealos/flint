@@ -349,8 +349,10 @@ impl Workspace {
             .cluster
             .as_ref()
             .map(|c| (c.to_string(), summary.and_then(|s| s.info.server.clone())));
+        let label = self.cluster.as_deref().map(|c| model.names().of(c));
         let key = SwitcherKey {
             cluster: cluster_id.clone(),
+            label: label.clone(),
             generation: summary.map(|s| s.generation),
             kinds: entries
                 .iter()
@@ -360,10 +362,7 @@ impl Workspace {
             on_view,
         };
         let scope = SwitcherScope {
-            cluster: self
-                .cluster
-                .as_deref()
-                .map(|c| SharedString::from(self.model.read(cx).names().of(c))),
+            cluster: label.map(SharedString::from),
             cluster_id,
             index: Index::new(&entries, &[]),
             loading: self.cluster.is_some() && !entries.is_empty(),
@@ -464,6 +463,8 @@ impl Workspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::ui) struct SwitcherKey {
     cluster: Option<(String, Option<String>)>,
+    /// What the active cluster is called: a custom name can change while the switcher is open.
+    label: Option<String>,
     /// The active context's slot: one that started over (re-pointed and put back between reads,
     /// so name, server and kinds match again) has other objects, and the index is rebuilt.
     generation: Option<u64>,

@@ -847,8 +847,9 @@ pub fn set_cluster_name(
                 SettingsError::Invalid {
                     path: path.to_owned(),
                     reason: format!(
-                        "a cluster name has 1 to {} characters, none of them hidden",
-                        crate::display::MAX_CUSTOM_NAME_CHARS
+                        "a cluster name has 1 to {} letters, digits or any of {}",
+                        crate::display::MAX_CUSTOM_NAME_CHARS,
+                        crate::display::CUSTOM_NAME_PUNCTUATION
                     ),
                 }
             })?),
@@ -861,6 +862,22 @@ pub fn set_cluster_name(
             *names = toml::Value::Table(toml::Table::new());
         }
         let entries = names.as_table_mut().expect("a table");
+        // Against the file as it is now: another Flint may have taken the name since it was
+        // checked, and two clusters with one name would both lose it.
+        if let Some(name) = &cleaned {
+            let taken = entries.iter().any(|(other, value)| {
+                other != context
+                    && value
+                        .as_str()
+                        .is_some_and(|v| v.to_lowercase() == name.to_lowercase())
+            });
+            if taken {
+                return Err(SettingsError::Invalid {
+                    path: path.to_owned(),
+                    reason: format!("another cluster already goes by {name:?}"),
+                });
+            }
+        }
         match cleaned {
             Some(name) => {
                 entries.insert(context.to_owned(), toml::Value::String(name));
@@ -1627,6 +1644,9 @@ mod tests {
             s,
             "a refused name changes nothing"
         );
+        // Taken in the file meanwhile, in any case: refused, and the other name stays.
+        assert!(set_cluster_name(dir.path(), "other", Some("MAIN")).is_err());
+        assert_eq!(load_settings(dir.path()).unwrap(), s);
         let s = set_cluster_name(dir.path(), context, None).unwrap();
         assert!(s.cluster_names.is_empty());
         let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();

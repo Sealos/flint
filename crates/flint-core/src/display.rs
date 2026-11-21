@@ -62,28 +62,21 @@ const MAX_NAME_BESIDE_REAL: usize = 16;
 /// The longest custom cluster name, in characters.
 pub const MAX_CUSTOM_NAME_CHARS: usize = 32;
 
-/// `name` as a custom cluster name: trimmed, at most [`MAX_CUSTOM_NAME_CHARS`], with no control
-/// or invisible characters, which could make it read as something else. `None` when it is not
-/// one.
+/// What a custom cluster name may hold besides letters and digits.
+pub const CUSTOM_NAME_PUNCTUATION: &str = " -_.:/·()#+@";
+
+/// `name` as a custom cluster name: trimmed, at most [`MAX_CUSTOM_NAME_CHARS`], of letters, digits
+/// and [`CUSTOM_NAME_PUNCTUATION`] only. An allowlist, so a control, invisible or combining
+/// character cannot make it read as something else. `None` when it is not one.
 pub fn clean_custom_name(name: &str) -> Option<String> {
     let name = name.trim();
-    let invisible = |c: char| {
-        c.is_control()
-            || matches!(
-                c,
-                '\u{ad}'
-                    | '\u{61c}'
-                    | '\u{180e}'
-                    | '\u{200b}'..='\u{200f}'
-                    | '\u{2028}'..='\u{202e}'
-                    | '\u{2060}'..='\u{206f}'
-                    | '\u{feff}'
-            )
+    // Hangul fillers are letters that draw nothing.
+    let allowed = |c: char| {
+        (c.is_alphanumeric() && !matches!(c, '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}'))
+            || CUSTOM_NAME_PUNCTUATION.contains(c)
     };
-    (!name.is_empty()
-        && name.chars().count() <= MAX_CUSTOM_NAME_CHARS
-        && !name.chars().any(invisible))
-    .then(|| name.to_owned())
+    (!name.is_empty() && name.chars().count() <= MAX_CUSTOM_NAME_CHARS && name.chars().all(allowed))
+        .then(|| name.to_owned())
 }
 
 /// What each context is called on screen: its custom name, else [`short_name`]. Only for
@@ -273,6 +266,10 @@ mod tests {
             "a\u{202e}b",
             "a\u{200b}b",
             "a\u{feff}b",
+            "pr\u{34f}od",
+            "cafe\u{301}",
+            "a\u{3164}b",
+            "a\u{fe0f}b",
         ] {
             assert_eq!(clean_custom_name(bad), None, "{bad:?}");
         }

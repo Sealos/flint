@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use flint_core::display::{ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name, short_name};
+use flint_core::display::{
+    CUSTOM_NAME_PUNCTUATION, ClusterNames, MAX_CUSTOM_NAME_CHARS, clean_custom_name, short_name,
+};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,7 +28,8 @@ fn problem(
     }
     let Some(name) = clean_custom_name(typed) else {
         return Some(format!(
-            "A cluster name has at most {MAX_CUSTOM_NAME_CHARS} characters, none of them hidden."
+            "A cluster name has at most {MAX_CUSTOM_NAME_CHARS} letters, digits or any of \
+             {CUSTOM_NAME_PUNCTUATION}"
         ));
     };
     let mut with_it = names.clone();

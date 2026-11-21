@@ -617,7 +617,7 @@ impl Workspace {
         self.model.read(cx).settings_error.is_none()
     }
 
-    pub(super) fn cluster_summary<'a>(
+    pub(in crate::ui) fn cluster_summary<'a>(
         &self,
         name: &str,
         cx: &'a App,

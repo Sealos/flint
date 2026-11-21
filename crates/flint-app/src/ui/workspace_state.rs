@@ -41,6 +41,7 @@ impl Workspace {
         let cursor = self.sidebar_cursor(cx);
         let model = self.model.read(cx);
         let active = model.active.clone();
+        let names = model.names();
 
         let clusters = model
             .clusters
@@ -53,7 +54,7 @@ impl Workspace {
                 let is_active = active.as_deref() == Some(cluster.info.name.as_str());
                 ClusterState {
                     name: cluster.info.name.clone(),
-                    label: model.names().of(&cluster.info.name),
+                    label: names.of(&cluster.info.name),
                     active: is_active,
                     connection: state_name(&cluster.state),
                     presence: Presence::of(&cluster.state, is_active).name(),
@@ -114,7 +115,7 @@ impl Workspace {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();
             let controls = header_controls(cluster, list);
-            let mut breadcrumb = vec![model.names().of(name)];
+            let mut breadcrumb = vec![names.of(name)];
             if let Some(list) = list {
                 breadcrumb.push(list.label().to_owned());
             }
