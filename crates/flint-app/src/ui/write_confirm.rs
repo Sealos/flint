@@ -205,23 +205,10 @@ fn dialog_text_saying(
     }
 }
 
-/// Asks to confirm `review`, then runs it on `core` and calls `on_done` with the result.
-/// Cancelling runs nothing and does not call it.
-// The resource actions (#17) open it.
-#[allow(dead_code)]
-pub fn open(
-    window: &mut Window,
-    cx: &mut App,
-    core: CoreHandle,
-    review: WriteReview,
-    names: &ClusterNames,
-    on_done: impl Fn(Result<WriteOutcome, WriteError>, &mut App) + 'static,
-) {
-    open_noted(window, cx, core, review, names, None, |_| true, on_done);
-}
-
-/// [`open`], first saying `note` (why this review was opened again). Confirming asks `begin`
-/// right before the write: `false` runs nothing and does not call `on_done`.
+/// Asks to confirm `review`, first saying `note` (why this review was opened again), then runs it
+/// on `core` and calls `on_done` with the result. Cancelling runs nothing and does not call it.
+/// Confirming asks `begin` right before the write: `false` runs nothing and does not call
+/// `on_done`.
 #[allow(clippy::too_many_arguments)]
 pub fn open_noted(
     window: &mut Window,
