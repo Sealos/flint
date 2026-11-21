@@ -468,6 +468,18 @@ impl<'a> Presence<'a> {
     }
 }
 
+/// The row's status while reconnecting. A watch error can carry the server's own message, so
+/// only its safe summary is shown.
+pub fn reconnecting_text(error: Option<&str>) -> String {
+    match error {
+        Some(error) => format!(
+            "Reconnecting: {}",
+            flint_core::redact::safe_error_summary(error)
+        ),
+        None => "Reconnecting".to_owned(),
+    }
+}
+
 /// The cluster is reconnecting when at least one watched kind is reconnecting and no kind is
 /// synced. Other states alone do not indicate connection trouble. Use the first reconnecting
 /// kind with an error by kind ID so the tooltip is stable.
@@ -511,8 +523,8 @@ pub fn state_label(state: &ConnectionState) -> &'static str {
 mod tests {
     // Not `super::*`: that brings in `gpui_kit::test`, which shadows the std `#[test]`.
     use super::{
-        Discovered, Presence, forget_stale, reconnecting, replace_clusters, startup_cluster,
-        state_name,
+        Discovered, Presence, forget_stale, reconnecting, reconnecting_text, replace_clusters,
+        startup_cluster, state_name,
     };
     use flint_core::kubeconfig::ContextInfo;
     use flint_core::{ClusterSummary, ConnectionState, KindId, ServerVersion, SyncState};
@@ -664,6 +676,15 @@ mod tests {
         );
         states.insert(KindId::new("", "nodes"), SyncState::Synced);
         assert_eq!(reconnecting(&states), None);
+    }
+
+    #[test]
+    fn reconnecting_text_shows_only_a_safe_summary() {
+        assert_eq!(reconnecting_text(None), "Reconnecting");
+        let text = reconnecting_text(Some("denied for \"s3cret-value\"\nsecond line"));
+        assert!(text.starts_with("Reconnecting: denied for"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("second line"), "{text}");
     }
 
     #[test]

@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::closing;
-use super::clusters::{ClustersModel, Presence, state_label};
+use super::clusters::{ClustersModel, Presence, reconnecting_text, state_label};
 use super::confirm::{self, DialogText};
 use super::detail::{
     DetailEvent, DetailTab, DetailView, ObjectRef, Opening, TakeFocus, protected_reason, refused,
@@ -1309,8 +1309,7 @@ impl Workspace {
         // With a custom name, it starts with the real one: the row always says which cluster.
         let subtitle = names.subtitle(&name, cluster.info.server_host());
         let state_text = match (presence, &cluster.state) {
-            (Presence::Reconnecting { error: Some(error) }, _) => format!("Reconnecting: {error}"),
-            (Presence::Reconnecting { error: None }, _) => "Reconnecting".to_owned(),
+            (Presence::Reconnecting { error }, _) => reconnecting_text(error),
             (Presence::Idle, ConnectionState::Connected(v)) => format!(
                 "Connected, Kubernetes {}. Idle: not watched while another cluster is active",
                 v.git_version
