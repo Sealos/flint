@@ -770,6 +770,11 @@ async fn serve_or_put(
     query: &Query,
     accept: &str,
 ) -> Response<Body> {
+    if writes::handles(req.method(), route) {
+        return writes::serve(inner, req, route)
+            .await
+            .unwrap_or_else(|e| error(&e));
+    }
     if req.method() == Method::PUT && matches!(route, Route::Object { .. }) {
         return put_object(inner, req, route, query)
             .await
@@ -1151,6 +1156,9 @@ mod pods;
 
 #[path = "server_exec.rs"]
 mod execs;
+
+#[path = "server_writes.rs"]
+mod writes;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]
