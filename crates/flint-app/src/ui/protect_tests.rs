@@ -880,6 +880,68 @@ async fn known_local_clusters_start_unlocked(cx: &mut TestAppContext) {
     assert!(row.contains("On this machine: unlocked"), "{row}");
 }
 
+// covers UP-33: a dialog closes the namespace picker, which would stay above it, and once the
+// dialog is gone the keys work again from the picker's button.
+#[gpui_kit::test]
+async fn a_dialog_closes_the_namespace_picker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    t.click(cx, "namespace-filter-button");
+    t.wait_for_element(cx, "ns-all").await;
+    draw(cx, &t);
+    t.dispatch(cx, "workspace::UnlockCluster", json!({"cluster": "alpha"}))
+        .unwrap();
+    wait_for_dialog(cx, &t, true).await;
+    draw(cx, &t);
+    assert!(t.find(cx, "ns-all").is_none(), "the picker closed");
+    assert!(t.has_dialog(cx), "the dialog stays open");
+
+    t.press(cx, "escape");
+    wait_for_dialog(cx, &t, false).await;
+    draw(cx, &t);
+    assert!(t.find(cx, "ns-all").is_none(), "the picker stays closed");
+    let button = t.find(cx, "namespace-filter-button").unwrap();
+    assert_eq!(button.focused(), Some(true), "focus is back on the button");
+}
+
+// covers UP-33: a dialog that opened with focus in the picker's text field gives it back to the
+// button, whichever key dismisses it, also after the dialog's delayed focus restore.
+#[gpui_kit::test]
+async fn dismissing_a_dialog_does_not_refocus_the_hidden_picker_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 0)])
+        .await;
+    for key in ["escape", "enter"] {
+        t.click(cx, "namespace-filter-button");
+        t.wait_for_element(cx, "ns-all").await;
+        draw(cx, &t);
+        t.click(cx, "ns-add");
+        draw(cx, &t);
+        t.dispatch(cx, "flint::About", Value::Null).unwrap();
+        wait_for_dialog(cx, &t, true).await;
+        draw(cx, &t);
+        assert!(t.find(cx, "ns-all").is_none(), "{key}: the picker closed");
+
+        t.press(cx, key);
+        wait_for_dialog(cx, &t, false).await;
+        // Past the dialog's closing delay, when it restores the focus it saved.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        draw(cx, &t);
+        draw(cx, &t);
+        assert!(t.find(cx, "ns-all").is_none(), "{key}: stays closed");
+        let button = t.find(cx, "namespace-filter-button").unwrap();
+        assert_eq!(
+            button.focused(),
+            Some(true),
+            "{key}: focus is on the button"
+        );
+    }
+}
+
 const SERVER_WITH_USERINFO: &str = "https://admin:hunter2@prod.example:6443/?token=abc";
 const CLEANED_SERVER: &str = "https://prod.example:6443";
 

@@ -240,6 +240,18 @@ async fn connected_to_fake(
     t
 }
 
+/// The text of the open confirmation, as drawn.
+fn shown_confirmation(cx: &mut TestAppContext, t: &TestWorkspace) -> String {
+    cx.update_window(t.window, |_, window, _| {
+        window
+            .find_all("write-confirm-description")
+            .iter()
+            .find_map(|e| e.label().map(str::to_owned))
+    })
+    .unwrap()
+    .expect("the confirmation")
+}
+
 /// The one write the server received.
 fn only_write(server: &FakeApiServer) -> WriteRecord {
     let writes = server.writes();
@@ -557,4 +569,83 @@ async fn a_refused_confirmation_does_not_run_after_an_unlock(cx: &mut TestAppCon
     core.unlock("kind-alpha", &api.url);
     assert_runs_once(cx, &api, &flow, &confirmed);
     assert_eq!(api.patches(), 0);
+}
+
+// covers UP-51: what a live object's marker says reaches the drawn confirmation, named when it
+// can be read and as an unknown manager when it cannot, and nothing is written.
+#[gpui_kit::test]
+async fn a_marked_object_is_warned_about_in_the_dialog(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+
+    for (marker, value, expected) in [
+        (
+            "kustomize.toolkit.fluxcd.io/name",
+            "apps",
+            "Managed by Flux: apps. This change will likely be reverted on the next sync.",
+        ),
+        (
+            "argocd.argoproj.io/instance",
+            "team/shop",
+            "Managed by Argo CD: unknown application. This change will likely be reverted on \
+             the next sync.",
+        ),
+    ] {
+        let mut object = server.object(&deployments(), Some("demo"), "act").unwrap();
+        object["metadata"]["labels"] = json!({marker: value});
+        server.set_object(&deployments(), object);
+
+        let flow = open_on(cx, &t, act(&server), SCALE, true).await;
+        let text = shown_confirmation(cx, &t);
+        assert!(text.starts_with(expected), "{text}");
+        assert!(!text.contains("team/shop"), "{text}");
+        t.click(cx, "cancel");
+        draw(cx, &t);
+        assert_eq!(flow.begun.get(), 0);
+    }
+    assert!(server.writes().is_empty());
+}
+
+// covers UP-51: a Secret marked by an annotation is warned about in the drawn confirmation,
+// without the annotation's value.
+#[gpui_kit::test]
+async fn a_marked_secret_is_warned_about_without_its_value(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake_api();
+    let secrets = Gvr::core("secrets");
+    server.set_object(
+        &secrets,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "creds", "namespace": "demo", "uid": "uid-creds",
+                         "resourceVersion": "5001",
+                         "annotations": {"argocd.argoproj.io/instance": "marker-value"}},
+            "data": {},
+        }),
+    );
+    let t = connected_to_fake(cx, dir.path(), &server).await;
+    let live = server.object(&secrets, Some("demo"), "creds").unwrap();
+    let target = WriteTarget {
+        kind: KindId::new("", "secrets"),
+        name: "creds".to_owned(),
+        uid: Some("uid-creds".to_owned()),
+        resource_version: live["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_owned),
+        ..act(&server)
+    };
+
+    let flow = open_on(cx, &t, target, WriteProposal::Delete, true).await;
+    let text = shown_confirmation(cx, &t);
+    assert!(
+        text.starts_with("Managed by GitOps. This change will likely be reverted"),
+        "{text}"
+    );
+    assert!(!text.contains("marker-value"), "{text}");
+    t.click(cx, "cancel");
+    draw(cx, &t);
+    assert_eq!(flow.begun.get(), 0);
+    assert!(server.writes().is_empty());
 }
