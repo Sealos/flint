@@ -690,6 +690,37 @@ async fn a_call_refused_or_cancelled_before_admission_records_no_argument_values
     assert_tool_only_records(dir.path(), "get_resource", 2).await;
 }
 
+// covers UP-10: an argument of the wrong type is refused naming what was expected, without
+// repeating the value, even one holding quotes. A missing argument is still named.
+#[tokio::test]
+async fn a_wrong_type_argument_is_not_echoed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path(), None, Limits::default());
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for (id, limit) in [
+        (1, json!("raw-value")),
+        (2, json!("a\"raw-value\"b")),
+        (3, json!(-77_001)),
+    ] {
+        let arguments = json!({"cluster": "silent", "kind": "pods", "limit": limit});
+        client.call(id, "list_resources", arguments).await;
+        let reply = client.next().await;
+        assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+        let said = text(&reply);
+        assert!(said.contains("expected u32"), "{reply}");
+        assert!(
+            !said.contains("raw-value") && !said.contains("77001"),
+            "{reply}"
+        );
+        assert!(!reply.to_string().contains("raw-value"), "{reply}");
+    }
+    client
+        .call(4, "list_resources", json!({"cluster": "silent"}))
+        .await;
+    let missing = client.next().await;
+    assert!(text(&missing).contains("missing field `kind`"), "{missing}");
+}
+
 // covers UP-16: a `list_clusters` call ended by its deadline while it probes is still recorded
 // with the clusters it read about, so it shows in their activity.
 #[tokio::test(start_paused = true)]

@@ -16,7 +16,8 @@
 //! - **Shutdown:** when the client closes stdin, requests and refusals still on their way finish
 //!   as long as replies keep being written. After [`Limits::deadline`] plus [`SHUTDOWN_GRACE`]
 //!   with none written, the server stops waiting, so a client that stopped reading stdout cannot
-//!   keep the process alive.
+//!   keep the process alive. The same wait applies while the read-ahead queue is full, where the
+//!   end of stdin cannot be seen: with no reply written for that long, the client counts as gone.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -414,7 +415,8 @@ impl Drop for Held {
     }
 }
 
-/// The wait after stdin ended: it runs out at `until`, moved on whenever a reply is written.
+/// A wait for the client: after stdin ended, or with the read-ahead queue full. It runs out at
+/// `until`, moved on whenever a reply is written.
 #[derive(Clone, Copy)]
 struct Closed {
     written: usize,
@@ -454,6 +456,8 @@ pub(crate) struct Counted<T> {
     read_ahead_budget: usize,
     /// Set once stdin has ended.
     closed: Option<Closed>,
+    /// Set while the read-ahead queue is full and replies pass the budget.
+    stalled: Option<Closed>,
 }
 
 impl<T> Counted<T> {
@@ -468,6 +472,7 @@ impl<T> Counted<T> {
             read_ahead_bytes: 0,
             read_ahead_budget: READ_AHEAD_BYTES,
             closed: None,
+            stalled: None,
         }
     }
 }
@@ -572,8 +577,9 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
     /// a client that does not read stdout gets nothing more run or answered (refusals and replies
     /// to other requests included) until it does. A bounded queue of messages is read ahead
     /// meanwhile (`read_ahead`), so the end of stdin is seen unless more than that is waiting.
-    /// Otherwise reading goes on, so a cancellation
-    /// always gets through. A request read while [`Limits::unanswered`] are not done with is
+    /// With that queue full, the end of stdin cannot be seen, so a client that lets no reply be
+    /// written for [`Limits::deadline`] plus [`SHUTDOWN_GRACE`] counts as gone and the stream
+    /// ends. Otherwise reading goes on, so a cancellation always gets through. A request read while [`Limits::unanswered`] are not done with is
     /// refused here at once ("busy"), as is one whose id is still in flight; a tool call refused
     /// so is recorded. When the client closes its end, the stream ends once every request read is
     /// answered and every refusal written, or once no reply has been written for
@@ -587,11 +593,12 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
             self.quiet,
             self.read_ahead_budget,
         );
-        let (inner, read_ahead, ahead_bytes, closed) = (
+        let (inner, read_ahead, ahead_bytes, closed, stalled) = (
             &mut self.inner,
             &mut self.read_ahead,
             &mut self.read_ahead_bytes,
             &mut self.closed,
+            &mut self.stalled,
         );
         async move {
             loop {
@@ -623,7 +630,26 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                             return None;
                         }
                     } else if read_ahead.len() >= most || *ahead_bytes >= ahead_budget {
-                        replies.within(budget).await;
+                        let written = replies.written.load(Ordering::Acquire);
+                        let now = tokio::time::Instant::now();
+                        let wait = match stalled {
+                            Some(wait) if wait.written == written => *wait,
+                            _ => *stalled.insert(Closed {
+                                written,
+                                until: now + quiet,
+                            }),
+                        };
+                        let ready = replies.until(|| {
+                            replies.outstanding() <= budget
+                                || replies.written.load(Ordering::Acquire) != written
+                        });
+                        if tokio::time::timeout_at(wait.until, ready).await.is_err() {
+                            tracing::warn!(
+                                "the client stopped reading replies with its requests queued; \
+                                 closing the connection"
+                            );
+                            return None;
+                        }
                     } else {
                         tokio::select! {
                             biased;
@@ -647,6 +673,7 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for Counted<T> {
                     continue;
                 };
                 *ahead_bytes -= size;
+                *stalled = None;
                 match &message {
                     JsonRpcMessage::Request(request) => {
                         let id = &request.id;

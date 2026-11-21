@@ -482,6 +482,26 @@ const UNSUPPORTED_NAME_CHARS: usize = 64;
 /// likes, and a prefix of it could hold part of a credential.
 const UNSUPPORTED_NAME_BYTES: usize = 1024;
 
+/// `result` with an argument error's repeated value taken out ([`policy::argument_error`]). rmcp
+/// returns that error as a failed tool result.
+fn without_argument_values(
+    mut result: Result<rmcp::model::CallToolResponse, rmcp::ErrorData>,
+) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+    if let Ok(rmcp::model::CallToolResponse::Complete(done)) = &mut result
+        && done.is_error == Some(true)
+    {
+        for block in &mut done.content {
+            let safe = block
+                .as_text()
+                .and_then(|text| policy::argument_error(&text.text));
+            if let Some(safe) = safe {
+                *block = ContentBlock::text(safe);
+            }
+        }
+    }
+    result
+}
+
 /// The refusal for `arguments` that `tool`'s schema does not have, naming them and the accepted
 /// ones. A tool that dropped them would answer as if a filter it never applied had matched.
 /// `_meta` is not among them: it sits beside the arguments in the request.
@@ -811,6 +831,13 @@ impl ServerHandler for FlintMcp {
                             let record = c.record.take().filter(|_| finished);
                             (record, std::mem::take(&mut *c))
                         });
+                        // A tool that ran left its record: its text is the cluster's, not rmcp's
+                        // error for arguments that never reached it.
+                        let result = if finished && record.is_none() {
+                            without_argument_values(result)
+                        } else {
+                            result
+                        };
                         (result, record, note)
                     })
                     .await
@@ -1087,12 +1114,7 @@ impl FlintMcp {
             .kubeconfig
             .errors
             .iter()
-            .map(|(path, error)| {
-                json!({
-                    "file": path.display().to_string(),
-                    "error": flint_core::redact::safe_error_summary(error),
-                })
-            })
+            .map(|(path, error)| policy::kubeconfig_error_row(path, error))
             .collect();
         let mut rows = Vec::new();
         let results = self.probe_all(ctx, &exposed).await;

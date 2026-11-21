@@ -191,11 +191,59 @@ impl Setup {
     }
 }
 
-/// A path as an agent may read it: with anything like a credential redacted.
+/// A path as an agent may read it. A component with anything like a credential is hidden whole:
+/// spaces are valid in a path, so a passphrase can run past where the redactor stops. The whole
+/// path is then redacted too, for a credential that spans components.
 fn shown_path(path: &Path) -> String {
-    let mut shown = path.display().to_string();
+    let mut shown = path
+        .display()
+        .to_string()
+        .split('/')
+        .map(|component| {
+            let mut text = component.to_owned();
+            if redact_text(&mut text) > 0 {
+                "[REDACTED]".to_owned()
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
     redact_text(&mut shown);
     shown
+}
+
+/// How rmcp starts the error for arguments that do not fit a tool's types.
+const ARGUMENT_ERROR: &str = "failed to deserialize parameters: ";
+
+/// `text` without the value it repeats, if it is such an error: serde's ``invalid type: string
+/// "...", expected u32`` keeps only what was expected. It is rebuilt rather than masked, because
+/// a value can hold the quotes a mask would look for. A missing or repeated field is left as it
+/// is: it names a field of the tool's schema and no value.
+pub fn argument_error(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(ARGUMENT_ERROR)?;
+    if rest.starts_with("missing field `") || rest.starts_with("duplicate field `") {
+        return None;
+    }
+    Some(match rest.rsplit_once(", expected ") {
+        Some((_, expected)) => format!("{ARGUMENT_ERROR}wrong type or value, expected {expected}"),
+        None => format!("{ARGUMENT_ERROR}wrong type or value"),
+    })
+}
+
+/// One entry of `list_clusters`' `kubeconfig_errors`: the file and a one-line reason, each
+/// redacted on its own, since a redacted value runs to the end of its line.
+pub fn kubeconfig_error_row(path: &Path, error: &str) -> Value {
+    // Redacted before the summary cuts it: a cut can remove what marks a value as a credential.
+    let mut line = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    redact_text(&mut line);
+    let reason = flint_core::redact::safe_error_summary(&line);
+    serde_json::json!({ "file": shown_path(path), "error": reason })
 }
 
 /// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
@@ -1002,6 +1050,55 @@ mod tests {
         assert!(app().fix_settings().contains("Flint app"));
     }
 
+    // covers UP-15: a credential in a kubeconfig path or its error does not reach the agent, and
+    // the other field survives it.
+    #[test]
+    fn kubeconfig_errors_are_redacted_field_by_field() {
+        let row = kubeconfig_error_row(
+            Path::new("/home/me/password=hunter2/config"),
+            "could not read it: token=example-credential",
+        );
+        let text = row.to_string();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("example-credential"), "{text}");
+        assert!(
+            row["file"].as_str().unwrap().starts_with("/home/me/"),
+            "{row}"
+        );
+        assert!(
+            row["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read it"),
+            "{row}"
+        );
+
+        // Spaces are valid in a path: the whole component goes, and the rest stays.
+        let passphrase = kubeconfig_error_row(
+            Path::new("/home/me/password=correct horse battery/config"),
+            "bad yaml",
+        );
+        assert_eq!(
+            passphrase["file"], "/home/me/[REDACTED]/config",
+            "{passphrase}"
+        );
+
+        // A URL whose password starts before the summary's cut and ends after it.
+        let long = format!(
+            "bad url https://user:{}@example.com/ in {}",
+            "p".repeat(300),
+            "x".repeat(10)
+        );
+        let cut = kubeconfig_error_row(Path::new("/home/me/config"), &long);
+        assert!(!cut["error"].as_str().unwrap().contains("ppp"), "{cut}");
+
+        let plain = kubeconfig_error_row(Path::new("/home/me/config"), "bad yaml");
+        assert_eq!(
+            plain,
+            json!({"file": "/home/me/config", "error": "bad yaml"})
+        );
+    }
+
     // covers UP-09: the settings path is cluster-independent but still redacted.
     #[test]
     fn the_settings_path_in_advice_is_redacted() {
@@ -1396,6 +1493,36 @@ mod tests {
         sanitize(&mut list);
         assert_eq!(list["items"][0]["data"]["a"], REDACTED);
         assert!(list["items"][1]["metadata"].get("managedFields").is_none());
+    }
+
+    // covers UP-10: a wrong-type error names what was expected and repeats no value, even one
+    // holding the quotes a mask would rely on.
+    #[test]
+    fn argument_errors_repeat_no_value() {
+        let error = |rest: &str| format!("{ARGUMENT_ERROR}{rest}");
+        for (rest, expected) in [
+            (r#"invalid type: string "s3cret", expected u32"#, "u32"),
+            (r#"invalid type: string "a"s3cret"b", expected u32"#, "u32"),
+            ("invalid value: integer `-7`, expected u32", "u32"),
+            (
+                r#"invalid type: string "x, expected s3cret", expected a boolean"#,
+                "a boolean",
+            ),
+        ] {
+            let safe = argument_error(&error(rest)).unwrap();
+            assert_eq!(
+                safe,
+                error(&format!("wrong type or value, expected {expected}")),
+                "{rest}"
+            );
+        }
+        assert_eq!(
+            argument_error(&error("invalid s3cret")).unwrap(),
+            error("wrong type or value")
+        );
+        // Names a field of the schema, which the agent needs; and other text is not this error.
+        assert_eq!(argument_error(&error("missing field `kind`")), None);
+        assert_eq!(argument_error("NotFound: pods \"x\" not found"), None);
     }
 
     // covers UP-02, UP-09
