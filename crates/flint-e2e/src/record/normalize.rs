@@ -336,6 +336,7 @@ pub fn scrub_secret_table(table: &mut Value) {
         })
         .collect();
     let safe = redact::safe_secret_wire_columns(&definitions);
+    let name_first = definitions.first().is_some_and(|d| d.0 == "Name");
     for row in table
         .get_mut("rows")
         .and_then(Value::as_array_mut)
@@ -345,9 +346,17 @@ pub fn scrub_secret_table(table: &mut Value) {
         if let Some(object) = row.get_mut("object") {
             redact::mask_secret(object, SECRET_MARKER);
         }
+        // The Name cell is the server's text: keep the object's own name instead.
+        let name = row
+            .pointer("/object/metadata/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let Some(cells) = row.get_mut("cells").and_then(Value::as_array_mut) {
             for (i, cell) in cells.iter_mut().enumerate() {
-                if !safe.get(i).copied().unwrap_or(false) {
+                if i == 0 && name_first {
+                    let shown = name.clone().filter(|_| safe[0]);
+                    *cell = Value::String(shown.unwrap_or_else(|| CREDENTIAL_MARKER.to_owned()));
+                } else if !safe.get(i).copied().unwrap_or(false) {
                     *cell = Value::String(CREDENTIAL_MARKER.to_owned());
                 }
             }
@@ -567,7 +576,7 @@ mod tests {
         let mut table = json!({
             "columnDefinitions": [{"name": "Name"}, {"name": "Type"}, {"name": "Value"}],
             "rows": [{"cells": ["s", "Opaque", "hunter2"],
-                      "object": {"metadata": {"annotations": {"kubectl.kubernetes.io/last-applied-configuration": "{}"}}}}],
+                      "object": {"metadata": {"name": "s", "annotations": {"kubectl.kubernetes.io/last-applied-configuration": "{}"}}}}],
         });
         scrub_secret_table(&mut table);
         assert_eq!(
@@ -584,6 +593,14 @@ mod tests {
         normalize_age_cells(named_age.as_object_mut().unwrap());
         assert_eq!(named_age["rows"][0]["cells"], json!([CREDENTIAL_MARKER]));
 
+        // With no object to take the name from, the Name cell is hidden too.
+        let mut no_object = json!({
+            "columnDefinitions": [{"name": "Name"}],
+            "rows": [{"cells": ["hunter2"]}],
+        });
+        scrub_secret_table(&mut no_object);
+        assert_eq!(no_object["rows"][0]["cells"], json!([CREDENTIAL_MARKER]));
+
         // A column is not safe because of its header alone.
         let mut repeated = json!({
             "columnDefinitions": [
@@ -591,13 +608,14 @@ mod tests {
                 {"name": "Name"}, {"name": "Namespace"}, {"name": "Type"}, {"name": "Data"},
                 {"name": "Age"},
             ],
-            "rows": [{"cells": ["s", "Opaque", 1, "1d", "a", "b", "c", "d", "e"]}],
+            "rows": [{"cells": ["wire-text", "Opaque", 1, "1d", "a", "b", "c", "d", "e"],
+                      "object": {"metadata": {"name": "s"}}}],
         });
         scrub_secret_table(&mut repeated);
         let m = CREDENTIAL_MARKER;
         assert_eq!(
             repeated["rows"][0]["cells"],
-            json!(["s", m, m, "1d", m, m, m, m, "e"])
+            json!(["s", m, m, "1d", m, m, m, m, m])
         );
         assert_eq!(
             table["rows"][0]["object"]["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"],
