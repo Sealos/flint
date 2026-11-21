@@ -196,7 +196,7 @@ struct Inner {
     watchers: Mutex<HashMap<Gvr, Vec<Watcher>>>,
     requests: Mutex<Vec<RequestRecord>>,
     /// Every request as it arrived, before faults or answers: what the app sent, and when.
-    arrivals: Mutex<Vec<RequestRecord>>,
+    arrivals: Arc<Mutex<Vec<RequestRecord>>>,
     /// Every write as it arrived, with its body; its status is set when it is answered.
     writes: Mutex<Vec<WriteRecord>>,
     /// Metrics samples queued per target. Locked after `state` when both are needed.
@@ -232,6 +232,36 @@ pub fn arrivals_at(url: &str) -> Option<Vec<RequestRecord>> {
         .and_then(|(_, inner)| inner.upgrade())?;
     drop(running);
     Some(lock(&inner.arrivals).clone())
+}
+
+/// A fake server's arrivals ([`arrival_log_at`]), readable after the server has stopped.
+#[derive(Clone, Debug)]
+pub struct ArrivalLog(Arc<Mutex<Vec<RequestRecord>>>);
+
+impl ArrivalLog {
+    /// The requests that have arrived so far, oldest first.
+    pub fn records(&self) -> Vec<RequestRecord> {
+        lock(&self.0).clone()
+    }
+
+    /// Whether both are the log of the same server.
+    pub fn is_same(&self, other: &ArrivalLog) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The arrival log of the fake server running at `url`, which outlives the server; `None` when
+/// no fake server runs there.
+pub fn arrival_log_at(url: &str) -> Option<ArrivalLog> {
+    let url = url.trim_end_matches('/');
+    let running = lock(&RUNNING);
+    let inner = running
+        .iter()
+        .rev()
+        .find(|(u, _)| u == url)
+        .and_then(|(_, inner)| inner.upgrade())?;
+    drop(running);
+    Some(ArrivalLog(inner.arrivals.clone()))
 }
 
 /// A mark between the connections the fake server at `url` has accepted so far and those it
@@ -356,7 +386,7 @@ impl FakeApiServer {
             scripts: Mutex::default(),
             watchers: Mutex::default(),
             requests: Mutex::default(),
-            arrivals: Mutex::default(),
+            arrivals: Arc::default(),
             writes: Mutex::default(),
             metrics: Mutex::default(),
             in_flight: AtomicUsize::new(0),

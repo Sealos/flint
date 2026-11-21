@@ -513,24 +513,34 @@ impl App {
         self.teardown().selecting(context);
     }
 
-    /// Runs `edit`, the test's own change to the kubeconfig files (UP-06), and takes the files as
-    /// they are after it as the ones the app must leave untouched (UP-90).
-    pub fn edit_kubeconfig<T>(&self, edit: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// Runs `edit`, the test's own change to the kubeconfig `files` (UP-06), and takes those files
+    /// as they are after it as the ones the app must leave untouched (UP-90). Every other file
+    /// keeps its baseline, and a named file that had already changed is still reported.
+    pub fn edit_kubeconfig<T>(
+        &self,
+        files: impl IntoIterator<Item: AsRef<Path>>,
+        edit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let files: Vec<PathBuf> = files.into_iter().map(|f| f.as_ref().to_owned()).collect();
+        self.teardown().kubeconfig_editing(&files);
         let result = edit();
-        self.teardown().kubeconfig_edited();
+        self.teardown().kubeconfig_edited(&files);
         result
     }
 
     /// Writes the app's `settings.toml` (see [`crate::scratch::write_settings`]). Kubeconfig
     /// files the new settings add (`kubeconfig_paths`) are snapshotted first, with the request
-    /// counts of the servers they name, before the app can read them (UP-90, UP-91). Tests
+    /// counts of the servers the new file list names, before the app can read them, and a
+    /// selected context the new order moves is checked from that moment (UP-90, UP-91). Tests
     /// change settings through this, not by writing the file.
     pub fn write_settings(&self, settings: &str) -> Result<()> {
         let staged = tempfile::tempdir()?;
         crate::scratch::write_settings(staged.path(), settings)?;
         let files = kubeconfig_files_in(self.kubeconfig.as_deref(), &self.home(), staged.path());
-        self.teardown().expect_files(files);
-        crate::scratch::write_settings(&self.config_dir(), settings)
+        self.teardown().settings_writing(files);
+        let written = crate::scratch::write_settings(&self.config_dir(), settings);
+        self.teardown().settings_written();
+        written
     }
 
     /// Says the test is failing with an error it is about to return: dropping the app then

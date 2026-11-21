@@ -18,7 +18,7 @@ review (#15). "#116" marks view tests that have since merged (aa59738). The app 
 | 01 | U, ui | `kubeconfig.rs::merges_files_first_wins_and_tracks_sources`, `display.rs::eks_arns_show_the_cluster_name` (U); `app/m0.rs::up_01_launch_and_see_my_clusters` (A, no requests); #116 `clusters_tests.rs` (V, tooltip) | — | — |
 | 02 | U, ui | 6 tests in `kubeconfig.rs` (U); `app/m0.rs::up_02_launch_with_no_usable_kubeconfig` (A) | — | — |
 | 03 | K, ui | `dev_cluster.rs::core_handle_connects_and_reads_version` (K); `e2e/core.rs::connects_and_discovers_every_recorded_kind` (F); `app/m0.rs::up_03_connect_to_a_cluster` (A, also on kind) | — | — |
-| 04 | U, K, ui | `cluster.rs` timeouts and missing plugin (U); `core_handle.rs::unreachable_cluster_fails_with_a_readable_error`; `app/m0.rs::up_04_connection_fails_with_a_plain_cause_and_retries` (A, unreachable only, loose text `TODO(#98)`) | missing and hanging exec plugins in the app | #130, #127 |
+| 04 | U, K, ui | `cluster.rs` timeouts and missing plugin (U); `core_handle.rs::unreachable_cluster_fails_with_a_readable_error`; `app/m0.rs::up_04_connection_fails_with_a_plain_cause_and_retries` (A, exact text for an unreachable server) | missing and hanging exec plugins in the app | #130, #127 |
 | 05 | U, Man | 9 tests in `env_path.rs` (U) | — | [release checklist](./RELEASING.md#3-exec-plugin-auth-from-finder-up-05) |
 | 06 | U, K | `core_handle.rs::reloads_when_kubeconfig_changes`; `app/m0.rs::up_06_kubeconfig_changes_on_disk` (A) | its half-written file lasts 30 ms, under the 300 ms debounce, so a file held half-written is untested | #131 |
 | 07 | U, ui | `core_handle.rs::set_ai_exposed_writes_context_and_server` (U); `ui/workspace_tests.rs::the_expose_dialog_answers_confirm_and_cancel` (V); `app/m0.rs::up_07_expose_a_cluster_to_ai` (A); #116 `expose_tests.rs` | — | — |
@@ -39,7 +39,7 @@ review (#15). "#116" marks view tests that have since merged (aa59738). The app 
 | 24 | K, ui | `watch_cluster.rs::on_view_versus_all_and_switching_clusters` (K); `app/m1.rs::up_24_switch_clusters` (A); `app/m2_shell.rs::up_42_sessions_outlive_navigation` (A + two fakes: a log tab and a shell tab on one cluster keep streaming across a switch to the other, with no new log or exec request, chips naming each tab's cluster) | — | — |
 | 25 | U, K | `watch/tests.rs::watch_mode_transitions` (U); `watch_cluster.rs::on_view_versus_all…` (K); `app/m1.rs::up_25_change_the_watch_mode` (A) | — | — |
 | 26 | K, measured | `watch_load.rs::measure_all_mode_during_scale_down` (K, skipped in CI: `FLINT_LOAD_NAMESPACE` unset); `ui/list_tests.rs::measure_frame_cost_with_10k_rows` (V) | the whole app under load | #133 |
-| 27 | U, K | `watch_recovery.rs::lists_recover_after_the_api_server_restarts` (K, nightly); `e2e/core.rs::relists_after_a_410…` (F); `app/m1.rs::up_27_recover_from_a_broken_watch` (A, loose text `TODO(#98)`) | strict wording | #127 |
+| 27 | U, K | `watch_recovery.rs::lists_recover_after_the_api_server_restarts` (K, nightly); `e2e/core.rs::relists_after_a_410…` (F); `app/m1.rs::up_27_recover_from_a_broken_watch` (A, exact cause in the banner) | — | #127 |
 | 28 | U, K | `table.rs::non_table_responses_fall_back_to_name_namespace_age` (U); `app/m1.rs::up_28_an_api_without_tables` (A) | — | — |
 
 ## M1.5 and M2
