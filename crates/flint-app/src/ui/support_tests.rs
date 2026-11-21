@@ -81,12 +81,34 @@ extern "C" fn clear_proxy_variables() {
     }
 }
 
-// The proxy variables of the environment the tests were started in do not reach them.
+// The proxy variables of the environment the tests were started in do not reach them. Checked
+// in a child started with both set, since CI runs without them.
 #[test]
 fn view_tests_run_without_proxy_variables() {
-    for name in ["HTTPS_PROXY", "https_proxy"] {
-        assert_eq!(std::env::var_os(name), None, "{name}");
+    const CHILD: &str = "FLINT_TEST_PROXY_VARIABLES_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        for name in ["HTTPS_PROXY", "https_proxy"] {
+            assert_eq!(std::env::var_os(name), None, "{name}");
+        }
+        return;
     }
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            &format!("{module}::view_tests_run_without_proxy_variables"),
+            "--exact",
+        ])
+        .env(CHILD, "1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test: {stdout}"
+    );
 }
 
 /// The local servers a test's kubeconfig can point at.
