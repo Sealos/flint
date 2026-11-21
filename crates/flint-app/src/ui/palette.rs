@@ -703,13 +703,18 @@ impl CommandPalette {
         cx.notify();
     }
 
-    /// Only Quit or Close Window is listed and no key or click chose it: no row is selected, and
-    /// Enter runs nothing.
+    /// Only Quit or Close Window is listed, the query does not clearly name the best row, and no
+    /// key or click chose it: no row is selected, and Enter runs nothing.
     fn nothing_selected(&self) -> bool {
         !self.chosen
             && matches!(
                 self.rows.get(self.selected),
-                Some(Row::Action { entry, .. }) if ends_the_app(self.entries[*entry].spec)
+                Some(Row::Action { entry, .. })
+                    if ends_the_app(self.entries[*entry].spec)
+                        && !palette_model::clear_match(
+                            &self.query_text,
+                            self.entries[*entry].spec.label,
+                        )
             )
     }
 

@@ -372,10 +372,23 @@ pub struct Candidate {
     pub alt: Option<String>,
     /// Its place among the recently run actions, 0 for the latest; `None` if it is not one.
     pub recent: Option<usize>,
-    /// Ranks after every other match, however close or recent: Quit and Close Window, so Enter
-    /// on the best row never ends the app (#407).
+    /// Ranks after every other match, however recent, unless the query is a [`clear_match`] for
+    /// it: Quit and Close Window, so Enter on the best row ends the app only when asked (#407).
     pub last: bool,
 }
+
+/// Whether `query` deliberately names `label`: at least [`CLEAR_MATCH_CHARS`] characters, and a
+/// prefix of the label or of a word in it, ignoring case and repeated spaces.
+pub fn clear_match(query: &str, label: &str) -> bool {
+    let spaced = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let query = spaced(query).to_lowercase();
+    let label = spaced(label).to_lowercase();
+    query.chars().count() >= CLEAR_MATCH_CHARS
+        && (label.starts_with(&query) || label.split(' ').any(|word| word.starts_with(&query)))
+}
+
+/// The shortest query that can be a [`clear_match`].
+const CLEAR_MATCH_CHARS: usize = 3;
 
 /// A listed candidate: its index in the candidates, and the label's matched bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,7 +400,8 @@ pub struct Hit {
 /// The candidates matching `query`, best first. With no query: the recent ones (latest first),
 /// then the rest in their own order. With one: by score, so a closer match always wins; among
 /// equal scores the recent ones first (latest first), then in their own order. Either way, the
-/// ones marked [`Candidate::last`] come after all the others.
+/// ones marked [`Candidate::last`] come after all the others, unless the query is a
+/// [`clear_match`] for them; even then they lose a tie.
 pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
     if query.trim().is_empty() {
         let mut hits: Vec<(usize, &Candidate)> = candidates.iter().enumerate().collect();
@@ -401,7 +415,7 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
             .collect();
     }
     let mut matcher = Matcher::new(query);
-    let mut scored: Vec<(bool, i32, usize, Hit)> = candidates
+    let mut scored: Vec<(bool, std::cmp::Reverse<i32>, bool, usize, Hit)> = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, c)| {
@@ -413,17 +427,18 @@ pub fn rank(query: &str, candidates: &[Candidate]) -> Vec<Hit> {
                 }
             };
             Some((
+                c.last && !clear_match(query, &c.label),
+                std::cmp::Reverse(points),
                 c.last,
-                points,
                 c.recent.unwrap_or(usize::MAX),
                 Hit { index, ranges },
             ))
         })
         .collect();
-    scored.sort_by_key(|(last, points, recent, hit)| {
-        (*last, std::cmp::Reverse(*points), *recent, hit.index)
+    scored.sort_by_key(|(held, points, last, recent, hit)| {
+        (*held, *points, *last, *recent, hit.index)
     });
-    scored.into_iter().map(|(_, _, _, hit)| hit).collect()
+    scored.into_iter().map(|(.., hit)| hit).collect()
 }
 
 /// The actions run from the palette, latest first, by name; at most [`RECENTS`].
@@ -454,7 +469,7 @@ pub fn step(selected: usize, count: usize, step: isize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, Matcher, Recents, fuzzy, rank, step};
+    use super::{Candidate, Matcher, Recents, clear_match, fuzzy, rank, step};
 
     fn candidates(labels: &[&str]) -> Vec<Candidate> {
         labels
@@ -595,15 +610,32 @@ mod tests {
         assert_eq!(labels("", &c), ["Toggle Pause", "Open Logs"]);
     }
 
-    // covers UP-30 (#407): an action marked last stays last, however close or recent.
+    // covers UP-30 (#407): an action marked last stays last, however recent, unless the query
+    // clearly names it; even then it loses a tie.
     #[test]
-    fn a_last_candidate_ranks_after_every_other_match() {
+    fn a_last_candidate_ranks_after_other_matches_unless_clearly_named() {
         let mut c = candidates(&["Quit Flint", "Open Logs", "Query Logs"]);
         c[0].last = true;
         c[0].recent = Some(0);
         assert_eq!(labels("", &c), ["Open Logs", "Query Logs", "Quit Flint"]);
         assert_eq!(labels("qu", &c), ["Query Logs", "Quit Flint"]);
         assert_eq!(labels("quit", &c), ["Quit Flint"]);
+
+        let mut tied = candidates(&["Quit Tool", "Hide Tool"]);
+        tied[0].last = true;
+        assert_eq!(labels("tool", &tied), ["Hide Tool", "Quit Tool"]);
+    }
+
+    #[test]
+    fn a_clear_match_is_a_long_enough_prefix_of_the_name_or_a_word() {
+        for query in ["qui", "quit", "QUIT", " quit  flint ", "fli"] {
+            assert!(clear_match(query, "Quit Flint"), "{query}");
+        }
+        assert!(clear_match("close w", "Close Window"));
+        assert!(clear_match("win", "Close Window"));
+        for query in ["", "q", "qu", "qt", "qtf", "uit", "quit x"] {
+            assert!(!clear_match(query, "Quit Flint"), "{query}");
+        }
     }
 
     #[test]

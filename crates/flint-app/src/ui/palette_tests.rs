@@ -597,8 +597,23 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
     );
 }
 
+/// The palette as it shows `query`, opened for it and closed again.
+async fn showing(cx: &mut TestAppContext, t: &TestWorkspace, query: &str) -> PaletteState {
+    open_palette(cx, t).await;
+    t.type_text(cx, query);
+    let palette = shown(cx, t);
+    t.press(cx, "escape");
+    palette
+}
+
+/// The selected row's label, if a row is selected.
+fn preselected(state: &PaletteState) -> Option<&str> {
+    state.selected.map(|at| state.rows[at].label.as_str())
+}
+
 // covers UP-30 (#407): opening the palette and pressing Enter never quits or closes the window.
-// They rank last, and when only they match, nothing is selected until an arrow key picks one.
+// They rank last until the query clearly names them; a short or scattered match that lists only
+// them selects nothing until an arrow key picks one.
 #[gpui_kit::test]
 async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
     const ENDING: [&str; 2] = ["Quit Flint", "Close Window"];
@@ -612,18 +627,36 @@ async fn never_preselects_quit_or_close_window(cx: &mut TestAppContext) {
     let mut last_two = all[all.len() - 2..].to_vec();
     last_two.sort_unstable();
     assert_eq!(last_two, ["Close Window", "Quit Flint"], "{all:?}");
+    t.press(cx, "escape");
 
-    t.type_text(cx, "quit flint");
+    // Short or scattered: not selected. "flint" names a word of Quit Flint, but ties with others.
+    for query in ["q", "qt", "qu", "flint"] {
+        let palette = showing(cx, &t, query).await;
+        let first = preselected(&palette);
+        assert!(
+            !first.is_some_and(|l| ENDING.contains(&l)),
+            "{query}: {palette:?}"
+        );
+    }
+    // Clearly named: selected, so Enter runs it.
+    for (query, label) in [
+        ("qui", "Quit Flint"),
+        ("quit", "Quit Flint"),
+        ("quit flint", "Quit Flint"),
+        ("close w", "Close Window"),
+    ] {
+        let palette = showing(cx, &t, query).await;
+        assert_eq!(preselected(&palette), Some(label), "{query}: {palette:?}");
+    }
+
+    // A scattered match listing only Quit: Enter runs nothing until an arrow key selects it.
+    open_palette(cx, &t).await;
+    t.type_text(cx, "qtf");
     let palette = shown(cx, &t);
     assert_eq!(labels(&palette), ["Quit Flint"]);
     assert_eq!(palette.selected, None, "{palette:?}");
     t.press(cx, "enter");
-    assert_eq!(
-        shown(cx, &t).query,
-        "quit flint",
-        "Enter with nothing selected runs nothing"
-    );
-
+    assert_eq!(shown(cx, &t).query, "qtf", "Enter ran nothing");
     t.press(cx, "down");
     assert_eq!(selected(&shown(cx, &t)), "Quit Flint");
     t.press(cx, "escape");
@@ -820,7 +853,6 @@ async fn a_stale_focus_behind_the_palette_does_not_strand_it(cx: &mut TestAppCon
     open_palette(cx, &t).await;
     strand_palette(cx, &t);
     t.type_text(cx, "quit flint");
-    t.press(cx, "down");
     t.press(cx, "enter");
     assert!(palette_closed(cx, &t));
     cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
