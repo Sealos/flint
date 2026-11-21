@@ -23,6 +23,9 @@ const LOCK_WAIT: Duration = Duration::from_millis(50);
 const QUEUE: usize = 1024;
 /// How long [`flush`] waits for queued events to reach the file.
 const FLUSH_WAIT: Duration = Duration::from_millis(500);
+/// How many times a write looks for the current lock file when the directory keeps being
+/// replaced while it waits.
+const LOCK_ATTEMPTS: usize = 3;
 
 static FILE_QUEUE: OnceLock<SyncSender<Message>> = OnceLock::new();
 
@@ -30,6 +33,8 @@ static FILE_QUEUE: OnceLock<SyncSender<Message>> = OnceLock::new();
 /// rotating log file filtered by `file_filter`.
 pub(crate) fn init(stderr_filter: EnvFilter, file_filter: EnvFilter) {
     let state_home = std::env::var_os("XDG_STATE_HOME");
+    // Spawning only: the writer thread opens the file, so a log directory on an unresponsive
+    // mount cannot hold up startup.
     let file = log_path(
         cfg!(target_os = "macos"),
         std::env::home_dir().as_deref(),
@@ -46,8 +51,16 @@ pub(crate) fn init(stderr_filter: EnvFilter, file_filter: EnvFilter) {
     }
     subscriber(stderr_filter, file_filter, file, io::stderr).init();
     if let Some(error) = error {
-        tracing::warn!(%error, "could not open Flint's log file; logging to stderr");
+        tracing::warn!(%error, "could not start Flint's log file; logging to stderr");
     }
+}
+
+/// Writes one error to the log file only, for a startup failure before [`init`] would run: the
+/// caller has already printed it on stderr. A launch from Finder has no other trace of it.
+pub(crate) fn log_startup_failure(file_filter: EnvFilter, message: &str) {
+    init(EnvFilter::new("off"), file_filter);
+    tracing::error!("{message}");
+    flush();
 }
 
 /// Waits briefly for queued events to reach the log file. Call it before the process exits.
@@ -144,21 +157,38 @@ struct FileLog {
 
 impl FileLog {
     fn spawn(path: PathBuf, max_bytes: u64) -> io::Result<Self> {
-        Self::spawn_writer(FileWriter::open(path, max_bytes, LOCK_WAIT)?)
+        Self::spawn_opening(move || FileWriter::open(path, max_bytes, LOCK_WAIT))
     }
 
-    fn spawn_writer(mut writer: FileWriter) -> io::Result<Self> {
+    /// Starts the writer thread, which runs `open` first. Until `open` returns, events wait in
+    /// the queue (and past its size are dropped), and if it fails they are dropped: stderr keeps
+    /// them, and says why.
+    fn spawn_opening(
+        open: impl FnOnce() -> io::Result<FileWriter> + Send + 'static,
+    ) -> io::Result<Self> {
         let (queue, events) = mpsc::sync_channel(QUEUE);
         std::thread::Builder::new()
             .name("flint-log".into())
             .spawn(move || {
+                let mut writer = match open() {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "flint: could not open the log file; logging to stderr: {error}"
+                        );
+                        None
+                    }
+                };
                 for message in events {
                     match message {
                         // Redact here, off the emitting thread. A failed write drops the event;
                         // stderr keeps it.
                         Message::Event(bytes) => {
-                            let text = String::from_utf8_lossy(&bytes);
-                            let _ = writer.write(redact_credentials(&text).text.as_bytes());
+                            if let Some(writer) = &mut writer {
+                                let text = String::from_utf8_lossy(&bytes);
+                                let _ = writer.write(redact_credentials(&text).text.as_bytes());
+                            }
                         }
                         Message::Flush(done) => {
                             let _ = done.send(());
@@ -224,19 +254,40 @@ impl FileWriter {
         } else {
             bytes
         };
-        // The directory may have been removed and recreated (by this or another process): lock
-        // the lock file that is at the path now, so every writer shares one.
-        if !is_same_file(&self.lock, &self.lock_path)? {
-            fs::create_dir_all(self.path.parent().expect("log path has a parent directory"))?;
-            self.lock = open_private(&self.lock_path)?;
-        }
-        let _lock = self.lock()?;
+        self.lock_current()?;
+        let _lock = Locked(&self.lock);
         let mut file = open_private(&self.path)?;
         if file.metadata()?.len() + event.len() as u64 > self.max_bytes {
             self.rotate()?;
             file = open_private(&self.path)?;
         }
         file.write_all(event)
+    }
+
+    /// Takes the lock on the lock file that is at the path now, so every writer shares one. The
+    /// directory may be removed and recreated (by this or another process), also while this
+    /// waits for the lock, so the path is compared again once the lock is held. On success the
+    /// caller holds the lock and must release it.
+    fn lock_current(&mut self) -> io::Result<()> {
+        for _ in 0..LOCK_ATTEMPTS {
+            if !is_same_file(&self.lock, &self.lock_path)? {
+                fs::create_dir_all(self.path.parent().expect("log path has a parent directory"))?;
+                self.lock = open_private(&self.lock_path)?;
+            }
+            std::mem::forget(self.lock()?);
+            match is_same_file(&self.lock, &self.lock_path) {
+                Ok(true) => return Ok(()),
+                Ok(false) => drop(Locked(&self.lock)),
+                Err(error) => {
+                    drop(Locked(&self.lock));
+                    return Err(error);
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Flint's log directory keeps being replaced",
+        ))
     }
 
     /// Takes the cross-process lock, giving up after `lock_wait`: a process stopped while
@@ -428,6 +479,58 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_file_replaced_during_the_wait_is_not_written_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/flint.log");
+        let holder = writer(&path, 1024);
+        let mut waiting = writer(&path, 1024);
+        let held = holder.lock().unwrap();
+        std::thread::scope(|scope| {
+            let write = scope.spawn(|| waiting.write(b"after\n"));
+            // Long enough for the writer to be waiting on the old lock file.
+            std::thread::sleep(Duration::from_millis(100));
+            fs::remove_dir_all(dir.path().join("logs")).unwrap();
+            let mut replacement = writer(&path, 1024);
+            replacement.write(b"first\n").unwrap();
+            drop(held);
+            write.join().unwrap().unwrap();
+        });
+        assert!(is_same_file(&waiting.lock, &waiting.lock_path).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\nafter\n");
+    }
+
+    #[test]
+    fn a_log_file_that_cannot_open_is_reported_and_events_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("file");
+        fs::write(&blocked, "").unwrap();
+        // Its parent is a file, so the directory cannot be created.
+        let log = FileLog::spawn(blocked.join("flint.log"), MAX_BYTES).unwrap();
+        (&log).write_all(b"dropped\n").unwrap();
+        let started = Instant::now();
+        flush_queue(&log.queue);
+        assert!(
+            started.elapsed() < FLUSH_WAIT,
+            "the writer thread still answers"
+        );
+    }
+
+    #[test]
+    fn a_log_file_that_hangs_on_open_does_not_hold_up_the_caller() {
+        let (release, hung) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let log = FileLog::spawn_opening(move || {
+            let _ = hung.recv();
+            Err(io::Error::other("released"))
+        })
+        .unwrap();
+        (&log).write_all(b"queued\n").unwrap();
+        flush_queue(&log.queue);
+        assert!(started.elapsed() < FLUSH_WAIT * 2);
+        drop(release);
+    }
+
+    #[test]
     fn file_logs_use_their_filter_and_exclude_credentials_and_dependency_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flint.log");
@@ -481,7 +584,8 @@ mod tests {
         let other = writer(&path, 1024);
         let held = other.lock().unwrap();
         // The writer thread waits for the held lock on every event; the queue fills up.
-        let mut log = &FileLog::spawn_writer(writer(&path, 1024)).unwrap();
+        let stalled = writer(&path, 1024);
+        let mut log = &FileLog::spawn_opening(move || Ok(stalled)).unwrap();
         let started = Instant::now();
         for _ in 0..QUEUE * 2 {
             log.write_all(b"event\n").unwrap();
