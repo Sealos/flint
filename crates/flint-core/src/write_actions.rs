@@ -72,9 +72,11 @@ pub(crate) enum ActionError {
 impl ActionError {
     fn of(error: kube::Error) -> Self {
         let code = api_code(&error);
+        let replaced = names_another_uid(&error);
         let message = ClusterError::kube(error).summary().to_string();
         match code {
             Some(409) => Self::Conflict(message),
+            Some(422) if replaced => Self::Conflict(message),
             Some(404) => Self::Gone(message),
             _ => Self::Failed(message),
         }
@@ -86,6 +88,18 @@ fn api_code(error: &kube::Error) -> Option<u16> {
         kube::Error::Api(status) => Some(status.code),
         _ => None,
     }
+}
+
+/// Whether a patch was refused for naming another uid than the object's: the API server answers
+/// a patch's `metadata.uid` that way on most resources, and with a conflict on `scale`.
+fn names_another_uid(error: &kube::Error) -> bool {
+    let kube::Error::Api(status) = error else {
+        return false;
+    };
+    status
+        .details
+        .as_ref()
+        .is_some_and(|d| d.causes.iter().any(|c| c.field == "metadata.uid"))
 }
 
 fn patch_params() -> PatchParams {
@@ -590,6 +604,38 @@ mod tests {
             );
         }
         assert_eq!(log.lock().unwrap().len(), 4);
+    }
+
+    // covers UP-52: a patch refused for its uid means the object was replaced: review it again.
+    // Any other invalid patch is a failure.
+    #[tokio::test]
+    async fn a_refused_uid_is_a_conflict() {
+        let invalid = |field: &str| {
+            json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 422,
+                "reason": "Invalid", "message": "invalid",
+                "details": {"causes": [{"reason": "FieldValueInvalid", "field": field,
+                                        "message": "invalid"}]},
+            })
+        };
+        let uid = invalid("metadata.uid");
+        let (client, _log) = fake(Arc::new(move |_| (422, uid.clone())));
+        let mut gated = writes(client, open());
+        let result = rollout_restart(&mut gated, &deployment()).await;
+        assert!(
+            matches!(result, Err(ActionError::Conflict(_))),
+            "{result:?}"
+        );
+        let result = set_cordoned(&mut gated, &node(), true).await;
+        assert!(
+            matches!(result, Err(ActionError::Conflict(_))),
+            "{result:?}"
+        );
+
+        let other = invalid("spec.replicas");
+        let (client, _log) = fake(Arc::new(move |_| (422, other.clone())));
+        let result = scale(&mut writes(client, open()), &deployment(), 3).await;
+        assert!(matches!(result, Err(ActionError::Failed(_))), "{result:?}");
     }
 
     // covers UP-54: with the gate closed, no action sends anything.
