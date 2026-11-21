@@ -433,29 +433,29 @@ mod tests {
             .iter()
             .map(|c| c["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["alpha", "beta"]);
+        assert_eq!(names, ["kind-alpha", "kind-beta"]);
 
         let selected = ask(
             cx,
             &target,
-            json!({"id": 2, "cmd": "select_cluster", "args": {"cluster": "beta"}}),
+            json!({"id": 2, "cmd": "select_cluster", "args": {"cluster": "kind-beta"}}),
         )
         .await;
         assert_eq!(selected["ok"], true, "{selected}");
         let active = model.clone();
         cx.wait_for(window, WAIT, move |_, cx| {
-            active.read(cx).active.as_deref() == Some("beta")
+            active.read(cx).active.as_deref() == Some("kind-beta")
         })
         .await;
         let waited = ask(
             cx,
             &target,
-            json!({"id": 3, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "beta"}}),
+            json!({"id": 3, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "kind-beta"}}),
         )
         .await;
         assert_eq!(waited["ok"], true, "{waited}");
         assert_eq!(waited["result"]["clusters"][1]["active"], true);
-        // Nothing listens on beta's port: the error says so in plain words, naming the server.
+        // Nothing listens on kind-beta's port: the error says so in plain words, naming the server.
         let refused = format!(
             "connection refused by {}; is the API server running, and is the port right?",
             t.refused_server
@@ -495,7 +495,7 @@ mod tests {
                 "invalid_args",
             ),
             (
-                json!({"id": 10, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "alpha", "timeout_ms": 0}}),
+                json!({"id": 10, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "kind-alpha", "timeout_ms": 0}}),
                 "timeout",
             ),
         ];
@@ -535,14 +535,14 @@ mod tests {
         let selected = ask(
             cx,
             &target,
-            json!({"cmd": "select_cluster", "args": {"cluster": "alpha"}}),
+            json!({"cmd": "select_cluster", "args": {"cluster": "kind-alpha"}}),
         )
         .await;
         assert!(ok(&selected), "{selected}");
         // The core reports the activation asynchronously; the guards follow the workspace.
         let workspace = t.workspace.clone();
         cx.wait_for(t.window, WAIT, move |_, cx| {
-            workspace.read(cx).view_state_cluster() == Some("alpha")
+            workspace.read(cx).view_state_cluster() == Some("kind-alpha")
         })
         .await;
         serve_pods(cx, &t);
@@ -660,7 +660,7 @@ mod tests {
             let target = target(&t, dir.path());
             cx.spawn(async move |mut cx| {
                 handle_line(
-                    &json!({"id": 1, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "beta", "timeout_ms": 5000}}).to_string(),
+                    &json!({"id": 1, "cmd": "wait_for", "args": {"pointer": "/active_cluster", "equals": "kind-beta", "timeout_ms": 5000}}).to_string(),
                     &target,
                     &mut cx,
                 )
@@ -669,10 +669,10 @@ mod tests {
         };
         cx.executor().advance_clock(Duration::from_millis(200));
         cx.run_until_parked();
-        t.model.update(cx, |m, _| m.activate("beta".into()));
+        t.model.update(cx, |m, _| m.activate("kind-beta".into()));
         let workspace = t.workspace.clone();
         cx.wait_for(t.window, WAIT, move |_, cx| {
-            workspace.read(cx).view_state_cluster() == Some("beta")
+            workspace.read(cx).view_state_cluster() == Some("kind-beta")
         })
         .await;
         cx.executor().advance_clock(Duration::from_millis(200));

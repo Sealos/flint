@@ -41,15 +41,15 @@ pub const CURRENT_GENERATION: u64 = u64::MAX;
 pub const WAIT: Duration = Duration::from_secs(10);
 
 /// The main window, once the core has loaded kubeconfig. With [`open_workspace`] it shows two
-/// contexts: `alpha`'s server accepts connections and never answers, so it stays "connecting"
-/// and its views show; `beta`'s refuses them. Nothing outside this process is reached.
+/// contexts: `kind-alpha`'s server accepts connections and never answers, so it stays "connecting"
+/// and its views show; `kind-beta`'s refuses them. Nothing outside this process is reached.
 pub struct TestWorkspace {
     pub window: AnyWindowHandle,
     pub workspace: Entity<Workspace>,
     pub model: Entity<ClustersModel>,
-    /// The silent server's URL, as kubeconfig names it (`alpha`'s server).
+    /// The silent server's URL, as kubeconfig names it (`kind-alpha`'s server).
     pub server: String,
-    /// `beta`'s server: a local port nothing listens on.
+    /// `kind-beta`'s server: a local port nothing listens on.
     pub refused_server: String,
     /// The silent server. It never answers; tests can check that nothing connected to it.
     listener: TcpListener,
@@ -60,7 +60,7 @@ pub struct TestWorkspace {
     _record_states: Subscription,
 }
 
-/// The workspace over `alpha` (silent) and `beta` (refused), with default settings.
+/// The workspace over `kind-alpha` (silent) and `kind-beta` (refused), with default settings.
 pub async fn open_workspace(cx: &mut TestAppContext, dir: &Path) -> TestWorkspace {
     open_workspace_with(cx, dir, alpha_and_beta).await
 }
@@ -119,12 +119,15 @@ pub struct Servers {
     pub refused: String,
 }
 
-/// One kubeconfig file with `alpha` on the silent server, and `beta` on the refused one.
+/// One kubeconfig file with `kind-alpha` on the silent server, and `kind-beta` on the refused one.
 pub fn alpha_and_beta(dir: &Path, servers: &Servers) -> Vec<PathBuf> {
     let kubeconfig = dir.join("kubeconfig");
     std::fs::write(
         &kubeconfig,
-        kubeconfig_yaml(&[("alpha", &servers.silent), ("beta", &servers.refused)]),
+        kubeconfig_yaml(&[
+            ("kind-alpha", &servers.silent),
+            ("kind-beta", &servers.refused),
+        ]),
     )
     .unwrap();
     vec![kubeconfig]
@@ -272,7 +275,7 @@ pub async fn open_empty_workspace(
     (window, workspace, model)
 }
 
-/// Opens a running shell on `alpha` in the dock, over a session the test drives.
+/// Opens a running shell on `kind-alpha` in the dock, over a session the test drives.
 pub fn open_fake_shell(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -290,7 +293,7 @@ pub fn open_fake_shell_in(
     use crate::ui::terminal_model::ShellRequest;
     use crate::ui::terminal_view::TerminalView;
     let request = ShellRequest {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         namespace: "demo".into(),
         pod: pod.into(),
         container: Some("app".into()),
@@ -305,7 +308,7 @@ pub fn open_fake_shell_in(
             dock.update(cx, |dock, cx| {
                 dock.open(
                     crate::ui::dock::TabKey::Shell(request.clone()),
-                    TabCluster::new("alpha", Some(&server)),
+                    TabCluster::new("kind-alpha", Some(&server)),
                     |window, cx| {
                         crate::ui::dock::DockTab::Shell(
                             cx.new(|cx| TerminalView::new(session, request, window, cx)),
@@ -441,25 +444,27 @@ impl TestWorkspace {
         .await;
     }
 
-    /// Activates `alpha` and makes it connected with `sections` as its navigation, as the core
-    /// reports a connect and a discovery. Also after a switch back to `alpha`: its state is
+    /// Activates `kind-alpha` and makes it connected with `sections` as its navigation, as the core
+    /// reports a connect and a discovery. Also after a switch back to `kind-alpha`: its state is
     /// reset first, so only the core's own "connecting" for this activation satisfies the wait,
     /// and that cannot land after the connect fed here.
     pub async fn connect_alpha(&self, cx: &mut TestAppContext, sections: Vec<NavSection>) {
         self.feed(
             cx,
             Event::ConnectionChanged {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 state: ConnectionState::Disconnected,
             },
         );
-        self.activate(cx, "alpha").await;
-        self.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connecting))
-            .await;
+        self.activate(cx, "kind-alpha").await;
+        self.wait_for_state(cx, "kind-alpha", |s| {
+            matches!(s, ConnectionState::Connecting)
+        })
+        .await;
         self.feed(
             cx,
             Event::ConnectionChanged {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 state: ConnectionState::Connected(ServerVersion {
                     git_version: "v1.33.1".into(),
                     platform: "linux/arm64".into(),
@@ -469,7 +474,7 @@ impl TestWorkspace {
         self.feed(
             cx,
             Event::DiscoveryChanged {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 generation: crate::ui::support_tests::CURRENT_GENERATION,
                 discovery: Some(Arc::new(discovery(sections))),
                 error: None,
@@ -506,7 +511,7 @@ impl TestWorkspace {
         cx.run_until_parked();
     }
 
-    /// Connects `alpha` with the standard navigation and opens Pods through the registry, with
+    /// Connects `kind-alpha` with the standard navigation and opens Pods through the registry, with
     /// `rows` fed by hand.
     pub async fn open_pods(&self, cx: &mut TestAppContext, rows: &[(&str, &str, i64)]) {
         self.connect_alpha(cx, standard_sections()).await;
@@ -657,7 +662,7 @@ impl TestWorkspace {
         std::fs::read_to_string(self.dir.join("settings.toml")).unwrap_or_default()
     }
 
-    /// Waits until `alpha`'s connection attempt has reached the silent server, returning that
+    /// Waits until `kind-alpha`'s connection attempt has reached the silent server, returning that
     /// connection, or has failed without reaching it. While the connection is held, open and
     /// unanswered, the attempt neither fails nor retries.
     pub async fn wait_for_alpha_attempt(&self, cx: &mut TestAppContext) -> Option<TcpStream> {
@@ -671,7 +676,7 @@ impl TestWorkspace {
             let failed = states
                 .borrow()
                 .iter()
-                .any(|(name, s)| name == "alpha" && matches!(s, ConnectionState::Failed(_)));
+                .any(|(name, s)| name == "kind-alpha" && matches!(s, ConnectionState::Failed(_)));
             match listener.accept() {
                 Ok((stream, _)) => {
                     *slot.borrow_mut() = Some(stream);
@@ -685,7 +690,7 @@ impl TestWorkspace {
         accepted.take()
     }
 
-    /// Whether anything has connected to the silent server (`alpha`'s) so far.
+    /// Whether anything has connected to the silent server (`kind-alpha`'s) so far.
     pub fn server_was_contacted(&self) -> bool {
         self.listener.set_nonblocking(true).unwrap();
         match self.listener.accept() {
@@ -866,7 +871,7 @@ pub fn objects(
         .collect();
     rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Arc::new(KindSnapshot {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         kind,
         namespaced,
         columns: columns.into(),
@@ -877,7 +882,7 @@ pub fn objects(
     })
 }
 
-/// Gives `alpha` a navigation with Pods, as if its discovery had arrived.
+/// Gives `kind-alpha` a navigation with Pods, as if its discovery had arrived.
 #[cfg(feature = "automation")]
 pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
     use flint_core::{ClusterDiscovery, KindInfo};
@@ -908,10 +913,10 @@ pub fn serve_pods(cx: &mut TestAppContext, t: &TestWorkspace) {
         let generation = model
             .clusters
             .iter()
-            .find(|c| c.info.name == "alpha")
+            .find(|c| c.info.name == "kind-alpha")
             .map_or(0, |c| c.generation);
         model.discovery.insert(
-            "alpha".into(),
+            "kind-alpha".into(),
             Discovered {
                 discovery: Some(Arc::new(discovery)),
                 error: None,

@@ -1,6 +1,6 @@
 //! M3 user paths: protected clusters (UP-54, UP-55), against the fake API server.
 //!
-//! The fake server listens on `127.0.0.1`, and clusters on this machine start unlocked, so the
+//! The fake server listens on `127.0.0.1` under a known local context, which starts unlocked, so the
 //! tests turn on `protect_local_clusters` to meet a protected one. Not here, and why:
 //!
 //! - **A remote cluster protected by default, and a trusted context re-pointed at another

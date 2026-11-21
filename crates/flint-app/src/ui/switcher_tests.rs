@@ -15,7 +15,7 @@ use crate::ui::support_tests::{
 };
 use crate::ui::view_state::{Focus, PaletteState};
 
-/// Puts rows in the core's stores for `alpha`, as its watches would hold them.
+/// Puts rows in the core's stores for `kind-alpha`, as its watches would hold them.
 fn store(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -27,7 +27,7 @@ fn store(
         .read_with(cx, |m, _| m.core().store_for_tests(snapshot))
 }
 
-/// `alpha` connected with the standard navigation, and pods and a deployment in memory.
+/// `kind-alpha` connected with the standard navigation, and pods and a deployment in memory.
 async fn alpha_with_objects(cx: &mut TestAppContext, t: &TestWorkspace) -> Vec<StoredForTests> {
     t.connect_alpha(cx, standard_sections()).await;
     vec![
@@ -125,11 +125,11 @@ async fn lists_kinds_and_objects_and_filters_them(cx: &mut TestAppContext) {
         "watch mode All lists every kind's objects"
     );
     assert_eq!(pods.kind.as_deref(), Some("pods"));
-    assert_eq!(pods.cluster.as_deref(), Some("alpha"));
+    assert_eq!(pods.cluster.as_deref(), Some("kind-alpha"));
     let web = &switcher.rows[6];
     assert_eq!(web.detail.as_deref(), Some("Deployments"));
     assert_eq!(web.kind.as_deref(), Some("deployments.apps"));
-    assert_eq!(web.cluster.as_deref(), Some("alpha"));
+    assert_eq!(web.cluster.as_deref(), Some("kind-alpha"));
     assert_eq!(
         switcher.footer.as_deref(),
         Some("6 kinds and 3 objects in memory")
@@ -314,7 +314,7 @@ async fn enter_on_an_object_opens_it_selected_with_its_details(cx: &mut TestAppC
     assert_eq!(focus, Focus::List);
     let filter = t
         .workspace
-        .read_with(cx, |ws, _| ws.namespace_filter_of(&"alpha".into()));
+        .read_with(cx, |ws, _| ws.namespace_filter_of(&"kind-alpha".into()));
     assert_eq!(filter, ["kube-system"], "the filter is not changed");
     let banner = list_state
         .banners
@@ -357,13 +357,13 @@ async fn searching_never_reaches_the_cluster(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
     let _stored = alpha_with_objects(cx, &t).await;
-    // Activating alpha starts one real attempt, which reaches the server on its own task,
+    // Activating kind-alpha starts one real attempt, which reaches the server on its own task,
     // possibly well after "connecting" is reported, or fails first (a proxy in the environment).
     // Wait for either, keeping its connection open and unanswered, so that any connection from
     // here on is the switcher's.
     let _activation = t.wait_for_alpha_attempt(cx).await;
     let core = t.model.read_with(cx, |m, _| m.core().clone());
-    let hubs = core.sync_states("alpha");
+    let hubs = core.sync_states("kind-alpha");
 
     open_switcher(cx, &t).await;
     for query in ["w", "we", "web", "pods", "coredns"] {
@@ -382,7 +382,11 @@ async fn searching_never_reaches_the_cluster(cx: &mut TestAppContext) {
         !t.server_was_contacted(),
         "the switcher reached the cluster"
     );
-    assert_eq!(core.sync_states("alpha"), hubs, "a kind was subscribed");
+    assert_eq!(
+        core.sync_states("kind-alpha"),
+        hubs,
+        "a kind was subscribed"
+    );
 }
 
 // covers UP-31: a cluster with nothing in memory lists its kinds; with no cluster active the
@@ -400,7 +404,7 @@ async fn an_empty_cluster_lists_only_its_kinds(cx: &mut TestAppContext) {
     );
     t.press(cx, "escape");
 
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     open_switcher(cx, &t).await;
     assert_eq!(
         shown(cx, &t).footer.as_deref(),
@@ -432,11 +436,11 @@ async fn an_empty_cluster_lists_only_its_kinds(cx: &mut TestAppContext) {
 async fn says_why_kinds_or_objects_are_missing(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: None,
             error: Some("the server is unreachable".into()),
@@ -454,7 +458,7 @@ async fn says_why_kinds_or_objects_are_missing(cx: &mut TestAppContext) {
         .unwrap();
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        model.read(cx).settings.watch_mode_for("alpha") == flint_core::WatchMode::OnView
+        model.read(cx).settings.watch_mode_for("kind-alpha") == flint_core::WatchMode::OnView
     })
     .await;
     open_switcher(cx, &t).await;
@@ -750,18 +754,18 @@ async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
     t.type_text(cx, "web");
     let before = shown(cx, &t);
     assert_eq!(labels(&before), ["demo/web", "demo/web-7d9f"]);
-    assert_eq!(before.rows[0].cluster.as_deref(), Some("alpha"));
-    // beta becomes active, and serves the same kinds.
+    assert_eq!(before.rows[0].cluster.as_deref(), Some("kind-alpha"));
+    // kind-beta becomes active, and serves the same kinds.
     t.dispatch(
         cx,
         "workspace::SelectCluster",
-        serde_json::json!({"cluster": "beta"}),
+        serde_json::json!({"cluster": "kind-beta"}),
     )
     .unwrap();
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "beta".into(),
+            cluster: "kind-beta".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
@@ -771,7 +775,7 @@ async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
     );
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).shown_cluster() == Some("beta")
+        workspace.read(cx).shown_cluster() == Some("kind-beta")
     })
     .await;
     let after = shown(cx, &t);
@@ -781,18 +785,18 @@ async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
         after
             .rows
             .iter()
-            .all(|r| r.cluster.as_deref() == Some("beta")),
+            .all(|r| r.cluster.as_deref() == Some("kind-beta")),
         "{after:?}"
     );
     assert!(labels(&after).iter().all(|l| !l.contains("web-7d9f")));
-    // An Enter from alpha's rows, arriving now: refused, nothing opens on beta.
+    // An Enter from kind-alpha's rows, arriving now: refused, nothing opens on kind-beta.
     t.focus_workspace(cx);
     let refused = t.dispatch(
         cx,
         "workspace::OpenObject",
         serde_json::json!({
             "kind": "pods", "namespace": "demo", "name": "web-7d9f",
-            "cluster": "alpha", "server": t.server,
+            "cluster": "kind-alpha", "server": t.server,
         }),
     );
     assert!(
@@ -806,7 +810,7 @@ async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
     let refused = t.dispatch(
         cx,
         "workspace::OpenView",
-        serde_json::json!({"kind": "pods", "cluster": "alpha", "server": t.server}),
+        serde_json::json!({"kind": "pods", "cluster": "kind-alpha", "server": t.server}),
     );
     assert!(refused.is_err(), "{refused:?}");
 }
@@ -817,7 +821,7 @@ async fn another_active_cluster_lists_anew(cx: &mut TestAppContext) {
 async fn kinds_arrive_in_an_open_switcher(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    t.activate(cx, "alpha").await;
+    t.activate(cx, "kind-alpha").await;
     open_switcher(cx, &t).await;
     assert_eq!(
         shown(cx, &t).footer.as_deref(),
@@ -827,7 +831,7 @@ async fn kinds_arrive_in_an_open_switcher(cx: &mut TestAppContext) {
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
@@ -904,15 +908,15 @@ async fn a_limited_list_proves_an_object_gone_only_when_its_namespace_is_listed_
 async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let t = open_workspace(cx, dir.path()).await;
-    // Pods open on alpha: the view alpha restores.
+    // Pods open on kind-alpha: the view kind-alpha restores.
     t.open_pods(cx, &[("demo", "api", 0)]).await;
-    t.activate(cx, "beta").await;
-    t.activate(cx, "alpha").await;
-    // alpha's discovery is gone for now (it failed, say): nothing to restore yet.
+    t.activate(cx, "kind-beta").await;
+    t.activate(cx, "kind-alpha").await;
+    // kind-alpha's discovery is gone for now (it failed, say): nothing to restore yet.
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: None,
             error: Some("unreachable".into()),
@@ -920,8 +924,8 @@ async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
     );
     if t.list(cx).is_some() {
         // Restored already from the discovery kept before: close it to restore again.
-        t.activate(cx, "beta").await;
-        t.activate(cx, "alpha").await;
+        t.activate(cx, "kind-beta").await;
+        t.activate(cx, "kind-alpha").await;
     }
     open_switcher(cx, &t).await;
     t.type_text(cx, "web");
@@ -930,7 +934,7 @@ async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
@@ -938,7 +942,7 @@ async fn a_restored_view_leaves_the_switcher_open(cx: &mut TestAppContext) {
             error: None,
         },
     );
-    let list = t.list(cx).expect("alpha's last view is restored");
+    let list = t.list(cx).expect("kind-alpha's last view is restored");
     assert_eq!(list.read_with(cx, |l, _| l.kind().clone()), KindId::pods());
     let (switcher, focus) = state(cx, &t);
     let switcher = switcher.expect("the switcher stays open");
@@ -967,7 +971,7 @@ async fn a_renamed_kind_lists_anew(cx: &mut TestAppContext) {
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 sections,
@@ -1097,7 +1101,7 @@ async fn the_chosen_item_survives_a_rename(cx: &mut TestAppContext) {
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 sections,
@@ -1152,7 +1156,7 @@ async fn an_index_read_for_an_earlier_scope_is_dropped(cx: &mut TestAppContext) 
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 sections,
@@ -1186,11 +1190,14 @@ async fn a_cluster_that_starts_over_lists_anew(cx: &mut TestAppContext) {
         let alpha = m
             .clusters
             .iter_mut()
-            .find(|c| c.info.name == "alpha")
-            .expect("alpha is listed");
+            .find(|c| c.info.name == "kind-alpha")
+            .expect("kind-alpha is listed");
         alpha.generation += 1;
         let generation = alpha.generation;
-        let discovered = m.discovery.get_mut("alpha").expect("alpha was discovered");
+        let discovered = m
+            .discovery
+            .get_mut("kind-alpha")
+            .expect("kind-alpha was discovered");
         discovered.generation = generation;
         cx.notify();
     });
