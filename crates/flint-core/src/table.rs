@@ -4,8 +4,9 @@
 //! Lists and watches ask for Tables with `includeObject=Metadata`, so every row carries the
 //! object's identity. See `docs/spikes/table-watch.md` for the wire format. Rows keep what a list
 //! needs and nothing else: `managedFields`, annotations and owner references are never stored
-//! (the detail view fetches the full object), the `Age` cell is never stored as text (the UI
-//! computes it from `creationTimestamp`), and repeated strings are interned per kind.
+//! (the detail view fetches the full object; of the annotations, a row keeps only the GitOps
+//! manager they name), the `Age` cell is never stored as text (the UI computes it from
+//! `creationTimestamp`), and repeated strings are interned per kind.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -19,6 +20,7 @@ use serde_json::Value;
 
 use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{self, ClusterError};
+use crate::gitops;
 use crate::paging;
 use crate::read::{KindInfo, ListQuery};
 
@@ -174,6 +176,13 @@ impl Row {
             .iter()
             .find(|(k, _)| &**k == key)
             .map(|(_, v)| &**v)
+    }
+
+    /// The Argo CD or Flux object managing this one, as [`gitops::ManagedBy`] prints it. Read from
+    /// the list's own metadata. A Secret list must not show or match it: its annotations are
+    /// masked.
+    pub fn managed_by(&self) -> Option<&str> {
+        self.label(gitops::ROW_MANAGER_KEY)
     }
 }
 
@@ -374,7 +383,7 @@ pub(crate) struct WireMeta {
     pub generation: Option<i64>,
     #[serde(default)]
     pub labels: Option<BTreeMap<String, String>>,
-    /// Only the annotation Flint needs is parsed; the rest are skipped.
+    /// Only the annotations Flint needs are parsed; the rest are skipped.
     #[serde(default)]
     pub annotations: Option<MarkerAnnotations>,
 }
@@ -383,6 +392,68 @@ pub(crate) struct WireMeta {
 pub(crate) struct MarkerAnnotations {
     #[serde(default, rename = "k8s.io/initial-events-end")]
     pub initial_events_end: Option<String>,
+    #[serde(
+        default,
+        rename = "argocd.argoproj.io/tracking-id",
+        deserialize_with = "text_or_none"
+    )]
+    argo_tracking_id: Option<String>,
+    #[serde(
+        default,
+        rename = "argocd.argoproj.io/instance",
+        deserialize_with = "text_or_none"
+    )]
+    argo_instance: Option<String>,
+    #[serde(
+        default,
+        rename = "kustomize.toolkit.fluxcd.io/name",
+        deserialize_with = "text_or_none"
+    )]
+    flux_kustomize_name: Option<String>,
+    #[serde(
+        default,
+        rename = "kustomize.toolkit.fluxcd.io/namespace",
+        deserialize_with = "text_or_none"
+    )]
+    flux_kustomize_namespace: Option<String>,
+    #[serde(
+        default,
+        rename = "helm.toolkit.fluxcd.io/name",
+        deserialize_with = "text_or_none"
+    )]
+    flux_helm_name: Option<String>,
+    #[serde(
+        default,
+        rename = "helm.toolkit.fluxcd.io/namespace",
+        deserialize_with = "text_or_none"
+    )]
+    flux_helm_namespace: Option<String>,
+}
+
+impl MarkerAnnotations {
+    /// The GitOps marker at `key`, for [`gitops::managed_by`].
+    fn gitops_marker(&self, key: &str) -> Option<&str> {
+        match key {
+            "argocd.argoproj.io/tracking-id" => &self.argo_tracking_id,
+            "argocd.argoproj.io/instance" => &self.argo_instance,
+            "kustomize.toolkit.fluxcd.io/name" => &self.flux_kustomize_name,
+            "kustomize.toolkit.fluxcd.io/namespace" => &self.flux_kustomize_namespace,
+            "helm.toolkit.fluxcd.io/name" => &self.flux_helm_name,
+            "helm.toolkit.fluxcd.io/namespace" => &self.flux_helm_namespace,
+            _ => return None,
+        }
+        .as_deref()
+    }
+}
+
+/// A marker that is not text counts as absent, so one odd annotation cannot fail a whole list.
+fn text_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(text) => Some(text),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -755,6 +826,7 @@ pub(crate) fn build_row(
     interner: &mut Interner,
     now: i64,
 ) -> Option<Row> {
+    let manager = row_manager(&meta);
     let name = meta.name.filter(|n| !n.is_empty())?;
     let namespace = meta
         .namespace
@@ -767,12 +839,20 @@ pub(crate) fn build_row(
             None => name.clone().into_boxed_str(),
         },
     };
-    let labels = meta
+    let mut labels: Vec<_> = meta
         .labels
         .unwrap_or_default()
         .iter()
+        .filter(|(k, _)| k.as_str() != gitops::ROW_MANAGER_KEY)
         .map(|(k, v)| (interner.intern(k), interner.intern(v)))
         .collect();
+    if let Some(manager) = manager {
+        labels.push((
+            interner.intern(gitops::ROW_MANAGER_KEY),
+            interner.intern(&manager),
+        ));
+    }
+    let labels = labels.into_boxed_slice();
     Some(Row {
         uid,
         name: name.into_boxed_str(),
@@ -783,6 +863,25 @@ pub(crate) fn build_row(
         labels,
         cells: layout.cells(cells, interner, now),
     })
+}
+
+/// Who manages the object `meta` describes, as text. A row does not know its kind, so a tracking
+/// id is compared by namespace and name only.
+fn row_manager(meta: &WireMeta) -> Option<String> {
+    let name = meta.name.as_deref().filter(|n| !n.is_empty())?;
+    let identity = gitops::Identity {
+        group: None,
+        kind: "",
+        namespace: meta.namespace.as_deref().filter(|n| !n.is_empty()),
+        name,
+    };
+    let manager = gitops::managed_by(&identity, |key: &str| {
+        let label = meta.labels.as_ref().and_then(|l| l.get(key));
+        label
+            .map(String::as_str)
+            .or_else(|| meta.annotations.as_ref().and_then(|a| a.gitops_marker(key)))
+    })?;
+    Some(manager.to_string())
 }
 
 /// The layout `object` asks for, if it differs from `current`: its column definitions, or the
@@ -1043,6 +1142,10 @@ pub async fn list_table(
         continue_token: end.continue_token,
     })
 }
+
+#[cfg(test)]
+#[path = "table_managed_tests.rs"]
+mod managed_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -220,7 +220,8 @@ impl ResourceList {
                 }
             }
         });
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label…"));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name, label, managed…"));
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
@@ -912,6 +913,9 @@ impl ResourceList {
                             .child(shown.clone())
                             .test_text(shown),
                     )
+                    .when(column.role == ColumnRole::Name, |el| {
+                        el.children(managed::marker(row, secrets, theme))
+                    })
                     .when_some(tooltip, |el, text| {
                         el.tooltip(move |window, cx| {
                             #[cfg(test)]
@@ -1482,6 +1486,9 @@ impl Render for ResourceList {
 
 #[path = "list_actions.rs"]
 mod actions;
+
+#[path = "list_managed.rs"]
+mod managed;
 
 #[cfg(any(test, feature = "automation"))]
 #[path = "list_state.rs"]
