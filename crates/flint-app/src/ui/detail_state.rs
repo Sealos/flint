@@ -20,6 +20,18 @@ impl DetailView {
         if let Some(waiting) = self.waiting() {
             banners.push(Banner::new("detail-pending", Level::Info, waiting));
         }
+        if self.freshness.is_stale() && matches!(self.fetch, Fetch::Loaded { .. }) {
+            let text = format!(
+                "{} {}",
+                self.freshness.headline(),
+                super::sync::last_updated(self.fetched_at)
+            );
+            banners.push(Banner::new(
+                "detail-stale",
+                Level::Warning,
+                error_text(&text),
+            ));
+        }
         if let Some(error) = &self.refresh_error {
             banners.push(Banner::new(
                 "detail-refresh-error",

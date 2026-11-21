@@ -5,7 +5,7 @@
 //! The silent cluster never answers, so the core's fetch fails ("not connected"). Tests check
 //! that failure, then show an object as a finished fetch would ([`show_fetched`]).
 
-use flint_core::{KindId, ObjectDetail, SyncState};
+use flint_core::{KindId, KindSnapshot, ObjectDetail, SyncState};
 use gpui_kit::component::input::EditorState;
 use gpui_kit::test::{TestAppContextExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
@@ -386,6 +386,120 @@ async fn banners_mark_a_stale_or_deleted_object(cx: &mut TestAppContext) {
     t.press(cx, "escape");
     assert!(t.detail(cx).is_none());
     assert_eq!(t.selected(cx), None);
+}
+
+/// Publishes `state` for Pods on `alpha` as a watch would. Keep the value while the test runs.
+fn publish_sync(
+    cx: &mut TestAppContext,
+    t: &TestWorkspace,
+    state: SyncState,
+) -> impl Sized + use<> {
+    let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
+    core.store_for_tests(KindSnapshot {
+        cluster: "alpha".into(),
+        kind: KindId::pods(),
+        state,
+        ..Default::default()
+    })
+}
+
+fn stale_banner(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<String> {
+    view(cx, t).read_with(cx, |v, _| {
+        v.view_state()
+            .banners
+            .into_iter()
+            .find(|b| b.id == "detail-stale")
+            .map(|b| b.text)
+    })
+}
+
+/// Waits until the stale notice contains `text`.
+async fn wait_for_stale(cx: &mut TestAppContext, t: &TestWorkspace, text: &'static str) {
+    let v = view(cx, t);
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        v.read(cx)
+            .view_state()
+            .banners
+            .iter()
+            .any(|b| b.id == "detail-stale" && b.text.contains(text))
+    })
+    .await;
+}
+
+// covers UP-20, UP-23: while the kind is not current, an open pod says it may be out of date and
+// when it last updated, on every state that is not current. The return of the connection fetches
+// it again, and the notice stays until a fetch has succeeded. Nothing about editing changes.
+#[gpui_kit::test]
+async fn a_pod_open_through_an_outage_stays_marked_until_fetched(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    show_fetched(cx, &t, pod("api"));
+    assert_eq!(stale_banner(cx, &t), None);
+    let v = view(cx, &t);
+    let editable = v.read_with(cx, |v, _| v.can_start_edit());
+
+    let _sync = publish_sync(
+        cx,
+        &t,
+        SyncState::Reconnecting {
+            error: Some("connection refused".into()),
+        },
+    );
+    wait_for_stale(cx, &t, "connection refused").await;
+    let text = stale_banner(cx, &t).unwrap();
+    assert!(text.contains("may be out of date"), "{text}");
+    assert!(text.contains("Last updated"), "{text}");
+    assert_eq!(v.read_with(cx, |v, _| v.can_start_edit()), editable);
+
+    let _sync = publish_sync(
+        cx,
+        &t,
+        SyncState::RetryingRefusal {
+            error: "forbidden for now".into(),
+        },
+    );
+    wait_for_stale(cx, &t, "forbidden for now").await;
+
+    // Back: the fetch runs and fails here, so the copy is still not known to be current.
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    let fetched = v.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        let v = fetched.read(cx);
+        !v.fetching
+            && v.refresh_error
+                .as_deref()
+                .is_some_and(|e| e.contains("not connected"))
+    })
+    .await;
+    assert!(stale_banner(cx, &t).is_some(), "not fetched since");
+    assert!(t.find(cx, "detail-retry").is_some());
+
+    show_fetched(cx, &t, pod("api"));
+    assert_eq!(stale_banner(cx, &t), None);
+}
+
+// covers UP-20, UP-23: a pane that failed during an outage fetches again when the connection
+// returns, and its error has a Retry.
+#[gpui_kit::test]
+async fn a_failed_pane_refetches_when_the_connection_returns(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    let v = view(cx, &t);
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    cx.run_until_parked();
+    assert!(t.find(cx, "detail-retry").is_some());
+
+    let _sync = publish_sync(cx, &t, SyncState::Synced);
+    wait_for_failed_fetch(cx, &t).await;
+
+    v.update(cx, |v, cx| v.show_failed("connection refused".into(), cx));
+    cx.run_until_parked();
+    t.click(cx, "detail-retry");
+    wait_for_failed_fetch(cx, &t).await;
 }
 
 // covers UP-04, UP-23: Cmd-R (Refresh and Retry Connection share it) fetches the shown object
