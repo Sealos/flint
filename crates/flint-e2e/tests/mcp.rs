@@ -936,6 +936,55 @@ fn up_14_a_hand_written_scope_resolves_and_reports_what_matches_nothing() -> Res
     Ok(())
 }
 
+// covers UP-14: `list_clusters` says when its scope check could not cover everything, and the
+// scope is enforced all the same.
+#[test]
+fn up_14_a_scope_check_says_what_it_could_not_cover() -> Result<()> {
+    use flint_e2e::fake_api::{Fault, Gvr};
+
+    let two = Two::start()?;
+    let many: Vec<String> = (0..70).map(|i| format!("missing-{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    two.scratch
+        .write_settings(&exposing_scoped(EXPOSED, &two.a.url(), &many, &["pods"]))?;
+    let mut mcp = two.mcp()?;
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    let scope = &clusters["clusters"][0]["scope"];
+    assert_eq!(
+        scope["unmatched_namespaces"].as_array().map(Vec::len),
+        Some(64),
+        "{clusters}"
+    );
+    assert_eq!(scope["unchecked_namespaces"], 6, "{clusters}");
+    let note = scope["check_incomplete"].as_str().unwrap_or_default();
+    assert!(note.starts_with("6 of the scope's namespaces"), "{note}");
+
+    // A lookup the server refuses says nothing about the namespace: unchecked, not missing.
+    two.scratch.write_settings(&exposing_scoped(
+        EXPOSED,
+        &two.a.url(),
+        &["demo"],
+        &["pods"],
+    ))?;
+    two.a
+        .inject(Fault::status(403).on(&Gvr::core("namespaces")));
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    two.a.clear_faults();
+    let scope = &clusters["clusters"][0]["scope"];
+    assert!(scope.get("unmatched_namespaces").is_none(), "{clusters}");
+    assert_eq!(scope["unchecked_namespaces"], 1, "{clusters}");
+    let services = json!({"cluster": EXPOSED, "kind": "services", "namespace": "demo"});
+    let refused = mcp.call("list_resources", services)?;
+    assert_eq!(refused.text, out_of_scope(EXPOSED));
+
+    // Everything checked: nothing to say.
+    let clusters = mcp.call_json("list_clusters", json!({}))?;
+    let scope = &clusters["clusters"][0]["scope"];
+    assert!(scope.get("check_incomplete").is_none(), "{clusters}");
+    assert!(scope.get("unchecked_namespaces").is_none(), "{clusters}");
+    Ok(())
+}
+
 // covers UP-14: a cluster limited to a namespace and kinds shows only those. Every request
 // beyond the scope (another namespace, another kind, a cluster-scoped kind, a missing kind)
 // fails with exactly the error of a cluster that is not exposed, so nothing can be probed.

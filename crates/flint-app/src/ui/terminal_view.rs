@@ -247,6 +247,17 @@ impl TerminalView {
         if snapshot.state.is_finished() || self.ended.is_some() {
             self.marked = None;
             self.clear_shell_input_note();
+            // The shell ended before a running snapshot could say so. This note stays: it is
+            // about the ended shell, and nothing can be typed again.
+            if self.ended.is_none()
+                && snapshot.input_not_replayed
+                && !self.snapshot.input_not_replayed
+            {
+                self.set_note(
+                    Tone::Warning,
+                    terminal_model::INPUT_NOT_REPLAYED_ENDED.to_owned(),
+                );
+            }
         } else if snapshot.input_not_replayed
             && !self.snapshot.input_not_replayed
             && self.note_kind != NoteKind::PasteDiscarded

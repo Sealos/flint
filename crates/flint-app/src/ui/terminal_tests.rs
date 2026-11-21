@@ -967,6 +967,27 @@ async fn input_not_replayed_to_the_next_shell_is_said(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn input_lost_to_a_shell_that_already_ended_is_said_in_the_past(cx: &mut TestAppContext) {
+    let mut shell = open(cx);
+    shell.fake.fallback();
+    shell.fake.set_state(ExecState::Exited { code: Some(0) });
+    shell.fake.input_not_replayed();
+    shell.settle(cx);
+    let note = shell
+        .view
+        .read_with(cx, |v, _| v.note.as_ref().map(|n| n.text.clone()));
+    let expected = Some(crate::ui::terminal_model::INPUT_NOT_REPLAYED_ENDED.to_owned());
+    assert_eq!(note, expected);
+    // Later snapshots of the ended tab keep it.
+    shell.fake.print(b"x");
+    shell.settle(cx);
+    let note = shell
+        .view
+        .read_with(cx, |v, _| v.note.as_ref().map(|n| n.text.clone()));
+    assert_eq!(note, expected);
+}
+
+#[gpui_kit::test]
 async fn the_input_not_replayed_note_clears_when_the_shell_ends(cx: &mut TestAppContext) {
     for state in [
         Some(ExecState::Exited { code: Some(0) }),

@@ -20,6 +20,7 @@
 //! per session, and up to 100 ms of lines), and the shown tab's own cap when it alone is over.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -37,6 +38,9 @@ struct Inner {
     /// Advances on every change of what is shown: the order of viewing.
     clock: u64,
     sessions: HashMap<u64, Entry>,
+    /// How many reports sessions made.
+    #[cfg(test)]
+    reports: usize,
 }
 
 #[derive(Debug)]
@@ -59,6 +63,9 @@ struct Entry {
     /// Advances when what the session may give back changes: shown, hidden, paused, resumed, or
     /// planned again. A trim under way stops when it moves.
     plan: u64,
+    /// The session's oldest line after its latest trim, recorded in the step that detached it.
+    /// Atomic so a frame can read it without waiting on this budget's lock.
+    cutoff: Arc<AtomicU64>,
     wake: Arc<Notify>,
 }
 
@@ -77,6 +84,8 @@ impl LogBudget {
                 limit,
                 clock: 0,
                 sessions: HashMap::new(),
+                #[cfg(test)]
+                reports: 0,
             }),
         })
     }
@@ -112,6 +121,7 @@ impl LogBudget {
                 trim_to: None,
                 in_flight: None,
                 plan: 0,
+                cutoff: Arc::default(),
                 wake: wake.clone(),
             },
         );
@@ -143,6 +153,19 @@ impl LogBudget {
         }
     }
 
+    /// Where session `id`'s cutoff is published: the first line it still holds after its trims.
+    pub(crate) fn cutoff_of(&self, id: u64) -> Arc<AtomicU64> {
+        self.lock()
+            .sessions
+            .get(&id)
+            .map_or_else(Arc::default, |e| e.cutoff.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports(&self) -> usize {
+        self.lock().reports
+    }
+
     /// Whether session `id`'s tab is the one shown.
     pub fn is_shown(&self, id: u64) -> bool {
         self.lock().sessions.get(&id).is_some_and(|e| e.shown)
@@ -164,6 +187,10 @@ impl LogBudget {
     /// is or is not paused.
     pub(crate) fn report(&self, id: u64, bytes: usize, trimmable: usize, paused: bool) {
         let mut inner = self.lock();
+        #[cfg(test)]
+        {
+            inner.reports += 1;
+        }
         if let Some(entry) = inner.sessions.get_mut(&id) {
             entry.bytes = bytes;
             entry.trimmable = trimmable;
@@ -198,20 +225,23 @@ impl LogBudget {
 
     /// Runs `detach` under the budget's lock if session `id`'s tab is still hidden and `plan`
     /// still stands, and counts the bytes it returns as gone in the same step, so a plan made
-    /// right after does not ask another tab for them. `detach` must take constant time: the UI
-    /// thread can wait on this lock.
+    /// right after does not ask another tab for them. `detach` sets the new cutoff it is handed
+    /// ([`crate::LogSession::trim_cutoff`]). It must take constant time: the UI thread can wait
+    /// on this lock.
     pub(crate) fn while_planned<T>(
         &self,
         id: u64,
         plan: TrimPlan,
-        detach: impl FnOnce() -> Option<(T, usize)>,
+        detach: impl FnOnce(&mut u64) -> Option<(T, usize)>,
     ) -> Option<T> {
         let mut inner = self.lock();
         let entry = inner.sessions.get_mut(&id)?;
         if entry.shown || entry.plan != plan.plan {
             return None;
         }
-        let (detached, freed) = detach()?;
+        let mut cutoff = entry.cutoff.load(Ordering::Relaxed);
+        let (detached, freed) = detach(&mut cutoff)?;
+        entry.cutoff.store(cutoff, Ordering::Release);
         entry.bytes = entry.bytes.saturating_sub(freed);
         entry.trimmable = entry.trimmable.saturating_sub(freed);
         Some(detached)
@@ -391,11 +421,11 @@ mod tests {
         let plan = budget.begin_trim(1).expect("over the budget");
         assert_eq!(plan.to, 10 * MIB);
         assert_eq!(
-            budget.while_planned(1, plan, || Some(("detached", MIB))),
+            budget.while_planned(1, plan, |_| Some(("detached", MIB))),
             Some("detached")
         );
         budget.set_shown(1, true);
-        let late = budget.while_planned(1, plan, || -> Option<((), usize)> {
+        let late = budget.while_planned(1, plan, |_| -> Option<((), usize)> {
             panic!("a block was detached from a tab shown")
         });
         assert_eq!(late, None);
@@ -410,7 +440,7 @@ mod tests {
         let plan = budget.begin_trim(1).unwrap();
         budget.set_shown(1, true);
         budget.set_shown(1, false);
-        assert_eq!(budget.while_planned(1, plan, || Some(((), 0))), None);
+        assert_eq!(budget.while_planned(1, plan, |_| Some(((), 0))), None);
     }
 
     // covers UP-42: a trim under way stops once the budget no longer needs it.
@@ -423,7 +453,7 @@ mod tests {
         budget.report(2, 6 * MIB, 6 * MIB, false);
         let plan = budget.begin_trim(1).expect("2 MiB over");
         budget.unregister(2);
-        assert_eq!(budget.while_planned(1, plan, || Some(((), MIB))), None);
+        assert_eq!(budget.while_planned(1, plan, |_| Some(((), MIB))), None);
     }
 
     // covers UP-42: a report that keeps the same plan does not stop a trim under way.
@@ -434,7 +464,7 @@ mod tests {
         budget.report(1, 20 * MIB, 20 * MIB, false);
         let plan = budget.begin_trim(1).unwrap();
         budget.report(1, 20 * MIB, 20 * MIB, false);
-        assert_eq!(budget.while_planned(1, plan, || Some(((), MIB))), Some(()));
+        assert_eq!(budget.while_planned(1, plan, |_| Some(((), MIB))), Some(()));
         assert_eq!(budget.begin_trim(1), None, "not asked twice");
     }
 
@@ -450,7 +480,7 @@ mod tests {
         let plan = budget.begin_trim(1).expect("2 MiB over");
         assert_eq!(plan.to, 6 * MIB);
         assert_eq!(
-            budget.while_planned(1, plan, || Some(((), 2 * MIB))),
+            budget.while_planned(1, plan, |_| Some(((), 2 * MIB))),
             Some(())
         );
         budget.set_shown(1, true);

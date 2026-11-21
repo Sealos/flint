@@ -221,6 +221,50 @@ async fn a_trimmed_tab_says_older_lines_were_dropped(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.view_state().trimmed));
 }
 
+// A tab shown during a trim never draws a line below the cutoff, and a snapshot queued before the
+// trim does not bring those lines back.
+#[gpui_kit::test]
+async fn a_trim_cutoff_keeps_removed_rows_off_the_first_frame(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, view) = open(cx, core);
+    let mut lines = Feed::new(50);
+    let older = lines.push(0, 6).streaming();
+    feed(cx, &view, older.clone());
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find(line_id(2)).is_some()
+    })
+    .await;
+
+    view.update(cx, |view, _| view.set_trim_cutoff(3));
+    draw(cx, window);
+    let drawn = |cx: &mut TestAppContext, id| {
+        cx.update_window(window, |_, window, _| {
+            window.try_find(line_id(id)).is_some()
+        })
+        .unwrap()
+    };
+    assert!(!drawn(cx, 2), "a line below the cutoff was drawn");
+    assert!(drawn(cx, 3));
+
+    feed(cx, &view, older);
+    draw(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.snapshot().lines.first_id()), 3);
+    assert!(
+        view.read_with(cx, |v, _| v.snapshot().trimmed),
+        "it says lines were dropped"
+    );
+    assert!(!drawn(cx, 2), "a queued snapshot brought a line back");
+    assert!(drawn(cx, 3));
+
+    // A snapshot entirely below the cutoff shows no line, and stays as it is on the next frame.
+    view.update(cx, |view, _| view.set_trim_cutoff(100));
+    draw(cx, window);
+    let empty = view.read_with(cx, |v, _| v.snapshot().clone());
+    assert!(empty.lines.is_empty());
+    draw(cx, window);
+    assert!(view.read_with(cx, |v, _| Arc::ptr_eq(v.snapshot(), &empty)));
+}
+
 // covers UP-42: an ended tab whose every line the budget dropped says so; one that never had a
 // line does not.
 #[gpui_kit::test]
