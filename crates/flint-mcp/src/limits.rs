@@ -433,7 +433,9 @@ pub(crate) struct Counted<T> {
     quiet: Duration,
     /// Up to [`Limits::unanswered`] messages read while replies pass the budget and not acted on
     /// yet, so the end of stdin is still seen. Kept here because rmcp drops the `receive` future
-    /// whenever something else is ready.
+    /// whenever something else is ready. The stdio transport discards a line over 16 MiB (rmcp's
+    /// `DEFAULT_MAX_LINE_LENGTH`), so at the default limit of 128 this holds at most about 2 GiB
+    /// of JSON, and more once parsed, for a client that sends that much and stops reading stdout.
     read_ahead: VecDeque<RxJsonRpcMessage<RoleServer>>,
     /// Set once stdin has ended.
     closed: Option<Closed>,
