@@ -1193,6 +1193,12 @@ pub fn limited_text(label: &str, limit: &flint_core::NamespaceLimit) -> String {
     text
 }
 
+impl list_model::CellText for SharedString {
+    fn from_static(text: &'static str) -> Self {
+        SharedString::new_static(text)
+    }
+}
+
 /// A cell's text, without copying text the row already shares.
 fn cell_text(row: &Row, col: usize, now: i64) -> SharedString {
     match row.cells.get(col) {

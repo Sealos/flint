@@ -381,6 +381,11 @@ pub struct RowFlags {
     pub masked: bool,
 }
 
+/// A cell's text type. `from_static` must not copy: the mask is drawn in every hidden cell.
+pub trait CellText: Clone + AsRef<str> + From<String> {
+    fn from_static(text: &'static str) -> Self;
+}
+
 /// How one list cell is drawn, decided without GPUI. `T` is the text type: the view's shared
 /// strings, so a cell that is not cut shares its text instead of copying it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,12 +401,12 @@ pub struct CellStyle<T> {
     pub mono: bool,
 }
 
-impl<T: Clone + AsRef<str> + From<String> + From<&'static str>> CellStyle<T> {
+impl<T: CellText> CellStyle<T> {
     /// The style of `column`'s cell, `width` wide. `raw_text` is not called for a masked cell,
     /// so a Secret's value is never read to draw it.
     pub fn of(column: &Column, raw_text: impl FnOnce() -> T, width: f32, flags: RowFlags) -> Self {
         let text = if flags.masked && !is_safe_secret_column(&column.name) {
-            T::from(super::object::MASK)
+            T::from_static(super::object::MASK)
         } else {
             raw_text()
         };
@@ -992,6 +997,12 @@ mod tests {
     }
 
     // covers UP-21: the count is within the namespace filter, which the header names.
+    impl CellText for String {
+        fn from_static(text: &'static str) -> Self {
+            text.to_owned()
+        }
+    }
+
     fn style(column: &Column, text: &str, width: f32, flags: RowFlags) -> CellStyle<String> {
         CellStyle::of(column, || text.to_owned(), width, flags)
     }
