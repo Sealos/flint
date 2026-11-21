@@ -985,8 +985,9 @@ Rules:
   reply reaches the transport, or, once cancelled, until nothing works on it (a tool call's handler has ended). When
   the client closes its end, the stream ends once every request read is answered and every refusal written, or once
   no reply has been written for the call deadline plus 5 s, so a client that stopped reading stdout cannot keep the
-  process alive. While replies pass the budget, up to 128 messages or 8 MiB of input are read ahead, unacted on, to
-  see stdin close. With that queue full stdin's end cannot be seen, so the same wait with no reply written counts the
+  process alive. While replies pass the budget, input is read ahead, unacted on, to see stdin close. Reading stops at
+  128 messages or once 8 MiB is queued; the message that crosses 8 MiB is kept whole, and a line is at most 16 MiB, so
+  the queue holds under 24 MiB of JSON. With that queue full stdin's end cannot be seen, so the same wait with no reply written counts the
   client as gone and ends the connection. Clusters connect through the
   per-cluster client cache, each connection bounded by its own 30 s timeout; the admission limit bounds how many
   connect at once. Every call is recorded in the activity log on its own path (refused, cancelled and timed-out calls
