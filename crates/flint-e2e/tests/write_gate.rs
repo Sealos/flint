@@ -156,6 +156,15 @@ fn proposal() -> WriteProposal {
     }
 }
 
+/// Whether the review's `GET` is still unanswered. Checked after a state change, it proves the
+/// review's next request sees that state: a slow run fails here instead of passing early.
+fn get_is_held(server: &FakeApiServer) -> bool {
+    !server
+        .requests()
+        .iter()
+        .any(|r| r.method == http::Method::GET && r.path.ends_with(EDITED))
+}
+
 fn puts(server: &FakeApiServer) -> usize {
     server
         .arrivals()
@@ -178,7 +187,7 @@ async fn a_context_repointed_and_back_between_requests_is_refused() {
     let review = core.review_held_at_get(&a).await;
     core.point_at(&b).await;
     core.point_at(&a).await;
-    assert!(!review.is_finished(), "the GET must outlast the re-point");
+    assert!(get_is_held(&a), "the GET must outlast the re-point");
 
     assert_eq!(
         review.await.unwrap().unwrap_err(),
@@ -209,7 +218,7 @@ async fn a_cluster_locked_after_the_get_gets_no_dry_run() {
 
     let review = core.review_held_at_get(&server).await;
     assert!(core.handle.lock(CONTEXT));
-    assert!(!review.is_finished(), "the GET must outlast the lock");
+    assert!(get_is_held(&server), "the GET must outlast the lock");
 
     assert_eq!(
         review.await.unwrap().unwrap_err(),
