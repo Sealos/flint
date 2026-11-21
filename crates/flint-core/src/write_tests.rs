@@ -237,3 +237,6 @@ fn the_gitops_warning_comes_from_the_live_object() {
     );
     assert!(warnings_for(&json!({"metadata": {"name": "web"}})).is_empty());
 }
+
+#[path = "write_timeout_tests.rs"]
+mod timeout;
