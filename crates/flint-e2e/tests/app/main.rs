@@ -12,6 +12,7 @@
 #![cfg(target_os = "macos")]
 
 mod harness;
+mod load;
 mod m0;
 mod m1;
 mod m2;
