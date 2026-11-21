@@ -56,30 +56,73 @@ fn is_plain_name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Which object is being asked about, to compare with what a tracking id names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Identity<'a> {
+    /// `None` when the object has no `apiVersion`; the core group is `Some("")`.
+    pub group: Option<&'a str>,
+    /// Empty when unknown, and then not compared.
+    pub kind: &'a str,
+    pub namespace: Option<&'a str>,
+    pub name: &'a str,
+}
+
+impl<'a> Identity<'a> {
+    /// Reads it from an object as JSON.
+    pub fn of(object: &'a Value) -> Self {
+        let metadata = object.get("metadata");
+        let text = |value: Option<&'a Value>| value.and_then(Value::as_str);
+        Identity {
+            group: text(object.get("apiVersion"))
+                .map(|version| version.rsplit_once('/').map_or("", |(group, _)| group)),
+            kind: text(object.get("kind")).unwrap_or_default(),
+            namespace: text(metadata.and_then(|m| m.get("namespace"))),
+            name: text(metadata.and_then(|m| m.get("name"))).unwrap_or_default(),
+        }
+    }
+}
+
 /// What an Argo CD tracking id says about the object carrying it.
 #[derive(Debug, PartialEq, Eq)]
 enum Tracking<'a> {
     /// It names this object, tracked by this application.
     App(&'a str),
-    /// It names another object: copied, as a Deployment's annotations are to its ReplicaSets.
+    /// It names another object: copied, as a Deployment's annotations are to its ReplicaSets, or
+    /// by a controller into another namespace.
     Copied,
+    /// Replaced by a redaction mask, so it says nothing.
+    Masked,
     Unreadable,
 }
 
-/// Reads `<app>:<group>/<kind>:<namespace>/<name>`. An empty `kind` is not compared.
-fn tracking<'a>(id: &'a str, kind: &str, name: &str) -> Tracking<'a> {
-    let mut parts = id.split(':');
-    let (Some(app), Some(group_kind), Some(namespace_name), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
+/// Whether `value` is what the app or the MCP server put in place of a hidden value.
+fn is_masked(value: &str) -> bool {
+    value == "<redacted>" || value.starts_with("[REDACTED") || value.contains('\u{2022}')
+}
+
+/// Reads `<app>:<group>/<kind>:<namespace>/<name>`; a name may hold colons (`shop:reader`). A
+/// cluster-scoped object's id may carry a namespace or none, so only a namespaced object's is
+/// compared.
+fn tracking<'a>(id: &'a str, object: &Identity<'_>) -> Tracking<'a> {
+    if is_masked(id) {
+        return Tracking::Masked;
+    }
+    let mut parts = id.splitn(3, ':');
+    let (Some(app), Some(group_kind), Some(namespace_name)) =
+        (parts.next(), parts.next(), parts.next())
     else {
         return Tracking::Unreadable;
     };
-    let (Some((_, tracked_kind)), Some((_, tracked_name))) =
-        (group_kind.rsplit_once('/'), namespace_name.rsplit_once('/'))
+    let (Some((group, kind)), Some((namespace, name))) =
+        (group_kind.rsplit_once('/'), namespace_name.split_once('/'))
     else {
         return Tracking::Unreadable;
     };
-    if tracked_name != name || (!kind.is_empty() && tracked_kind != kind) {
+    let same = name == object.name
+        && (object.kind.is_empty() || kind == object.kind)
+        && object.group.is_none_or(|own| own == group)
+        && (namespace.is_empty() || object.namespace.is_none_or(|own| own == namespace));
+    if !same {
         Tracking::Copied
     } else if is_plain_name(app) {
         Tracking::App(app)
@@ -88,11 +131,11 @@ fn tracking<'a>(id: &'a str, kind: &str, name: &str) -> Tracking<'a> {
     }
 }
 
-/// Who manages the object of this `kind` and `name`, given a lookup in its labels and
-/// annotations. Argo CD is checked first, then Flux's Kustomization, then its HelmRelease.
+/// Who manages `object`, given a lookup in its labels and annotations. Argo CD is checked first,
+/// then Flux's Kustomization, then its HelmRelease. A tracking id naming another object rules
+/// out Argo CD's labels too, since they are copied with it, but not Flux.
 pub fn managed_by<'a>(
-    kind: &str,
-    name: &str,
+    object: &Identity<'_>,
     read: impl Fn(&str) -> Option<&'a str>,
 ) -> Option<ManagedBy> {
     let plain = |key: &str| read(key).filter(|value| is_plain_name(value));
@@ -101,18 +144,20 @@ pub fn managed_by<'a>(
         name: name.to_owned(),
         namespace: None,
     };
-    let tracked = read(ARGO_TRACKING_ID).map(|id| tracking(id, kind, name));
+    let tracked = read(ARGO_TRACKING_ID).map(|id| tracking(id, object));
     if let Some(Tracking::App(app)) = tracked {
         return Some(argo(app));
     }
-    if let Some(app) = plain(ARGO_INSTANCE) {
-        return Some(argo(app));
-    }
-    // This common label says nothing alone: it counts only beside a tracking id for this object.
-    if tracked == Some(Tracking::Unreadable)
-        && let Some(app) = plain(APP_INSTANCE)
-    {
-        return Some(argo(app));
+    if tracked != Some(Tracking::Copied) {
+        if let Some(app) = plain(ARGO_INSTANCE) {
+            return Some(argo(app));
+        }
+        // This common label says nothing alone: it counts only beside a readable-looking id.
+        if tracked == Some(Tracking::Unreadable)
+            && let Some(app) = plain(APP_INSTANCE)
+        {
+            return Some(argo(app));
+        }
     }
     [
         (Manager::FluxKustomization, FLUX_KUSTOMIZE),
@@ -133,17 +178,9 @@ pub fn managed_by<'a>(
 pub fn managed_by_object(object: &Value) -> Option<ManagedBy> {
     let metadata = object.get("metadata")?;
     let field = |map: &str, key: &str| metadata.get(map)?.get(key)?.as_str();
-    managed_by(
-        object
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        metadata
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        |key| field("labels", key).or_else(|| field("annotations", key)),
-    )
+    managed_by(&Identity::of(object), |key| {
+        field("labels", key).or_else(|| field("annotations", key))
+    })
 }
 
 #[cfg(test)]
@@ -201,6 +238,59 @@ mod tests {
             json!({ARGO_TRACKING_ID: "not a tracking id"}),
         );
         assert_eq!(shown(&unreadable).as_deref(), Some("Argo CD: shop"));
+    }
+
+    // covers UP-23: a copy in another namespace or API group is not the tracked object, and
+    // Argo CD's label travels with the copy, while Flux's own labels still count.
+    #[test]
+    fn a_tracking_id_must_name_this_group_and_namespace() {
+        let id = "shop:apps/Deployment:demo/web";
+        let at = |version: &str, namespace: &str, labels: Value| {
+            json!({"apiVersion": version, "kind": "Deployment", "metadata": {
+                "name": "web", "namespace": namespace, "labels": labels,
+                "annotations": {ARGO_TRACKING_ID: id},
+            }})
+        };
+        assert_eq!(
+            shown(&at("apps/v1", "demo", json!({}))).as_deref(),
+            Some("Argo CD: shop")
+        );
+        assert_eq!(shown(&at("apps/v1", "other", json!({}))), None);
+        assert_eq!(shown(&at("example.com/v1", "demo", json!({}))), None);
+        assert_eq!(
+            shown(&at("apps/v1", "other", json!({ARGO_INSTANCE: "shop"}))),
+            None
+        );
+        assert_eq!(
+            shown(&at("apps/v1", "other", json!({FLUX_KUSTOMIZE.0: "apps"}))).as_deref(),
+            Some("Flux: apps")
+        );
+    }
+
+    // covers UP-23: Kubernetes allows colons in some names, such as RBAC roles.
+    #[test]
+    fn a_tracked_name_may_hold_colons() {
+        let role = json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+        "metadata": {"name": "shop:reader", "annotations": {
+            ARGO_TRACKING_ID: "shop:rbac.authorization.k8s.io/ClusterRole:/shop:reader",
+        }}});
+        assert_eq!(shown(&role).as_deref(), Some("Argo CD: shop"));
+    }
+
+    // covers UP-23: a masked id says nothing, so the common label beside it does not count.
+    #[test]
+    fn a_masked_tracking_id_does_not_activate_the_instance_label() {
+        for masked in [
+            "<redacted>",
+            "[REDACTED:secret]",
+            "\u{2022}\u{2022}\u{2022}",
+        ] {
+            let secret = object(
+                json!({APP_INSTANCE: "shop"}),
+                json!({ARGO_TRACKING_ID: masked}),
+            );
+            assert_eq!(shown(&secret), None, "{masked}");
+        }
     }
 
     // covers UP-23

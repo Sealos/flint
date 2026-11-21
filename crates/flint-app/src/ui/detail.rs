@@ -485,7 +485,6 @@ impl DetailView {
                                 Tooltip::new(full_name.clone()).build(window, cx)
                             }),
                     )
-                    .children(self.render_managed_by(theme))
                     .when(self.fetching, |el| el.child(Spinner::new().xsmall()))
                     .children(self.render_logs_button())
                     .children(self.render_shell_button())
@@ -506,6 +505,7 @@ impl DetailView {
                             .on_click(registry::on_click(Close)),
                     ),
             )
+            .children(self.render_managed_by(theme))
             .children(self.render_captions(theme))
             .child(
                 TabBar::new("detail-tabs")
@@ -529,7 +529,8 @@ impl DetailView {
     }
 
     /// "managed by Argo CD: shop" or "managed by Flux: flux-system/apps", for a loaded object a
-    /// GitOps controller manages. Long names are cut; the tooltip has the whole text.
+    /// GitOps controller manages, on its own line so it never crowds the header's buttons. Long
+    /// names are cut; the tooltip has the whole text.
     fn render_managed_by(&self, theme: &Theme) -> Option<AnyElement> {
         let Fetch::Loaded { overview, .. } = &self.fetch else {
             return None;
@@ -539,11 +540,9 @@ impl DetailView {
         Some(
             div()
                 .id("detail-managed-by")
-                .flex_none()
-                .max_w(px(240.))
-                .px_1()
-                .rounded_sm()
-                .bg(theme.muted)
+                .px_3()
+                .pb_1()
+                .min_w_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .truncate()

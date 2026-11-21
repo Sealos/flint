@@ -171,20 +171,13 @@ pub fn overview(object: &Value, is_secret: bool) -> Overview {
     if is_secret {
         mask_secret_annotations(&mut annotations);
     }
-    let managed_by = gitops::managed_by(
-        object
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        str_at(meta, &["name"]).unwrap_or_default(),
-        |key| {
-            labels
-                .iter()
-                .chain(&annotations)
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        },
-    );
+    let managed_by = gitops::managed_by(&gitops::Identity::of(object), |key| {
+        labels
+            .iter()
+            .chain(&annotations)
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    });
     Overview {
         name: str_at(meta, &["name"]).unwrap_or_default().to_owned(),
         namespace: str_at(meta, &["namespace"]).map(str::to_owned),

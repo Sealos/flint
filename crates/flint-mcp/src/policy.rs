@@ -634,6 +634,15 @@ mod tests {
         );
         sanitize_secret(&mut secret);
         assert_eq!(managed_by_line(&secret), None);
+
+        // The masked id says nothing, so the common label beside it does not name an app.
+        let mut labelled = with_metadata(
+            "Secret",
+            serde_json::json!({"app.kubernetes.io/instance": "shop"}),
+            serde_json::json!({"argocd.argoproj.io/tracking-id": "shop:/Secret:other/web"}),
+        );
+        sanitize_secret(&mut labelled);
+        assert_eq!(managed_by_line(&labelled), None);
     }
 
     // covers UP-09, UP-11

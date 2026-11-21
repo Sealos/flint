@@ -637,7 +637,7 @@ impl FlintMcp {
     }
 
     #[tool(
-        description = "Get one object as YAML. A `# managed_by=` header line names the Argo CD or Flux object that manages it, whose next sync will likely revert a change. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
+        description = "Get one object as YAML. A `# managed_by=` header line names the Argo CD or Flux object that manages it, whose sync may revert a change. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_resource(&self, Parameters(p): Parameters<GetResourceParams>) -> ToolResult {
