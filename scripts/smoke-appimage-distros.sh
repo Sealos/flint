@@ -35,7 +35,7 @@ smoke() {
   echo "== $1"
   docker run --rm -v "$repo:/w:ro" -w /w -e APPIMAGE="$appimage" -e VERSION="$version" \
     -e DEBIAN_FRONTEND=noninteractive "$2" \
-    bash -c "set -euo pipefail; $3; ldd --version | head -n 1; scripts/smoke-appimage.sh \"\$APPIMAGE\" \"\$VERSION\""
+    bash -c "set -euo pipefail; $3; ldd --version | sed -n 1p; scripts/smoke-appimage.sh \"\$APPIMAGE\" \"\$VERSION\""
 }
 
 smoke "AlmaLinux 9 (glibc 2.34)" \

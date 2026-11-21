@@ -256,7 +256,8 @@ Security** and choose **Open Anyway**.
 
 Each release also has an AppImage for x86_64 and aarch64 (arm64). Linux support is best effort: CI builds and
 tests it, but it is not tested on every desktop and distribution ([ADR-0016](docs/adr/0016-linux-appimage.md)). It
-needs glibc 2.34 or newer. CI starts it on AlmaLinux 9 (RHEL 9 compatible), Ubuntu 22.04, Debian 12 and Ubuntu 24.04.
+needs glibc 2.34 or newer, and on x86_64 a CPU with x86-64-v2 (SSE4.2 and POPCNT). CI starts it on AlmaLinux 9
+(RHEL 9 compatible), Ubuntu 22.04, Debian 12 and Ubuntu 24.04.
 
 ```sh
 gh release download -R Sealos/flint --pattern 'flint-*-linux-x86_64.AppImage*'   # or linux-aarch64

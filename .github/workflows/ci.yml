@@ -177,6 +177,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-appimage-glibc-2.34-${{ matrix.arch }}
+          workspaces: ". -> target/glibc-2.34"
           save-if: ${{ github.ref == 'refs/heads/master' }}
       # Includes the check that the release binary has no automation channel.
       - name: Build and package on the glibc floor

@@ -6,8 +6,9 @@
 # writes flint-v<version>-linux-<arch>.AppImage to the repository root. <arch> is x86_64 or
 # aarch64 and must match the host. The binary links the glibc it is built against and linuxdeploy
 # bundles libraries from the system it runs on, so both run inside AlmaLinux 9 (glibc 2.34),
-# pinned by digest below. The Rust toolchain, the cargo cache and target/ are the host's, mounted
-# at the same paths; the build runs as the host's user, so they stay owned by it.
+# pinned by digest below. The Rust toolchain and the cargo cache are the host's, mounted at the
+# same paths; the build runs as the host's user, so they stay owned by it. Its objects go to their
+# own target/glibc-<floor>, because cargo would otherwise reuse those of a native build.
 set -euo pipefail
 
 # A multi-architecture index: the same digest serves x86_64 and aarch64.
@@ -25,12 +26,13 @@ if [ "${1:-}" = --in-container ]; then
   # shellcheck disable=SC2016 # expanded by the inner shell
   exec setpriv --reuid "$uid" --regid "$gid" --clear-groups env \
     ARCH="$arch" FLINT_GLIBC_FLOOR="$GLIBC_FLOOR" PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" \
+    CARGO_TARGET_DIR="target/glibc-$GLIBC_FLOOR" \
     bash -euo pipefail -c '
       cargo build --release --locked -p flint-app
       # On the ELF binary, before the AppImage compresses it (docs/TESTING.md).
-      scripts/check-no-automation.sh ./target/release/flint
-      version=$(./target/release/flint --version | cut -d" " -f2)
-      scripts/package-appimage.sh target/release/flint "$version" "$ARCH"
+      scripts/check-no-automation.sh "$CARGO_TARGET_DIR/release/flint"
+      version=$("$CARGO_TARGET_DIR/release/flint" --version | cut -d" " -f2)
+      scripts/package-appimage.sh "$CARGO_TARGET_DIR/release/flint" "$version" "$ARCH"
     '
 fi
 

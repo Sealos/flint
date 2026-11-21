@@ -59,6 +59,9 @@ and `flint-vX.Y.Z-linux-aarch64.AppImage`, each with a `.sha256`, next to the ma
   cannot run it. The image is pinned by digest, and `scripts/package-appimage.sh` fails the build if any ELF file in
   the AppDir asks for a newer glibc symbol version, so the floor cannot rise silently. The static `flint-mcp` has no
   floor, so agents on older systems run that instead of `flint mcp`.
+- **x86-64-v2.** AlmaLinux 9 compiles its packages for x86-64-v2, so the x86_64 AppImage, which bundles some of them,
+  is documented as needing a CPU with SSE4.2 and POPCNT, the same minimum as RHEL 9. CI does not run it on an older
+  CPU.
 - **musl's allocator.** The static `flint-mcp` uses musl's `malloc`, which is slower than glibc's under many
   threads. The server is mostly waiting on the API server, so this has not mattered; a faster allocator can be
   linked in if it does.
