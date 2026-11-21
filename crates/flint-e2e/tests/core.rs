@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flint_core::exec::BracketedPaste;
 use flint_core::handle::{Command, ConnectionState, CoreConfig, CoreHandle, Event};
 use flint_core::read::{self, ListQuery};
 use flint_core::{
@@ -1128,7 +1129,10 @@ async fn exit_codes_end_the_session_and_keep_the_screen() {
     // check that can fail. The screen and stdin checks below only document the outcome (Flint
     // doesn't echo locally, and the fake has closed the session).
     shell.write(b"echo late\r".to_vec()).unwrap();
-    assert!(!shell.paste_if_bracketed("x").unwrap().await);
+    assert_eq!(
+        shell.paste_if_bracketed("x").unwrap().await,
+        BracketedPaste::Discarded
+    );
     let snap = shell.latest();
     assert!(
         !snap.terminal.text().contains("late"),
