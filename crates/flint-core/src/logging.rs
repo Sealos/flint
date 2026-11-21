@@ -175,7 +175,7 @@ impl FileLog {
                     Err(error) => {
                         let _ = writeln!(
                             io::stderr(),
-                            "flint: could not open the log file; logging to stderr: {error}"
+                            "flint: could not open Flint's log file; logging to stderr: {error}"
                         );
                         None
                     }
