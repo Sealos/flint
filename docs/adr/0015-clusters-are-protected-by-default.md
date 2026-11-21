@@ -6,10 +6,12 @@ cluster is read-only in Flint: browsing, logs and the detail view work, but ever
 (edit, apply, create, delete, scale, restart, cordon, drain, Helm changes, exec, port-forward, debug containers) is
 disabled, and says why.
 
-- **Unlocked by default:** clusters whose API server is on the user's own machine (`localhost`, `127.0.0.1`, `::1`:
-  kind, minikube, Docker Desktop, OrbStack). Docker Desktop's `kubernetes.docker.internal`, names under `.localhost`
-  and the rest of `127.0.0.0/8` count too, as the kubeconfig names them, never resolved. A local address can be a
-  tunnel to a remote cluster (an SSH, SSM or Teleport proxy), so the `protect_local_clusters` setting can protect them as well.
+- **Unlocked by default:** known local clusters: a context named exactly `kind`, `minikube`, `docker-desktop` or
+  `orbstack`, or starting with exactly `kind-`, whose API server is on the user's own machine (`localhost`,
+  `127.0.0.1`, `::1`) and whose cluster has no `proxy-url`. Docker Desktop's `kubernetes.docker.internal`, names under
+  `.localhost` and the rest of `127.0.0.0/8` count as this machine too, as the kubeconfig names them, never resolved.
+  Every other context on a local address takes Unlock or Trust like any other cluster, and the
+  `protect_local_clusters` setting protects the known local ones as well.
 - **Trusted clusters:** the user can mark any cluster trusted, which keeps it unlocked across restarts. Trust is a
   typed `trusted_clusters` setting, pinned to the context name and API server URL like AI exposure, so a re-pointed
   context is protected again.

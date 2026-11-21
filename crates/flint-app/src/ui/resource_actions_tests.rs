@@ -28,7 +28,7 @@ use crate::ui::support_tests::{
 
 const WRITES: [&str; 2] = ["Scale…", "Rollout Restart…"];
 
-/// Connects `alpha` with a discovery in which every kind can be deleted.
+/// Connects `kind-alpha` with a discovery in which every kind can be deleted.
 async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.connect_alpha(cx, standard_sections()).await;
     let mut found = discovery(standard_sections());
@@ -38,7 +38,7 @@ async fn connect_deletable(cx: &mut TestAppContext, t: &TestWorkspace) {
     t.feed(
         cx,
         Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: CURRENT_GENERATION,
             discovery: Some(Arc::new(found)),
             error: None,
@@ -153,7 +153,7 @@ async fn a_protected_clusters_actions_are_disabled_with_unlock(cx: &mut TestAppC
         ]
     );
     let unlock = t.find(cx, "menu-unlock").expect("the Unlock entry");
-    assert_eq!(unlock.label(), Some("Unlock alpha…"));
+    assert_eq!(unlock.label(), Some("Unlock kind-alpha…"));
     assert_eq!(
         rows.iter()
             .filter(|r| *r == crate::ui::detail::PROTECTED_NOTE)
@@ -558,18 +558,20 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir.path(), move |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
     })
     .await;
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
-        .await;
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model
             .read(cx)
-            .discovered("alpha")
+            .discovered("kind-alpha")
             .is_some_and(|d| d.discovery.is_some())
     })
     .await;
@@ -608,7 +610,7 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
         .update_window(t.window, |_, window, cx| confirm::shown(window, cx))
         .unwrap()
         .expect("the new review");
-    assert_eq!(shown.title, "Scale web on alpha?");
+    assert_eq!(shown.title, "Scale web on kind-alpha?");
 
     wait_for_one_ok(cx, &t).await;
     t.click(cx, "ok");
@@ -623,7 +625,7 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
 
 fn web_key() -> WriteKey {
     WriteKey::new(
-        "alpha",
+        "kind-alpha",
         &KindId::new("apps", "deployments"),
         Some("demo"),
         "web",
@@ -631,7 +633,7 @@ fn web_key() -> WriteKey {
 }
 
 fn node_key(name: &str) -> WriteKey {
-    WriteKey::new("alpha", &KindId::new("", "nodes"), None, name)
+    WriteKey::new("kind-alpha", &KindId::new("", "nodes"), None, name)
 }
 
 /// Every resource action the selected row's menu has, with why it cannot run.
@@ -655,18 +657,20 @@ pub(super) async fn connected(
     let url = api.url.clone();
     let t = open_workspace_with(cx, dir, move |dir, _| {
         let path = dir.join("kubeconfig");
-        std::fs::write(&path, kubeconfig_yaml(&[("alpha", &url)])).unwrap();
+        std::fs::write(&path, kubeconfig_yaml(&[("kind-alpha", &url)])).unwrap();
         vec![path]
     })
     .await;
-    t.activate(cx, "alpha").await;
-    t.wait_for_state(cx, "alpha", |s| matches!(s, ConnectionState::Connected(_)))
-        .await;
+    t.activate(cx, "kind-alpha").await;
+    t.wait_for_state(cx, "kind-alpha", |s| {
+        matches!(s, ConnectionState::Connected(_))
+    })
+    .await;
     let model = t.model.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
         model
             .read(cx)
-            .discovered("alpha")
+            .discovered("kind-alpha")
             .is_some_and(|d| d.discovery.is_some())
     })
     .await;

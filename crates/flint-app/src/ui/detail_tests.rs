@@ -86,7 +86,7 @@ fn view(cx: &mut TestAppContext, t: &TestWorkspace) -> Entity<DetailView> {
     t.detail(cx).expect("the detail pane is open")
 }
 
-/// Opens `kind` on a connected `alpha` with `rows`, and selects `name` in `demo`.
+/// Opens `kind` on a connected `kind-alpha` with `rows`, and selects `name` in `demo`.
 async fn open_and_select(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -388,7 +388,7 @@ async fn banners_mark_a_stale_or_deleted_object(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx), None);
 }
 
-/// Publishes `state` for Pods on `alpha` as a watch would. Keep the value while the test runs.
+/// Publishes `state` for Pods on `kind-alpha` as a watch would. Keep the value while the test runs.
 fn publish_sync(
     cx: &mut TestAppContext,
     t: &TestWorkspace,
@@ -396,7 +396,7 @@ fn publish_sync(
 ) -> impl Sized + use<> {
     let core = t.workspace.read_with(cx, |ws, cx| ws.core(cx).clone());
     core.store_for_tests(KindSnapshot {
-        cluster: "alpha".into(),
+        cluster: "kind-alpha".into(),
         kind: KindId::pods(),
         state,
         ..Default::default()
@@ -632,7 +632,7 @@ async fn the_refresh_key_refetches_or_retries(cx: &mut TestAppContext) {
     show_fetched(cx, &t, pod("api"));
     let v = view(cx, &t);
     assert!(v.read_with(cx, |v, _| v.refresh_error.is_none()));
-    let attempts = t.connection_attempts("alpha");
+    let attempts = t.connection_attempts("kind-alpha");
 
     t.press_key_of(cx, "detail::Refresh");
     let refetched = v.clone();
@@ -640,17 +640,21 @@ async fn the_refresh_key_refetches_or_retries(cx: &mut TestAppContext) {
         refetched.read(cx).refresh_error.is_some()
     })
     .await;
-    assert_eq!(t.connection_attempts("alpha"), attempts, "no reconnect");
+    assert_eq!(
+        t.connection_attempts("kind-alpha"),
+        attempts,
+        "no reconnect"
+    );
 
-    t.activate(cx, "beta").await;
-    t.wait_for_state(cx, "beta", |s| {
+    t.activate(cx, "kind-beta").await;
+    t.wait_for_state(cx, "kind-beta", |s| {
         matches!(s, flint_core::ConnectionState::Failed(_))
     })
     .await;
-    let attempts = t.connection_attempts("beta");
+    let attempts = t.connection_attempts("kind-beta");
     t.focus_workspace(cx);
     t.press_key_of(cx, "workspace::RetryConnection");
-    t.wait_for_attempts(cx, "beta", attempts + 1).await;
+    t.wait_for_attempts(cx, "kind-beta", attempts + 1).await;
 }
 
 /// Shows the open pane's YAML and moves focus into it, as a click to select and copy does, so the
@@ -737,7 +741,7 @@ async fn a_detail_pane_replaced_from_the_dock_is_released(cx: &mut TestAppContex
     cx.update_window(t.window, |_, window, cx| {
         workspace.update(cx, |ws, cx| {
             let request = LogRequest {
-                cluster: "alpha".into(),
+                cluster: "kind-alpha".into(),
                 subject: LogSubject::Pod(LogTarget {
                     namespace: "demo".into(),
                     pod: "api".into(),

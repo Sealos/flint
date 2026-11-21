@@ -175,17 +175,17 @@ async fn the_sidebar_moves_with_the_arrows_and_enter_connects(cx: &mut TestAppCo
     t.press(cx, "tab");
     assert_eq!(focus(cx, &t), Focus::Sidebar);
     // No cluster is active: the cursor starts on the first.
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
     t.press(cx, "down");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("beta"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-beta"));
     t.press(cx, "down");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("beta"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-beta"));
     t.press(cx, "up");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
     t.press(cx, "enter");
     let workspace = t.workspace.clone();
     cx.wait_for(t.window, WAIT, move |_, cx| {
-        workspace.read(cx).shown_cluster() == Some("alpha")
+        workspace.read(cx).shown_cluster() == Some("kind-alpha")
     })
     .await;
     assert_eq!(focus(cx, &t), Focus::Sidebar);
@@ -195,8 +195,8 @@ async fn the_sidebar_moves_with_the_arrows_and_enter_connects(cx: &mut TestAppCo
     t.focus_workspace(cx);
     assert!(!t.available(cx).contains(&"sidebar::SelectNextCluster"));
     // A cluster picked another way moves the cursor too.
-    t.activate(cx, "beta").await;
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("beta"));
+    t.activate(cx, "kind-beta").await;
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-beta"));
 }
 
 // covers UP-33: in the navigation the arrows move over section headers and kinds, Enter opens a
@@ -311,7 +311,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 without_pods,
@@ -323,7 +323,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.feed(
         cx,
         flint_core::Event::DiscoveryChanged {
-            cluster: "alpha".into(),
+            cluster: "kind-alpha".into(),
             generation: crate::ui::support_tests::CURRENT_GENERATION,
             discovery: Some(std::sync::Arc::new(crate::ui::support_tests::discovery(
                 standard_sections(),
@@ -335,7 +335,7 @@ async fn go_back_returns_to_the_kind_and_object_shown_before(cx: &mut TestAppCon
     t.dispatch(cx, "workspace::OpenView", json!({"kind": "services"}))
         .unwrap();
     assert!(t.available(cx).contains(&"workspace::GoBack"));
-    t.activate(cx, "beta").await;
+    t.activate(cx, "kind-beta").await;
     assert!(!t.available(cx).contains(&"workspace::GoBack"));
 }
 
@@ -360,14 +360,14 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
     };
     t.focus_workspace(cx);
     let (dot, label) = (
-        origin(cx, "cluster-dot-alpha"),
+        origin(cx, "cluster-dot-kind-alpha"),
         origin(cx, "nav-label-pods"),
     );
     let title = header(cx);
-    // The sidebar's cursor on alpha, then the navigation's on the Workloads header and Pods.
+    // The sidebar's cursor on kind-alpha, then the navigation's on the Workloads header and Pods.
     t.press(cx, "tab");
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
-    assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
+    assert_eq!(origin(cx, "cluster-dot-kind-alpha"), dot);
     t.press(cx, "tab");
     assert_eq!(
         nav_cursor(&nav(cx, &t)).as_deref(),
@@ -378,7 +378,7 @@ async fn the_cursor_ring_shifts_nothing(cx: &mut TestAppContext) {
     assert_eq!(nav_cursor(&nav(cx, &t)).as_deref(), Some("kind:pods"));
     assert_eq!(header(cx), title);
     assert_eq!(origin(cx, "nav-label-pods"), label);
-    assert_eq!(origin(cx, "cluster-dot-alpha"), dot);
+    assert_eq!(origin(cx, "cluster-dot-kind-alpha"), dot);
 }
 
 // covers UP-33: Go Back to the kind already open, with nothing to select, still puts focus in
@@ -571,15 +571,15 @@ async fn the_lock_stays_reachable_from_the_sidebar(cx: &mut TestAppContext) {
     .unwrap();
     let t = open_workspace_with(cx, dir.path(), alpha_and_beta).await;
     let lock = |cx: &mut TestAppContext| {
-        t.find(cx, "lock-alpha")
-            .expect("alpha's lock button is drawn")
+        t.find(cx, "lock-kind-alpha")
+            .expect("kind-alpha's lock button is drawn")
             .bounds()
     };
     t.focus_workspace(cx);
     let before = lock(cx);
     t.press(cx, "tab");
     assert_eq!(focus(cx, &t), Focus::Sidebar);
-    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("alpha"));
+    assert_eq!(sidebar_cursor(cx, &t).as_deref(), Some("kind-alpha"));
     assert_eq!(lock(cx), before, "the ring moved the lock button");
 
     t.press_key_of(cx, "palette::ToggleCommandPalette");
@@ -593,7 +593,7 @@ async fn the_lock_stays_reachable_from_the_sidebar(cx: &mut TestAppContext) {
     .await;
     t.type_text(cx, "unlock cluster");
     t.press(cx, "enter");
-    t.type_text(cx, "alpha");
+    t.type_text(cx, "kind-alpha");
     t.press(cx, "enter");
     cx.wait_for(t.window, WAIT, move |window, cx| {
         gpui_kit::component::WindowExt::has_active_dialog(window, cx)

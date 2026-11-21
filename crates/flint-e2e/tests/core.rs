@@ -1590,7 +1590,7 @@ async fn a_write_through_a_fallback_definition_is_refused() {
 
 // covers UP-54, UP-55: the core refuses a shell on a protected cluster before anything reaches
 // the API server; an unlock pinned to the server lets it through until Lock Again, and so
-// does trust, written to settings.toml. (The fake server is on this machine, which starts
+// does trust, written to settings.toml. (The fake server is a known local cluster, which starts
 // unlocked; `protect_local_clusters` protects it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_protected_cluster_refuses_shells_until_unlocked_or_trusted() {
