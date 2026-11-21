@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use flint_core::redact::is_safe_secret_column;
+use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, SortBy};
 
 /// The user's sort choice, by column key ([`Column::key`]), as `state.toml` keeps it per cluster
@@ -122,8 +122,8 @@ const SAMPLE_ROWS: usize = 2_000;
 /// Each column's width in characters: the longest of its header and the cells of the sampled
 /// `rows` (indexes into `snapshot.rows`: the rows passing the filters, so a namespace filter
 /// leaves out the widths of rows it hides), within limits. The name column is measured up to
-/// the longest name. Runs on a background thread; it is the only per-row work outside
-/// `compute_view`.
+/// the longest name. A Secret's masked column is as wide as the mask, whatever its value. Runs
+/// on a background thread; it is the only per-row work outside `compute_view`.
 pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<usize> {
     let step = (rows.len() / SAMPLE_ROWS).max(1);
     // Sampled in snapshot order, not display order: a sort must not change which rows are
@@ -137,22 +137,26 @@ pub fn measure_columns(snapshot: &KindSnapshot, rows: &[u32], now: i64) -> Vec<u
     } else {
         rows
     };
+    let secret = is_secret_list(snapshot.kind.as_str());
     snapshot
         .columns
         .iter()
         .enumerate()
         .map(|(i, column)| {
-            let cells = rows
-                .iter()
-                .step_by(step)
-                .map(|&row| {
-                    snapshot.rows[row as usize]
-                        .cell_text(i, now)
-                        .chars()
-                        .count()
-                })
-                .max()
-                .unwrap_or(0);
+            let cells = if is_masked_column(secret, &column.name) {
+                super::object::MASK.chars().count()
+            } else {
+                rows.iter()
+                    .step_by(step)
+                    .map(|&row| {
+                        snapshot.rows[row as usize]
+                            .cell_text(i, now)
+                            .chars()
+                            .count()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            };
             // The header also holds the sort arrow.
             let header = column.name.chars().count() + 2;
             let max = if column.role == ColumnRole::Name {
@@ -404,7 +408,7 @@ pub struct CellStyle<T> {
 impl<T: CellText> CellStyle<T> {
     /// The style of `column`'s cell, `width` wide. `raw_text` is not called for a masked cell.
     pub fn of(column: &Column, raw_text: impl FnOnce() -> T, width: f32, flags: RowFlags) -> Self {
-        let text = if flags.masked && !is_safe_secret_column(&column.name) {
+        let text = if is_masked_column(flags.masked, &column.name) {
             T::from_static(super::object::MASK)
         } else {
             raw_text()
@@ -1016,6 +1020,43 @@ mod tests {
         finished: false,
         masked: false,
     };
+
+    fn token_snapshot(kind: flint_core::KindId, token: &str) -> KindSnapshot {
+        KindSnapshot {
+            kind,
+            columns: vec![
+                col("Name", 0, ColumnRole::Name, ColumnType::String),
+                value("Token"),
+            ]
+            .into(),
+            rows: vec![Arc::new(Row {
+                uid: "u".into(),
+                name: "creds".into(),
+                namespace: None,
+                resource_version: "1".into(),
+                generation: None,
+                created: Some(0),
+                labels: Box::new([]),
+                cells: Box::new([Cell::Name, Cell::Text(token.into())]),
+            })],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_masked_column_is_as_wide_whatever_its_value() {
+        let secrets = flint_core::KindId::new("", "secrets");
+        let short = measure_columns(&token_snapshot(secrets.clone(), "x"), &[0], 0);
+        let long = measure_columns(&token_snapshot(secrets, &"x".repeat(40)), &[0], 0);
+        assert_eq!(short, long);
+        assert_eq!(short[1], crate::ui::object::MASK.chars().count());
+    }
+
+    #[test]
+    fn other_kinds_measure_the_same_column_by_its_value() {
+        let long = token_snapshot(flint_core::KindId::pods(), &"x".repeat(40));
+        assert_eq!(measure_columns(&long, &[0], 0)[1], 40);
+    }
 
     #[test]
     fn a_masked_cell_never_reads_its_value() {
