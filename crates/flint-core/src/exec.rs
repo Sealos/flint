@@ -81,8 +81,9 @@ const STATUS_WAIT: Duration = Duration::from_secs(2);
 /// loop then returns without ending the stream, which would otherwise never reach its end.
 const DRAIN_WAIT: Duration = Duration::from_millis(250);
 
-/// What to run, and where.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What to run, and where. Its `Debug` shows the server through [`crate::redact::server_url`]: a
+/// kubeconfig URL can carry credentials.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecRequest {
     pub cluster: ClusterId,
     pub namespace: String,
@@ -97,6 +98,24 @@ pub struct ExecRequest {
     /// it. Refused before it starts if the context shows another one when the core takes the
     /// request. `None` for whatever it shows then.
     pub server: Option<Option<String>>,
+}
+
+impl std::fmt::Debug for ExecRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let server = self
+            .server
+            .as_ref()
+            .map(|server| server.as_deref().map(crate::redact::server_url));
+        f.debug_struct("ExecRequest")
+            .field("cluster", &self.cluster)
+            .field("namespace", &self.namespace)
+            .field("pod", &self.pod)
+            .field("container", &self.container)
+            .field("command", &self.command)
+            .field("size", &self.size)
+            .field("server", &server)
+            .finish()
+    }
 }
 
 impl ExecRequest {
@@ -1886,6 +1905,26 @@ mod tests {
         )
         .await
         .expect("the connection was closed");
+    }
+
+    // covers UP-41: a kubeconfig URL can carry credentials, so a request's debug output shows
+    // only what may be shown of it, however it is formatted.
+    #[test]
+    fn a_requests_debug_output_hides_credentials_in_the_server() {
+        let url = "https://user:hunter2@example.invalid:6443/base?token=abc123#part";
+        let request = ExecRequest::shell("dev", "demo", "web").at(Some(url.to_owned()));
+        for text in [format!("{request:?}"), format!("{request:#?}")] {
+            for secret in ["user", "hunter2", "abc123", "part"] {
+                assert!(!text.contains(secret), "{secret}: {text}");
+            }
+            assert!(text.contains("https://example.invalid:6443/base"), "{text}");
+            assert!(text.contains("dev") && text.contains("web"), "{text}");
+        }
+        // Unset, and set to a context with no server, stay apart.
+        let unset = format!("{:?}", ExecRequest::shell("dev", "demo", "web"));
+        assert!(unset.contains("server: None"), "{unset}");
+        let none = format!("{:?}", ExecRequest::shell("dev", "demo", "web").at(None));
+        assert!(none.contains("server: Some(None)"), "{none}");
     }
 
     fn request() -> ExecRequest {
