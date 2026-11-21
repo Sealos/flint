@@ -3,8 +3,8 @@
 #
 #   scripts/smoke-appimage.sh <AppImage> <version>
 #
-# `--version` must print "flint <version>", LICENSE and LICENSE-LUCIDE must be inside, and `mcp`
-# must reach the MCP server (arguments pass through the AppImage) and answer `initialize`. Runs
+# `--version` must print "flint <version>", `mcp --help` must name the AppImage and no temporary
+# path, LICENSE and LICENSE-LUCIDE must be inside, and `mcp` must reach the MCP server (arguments pass through the AppImage) and answer `initialize`. Runs
 # with APPIMAGE_EXTRACT_AND_RUN=1, since CI runners have no FUSE; the kubeconfig points at a port
 # that refuses connections.
 set -euo pipefail
@@ -30,6 +30,21 @@ if [ "$got" != "flint $version" ]; then
   exit 1
 fi
 echo "--version: $got"
+
+# The registration example must name the AppImage: the path a launch runs from is deleted when
+# that launch exits.
+help=$("$appimage" mcp --help)
+if grep -qE 'appimage_extracted|\.mount_' <<<"$help"; then
+  echo "error: mcp --help names a temporary path:" >&2
+  echo "$help" >&2
+  exit 1
+fi
+if ! grep -qF "$(basename "$appimage")" <<<"$help"; then
+  echo "error: mcp --help does not name the AppImage:" >&2
+  echo "$help" >&2
+  exit 1
+fi
+echo "mcp --help: names the AppImage"
 
 # The notices travel with the AppImage: Flint's LICENSE, and LICENSE-LUCIDE for the Lucide icons
 # compiled into the binary.

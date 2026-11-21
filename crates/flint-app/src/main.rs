@@ -2,6 +2,8 @@
 
 mod ui;
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::process::ExitCode;
 
 use flint_core::bootstrap;
@@ -55,9 +57,43 @@ default. Use --verbose for info, or set FLINT_LOG (for example FLINT_LOG=debug).
     )
 }
 
-/// This binary's absolute path, or `flint` if it cannot be found.
-fn current_exe() -> String {
-    std::env::current_exe().map_or_else(|_| "flint".to_owned(), |p| p.display().to_string())
+/// The command that starts this binary later, for the `flint mcp --help` example.
+fn registered_exe() -> String {
+    let appdir = std::env::var_os("APPDIR").and_then(|dir| std::fs::canonicalize(dir).ok());
+    registered_exe_from(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var_os("APPIMAGE").as_deref(),
+        appdir.as_deref(),
+    )
+}
+
+/// `exe`, shell-quoted, or `flint` if it is unknown or not UTF-8. Inside an AppImage `exe` is a
+/// temporary path that goes away when the launch exits, so the AppImage itself is named instead.
+/// `APPIMAGE` counts only when `exe` is inside `APPDIR`: child processes inherit both variables,
+/// so another `flint` started from an AppImage's shell must still name itself.
+fn registered_exe_from(
+    exe: Option<&Path>,
+    appimage: Option<&OsStr>,
+    appdir: Option<&Path>,
+) -> String {
+    let Some(exe) = exe else {
+        return "flint".to_owned();
+    };
+    let path = match (appimage.map(Path::new), appdir) {
+        (Some(image), Some(dir)) if image.is_absolute() && exe.starts_with(dir) => image,
+        _ => exe,
+    };
+    path.to_str()
+        .map_or_else(|| "flint".to_owned(), shell_quote)
+}
+
+/// `text` as one POSIX shell word: unchanged when it is safe, otherwise in single quotes.
+fn shell_quote(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+=:@%,".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        return text.to_owned();
+    }
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 fn version() -> String {
@@ -94,7 +130,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Run, (String, u8
         // Checked before the server starts: on stdio, `--help` would otherwise be served as a
         // session that ends at once.
         ["mcp"] => run(Mode::Mcp),
-        ["mcp", "-h" | "--help" | "help", ..] => Err((mcp_usage(&current_exe()), 0)),
+        ["mcp", "-h" | "--help" | "help", ..] => Err((mcp_usage(&registered_exe()), 0)),
         ["mcp", "-V" | "--version" | "version", ..] => Err((version(), 0)),
         ["mcp", other, ..] => Err((
             format!("flint mcp: unknown argument \"{other}\" (try flint mcp --help)"),
@@ -146,7 +182,54 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Run, parse_args, version};
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use super::{Mode, Run, parse_args, registered_exe_from, shell_quote, version};
+
+    #[test]
+    fn mcp_help_names_the_appimage_not_its_temporary_mount() {
+        let exe = Path::new("/tmp/.mount_FlintX/usr/bin/flint");
+        let dir = Path::new("/tmp/.mount_FlintX");
+        let image = OsStr::new("/home/me/My Apps/Flint's.AppImage");
+        assert_eq!(
+            registered_exe_from(Some(exe), Some(image), Some(dir)),
+            r"'/home/me/My Apps/Flint'\''s.AppImage'"
+        );
+        // A relative APPIMAGE would not work from another directory.
+        let relative = OsStr::new("Flint.AppImage");
+        assert_eq!(
+            registered_exe_from(Some(exe), Some(relative), Some(dir)),
+            exe.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn mcp_help_ignores_appimage_variables_inherited_by_another_binary() {
+        let exe = Path::new("/usr/local/bin/flint");
+        let image = OsStr::new("/home/me/Flint.AppImage");
+        let dir = Path::new("/tmp/.mount_FlintX");
+        assert_eq!(
+            registered_exe_from(Some(exe), Some(image), Some(dir)),
+            "/usr/local/bin/flint"
+        );
+        assert_eq!(
+            registered_exe_from(Some(exe), Some(image), None),
+            "/usr/local/bin/flint"
+        );
+    }
+
+    #[test]
+    fn mcp_help_quotes_the_path_and_falls_back_to_flint() {
+        let spaced = Path::new("/Applications/My Tools/flint");
+        assert_eq!(
+            registered_exe_from(Some(spaced), None, None),
+            "'/Applications/My Tools/flint'"
+        );
+        assert_eq!(registered_exe_from(None, None, None), "flint");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a$(b)"), "'a$(b)'");
+    }
 
     fn parse(args: &[&str]) -> Result<Run, (String, u8)> {
         parse_args(args.iter().map(|a| (*a).to_owned()))
@@ -246,8 +329,9 @@ mod tests {
             assert!(text.contains("--verbose"), "{text}");
             // The example names this binary by its absolute path.
             let exe = std::env::current_exe().unwrap();
+            let exe = shell_quote(exe.to_str().unwrap());
             assert!(
-                text.contains(&format!("claude mcp add flint -- {} mcp", exe.display())),
+                text.contains(&format!("claude mcp add flint -- {exe} mcp")),
                 "{text}"
             );
         }
