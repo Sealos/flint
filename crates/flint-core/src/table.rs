@@ -556,7 +556,6 @@ impl Interner {
     }
 }
 
-/// How server cells map onto a kind's columns.
 /// The role of the server column at `index` of a Table's definitions.
 pub(crate) fn wire_role(index: usize, name: &str, format: &str) -> ColumnRole {
     if index == 0 && (name == "Name" || format == "name") {
@@ -568,6 +567,7 @@ pub(crate) fn wire_role(index: usize, name: &str, format: &str) -> ColumnRole {
     }
 }
 
+/// How server cells map onto a kind's columns.
 #[derive(Debug, Clone)]
 pub(crate) struct Layout {
     /// The published columns, Namespace included.

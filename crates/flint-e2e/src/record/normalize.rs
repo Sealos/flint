@@ -337,6 +337,7 @@ pub fn scrub_secret_table(table: &mut Value) {
         .collect();
     let safe = redact::safe_secret_wire_columns(&definitions);
     let name_first = definitions.first().is_some_and(|d| d.0 == "Name");
+    let age_at = definitions.iter().position(|d| d.0 == "Age");
     for row in table
         .get_mut("rows")
         .and_then(Value::as_array_mut)
@@ -356,7 +357,10 @@ pub fn scrub_secret_table(table: &mut Value) {
                 if i == 0 && name_first {
                     let shown = name.clone().filter(|_| safe[0]);
                     *cell = Value::String(shown.unwrap_or_else(|| CREDENTIAL_MARKER.to_owned()));
-                } else if !safe.get(i).copied().unwrap_or(false) {
+                } else if !safe.get(i).copied().unwrap_or(false)
+                    // A string Age is replaced when ages are normalized; nothing else is.
+                    || (Some(i) == age_at && !cell.is_string())
+                {
                     *cell = Value::String(CREDENTIAL_MARKER.to_owned());
                 }
             }
@@ -604,6 +608,22 @@ mod tests {
             age_as_name["rows"][0]["cells"],
             json!([CREDENTIAL_MARKER, CREDENTIAL_MARKER])
         );
+
+        // An Age cell that is not a string is hidden by the scrub alone.
+        for raw in [
+            json!({"token": "hunter2"}),
+            json!(12345678),
+            json!(null),
+            json!(true),
+            json!(["hunter2"]),
+        ] {
+            let mut table = json!({
+                "columnDefinitions": [{"name": "Name"}, {"name": "Age"}],
+                "rows": [{"cells": ["s", raw], "object": {"metadata": {"name": "s"}}}],
+            });
+            scrub_secret_table(&mut table);
+            assert_eq!(table["rows"][0]["cells"], json!(["s", CREDENTIAL_MARKER]));
+        }
 
         // A standard Secret Table is recorded unchanged.
         let mut standard = json!({

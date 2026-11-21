@@ -570,6 +570,15 @@ async fn a_repeated_safe_header_is_masked_in_a_secret_list(cx: &mut TestAppConte
     assert!(!texts.iter().any(|t| t.starts_with("raw-")), "{texts:?}");
     assert!(texts.iter().any(|t| t == "creds"), "{texts:?}");
     assert!(texts.iter().any(|t| t == "demo"), "{texts:?}");
+    // All nine columns are drawn: both copies of Type and Data, and the extra Name and
+    // Namespace, each with the mask.
+    let drawn = list.read_with(cx, |list, _| list.drawn.len());
+    assert_eq!(drawn, 9);
+    let masks = texts
+        .iter()
+        .filter(|t| *t == crate::ui::object::MASK)
+        .count();
+    assert_eq!(masks, 6, "{texts:?}");
 }
 
 // covers UP-23: a cell that is cut offers its full text in a tooltip; one that fits has none.
