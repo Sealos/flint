@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use flint_core::logs::ContainerWait;
+use flint_core::logs::{ContainerWait, FailedHop, NETWORK_FAILURES};
 use flint_core::{
     LineFormat, LineId, LineSelection, LineSource, LogLine, LogLines, LogState, LogSubject, PodSet,
     PodSetStatus, SearchQuery, WorkloadTarget,
@@ -445,23 +445,9 @@ pub struct Explained {
     pub detail: Option<String>,
 }
 
-/// Words of a failure to reach a server.
-const NETWORK: &[&str] = &[
-    "connection refused",
-    "could not resolve",
-    "tls handshake",
-    "connection reset",
-    "dropped",
-    "unreachable",
-    "timed out",
-    "could not reach",
-    "no route to host",
-    "i/o timeout",
-];
-
-/// Says what a log session's `error` means. `pod`: the session reads one pod (else a
-/// workload's pods).
-pub fn explain(error: &str, pod: bool) -> Explained {
+/// Says what a log session's `error` means. `hop`: the part that failed, as the session read it
+/// from the full error. `pod`: the session reads one pod (else a workload's pods).
+pub fn explain(error: &str, hop: FailedHop, pod: bool) -> Explained {
     let lower = error.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
     let (short, headline) = if lower.starts_with("forbidden") || has(&["denied access (403"]) {
@@ -478,8 +464,7 @@ pub fn explain(error: &str, pod: bool) -> Explained {
             "credentials rejected",
             "The API server rejected your credentials.",
         )
-    } else if (lower.starts_with("internalerror") || has(&[":10250/", ":10250\""])) && has(NETWORK)
-    {
+    } else if hop == FailedHop::Node {
         // The API server answered, but could not reach the kubelet it proxies the log from.
         (
             "can't reach the node",
@@ -489,7 +474,7 @@ pub fn explain(error: &str, pod: bool) -> Explained {
                 "Can't reach the node running one of these pods."
             },
         )
-    } else if has(NETWORK) {
+    } else if has(NETWORK_FAILURES) {
         ("can't reach the API server", "Can't reach the API server.")
     } else if has(&["previous terminated container"]) {
         ("not available", PREVIOUS_NOT_AVAILABLE)
@@ -528,8 +513,8 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
         text: text.to_owned(),
         tooltip: None,
     };
-    let explained = |e: &str| {
-        let ex = explain(e, pod);
+    let explained = |e: &str, hop: FailedHop| {
+        let ex = explain(e, hop, pod);
         let tooltip = match &ex.detail {
             Some(detail) => format!("{}\n{detail}", ex.headline),
             None => ex.headline.clone(),
@@ -552,9 +537,9 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
             text: wait_text(wait),
             tooltip: Some(format!("{}\n{WAITING_DETAIL}", wait_text(wait))),
         },
-        LogState::Reconnecting { error, attempt, .. } => match error {
+        LogState::Reconnecting { error, hop, attempt, .. } => match error {
             Some(e) => {
-                let (ex, tooltip) = explained(e);
+                let (ex, tooltip) = explained(e, *hop);
                 StatusText {
                     tone: Tone::Warning,
                     text: match ex.short {
@@ -574,8 +559,8 @@ pub fn state_text(state: &LogState, pod: bool) -> StatusText {
                 tooltip: Some(format!("{PREVIOUS_NOT_AVAILABLE}\n{kubelet}")),
             }
         }
-        LogState::Ended { error: Some(e), .. } => {
-            let (ex, tooltip) = explained(e);
+        LogState::Ended { error: Some(e), hop, .. } => {
+            let (ex, tooltip) = explained(e, *hop);
             StatusText {
                 tone: Tone::Danger,
                 text: format!("Ended · {}", ex.short),
@@ -1183,6 +1168,7 @@ mod tests {
                 stream(LogState::Streaming),
                 stream(LogState::Streaming),
                 stream(LogState::Ended {
+                    hop: Default::default(),
                     error: Some("x".into()),
                     pod_deleted: false,
                 }),
@@ -1237,6 +1223,7 @@ mod tests {
         assert_eq!(text(LogState::Connecting).0, Tone::Muted);
         assert_eq!(text(LogState::Streaming), (Tone::Live, "Streaming".into()));
         let reconnecting = |error: Option<&str>, back_off| LogState::Reconnecting {
+            hop: Default::default(),
             error: error.map(str::to_owned),
             attempt: 3,
             back_off,
@@ -1274,6 +1261,7 @@ mod tests {
             (Tone::Warning, BACK_OFF.into())
         );
         let ended = |error: Option<&str>, pod_deleted| LogState::Ended {
+            hop: Default::default(),
             error: error.map(str::to_owned),
             pod_deleted,
         };
@@ -1313,18 +1301,19 @@ mod tests {
     fn common_errors_are_explained() {
         let forbidden = "Forbidden: pods is forbidden: User \"flint-e2e\" cannot get resource \
                          \"pods\" in API group \"\" in the namespace \"demo\"";
-        let ex = explain(forbidden, true);
+        let ex = explain(forbidden, FailedHop::Unknown, true);
         assert_eq!(
             ex.headline,
             "You don't have permission to read this pod's logs."
         );
         assert_eq!(ex.detail.as_deref(), Some(forbidden));
         assert_eq!(
-            explain(forbidden, false).headline,
+            explain(forbidden, FailedHop::Unknown, false).headline,
             "You don't have permission to read these pods' logs."
         );
         let status = state_text(
             &LogState::Ended {
+                hop: Default::default(),
                 error: Some(forbidden.into()),
                 pod_deleted: false,
             },
@@ -1342,7 +1331,7 @@ mod tests {
             "TLS handshake with https://h:6443 failed",
         ] {
             assert_eq!(
-                explain(network, true).headline,
+                explain(network, FailedHop::Unknown, true).headline,
                 "Can't reach the API server.",
                 "{network}"
             );
@@ -1350,26 +1339,35 @@ mod tests {
         assert_eq!(
             explain(
                 "https://h rejected the credentials (401 Unauthorized)",
+                FailedHop::Unknown,
                 true
             )
             .short,
             "credentials rejected"
         );
-        assert_eq!(explain("boom", true).headline, "Couldn't read the logs.");
-        // The API server answered, but its proxy to the pod's kubelet failed: the node is the
-        // one out of reach.
-        let dead_node = "InternalError: Get \"https://10.0.1.5:10250/containerLogs/demo/p/app?follow=true\": \
-                         dial tcp 10.0.1.5:10250: connect: connection refused";
-        let ex = explain(dead_node, true);
+        assert_eq!(
+            explain("boom", FailedHop::Unknown, true).headline,
+            "Couldn't read the logs."
+        );
+        // The API server answered, but its proxy to the pod's kubelet failed: the session marks
+        // the node as the failed hop, and the words follow it.
+        let ex = explain(
+            "InternalError: Get [REDACTED]: i/o timeout",
+            FailedHop::Node,
+            true,
+        );
         assert_eq!(ex.headline, "Can't reach the node running this pod.");
         assert_eq!(ex.short, "can't reach the node");
-        assert_eq!(ex.detail.as_deref(), Some(dead_node));
-        let proxied = "Get \"https://10.0.1.5:10250/containerLogs/demo/p/app\": dial tcp \
-                       10.0.1.5:10250: i/o timeout";
-        assert_eq!(explain(proxied, true).short, "can't reach the node");
+        assert_eq!(
+            explain("Timeout: i/o timeout", FailedHop::Unknown, true).short,
+            "can't reach the API server"
+        );
         // The previous container is gone, the pod is not.
         let previous = "BadRequest: previous terminated container \"app\" in pod \"p\" not found";
-        assert_eq!(explain(previous, true).headline, PREVIOUS_NOT_AVAILABLE);
+        assert_eq!(
+            explain(previous, FailedHop::Unknown, true).headline,
+            PREVIOUS_NOT_AVAILABLE
+        );
     }
 
     // covers UP-43: timestamps show as fixed-width local time to the millisecond.
@@ -1718,6 +1716,7 @@ mod tests {
         let ended = LogSnapshot {
             lines: Default::default(),
             state: LogState::Ended {
+                hop: Default::default(),
                 error: None,
                 pod_deleted: true,
             },

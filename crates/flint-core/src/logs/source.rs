@@ -11,7 +11,7 @@ use kube::Client;
 use kube::api::{Api, LogParams};
 
 use super::line::MAX_LINE_BYTES;
-use super::session::{ContainerWait, LogSince, LogTarget};
+use super::session::{ContainerWait, FailedHop, LogSince, LogTarget};
 use crate::api_error::{ApiError, ApiErrorKind};
 use crate::cluster::{ClusterError, Target};
 
@@ -68,6 +68,8 @@ pub(crate) type RawLines = BoxStream<'static, Result<RawLine, LogError>>;
 pub(crate) struct LogError {
     pub message: String,
     pub kind: ErrorKind,
+    /// Read from the full error: [`LogError::message`] has its values hidden.
+    pub hop: FailedHop,
 }
 
 /// What a [`LogError`] means for the stream and the session.
@@ -97,6 +99,7 @@ impl LogError {
         LogError {
             message: message.into(),
             kind: ErrorKind::Retry,
+            hop: FailedHop::Unknown,
         }
     }
 
@@ -104,6 +107,7 @@ impl LogError {
         LogError {
             message: message.into(),
             kind: ErrorKind::Fatal,
+            hop: FailedHop::Unknown,
         }
     }
 
@@ -112,6 +116,7 @@ impl LogError {
         LogError {
             message: message.into(),
             kind: ErrorKind::PodGone,
+            hop: FailedHop::Unknown,
         }
     }
 
@@ -120,6 +125,7 @@ impl LogError {
         LogError {
             message: message.into(),
             kind: ErrorKind::Cluster,
+            hop: FailedHop::Unknown,
         }
     }
 
@@ -128,6 +134,7 @@ impl LogError {
         LogError {
             message: message.into(),
             kind: ErrorKind::NotStarted,
+            hop: FailedHop::Unknown,
         }
     }
 
@@ -162,19 +169,23 @@ impl LogError {
                 && is_starting(api.message)
                 && !api.message.contains(CRASH_LOOP)
         });
-        let message = ClusterError::kube(err).summary().to_string();
-        if not_started {
+        let error = ClusterError::kube(err);
+        let hop = FailedHop::of(&error.to_string());
+        let message = error.summary().to_string();
+        let classified = if not_started {
             LogError::not_started(message)
         } else if not_found {
             LogError {
                 message,
                 kind: ErrorKind::NotFound,
+                hop,
             }
         } else if fatal {
             LogError::fatal(message)
         } else {
             LogError::retry(message)
-        }
+        };
+        LogError { hop, ..classified }
     }
 }
 
@@ -591,6 +602,45 @@ mod tests {
         }))
     }
 
+    fn status(code: u16, reason: &str, message: &str) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            reason: reason.into(),
+            message: message.into(),
+            ..Default::default()
+        }))
+    }
+
+    // covers UP-40: the failing hop is read from the whole error and kept apart from its text.
+    #[test]
+    fn a_quoted_kubelet_address_marks_the_node_as_the_failed_hop() {
+        let url = "https://10.0.1.5:10250/containerLogs/demo/p/app";
+        let error = LogError::from_kube(status(
+            504,
+            "Timeout",
+            &format!("Get \"{url}\": context deadline exceeded: i/o timeout"),
+        ));
+        assert_eq!(error.hop, FailedHop::Node);
+        assert!(!error.message.contains(url), "{}", error.message);
+    }
+
+    // covers UP-40
+    #[test]
+    fn a_failure_word_inside_a_quoted_value_does_not_mark_a_hop() {
+        let quoted = status(
+            500,
+            "InternalError",
+            "object \"connection-refused-timed-out\" could not be saved",
+        );
+        assert_eq!(LogError::from_kube(quoted).hop, FailedHop::Unknown);
+        let elsewhere = status(
+            504,
+            "Timeout",
+            "Get \"https://10.0.0.1:6443/x\": i/o timeout",
+        );
+        assert_eq!(LogError::from_kube(elsewhere).hop, FailedHop::Unknown);
+    }
+
     // covers UP-40
     #[test]
     fn errors_say_whether_retrying_helps() {
@@ -604,7 +654,7 @@ mod tests {
         let long = LogError::from_kube(api_error(
             400,
             &format!(
-                "container \"c\" in pod \"{}\" is waiting to start: image can't be pulled",
+                "container c in pod {} is waiting to start: image can't be pulled",
                 "p".repeat(253)
             ),
         ));
