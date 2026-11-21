@@ -471,6 +471,31 @@ async fn a_narrow_list_across_namespaces_keeps_namespace(cx: &mut TestAppContext
     }
 }
 
+// covers UP-20, UP-23: choosing one namespace hides the column only once that namespace's rows
+// are drawn: until then the old rows may differ by namespace alone.
+#[gpui_kit::test]
+async fn namespace_stays_until_the_scoped_rows_arrive(cx: &mut TestAppContext) {
+    let (core, _dir) = core();
+    let (window, list) = open_sized(cx, core, "Pods", 400.);
+    let pod = pod_like("pods", LONG_POD, "CrashLoopBackOff");
+    show_narrow(cx, window, &list, pod, &[]).await;
+    assert!(has_header(cx, window, "Namespace"));
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    list.update(cx, |list, cx| {
+        list.set_namespaces(vec![NARROW_NAMESPACE.to_owned()], cx)
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(has_header(cx, window, "Namespace"), "hidden over old rows");
+
+    permits.send(()).await.unwrap();
+    cx.wait_for(window, WAIT, |window, _| {
+        window.try_find("sort-Namespace").is_none()
+    })
+    .await;
+}
+
 // covers UP-22: a CRD's own Ready printer column is never left out.
 #[gpui_kit::test]
 async fn a_narrow_list_keeps_a_custom_ready_column(cx: &mut TestAppContext) {

@@ -151,6 +151,9 @@ pub struct ResourceList {
     /// The pane width this frame was laid out for. The width is known only after layout, so
     /// when it changed, the next frame draws again with the new one.
     laid_out_width: Option<f32>,
+    /// Whether the rows on screen were computed for exactly one namespace. A newly chosen scope
+    /// does not count until its rows arrive: the old ones may still span several namespaces.
+    rows_in_one_namespace: bool,
     /// Whether the last recompute applied the sort: its column was drawn then. When that
     /// changes with the layout (Wide toggled, the pane resized), the rows are sorted again.
     sort_drawn: bool,
@@ -262,6 +265,7 @@ impl ResourceList {
             drawn: Vec::new(),
             dropped_wide: 0,
             laid_out_width: None,
+            rows_in_one_namespace: false,
             sort_drawn: false,
             #[cfg(test)]
             compute_gate: None,
@@ -507,6 +511,7 @@ impl ResourceList {
         let selected_uid = self.selected.as_ref().map(|s| s.uid.clone());
         let restart = std::mem::take(&mut self.remeasure);
         let namespaces = self.query.namespaces.clone();
+        let one_namespace = namespaces.len() == 1;
         let job_snapshot = snapshot.clone();
         #[cfg(test)]
         let gate = self.compute_gate.clone();
@@ -548,6 +553,7 @@ impl ResourceList {
                 }
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
+                list.rows_in_one_namespace = one_namespace;
                 list.apply(snapshot, rows, uid, position, cx);
                 if list.dirty {
                     list.recompute(cx);
@@ -775,7 +781,7 @@ impl ResourceList {
             let sort = self.query.sort.as_ref();
             let rules = list_model::ShedRules {
                 ready_repeats_status: list_model::ready_repeats_status(self.kind.as_str()),
-                one_namespace: self.query.namespaces.len() == 1,
+                one_namespace: self.rows_in_one_namespace,
             };
             list_model::shed_columns(
                 &mut drawn,
