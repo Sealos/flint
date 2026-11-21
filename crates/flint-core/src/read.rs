@@ -127,8 +127,8 @@ pub struct DiscoveredKinds {
     /// whose backend is down, often metrics.k8s.io). Sorted. Only servers without aggregated
     /// discovery report these; aggregated discovery lists such groups as stale instead.
     pub skipped_groups: Vec<String>,
-    /// API groups aggregated discovery marks as stale: what they list, if anything, may not be
-    /// what they serve. Sorted.
+    /// API groups whose preferred version aggregated discovery marks as stale: what it lists, if
+    /// anything, may not be what it serves. Sorted.
     pub stale_groups: Vec<String>,
 }
 
@@ -259,13 +259,14 @@ async fn discover_aggregated(
     }))
 }
 
-/// Whether any version of `group` is not reported as current. A server that says nothing about
-/// freshness (the beta API) counts as current.
+/// Whether the version of `group` Flint reads, its preferred one, is not reported as current. A
+/// server that says nothing about freshness (the beta API) counts as current.
 fn is_stale(group: &APIGroupDiscovery) -> bool {
     group
         .versions
-        .iter()
-        .any(|version| version.freshness.as_deref().is_some_and(|f| f != "Current"))
+        .first()
+        .and_then(|version| version.freshness.as_deref())
+        .is_some_and(|freshness| freshness != "Current")
 }
 
 /// Whether `name` can be sent as one segment of a request path, as client-go's
@@ -1413,6 +1414,11 @@ mod tests {
                     group("metrics.k8s.io", Some("Stale"), json!([])),
                     group("a.example.com", None, json!([])),
                     group("b.example.com", Some("Current"), json!([])),
+                    // Only the preferred version, listed first, is read.
+                    json!({"metadata": {"name": "c.example.com"}, "versions": [
+                        {"version": "v1", "freshness": "Current", "resources": []},
+                        {"version": "v1beta1", "freshness": "Stale", "resources": []},
+                    ]}),
                 ]}),
             ),
         ])

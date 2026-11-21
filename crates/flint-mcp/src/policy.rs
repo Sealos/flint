@@ -383,8 +383,7 @@ pub struct ResolvedKinds {
     /// The names that resolved to no kind, to several, or to one that a group missing from
     /// discovery could change.
     pub unmatched: Vec<String>,
-    /// The scope names kinds, and part of discovery could not be read: a name without a group
-    /// grants nothing until it can be.
+    /// Part of discovery could not be read and a name did not resolve: it may exist.
     pub discovery_incomplete: bool,
 }
 
@@ -399,7 +398,7 @@ pub struct ScopeCheck {
     /// Namespaces of the scope not looked up (past the limit, out of time) or whose lookup
     /// failed. Any of them may be missing.
     pub unchecked_namespaces: usize,
-    /// Part of API discovery could not be read.
+    /// Part of API discovery could not be read, so an unmatched kind may exist.
     pub discovery_incomplete: bool,
     /// The check could not run at all.
     pub not_run: bool,
@@ -434,8 +433,9 @@ impl ScopeCheck {
         }
         if self.discovery_incomplete {
             notes.push(
-                "Part of API discovery is failing: a kind written without its group grants \
-                 nothing and is listed as unmatched until it recovers."
+                "Part of API discovery is failing, so a kind in unmatched_kinds may exist. It \
+                 grants nothing until discovery recovers, or until it is written as its exact \
+                 kind id."
                     .to_owned(),
             );
         }
@@ -492,10 +492,11 @@ pub fn resolve_scope_kinds(
             unmatched.push(name.clone());
         }
     }
+    let discovery_incomplete = !skipped.is_empty() && !unmatched.is_empty();
     ResolvedKinds {
         scope: AiScope::new(scope.namespaces.clone(), names),
         unmatched,
-        discovery_incomplete: !skipped.is_empty() && !scope.kinds.is_empty(),
+        discovery_incomplete,
     }
 }
 
@@ -1244,14 +1245,18 @@ mod tests {
         assert_eq!(missing.unmatched, ["widget.b.example.com"]);
     }
 
-    // covers UP-14: a resolved scope says when discovery was incomplete, only if it names kinds.
+    // covers UP-14: incomplete discovery is said only for a name it left unresolved: an exact
+    // kind id still works.
     #[test]
-    fn resolving_says_when_discovery_was_incomplete() {
+    fn resolving_says_when_discovery_left_a_name_unresolved() {
         let kinds = [kind("", "v1", "Pod", "pods", true)];
         let stale = ["metrics.k8s.io".to_owned()];
-        assert!(resolve_scope_kinds(&scoped(&[], &["pods"]), &kinds, &stale).discovery_incomplete);
+        assert!(resolve_scope_kinds(&scoped(&[], &["po"]), &kinds, &stale).discovery_incomplete);
+        let exact = resolve_scope_kinds(&scoped(&[], &["pods"]), &kinds, &stale);
+        assert!(exact.unmatched.is_empty());
+        assert!(!exact.discovery_incomplete);
         assert!(!resolve_scope_kinds(&scoped(&["a"], &[]), &kinds, &stale).discovery_incomplete);
-        assert!(!resolve_scope_kinds(&scoped(&[], &["pods"]), &kinds, &[]).discovery_incomplete);
+        assert!(!resolve_scope_kinds(&scoped(&[], &["nope"]), &kinds, &[]).discovery_incomplete);
     }
 
     // covers UP-14: what a scope check could not cover is said, and no API group is named.
