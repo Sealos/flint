@@ -347,11 +347,13 @@ fn up_09_agent_lists_only_exposed_clusters() -> Result<()> {
         ]
     );
 
-    // Nothing exposed: no clusters, and a hint pointing at the toggle in Flint.
+    // Nothing exposed: no clusters, and a hint this headless server's user can follow.
     let clusters = mcp.call_json("list_clusters", json!({}))?;
     assert_eq!(clusters["clusters"], json!([]), "{clusters}");
     let hint = clusters["hint"].as_str().unwrap_or_default();
-    assert!(hint.contains("Expose to AI"), "{clusters}");
+    assert!(hint.contains("[[ai_exposed_clusters]]"), "{clusters}");
+    assert!(hint.contains("settings.toml"), "{clusters}");
+    assert!(!hint.contains("robot button"), "{clusters}");
 
     // Exposed in settings (as the app writes it): listed, reachable, with its version.
     on.expose()?;
@@ -886,6 +888,14 @@ fn up_11_unexposed_repointed_and_unknown_clusters_look_the_same() -> Result<()> 
     Ok(())
 }
 
+/// What every request outside a visible cluster's scope gets, whatever it named.
+fn out_of_scope(cluster: &str) -> String {
+    format!(
+        "this request is outside the scope exposed to agents on cluster \"{cluster}\". Call \
+         list_clusters for the namespaces and kinds in scope."
+    )
+}
+
 /// Settings exposing `context` at `server`, limited to `namespaces` and `kinds`.
 fn exposing_scoped(context: &str, server: &str, namespaces: &[&str], kinds: &[&str]) -> String {
     format!(
@@ -922,14 +932,7 @@ fn up_14_a_hand_written_scope_resolves_and_reports_what_matches_nothing() -> Res
     assert!(!deployments.is_error, "{}", deployments.text);
     let services = mcp.call("list_resources", list("services"))?;
     assert!(services.is_error, "{}", services.text);
-    let unknown = mcp.call(
-        "list_resources",
-        json!({"cluster": "no-such-cluster", "kind": "services", "namespace": "demo"}),
-    )?;
-    assert_eq!(
-        services.text.replace(EXPOSED, "X"),
-        unknown.text.replace("no-such-cluster", "X")
-    );
+    assert_eq!(services.text, out_of_scope(EXPOSED));
     Ok(())
 }
 
@@ -948,6 +951,15 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
         ],
     )?;
     two.a.set_log("demo", "web-69c6f74b8b-qv4xv", "GET / 200\n");
+    // An object that exists outside the scope, to compare with one that does not.
+    two.a.set_object(
+        &two.a.gvr("pods"),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "exists", "namespace": "kube-system"},
+        }),
+    );
     two.scratch
         .write_settings(&exposing_scoped(EXPOSED, &two.a.url(), &["demo"], &[]))?;
     let mut mcp = two.mcp()?;
@@ -981,13 +993,14 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
         "{clusters}"
     );
 
-    // The not-found every out-of-scope request must match: an unknown cluster's, named alike.
+    // An unknown cluster stays "not found"; a visible one's scope is reported as such.
     let unknown = mcp.call(
         "list_resources",
         json!({"cluster": "no-such-cluster", "kind": "pods", "namespace": "demo"}),
     )?;
     assert!(unknown.is_error);
-    let expected = unknown.text.replace("no-such-cluster", EXPOSED);
+    assert!(unknown.text.contains("not found"), "{}", unknown.text);
+    let expected = out_of_scope(EXPOSED);
     let mut refused = |tool: &str, args: Value| -> Result<()> {
         let got = mcp.call(tool, args.clone())?;
         assert!(got.is_error, "{tool} {args}: {}", got.text);
@@ -996,10 +1009,22 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
     };
     let pods_in = |ns: &str| json!({"cluster": EXPOSED, "kind": "pods", "namespace": ns});
     refused("list_resources", pods_in("kube-system"))?;
-    refused(
-        "get_resource",
-        json!({"cluster": EXPOSED, "kind": "pods", "namespace": "kube-system", "name": "x"}),
-    )?;
+    refused("list_resources", pods_in("no-such-namespace"))?;
+    // The same text for an object that exists and for one that does not.
+    for (namespace, name) in [
+        ("kube-system", "exists"),
+        ("kube-system", "x"),
+        ("no-such-namespace", "x"),
+    ] {
+        refused(
+            "get_resource",
+            json!({"cluster": EXPOSED, "kind": "pods", "namespace": namespace, "name": name}),
+        )?;
+        refused(
+            "get_pod_logs",
+            json!({"cluster": EXPOSED, "namespace": namespace, "pod": name}),
+        )?;
+    }
     // Cluster-scoped kinds are hidden under a namespace scope, as is a kind that does not exist.
     refused(
         "list_resources",
@@ -1081,9 +1106,18 @@ fn up_14_scoped_exposure_shows_only_its_namespaces_and_kinds() -> Result<()> {
         json!({"cluster": EXPOSED, "kind": "nodes"}),
     )?;
     assert!(!nodes["rows"].as_array().unwrap().is_empty(), "{nodes}");
-    let expected = unknown.text.replace("no-such-cluster", EXPOSED);
+    let expected = out_of_scope(EXPOSED);
     for (tool, args) in [
         ("list_resources", pods_in("demo")),
+        // A kind that exists and one that does not, in a namespace in scope.
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": "services", "namespace": "demo"}),
+        ),
+        (
+            "list_resources",
+            json!({"cluster": EXPOSED, "kind": "gizmos", "namespace": "demo"}),
+        ),
         (
             "get_pod_logs",
             json!({"cluster": EXPOSED, "namespace": "demo", "pod": "web-69c6f74b8b-qv4xv"}),

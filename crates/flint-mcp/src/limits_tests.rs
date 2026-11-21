@@ -48,6 +48,21 @@ async fn calls_run_wait_or_are_refused() {
     assert_eq!(admission.admitted(), 2, "a call that stops waiting leaves");
 }
 
+// covers UP-16: a cancellation already signalled beats a free turn, so the call is not admitted
+// and its unvalidated arguments are never read for its record.
+#[tokio::test]
+async fn a_cancelled_call_is_not_admitted_even_with_a_turn_free() {
+    let admission = Admission::new(limits(1, 1));
+    for _ in 0..64 {
+        let entered = admission.enter_unless(std::future::ready(())).await;
+        assert!(entered.is_none());
+        assert_eq!(admission.admitted(), 0);
+        assert_eq!(admission.running(), 0);
+    }
+    let turn = admission.enter_unless(std::future::pending()).await;
+    assert!(matches!(turn, Some(Ok(_))), "not cancelled: it runs");
+}
+
 // covers UP-08: while replies not yet written pass the budget, no call starts.
 #[tokio::test]
 async fn no_call_starts_while_replies_pass_the_budget() {
@@ -231,6 +246,51 @@ async fn a_message_over_the_read_ahead_budget_still_proceeds() {
     );
     assert_eq!(transport.read_ahead_bytes, 0);
     assert!(transport.receive().await.is_some(), "reading goes on");
+}
+
+// covers UP-08: with the read-ahead queue full, the end of stdin cannot be seen, so a client
+// that lets no reply be written counts as gone; nothing queued is run.
+#[tokio::test(start_paused = true)]
+async fn a_full_read_ahead_queue_with_no_writes_ends_the_stream() {
+    let replies = Arc::new(ReplyBytes::default());
+    let incoming = [tool_call(1), tool_call(2), tool_call(3), tool_call(4)];
+    let size = serialized_len(&incoming[0]).unwrap();
+    let mut transport = Counted::new(Gated::new(incoming), replies.clone(), &limits(1, 1));
+    transport.read_ahead_budget = 2 * size;
+    let _stuck = replies.hold(1001);
+    let started = tokio::time::Instant::now();
+    assert!(transport.receive().await.is_none());
+    assert_eq!(started.elapsed(), limits(1, 1).deadline + SHUTDOWN_GRACE);
+    assert_eq!(transport.inner.incoming.len(), 2, "no more was read");
+    assert_eq!(replies.unanswered_count(), 0, "nothing queued was run");
+}
+
+// covers UP-08: a slow client is not a gone one: each reply written moves the wait on, and once
+// replies are within the budget the queue runs in order.
+#[tokio::test(start_paused = true)]
+async fn a_full_read_ahead_queue_waits_while_replies_are_written() {
+    let replies = Arc::new(ReplyBytes::default());
+    let incoming = [tool_call(1), tool_call(2), tool_call(3)];
+    let size = serialized_len(&incoming[0]).unwrap();
+    let mut transport = Counted::new(Gated::new(incoming), replies.clone(), &limits(1, 1));
+    transport.read_ahead_budget = 2 * size;
+    let deadline = limits(1, 1).deadline;
+    let first = replies.hold(1);
+    let rest = replies.hold(1001);
+    tokio::spawn(async move {
+        tokio::time::sleep(deadline).await;
+        drop(first);
+        tokio::time::sleep(deadline).await;
+        drop(rest);
+    });
+    let started = tokio::time::Instant::now();
+    let message = transport.receive().await.unwrap();
+    assert_eq!(started.elapsed(), deadline * 2);
+    assert_eq!(
+        request_id(&message),
+        Some(rmcp::model::NumberOrString::Number(1))
+    );
+    assert!(transport.stalled.is_none());
 }
 
 // covers UP-08: a client that closed stdin and keeps reading stdout gets its slower calls

@@ -55,6 +55,8 @@ struct Inner {
     kubeconfig: Mutex<Option<(FileStamps, Arc<LoadedKubeconfig>)>>,
     clients: SlotMap<Client>,
     discovery: SlotMap<Discovered>,
+    /// Which program this is, for advice that can be followed where it runs.
+    flavour: policy::Flavour,
     /// Unmatched scopes already logged, so each is logged once.
     warned_scopes: std::sync::Mutex<std::collections::HashSet<String>>,
     /// How many tool calls run and wait, and the reply bytes not yet written (#252).
@@ -102,9 +104,9 @@ struct Discovered {
 #[derive(Debug)]
 struct ToolError {
     message: String,
-    /// The call named something the agent may not read: a cluster not exposed, or a namespace or
-    /// kind outside its scope. Only [`policy::PolicyError`] sets it. The agent cannot tell (the
-    /// message is the same as for a cluster that does not exist); the activity log can.
+    /// The call named something the agent may not read: a cluster not exposed (the message is
+    /// the same as for a cluster that does not exist), or a namespace or kind outside its scope
+    /// (one message, whatever it named). Only [`policy::PolicyError`] sets it.
     denied: bool,
 }
 
@@ -480,6 +482,26 @@ const UNSUPPORTED_NAME_CHARS: usize = 64;
 /// likes, and a prefix of it could hold part of a credential.
 const UNSUPPORTED_NAME_BYTES: usize = 1024;
 
+/// `result` with an argument error's repeated value taken out ([`policy::argument_error`]). rmcp
+/// returns that error as a failed tool result.
+fn without_argument_values(
+    mut result: Result<rmcp::model::CallToolResponse, rmcp::ErrorData>,
+) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+    if let Ok(rmcp::model::CallToolResponse::Complete(done)) = &mut result
+        && done.is_error == Some(true)
+    {
+        for block in &mut done.content {
+            let safe = block
+                .as_text()
+                .and_then(|text| policy::argument_error(&text.text));
+            if let Some(safe) = safe {
+                *block = ContentBlock::text(safe);
+            }
+        }
+    }
+    result
+}
+
 /// The refusal for `arguments` that `tool`'s schema does not have, naming them and the accepted
 /// ones. A tool that dropped them would answer as if a filter it never applied had matched.
 /// `_meta` is not among them: it sits beside the arguments in the request.
@@ -550,8 +572,41 @@ impl FlintMcp {
         home: Option<PathBuf>,
         limits: Limits,
     ) -> Self {
+        Self::built(
+            config_dir,
+            kubeconfig_base,
+            home,
+            limits,
+            policy::Flavour::App,
+        )
+    }
+
+    /// [`FlintMcp::new`] for the program `flavour`, whose advice it gives.
+    pub fn with_flavour(
+        config_dir: PathBuf,
+        kubeconfig_base: Vec<PathBuf>,
+        home: Option<PathBuf>,
+        flavour: policy::Flavour,
+    ) -> Self {
+        Self::built(
+            config_dir,
+            kubeconfig_base,
+            home,
+            Limits::default(),
+            flavour,
+        )
+    }
+
+    fn built(
+        config_dir: PathBuf,
+        kubeconfig_base: Vec<PathBuf>,
+        home: Option<PathBuf>,
+        limits: Limits,
+        flavour: policy::Flavour,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                flavour,
                 config_dir,
                 kubeconfig_base,
                 home,
@@ -578,40 +633,39 @@ impl FlintMcp {
         // A tool call refused at the transport never reaches `call_tool`:
         // recorded from there.
         let inner = Arc::downgrade(&self.inner);
-        admission
-            .replies()
-            .on_dropped_call(Box::new(move |tool, arguments| {
-                let inner = inner.clone();
-                Box::pin(async move {
-                    let Some(inner) = inner.upgrade() else {
-                        return;
-                    };
-                    let named = named_in(arguments.as_ref());
-                    inner
-                        .record(
-                            activity::ActivityRecord {
-                                at_ms: activity::now_ms(),
-                                tool,
-                                server: None,
-                                cluster: named.cluster,
-                                kind: named.kind,
-                                namespace: named.namespace,
-                                name: named.name,
-                                container: named.container,
-                                items: None,
-                                bytes: 0,
-                                truncated: false,
-                                outcome: activity::Outcome::Failed,
-                                cluster_key: None,
-                                server_key: None,
-                                probed: Vec::new(),
-                                probed_more: 0,
-                            },
-                            activity::Reached::default(),
-                        )
-                        .await;
-                })
-            }));
+        admission.replies().on_dropped_call(Box::new(move |tool| {
+            let inner = inner.clone();
+            Box::pin(async move {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                // Its arguments are unvalidated: none is recorded, or trusted to say which
+                // cluster the call was about.
+                inner
+                    .record(
+                        activity::ActivityRecord {
+                            at_ms: activity::now_ms(),
+                            tool,
+                            server: None,
+                            cluster: None,
+                            kind: None,
+                            namespace: None,
+                            name: None,
+                            container: None,
+                            items: None,
+                            bytes: 0,
+                            truncated: false,
+                            outcome: activity::Outcome::Failed,
+                            cluster_key: None,
+                            server_key: None,
+                            probed: Vec::new(),
+                            probed_more: 0,
+                        },
+                        activity::Reached::default(),
+                    )
+                    .await;
+            })
+        }));
         Counted::new(transport, admission.replies(), &admission.limits())
     }
 
@@ -715,22 +769,21 @@ impl ServerHandler for FlintMcp {
     /// once when too many are in flight), stopped when the client cancels it, and ended at the
     /// deadline. A call the router answers without running its tool (an unknown tool, arguments
     /// that do not fit the tool's schema) is recorded here, as failed, with what its arguments
-    /// name; so is one refused, cancelled or past its deadline. The others are recorded by their
-    /// tool (`FlintMcp::finish`).
+    /// name; so is one cancelled or past its deadline once admitted. One refused or cancelled
+    /// before that is recorded with its tool only: its arguments are unvalidated. The others are
+    /// recorded by their tool (`FlintMcp::finish`).
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let tool = request.name.to_string();
-        let mut named = named_in(request.arguments.as_ref());
+        // Nothing from the arguments until the call is admitted and they fit its tool.
+        let mut named = Named::default();
         let cancelled = context.ct.clone();
         let admission = &self.inner.admission;
         let deadline = admission.limits().deadline;
-        let turn = tokio::select! {
-            turn = admission.enter() => Some(turn),
-            () = cancelled.cancelled() => None,
-        };
+        let turn = admission.enter_unless(cancelled.cancelled()).await;
         let failed = |text: &str| Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
         // The reply, the record its tool left when it is the outcome, and what the call learned
         // on its way (for a record of its own otherwise).
@@ -751,9 +804,9 @@ impl ServerHandler for FlintMcp {
                     drop(turn);
                     // Its arguments are unvalidated: none is recorded, or trusted to say which
                     // cluster the call was about.
-                    named = Named::default();
                     (failed(&text), None, CallNote::default())
                 } else {
+                    named = named_in(request.arguments.as_ref());
                     let call =
                         rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
                     CALL.scope(std::cell::RefCell::default(), async {
@@ -778,6 +831,13 @@ impl ServerHandler for FlintMcp {
                             let record = c.record.take().filter(|_| finished);
                             (record, std::mem::take(&mut *c))
                         });
+                        // A tool that ran left its record: its text is the cluster's, not rmcp's
+                        // error for arguments that never reached it.
+                        let result = if finished && record.is_none() {
+                            without_argument_values(result)
+                        } else {
+                            result
+                        };
                         (result, record, note)
                     })
                     .await
@@ -839,12 +899,13 @@ impl FlintMcp {
     async fn context(&self) -> Result<CallContext, ToolError> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            // The full TOML error quotes lines of settings.toml; give the agent one line.
+            // The full TOML error quotes lines of settings.toml; give the agent one safe line.
             let settings = settings::load_settings(&inner.config_dir).map_err(|e| {
+                let setup = policy::Setup::new(inner.flavour, &inner.config_dir);
                 ToolError::new(format!(
-                    "Flint's settings.toml is invalid ({}), so no cluster is exposed. Ask the \
-                     user to fix it; the Flint app shows the details.",
-                    flint_core::redact::safe_error_summary(&e.to_string())
+                    "Flint's settings.toml is invalid ({}), so no cluster is exposed. {}",
+                    e.safe_reason(),
+                    setup.fix_settings()
                 ))
             })?;
             let paths = kubeconfig::paths_for_settings(
@@ -1009,7 +1070,7 @@ impl FlintMcp {
     /// The connection and the resolved kind. `check` (the names the call carries) runs once the
     /// cluster is known to be exposed and before discovery or the scope, so a call it refuses
     /// sends no request at all. The kind is resolved among those the agent may read: on a
-    /// scoped cluster one that does not resolve gives the unexposed-cluster error, whether it
+    /// scoped cluster one that does not resolve gives the out-of-scope error, whether it
     /// is out of scope or does not exist, so the two cannot be told apart.
     async fn resolve(
         &self,
@@ -1053,12 +1114,7 @@ impl FlintMcp {
             .kubeconfig
             .errors
             .iter()
-            .map(|(path, error)| {
-                json!({
-                    "file": path.display().to_string(),
-                    "error": flint_core::redact::safe_error_summary(error),
-                })
-            })
+            .map(|(path, error)| policy::kubeconfig_error_row(path, error))
             .collect();
         let mut rows = Vec::new();
         let results = self.probe_all(ctx, &exposed).await;
@@ -1114,6 +1170,7 @@ impl FlintMcp {
             missing,
             &kubeconfig_paths,
             !kubeconfig_errors.is_empty(),
+            &policy::Setup::new(self.inner.flavour, &self.inner.config_dir),
         ) {
             out["hint"] = json!(hint);
         }

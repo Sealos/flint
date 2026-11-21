@@ -1585,6 +1585,13 @@ impl LogView {
             ),
             LogState::Ended { .. } => (false, theme.muted_foreground, "No log lines.".into(), None),
         };
+        // The tab is empty because its lines were given back, not because the pod logged none.
+        let (text, detail) = if log_model::all_lines_dropped(&self.snapshot) {
+            let failed = matches!(&self.snapshot.state, LogState::Ended { error: Some(_), .. });
+            log_model::with_lines_dropped(text, detail, failed)
+        } else {
+            (text, detail)
+        };
         v_flex()
             .id("log-empty")
             .flex_1()

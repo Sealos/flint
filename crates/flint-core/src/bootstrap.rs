@@ -81,6 +81,20 @@ pub fn flush_logs() {
     logging::flush();
 }
 
+/// Records a startup failure in the log file, without printing it: the caller prints it. For a
+/// failure before [`init_logging`], such as a [`bootstrap`] error. Call it at most once, instead
+/// of `init_logging`. It writes nothing when no log location is known: [`bootstrap`] fails only
+/// without a home directory, and on macOS the log file lives under it, so there only stderr has
+/// the error. On Linux an absolute `XDG_STATE_HOME` still places the file.
+pub fn log_startup_failure(message: &str) {
+    let flint_log = std::env::var("FLINT_LOG").ok();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    logging::log_startup_failure(
+        log_filter(flint_log.as_deref(), rust_log.as_deref(), true),
+        message,
+    );
+}
+
 /// The log filter: `FLINT_LOG` if set, else `RUST_LOG`, else `info` when `verbose` and `warn`
 /// otherwise, so a plain run prints only warnings and errors. A variable with no directive (empty,
 /// or only commas and spaces) or an unparsable one counts as unset: `EnvFilter` would drop the

@@ -273,6 +273,9 @@ pub enum Event {
     SettingsChanged {
         settings: Arc<Settings>,
         error: Option<String>,
+        /// The newest Trust or Stop Trusting request whose write has finished: settings events
+        /// can be merged, so a front end tells by this that one it asked for is done.
+        trust_settled: u64,
     },
     /// Discovery ran for a cluster: at connect, and again when its CRDs change. On failure,
     /// `error` is set and `discovery` holds the previous result, if any.
@@ -632,7 +635,7 @@ impl CoreHandle {
     /// The client for an action that changes `cluster` or runs code in it, with the context's
     /// pin: refused while the cluster is protected (ADR-0015) or not connected.
     /// Never blocks.
-    fn write_client(
+    pub(crate) fn write_client(
         &self,
         cluster: &str,
         server: Option<Option<String>>,
@@ -650,6 +653,25 @@ impl CoreHandle {
             }
             rx.await.unwrap_or(Err(WriteRefusal::Stopped))
         }
+    }
+
+    /// Whether a write may go out on `pin`: the context still names its server, confirmed, and
+    /// the gate allows changes there.
+    pub(crate) fn check_write_pin(
+        &self,
+        cluster: &ClusterId,
+        pin: ContextPin,
+    ) -> impl Future<Output = Result<(), WriteRefusal>> + Send + 'static {
+        launch_check(self.requests.clone(), cluster.clone(), pin)()
+    }
+
+    /// Runs `task` on the core's runtime, for callers on another executor. Dropping the returned
+    /// future aborts it.
+    pub(crate) fn on_runtime<T: Send + 'static>(
+        &self,
+        task: impl Future<Output = T> + Send + 'static,
+    ) -> impl Future<Output = Option<T>> + Send + 'static {
+        spawn_aborting(&self.runtime, task)
     }
 
     /// Unlocks `cluster` at `server` (the URL the user confirmed) until Flint quits or
@@ -681,13 +703,16 @@ impl CoreHandle {
     /// cluster starts, before `settings.toml` is written (commands and the core's gate take
     /// separate queues), and no Trust written before then lifts it. Shells already open keep
     /// running.
-    pub fn untrust(&self, cluster: &str) {
+    ///
+    /// Returns the request's number, which `Event::SettingsChanged` reports once it is done.
+    pub fn untrust(&self, cluster: &str) -> u64 {
         let request = self.unlocks.revoke_trust(cluster);
         self.send(Command::SetTrusted {
             cluster: cluster.to_owned(),
             server: None,
             request,
         });
+        request
     }
 
     /// The session's unlocks, for showing each cluster's [`crate::Protection`].

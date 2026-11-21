@@ -116,7 +116,9 @@ init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 # so a crash or hang after a good answer still fails. All of stdout is kept (no `head` closing
 # the pipe early).
 status=0
-KUBECONFIG=$scratch/kubeconfig FLINT_CONFIG_DIR=$scratch/config FLINT_LOG=warn \
+# HOME places the log file: never the real one when run locally.
+mkdir -p "$scratch/home"
+HOME=$scratch/home KUBECONFIG=$scratch/kubeconfig FLINT_CONFIG_DIR=$scratch/config FLINT_LOG=warn \
   guard 60 "$exe" mcp <<<"$init" >"$scratch/mcp.out" 2>"$scratch/mcp.err" || status=$?
 answer=$(head -n 1 "$scratch/mcp.out")
 if [ "$status" != 0 ]; then

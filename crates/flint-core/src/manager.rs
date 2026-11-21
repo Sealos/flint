@@ -240,6 +240,8 @@ pub(crate) struct ClusterManager {
     kubeconfig_paths: Vec<PathBuf>,
     settings: Arc<Settings>,
     settings_error: Option<String>,
+    /// The newest Trust or Stop Trusting request whose write has finished.
+    trust_settled: u64,
     /// In kubeconfig order.
     clusters: Vec<Cluster>,
     active: Option<ClusterId>,
@@ -288,6 +290,7 @@ impl ClusterManager {
         Self {
             settings: Arc::new(config.settings.clone()),
             settings_error: config.settings_error.clone(),
+            trust_settled: 0,
             config,
             events,
             internal_tx,
@@ -342,6 +345,7 @@ impl ClusterManager {
         self.emit(Event::SettingsChanged {
             settings: self.settings.clone(),
             error: self.settings_error.clone(),
+            trust_settled: self.trust_settled,
         });
     }
 
@@ -691,6 +695,7 @@ impl ClusterManager {
         } else if saved {
             self.unlocks.trust_removed(&cluster, request);
         }
+        self.trust_settled = self.trust_settled.max(request);
         if saved {
             // The settings may be unchanged (the same pin again, or none to remove): say it
             // anyway, so the front end shows the protection that holds now.
@@ -1893,6 +1898,50 @@ mod tests {
             .err()
             .expect("no client");
         assert!(gone.is_cluster());
+    }
+
+    // covers UP-55: from Stop Trusting on, the gate refuses at every step: before the write, once
+    // it is done, and after the file is read back.
+    #[tokio::test]
+    async fn the_gate_stays_closed_through_stop_trusting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::events::channel();
+        let config = CoreConfig {
+            config_dir: dir.path().to_owned(),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: Vec::new(),
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        };
+        let hubs = HubRegistry::default();
+        let unlocks = SessionUnlocks::default();
+        let mut manager = ClusterManager::new(config, events, hubs.clone(), unlocks.clone());
+        manager.clusters.push(Cluster::new(
+            context(None),
+            None,
+            &hubs,
+            &manager.engine_config,
+        ));
+        let protected = Some(WriteRefusal::Protected {
+            cluster: "dev".into(),
+        });
+
+        let trust = unlocks.request_trust("dev");
+        manager
+            .set_trusted("dev".into(), Some("https://dev".into()), trust)
+            .await;
+        assert!(manager.write_gate("dev").is_ok());
+
+        let stop = unlocks.revoke_trust("dev");
+        assert_eq!(manager.write_gate("dev").err(), protected);
+        manager.set_trusted("dev".into(), None, stop).await;
+        assert!(!unlocks.trust_revoked("dev"), "the revocation has ended");
+        assert!(manager.settings.trusted_clusters.is_empty());
+        assert_eq!(manager.write_gate("dev").err(), protected);
+        manager.reload_settings().await;
+        assert_eq!(manager.write_gate("dev").err(), protected);
     }
 
     // covers UP-06, UP-41: a shell's check (`Request::CheckContext`) compares the context with

@@ -538,11 +538,13 @@ async fn at_the_request_limit_calls_are_refused_and_cancellations_pass() {
         records().len() == 2
     })
     .await;
+    // The refused call is recorded by its tool alone: its arguments were never validated.
     let refused_record = records()
         .into_iter()
-        .find(|r| r.kind.as_deref() == Some("services"))
+        .find(|r| r.cluster.is_none())
         .expect("the refused call");
-    assert_eq!(refused_record.cluster.as_deref(), Some("silent"));
+    assert_eq!(refused_record.tool, "list_resources");
+    assert_eq!(refused_record.kind, None);
     assert!(
         records()
             .iter()
@@ -585,6 +587,138 @@ async fn a_refused_call_records_no_argument_values() {
         .collect::<String>();
     assert!(!stored.is_empty());
     assert!(!stored.contains("raw-value"), "{stored}");
+}
+
+/// Values a call sends that must never reach the activity log, in every field a record has.
+fn raw_arguments() -> Value {
+    json!({
+        "cluster": "raw-value-cluster",
+        "kind": "raw-value-kind",
+        "namespace": "raw-value-namespace",
+        "name": "raw-value-name",
+        "container": "raw-value-container",
+    })
+}
+
+/// Waits for `count` records of `tool` with no argument value or cluster, and checks that no
+/// file in `dir` holds a value of [`raw_arguments`].
+async fn assert_tool_only_records(dir: &std::path::Path, tool: &str, count: usize) {
+    let bare = || {
+        flint_core::activity::read(dir)
+            .into_iter()
+            .filter(|r| r.tool == tool && r.cluster.is_none())
+            .collect::<Vec<_>>()
+    };
+    wait_for("the refused calls are recorded", || bare().len() >= count).await;
+    for record in bare() {
+        assert_eq!(record.outcome, flint_core::activity::Outcome::Failed);
+        assert_eq!(record.kind, None, "{record:?}");
+        assert_eq!(record.namespace, None, "{record:?}");
+        assert_eq!(record.name, None, "{record:?}");
+        assert_eq!(record.container, None, "{record:?}");
+        assert_eq!(record.server, None, "{record:?}");
+    }
+    let stored = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect::<String>();
+    assert!(!stored.contains("raw-value"), "{stored}");
+}
+
+// covers UP-16: a call refused at the transport, past the request limit or with a repeated id,
+// records its tool only.
+#[tokio::test]
+async fn a_call_refused_at_the_transport_records_no_argument_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        unanswered: 2,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let mut client = Client::start(&server, 64 * 1024).await;
+    let held = json!({"cluster": "silent", "kind": "pods"});
+    client.call(1, "list_resources", held.clone()).await;
+    client.call(2, "list_resources", held).await;
+    wait_for("two calls running", || {
+        server.inner.admission.running() == 2
+    })
+    .await;
+    for id in [3, 1] {
+        client.call(id, "get_resource", raw_arguments()).await;
+        let refused = client.next().await;
+        assert_eq!(refused["id"], json!(id), "{refused}");
+        assert!(refused["error"].is_object(), "{refused}");
+    }
+    assert_tool_only_records(dir.path(), "get_resource", 2).await;
+}
+
+// covers UP-16: a call refused because too many are in flight, and one cancelled while it waits
+// for a turn, record their tool only.
+#[tokio::test]
+async fn a_call_refused_or_cancelled_before_admission_records_no_argument_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _sockets) = silent_server().await;
+    let limits = Limits {
+        running: 1,
+        waiting: 1,
+        ..Limits::default()
+    };
+    let server = server(dir.path(), Some(&url), limits);
+    let admission = || &server.inner.admission;
+    let mut client = Client::start(&server, 64 * 1024).await;
+    client
+        .call(
+            1,
+            "list_resources",
+            json!({"cluster": "silent", "kind": "pods"}),
+        )
+        .await;
+    wait_for("one call running", || admission().running() == 1).await;
+    client.call(2, "get_resource", raw_arguments()).await;
+    wait_for("one call waiting", || admission().admitted() == 2).await;
+
+    client.call(3, "get_resource", raw_arguments()).await;
+    let busy = client.next().await;
+    assert_eq!(busy["id"], json!(3), "{busy}");
+    assert!(text(&busy).starts_with("too many tool calls"), "{busy}");
+    assert_tool_only_records(dir.path(), "get_resource", 1).await;
+
+    client.cancel(2).await;
+    wait_for("the waiting call left", || admission().admitted() == 1).await;
+    assert_tool_only_records(dir.path(), "get_resource", 2).await;
+}
+
+// covers UP-10: an argument of the wrong type is refused naming what was expected, without
+// repeating the value, even one holding quotes. A missing argument is still named.
+#[tokio::test]
+async fn a_wrong_type_argument_is_not_echoed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path(), None, Limits::default());
+    let mut client = Client::start(&server, 64 * 1024).await;
+    for (id, limit) in [
+        (1, json!("raw-value")),
+        (2, json!("a\"raw-value\"b")),
+        (3, json!(-77_001)),
+    ] {
+        let arguments = json!({"cluster": "silent", "kind": "pods", "limit": limit});
+        client.call(id, "list_resources", arguments).await;
+        let reply = client.next().await;
+        assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+        let said = text(&reply);
+        assert!(said.contains("expected u32"), "{reply}");
+        assert!(
+            !said.contains("raw-value") && !said.contains("77001"),
+            "{reply}"
+        );
+        assert!(!reply.to_string().contains("raw-value"), "{reply}");
+    }
+    client
+        .call(4, "list_resources", json!({"cluster": "silent"}))
+        .await;
+    let missing = client.next().await;
+    assert!(text(&missing).contains("missing field `kind`"), "{missing}");
 }
 
 // covers UP-16: a `list_clusters` call ended by its deadline while it probes is still recorded

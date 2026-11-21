@@ -484,7 +484,10 @@ fn mcp_policy_without_a_cluster() {
         format!("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: {refusing}\nusers:\n- name: u\n  user:\n    token: SECRETTOKEN\ncontexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n- name: other\n  context:\n    cluster: c\n    user: u\n"),
     )
     .unwrap();
-    let broken = scratch.path().join("broken");
+    // In a directory whose name holds a credential: the error names the file, redacted.
+    let broken_dir = scratch.path().join("password=PATHSECRET");
+    std::fs::create_dir_all(&broken_dir).unwrap();
+    let broken = broken_dir.join("broken");
     std::fs::write(
         &broken,
         "users:\n- name: x\n  user:\n    token: BROKENSECRET\nclusters: [\n",
@@ -505,7 +508,7 @@ fn mcp_policy_without_a_cluster() {
     assert_eq!(clusters["clusters"], json!([]), "{clusters}");
     let hint = clusters["hint"].as_str().unwrap();
     assert!(
-        hint.contains("Expose to AI") && hint.contains("different API server"),
+        hint.contains("[[ai_exposed_clusters]]") && hint.contains("different API server"),
         "{hint}"
     );
     let errors = clusters["kubeconfig_errors"].as_array().unwrap();
@@ -515,6 +518,7 @@ fn mcp_policy_without_a_cluster() {
         !text.contains("SECRETTOKEN") && !text.contains("BROKENSECRET"),
         "{text}"
     );
+    assert!(!text.contains("PATHSECRET"), "{text}");
     assert!(
         !text.contains("\"dev\""),
         "a re-pointed cluster was named: {text}"
@@ -558,6 +562,22 @@ fn mcp_policy_without_a_cluster() {
     assert!(is_error, "{text}");
     assert!(text.contains("settings.toml is invalid"), "{text}");
     assert!(!text.contains('\n'), "{text}");
+    assert!(!text.contains("Flint app"), "{text}");
+
+    // A misspelt key: the agent reads which one and where, and no value from the file.
+    std::fs::write(
+        &settings,
+        "[[ai_exposed_clusters]]\ncontext = \"dev\"\nserver = \"https://x\"\n\
+         namespace = [\"SECRETVALUE\"]\n",
+    )
+    .unwrap();
+    let (is_error, text) = server.call("list_clusters", json!({}));
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("unknown field namespace at line 4, column 1"),
+        "{text}"
+    );
+    assert!(!text.contains("SECRETVALUE"), "{text}");
 }
 
 // covers UP-08, UP-09, UP-10, UP-11

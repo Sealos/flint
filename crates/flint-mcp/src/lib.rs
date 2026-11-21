@@ -30,12 +30,13 @@ pub unsafe fn serve_stdio_main(program: &str, verbose: bool) -> ExitCode {
         Ok(boot) => boot,
         Err(e) => {
             eprintln!("{program}: {e}");
+            bootstrap::log_startup_failure(&format!("{program}: {e}"));
             return ExitCode::FAILURE;
         }
     };
     bootstrap::init_logging(verbose);
     boot.log_summary();
-    let code = match run_stdio(&boot) {
+    let code = match run_stdio(&boot, policy::Flavour::of_program(program)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("mcp server failed: {}", failure_summary(&e));
@@ -73,17 +74,18 @@ fn failure_summary(e: &anyhow::Error) -> String {
 /// Serves MCP over stdin/stdout until the client disconnects. Starts its own tokio runtime, so
 /// call it after [`flint_core::bootstrap::bootstrap`] and from a plain (non-async) context.
 /// stdout carries only the protocol. Diagnostics go to stderr and the shared log file.
-pub fn run_stdio(bootstrap: &Bootstrap) -> anyhow::Result<()> {
+pub fn run_stdio(bootstrap: &Bootstrap, flavour: policy::Flavour) -> anyhow::Result<()> {
     // A mostly idle stdio server: two workers are plenty.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("flint-mcp")
         .enable_all()
         .build()?;
-    let server = FlintMcp::new(
+    let server = FlintMcp::with_flavour(
         bootstrap.config_dir.clone(),
         bootstrap.kubeconfig_base.clone(),
         bootstrap.home.clone(),
+        flavour,
     );
     let result = runtime.block_on(async move {
         let stdio =

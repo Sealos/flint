@@ -4,7 +4,7 @@
 //! are on this machine, so the tests turn on `protect_local_clusters` to see a protected one.
 
 use flint_core::settings::TrustState;
-use flint_core::{ObjectDetail, Protection};
+use flint_core::{Event, ObjectDetail, Protection};
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
@@ -718,6 +718,75 @@ async fn a_shell_whose_context_is_gone_offers_no_unlock(cx: &mut TestAppContext)
     );
     assert_eq!(disabled(cx, &t, "terminal-restart"), Some(true));
     assert_eq!(disabled(cx, &t, "terminal-unlock"), None);
+}
+
+/// Trusts `alpha` and waits until the core has finished that request.
+async fn trust_alpha(cx: &mut TestAppContext, t: &TestWorkspace) {
+    let server = t.server.clone();
+    t.model
+        .update(cx, |m, _| m.trust_cluster("alpha".into(), server));
+    wait_for_protection(cx, t, "alpha", Protection::Trusted).await;
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).trust_settled > 0
+    })
+    .await;
+}
+
+// covers UP-55: after Stop Trusting the cluster shows as protected until the core reports it
+// done, however soon the core has finished with it.
+#[gpui_kit::test]
+async fn stop_trusting_shows_protected_until_the_settings_arrive(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    trust_alpha(cx, &t).await;
+
+    t.model.update(cx, |m, cx| {
+        m.untrust_cluster("alpha".into(), cx);
+        // As once the core has written the change, before its event reaches this model.
+        let unlocks = m.core().unlocks();
+        let request = unlocks.revoke_trust("alpha");
+        unlocks.trust_removed("alpha", request);
+        assert!(!unlocks.trust_revoked("alpha"), "the core is done with it");
+        assert!(!m.settings.trusted_clusters.is_empty(), "the old settings");
+        assert_eq!(m.protection_of("alpha"), Protection::Protected);
+    });
+    let model = t.model.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        model.read(cx).settings.trusted_clusters.is_empty()
+    })
+    .await;
+    assert_eq!(protection(cx, &t, "alpha"), Protection::Protected);
+
+    // Trusting it again counts as soon as it is written.
+    trust_alpha(cx, &t).await;
+}
+
+// covers UP-55: settings events can be merged. One that reports the Stop Trusting done ends it,
+// even if it already holds a trust made since.
+#[gpui_kit::test]
+async fn a_merged_settings_event_ends_stop_trusting(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_with_settings(cx, dir.path(), PROTECT_LOCAL).await;
+    trust_alpha(cx, &t).await;
+
+    t.model.update(cx, |m, cx| {
+        let settings = m.settings.clone();
+        m.untrust_cluster("alpha".into(), cx);
+        let unlocks = m.core().unlocks();
+        let request = unlocks.revoke_trust("alpha");
+        unlocks.trust_removed("alpha", request);
+        assert_eq!(m.protection_of("alpha"), Protection::Protected);
+        m.feed(
+            Event::SettingsChanged {
+                settings,
+                error: None,
+                trust_settled: request,
+            },
+            cx,
+        );
+        assert_eq!(m.protection_of("alpha"), Protection::Trusted);
+    });
 }
 
 // covers UP-54: clusters on this machine start unlocked: no lock button, Shell enabled, and

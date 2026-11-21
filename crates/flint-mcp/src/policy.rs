@@ -2,7 +2,7 @@
 //! redaction, and output bounds. Everything here is pure so it can be tested without a cluster.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flint_core::Settings;
 use flint_core::kubeconfig::{ContextInfo, LoadedKubeconfig};
@@ -46,6 +46,10 @@ pub enum PolicyError {
     /// Used for clusters that do not exist and for clusters that are not exposed, so callers
     /// cannot tell the two apart.
     ClusterNotFound(String),
+    /// A request outside the scope of a cluster the agent can see. It names only the cluster, so
+    /// its text is the same whether what was asked for exists or not, and nothing beyond the
+    /// scope can be probed.
+    OutOfScope(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -54,6 +58,11 @@ impl std::fmt::Display for PolicyError {
             PolicyError::ClusterNotFound(name) => write!(
                 f,
                 "cluster \"{name}\" not found. Call list_clusters for the available clusters."
+            ),
+            PolicyError::OutOfScope(name) => write!(
+                f,
+                "this request is outside the scope exposed to agents on cluster \"{name}\". Call \
+                 list_clusters for the namespaces and kinds in scope."
             ),
         }
     }
@@ -96,6 +105,147 @@ pub fn changed_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> 
         .count()
 }
 
+/// Which program serves MCP: it decides what setup advice can be followed where it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    /// `flint mcp`: the app is installed, with its Expose to AI toggle.
+    App,
+    /// `flint-mcp`: no app, so clusters are exposed by editing `settings.toml`.
+    Headless,
+}
+
+impl Flavour {
+    /// The flavour of the program named `program`.
+    pub fn of_program(program: &str) -> Self {
+        if program == "flint" {
+            Flavour::App
+        } else {
+            Flavour::Headless
+        }
+    }
+}
+
+/// What a hint may tell the user to do: the flavour, and where its settings file is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setup {
+    flavour: Flavour,
+    settings: String,
+}
+
+impl Setup {
+    pub fn new(flavour: Flavour, config_dir: &Path) -> Self {
+        Self {
+            flavour,
+            settings: shown_path(&config_dir.join("settings.toml")),
+        }
+    }
+
+    /// How to expose a first cluster.
+    fn expose(&self) -> String {
+        match self.flavour {
+            Flavour::App => "Ask the user to open Flint and turn on Expose to AI (the robot \
+                             button) next to a cluster in the sidebar."
+                .to_owned(),
+            Flavour::Headless => format!(
+                "Ask the user to add an [[ai_exposed_clusters]] entry with the cluster's context \
+                 and server to {}. If the file already has an ai_exposed_clusters = [...] array, \
+                 the entry goes in that array instead.",
+                self.settings
+            ),
+        }
+    }
+
+    /// The advice when nothing is exposed and `changed` entries point at another server. Without
+    /// the app, a new entry beside a re-pointed one would drop that entry's scope, so only the
+    /// note on updating it is given then.
+    fn nothing_exposed(&self, changed: usize) -> String {
+        if changed > 0 && self.flavour == Flavour::Headless {
+            String::new()
+        } else {
+            format!(" {}", self.expose())
+        }
+    }
+
+    /// How to bring back clusters whose server changed, after "...so it is hidden until".
+    fn expose_again(&self, one: bool) -> String {
+        let (it, entry) = if one {
+            ("it", "its entry")
+        } else {
+            ("them", "their entries")
+        };
+        match self.flavour {
+            Flavour::App => format!("they expose {it} again in Flint."),
+            Flavour::Headless => format!(
+                "they update the server in {entry} under [[ai_exposed_clusters]] in {}.",
+                self.settings
+            ),
+        }
+    }
+
+    /// The end of the error for a settings file that cannot be read.
+    pub fn fix_settings(&self) -> &'static str {
+        match self.flavour {
+            Flavour::App => "Ask the user to fix it; the Flint app shows the details.",
+            Flavour::Headless => "Ask the user to fix that file.",
+        }
+    }
+}
+
+/// A path as an agent may read it. A component with anything like a credential is hidden whole:
+/// spaces are valid in a path, so a passphrase can run past where the redactor stops. The whole
+/// path is then redacted too, for a credential that spans components.
+fn shown_path(path: &Path) -> String {
+    let mut shown = path
+        .display()
+        .to_string()
+        .split('/')
+        .map(|component| {
+            let mut text = component.to_owned();
+            if redact_text(&mut text) > 0 {
+                "[REDACTED]".to_owned()
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    redact_text(&mut shown);
+    shown
+}
+
+/// How rmcp starts the error for arguments that do not fit a tool's types.
+const ARGUMENT_ERROR: &str = "failed to deserialize parameters: ";
+
+/// `text` without the value it repeats, if it is such an error: serde's ``invalid type: string
+/// "...", expected u32`` keeps only what was expected. It is rebuilt rather than masked, because
+/// a value can hold the quotes a mask would look for. A missing or repeated field is left as it
+/// is: it names a field of the tool's schema and no value.
+pub fn argument_error(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(ARGUMENT_ERROR)?;
+    if rest.starts_with("missing field `") || rest.starts_with("duplicate field `") {
+        return None;
+    }
+    Some(match rest.rsplit_once(", expected ") {
+        Some((_, expected)) => format!("{ARGUMENT_ERROR}wrong type or value, expected {expected}"),
+        None => format!("{ARGUMENT_ERROR}wrong type or value"),
+    })
+}
+
+/// One entry of `list_clusters`' `kubeconfig_errors`: the file and a one-line reason, each
+/// redacted on its own, since a redacted value runs to the end of its line.
+pub fn kubeconfig_error_row(path: &Path, error: &str) -> Value {
+    // Redacted before the summary cuts it: a cut can remove what marks a value as a credential.
+    let mut line = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    redact_text(&mut line);
+    let reason = flint_core::redact::safe_error_summary(&line);
+    serde_json::json!({ "file": shown_path(path), "error": reason })
+}
+
 /// How many exposed contexts are in none of the loaded kubeconfig files. They are hidden; only
 /// the count is reported, not their names.
 pub fn missing_exposures(settings: &Settings, kubeconfig: &LoadedKubeconfig) -> usize {
@@ -117,15 +267,19 @@ pub fn list_clusters_hint(
     missing: usize,
     paths: &[PathBuf],
     load_failed: bool,
+    setup: &Setup,
 ) -> Option<String> {
     let changed_note = match changed {
         0 => String::new(),
-        1 => " One cluster the user exposed now points to a different API server, so it is hidden \
-              until they expose it again in Flint."
-            .to_owned(),
+        1 => format!(
+            " One cluster the user exposed now points to a different API server, so it is hidden \
+             until {}",
+            setup.expose_again(true)
+        ),
         n => format!(
             " {n} clusters the user exposed now point to a different API server, so they are \
-             hidden until they expose them again in Flint."
+             hidden until {}",
+            setup.expose_again(false)
         ),
     };
     let missing_note = match missing {
@@ -138,12 +292,8 @@ pub fn list_clusters_hint(
             };
             let files = paths
                 .iter()
-                .map(|path| {
-                    // One path at a time: a redacted value runs to the end of its line.
-                    let mut shown = path.display().to_string();
-                    redact_text(&mut shown);
-                    shown
-                })
+                // One path at a time: a redacted value runs to the end of its line.
+                .map(|path| shown_path(path))
                 .collect::<Vec<_>>()
                 .join(", ");
             let advice = if load_failed {
@@ -161,8 +311,8 @@ pub fn list_clusters_hint(
     };
     if exposed == 0 && missing == 0 {
         Some(format!(
-            "No clusters are exposed to AI agents. Ask the user to open Flint and turn on \
-             Expose to AI (the robot button) next to a cluster in the sidebar.{changed_note}"
+            "No clusters are exposed to AI agents.{}{changed_note}",
+            setup.nothing_exposed(changed)
         ))
     } else if changed > 0 || missing > 0 {
         Some(
@@ -218,10 +368,10 @@ pub fn cluster_scope(settings: &Settings, info: &ContextInfo) -> AiScope {
         .unwrap_or_default()
 }
 
-/// The error for anything outside a cluster's scope: exactly the one a cluster that is not
-/// exposed gives, so an agent cannot tell what exists beyond its scope.
+/// The error for anything outside the scope of an exposed cluster. One text for every such
+/// request, so an agent cannot tell what exists beyond its scope.
 pub fn out_of_scope(cluster: &str) -> PolicyError {
-    PolicyError::ClusterNotFound(cluster.to_owned())
+    PolicyError::OutOfScope(cluster.to_owned())
 }
 
 /// A scope with its hand-written kind names resolved against a cluster's kinds.
@@ -736,7 +886,7 @@ mod tests {
         let unknown = exposed_cluster(&s, &kc, "nope").unwrap_err().to_string();
         assert_eq!(changed.replace("dev", "X"), unknown.replace("nope", "X"));
         assert_eq!(changed_exposures(&s, &kc), 1);
-        let hint = list_clusters_hint(0, 1, 0, &[], false).unwrap();
+        let hint = list_clusters_hint(0, 1, 0, &[], false, &app()).unwrap();
         assert!(hint.contains("Expose to AI") && hint.contains("different API server"));
     }
 
@@ -744,13 +894,13 @@ mod tests {
     #[test]
     fn hint_only_when_useful() {
         assert!(
-            list_clusters_hint(0, 0, 0, &[], false)
+            list_clusters_hint(0, 0, 0, &[], false, &app())
                 .unwrap()
                 .contains("Expose to AI")
         );
-        assert_eq!(list_clusters_hint(2, 0, 0, &[], false), None);
+        assert_eq!(list_clusters_hint(2, 0, 0, &[], false, &app()), None);
         assert!(
-            list_clusters_hint(1, 2, 0, &[], false)
+            list_clusters_hint(1, 2, 0, &[], false, &app())
                 .unwrap()
                 .starts_with("2 clusters")
         );
@@ -776,14 +926,14 @@ mod tests {
     #[test]
     fn missing_hint_lists_the_files_read_and_never_the_context() {
         let paths = [PathBuf::from("/a/config"), PathBuf::from("/b/config")];
-        let hint = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        let hint = list_clusters_hint(0, 0, 1, &paths, false, &app()).unwrap();
         assert!(hint.starts_with("One cluster"), "{hint}");
         assert!(hint.contains("/a/config, /b/config"), "{hint}");
         assert!(hint.contains("kubeconfig_paths"), "{hint}");
         // It is already exposed, so the advice to turn that on would be wrong.
         assert!(!hint.contains("turn on"), "{hint}");
 
-        let both = list_clusters_hint(1, 1, 2, &paths, false).unwrap();
+        let both = list_clusters_hint(1, 1, 2, &paths, false, &app()).unwrap();
         assert!(both.contains("different API server"), "{both}");
         assert!(
             both.contains("2 clusters the user exposed are not"),
@@ -795,10 +945,10 @@ mod tests {
     #[test]
     fn missing_hint_points_at_files_that_failed_to_load() {
         let paths = [PathBuf::from("/a/config")];
-        let hint = list_clusters_hint(0, 0, 1, &paths, true).unwrap();
+        let hint = list_clusters_hint(0, 0, 1, &paths, true, &app()).unwrap();
         assert!(hint.contains("could not be loaded"), "{hint}");
         assert!(hint.contains("kubeconfig_errors"), "{hint}");
-        let clean = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        let clean = list_clusters_hint(0, 0, 1, &paths, false, &app()).unwrap();
         assert!(!clean.contains("kubeconfig_errors"), "{clean}");
     }
 
@@ -809,7 +959,7 @@ mod tests {
             PathBuf::from("/home/me/password=hunter2"),
             PathBuf::from("/b/config"),
         ];
-        let hint = list_clusters_hint(0, 0, 1, &paths, false).unwrap();
+        let hint = list_clusters_hint(0, 0, 1, &paths, false, &app()).unwrap();
         assert!(!hint.contains("hunter2"), "{hint}");
         assert!(hint.contains("/b/config"), "{hint}");
         assert!(hint.contains("kubeconfig_paths"), "{hint}");
@@ -864,6 +1014,97 @@ mod tests {
             namespaces.iter().map(|s| (*s).to_owned()).collect(),
             kinds.iter().map(|s| (*s).to_owned()).collect(),
         )
+    }
+
+    fn app() -> Setup {
+        Setup::new(Flavour::App, Path::new("/config"))
+    }
+
+    // covers UP-09: each flavour gets advice it can follow where it runs.
+    #[test]
+    fn setup_advice_follows_the_flavour() {
+        assert_eq!(Flavour::of_program("flint"), Flavour::App);
+        assert_eq!(Flavour::of_program("flint-mcp"), Flavour::Headless);
+        let headless = Setup::new(Flavour::Headless, Path::new("/config"));
+        for (exposed, changed) in [(0, 0), (0, 1), (1, 2)] {
+            let hint = list_clusters_hint(exposed, changed, 0, &[], false, &headless).unwrap();
+            assert!(hint.contains("[[ai_exposed_clusters]]"), "{hint}");
+            assert!(hint.contains("/config/settings.toml"), "{hint}");
+            assert!(!hint.contains("robot"), "{hint}");
+            assert!(!hint.contains("in Flint."), "{hint}");
+        }
+        // Adding an entry beside a re-pointed one would drop its scope: only updating is advised.
+        let repointed = list_clusters_hint(0, 1, 0, &[], false, &headless).unwrap();
+        assert!(repointed.contains("update the server"), "{repointed}");
+        assert!(!repointed.contains("add an"), "{repointed}");
+        // A file may already hold the inline form, where a table would be a second definition.
+        let first = list_clusters_hint(0, 0, 0, &[], false, &headless).unwrap();
+        assert!(first.contains("ai_exposed_clusters = [...]"), "{first}");
+        let hint = list_clusters_hint(0, 1, 0, &[], false, &app()).unwrap();
+        assert!(
+            hint.contains("robot button") && hint.contains("again in Flint."),
+            "{hint}"
+        );
+        assert!(!hint.contains("[[ai_exposed_clusters]]"), "{hint}");
+        assert!(headless.fix_settings().contains("fix that file"));
+        assert!(app().fix_settings().contains("Flint app"));
+    }
+
+    // covers UP-15: a credential in a kubeconfig path or its error does not reach the agent, and
+    // the other field survives it.
+    #[test]
+    fn kubeconfig_errors_are_redacted_field_by_field() {
+        let row = kubeconfig_error_row(
+            Path::new("/home/me/password=hunter2/config"),
+            "could not read it: token=example-credential",
+        );
+        let text = row.to_string();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("example-credential"), "{text}");
+        assert!(
+            row["file"].as_str().unwrap().starts_with("/home/me/"),
+            "{row}"
+        );
+        assert!(
+            row["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read it"),
+            "{row}"
+        );
+
+        // Spaces are valid in a path: the whole component goes, and the rest stays.
+        let passphrase = kubeconfig_error_row(
+            Path::new("/home/me/password=correct horse battery/config"),
+            "bad yaml",
+        );
+        assert_eq!(
+            passphrase["file"], "/home/me/[REDACTED]/config",
+            "{passphrase}"
+        );
+
+        // A URL whose password starts before the summary's cut and ends after it.
+        let long = format!(
+            "bad url https://user:{}@example.com/ in {}",
+            "p".repeat(300),
+            "x".repeat(10)
+        );
+        let cut = kubeconfig_error_row(Path::new("/home/me/config"), &long);
+        assert!(!cut["error"].as_str().unwrap().contains("ppp"), "{cut}");
+
+        let plain = kubeconfig_error_row(Path::new("/home/me/config"), "bad yaml");
+        assert_eq!(
+            plain,
+            json!({"file": "/home/me/config", "error": "bad yaml"})
+        );
+    }
+
+    // covers UP-09: the settings path is cluster-independent but still redacted.
+    #[test]
+    fn the_settings_path_in_advice_is_redacted() {
+        let setup = Setup::new(Flavour::Headless, Path::new("/home/me/password=hunter2"));
+        let hint = list_clusters_hint(0, 0, 0, &[], false, &setup).unwrap();
+        assert!(!hint.contains("hunter2"), "{hint}");
     }
 
     // covers UP-14: a hand-written name resolves as it does for the tools.
@@ -955,20 +1196,23 @@ mod tests {
         assert_eq!(cluster_scope(&s, prod).namespaces, ["shop"]);
     }
 
-    // covers UP-14: anything out of scope fails exactly as an unexposed cluster does, in text
-    // and in type, so nothing can be probed.
+    // covers UP-14: out of scope says so, names only the cluster, and stays distinct from a
+    // cluster that is not exposed.
     #[test]
-    fn out_of_scope_is_the_unexposed_error() {
+    fn out_of_scope_names_only_the_cluster() {
         let kc = kubeconfig(&["dev", "prod"]);
         let s = settings(&["dev"]);
         let unexposed = exposed_cluster(&s, &kc, "prod").unwrap_err();
-        assert_eq!(out_of_scope("prod"), unexposed);
-        assert_eq!(out_of_scope("prod").to_string(), unexposed.to_string());
+        assert!(unexposed.to_string().contains("not found"));
+        let text = out_of_scope("prod").to_string();
+        assert!(text.contains("outside the scope"), "{text}");
+        assert!(!text.contains("not found"), "{text}");
         let scope = scoped(&["shop"], &[]);
-        assert_eq!(
-            namespaces_for(&scope, "prod", true, Some("kube-system")),
-            Err(unexposed)
-        );
+        for namespace in ["kube-system", "no-such-namespace"] {
+            let error = namespaces_for(&scope, "prod", true, Some(namespace)).unwrap_err();
+            assert_eq!(error, out_of_scope("prod"));
+            assert!(!error.to_string().contains(namespace));
+        }
     }
 
     // covers UP-14
@@ -1249,6 +1493,36 @@ mod tests {
         sanitize(&mut list);
         assert_eq!(list["items"][0]["data"]["a"], REDACTED);
         assert!(list["items"][1]["metadata"].get("managedFields").is_none());
+    }
+
+    // covers UP-10: a wrong-type error names what was expected and repeats no value, even one
+    // holding the quotes a mask would rely on.
+    #[test]
+    fn argument_errors_repeat_no_value() {
+        let error = |rest: &str| format!("{ARGUMENT_ERROR}{rest}");
+        for (rest, expected) in [
+            (r#"invalid type: string "s3cret", expected u32"#, "u32"),
+            (r#"invalid type: string "a"s3cret"b", expected u32"#, "u32"),
+            ("invalid value: integer `-7`, expected u32", "u32"),
+            (
+                r#"invalid type: string "x, expected s3cret", expected a boolean"#,
+                "a boolean",
+            ),
+        ] {
+            let safe = argument_error(&error(rest)).unwrap();
+            assert_eq!(
+                safe,
+                error(&format!("wrong type or value, expected {expected}")),
+                "{rest}"
+            );
+        }
+        assert_eq!(
+            argument_error(&error("invalid s3cret")).unwrap(),
+            error("wrong type or value")
+        );
+        // Names a field of the schema, which the agent needs; and other text is not this error.
+        assert_eq!(argument_error(&error("missing field `kind`")), None);
+        assert_eq!(argument_error("NotFound: pods \"x\" not found"), None);
     }
 
     // covers UP-02, UP-09
