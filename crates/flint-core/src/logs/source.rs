@@ -604,7 +604,7 @@ mod tests {
         let long = LogError::from_kube(api_error(
             400,
             &format!(
-                "container \"c\" in pod \"{}\" is waiting to start: image can't be pulled",
+                "container c in pod {} is waiting to start: image can't be pulled",
                 "p".repeat(253)
             ),
         ));

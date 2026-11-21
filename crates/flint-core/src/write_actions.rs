@@ -721,6 +721,12 @@ fn stop_before(
     report.stopped = Some(error.into());
 }
 
+/// Ends a drain whose node could not be checked after listing `pods`: none of them were tried.
+fn stop_not_rechecked(report: &mut DrainReport, pods: &[Pod], error: ActionError) {
+    report.remaining = pods.iter().map(pod_name).collect();
+    report.stopped = Some(WriteError::NodeNotRechecked(Box::new(error.into())));
+}
+
 fn pod_name(pod: &Pod) -> PodName {
     PodName {
         namespace: pod.namespace().unwrap_or_default(),
@@ -762,8 +768,7 @@ pub(crate) async fn drain(
     let client = match gate.client().await {
         Ok(client) => client,
         Err(error) => {
-            report.remaining = pods.iter().map(pod_name).collect();
-            report.stopped = Some(WriteError::NodeNotRechecked(Box::new(error.into())));
+            stop_not_rechecked(&mut report, &pods, error);
             return report;
         }
     };
@@ -775,7 +780,7 @@ pub(crate) async fn drain(
             return report;
         }
         Err(error) => {
-            report.stopped = Some(error.into());
+            stop_not_rechecked(&mut report, &pods, error);
             return report;
         }
     }

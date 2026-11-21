@@ -660,6 +660,63 @@ async fn locking_during_a_drain_stops_the_next_eviction() {
     assert_eq!(evictions(&server, "pod-c"), 0);
 }
 
+// covers UP-53: when the node cannot be read after the pod list, the listed pods are reported as
+// not tried and no eviction is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_node_check_reports_the_listed_pods_as_not_tried() {
+    let server = FakeApiServer::start().await.unwrap();
+    node(&server);
+    for name in ["pod-a", "pod-b"] {
+        server.add_pod(pod_on_node(name, "ReplicaSet"));
+    }
+    let core = Core::start(&server, Settings::default()).await;
+    let review = core
+        .handle
+        .review_write(node_target(&server), drain())
+        .await
+        .unwrap();
+    server.inject(
+        Fault::delay(Duration::from_millis(400))
+            .on(&Gvr::core("pods"))
+            .verb(Verb::List)
+            .cluster_wide(),
+    );
+    let from = server.arrivals().len();
+    let running = tokio::spawn(core.handle.run_write(review.into_intent()));
+    tokio::time::timeout(WAIT, async {
+        let node_path = format!("/api/v1/nodes/{NODE}");
+        loop {
+            let seen = server.arrivals();
+            let seen = &seen[from..];
+            let cordoned = seen
+                .iter()
+                .position(|r| r.method == http::Method::PATCH && r.path == node_path);
+            if cordoned.is_some_and(|at| seen[at..].iter().any(|r| r.path == "/api/v1/pods")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the pod list after the cordon");
+    server.inject(Fault::status(500).on(&nodes()).verb(Verb::Get).named(NODE));
+
+    let drained = report(running.await.unwrap().unwrap());
+    server.clear_faults();
+
+    assert!(drained.cordoned);
+    assert!(drained.evicted.is_empty());
+    assert_eq!(drained.remaining, [named("pod-a"), named("pod-b")]);
+    let stopped = drained.stopped.expect("the drain stopped");
+    assert!(
+        matches!(stopped, WriteError::NodeNotRechecked(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.to_string().contains("could not be checked again"));
+    assert_eq!(evictions(&server, "pod-a"), 0);
+    assert_eq!(evictions(&server, "pod-b"), 0);
+}
+
 // covers UP-54: on a protected cluster an action is refused at review, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_protected_cluster_refuses_actions() {
