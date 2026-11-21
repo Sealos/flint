@@ -746,6 +746,18 @@ async fn handle(
             reason(code),
             format!("injected fault: {code}"),
         )),
+        Some(Effect::DisruptionBudget) => {
+            let mut refused = ApiError::new(
+                429,
+                reason(429),
+                "Cannot evict pod as it would violate the pod's disruption budget.",
+            );
+            refused.body["details"] = serde_json::json!({"causes": [{
+                "reason": "DisruptionBudget",
+                "message": "The disruption budget needs more healthy pods.",
+            }]});
+            error(&refused)
+        }
         Some(Effect::Delay(delay)) => {
             tokio::time::sleep(delay).await;
             serve_or_put(&inner, req, upgrade, &route, verb, &query, &accept).await
@@ -770,6 +782,11 @@ async fn serve_or_put(
     query: &Query,
     accept: &str,
 ) -> Response<Body> {
+    if writes::handles(req.method(), route) {
+        return writes::serve(inner, req, route)
+            .await
+            .unwrap_or_else(|e| error(&e));
+    }
     if req.method() == Method::PUT && matches!(route, Route::Object { .. }) {
         return put_object(inner, req, route, query)
             .await
@@ -1192,6 +1209,9 @@ mod pods;
 
 #[path = "server_exec.rs"]
 mod execs;
+
+#[path = "server_writes.rs"]
+mod writes;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

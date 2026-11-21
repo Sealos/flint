@@ -46,6 +46,7 @@ use super::registry::{
     ShowAgentActivity, ShowAllNamespaces, ToggleNamespace, TrustCluster, UnlockCluster,
     UntrustCluster, UseDefaultWatchMode, WatchAllKinds, WatchOpenViewsOnly,
 };
+use super::resource_actions;
 use super::row_menu;
 use super::scope_picker::{self, ScopePicker};
 use super::startup::StartupView;
@@ -229,6 +230,8 @@ pub struct Workspace {
     /// the selection, list or cluster changes, or [`ACTION_ERROR_SHOWN`] has passed.
     action_error: Option<String>,
     _action_error: Task<()>,
+    /// The review a resource action is waiting for.
+    _write_review: Task<()>,
     /// The last write of `state.toml`; the next one waits for it, so writes land in order.
     saving: Option<Task<()>>,
     /// Writes the pane widths once a drag pauses.
@@ -363,6 +366,7 @@ impl Workspace {
             startup_logs: startup_view.as_ref().is_some_and(|v| v.logs),
             action_error: None,
             _action_error: Task::ready(()),
+            _write_review: Task::ready(()),
             startup_view,
             saving: None,
             _save_panes: Task::ready(()),
@@ -371,6 +375,8 @@ impl Workspace {
             _list_subscriptions: Vec::new(),
             _detail_subscriptions: Vec::new(),
             _subscriptions: vec![
+                // A write that starts or ends, in any window, changes what the menu offers.
+                cx.observe_global::<resource_actions::RunningWrites>(|_, cx| cx.notify()),
                 observe,
                 appearance,
                 on_namespace_input,
@@ -746,17 +752,45 @@ impl Workspace {
         let core = self.model.read(cx).core().clone();
         let names = self.cluster_names(cx);
         let handle = window.window_handle();
-        let started = detail.clone();
-        write_confirm::open_with(
+        // The same claim as the row actions: one write at a time per object.
+        let key = resource_actions::WriteKey::of(review.target());
+        let begin = {
+            let (key, detail) = (key.clone(), detail.clone());
+            move |cx: &mut App| match resource_actions::claim(
+                &key,
+                resource_actions::RunningWrite::YamlEdit,
+                cx,
+            ) {
+                Ok(()) => {
+                    let _ = detail.update(cx, |d, cx| d.edit_applying(cx));
+                    true
+                }
+                Err(why) => {
+                    let detail = detail.clone();
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = detail.update(cx, |d, cx| {
+                            d.edit_applied(
+                                Err(flint_core::write::WriteError::Failed(why)),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                    false
+                }
+            }
+        };
+        write_confirm::open_noted(
             window,
             cx,
             core,
             review.clone(),
             &names,
-            move |cx| {
-                let _ = started.update(cx, |d, cx| d.edit_applying(cx));
-            },
+            None,
+            begin,
             move |result, cx| {
+                // First, and outside the window: a closed one must not keep the object claimed.
+                resource_actions::release(&key, cx);
                 let detail = detail.clone();
                 let _ = handle.update(cx, |_, window, cx| {
                     let _ = detail.update(cx, |d, cx| d.edit_applied(result, window, cx));
@@ -987,7 +1021,8 @@ impl Workspace {
         let list = cx.new(|cx| {
             ResourceList::new(core, cluster.clone(), entry, namespaces, sort, window, cx)
         });
-        if row_menu::has_row_actions(&entry.id) {
+        let deletable = self.kind_deletable(&cluster, &entry.id, cx);
+        if row_menu::has_row_actions(&entry.id, deletable) {
             let menu = row_menu::row_menu(cx.weak_entity());
             list.update(cx, |list, _| list.set_row_menu(menu));
         }
@@ -2445,6 +2480,7 @@ impl Render for Workspace {
                         theme,
                         cx,
                     )))
+                    .children(resource_actions::drain_strips(theme, cx))
                     .when_some(self.action_error.clone(), |el, why| {
                         el.child(refusal_strip(why, theme))
                     })

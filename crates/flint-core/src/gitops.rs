@@ -7,6 +7,8 @@ use serde_json::Value;
 const ARGO_TRACKING_ID: &str = "argocd.argoproj.io/tracking-id";
 const ARGO_INSTANCE: &str = "argocd.argoproj.io/instance";
 const APP_INSTANCE: &str = "app.kubernetes.io/instance";
+/// What names an Argo CD application whose name cannot be read from its tracking id.
+const UNNAMED_APP: &str = "unknown application";
 const FLUX_KUSTOMIZE: (&str, &str) = (
     "kustomize.toolkit.fluxcd.io/name",
     "kustomize.toolkit.fluxcd.io/namespace",
@@ -87,9 +89,9 @@ impl<'a> Identity<'a> {
 enum Tracking<'a> {
     /// It names this object, tracked by this application.
     App(&'a str),
-    /// It names another object: copied, as a Deployment's annotations are to its ReplicaSets, or
-    /// by a controller into another namespace.
-    Copied,
+    /// It names another object, tracked by this application: copied, as a Deployment's
+    /// annotations are to its ReplicaSets, or by a controller into another namespace.
+    Copied(&'a str),
     /// Replaced by a redaction mask, so it says nothing.
     Masked,
     Unreadable,
@@ -123,7 +125,7 @@ fn tracking<'a>(id: &'a str, object: &Identity<'_>) -> Tracking<'a> {
         && object.group.is_none_or(|own| own == group)
         && (namespace.is_empty() || object.namespace.is_none_or(|own| own == namespace));
     if !same {
-        Tracking::Copied
+        Tracking::Copied(app)
     } else if is_plain_name(app) {
         Tracking::App(app)
     } else {
@@ -131,9 +133,10 @@ fn tracking<'a>(id: &'a str, object: &Identity<'_>) -> Tracking<'a> {
     }
 }
 
-/// Who manages `object`, given a lookup in its labels and annotations. Argo CD is checked first,
-/// then Flux's Kustomization, then its HelmRelease. A tracking id naming another object rules
-/// out Argo CD's labels too, since they are copied with it, but not Flux.
+/// Who manages `object`, given a lookup in its labels and annotations: Argo CD by a tracking id
+/// naming this object or its instance label, then Flux's Kustomization, then its HelmRelease.
+/// Any other readable or unreadable tracking id still counts as Argo CD, so a change is warned
+/// about when in doubt; a masked one says nothing.
 pub fn managed_by<'a>(
     object: &Identity<'_>,
     read: impl Fn(&str) -> Option<&'a str>,
@@ -148,18 +151,16 @@ pub fn managed_by<'a>(
     if let Some(Tracking::App(app)) = tracked {
         return Some(argo(app));
     }
-    if tracked != Some(Tracking::Copied) {
-        if let Some(app) = plain(ARGO_INSTANCE) {
-            return Some(argo(app));
-        }
-        // This common label says nothing alone: it counts only beside a readable-looking id.
-        if tracked == Some(Tracking::Unreadable)
-            && let Some(app) = plain(APP_INSTANCE)
-        {
-            return Some(argo(app));
-        }
+    if let Some(app) = plain(ARGO_INSTANCE) {
+        return Some(argo(app));
     }
-    [
+    // This common label says nothing alone: it counts only beside a readable-looking id.
+    if tracked == Some(Tracking::Unreadable)
+        && let Some(app) = plain(APP_INSTANCE)
+    {
+        return Some(argo(app));
+    }
+    let flux = [
         (Manager::FluxKustomization, FLUX_KUSTOMIZE),
         (Manager::FluxHelmRelease, FLUX_HELM),
     ]
@@ -170,6 +171,11 @@ pub fn managed_by<'a>(
             name: plain(name_key)?.to_owned(),
             namespace: plain(namespace_key).map(str::to_owned),
         })
+    });
+    flux.or_else(|| match tracked? {
+        Tracking::Copied(app) if is_plain_name(app) => Some(argo(app)),
+        Tracking::Copied(_) | Tracking::Unreadable => Some(argo(UNNAMED_APP)),
+        Tracking::App(_) | Tracking::Masked => None,
     })
 }
 
@@ -214,16 +220,16 @@ mod tests {
         assert_eq!(shown(&cluster_scoped).as_deref(), Some("Argo CD: shop"));
     }
 
-    // covers UP-23: a Deployment's annotations are copied to its ReplicaSets, which Argo CD does
-    // not manage, and the common instance label alone is not Argo CD's.
+    // covers UP-23: a ReplicaSet carrying its Deployment's tracking id belongs to that application,
+    // and the common instance label alone is not Argo CD's.
     #[test]
-    fn a_copied_tracking_id_or_a_lone_instance_label_is_not_argo_cd() {
+    fn a_copied_tracking_id_names_its_app_and_a_lone_instance_label_does_not() {
         let copied = json!({"kind": "ReplicaSet", "metadata": {
             "name": "web-5d8",
-            "labels": {APP_INSTANCE: "shop"},
+            "labels": {APP_INSTANCE: "other"},
             "annotations": {ARGO_TRACKING_ID: "shop:apps/Deployment:demo/web"},
         }});
-        assert_eq!(shown(&copied), None);
+        assert_eq!(shown(&copied).as_deref(), Some("Argo CD: shop"));
         assert_eq!(
             shown(&object(json!({APP_INSTANCE: "shop"}), json!({}))),
             None
@@ -240,10 +246,10 @@ mod tests {
         assert_eq!(shown(&unreadable).as_deref(), Some("Argo CD: shop"));
     }
 
-    // covers UP-23: a copy in another namespace or API group is not the tracked object, and
-    // Argo CD's label travels with the copy, while Flux's own labels still count.
+    // covers UP-23: an id naming another object still points to Argo CD. Its instance label names
+    // the application, and Flux's own labels take precedence over the id alone.
     #[test]
-    fn a_tracking_id_must_name_this_group_and_namespace() {
+    fn a_tracking_id_for_another_object_still_counts() {
         let id = "shop:apps/Deployment:demo/web";
         let at = |version: &str, namespace: &str, labels: Value| {
             json!({"apiVersion": version, "kind": "Deployment", "metadata": {
@@ -255,15 +261,42 @@ mod tests {
             shown(&at("apps/v1", "demo", json!({}))).as_deref(),
             Some("Argo CD: shop")
         );
-        assert_eq!(shown(&at("apps/v1", "other", json!({}))), None);
-        assert_eq!(shown(&at("example.com/v1", "demo", json!({}))), None);
         assert_eq!(
-            shown(&at("apps/v1", "other", json!({ARGO_INSTANCE: "shop"}))),
-            None
+            shown(&at("apps/v1", "other", json!({}))).as_deref(),
+            Some("Argo CD: shop")
+        );
+        assert_eq!(
+            shown(&at("example.com/v1", "demo", json!({}))).as_deref(),
+            Some("Argo CD: shop")
+        );
+        assert_eq!(
+            shown(&at("apps/v1", "other", json!({ARGO_INSTANCE: "cart"}))).as_deref(),
+            Some("Argo CD: cart")
         );
         assert_eq!(
             shown(&at("apps/v1", "other", json!({FLUX_KUSTOMIZE.0: "apps"}))).as_deref(),
             Some("Flux: apps")
+        );
+    }
+
+    // covers UP-23: an id that cannot be read still points to Argo CD, without repeating its text.
+    #[test]
+    fn a_malformed_tracking_id_is_argo_cd_without_a_name() {
+        for id in ["not a tracking id", "a b:apps/Deployment:demo/web"] {
+            let malformed = object(json!({}), json!({ARGO_TRACKING_ID: id}));
+            assert_eq!(
+                shown(&malformed).as_deref(),
+                Some("Argo CD: unknown application"),
+                "{id}"
+            );
+        }
+        let copied = object(
+            json!({}),
+            json!({ARGO_TRACKING_ID: "a b:apps/Deployment:demo/other"}),
+        );
+        assert_eq!(
+            shown(&copied).as_deref(),
+            Some("Argo CD: unknown application")
         );
     }
 
@@ -325,10 +358,12 @@ mod tests {
                 None
             );
             let id = format!("{value}:apps/Deployment:demo/web");
-            assert_eq!(
-                shown(&object(json!({}), json!({ARGO_TRACKING_ID: id}))),
-                None
-            );
+            let got = shown(&object(json!({}), json!({ARGO_TRACKING_ID: id})));
+            if is_masked(value) {
+                assert_eq!(got, None, "{value}");
+            } else {
+                assert_eq!(got.as_deref(), Some("Argo CD: unknown application"));
+            }
         }
         assert_eq!(shown(&object(json!({}), json!({}))), None);
     }
