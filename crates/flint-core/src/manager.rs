@@ -506,8 +506,12 @@ impl ClusterManager {
             } => {
                 let _ = reply.send(self.shell_client(&cluster, server));
             }
-            Request::CheckWriteGate { cluster, reply } => {
-                let _ = reply.send(self.write_gate(&cluster).map(drop));
+            Request::CheckWriteGate {
+                cluster,
+                pin,
+                reply,
+            } => {
+                let _ = reply.send(self.launch_gate(&cluster, &pin));
             }
             Request::CheckContext {
                 cluster,
@@ -1133,13 +1137,36 @@ impl ClusterManager {
 
     /// The cluster's protection now, if it allows changes.
     fn write_gate(&self, cluster: &str) -> Result<crate::Protection, WriteRefusal> {
+        let server = self
+            .cluster(cluster)
+            .and_then(|slot| slot.info.server.as_deref());
+        self.gate_for_server(cluster, server)
+    }
+
+    /// The gate for a session about to run a command with the client it was given at `pin`: for
+    /// the server that client talks to, in the same step as checking the context still names it.
+    fn launch_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteRefusal> {
+        if self.contexts.check(Pinned::Shell, cluster, pin).is_some() {
+            return Err(WriteRefusal::Moved {
+                cluster: cluster.to_owned(),
+            });
+        }
+        self.gate_for_server(cluster, pin.server()).map(drop)
+    }
+
+    /// `cluster`'s protection for `server`, if it allows changes.
+    fn gate_for_server(
+        &self,
+        cluster: &str,
+        server: Option<&str>,
+    ) -> Result<crate::Protection, WriteRefusal> {
         // A context Flint does not know has no client either: say that, not "protected".
         let slot = self
             .cluster(cluster)
             .ok_or_else(|| WriteRefusal::NotConnected {
                 cluster: cluster.to_owned(),
             })?;
-        let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
+        let proxy = slot.info.proxy_url.as_deref();
         let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
         if protection.allows_changes() {
             Ok(protection)
@@ -1914,6 +1941,70 @@ mod tests {
         );
         let logs = manager.log_client("dev", &pin).err().expect("no client");
         assert!(logs.is_cluster(), "{}", logs.message);
+    }
+
+    // covers UP-54: a session's launch check goes through the request channel and answers for
+    // the server its client talks to, whatever the context names now.
+    #[tokio::test]
+    async fn a_launch_check_answers_for_the_pinned_server() {
+        async fn ask(
+            manager: &mut ClusterManager,
+            inbox: &async_channel::Receiver<Request>,
+            check: &crate::exec::LaunchCheck,
+        ) -> Result<(), WriteRefusal> {
+            let answer = tokio::spawn(check());
+            let request = inbox.recv().await.unwrap();
+            manager.handle_request(request);
+            answer.await.unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_reading(dir.path(), &kubeconfig_with("https://remote-a")).await;
+        offline(&mut manager);
+        let unlocks = manager.unlocks.clone();
+        unlocks.unlock("dev", "https://remote-a");
+        let pin = manager.contexts.pin_confirmed("dev");
+        let (requests, inbox) = async_channel::bounded(8);
+        let check = crate::handle::launch_check(requests, "dev".into(), pin);
+        let protected = Err(WriteRefusal::Protected {
+            cluster: "dev".into(),
+        });
+        let moved = Err(WriteRefusal::Moved {
+            cluster: "dev".into(),
+        });
+
+        assert_eq!(ask(&mut manager, &inbox, &check).await, Ok(()));
+        unlocks.lock("dev");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, protected);
+        unlocks.unlock("dev", "https://remote-a");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, Ok(()));
+
+        // The context now names a server that needs no unlock: the client still talks to the
+        // first one.
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://127.0.0.1:6443"),
+        )
+        .await;
+        offline(&mut manager);
+        unlocks.lock("dev");
+        assert!(manager.write_gate("dev").is_ok(), "open for the new server");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
+
+        // Put back, it is still not the definition the session was pinned to.
+        rewrite(
+            &mut manager,
+            dir.path(),
+            &kubeconfig_with("https://remote-a"),
+        )
+        .await;
+        offline(&mut manager);
+        unlocks.unlock("dev", "https://remote-a");
+        assert_eq!(ask(&mut manager, &inbox, &check).await, moved);
+
+        drop(inbox);
+        assert_eq!(check().await, Err(WriteRefusal::Stopped));
     }
 
     // covers UP-06: a kubeconfig caught half-written fails to parse and is skipped. That is not

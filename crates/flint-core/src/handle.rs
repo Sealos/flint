@@ -207,9 +207,11 @@ pub(crate) enum Request {
         server: Option<Option<String>>,
         reply: oneshot::Sender<Result<(GatedClient, ContextPin), WriteRefusal>>,
     },
-    /// What the write gate says about `cluster` now, for a session about to run a command.
+    /// What the write gate says now about `cluster` as pinned at `pin`, for a session about to
+    /// run a command.
     CheckWriteGate {
         cluster: ClusterId,
+        pin: ContextPin,
         reply: oneshot::Sender<Result<(), WriteRefusal>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
@@ -618,7 +620,7 @@ impl CoreHandle {
         let cluster = request.cluster.clone();
         self.runtime.spawn(async move {
             let client = client.await.map(|(client, pin)| {
-                let launch = launch_check(requests.clone(), cluster.clone());
+                let launch = launch_check(requests.clone(), cluster.clone(), pin.clone());
                 let check = context_check(requests, cluster, pin);
                 (client, ContextWatch::new(check, launch, RECHECK_EVERY))
             });
@@ -973,16 +975,25 @@ fn context_check(
     })
 }
 
-/// Asks the cluster manager's write gate about `cluster`, each time it is called. With the core
-/// gone, the answer is a refusal.
-fn launch_check(requests: async_channel::Sender<Request>, cluster: ClusterId) -> LaunchCheck {
+/// Asks the cluster manager's write gate about `cluster` as pinned at `pin`, each time it is
+/// called. With the core gone, the answer is a refusal.
+pub(crate) fn launch_check(
+    requests: async_channel::Sender<Request>,
+    cluster: ClusterId,
+    pin: ContextPin,
+) -> LaunchCheck {
     Arc::new(move || {
         let requests = requests.clone();
         let cluster = cluster.clone();
+        let pin = pin.clone();
         Box::pin(async move {
             let (reply, rx) = oneshot::channel();
             requests
-                .send(Request::CheckWriteGate { cluster, reply })
+                .send(Request::CheckWriteGate {
+                    cluster,
+                    pin,
+                    reply,
+                })
                 .await
                 .map_err(|_| WriteRefusal::Stopped)?;
             rx.await.unwrap_or(Err(WriteRefusal::Stopped))

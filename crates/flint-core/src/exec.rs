@@ -829,6 +829,39 @@ pub(crate) async fn start(
     }
 }
 
+/// What came of asking the write gate.
+enum GateAnswer {
+    Open,
+    Refused(WriteRefusal),
+    /// The session was closed before the gate answered.
+    Closed,
+}
+
+/// Asks the write gate, taking in what is typed meanwhile. Input goes first, so a session closed
+/// by the time the gate answers counts as closed.
+async fn ask_gate(
+    session: &mut Session,
+    mut answer: BoxFuture<'static, Result<(), WriteRefusal>>,
+    pending: &mut Replay,
+) -> GateAnswer {
+    loop {
+        tokio::select! {
+            biased;
+            input = session.next_input() => {
+                if session.handle_offline(input, Some(&mut *pending)) == Flow::Close {
+                    return GateAnswer::Closed;
+                }
+            }
+            result = &mut answer => {
+                return match result {
+                    Ok(()) => GateAnswer::Open,
+                    Err(refusal) => GateAnswer::Refused(refusal),
+                };
+            }
+        }
+    }
+}
+
 /// How a session shows a refusal from the write gate.
 fn refused(refusal: &WriteRefusal) -> ExecFailure {
     let kind = match refusal {
@@ -857,9 +890,16 @@ pub(crate) async fn run(
         let last = i + 1 == candidates.len();
         session.set_state(ExecState::Connecting);
         // Every command asks the gate, before it is launched and before it is handed the input.
-        if let Err(refusal) = watch.may_launch().await {
-            session.set_state(ExecState::Failed(refused(&refusal)));
-            break;
+        match ask_gate(&mut session, watch.may_launch(), &mut pending).await {
+            GateAnswer::Open => {}
+            GateAnswer::Refused(refusal) => {
+                session.set_state(ExecState::Failed(refused(&refusal)));
+                break;
+            }
+            GateAnswer::Closed => {
+                session.set_state(ExecState::Closed);
+                return;
+            }
         }
         let mut launch = launcher.launch(command.clone());
         let launched = loop {
@@ -891,11 +931,17 @@ pub(crate) async fn run(
                 break;
             }
         };
-        if let Err(refusal) = watch.may_launch().await {
-            // Dropping the process closes its connection.
-            drop(process);
-            session.set_state(ExecState::Failed(refused(&refusal)));
-            break;
+        // Leaving this turn of the loop drops the process, which closes its connection.
+        match ask_gate(&mut session, watch.may_launch(), &mut pending).await {
+            GateAnswer::Open => {}
+            GateAnswer::Refused(refusal) => {
+                session.set_state(ExecState::Failed(refused(&refusal)));
+                break;
+            }
+            GateAnswer::Closed => {
+                session.set_state(ExecState::Closed);
+                return;
+            }
         }
         session.set_state(ExecState::Running {
             command: command.clone(),
@@ -2885,6 +2931,66 @@ mod tests {
         let snap = wait_for(&mut session, "the refusal", |s| s.state.is_finished()).await;
         assert_eq!(snap.state, refused_as_protected());
         assert_eq!(launcher.launches(), 0);
+    }
+
+    // covers UP-41: a session closed while the gate answers ends there, and its input goes nowhere.
+    #[tokio::test]
+    async fn closing_while_the_gate_answers_sends_nothing() {
+        let launcher = ScriptedLauncher::default();
+        let bash = launcher.next();
+        let (answer, held) = oneshot::channel::<()>();
+        let held = Arc::new(Mutex::new(Some(held)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let launch: LaunchCheck = Arc::new(move || {
+            let call = counted.fetch_add(1, Ordering::SeqCst);
+            let wait = (call == 1).then(|| held.lock().unwrap().take()).flatten();
+            async move {
+                if let Some(wait) = wait {
+                    let _ = wait.await;
+                }
+                Ok(())
+            }
+            .boxed()
+        });
+        let (mut session, channels) = ExecSession::new(request());
+        let never: ContextCheck = Arc::new(|| async { None }.boxed());
+        let watch = ContextWatch::new(never, launch, CHECK_EVERY);
+        tokio::spawn(run(launcher.clone(), request(), channels, watch));
+        launcher.launched(1).await;
+        session.write(b"typed".to_vec()).unwrap();
+        // The session takes it in while the command starts.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let (process, mut remote) = process();
+        bash.send(Ok(process)).ok().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second gate check");
+
+        // It does not wait for the gate's answer.
+        session.close();
+        let snap = wait_for(&mut session, "closed", |s| s.state == ExecState::Closed).await;
+        assert_eq!(snap.state, ExecState::Closed);
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut remote.stdin, &mut received),
+        )
+        .await
+        .expect("the connection is closed")
+        .unwrap();
+        assert!(
+            received.is_empty(),
+            "sent {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        drop(answer);
     }
 
     // covers UP-41 (#256): pastes before the shell starts, while another shell could still
