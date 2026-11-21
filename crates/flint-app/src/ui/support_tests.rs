@@ -65,6 +65,30 @@ pub async fn open_workspace(cx: &mut TestAppContext, dir: &Path) -> TestWorkspac
     open_workspace_with(cx, dir, alpha_and_beta).await
 }
 
+/// Runs [`clear_proxy_variables`] as the test binary loads, before `main` and any thread.
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+static CLEAR_PROXY_VARIABLES: extern "C" fn() = clear_proxy_variables;
+
+/// View tests point clusters at loopback fixtures, and many rely on an attempt that stays
+/// connecting. The client refuses a proxy before it dials (and, built without kube's proxy
+/// features, ignores `NO_PROXY`), so these variables would fail those attempts at once.
+extern "C" fn clear_proxy_variables() {
+    for name in ["HTTPS_PROXY", "https_proxy"] {
+        // SAFETY: this runs before `main`, while the process has a single thread.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+// The proxy variables of the environment the tests were started in do not reach them.
+#[test]
+fn view_tests_run_without_proxy_variables() {
+    for name in ["HTTPS_PROXY", "https_proxy"] {
+        assert_eq!(std::env::var_os(name), None, "{name}");
+    }
+}
+
 /// The local servers a test's kubeconfig can point at.
 pub struct Servers {
     /// Accepts connections and never answers.
