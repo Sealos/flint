@@ -658,7 +658,10 @@ mod tests {
         for _ in 0..60 {
             match append(dir, record) {
                 Ok(()) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                // The lock's own timeout, which has no OS error: an OS timeout may come from a
+                // rotation or a write that already changed the log.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut && e.raw_os_error().is_none() => {}
                 Err(e) => panic!("append failed: {e}"),
             }
         }
