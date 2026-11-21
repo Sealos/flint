@@ -134,23 +134,63 @@ pub(crate) async fn delete(
         .map_err(ActionError::of)
 }
 
-/// Sets `object`'s replicas through its `scale` subresource.
+/// Changes a workload's replicas from `from`, the count reviewed, to `to`. A JSON Patch tests the
+/// uid and the count, so another change to either is a conflict and a status update is not. It
+/// patches the workload: its `scale` subresource omits `replicas` at zero, which a test cannot
+/// match.
 pub(crate) async fn scale(
     gate: &mut impl ActionGate,
     object: &ActionObject,
-    replicas: u32,
+    from: u32,
+    to: u32,
 ) -> Result<(), ActionError> {
+    let resource = &object.resource;
+    let scalable = match resource.group.as_str() {
+        "apps" => matches!(
+            resource.plural.as_str(),
+            "deployments" | "statefulsets" | "replicasets"
+        ),
+        "" => resource.plural == "replicationcontrollers",
+        _ => false,
+    };
+    if !scalable {
+        return Err(ActionError::Unsupported(format!(
+            "{} cannot be scaled",
+            resource.plural
+        )));
+    }
     let client = gate.client().await?;
-    let patch = json!({
-        "metadata": { "uid": object.uid },
-        "spec": { "replicas": replicas },
-    });
-    object
-        .api(client)
-        .patch_scale(&object.name, &patch_params(), &Patch::Merge(&patch))
-        .await
-        .map(drop)
-        .map_err(ActionError::of)
+    let patch = json!([
+        { "op": "test", "path": "/metadata/uid", "value": object.uid },
+        { "op": "test", "path": "/spec/replicas", "value": from },
+        { "op": "replace", "path": "/spec/replicas", "value": to },
+    ]);
+    let url = format!(
+        "{}/{}?fieldManager={FIELD_MANAGER}",
+        object.api(client.clone()).resource_url(),
+        object.name
+    );
+    let request = http::Request::patch(url)
+        .header(http::header::CONTENT_TYPE, "application/json-patch+json")
+        .header(http::header::ACCEPT, "application/json")
+        .body(patch.to_string().into_bytes())
+        .map_err(|e| ActionError::Failed(e.to_string()))?;
+    match client.request_text(request).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_failed_patch_test(&error) => Err(ActionError::Conflict(
+            "the replica count or the object changed since it was reviewed".to_owned(),
+        )),
+        Err(error) => Err(ActionError::of(error)),
+    }
+}
+
+/// Whether a JSON Patch failed one of its tests: the API server answers that as Invalid with no
+/// field named, where a real validation error names its field.
+fn is_failed_patch_test(error: &kube::Error) -> bool {
+    let kube::Error::Api(status) = error else {
+        return false;
+    };
+    status.code == 422 && status.details.as_ref().is_none_or(|d| d.causes.is_empty())
 }
 
 /// Restarts a Deployment's, DaemonSet's or StatefulSet's pods, as `kubectl rollout restart`.
@@ -590,7 +630,7 @@ mod tests {
         let mut gated = writes(client, open());
         for result in [
             delete(&mut gated, &deployment()).await,
-            scale(&mut gated, &deployment(), 3).await,
+            scale(&mut gated, &deployment(), 2, 3).await,
             rollout_restart(&mut gated, &deployment()).await,
             set_cordoned(&mut gated, &node(), true).await,
         ] {
@@ -630,7 +670,7 @@ mod tests {
 
         let other = invalid("spec.replicas");
         let (client, _log) = fake(Arc::new(move |_| (422, other.clone())));
-        let result = scale(&mut writes(client, open()), &deployment(), 3).await;
+        let result = scale(&mut writes(client, open()), &deployment(), 2, 3).await;
         assert!(matches!(result, Err(ActionError::Failed(_))), "{result:?}");
     }
 
@@ -641,7 +681,7 @@ mod tests {
         let mut gated = writes(client, Arc::new(AtomicBool::new(true)));
         let refused = Err(ActionError::Refused(refusal()));
         assert_eq!(delete(&mut gated, &deployment()).await, refused);
-        assert_eq!(scale(&mut gated, &deployment(), 1).await, refused);
+        assert_eq!(scale(&mut gated, &deployment(), 2, 1).await, refused);
         assert_eq!(rollout_restart(&mut gated, &deployment()).await, refused);
         assert_eq!(set_cordoned(&mut gated, &node(), true).await, refused);
         let report = drain(&mut gated, &node(), &DrainOptions::default()).await;
@@ -650,32 +690,65 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
     }
 
-    // covers UP-53
+    // covers UP-52, UP-53: scale tests the uid and the reviewed count, in one JSON Patch.
     #[tokio::test]
-    async fn scale_patches_the_scale_subresource_of_the_reviewed_object() {
-        let reply: Reply = Arc::new(|_| {
-            (
-                200,
-                json!({"apiVersion": "autoscaling/v1", "kind": "Scale",
-                         "metadata": {"name": "web"}, "spec": {"replicas": 3}}),
-            )
-        });
-        let (client, log) = fake(reply);
-        scale(&mut writes(client, open()), &deployment(), 3)
+    async fn scale_tests_the_reviewed_count() {
+        let (client, log) = fake(Arc::new(ok));
+        scale(&mut writes(client, open()), &deployment(), 2, 3)
             .await
             .unwrap();
         let seen = log.lock().unwrap();
         assert_eq!(seen[0].method, "PATCH");
         assert_eq!(
             seen[0].path,
-            "/apis/apps/v1/namespaces/demo/deployments/web/scale"
+            "/apis/apps/v1/namespaces/demo/deployments/web"
         );
-        assert_eq!(seen[0].body["spec"]["replicas"], 3);
-        assert_eq!(seen[0].body["metadata"]["uid"], "uid-web");
+        assert_eq!(
+            seen[0].body,
+            json!([
+                {"op": "test", "path": "/metadata/uid", "value": "uid-web"},
+                {"op": "test", "path": "/spec/replicas", "value": 2},
+                {"op": "replace", "path": "/spec/replicas", "value": 3},
+            ])
+        );
+    }
+
+    // covers UP-52: a failed test names no field and is a conflict; a validation error names
+    // one and is not.
+    #[tokio::test]
+    async fn a_failed_patch_test_is_a_conflict() {
+        let bare = json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 422,
+                          "reason": "Invalid", "message": "rejected", "details": {}});
+        let (client, log) = fake(Arc::new(move |_| (422, bare.clone())));
+        let result = scale(&mut writes(client, open()), &deployment(), 2, 3).await;
         assert!(
-            seen[0].body["metadata"].get("resourceVersion").is_none(),
-            "status updates must not conflict with it"
+            matches!(result, Err(ActionError::Conflict(_))),
+            "{result:?}"
         );
+        assert_eq!(log.lock().unwrap().len(), 1, "not retried");
+    }
+
+    // covers UP-53: only workloads with replicas can be scaled, and nothing is sent otherwise.
+    #[tokio::test]
+    async fn scale_refuses_other_kinds() {
+        let (client, log) = fake(Arc::new(ok));
+        let mut gated = writes(client, open());
+        for (group, plural) in [
+            ("", "pods"),
+            ("apps", "daemonsets"),
+            ("example.com", "widgets"),
+        ] {
+            let object = ActionObject {
+                resource: resource(group, "v1", "Other", plural),
+                ..deployment()
+            };
+            let result = scale(&mut gated, &object, 1, 2).await;
+            assert!(
+                matches!(result, Err(ActionError::Unsupported(_))),
+                "{plural}"
+            );
+        }
+        assert!(log.lock().unwrap().is_empty());
     }
 
     // covers UP-53
