@@ -4,7 +4,7 @@
 //! Files are merged in order and the first file to define a name wins (`Kubeconfig::merge`).
 //! Every context becomes a Flint cluster, and Flint records which file each one came from.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +56,9 @@ pub struct LoadedKubeconfig {
     /// The context names each file that loaded defines, in file order, including the ones an
     /// earlier file shadows.
     pub defines: Vec<(PathBuf, Vec<String>)>,
+    /// The file whose entry won each cluster name: a context and its cluster can come from
+    /// different files, and the server shown is the cluster entry's.
+    pub cluster_sources: HashMap<String, PathBuf>,
 }
 
 impl LoadedKubeconfig {
@@ -158,6 +161,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
     let mut contexts = Vec::new();
     let mut errors = Vec::new();
     let mut defines = Vec::new();
+    let mut cluster_sources = HashMap::new();
     for path in paths {
         if !path.exists() {
             continue;
@@ -178,6 +182,11 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
             path.clone(),
             config.contexts.iter().map(|c| c.name.clone()).collect(),
         ));
+        for cluster in &config.clusters {
+            cluster_sources
+                .entry(cluster.name.clone())
+                .or_insert_with(|| path.clone());
+        }
         let known: HashSet<String> = merged.contexts.iter().map(|c| c.name.clone()).collect();
         let new_contexts: Vec<NamedContext> = config
             .contexts
@@ -224,6 +233,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         paths: paths.to_vec(),
         errors,
         defines,
+        cluster_sources,
     }
 }
 
@@ -367,6 +377,7 @@ mod tests {
         assert_eq!(prod.source, second);
         assert_eq!(prod.user.as_deref(), Some("u2"));
         assert_eq!(prod.server.as_deref(), Some("https://first.example"));
+        assert_eq!(loaded.cluster_sources["c1"], first, "the entry that won");
 
         let dev = loaded.context("dev").unwrap();
         assert_eq!(dev.server_host(), Some("dev.example:6443"));
