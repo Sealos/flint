@@ -35,6 +35,8 @@ pub const LOG_LINES: Bound = Bound {
 };
 /// Byte cap on log output, so a few huge lines cannot flood the agent.
 pub const LOG_BYTES: usize = 256 * 1024;
+/// Lines fetched before the requested tail, so text spanning lines is redacted with its start.
+pub const LOG_LOOK_BEHIND: u32 = 200;
 /// Byte cap on the rows of one list_resources result, so long printer-column cells cannot
 /// flood the agent.
 pub const LIST_BYTES: usize = 256 * 1024;
@@ -588,11 +590,13 @@ pub fn logs_in_scope(scope: &AiScope) -> bool {
     scope.allows_kind("pods", true)
 }
 
-/// Makes an object safe to show: removes `metadata.managedFields`, redacts Secret values, and
-/// redacts credentials in message fields and container arguments ([`redact_object_text`]).
-/// Works on single objects and on lists (`items`). Returns how many credentials were replaced.
+/// Makes an object safe to show: removes `metadata.managedFields`, redacts Secret values at any
+/// depth (`mask_nested_secrets`), and redacts credentials in message fields and container
+/// arguments ([`redact_object_text`]). Works on single objects and on lists (`items`). Returns
+/// how many credentials were replaced; masked Secret values are not counted.
 pub fn sanitize(value: &mut Value) -> usize {
     strip(value, false);
+    mask_nested_secrets(value, 0);
     redact_object_text(value)
 }
 
@@ -600,6 +604,7 @@ pub fn sanitize(value: &mut Value) -> usize {
 /// list, is redacted as a Secret whatever its `kind` field says.
 pub fn sanitize_secret(value: &mut Value) -> usize {
     strip(value, true);
+    mask_nested_secrets(value, 0);
     redact_object_text(value)
 }
 
@@ -624,6 +629,117 @@ fn strip(value: &mut Value, secret: bool) {
     if secret || flint_core::redact::is_secret_object(value) {
         flint_core::redact::mask_secret(value, REDACTED);
     }
+}
+
+/// How many levels of JSON inside a string are parsed. Deeper text is matched as text.
+const MAX_SERIALIZED_DEPTH: usize = 3;
+
+/// Masks every Secret-shaped object under `value`, whatever holds it: an object of kind `Secret`
+/// or `SecretList` whose `apiVersion` is `v1` or missing (embedded manifests may omit it), and
+/// strings holding one as JSON or YAML ([`mask_serialized`]). Returns whether any was found.
+fn mask_nested_secrets(value: &mut Value, depth: usize) -> bool {
+    let (secret, list) = value.as_object().map_or((false, false), |map| {
+        let core = map
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_none_or(|version| version == "v1");
+        let kind = map.get("kind").and_then(Value::as_str).unwrap_or("");
+        (
+            core && kind.eq_ignore_ascii_case("Secret"),
+            core && kind.eq_ignore_ascii_case("SecretList"),
+        )
+    });
+    if secret {
+        mask_secret_fields(value);
+    }
+    if list && let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
+        items.iter_mut().for_each(mask_secret_fields);
+    }
+    let mut found = secret || list;
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                found |= mask_nested_secrets(child, depth);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                found |= mask_nested_secrets(child, depth);
+            }
+        }
+        Value::String(text) => found |= mask_serialized(text, depth),
+        _ => {}
+    }
+    found
+}
+
+/// [`flint_core::redact::mask_secret`] that also hides a `data`, `stringData` or `annotations`
+/// that is not a map, and a list item that is not an object.
+fn mask_secret_fields(object: &mut Value) {
+    let marker = || Value::String(REDACTED.to_owned());
+    if !object.is_object() {
+        *object = marker();
+        return;
+    }
+    flint_core::redact::mask_secret(object, REDACTED);
+    for field in ["data", "stringData"] {
+        if let Some(value) = object.get_mut(field)
+            && !value.is_object()
+            && !value.is_null()
+        {
+            *value = marker();
+        }
+    }
+    if let Some(annotations) = object
+        .get_mut("metadata")
+        .and_then(|metadata| metadata.get_mut("annotations"))
+        && !annotations.is_object()
+        && !annotations.is_null()
+    {
+        *annotations = marker();
+    }
+}
+
+/// Masks a Secret held in a string. JSON is parsed and only the Secret's values change. Anything
+/// else that reads as a Secret manifest (YAML, or JSON too deep or invalid) is replaced whole.
+fn mask_serialized(text: &mut String, depth: usize) -> bool {
+    if depth < MAX_SERIALIZED_DEPTH
+        && text.trim_start().starts_with(['{', '['])
+        && let Ok(mut parsed) = serde_json::from_str::<Value>(text)
+    {
+        if !mask_nested_secrets(&mut parsed, depth + 1) {
+            return false;
+        }
+        let newline = text.ends_with('\n');
+        *text = parsed.to_string();
+        if newline {
+            text.push('\n');
+        }
+        return true;
+    }
+    let manifest = names_secret_manifest(text);
+    if manifest {
+        REDACTED.clone_into(text);
+    }
+    manifest
+}
+
+/// Whether `text` has a `kind: Secret` or `kind: SecretList` pair, in any quoting or escaping,
+/// and mentions `data`. Errs toward yes.
+fn names_secret_manifest(text: &str) -> bool {
+    const SKIPPED: [char; 5] = ['"', '\'', '\\', ' ', '\t'];
+    let lower = text.to_ascii_lowercase();
+    lower.contains("data")
+        && lower.match_indices("kind").any(|(at, _)| {
+            let rest = lower[at + "kind".len()..].trim_start_matches(SKIPPED);
+            let Some(rest) = rest.strip_prefix(':') else {
+                return false;
+            };
+            let Some(after) = rest.trim_start_matches(SKIPPED).strip_prefix("secret") else {
+                return false;
+            };
+            after.starts_with("list") || !after.starts_with(|c: char| c.is_ascii_alphanumeric())
+        })
 }
 
 /// Whether an object field holds free text that a workload or controller wrote: an Event's
@@ -784,28 +900,114 @@ pub struct LogOutput {
 }
 
 /// The last `max_lines` lines of `fetched`, with credentials redacted, then cut to `max_bytes`
-/// at a line boundary. Redacting before the byte cut sees each value next to its label, and the
-/// cap then applies to the text actually returned.
-pub fn log_output(fetched: &str, max_lines: usize, max_bytes: usize) -> LogOutput {
-    let (text, cut_lines) = tail_lines(fetched, max_lines);
-    let redacted = flint_core::redact::redact_credentials(text);
-    let (kept, cut_bytes) = tail_bytes(&redacted.text, max_bytes);
+/// at a line boundary. Redacting everything fetched first sees each value next to its label and
+/// each block with its opening line, and the caps then apply to the text actually returned.
+/// `older` says the log may go on before `fetched`: leading lines that continue a block whose
+/// start is out of reach are then left out (`leading_cut_off_lines`).
+pub fn log_output(fetched: &str, max_lines: usize, max_bytes: usize, older: bool) -> LogOutput {
+    let redacted = flint_core::redact::redact_credentials(fetched);
+    let all = &*redacted.text;
+    let safe_start = if older { leading_cut_off_lines(all) } else { 0 };
+    let (tail, cut_lines) = tail_lines(all, max_lines);
+    let window = &all[(all.len() - tail.len()).max(safe_start)..];
+    let (kept, cut_bytes) = tail_bytes(window, max_bytes);
     // Only markers the redactor wrote into the kept lines, not ones the workload logged.
-    let count = redacted.count_from(redacted.text.len() - kept.len());
-    let note = (kept.is_empty() && !redacted.text.is_empty()).then(|| {
+    let count = redacted.count_from(all.len() - kept.len());
+    let note = if !kept.is_empty() || all.is_empty() {
+        None
+    } else if window.is_empty() {
+        Some("the available lines continue a block that starts earlier and were left out".into())
+    } else {
         let limit = if max_bytes.is_multiple_of(1024) {
             format!("{} KiB", max_bytes / 1024)
         } else {
             format!("{max_bytes} bytes")
         };
-        format!("the last line is longer than the {limit} limit and was left out")
-    });
+        Some(format!(
+            "the last line is longer than the {limit} limit and was left out"
+        ))
+    };
     LogOutput {
         text: kept.to_owned(),
-        truncated: cut_lines || cut_bytes,
+        truncated: cut_lines || cut_bytes || safe_start > 0,
         redacted: count,
         note,
     }
+}
+
+/// How many lines to request first for a tail of `lines`: the look-behind, plus one to learn
+/// whether older lines exist.
+pub fn log_fetch_tail(lines: u32) -> i64 {
+    i64::from(lines) + i64::from(LOG_LOOK_BEHIND) + 1
+}
+
+/// The next, smaller request after a response hit the byte limit with `complete` whole lines.
+/// The look-behind goes first, so it never costs requested lines.
+pub fn next_log_tail(tail: i64, lines: u32, complete: i64) -> i64 {
+    let wanted = i64::from(lines) + 1;
+    if tail > wanted {
+        wanted
+    } else {
+        complete.clamp(1, tail / 2)
+    }
+}
+
+/// Where `text` stops continuing a block whose start was not fetched: 0 when it does not begin
+/// with one.
+fn leading_cut_off_lines(text: &str) -> usize {
+    leading_key_lines(text).max(leading_cookie_items(text))
+}
+
+/// The end of the run of key-shaped lines at the start of `text`, optionally after a log prefix.
+/// The run counts when one line has a key's width and mix of characters, or an END line follows.
+fn leading_key_lines(text: &str) -> usize {
+    let mut end = 0;
+    let mut wide = false;
+    for line in text.split_inclusive('\n') {
+        let Some(token) = key_token(line) else {
+            let closes = line.contains("-----END ") && line.contains("PRIVATE KEY");
+            return if wide || (end > 0 && closes) { end } else { 0 };
+        };
+        wide |= token.len() >= 40
+            && token.bytes().any(|b| b.is_ascii_uppercase())
+            && token.bytes().any(|b| b.is_ascii_lowercase())
+            && token.bytes().any(|b| b.is_ascii_digit());
+        end += line.len();
+    }
+    if wide { end } else { 0 }
+}
+
+/// The last word of `line` when it could be a line of base64 key material.
+fn key_token(line: &str) -> Option<&str> {
+    let word = line.split_whitespace().next_back()?;
+    let word = word.trim_end_matches([',', '"', '\'']);
+    let word = word.strip_suffix("\\n").unwrap_or(word);
+    (word.len() >= 16
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')))
+    .then_some(word)
+}
+
+/// The end of the run of quoted `name=value` items at the start of `text` when it runs to a
+/// closing `]` or to the end of the text: a JSON array whose opening line was not fetched.
+fn leading_cookie_items(text: &str) -> usize {
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        let item = line.find('"').map(|at| line[at..].trim_end());
+        let item = item.map(|item| item.strip_suffix(',').unwrap_or(item));
+        if item.is_some_and(|i| i.len() > 2 && i.ends_with('"') && i.contains('=')) {
+            end += line.len();
+            continue;
+        }
+        let trimmed = line.trim_end();
+        return if trimmed.ends_with(']') || trimmed.ends_with("],") {
+            end
+        } else {
+            0
+        };
+    }
+    end
 }
 
 /// Keeps the last `n` lines of `text`. Returns whether lines were dropped.
@@ -821,6 +1023,10 @@ pub fn tail_lines(text: &str, n: usize) -> (&str, bool) {
         .map_or(0, |(i, _)| i + 1);
     (&text[start..], true)
 }
+
+#[cfg(test)]
+#[path = "policy_masking_tests.rs"]
+mod masking_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1691,7 +1897,7 @@ mod tests {
         assert_eq!(tail_bytes("password=hunter2\nnext\n", 9), ("next\n", true));
         // One line longer than the cap: nothing of it is kept, not even after redaction.
         let long = format!("{} password=hunter2 {}", "a".repeat(64), "b".repeat(64));
-        let out = log_output(&long, 100, 32);
+        let out = log_output(&long, 100, 32, false);
         assert_eq!(
             (out.text.as_str(), out.truncated, out.redacted),
             ("", true, 0)
@@ -1700,9 +1906,9 @@ mod tests {
             out.note.as_deref(),
             Some("the last line is longer than the 32 bytes limit and was left out")
         );
-        let out = log_output(&long, 100, 64 * 1024);
+        let out = log_output(&long, 100, 64 * 1024, false);
         assert_eq!((out.redacted, out.note), (1, None));
-        let out = log_output(&format!("{long}\nlast\n"), 100, 32);
+        let out = log_output(&format!("{long}\nlast\n"), 100, 32, false);
         assert_eq!((out.text.as_str(), out.redacted), ("last\n", 0));
     }
 
@@ -1715,21 +1921,21 @@ mod tests {
             "a".repeat(50),
             "b".repeat(5)
         );
-        let out = log_output(&log, 100, 40);
+        let out = log_output(&log, 100, 40, false);
         assert_eq!(out.text, "password=[REDACTED:password] bbbbb\nlast\n");
         assert_eq!((out.truncated, out.redacted), (true, 1));
         // Markers longer than the values they replace still respect the cap.
         let log = "token=a\n".repeat(10);
-        let out = log_output(&log, 100, 64);
+        let out = log_output(&log, 100, 64, false);
         assert!(out.text.len() <= 64 && out.truncated, "{out:?}");
         assert_eq!(out.redacted, out.text.lines().count());
         // A credential only in a line the cap dropped is not counted.
-        let out = log_output("token=abc\nplain line\n", 100, 12);
+        let out = log_output("token=abc\nplain line\n", 100, 12, false);
         assert_eq!((out.text.as_str(), out.redacted), ("plain line\n", 0));
         // Markers the workload logged itself are not counted, cut or not.
         let log = "old token=abc\nlogged [REDACTED:password] and token=def\n";
-        assert_eq!(log_output(log, 100, 1_000).redacted, 2);
-        let out = log_output(log, 100, 60);
+        assert_eq!(log_output(log, 100, 1_000, false).redacted, 2);
+        let out = log_output(log, 100, 60, false);
         assert_eq!(
             (out.text.as_str(), out.redacted),
             ("logged [REDACTED:password] and token=[REDACTED:token]\n", 1)

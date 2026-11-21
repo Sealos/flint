@@ -762,7 +762,7 @@ impl FlintMcp {
 #[tool_handler(
     router = self.tool_router,
     name = "flint",
-    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Secret values are always redacted. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
+    instructions = "Read-only access to Kubernetes clusters the user has opted in to in Flint (Expose to AI). Start with list_clusters. Nothing can be created, changed, or deleted. Values of Secret objects are redacted, also when a Secret is nested in another object or held in a string as JSON or YAML; other custom resource fields are shown as stored. Values that look like credentials in pod logs, event messages, list cells, object messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers, and each result's `redacted` count says how many. Large outputs are cut short with truncated=true."
 )]
 impl ServerHandler for FlintMcp {
     /// Every call, with its own `CALL` note, within the [`Limits`]: admitted (or refused at
@@ -1543,8 +1543,8 @@ impl FlintMcp {
             }
         }
         let lines = policy::LOG_LINES.clamp(p.tail_lines);
-        // Ask for one extra line to learn whether older lines exist.
-        let mut tail = i64::from(lines) + 1;
+        // Starts before the requested tail, so redaction sees blocks that open earlier.
+        let mut tail = policy::log_fetch_tail(lines);
         let mut cut_fetch;
         let mut text;
         loop {
@@ -1570,16 +1570,19 @@ impl FlintMcp {
                 break;
             }
             let complete = text.lines().count().saturating_sub(1) as i64;
-            tail = complete.clamp(1, tail / 2);
+            tail = policy::next_log_tail(tail, lines, complete);
         }
-        let out = policy::log_output(&text, lines as usize, policy::LOG_BYTES);
+        let more = cut_fetch || text.lines().count() as i64 >= tail;
+        // A time window can also start in the middle of a block.
+        let older = more || p.since_seconds.is_some_and(|s| s > 0);
+        let out = policy::log_output(&text, lines as usize, policy::LOG_BYTES, older);
         let mut result = json!({
             "cluster": p.cluster,
             "namespace": p.namespace,
             "pod": p.pod,
             "container": p.container,
             "lines": out.text.lines().count(),
-            "truncated": out.truncated || cut_fetch,
+            "truncated": out.truncated || more,
             "redacted": out.redacted,
             "log": out.text,
         });
