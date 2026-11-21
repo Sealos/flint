@@ -466,6 +466,8 @@ pub(crate) struct Interner {
     /// The most strings held as a relist began or ended, since the table was last given back.
     /// Read before the relist's rows arrive, so outgoing and incoming strings aren't added up.
     high: usize,
+    /// How many distinct strings the relist in progress has asked for.
+    incoming: usize,
     /// The highest capacity seen since shrinking, before retains can hide buckets as tombstones.
     peak_capacity: usize,
     #[cfg(test)]
@@ -483,11 +485,13 @@ impl Interner {
                 && let Some(last) = self.set.get_mut(s)
             {
                 *last = self.relist;
+                self.incoming += 1;
             }
             return existing;
         }
         let fresh: Arc<str> = s.into();
         self.set.insert(fresh.clone(), self.relist);
+        self.incoming += 1;
         self.inserts += 1;
         if self.inserts >= PRUNE_MIN.max(self.kept) {
             self.prune();
@@ -515,6 +519,7 @@ impl Interner {
     /// Starts marking the strings a relist's rows ask for.
     pub fn begin_relist(&mut self) {
         self.high = self.high.max(self.set.len());
+        self.incoming = 0;
         self.relist += 1;
     }
 
@@ -522,10 +527,16 @@ impl Interner {
     /// some rows it asked for were replaced or removed before it completed, so their strings
     /// are not kept for rows that are gone.
     pub fn remark<'a>(&mut self, used: impl Iterator<Item = &'a Arc<str>>) {
+        // What the relist asked for before its rows were discarded counts as a list it held.
+        self.high = self.high.max(self.incoming);
+        self.incoming = 0;
         self.relist += 1;
         for s in used {
-            if let Some(last) = self.set.get_mut(&**s) {
+            if let Some(last) = self.set.get_mut(&**s)
+                && *last != self.relist
+            {
                 *last = self.relist;
+                self.incoming += 1;
             }
         }
     }
@@ -1291,6 +1302,39 @@ pub(crate) mod tests {
             drop(rows);
             assert_eq!(interner.shrinks, 0, "{size} strings");
         }
+    }
+
+    #[test]
+    fn a_relist_that_discards_most_of_its_rows_gives_back_its_allocation() {
+        let mut interner = Interner::default();
+        interner.begin_relist();
+        let rows: Vec<Arc<str>> = (0..100_000)
+            .map(|i| interner.intern(&format!("s-{i}")))
+            .collect();
+        let big = interner.set.capacity();
+        interner.remark(rows[..1].iter());
+        interner.keep_relisted();
+        assert_eq!(interner.len(), 1);
+        assert!(interner.set.capacity() < big / 100);
+    }
+
+    #[test]
+    fn remarking_a_constant_size_list_does_not_shrink_and_regrow() {
+        let size = 7_167;
+        let mut interner = Interner::default();
+        let mut rows = Vec::new();
+        for poll in 0..40 {
+            interner.begin_relist();
+            let next: Vec<Arc<str>> = (0..size)
+                .map(|i| interner.intern(&format!("s-{poll}-{i}")))
+                .collect();
+            interner.remark(next.iter());
+            interner.keep_relisted();
+            assert_eq!(interner.len(), size);
+            rows = next;
+        }
+        drop(rows);
+        assert_eq!(interner.shrinks, 0);
     }
 
     #[test]
