@@ -80,7 +80,7 @@ pub use pods::FakePod;
 pub use route::{Query, Verb};
 pub use row::FakeRow;
 pub use server::{
-    FakeApiServer, MetricsSample, MetricsTarget, Options, RequestRecord, WriteRecord, arrivals_at,
-    connection_mark_at, write_kubeconfigs,
+    ArrivalLog, FakeApiServer, MetricsSample, MetricsTarget, Options, RequestRecord, WriteRecord,
+    arrival_log_at, arrivals_at, connection_mark_at, write_kubeconfigs,
 };
 pub use watch::WatchStep;

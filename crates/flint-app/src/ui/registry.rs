@@ -90,6 +90,12 @@ actions!(
         RetryConnection,
         /// Clear the namespace filter.
         ShowAllNamespaces,
+        /// Open the namespace filter's picker, with focus inside it.
+        OpenNamespaceFilter,
+        /// Move focus to the namespace picker's next control, wrapping around.
+        NamespacePickerNext,
+        /// Move focus to the namespace picker's previous control, wrapping around.
+        NamespacePickerPrevious,
         /// Watch every kind on the active cluster.
         WatchAllKinds,
         /// Watch only the kinds open in a view, on the active cluster.
@@ -1596,6 +1602,10 @@ const LOG_SEARCH: &str = "LogView > Input";
 pub const PALETTE: &str = "CommandPalette";
 /// Keys the palette takes from its own search field (the arrows, Enter, Esc), over the field's.
 const PALETTE_INPUT: &str = "CommandPalette > Input";
+/// The namespace picker's key context.
+pub const NAMESPACE_PICKER: &str = "NamespacePicker";
+/// Keys the picker keeps for moving between its controls, also over its text field's.
+const NAMESPACE_PICKER_KEYS: &str = "NamespacePicker || (NamespacePicker > Input)";
 /// A focused text field, where gpui-component handles Cut, Copy, Paste and Select All.
 const TEXT_FIELD: &str = "Input";
 /// The cluster sidebar's key context, while it has focus.
@@ -2173,6 +2183,25 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Namespace, S::Workspace),
         Spec::unit::<ShowAllNamespaces>("Show All Namespaces", "Clear the namespace filter.")
             .of(C::Namespace, S::Workspace),
+        Spec::unit::<OpenNamespaceFilter>(
+            "Open Namespace Filter",
+            "Open the namespace filter's picker.",
+        )
+        .of(C::Namespace, S::Workspace),
+        Spec::unit::<NamespacePickerNext>(
+            "Next Namespace Control",
+            "Move focus to the namespace picker's next control.",
+        )
+        .of(C::Namespace, S::Workspace)
+        .keys(&["tab", "down"], Some(NAMESPACE_PICKER_KEYS))
+        .hidden(),
+        Spec::unit::<NamespacePickerPrevious>(
+            "Previous Namespace Control",
+            "Move focus to the namespace picker's previous control.",
+        )
+        .of(C::Namespace, S::Workspace)
+        .keys(&["shift-tab", "up"], Some(NAMESPACE_PICKER_KEYS))
+        .hidden(),
         Spec::with_args::<SetNamespaces>(
             "Set Namespace Filter…",
             "Show only these namespaces (remembered per cluster).",
@@ -3016,6 +3045,8 @@ pub mod tests {
             || (key == "escape" && context == Some(super::LOG_SEARCH))
             || context == Some(super::PALETTE_INPUT)
             || (matches!(key, "escape" | "enter" | "down") && context == Some(super::LIST_FILTER))
+            || (matches!(key, "tab" | "up" | "down")
+                && context == Some(super::NAMESPACE_PICKER_KEYS))
     }
 
     #[test]

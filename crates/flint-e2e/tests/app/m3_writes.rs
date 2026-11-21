@@ -323,7 +323,9 @@ fn up_55_repointing_protects_again() -> Result<()> {
             app_offers(&app, write)?;
         }
 
-        app.edit_kubeconfig(|| other.write_kubeconfig(&cluster.kubeconfig, None))?;
+        app.edit_kubeconfig([&cluster.kubeconfig], || {
+            other.write_kubeconfig(&cluster.kubeconfig, None)
+        })?;
         app.wait_for(
             "/clusters",
             Any(json!({"name": cluster.context, "protection": "protected"})),
