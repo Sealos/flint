@@ -8,6 +8,7 @@ use kube::Client;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
 use crate::api_error::{self, ApiError, Transport};
+use crate::protection::{ClusterClients, WriteAccess};
 use crate::redact;
 
 /// How long a connection attempt may take, exec auth plugin included. Some plugins (SSO logins)
@@ -400,6 +401,61 @@ pub struct ServerVersion {
 /// never comes. The rest of the client setup (reading certificate files) runs on a blocking
 /// thread.
 pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, ClusterError> {
+    let ready = prepare(kubeconfig, context).await?;
+    let target = ready.target;
+    let (config, token) = (ready.config, ready.token);
+    tokio::task::spawn_blocking(move || build_client(config, token, Access::ReadOnly))
+        .await
+        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+        .map_err(|e| ClusterError::kube(e).for_target(&target))
+}
+
+/// As [`connect`], with the client that can write, closed behind the write gate.
+async fn connect_gated(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+) -> Result<ClusterClients, ClusterError> {
+    let ready = prepare(kubeconfig, context).await?;
+    let target = ready.target;
+    let (config, token) = (ready.config, ready.token);
+    tokio::task::spawn_blocking(move || {
+        let read = build_client(config.clone(), token.clone(), Access::ReadOnly)?;
+        let write = build_client(config, token, Access::Unrestricted)?;
+        Ok::<_, kube::Error>(ClusterClients {
+            read,
+            writes: WriteAccess::new(write),
+        })
+    })
+    .await
+    .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+    .map_err(|e| ClusterError::kube(e).for_target(&target))
+}
+
+/// A client with no read-only rule, for tests of the exec endpoints themselves. Flint's own
+/// sessions get theirs from the write gate.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn connect_unrestricted_for_tests(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+) -> Result<Client, ClusterError> {
+    let ready = prepare(kubeconfig, context).await?;
+    let target = ready.target;
+    let (config, token) = (ready.config, ready.token);
+    tokio::task::spawn_blocking(move || build_client(config, token, Access::Unrestricted))
+        .await
+        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
+        .map_err(|e| ClusterError::kube(e).for_target(&target))
+}
+
+/// What building a context's clients takes.
+struct Prepared {
+    config: kube::Config,
+    token: Option<crate::auth_plugin::TokenLayer>,
+    target: Target,
+}
+
+/// Reads `context`'s connection settings and runs its exec auth plugin, if any.
+async fn prepare(kubeconfig: &Kubeconfig, context: &str) -> Result<Prepared, ClusterError> {
     if !kubeconfig.contexts.iter().any(|c| c.name == context) {
         return Err(ClusterError::UnknownContext(context.to_owned()));
     }
@@ -416,20 +472,33 @@ pub async fn connect(kubeconfig: &Kubeconfig, context: &str) -> Result<Client, C
         })?;
     let target = Target::of(kubeconfig, context);
     // kube's builder refuses a proxy (`proxy-url`, or `HTTPS_PROXY` and the like) before it runs
-    // an exec plugin: so does this, with kube's own error, so no login opens for nothing.
+    // an exec plugin: so does this, with kube's own error, so no login opens for nothing. A
+    // client it did build would have no read-only rule, so that is refused too.
     if config.proxy_url.is_some() {
-        return tokio::task::spawn_blocking(move || Client::try_from(config))
+        let built = tokio::task::spawn_blocking(move || Client::try_from(config))
             .await
-            .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
-            .map_err(|e| ClusterError::kube(e).for_target(&target));
+            .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?;
+        return Err(match built {
+            Err(e) => ClusterError::kube(e).for_target(&target),
+            Ok(_) => ClusterError::Kube("connecting through a proxy is not supported".to_owned()),
+        });
     }
     let token = crate::auth_plugin::resolve(&mut config, context)
         .await
         .map_err(|e| ClusterError::kube(kube::Error::Auth(e)).for_target(&target))?;
-    tokio::task::spawn_blocking(move || build_client(config, token))
-        .await
-        .map_err(|e| ClusterError::Kube(format!("client setup failed: {e}")))?
-        .map_err(|e| ClusterError::kube(e).for_target(&target))
+    Ok(Prepared {
+        config,
+        token,
+        target,
+    })
+}
+
+/// What a client built by [`build_client`] may send.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Reads only ([`crate::read_only`]): every client but the one behind the write gate.
+    ReadOnly,
+    Unrestricted,
 }
 
 /// The TCP connector under every client: kube's (`enforce_http(false)`, so HTTPS is allowed),
@@ -456,6 +525,7 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 fn build_client(
     config: kube::Config,
     token: Option<crate::auth_plugin::TokenLayer>,
+    access: Access,
 ) -> Result<Client, kube::Error> {
     use kube::client::ConfigExt;
     use kube::client::retry::RetryPolicy;
@@ -472,6 +542,8 @@ fn build_client(
         hyper_util::client::legacy::Builder::new(hyper_util::rt::TokioExecutor::new())
             .build(connector);
     let service = ServiceBuilder::new()
+        // Outermost, so it judges the path as asked for, before a server URL's prefix is added.
+        .option_layer((access == Access::ReadOnly).then(crate::read_only::layer))
         .layer(config.base_uri_layer())
         .option_layer(
             config
@@ -515,15 +587,41 @@ pub async fn connect_and_check(
     context: &str,
     timeout: Duration,
 ) -> Result<(Client, ServerVersion), ClusterError> {
-    let target = Target::of(kubeconfig, context);
-    tokio::time::timeout(timeout, async {
+    bounded(kubeconfig, context, timeout, async {
         let client = connect(kubeconfig, context).await?;
         let version = server_version(&client).await?;
         Ok((client, version))
     })
     .await
-    .unwrap_or_else(|_| Err(ClusterError::timeout(timeout, None)))
-    .map_err(|e| e.for_target(&target))
+}
+
+/// As [`connect_and_check`], for a cluster the app manages: with the client that can write,
+/// closed behind the write gate.
+pub(crate) async fn connect_gated_and_check(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    timeout: Duration,
+) -> Result<(ClusterClients, ServerVersion), ClusterError> {
+    bounded(kubeconfig, context, timeout, async {
+        let clients = connect_gated(kubeconfig, context).await?;
+        let version = server_version(&clients.read).await?;
+        Ok((clients, version))
+    })
+    .await
+}
+
+/// `attempt`, bounded by `timeout`, its error naming `context`'s server.
+async fn bounded<T>(
+    kubeconfig: &Kubeconfig,
+    context: &str,
+    timeout: Duration,
+    attempt: impl Future<Output = Result<T, ClusterError>>,
+) -> Result<T, ClusterError> {
+    let target = Target::of(kubeconfig, context);
+    tokio::time::timeout(timeout, attempt)
+        .await
+        .unwrap_or_else(|_| Err(ClusterError::timeout(timeout, None)))
+        .map_err(|e| e.for_target(&target))
 }
 
 /// A hash of everything that decides how a context connects: the context, its cluster entry, and
@@ -816,6 +914,56 @@ mod tests {
     }
 
     // covers UP-04
+    // covers UP-54: a read-only client refuses writes and tunnels without touching the server,
+    // and still sends reads.
+    #[tokio::test]
+    async fn a_read_only_client_stops_writes_before_the_server() {
+        use http::{Method, Request};
+        use kube::client::Body;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let config = kube::Config::new(url.parse().unwrap());
+        let client = build_client(config, None, Access::ReadOnly).unwrap();
+        let pod = "/api/v1/namespaces/demo/pods/web";
+        for (method, path) in [
+            (Method::POST, "/api/v1/namespaces/demo/pods".to_owned()),
+            (Method::PUT, pod.to_owned()),
+            (Method::PATCH, pod.to_owned()),
+            (Method::DELETE, pod.to_owned()),
+            (Method::GET, format!("{pod}/exec?command=sh")),
+            (Method::GET, format!("{pod}/attach")),
+            (Method::GET, format!("{pod}/portforward?ports=80")),
+            (Method::GET, format!("{pod}/proxy/admin")),
+            (Method::GET, format!("{pod}/%65xec")),
+        ] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(&path)
+                .body(Body::empty())
+                .unwrap();
+            let refused = client.send(request).await.unwrap_err().to_string();
+            assert!(refused.contains("read-only"), "{method} {path}: {refused}");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "a refused request reached the server"
+        );
+
+        let reader = client.clone();
+        let read = tokio::spawn(async move {
+            let request = Request::get("/version").body(Body::empty()).unwrap();
+            reader.send(request).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("a read reaches the server")
+            .unwrap();
+        read.abort();
+    }
+
     #[tokio::test]
     async fn unknown_context_is_an_error() {
         let result = connect(&kubeconfig("https://a"), "nope").await;

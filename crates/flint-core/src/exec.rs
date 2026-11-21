@@ -34,7 +34,6 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, SinkExt};
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
-use kube::Client;
 use kube::api::{Api, AttachParams};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -42,7 +41,7 @@ use tokio::time::Instant;
 
 use crate::api_error::ApiError;
 use crate::cluster::{ClusterError, ClusterId};
-use crate::protection::WriteRefusal;
+use crate::protection::{GatedClient, WriteRefusal};
 use crate::recheck::Recheck;
 use crate::terminal::{SelectionKind, Side, TerminalModel, TerminalSize, TerminalSnapshot};
 use budget::{Charge, InputBudget};
@@ -797,14 +796,14 @@ impl ContextWatch {
 /// its context unchanged; without one, the session fails at once with the given reason (the
 /// cluster is not connected, say).
 pub(crate) async fn start(
-    client: Result<(Client, ContextWatch), WriteRefusal>,
+    client: Result<(GatedClient, ContextWatch), WriteRefusal>,
     request: ExecRequest,
     channels: SessionChannels,
 ) {
     match client {
         Ok((client, watch)) => {
             let launcher = KubeLauncher {
-                api: Api::namespaced(client, &request.namespace),
+                api: Api::namespaced(client.into_client(), &request.namespace),
                 pod: request.pod.clone(),
                 container: request.container.clone(),
             };

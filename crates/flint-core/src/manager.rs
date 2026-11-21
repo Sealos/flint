@@ -21,7 +21,7 @@ use crate::handle::{
 };
 use crate::kubeconfig::{self, ContextInfo, LoadedKubeconfig};
 use crate::logs::{self, KubeLogSource, KubePodSource, LogError, SessionConfig};
-use crate::protection::{SessionUnlocks, WriteRefusal, protection};
+use crate::protection::{ClusterClients, GatedClient, SessionUnlocks, WriteRefusal, protection};
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::{ContextHistory, ContextPin, Pinned};
 use crate::settings::{self, AiScope, Settings};
@@ -46,7 +46,7 @@ pub(crate) struct Cluster {
     info: ContextInfo,
     fingerprint: Option<u64>,
     state: ConnectionState,
-    client: Option<Client>,
+    client: Option<ClusterClients>,
     /// Id of the latest connection attempt, from the manager-wide counter, so a late result of an
     /// older attempt (even one made before the context was removed and re-added) is ignored.
     attempt: u64,
@@ -149,7 +149,7 @@ enum Internal {
     Connected {
         cluster: ClusterId,
         attempt: u64,
-        result: Result<(Client, ServerVersion), cluster::SafeErrorText>,
+        result: Result<(ClusterClients, ServerVersion), cluster::SafeErrorText>,
     },
     FilesChanged(Changed),
     Discovered {
@@ -611,7 +611,7 @@ impl ClusterManager {
         let Some(slot) = self.cluster_mut(id) else {
             return;
         };
-        let Some(client) = slot.client.clone() else {
+        let Some(client) = slot.client.as_ref().map(|c| c.read.clone()) else {
             return;
         };
         if slot.discovering {
@@ -833,13 +833,13 @@ impl ClusterManager {
                 }
                 let connected = result.is_ok();
                 match result {
-                    Ok((client, version)) => {
+                    Ok((clients, version)) => {
                         slot.watches.set_source(Some(KubeSource::new(
-                            client.clone(),
+                            clients.read.clone(),
                             Some(&version),
                             target,
                         )));
-                        slot.client = Some(client);
+                        slot.client = Some(clients);
                         slot.state = ConnectionState::Connected(version);
                     }
                     Err(message) => {
@@ -1044,8 +1044,8 @@ impl ClusterManager {
                 "\"{cluster}\" is uncertain while a kubeconfig file can't be read"
             )));
         };
-        if let Some(client) = &slot.client {
-            return Ok(client.clone());
+        if let Some(clients) = &slot.client {
+            return Ok(clients.read.clone());
         }
         match &slot.state {
             ConnectionState::Failed(error) => Err(LogError::retry(format!(
@@ -1069,7 +1069,7 @@ impl ClusterManager {
         &self,
         cluster: &str,
         server: Option<Option<String>>,
-    ) -> Result<(Client, ContextPin), WriteRefusal> {
+    ) -> Result<(GatedClient, ContextPin), WriteRefusal> {
         if let Some(expected) = &server
             && self
                 .cluster(cluster)
@@ -1093,24 +1093,30 @@ impl ClusterManager {
     }
 
     fn client(&self, cluster: &str) -> Option<Client> {
-        self.cluster(cluster).and_then(|c| c.client.clone())
+        self.cluster(cluster)
+            .and_then(|c| c.client.as_ref().map(|c| c.read.clone()))
     }
 
     /// The gate every action that changes a cluster, or runs code in it, goes through
     /// (ADR-0015): the cluster's client, unless the cluster is protected or not connected.
-    fn write_client(&self, cluster: &str) -> Result<Client, WriteRefusal> {
+    fn write_client(&self, cluster: &str) -> Result<GatedClient, WriteRefusal> {
         let not_connected = || WriteRefusal::NotConnected {
             cluster: cluster.to_owned(),
         };
         // A context Flint does not know has no client either: say that, not "protected".
         let slot = self.cluster(cluster).ok_or_else(not_connected)?;
         let (server, proxy) = (slot.info.server.as_deref(), slot.info.proxy_url.as_deref());
-        if !protection(&self.settings, &self.unlocks, cluster, server, proxy).allows_changes() {
+        let protection = protection(&self.settings, &self.unlocks, cluster, server, proxy);
+        if !protection.allows_changes() {
             return Err(WriteRefusal::Protected {
                 cluster: cluster.to_owned(),
             });
         }
-        slot.client.clone().ok_or_else(not_connected)
+        slot.client
+            .as_ref()
+            .ok_or_else(not_connected)?
+            .writes
+            .grant(protection, cluster)
     }
 
     fn cluster(&self, id: &str) -> Option<&Cluster> {
@@ -1186,7 +1192,7 @@ impl ClusterManager {
             // becomes a failed connection instead of a cluster stuck in "connecting".
             let name = cluster.clone();
             let attempt_task = tokio::spawn(async move {
-                cluster::connect_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
+                cluster::connect_gated_and_check(&kubeconfig.merged, &name, CONNECT_TIMEOUT)
                     .await
                     .map_err(|e| e.summary())
             });

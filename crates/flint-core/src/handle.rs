@@ -23,7 +23,7 @@ use crate::logs::{
     PodSet, WorkloadPod,
 };
 use crate::manager::ClusterManager;
-use crate::protection::{SessionUnlocks, WriteRefusal};
+use crate::protection::{GatedClient, SessionUnlocks, WriteRefusal};
 use crate::read::{KindId, ObjectDetail};
 use crate::recheck::{ContextPin, RECHECK_EVERY};
 use crate::settings::{Appearance, Settings, WatchMode};
@@ -195,7 +195,7 @@ pub(crate) enum Request {
         /// The server the session is for (its tab's), if it names one: refused if the context
         /// shows another.
         server: Option<Option<String>>,
-        reply: oneshot::Sender<Result<(kube::Client, ContextPin), WriteRefusal>>,
+        reply: oneshot::Sender<Result<(GatedClient, ContextPin), WriteRefusal>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
@@ -607,7 +607,7 @@ impl CoreHandle {
         &self,
         cluster: &str,
         server: Option<Option<String>>,
-    ) -> impl Future<Output = Result<(kube::Client, ContextPin), WriteRefusal>> + Send + 'static
+    ) -> impl Future<Output = Result<(GatedClient, ContextPin), WriteRefusal>> + Send + 'static
     {
         let (reply, rx) = oneshot::channel();
         let sent = self.requests.try_send(Request::WriteClient {
