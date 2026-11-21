@@ -1118,6 +1118,30 @@ async fn a_cluster_locked_after_review_refuses_the_write() {
     assert_eq!(replicas(&server), 1);
 }
 
+// The dialog awaits these on the UI executor, which has no tokio timer or reactor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_runs_from_an_executor_without_tokio() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let core = Core::start(&server, Some("demo")).await;
+    let handle = core.handle.clone();
+    let target = write_target(&server);
+    let written = tokio::task::spawn_blocking(move || {
+        std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                let review = handle.review_write(target, three_replicas()).await?;
+                handle.run_write(review.into_intent()).await
+            })
+        })
+        .join()
+        .expect("no panic outside tokio")
+    })
+    .await
+    .unwrap();
+    written.unwrap();
+    assert_eq!(replicas(&server), 3);
+}
+
 // covers UP-52: a review is for the object it read: another uid, a newer version, or an intent
 // retargeted after the review are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

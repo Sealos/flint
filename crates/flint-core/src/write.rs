@@ -38,6 +38,8 @@ const FIELD_MANAGER: &str = "flint";
 
 /// What a Secret's values read as in a review's diff.
 const HIDDEN_VALUE: &str = "<hidden>";
+/// A hidden value the change replaces.
+const HIDDEN_CHANGED: &str = "<hidden, changed>";
 
 /// The object a change is for, as the front end showed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,16 +213,17 @@ impl RequestGate {
             .core
             .write_client(&self.cluster, Some(self.server.clone()))
             .await?;
-        match &self.pin {
-            Some(first) if *first != pin => {
-                return Err(WriteRefusal::Moved {
-                    cluster: self.cluster.to_string(),
-                }
-                .into());
+        if self.pin.as_ref().is_some_and(|first| *first != pin) {
+            return Err(WriteRefusal::Moved {
+                cluster: self.cluster.to_string(),
             }
-            Some(_) => {}
-            None => self.pin = Some(pin),
+            .into());
         }
+        // A pin can be stale from the start: a fallback showing while a higher file is unreadable.
+        self.core
+            .check_write_pin(&self.cluster, pin.clone())
+            .await?;
+        self.pin = Some(pin);
         Ok(client.into_client())
     }
 }
@@ -235,7 +238,7 @@ impl CoreHandle {
         proposal: WriteProposal,
     ) -> impl Future<Output = Result<WriteReview, WriteError>> + Send + 'static {
         let core = self.clone();
-        async move {
+        let task = self.on_runtime(async move {
             let mut gate = RequestGate::new(core.clone(), &target);
             let kind = kind_of(&core, &target).await?;
             let client = gate.client().await?;
@@ -248,7 +251,8 @@ impl CoreHandle {
                 action,
                 warnings,
             })
-        }
+        });
+        async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
     }
 
     /// Runs a reviewed change. The gate is asked again first, and the change is refused if the
@@ -258,12 +262,13 @@ impl CoreHandle {
         intent: WriteIntent,
     ) -> impl Future<Output = Result<WriteOutcome, WriteError>> + Send + 'static {
         let core = self.clone();
-        async move {
+        let task = self.on_runtime(async move {
             check_bound(&intent)?;
             let mut gate = RequestGate::new(core.clone(), &intent.target);
             let kind = kind_of(&core, &intent.target).await?;
             execute(&mut gate, &kind, intent).await
-        }
+        });
+        async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
     }
 }
 
@@ -361,15 +366,17 @@ async fn prepare(
 ) -> Result<WriteAction, WriteError> {
     match proposal {
         WriteProposal::ApplyYaml { yaml } => {
-            let body = edit_body(&yaml, kind, target)?;
+            let mut body = edit_body(&yaml, kind, target)?;
+            keep_live_status(&mut body, live);
             let client = gate.client().await?;
             let result = replace(&client, kind, target, &body, true).await?;
             let result = serde_json::to_value(&result)
                 .map_err(|e| WriteError::Failed(format!("cannot read the dry run: {e}")))?;
+            let result = with_type_of(result, &body);
             Ok(WriteAction::ApplyYaml(ReviewedEdit {
                 bound: target.clone(),
                 before: shown_yaml(live)?,
-                after: shown_yaml(&with_type_of(result, &body))?,
+                after: shown_after(live, &result)?,
                 body,
             }))
         }
@@ -416,8 +423,14 @@ async fn replace(
 /// cannot move it to another name, namespace or kind, or drop the version that makes a
 /// concurrent change a conflict.
 fn edit_body(yaml: &str, kind: &KindInfo, target: &WriteTarget) -> Result<Value, WriteError> {
-    let mut body: Value = serde_saphyr::from_str(yaml)
-        .map_err(|e| WriteError::InvalidYaml(format!("not valid YAML: {e}")))?;
+    // No source snippet, and no quoted scalars: the text can be a Secret's.
+    let options = serde_saphyr::options! { with_snippet: false };
+    let mut body: Value = serde_saphyr::from_str_with_options(yaml, options).map_err(|e| {
+        WriteError::InvalidYaml(format!(
+            "not valid YAML: {}",
+            redact::redact_quoted(&e.to_string())
+        ))
+    })?;
     if !body.is_object() {
         return Err(WriteError::InvalidYaml(
             "not a Kubernetes object".to_owned(),
@@ -468,8 +481,18 @@ fn with_type_of(mut object: Value, body: &Value) -> Value {
     object
 }
 
+/// The editor leaves `status` out, and a `PUT` to a kind without a status subresource would
+/// erase it.
+fn keep_live_status(body: &mut Value, live: &Value) {
+    if body.get("status").is_none()
+        && let Some(status) = live.get("status")
+    {
+        body["status"] = status.clone();
+    }
+}
+
 /// `object` as a review shows it: no `status` or `managedFields`, Secret values hidden.
-fn shown_yaml(object: &Value) -> Result<String, WriteError> {
+fn shown_value(object: &Value) -> Value {
     let mut shown = object.clone();
     if let Some(fields) = shown.as_object_mut() {
         fields.remove("status");
@@ -480,7 +503,36 @@ fn shown_yaml(object: &Value) -> Result<String, WriteError> {
     if redact::is_secret_object(&shown) {
         redact::mask_secret(&mut shown, HIDDEN_VALUE);
     }
-    serde_saphyr::to_string(&shown)
+    shown
+}
+
+fn shown_yaml(object: &Value) -> Result<String, WriteError> {
+    render(&shown_value(object))
+}
+
+/// The result of an edit as shown. A hidden value that changed says so, or the diff of a rotated
+/// Secret key would be empty.
+fn shown_after(live: &Value, after: &Value) -> Result<String, WriteError> {
+    let mut shown = shown_value(after);
+    for fields in ["/data", "/metadata/annotations"] {
+        let was = live.pointer(fields).and_then(Value::as_object);
+        let now = after.pointer(fields).and_then(Value::as_object);
+        let map = shown.pointer_mut(fields).and_then(Value::as_object_mut);
+        let (Some(was), Some(now), Some(map)) = (was, now, map) else {
+            continue;
+        };
+        for (key, value) in map {
+            let hidden = value.as_str() == Some(HIDDEN_VALUE);
+            if hidden && was.get(key).is_some_and(|old| Some(old) != now.get(key)) {
+                *value = HIDDEN_CHANGED.into();
+            }
+        }
+    }
+    render(&shown)
+}
+
+fn render(shown: &Value) -> Result<String, WriteError> {
+    serde_saphyr::to_string(shown)
         .map_err(|e| WriteError::Failed(format!("cannot render YAML: {e}")))
 }
 

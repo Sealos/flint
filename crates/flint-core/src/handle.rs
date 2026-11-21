@@ -652,6 +652,25 @@ impl CoreHandle {
         }
     }
 
+    /// Whether a write may go out on `pin`: the context still names its server, confirmed, and
+    /// the gate allows changes there.
+    pub(crate) fn check_write_pin(
+        &self,
+        cluster: &ClusterId,
+        pin: ContextPin,
+    ) -> impl Future<Output = Result<(), WriteRefusal>> + Send + 'static {
+        launch_check(self.requests.clone(), cluster.clone(), pin)()
+    }
+
+    /// Runs `task` on the core's runtime, for callers on another executor. Dropping the returned
+    /// future aborts it.
+    pub(crate) fn on_runtime<T: Send + 'static>(
+        &self,
+        task: impl Future<Output = T> + Send + 'static,
+    ) -> impl Future<Output = Option<T>> + Send + 'static {
+        spawn_aborting(&self.runtime, task)
+    }
+
     /// Unlocks `cluster` at `server` (the URL the user confirmed) until Flint quits or
     /// [`CoreHandle::lock`] (ADR-0015). It takes effect at once. If the context now points
     /// elsewhere, the unlock does not cover it: the pin is to `server`.

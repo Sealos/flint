@@ -184,6 +184,40 @@ fn a_review_shows_no_secret_values_status_or_managed_fields() {
 }
 
 #[test]
+fn a_rotated_secret_value_shows_as_changed_without_its_value() {
+    let secret = |password: &str| {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "s"},
+            "data": {"password": password, "user": "YWRtaW4="},
+        })
+    };
+    let shown = shown_after(&secret("b2xk"), &secret("bmV3")).unwrap();
+    assert!(shown.contains(HIDDEN_CHANGED), "{shown}");
+    assert_eq!(shown.matches(HIDDEN_CHANGED).count(), 1, "{shown}");
+    assert!(
+        !shown.contains("bmV3") && !shown.contains("b2xk"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn an_edit_without_status_keeps_the_live_status() {
+    let live = json!({"status": {"phase": "Ready"}});
+    let mut body = json!({"spec": {}});
+    keep_live_status(&mut body, &live);
+    assert_eq!(body["status"]["phase"], "Ready");
+}
+
+#[test]
+fn invalid_yaml_does_not_repeat_the_text() {
+    let yaml = "apiVersion: v1\nkind: Secret\nstringData:\n  password: \"hunter2\n";
+    let error = edit_body(yaml, &kind(), &target()).unwrap_err().to_string();
+    assert!(!error.contains("hunter2"), "{error}");
+}
+
+#[test]
 fn the_gitops_warning_comes_from_the_live_object() {
     let managed = json!({
         "apiVersion": "apps/v1",
