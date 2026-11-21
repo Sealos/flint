@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use flint_core::redact::is_safe_secret_column;
 use flint_core::{Column, ColumnRole, ColumnType, KindSnapshot, SortBy};
 
 /// The user's sort choice, by column key ([`Column::key`]), as `state.toml` keeps it per cluster
@@ -359,6 +360,75 @@ pub fn has_ticking_columns(columns: &[Column]) -> bool {
     columns
         .iter()
         .any(|c| c.role == ColumnRole::Age || c.ty == ColumnType::Date)
+}
+
+/// The width of a character in a list cell, for fitting text without measuring it.
+pub const CHAR_WIDTH: f32 = 8.5;
+/// A cell's horizontal padding, both sides together.
+pub const CELL_PADDING: f32 = 16.;
+
+/// What a row contributes to how its cells are drawn.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RowFlags {
+    /// The list is not current: its rows are already muted, so cells get no tone.
+    pub stale: bool,
+    /// The kind has [`has_health_columns`].
+    pub health: bool,
+    /// The row has finished for good ([`row_finished`]).
+    pub finished: bool,
+    /// A Secret row: only identity columns show their value, as in the MCP server, because a
+    /// printer column added by an extension could show one.
+    pub masked: bool,
+}
+
+/// How one list cell is drawn, decided without GPUI. `T` is the text type: the view's shared
+/// strings, so a cell that is not cut shares its text instead of copying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellStyle<T> {
+    /// The text in the cell, cut to fit if it is a name.
+    pub shown: T,
+    /// The full text, when it does not fit the cell.
+    pub tooltip: Option<T>,
+    pub tone: Tone,
+    /// Right-aligned, with tabular figures.
+    pub numeric: bool,
+    /// A name, in the monospace font.
+    pub mono: bool,
+}
+
+impl<T: Clone + AsRef<str> + From<String> + From<&'static str>> CellStyle<T> {
+    /// The style of `column`'s cell, `width` wide. `raw_text` is not called for a masked cell,
+    /// so a Secret's value is never read to draw it.
+    pub fn of(column: &Column, raw_text: impl FnOnce() -> T, width: f32, flags: RowFlags) -> Self {
+        let text = if flags.masked && !is_safe_secret_column(&column.name) {
+            T::from(super::object::MASK)
+        } else {
+            raw_text()
+        };
+        let chars = text.as_ref();
+        // Stale rows are already muted; masked secrets have no status.
+        let tone = if flags.stale || !flags.health {
+            Tone::Normal
+        } else {
+            cell_tone(&column.name, chars, flags.finished)
+        };
+        let mono = column.role == ColumnRole::Name;
+        let fits = (chars.chars().count() as f32) * CHAR_WIDTH + CELL_PADDING <= width;
+        // Names of one workload share their start: cut them in the middle, so the ends that
+        // tell them apart stay in view. Other cells truncate at the end.
+        let room = ((width - CELL_PADDING) / CHAR_WIDTH).floor().max(0.) as usize;
+        let shown = match mono.then(|| fit_name(chars, room)) {
+            Some(Some(cut)) => T::from(cut),
+            _ => text.clone(),
+        };
+        Self {
+            shown,
+            tooltip: (!fits).then_some(text),
+            tone,
+            numeric: is_numeric(column),
+            mono,
+        }
+    }
 }
 
 /// How a cell's text is colored, so a failing object stands out from healthy ones.
@@ -922,6 +992,133 @@ mod tests {
     }
 
     // covers UP-21: the count is within the namespace filter, which the header names.
+    fn style(column: &Column, text: &str, width: f32, flags: RowFlags) -> CellStyle<String> {
+        CellStyle::of(column, || text.to_owned(), width, flags)
+    }
+
+    fn value(name: &str) -> Column {
+        col(name, 0, ColumnRole::Value, ColumnType::String)
+    }
+
+    const WIDE: f32 = 1_000.;
+    const HEALTHY: RowFlags = RowFlags {
+        stale: false,
+        health: true,
+        finished: false,
+        masked: false,
+    };
+
+    #[test]
+    fn a_masked_cell_never_reads_its_value() {
+        let flags = RowFlags {
+            masked: true,
+            ..RowFlags::default()
+        };
+        let cell = CellStyle::<String>::of(
+            &value("Token"),
+            || panic!("a masked value was read"),
+            WIDE,
+            flags,
+        );
+        assert_eq!(cell.shown, crate::ui::object::MASK);
+        assert_eq!(cell.tooltip, None);
+        // Too narrow: the tooltip offers the mask too, not the value.
+        let cell = CellStyle::<String>::of(
+            &value("Token"),
+            || panic!("a masked value was read"),
+            20.,
+            flags,
+        );
+        assert_eq!(cell.tooltip.as_deref(), Some(crate::ui::object::MASK));
+    }
+
+    #[test]
+    fn a_secrets_identity_columns_stay_readable() {
+        let flags = RowFlags {
+            masked: true,
+            ..RowFlags::default()
+        };
+        for name in ["Name", "Namespace", "Type", "Data", "Age"] {
+            assert_eq!(style(&value(name), "shown", WIDE, flags).shown, "shown");
+        }
+    }
+
+    #[test]
+    fn only_current_rows_of_health_kinds_get_a_tone() {
+        let status = value("Status");
+        assert_eq!(style(&status, "Error", WIDE, HEALTHY).tone, Tone::Danger);
+        let stale = RowFlags {
+            stale: true,
+            ..HEALTHY
+        };
+        assert_eq!(style(&status, "Error", WIDE, stale).tone, Tone::Normal);
+        let no_health = RowFlags {
+            health: false,
+            ..HEALTHY
+        };
+        assert_eq!(style(&status, "Error", WIDE, no_health).tone, Tone::Normal);
+    }
+
+    #[test]
+    fn a_finished_row_mutes_its_ready_count() {
+        let ready = value("Ready");
+        assert_eq!(style(&ready, "0/1", WIDE, HEALTHY).tone, Tone::Warning);
+        let finished = RowFlags {
+            finished: true,
+            ..HEALTHY
+        };
+        assert_eq!(style(&ready, "0/1", WIDE, finished).tone, Tone::Muted);
+    }
+
+    #[test]
+    fn numeric_columns_are_marked_and_others_are_not() {
+        let number = col("Restarts", 0, ColumnRole::Value, ColumnType::Integer);
+        assert!(style(&number, "3", WIDE, RowFlags::default()).numeric);
+        assert!(!style(&value("Node"), "3", WIDE, RowFlags::default()).numeric);
+    }
+
+    #[test]
+    fn a_name_is_mono_and_cut_in_the_middle_with_its_full_text_in_the_tooltip() {
+        let name = col("Name", 0, ColumnRole::Name, ColumnType::String);
+        let long = "podinfo-7b9c8d5f4-abcde";
+        let cell = style(&name, long, 16. + 10. * CHAR_WIDTH, RowFlags::default());
+        assert!(cell.mono);
+        assert!(cell.shown.contains('…'), "{}", cell.shown);
+        assert!(cell.shown.ends_with("bcde"), "{}", cell.shown);
+        assert_eq!(cell.tooltip.as_deref(), Some(long));
+    }
+
+    #[test]
+    fn other_cells_keep_their_text_and_truncate_when_drawn() {
+        let long = "a-long-node-name";
+        let cell = style(&value("Node"), long, 40., RowFlags::default());
+        assert!(!cell.mono);
+        assert_eq!(cell.shown, long);
+        assert_eq!(cell.tooltip.as_deref(), Some(long));
+    }
+
+    #[test]
+    fn a_cell_has_a_tooltip_only_past_its_exact_fit() {
+        let exact = 4. * CHAR_WIDTH + CELL_PADDING;
+        let node = value("Node");
+        assert_eq!(
+            style(&node, "node", exact, RowFlags::default()).tooltip,
+            None
+        );
+        assert!(
+            style(&node, "node", exact - 0.5, RowFlags::default())
+                .tooltip
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_cell_narrower_than_its_padding_still_has_a_style() {
+        let name = col("Name", 0, ColumnRole::Name, ColumnType::String);
+        let cell = style(&name, "podinfo", 4., RowFlags::default());
+        assert_eq!(cell.tooltip.as_deref(), Some("podinfo"));
+    }
+
     #[test]
     fn the_count_matches_the_namespace_filter() {
         let none: [String; 0] = [];

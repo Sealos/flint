@@ -28,8 +28,6 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use flint_core::redact::is_safe_secret_column;
-
 use super::list_model::{self, ColumnWidths, SortSpec};
 use super::notice::notice;
 use super::row_menu::RowMenu;
@@ -43,8 +41,7 @@ use super::registry::{
 pub const CONTEXT: &str = "ResourceList";
 pub const ROW_HEIGHT: f32 = 24.;
 /// Approximate advance of one character at the table's text size, for column widths.
-const CHAR_WIDTH: f32 = 8.5;
-const CELL_PADDING: f32 = 16.;
+use list_model::{CELL_PADDING, CHAR_WIDTH};
 
 // The kit's tooltips paint plain text that view tests cannot observe: this records what a cell's
 // tooltip was built with.
@@ -793,29 +790,21 @@ impl ResourceList {
                 && list_model::row_finished(&self.shown.columns, |i| {
                     cell_text(row, i, now).to_string()
                 });
+            let flags = list_model::RowFlags {
+                stale,
+                health,
+                finished,
+                masked: secrets,
+            };
             for &(col, width) in &self.drawn {
                 let column = &self.shown.columns[col];
-                let text = if secrets && !is_safe_secret_column(&column.name) {
-                    SharedString::new_static(super::object::MASK)
-                } else {
-                    cell_text(row, col, now)
-                };
-                // Stale rows are already muted; masked secrets have no status.
-                let tone = if stale || !health {
-                    list_model::Tone::Normal
-                } else {
-                    list_model::cell_tone(&column.name, &text, finished)
-                };
-                let numeric = list_model::is_numeric(column);
-                let is_name = column.role == ColumnRole::Name;
-                let fits = (text.chars().count() as f32) * CHAR_WIDTH + CELL_PADDING <= width;
-                // Names of one workload share their start: cut them in the middle, so the ends
-                // that tell them apart stay in view. Other cells truncate at the end.
-                let room = ((width - CELL_PADDING) / CHAR_WIDTH).floor().max(0.) as usize;
-                let shown_text = match is_name.then(|| list_model::fit_name(&text, room)) {
-                    Some(Some(cut)) => SharedString::from(cut),
-                    _ => text.clone(),
-                };
+                let list_model::CellStyle {
+                    shown,
+                    tooltip,
+                    tone,
+                    numeric,
+                    mono,
+                } = list_model::CellStyle::of(column, || cell_text(row, col, now), width, flags);
                 let cell = div()
                     .id(("cell", ix * ncols + col))
                     .h_full()
@@ -825,7 +814,7 @@ impl ResourceList {
                     .min_w_0()
                     .w(px(width))
                     .flex_none()
-                    .when(is_name, |el| el.font_family(theme.mono_font_family.clone()))
+                    .when(mono, |el| el.font_family(theme.mono_font_family.clone()))
                     .map(|el| match tone {
                         list_model::Tone::Normal => el,
                         list_model::Tone::Danger => el.text_color(theme.danger),
@@ -839,10 +828,10 @@ impl ResourceList {
                         div()
                             .min_w_0()
                             .truncate()
-                            .child(shown_text.clone())
-                            .test_text(shown_text),
+                            .child(shown.clone())
+                            .test_text(shown),
                     )
-                    .when(!fits, |el| {
+                    .when_some(tooltip, |el, text| {
                         el.tooltip(move |window, cx| {
                             #[cfg(test)]
                             CELL_TOOLTIPS.with_borrow_mut(|tips| tips.push(text.to_string()));
