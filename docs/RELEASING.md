@@ -53,6 +53,17 @@ Open the release on [GitHub Releases](https://github.com/Sealos/flint/releases),
   shasum -a 256 -c ./*.sha256
   ```
 
+- [ ] The provenance verifies. Every binary and SBOM has a build provenance attestation, made by the `attest` job
+  before the files were attached (checksum files are not attested). For each file, in the directory you downloaded
+  into:
+
+  ```sh
+  gh attestation verify ./flint-vX.Y.Z-linux-x86_64.AppImage -R Sealos/flint
+  ```
+
+  It succeeds only if the file's digest was attested by a workflow run in `Sealos/flint`. To also pin the workflow,
+  add `--signer-workflow Sealos/flint/.github/workflows/release-please.yml`. v0.3.1 and earlier have no attestations.
+
 The `publish` job already checks that all twelve files are on the draft, non-empty and matching their checksums, and
 that the release ends up published (and Latest when it should be). This step confirms what someone downloading it
 sees.
