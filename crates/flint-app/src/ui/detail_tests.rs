@@ -151,6 +151,31 @@ async fn a_configmap_pane_has_no_logs_or_shell(cx: &mut TestAppContext) {
     assert_eq!(none(cx), [false; 3], "failed");
 }
 
+// covers UP-23: an object Argo CD manages says so in the header, and one nothing manages does not.
+#[gpui_kit::test]
+async fn the_header_marks_an_object_a_gitops_controller_manages(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    open_and_select(cx, &t, KindId::pods(), &[("demo", "api", 0)], "api").await;
+    wait_for_failed_fetch(cx, &t).await;
+    assert!(t.find(cx, "detail-managed-by").is_none(), "nothing loaded");
+
+    show_fetched(cx, &t, pod("api"));
+    assert!(t.find(cx, "detail-managed-by").is_none(), "not managed");
+
+    let mut managed = pod("api");
+    managed.object["metadata"]["annotations"]["argocd.argoproj.io/tracking-id"] =
+        json!("shop:/Pod:demo/api");
+    show_fetched(cx, &t, managed);
+    assert!(t.find(cx, "detail-managed-by").is_some());
+    let v = view(cx, &t);
+    let shown = v.read_with(cx, |v, _| match &v.fetch {
+        Fetch::Loaded { overview, .. } => overview.managed_by.as_ref().map(ToString::to_string),
+        _ => None,
+    });
+    assert_eq!(shown.as_deref(), Some("Argo CD: shop"));
+}
+
 // covers UP-23: the pane shows the object's metadata, labels, owners, conditions and events,
 // and read-only YAML without managedFields until asked. Its tabs switch with the registry, their
 // keys and clicks, and moving to another row keeps the tab.

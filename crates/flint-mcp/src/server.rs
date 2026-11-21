@@ -659,7 +659,7 @@ impl FlintMcp {
     }
 
     #[tool(
-        description = "Get one object as YAML. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
+        description = "Get one object as YAML. A `# managed_by=` header line names the Argo CD or Flux object that manages it, whose sync may revert a change. managedFields are removed and Secret values redacted. Credentials in messages, annotations and container args and commands are replaced with [REDACTED:<kind>] markers; a first line `# redacted=N` says how many.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_resource(&self, Parameters(p): Parameters<GetResourceParams>) -> ToolResult {
@@ -1316,6 +1316,10 @@ impl FlintMcp {
                 "# truncated=true: output cut at {} bytes\n",
                 policy::OBJECT_BYTES
             ));
+        }
+        // After the other header lines, which callers expect first. Read from the redacted object.
+        if let Some(line) = policy::managed_by_line(&value) {
+            out.push_str(&line);
         }
         out.push_str(text);
         Ok(out)
@@ -2093,6 +2097,10 @@ mod tests {
         assert_eq!(reply_size("list_clusters", &clusters), (Some(2), false));
         let cut = "# redacted=0\n# truncated=true: output cut at 262144 bytes\nkind: Pod\n";
         assert_eq!(reply_size("get_resource", cut), (Some(1), true));
+        let marked = "# truncated=true: cut\n# managed_by=Argo CD: shop\nkind: Pod\n";
+        assert_eq!(reply_size("get_resource", marked), (Some(1), true));
+        let managed = "# managed_by=Argo CD: shop\nkind: Pod\n";
+        assert_eq!(reply_size("get_resource", managed), (Some(1), false));
         let whole = "kind: Pod\nmetadata:\n  name: '# truncated=true'\n";
         assert_eq!(reply_size("get_resource", whole), (Some(1), false));
         assert_eq!(reply_size("list_resources", "not json"), (None, false));
