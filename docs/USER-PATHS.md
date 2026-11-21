@@ -276,7 +276,8 @@ The full strategy is in [`TESTING.md`](./TESTING.md).
   ring. In the sidebar the arrows move between clusters and Enter connects to the one under the cursor. In the
   navigation the arrows move over sections and kinds, Enter opens a kind (its list takes focus) or opens and closes a
   section, Right opens a section and Left closes it (from a kind, its own section). In a list, Cmd-F moves to its text
-  filter, and Esc, Enter or Down there moves back to the rows, keeping the filter. Cmd-[ goes back to the kind and
+  filter, and Esc, Enter or Down there moves back to the rows, keeping the filter. With nothing selected, Down also
+  selects the first row and opens it. Cmd-[ goes back to the kind and
   object shown before, on the active cluster, never to the place already shown.
 - Tests: ui.
 

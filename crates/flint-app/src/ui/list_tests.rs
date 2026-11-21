@@ -1082,6 +1082,96 @@ async fn keys_drive_the_list_in_the_main_window(cx: &mut TestAppContext) {
     assert_eq!(t.selected(cx).as_deref(), Some("api"));
 }
 
+// covers UP-21 (#406): with nothing selected, Down from the filter selects the first row left
+// by the filter and opens it. Esc and Enter only move focus back to the rows.
+#[gpui_kit::test]
+async fn down_from_the_filter_selects_the_first_row(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::open_workspace;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    assert_eq!(t.selected(cx), None);
+
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    t.type_text(cx, "web");
+    let list = t.list(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| list.read(cx).shown().1 == 2)
+        .await;
+    for key in ["escape", "enter"] {
+        t.press(cx, key);
+        assert_eq!(t.selected(cx), None, "{key} selects nothing");
+        t.press_key_of(cx, "resource_list::FocusFilter");
+    }
+
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx).as_deref(), Some("web-a"));
+    assert!(t.detail(cx).is_some(), "the row opened");
+    let filter_focused = cx
+        .update_window(t.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("input-state").focused()
+        })
+        .unwrap();
+    assert_ne!(filter_focused, Some(true), "focus left the filter");
+}
+
+// covers UP-21 (#406): Down while the filter's rows are still being computed waits for them, so
+// it never opens a row the filter hides. Going back to the filter meanwhile cancels it.
+#[gpui_kit::test]
+async fn down_from_the_filter_waits_for_its_rows(cx: &mut TestAppContext) {
+    use crate::ui::support_tests::open_workspace;
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(
+        cx,
+        &[
+            ("demo", "api", 0),
+            ("demo", "web-a", 0),
+            ("demo", "web-b", 0),
+        ],
+    )
+    .await;
+    let list = t.list(cx).unwrap();
+    t.press_key_of(cx, "resource_list::FocusFilter");
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.type_text(cx, "web-b");
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "the old rows are not selected");
+    t.press_key_of(cx, "resource_list::FocusFilter");
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    let shown = list.clone();
+    cx.wait_for(t.window, WAIT, move |_, cx| shown.read(cx).shown().1 == 1)
+        .await;
+    cx.run_until_parked();
+    assert_eq!(t.selected(cx), None, "back in the filter, it was cancelled");
+
+    let permits = list.update(cx, |list, _| list.hold_computes());
+    t.press(cx, "backspace");
+    t.press(cx, "down");
+    assert_eq!(t.selected(cx), None, "still computing");
+    for _ in 0..8 {
+        permits.try_send(()).unwrap();
+    }
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        list.read(cx).selected_name().as_deref() == Some("web-a")
+    })
+    .await;
+    assert!(t.detail(cx).is_some(), "the row opened");
+}
+
 /// A quick measure of what one frame of a 10,000-row list costs on the UI thread (layout and
 /// paint of the visible rows, in the headless test window). Ignored: run it in release mode
 /// with `--ignored --nocapture` to compare changes to the row rendering.

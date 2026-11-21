@@ -132,6 +132,9 @@ pub struct ResourceList {
     computing: bool,
     /// Something changed while a computation ran: run again when it ends.
     dirty: bool,
+    /// Down left the filter while its rows were being computed: select the first row in this
+    /// window once they are current, if the rows still have focus.
+    select_first_in: Option<AnyWindowHandle>,
     /// The namespace or text filter changed: the next measurement starts the column widths
     /// over, so they fit the rows now shown. Live updates under the same filters only grow them.
     remeasure: bool,
@@ -219,6 +222,7 @@ impl ResourceList {
         let on_filter = cx.subscribe_in(&filter, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.query.text = input.read(cx).value().to_string();
+                this.select_first_in = None;
                 this.remeasure = true;
                 this.recompute(cx);
             }
@@ -252,6 +256,7 @@ impl ResourceList {
             selected_seen: None,
             computing: false,
             dirty: false,
+            select_first_in: None,
             remeasure: false,
             scoped: 0,
             scroll: UniformListScrollHandle::new(),
@@ -523,7 +528,7 @@ impl ResourceList {
         });
         self._compute = cx.spawn(async move |this, cx| {
             let (rows, widths, scoped, uid, position) = job.await;
-            let _ = this.update(cx, |list, cx| {
+            let select_first = this.update(cx, |list, cx| {
                 list.computing = false;
                 #[cfg(test)]
                 {
@@ -540,7 +545,7 @@ impl ResourceList {
                 if now != job_sort {
                     list.remeasure |= restart;
                     list.recompute(cx);
-                    return;
+                    return None;
                 }
                 list.widths.update(&snapshot.columns, &widths, restart);
                 list.scoped = scoped;
@@ -548,7 +553,22 @@ impl ResourceList {
                 if list.dirty {
                     list.recompute(cx);
                 }
+                // Only rows that match the filter now may be selected.
+                if list.computing {
+                    None
+                } else {
+                    list.select_first_in.take()
+                }
             });
+            if let Ok(Some(window)) = select_first {
+                let _ = window.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |list, cx| {
+                        if list.focus.is_focused(window) {
+                            list.select_first_if_none(window, cx);
+                        }
+                    });
+                });
+            }
         });
     }
 
@@ -641,11 +661,19 @@ impl ResourceList {
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         // An object still waited for would be selected later, out of the blue.
         self.pending_select = None;
+        self.select_first_in = None;
         self.missing = None;
         if self.selected.take().is_some() {
             self.selected_ix = None;
             cx.emit(ListEvent::Selected(None));
             cx.notify();
+        }
+    }
+
+    /// Selects the first row, unless a row is selected or waiting to be.
+    fn select_first_if_none(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none() && self.pending_select.is_none() {
+            self.select_index(0, window, cx);
         }
     }
 

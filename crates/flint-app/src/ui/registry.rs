@@ -148,8 +148,10 @@ actions!(
         ToggleWide,
         /// Move focus to the list's text filter.
         FocusFilter,
-        /// Move focus from the list's text filter back to its rows (Esc, Enter or Down there).
-        FocusRows
+        /// Move focus from the list's text filter back to its rows (Esc or Enter there).
+        FocusRows,
+        /// Down in the list's text filter: back to the rows, selecting the first if none is.
+        SelectFromFilter
     ]
 );
 actions!(
@@ -2144,7 +2146,14 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             "Move focus from the filter back to the rows, keeping the filter text.",
         )
         .of(C::List, S::List)
-        .keys(&["escape", "enter", "down"], Some(LIST_FILTER))
+        .keys(&["escape", "enter"], Some(LIST_FILTER))
+        .hidden(),
+        Spec::unit::<SelectFromFilter>(
+            "Select From Filter",
+            "Move focus from the filter to the rows, selecting the first if none is selected.",
+        )
+        .of(C::List, S::List)
+        .keys(&["down"], Some(LIST_FILTER))
         .hidden(),
         Spec::unit::<SelectPrev>("Select Previous Row", "Move the selection up.")
             .of(C::List, S::List)
