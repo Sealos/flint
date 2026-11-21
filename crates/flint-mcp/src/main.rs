@@ -18,7 +18,12 @@ exactly, for example FLINT_LOG=debug.
 
 Same server as `flint mcp`, without the desktop app. Where Flint is installed, register `flint mcp`
 in AI clients; elsewhere, this binary. It serves only the clusters that ai_exposed_clusters in
-settings.toml exposes (FLINT_CONFIG_DIR, or ~/.config/flint on Linux).";
+settings.toml exposes.
+
+settings.toml is read from the first of:
+  $FLINT_CONFIG_DIR
+  $XDG_CONFIG_HOME/flint (Linux)
+  ~/.config/flint (Linux), ~/Library/Application Support/Flint (macOS)";
 
 /// `Ok(verbose)` to serve; `Err` holds what to print and the exit code. Program name excluded.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<bool, (String, u8)> {
@@ -80,6 +85,17 @@ mod tests {
         let (help, code) = parse(&["--help"]).unwrap_err();
         assert_eq!(code, 0);
         assert!(help.contains("register `flint mcp`"), "{help}");
+        let precedence = [
+            "$FLINT_CONFIG_DIR",
+            "$XDG_CONFIG_HOME/flint",
+            "~/.config/flint",
+        ]
+        .map(|path| help.find(path).unwrap_or_else(|| panic!("{path}: {help}")));
+        assert!(precedence.is_sorted(), "{help}");
+        assert!(
+            help.contains("~/Library/Application Support/Flint"),
+            "{help}"
+        );
         let (text, code) = parse(&["--version"]).unwrap_err();
         assert_eq!(code, 0);
         assert_eq!(text, format!("flint-mcp {}", env!("CARGO_PKG_VERSION")));
