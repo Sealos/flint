@@ -2,8 +2,6 @@
 //! palette (UP-30) and the resource switcher (UP-31). The view tests cover each key; these prove
 //! the keys reach the running app and the fake API server behind it.
 
-use std::time::Duration;
-
 use anyhow::{Result, bail};
 use flint_e2e::app::{App, AppOptions};
 use flint_e2e::backend::TestCluster;
@@ -73,19 +71,29 @@ fn row_name(state: &Value, index: usize) -> Result<String> {
     }
 }
 
-/// How many requests have reached `fake`, once none arrived for a moment: loading a list also
-/// starts its watch, and the count must not catch that still on its way.
-fn settled_arrivals(fake: &FakeApiServer) -> Result<usize> {
-    let mut last = fake.arrivals().len();
-    for _ in 0..100 {
-        std::thread::sleep(Duration::from_millis(300));
-        let now = fake.arrivals().len();
-        if now == last {
-            return Ok(now);
-        }
-        last = now;
+/// Waits until a watch on each of `plurals` is open.
+fn wait_for_watches(fake: &FakeApiServer, plurals: &[&str]) -> Result<()> {
+    for plural in plurals {
+        let gvr = fake.gvr(plural);
+        until(
+            &format!("a {plural} watch"),
+            || fake.open_watches(&gvr),
+            |n| *n >= 1,
+        )?;
     }
-    bail!("requests kept arriving: {last} so far")
+    Ok(())
+}
+
+/// Waits for the app's socket to go, which it removes as it quits. No request can reach the app
+/// after that, so the `flint::Quit` in [`App::quit`] cannot be what ended it.
+fn wait_for_socket_removed(app: &App) -> Result<()> {
+    let socket = app.config_dir().join("automation.sock");
+    until(
+        "the app to quit and remove its socket",
+        || socket.symlink_metadata().is_err(),
+        |gone| *gone,
+    )?;
+    Ok(())
 }
 
 // covers UP-33
@@ -141,9 +149,9 @@ fn up_33_keyboard_only() -> Result<()> {
     app.wait_for("/detail", Equals(Value::Null))?;
     app.wait_for("/focus", Equals("list".into()))?;
 
-    // Cmd-Q itself ends the app; `quit` then checks exit code 0 and that the socket is gone.
+    // Cmd-Q itself ends the app (it may go before it answers); `quit` then checks exit code 0.
     let _ = app.press_key("secondary-q");
-    until("the app to exit", || app.state().is_err(), |gone| *gone)?;
+    wait_for_socket_removed(&app)?;
     app.quit()?;
     Ok(())
 }
@@ -199,14 +207,18 @@ fn up_31_jump_to_a_resource() -> Result<()> {
         );
         fake.set_row(&pods, row);
     }
-    let app = launch(&cluster)?;
+    // On View, so that once these watches are open nothing else is still starting.
+    let options = AppOptions::new(&cluster.kubeconfig).settings("watch_mode = \"on_view\"\n");
+    let app = App::launch(options)?;
+    connect(&app, &cluster.context)?;
     app.open_view("pods")?;
     app.wait_for("/list/sync", Equals("live".into()))?;
     let total = GENERATED_PODS + FIXTURE_PODS;
     app.wait_for("/list/total", Equals(total.into()))?;
+    wait_for_watches(fake, &["pods", "namespaces", "customresourcedefinitions"])?;
 
     // Searching thousands of objects sends the API server nothing.
-    let before = settled_arrivals(fake)?;
+    let before = fake.arrivals().len();
     app.press_key("secondary-p")?;
     app.wait_for("/palette/mode", Equals("resources".into()))?;
     app.type_text("generated-02999")?;
@@ -220,15 +232,31 @@ fn up_31_jump_to_a_resource() -> Result<()> {
     app.wait_for("/palette/query", Equals("".into()))?;
     app.type_text("crash-loop")?;
     app.wait_for("/palette/rows/0/label", Equals("demo/crash-loop".into()))?;
-    let after = settled_arrivals(fake)?;
-    assert_eq!(
-        after,
-        before,
-        "the search sent requests: {:?}",
-        &fake.arrivals()[before..]
-    );
+    app.press_key("escape")?;
+    app.wait_for("/palette", Equals(Value::Null))?;
 
-    // Enter on an object opens its list with it selected and its details shown.
+    // Opening another list is the fence: by the time its watch is up, a request the search had
+    // sent has arrived, and the only new requests are that list's.
+    app.open_view("services")?;
+    app.wait_for("/list/kind", Equals("services".into()))?;
+    app.wait_for("/list/sync", Equals("live".into()))?;
+    wait_for_watches(fake, &["services"])?;
+    let arrivals = fake.arrivals();
+    let sent: Vec<_> = arrivals[before..]
+        .iter()
+        .filter(|r| !r.path.ends_with("/services"))
+        .collect();
+    assert!(sent.is_empty(), "the search sent requests: {sent:?}");
+
+    // Enter on an object from another list switches to its list, with it selected and its
+    // details shown. Watching every kind keeps the pods in memory while Services is open.
+    app.dispatch("workspace::WatchAllKinds", Value::Null)?;
+    wait_for_watches(fake, &["pods"])?;
+    app.press_key("secondary-p")?;
+    app.wait_for("/palette/mode", Equals("resources".into()))?;
+    app.type_text("crash-loop")?;
+    app.wait_for("/palette/rows/0/label", Equals("demo/crash-loop".into()))?;
+    assert_eq!(app.state()?["list"]["kind"], "services");
     app.press_key("enter")?;
     app.wait_for("/palette", Equals(Value::Null))?;
     app.wait_for("/list/kind", Equals("pods".into()))?;
