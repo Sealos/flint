@@ -30,6 +30,7 @@ use crate::settings::{Appearance, Settings, WatchMode};
 use crate::store::{Feed, KindSnapshot, SyncState};
 use crate::view::{self, ViewQuery};
 use crate::watch::HubRegistry;
+use crate::write::WriteError;
 
 /// What the core needs to start. Usually built from [`crate::bootstrap::Bootstrap`].
 #[derive(Debug, Clone)]
@@ -213,6 +214,12 @@ pub(crate) enum Request {
         cluster: ClusterId,
         pin: ContextPin,
         reply: oneshot::Sender<Result<(), WriteRefusal>>,
+    },
+    /// [`Self::CheckWriteGate`] for a write, which also needs the definition pinned at `pin`.
+    CheckWritePin {
+        cluster: ClusterId,
+        pin: ContextPin,
+        reply: oneshot::Sender<Result<(), WriteError>>,
     },
     /// Why a session opened on `cluster` at `pin` must end (the context was re-pointed or
     /// removed since), or `None`. Never contacts the server.
@@ -694,14 +701,27 @@ impl CoreHandle {
         }
     }
 
-    /// Whether a write may go out on `pin`: the context still names its server, confirmed, and
-    /// the gate allows changes there.
+    /// Whether a write may go out on `pin`: the context still names its server, confirmed, on
+    /// the pinned definition, and the gate allows changes there.
     pub(crate) fn check_write_pin(
         &self,
         cluster: &ClusterId,
         pin: ContextPin,
-    ) -> impl Future<Output = Result<(), WriteRefusal>> + Send + 'static {
-        launch_check(self.requests.clone(), cluster.clone(), pin)()
+    ) -> impl Future<Output = Result<(), WriteError>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let requests = self.requests.clone();
+        let cluster = cluster.clone();
+        async move {
+            requests
+                .send(Request::CheckWritePin {
+                    cluster,
+                    pin,
+                    reply,
+                })
+                .await
+                .map_err(|_| WriteRefusal::Stopped)?;
+            rx.await.unwrap_or(Err(WriteRefusal::Stopped.into()))
+        }
     }
 
     /// Runs `task` on the core's runtime, for callers on another executor. Dropping the returned

@@ -10,9 +10,12 @@
 //!   `resourceVersion`. A [`ReviewedEdit`] can only be made here, and is refused for any other
 //!   target.
 //! - A write is never retried: a conflict goes back to a new review.
+//! - A resource action rechecks the live object before it runs, and a different uid or GitOps
+//!   manager is a conflict.
 //!
 //! To add an action: a [`WriteProposal`] variant, a [`WriteAction`] variant, and an arm in
-//! `prepare` and in `execute`. Each request goes through `RequestGate::client`.
+//! `prepare` and in `execute`. Each request goes through `RequestGate::client`. The resource
+//! actions (delete, scale, restart, cordon, drain) are in `write_actions`.
 
 use std::future::Future;
 use std::time::Duration;
@@ -29,6 +32,8 @@ use crate::protection::WriteRefusal;
 use crate::read::{self, KindId, KindInfo};
 use crate::recheck::ContextPin;
 use crate::redact;
+use crate::write_actions;
+pub use crate::write_actions::{BlockedReason, DrainReport, ManagedPod, PodName};
 
 /// How long one request of a write may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,7 +66,25 @@ pub struct WriteTarget {
 #[non_exhaustive]
 pub enum WriteProposal {
     /// Replace the object with this YAML.
-    ApplyYaml { yaml: String },
+    ApplyYaml {
+        yaml: String,
+    },
+    Delete,
+    /// Set a workload's replicas. The review reads the count it changes from.
+    Scale {
+        to: u32,
+    },
+    /// Restart a Deployment's, DaemonSet's or StatefulSet's pods.
+    RolloutRestart,
+    Cordon,
+    Uncordon,
+    /// Cordon a node and evict its pods.
+    Drain {
+        /// Also evict pods with `emptyDir` volumes, whose data is lost.
+        delete_emptydir_data: bool,
+        /// Also evict pods no controller will recreate.
+        force: bool,
+    },
 }
 
 /// A reviewed change, ready to run.
@@ -69,6 +92,53 @@ pub enum WriteProposal {
 #[non_exhaustive]
 pub enum WriteAction {
     ApplyYaml(ReviewedEdit),
+    Resource(ReviewedAction),
+}
+
+impl WriteAction {
+    /// The connection definition this action was reviewed on.
+    fn pin(&self) -> &ContextPin {
+        match self {
+            WriteAction::ApplyYaml(edit) => &edit.pin,
+            WriteAction::Resource(action) => &action.pin,
+        }
+    }
+}
+
+/// A resource action as reviewed. Only a review makes one, and it holds what it was reviewed
+/// against.
+#[derive(Debug, Clone)]
+pub struct ReviewedAction {
+    bound: WriteTarget,
+    /// The connection definition it was reviewed on.
+    pin: ContextPin,
+    change: ResourceChange,
+    reviewed: write_actions::Reviewed,
+}
+
+impl ReviewedAction {
+    pub fn change(&self) -> &ResourceChange {
+        &self.change
+    }
+}
+
+/// What a reviewed resource action does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceChange {
+    Delete,
+    /// From the count the review read: another count by then is a conflict.
+    Scale {
+        from: u32,
+        to: u32,
+    },
+    RolloutRestart,
+    Cordon,
+    Uncordon,
+    Drain {
+        delete_emptydir_data: bool,
+        force: bool,
+    },
 }
 
 /// What [`CoreHandle::run_write`] runs.
@@ -76,8 +146,6 @@ pub enum WriteAction {
 pub struct WriteIntent {
     pub target: WriteTarget,
     pub action: WriteAction,
-    /// The connection definition the review ran on.
-    reviewed: ContextPin,
 }
 
 /// What a confirmation must say before a change.
@@ -86,6 +154,8 @@ pub struct WriteIntent {
 pub enum WriteWarning {
     /// A GitOps controller manages the object and will likely put it back on its next sync.
     LikelyReverted(ManagedBy),
+    /// A drain would evict these pods, which GitOps controllers manage.
+    EvictsManaged(Vec<ManagedPod>),
 }
 
 /// The result of [`CoreHandle::review_write`]: the only thing a confirmation renders.
@@ -94,7 +164,6 @@ pub struct WriteReview {
     target: WriteTarget,
     action: WriteAction,
     warnings: Vec<WriteWarning>,
-    reviewed: ContextPin,
 }
 
 impl WriteReview {
@@ -116,7 +185,6 @@ impl WriteReview {
         WriteIntent {
             target: self.target,
             action: self.action,
-            reviewed: self.reviewed,
         }
     }
 }
@@ -126,6 +194,8 @@ impl WriteReview {
 #[derive(Clone)]
 pub struct ReviewedEdit {
     bound: WriteTarget,
+    /// The connection definition it was reviewed on.
+    pin: ContextPin,
     body: Value,
     before: String,
     after: String,
@@ -158,6 +228,8 @@ impl std::fmt::Debug for ReviewedEdit {
 pub struct WriteOutcome {
     /// The object's `resourceVersion` after the write, if it returned one.
     pub resource_version: Option<String>,
+    /// What a drain did, also when it stopped early.
+    pub drain: Option<DrainReport>,
 }
 
 /// Why a review or a write did not go through.
@@ -215,6 +287,11 @@ impl RequestGate {
         }
     }
 
+    /// The pin every request of this review went out on.
+    fn reviewed_pin(&self) -> Result<ContextPin, WriteError> {
+        self.pin.clone().ok_or(WriteRefusal::Stopped.into())
+    }
+
     /// A client for the next request. Call it again for every request: never keep the client.
     pub(crate) async fn client(&mut self) -> Result<Client, WriteError> {
         let (client, pin) = self
@@ -235,9 +312,6 @@ impl RequestGate {
         self.core
             .check_write_pin(&self.cluster, pin.clone())
             .await?;
-        if pin.provisional() {
-            return Err(WriteError::ConnectionChanged);
-        }
         self.pin = Some(pin);
         Ok(client.into_client())
     }
@@ -259,14 +333,17 @@ impl CoreHandle {
             let client = gate.client().await?;
             let live = read_live(&client, &kind, &target).await?;
             let target = bound_to_live(target, &live)?;
-            let warnings = warnings_for(&live);
+            let mut warnings = warnings_for(&live);
             let action = prepare(&mut gate, &kind, &target, &live, proposal).await?;
-            let reviewed = gate.pin.take().ok_or(WriteRefusal::Stopped)?;
+            if let WriteAction::Resource(action) = &action
+                && !action.reviewed.pods.is_empty()
+            {
+                warnings.push(WriteWarning::EvictsManaged(action.reviewed.pods.clone()));
+            }
             Ok(WriteReview {
                 target,
                 action,
                 warnings,
-                reviewed,
             })
         });
         async move { task.await.unwrap_or(Err(WriteRefusal::Stopped.into())) }
@@ -282,7 +359,7 @@ impl CoreHandle {
         let task = self.on_runtime(async move {
             check_bound(&intent)?;
             let mut gate = RequestGate::new(core.clone(), &intent.target);
-            gate.pin = Some(intent.reviewed.clone());
+            gate.pin = Some(intent.action.pin().clone());
             let kind = kind_of(&core, &intent.target).await?;
             execute(&mut gate, &kind, intent).await
         });
@@ -297,7 +374,7 @@ async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, Wr
         .ok_or_else(|| WriteError::NotServed(target.kind.clone()))
 }
 
-async fn read_live(
+pub(crate) async fn read_live(
     client: &Client,
     kind: &KindInfo,
     target: &WriteTarget,
@@ -371,7 +448,8 @@ fn warnings_for(live: &Value) -> Vec<WriteWarning> {
 fn check_bound(intent: &WriteIntent) -> Result<(), WriteError> {
     match &intent.action {
         WriteAction::ApplyYaml(edit) if edit.bound == intent.target => Ok(()),
-        WriteAction::ApplyYaml(_) => Err(WriteError::ReviewMismatch),
+        WriteAction::Resource(action) if action.bound == intent.target => Ok(()),
+        WriteAction::ApplyYaml(_) | WriteAction::Resource(_) => Err(WriteError::ReviewMismatch),
     }
 }
 
@@ -393,9 +471,20 @@ async fn prepare(
             let result = with_type_of(result, &body);
             Ok(WriteAction::ApplyYaml(ReviewedEdit {
                 bound: target.clone(),
+                pin: gate.reviewed_pin()?,
                 before: shown_yaml(live)?,
                 after: shown_after(live, &result)?,
                 body,
+            }))
+        }
+        proposal => {
+            let change = write_actions::review(kind, live, proposal)?;
+            let reviewed = write_actions::reviewed(gate, &target.name, live, &change).await?;
+            Ok(WriteAction::Resource(ReviewedAction {
+                bound: target.clone(),
+                pin: gate.reviewed_pin()?,
+                change,
+                reviewed,
             }))
         }
     }
@@ -412,7 +501,18 @@ async fn execute(
             let written = replace(&client, kind, &intent.target, &edit.body, false).await?;
             Ok(WriteOutcome {
                 resource_version: written.metadata.resource_version,
+                drain: None,
             })
+        }
+        WriteAction::Resource(action) => {
+            write_actions::run(
+                gate,
+                kind,
+                &intent.target,
+                action.change(),
+                &action.reviewed,
+            )
+            .await
         }
     }
 }

@@ -84,18 +84,10 @@ pub(crate) struct ContextPin {
     gate: u64,
     /// [`Record::definition`] when pinned. A write compares it with the one it was reviewed on.
     definition: Option<u64>,
-    /// [`Record::provisional`] when pinned.
-    provisional: bool,
     server: Option<String>,
 }
 
 impl ContextPin {
-    /// Whether the definition behind this pin may change once an unreadable file loads. No write
-    /// goes out on one.
-    pub fn provisional(&self) -> bool {
-        self.provisional
-    }
-
     /// The API server the session's client was built for.
     pub fn server(&self) -> Option<&str> {
         self.server.as_deref()
@@ -334,7 +326,6 @@ impl ContextHistory {
             endpoint,
             gate: record.map_or(0, |r| r.gate),
             definition: record.and_then(|r| r.definition),
-            provisional: record.is_none_or(|r| r.provisional),
             server: server.map(str::to_owned),
         }
     }
@@ -345,6 +336,14 @@ impl ContextHistory {
         self.records
             .get(context)
             .is_some_and(|r| r.gate != pin.gate)
+    }
+
+    /// Whether a write may go out on `pin`: the context's definition is the pinned one, and no
+    /// file that can't be read could change it.
+    pub fn definition_holds(&self, context: &str, pin: &ContextPin) -> bool {
+        self.records
+            .get(context)
+            .is_some_and(|r| r.present && !r.provisional && r.definition == pin.definition)
     }
 
     /// Whether `context`'s recorded server is the exact URL `pin` was taken for. Only says how to
@@ -666,20 +665,43 @@ mod tests {
         let mut h = ContextHistory::default();
         h.record(&on_user(load(&[("dev", STAGING, "a")], &[]), "b"));
         let pin = h.pin("dev", STAGING);
-        assert!(!pin.provisional());
+        assert!(h.definition_holds("dev", &pin));
 
         h.record(&on_user(load(&[("dev", STAGING, "a")], &["b"]), "c"));
-        assert!(h.pin("dev", STAGING).provisional());
+        assert!(!h.definition_holds("dev", &pin));
         assert_eq!(h.check(Pinned::Shell, "dev", &pin), None, "still running");
 
         let mut missing = load(&[("dev", STAGING, "a")], &["b"]);
         missing.contexts[0].user = Some("me".to_owned());
         h.record(&missing);
-        assert!(h.pin("dev", STAGING).provisional(), "may be in `b`");
+        assert!(!h.definition_holds("dev", &pin), "may be in `b`");
 
         h.record(&on_user(load(&[("dev", STAGING, "a")], &[]), "b"));
-        assert!(!h.pin("dev", STAGING).provisional());
+        assert!(h.definition_holds("dev", &pin));
         assert_eq!(h.pin("dev", STAGING), pin);
+    }
+
+    // covers UP-54: a pin holds only for the definition it was taken on, while a running session
+    // on the same server goes on.
+    #[test]
+    fn a_changed_user_entry_no_longer_holds() {
+        let with_token = |token: &str| {
+            let mut loaded = load(&[("dev", STAGING, "a")], &[]);
+            loaded.merged = kube::config::Kubeconfig::from_yaml(&format!(
+                "contexts:\n- name: dev\n  context:\n    cluster: c\n    user: u\n\
+                 users:\n- name: u\n  user:\n    token: {token}\n"
+            ))
+            .unwrap();
+            loaded
+        };
+        let mut h = ContextHistory::default();
+        h.record(&with_token("one"));
+        let pin = h.pin("dev", STAGING);
+        assert!(h.definition_holds("dev", &pin));
+        h.record(&with_token("two"));
+        assert!(!h.definition_holds("dev", &pin));
+        assert_ne!(h.pin("dev", STAGING), pin);
+        assert_eq!(h.check(Pinned::Shell, "dev", &pin), None);
     }
 
     // covers UP-06: a cluster entry no file defines, while a file failed, may be in that file.

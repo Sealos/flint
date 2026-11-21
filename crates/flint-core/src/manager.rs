@@ -27,6 +27,7 @@ use crate::recheck::{ContextHistory, ContextPin, Pinned};
 use crate::settings::{self, AiScope, Settings, server_identity};
 use crate::store::{KindSnapshot, SyncState};
 use crate::watch::{ClusterWatches, EngineConfig, HubRegistry, KubeSource};
+use crate::write::WriteError;
 
 /// Changes to watched files often come in bursts (editor save, `kind` rewriting the file).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -522,6 +523,13 @@ impl ClusterManager {
                 reply,
             } => {
                 let _ = reply.send(self.launch_gate(&cluster, &pin));
+            }
+            Request::CheckWritePin {
+                cluster,
+                pin,
+                reply,
+            } => {
+                let _ = reply.send(self.write_pin_gate(&cluster, &pin));
             }
             Request::CheckContext {
                 cluster,
@@ -1182,6 +1190,17 @@ impl ClusterManager {
             });
         }
         self.gate_for_server(cluster, pin.server()).map(drop)
+    }
+
+    /// [`Self::launch_gate`] for a write, in one step with checking the definition it is pinned
+    /// to is still the current one and certain.
+    fn write_pin_gate(&self, cluster: &str, pin: &ContextPin) -> Result<(), WriteError> {
+        self.launch_gate(cluster, pin)?;
+        if self.contexts.definition_holds(cluster, pin) {
+            Ok(())
+        } else {
+            Err(WriteError::ConnectionChanged)
+        }
     }
 
     /// `cluster`'s protection for `server`, if it allows changes.

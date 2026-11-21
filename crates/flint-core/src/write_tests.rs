@@ -107,6 +107,7 @@ fn a_review_binds_to_the_live_object() {
 fn reviewed() -> ReviewedEdit {
     ReviewedEdit {
         bound: target(),
+        pin: crate::recheck::ContextHistory::default().pin("dev", None),
         body: json!({"data": {"password": "aHVudGVyMg=="}}),
         before: String::new(),
         after: String::new(),
@@ -118,7 +119,6 @@ fn a_review_is_refused_for_any_other_target() {
     let intent = |target| WriteIntent {
         target,
         action: WriteAction::ApplyYaml(reviewed()),
-        reviewed: crate::recheck::ContextHistory::default().pin("dev", None),
     };
     assert_eq!(check_bound(&intent(target())), Ok(()));
     let others = [
