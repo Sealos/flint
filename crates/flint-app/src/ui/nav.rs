@@ -76,7 +76,9 @@ pub enum Marker {
 pub fn marker(state: &SyncState) -> Option<Marker> {
     match state {
         SyncState::Loading => Some(Marker::Loading),
-        SyncState::Reconnecting { .. } => Some(Marker::Reconnecting),
+        SyncState::Reconnecting { .. } | SyncState::RetryingRefusal { .. } => {
+            Some(Marker::Reconnecting)
+        }
         SyncState::Failed { .. } => Some(Marker::Failed),
         SyncState::Idle | SyncState::Synced | SyncState::Unavailable => None,
     }
@@ -257,6 +259,7 @@ impl NavPanel {
                 Some(e) => format!("reconnecting: {e}"),
                 None => "reconnecting".to_owned(),
             },
+            Some(SyncState::RetryingRefusal { error }) => format!("reconnecting: {error}"),
             Some(SyncState::Failed { error }) => format!("failed: {error}"),
             Some(SyncState::Unavailable) => "unavailable".to_owned(),
         };
