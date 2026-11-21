@@ -1101,7 +1101,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_container_that_has_not_started_is_waited_for() {
         let not_started = || {
-            Step::Opened(Err(LogError::retry(
+            Step::Opened(Err(LogError::not_started(
                 "BadRequest: container \"app\" in pod \"p\" is waiting to start: image can't be \
                  pulled",
             )))
