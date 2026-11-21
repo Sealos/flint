@@ -58,6 +58,12 @@ pub struct Options {
     /// it, as an `InternalError` status on the error channel. See `exec`'s module docs for
     /// which clusters do which.
     pub kubelet_websockets: bool,
+    /// Whether a `POST` to a collection creates the object. Off by default: the server then
+    /// answers it with a 405.
+    pub accept_creates: bool,
+    /// Serves no metrics.k8s.io: it is gone from discovery and its paths answer 404, as on a
+    /// cluster without metrics-server.
+    pub no_metrics: bool,
 }
 
 impl Default for Options {
@@ -68,6 +74,8 @@ impl Default for Options {
             now: SystemTime::now(),
             plain_only: Vec::new(),
             kubelet_websockets: true,
+            accept_creates: false,
+            no_metrics: false,
         }
     }
 }
@@ -111,6 +119,49 @@ impl std::fmt::Display for RequestRecord {
     }
 }
 
+/// One mutating request (`POST`, `PUT`, `PATCH` or `DELETE`) as the client sent it, whether or
+/// not it was refused. Exec requests are not writes.
+#[derive(Debug, Clone)]
+pub struct WriteRecord {
+    pub method: Method,
+    pub path: String,
+    /// The raw query string.
+    pub query: String,
+    /// The `Content-Type` header, empty if none.
+    pub content_type: String,
+    /// The request body, byte for byte.
+    pub body: Bytes,
+    /// `None` until answered, and for good when the connection was dropped instead.
+    pub status: Option<u16>,
+    /// The connection it came on ([`RequestRecord::connection`]).
+    pub connection: u64,
+}
+
+impl WriteRecord {
+    pub fn parsed_query(&self) -> Query {
+        Query::parse(Some(&self.query))
+    }
+
+    /// Whether it was sent with `dryRun=All`, in the query or in its delete options.
+    pub fn is_dry_run(&self) -> bool {
+        self.parsed_query().dry_run
+            || self.json().is_some_and(|body| {
+                writes::delete_options(&self.method, &Route::parse(&self.path), &body)
+                    .is_some_and(writes::asks_dry_run)
+            })
+    }
+
+    /// The body as JSON, if it is.
+    pub fn json(&self) -> Option<Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
+
+    /// Whether this write was about `gvr` (in any namespace).
+    pub fn is_about(&self, gvr: &Gvr) -> bool {
+        Route::parse(&self.path).gvr() == Some(gvr)
+    }
+}
+
 struct Watcher {
     tx: mpsc::UnboundedSender<Outgoing>,
 }
@@ -133,6 +184,10 @@ struct Inner {
     requests: Mutex<Vec<RequestRecord>>,
     /// Every request as it arrived, before faults or answers: what the app sent, and when.
     arrivals: Mutex<Vec<RequestRecord>>,
+    /// Every write as it arrived, with its body; its status is set when it is answered.
+    writes: Mutex<Vec<WriteRecord>>,
+    /// Metrics samples queued per target. Locked after `state` when both are needed.
+    metrics: Mutex<metrics::Sequences>,
     /// Requests whose handler is running: answered or not yet, before their response (a
     /// stream's body is not counted). A client that gives up on a request closes its connection,
     /// which ends the handler ([`FakeApiServer::requests_in_flight`]).
@@ -284,6 +339,8 @@ impl FakeApiServer {
             watchers: Mutex::default(),
             requests: Mutex::default(),
             arrivals: Mutex::default(),
+            writes: Mutex::default(),
+            metrics: Mutex::default(),
             in_flight: AtomicUsize::new(0),
             connections: AtomicU64::new(0),
             accepted: Mutex::default(),
@@ -585,6 +642,12 @@ impl FakeApiServer {
         lock(&self.inner.arrivals).clone()
     }
 
+    /// Every write that has arrived so far, oldest first, with its body, including those
+    /// refused by a fault and those not answered yet (their `status` is `None`).
+    pub fn writes(&self) -> Vec<WriteRecord> {
+        lock(&self.inner.writes).clone()
+    }
+
     fn last_requests(&self, n: usize) -> String {
         let requests = lock(&self.inner.requests);
         requests[requests.len().saturating_sub(n)..]
@@ -724,7 +787,19 @@ async fn handle(
     lock(&inner.arrivals).push(record.clone());
     let _in_flight = InFlight::enter(&inner);
     let upgrade = remote::is_websocket_upgrade(req.headers());
-    let effect = lock(&inner.faults).take(verb, &route, upgrade);
+    let is_write = writes::is_write(req.method(), &route, upgrade);
+    // Before the body is awaited: a slow upload keeps its place for a counted fault.
+    let effect = lock(&inner.faults).take(verb, &route, upgrade, is_write);
+    let mut write_index = None;
+    let call = if is_write {
+        let write = writes::read(req).await;
+        if let Ok(write) = &write {
+            write_index = Some(record_write(&inner, &record, write));
+        }
+        Call::Write(write)
+    } else {
+        Call::Read(req)
+    };
     let response = match effect {
         Some(Effect::DropConnection) => {
             lock(&inner.requests).push(record);
@@ -746,6 +821,10 @@ async fn handle(
             reason(code),
             format!("injected fault: {code}"),
         )),
+        Some(Effect::Conflict) => error(&faults::conflict(&route)),
+        Some(Effect::AdmissionDenied { webhook, message }) => {
+            error(&faults::admission_denied(&webhook, &message))
+        }
         Some(Effect::DisruptionBudget) => {
             let mut refused = ApiError::new(
                 429,
@@ -760,46 +839,67 @@ async fn handle(
         }
         Some(Effect::Delay(delay)) => {
             tokio::time::sleep(delay).await;
-            serve_or_put(&inner, req, upgrade, &route, verb, &query, &accept).await
+            answer(&inner, call, upgrade, &route, verb, &query, &accept)
         }
-        Some(Effect::StripUpgrade) => {
-            serve_or_put(&inner, req, false, &route, verb, &query, &accept).await
-        }
-        None => serve_or_put(&inner, req, upgrade, &route, verb, &query, &accept).await,
+        Some(Effect::StripUpgrade) => answer(&inner, call, false, &route, verb, &query, &accept),
+        None => answer(&inner, call, upgrade, &route, verb, &query, &accept),
     };
-    record.status = Some(response.status().as_u16());
+    let status = response.status().as_u16();
+    if let Some(index) = write_index {
+        lock(&inner.writes)[index].status = Some(status);
+    }
+    record.status = Some(status);
     lock(&inner.requests).push(record);
     Ok(response)
 }
 
-/// A `PUT` of an object replaces it; anything else is [`serve`]d.
-async fn serve_or_put(
+/// A request on its way to its answer: a write's body has been read, to record it.
+enum Call {
+    Read(Request<Incoming>),
+    Write(Result<writes::WriteRequest, ApiError>),
+}
+
+/// Records a write and returns its index in [`Inner::writes`].
+fn record_write(inner: &Inner, request: &RequestRecord, write: &writes::WriteRequest) -> usize {
+    let mut records = lock(&inner.writes);
+    records.push(WriteRecord {
+        method: request.method.clone(),
+        path: request.path.clone(),
+        query: request.query.clone(),
+        content_type: write.content_type.clone(),
+        body: write.body.clone(),
+        status: None,
+        connection: request.connection,
+    });
+    records.len() - 1
+}
+
+/// Answers a request: the writes the server knows change the state, anything else is
+/// [`serve`]d.
+fn answer(
     inner: &Arc<Inner>,
-    req: Request<Incoming>,
+    call: Call,
     upgrade: bool,
     route: &Route,
     verb: Verb,
     query: &Query,
     accept: &str,
 ) -> Response<Body> {
-    if writes::handles(req.method(), route) {
-        return writes::serve(inner, req, route)
-            .await
-            .unwrap_or_else(|e| error(&e));
+    match call {
+        Call::Read(req) => serve(inner, req, upgrade, route, verb, query, accept),
+        Call::Write(Err(e)) => error(&e),
+        Call::Write(Ok(write)) if writes::handles(inner, &write.method, route) => {
+            writes::serve(inner, &write, route, query).unwrap_or_else(|e| error(&e))
+        }
+        Call::Write(Ok(write)) => respond(inner, &write.method, route, verb, query, accept),
     }
-    if req.method() == Method::PUT && matches!(route, Route::Object { .. }) {
-        return put_object(inner, req, route, query)
-            .await
-            .unwrap_or_else(|e| error(&e));
-    }
-    serve(inner, req, upgrade, route, verb, query, accept)
 }
 
 /// Replaces an object as the API server does: the body's `uid` and `resourceVersion`, when set,
 /// must be the live ones (a 409 otherwise); with `dryRun=All` nothing is stored. Watches are told.
-async fn put_object(
+fn put_object(
     inner: &Arc<Inner>,
-    req: Request<Incoming>,
+    write: &writes::WriteRequest,
     route: &Route,
     query: &Query,
 ) -> Result<Response<Body>, ApiError> {
@@ -813,13 +913,7 @@ async fn put_object(
     };
     let ns = namespace.as_deref();
     known(inner, gvr, ns)?;
-    let bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?
-        .to_bytes();
-    let mut object: Value = serde_json::from_slice(&bytes)
+    let mut object: Value = serde_json::from_slice(&write.body)
         .map_err(|e| ApiError::new(400, "BadRequest", e.to_string()))?;
     let mut state = lock(&inner.state);
     let current = state.object(gvr, ns, name)?;
@@ -948,11 +1042,13 @@ fn respond(
         Route::DiscoveryCore | Route::DiscoveryGroups => {
             if accept.contains("as=APIGroupDiscoveryList") {
                 let body = if *route == Route::DiscoveryCore {
-                    &fixtures.discovery_core
+                    fixtures.discovery_core.clone()
+                } else if inner.options.no_metrics {
+                    metrics::without_metrics(&fixtures.discovery_groups)
                 } else {
-                    &fixtures.discovery_groups
+                    fixtures.discovery_groups.clone()
                 };
-                Ok(json_with(200, DISCOVERY_CONTENT_TYPE, body))
+                Ok(json_with(200, DISCOVERY_CONTENT_TYPE, &body))
             } else {
                 Err(ApiError::not_found(
                     "only aggregated discovery is recorded; ask for apidiscovery.k8s.io/v2",
@@ -993,8 +1089,13 @@ fn respond(
                         "sendInitialEvents: Forbidden: sendInitialEvents is forbidden for list",
                     ))
                 } else {
-                    let state = lock(&inner.state);
-                    let body = if table_for(gvr) {
+                    let table = table_for(gvr);
+                    if table {
+                        State::check_table_fields(query)?;
+                    }
+                    let mut state = lock(&inner.state);
+                    metrics::advance(&mut state, inner, route, query, table);
+                    let body = if table {
                         state.list_table(gvr, ns, query)
                     } else {
                         state.list_objects(gvr, ns, query)
@@ -1008,9 +1109,11 @@ fn respond(
             namespace,
             name,
         } => known(inner, gvr, namespace.as_deref()).and_then(|_| {
-            let state = lock(&inner.state);
+            let table = table_for(gvr);
+            let mut state = lock(&inner.state);
+            metrics::advance(&mut state, inner, route, &Query::default(), table);
             let ns = namespace.as_deref();
-            let body = if table_for(gvr) {
+            let body = if table {
                 state.table_object(gvr, ns, name)
             } else {
                 state.object(gvr, ns, name)
@@ -1072,6 +1175,7 @@ fn known<'a>(
         .resources
         .get(gvr)
         .filter(|r| r.namespaced || namespace.is_none())
+        .filter(|r| !(inner.options.no_metrics && metrics::is_metrics(&r.gvr)))
         .ok_or_else(|| ApiError::not_found("the server could not find the requested resource"))
 }
 
@@ -1213,6 +1317,14 @@ mod execs;
 #[path = "server_writes.rs"]
 mod writes;
 
+#[path = "server_metrics.rs"]
+mod metrics;
+pub use metrics::{MetricsSample, MetricsTarget};
+
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "server_writes_tests.rs"]
+mod writes_tests;
