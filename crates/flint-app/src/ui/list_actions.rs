@@ -5,8 +5,8 @@
 use gpui_kit::*;
 
 use super::super::registry::{
-    ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, SelectFirst, SelectLast,
-    SelectNext, SelectPrev, SelectRow, SortBy, ToggleWide,
+    ActionError, Bind, CloseDetail, FocusFilter, FocusRows, OnView, SelectFirst, SelectFromFilter,
+    SelectLast, SelectNext, SelectPrev, SelectRow, SortBy, ToggleWide,
 };
 use super::{ResourceList, find_row, list_model};
 
@@ -23,6 +23,7 @@ impl ResourceList {
             .bind::<ToggleWide>(Self::toggle_wide)
             .bind::<FocusFilter>(Self::focus_filter)
             .bind::<FocusRows>(Self::focus_rows)
+            .bind::<SelectFromFilter>(Self::select_from_filter)
     }
 
     pub(super) fn register_actions<E: InteractiveElement>(element: E, cx: &Context<Self>) -> E {
@@ -124,6 +125,21 @@ impl ResourceList {
     /// Back to the rows from the filter; the filter keeps its text.
     fn focus_rows(&mut self, _: &FocusRows, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Down in the filter: back to the rows, on the first one if nothing is selected or waiting
+    /// to be. A selection the filter hides stays selected.
+    fn select_from_filter(
+        &mut self,
+        _: &SelectFromFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        if self.selected.is_none() && self.pending_select.is_none() {
+            self.select_index(0, window, cx);
+        }
         cx.notify();
     }
 }
