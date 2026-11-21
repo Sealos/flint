@@ -1,5 +1,8 @@
 # Keep recently used clusters warm
 
+**Not scheduled before 1.0** (#247, after 1.0). Cluster sets ([ADR-0014](./0014-cluster-sets-and-combined-views.md))
+come first and work without warm clusters.
+
 This amends [ADR-0008](./0008-watch-everything-on-active-cluster.md). It replaces the rule that a cluster drops its
 watches as soon as it stops being active. Everything else in 0008 stays: the watch modes, and one active cluster in
 view at a time.
@@ -50,7 +53,7 @@ So a small warm cluster adds about 12 MiB, and the default of 3 costs about 24 M
 clusters. The cost per row grows with labels and cell text, so large clusters cost more. The 128 MiB budget caps the
 background clusters whatever their size.
 
-The target for CPU is under 1% of one core with 3 idle warm clusters. Before M5.5 ships, the estimate is checked
+The target for CPU is under 1% of one core with 3 idle warm clusters. Before warm clusters roll out, the estimate is checked
 against RSS with 1, 3 and 5 warm clusters at 10,000 and 50,000 pods (simulated with kwok), and the multiplier is
 set from those numbers.
 

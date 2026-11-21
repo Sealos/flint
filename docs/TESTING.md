@@ -654,12 +654,18 @@ milestone T; feature tests are in their feature's milestone.
   10,000 pods, nightly (UP-26, #133); Close Window in the app (UP-42: the app under test has no active window, so
   the action does nothing there; view tests cover it) and an exit observed apart from `App::quit` (#174).
 - **Later milestones:** M3 editing, actions and protection (#134); M4 views, metrics, diagram, dashboard and
-  `get_cluster_summary` (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log and
-  Claude analysis (#137), warm clusters and cluster sets (#138); M6 Homebrew cask smoke (#139).
+  `get_cluster_summary` (#135); M5 port-forward and Helm on kind (#136); M5.5 MCP scope, redaction, activity log
+  (#137) and cluster sets (#138), with warm clusters and Claude analysis not scheduled; M6 Homebrew cask smoke (#139).
+
+### v0.7: fleet actions
+
+UP-100 and UP-101 are release requirements for v0.7: the dry-run diff per cluster, the typed-name confirmation for
+locked clusters, and stopping at the first failure with a report of which clusters were done are each covered by a
+unit test (sequencing) and an e2e test on the fake API.
 
 ### P2
 
-Fleet actions (UP-100, UP-101), recordings (UP-110 to UP-116), a clipboard and save-path hook for automation, a fake
+Recordings (UP-110 to UP-116), a clipboard and save-path hook for automation, a fake
 port-forward, and a spike on running app e2e on Linux (with the AppImage's GPUI backend under Xvfb) so kind-backed
 app tests get cheap runners.
 

@@ -14,13 +14,14 @@ in [`docs/adr/`](./adr/). The journeys every release must keep working, with sta
 
 - macOS first ([ADR-0001](./adr/0001-rust-and-gpui.md)), plus a best-effort Linux AppImage for x86_64 and aarch64
   ([ADR-0016](./adr/0016-linux-appimage.md)). The core stays portable so Windows can follow.
-- Multiple clusters, loaded from the user's kubeconfig files, shown in one window with a cluster sidebar. The
-  clusters used most recently stay warm, so switching between them is instant
-  ([ADR-0012](./adr/0012-keep-recently-used-clusters-warm.md)).
+- Multiple clusters, loaded from the user's kubeconfig files, shown in one window with a cluster sidebar. Cluster
+  sets combine 2 to 5 of them in one view ([ADR-0014](./adr/0014-cluster-sets-and-combined-views.md)). Keeping
+  recently used clusters warm for instant switching is planned after 1.0
+  ([ADR-0012](./adr/0012-keep-recently-used-clusters-warm.md), #247).
 - Browse every resource kind, including CRDs, with live updates ([ADR-0003](./adr/0003-generic-resource-views.md)).
 - Pod logs: follow, search, pick a container, show previous logs, toggle timestamps, and highlight errors and
   warnings.
-- AI log analysis: send selected log lines, redacted, to the user's own Claude Code CLI (`claude`) and read the
+- AI log analysis (not scheduled): send selected log lines, redacted, to the user's own Claude Code CLI (`claude`) and read the
   answer in a side panel ([ADR-0011](./adr/0011-ai-log-analysis-through-local-cli.md)).
 - Pod exec terminal.
 - Edit YAML in the app. Syntax and schema errors show inline as you type, and a server-side dry-run with a diff runs
@@ -161,7 +162,7 @@ CLI or a different UI later. And if GPUI ever has to be replaced, the work is li
   The read stops when the pane that asked for it closes or moves to another row (its reply is dropped), so stepping
   through rows on a stalled server does not leave reads, their connections and the objects they hold behind (#258).
 - One window shows a cluster sidebar. Exactly one cluster is **active**, meaning the one in view.
-- The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
+- Planned after 1.0 (#247). The last N clusters the user selected (`warm_clusters`, default 3, counting the active one) stay **warm**: connected,
   with their watches running in the background, so switching to them is instant. The least recently used is made
   **cold** when the set is full, when the stores of the background clusters (not the active one) go over
   `warm_memory_mib` (default 128), after 30 minutes unused, or when the Mac sleeps. A cold cluster keeps its client
@@ -476,6 +477,8 @@ history is not taken for a quiet pod (#254).
     watcher keeps its client across re-watches, so a following session also rechecks its context every 30 s.
 
 ### AI log analysis
+
+Not scheduled: no release on the roadmap includes it. This is the design for when it is.
 
 The log viewer has an **Analyze with Claude** button. A palette action with a shortcut does the same. `claude` is
 found on the resolved `PATH` (relative and empty entries ignored) or set in `settings.toml`. If it is not found, the
@@ -1212,9 +1215,9 @@ helps (names, YAML, logs). The keyboard is a primary way to use the app.
 | M3 | YAML editing with inline syntax and schema validation, dry-run and diff, delete/scale/restart/cordon/drain, clusters protected by default |
 | M4 | Curated views for core kinds, metrics-server columns and node/pod usage, resource diagram, cluster dashboard with thresholds and `get_cluster_summary` |
 | M5 | Port-forward panel with local ports and open in browser, Helm releases |
-| M5.5 | Multi-cluster and AI: warm clusters for instant switching, cluster sets (super mode) combining 2 to 5 clusters in one view with named sets, colour tags and a set dashboard, AI log analysis through the user's Claude Code CLI |
+| M5.5 | Multi-cluster and AI (history). Cluster sets (super mode), named sets, colour tags and a set dashboard are now scheduled across v0.5 and v0.6. Warm clusters are after 1.0 (#247). AI log analysis is not scheduled |
 | M6 | Universal (arm64 + x86_64) build, signing with hardened runtime, signed DMG, notarization and stapling, Homebrew cask, first public release |
-| M7 | Fleet actions on a cluster set: rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
+| M7 | Fleet actions on a cluster set (v0.7): rollout restart, scale, apply YAML and delete, with a per-cluster dry-run preview, one cluster at a time, stopping at the first failure |
 | M8 | Recordings: background capture of a workload's logs, events and metrics into SQLite, automatic recording on trouble, a timeline view, MCP access and export |
 
 ## Risks
