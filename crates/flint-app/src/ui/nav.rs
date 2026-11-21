@@ -169,12 +169,18 @@ impl NavPanel {
         }
     }
 
-    pub fn set_states(&mut self, states: Vec<(KindId, SyncState)>, cx: &mut Context<Self>) {
+    pub fn states(&self) -> &HashMap<KindId, SyncState> {
+        &self.states
+    }
+
+    pub fn set_states(&mut self, states: Vec<(KindId, SyncState)>, cx: &mut Context<Self>) -> bool {
         let states: HashMap<KindId, SyncState> = states.into_iter().collect();
-        if states != self.states {
-            self.states = states;
-            cx.notify();
+        if states == self.states {
+            return false;
         }
+        self.states = states;
+        cx.notify();
+        true
     }
 
     pub fn set_selected(&mut self, kind: Option<KindId>, cx: &mut Context<Self>) {
