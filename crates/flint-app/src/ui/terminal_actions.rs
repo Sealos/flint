@@ -2,6 +2,7 @@
 //! the workspace's guards share with them. The toolbar's buttons dispatch these actions; mouse
 //! selection and keystrokes for the shell are not actions (they are the program's input).
 
+use flint_core::exec::{BracketedPaste, ConfirmedPaste, ShellAttempt};
 use gpui_kit::component::input;
 use gpui_kit::*;
 
@@ -9,7 +10,7 @@ use super::super::registry::{
     ActionError, Bind, CopyText, OnView, PasteText, ScrollPageDown, ScrollPageUp, ScrollToBottom,
     ScrollToTop, SelectText,
 };
-use super::TerminalView;
+use super::{NoteKind, TerminalView};
 use crate::ui::confirm::{self, DialogText};
 use crate::ui::log_model::Tone;
 use crate::ui::terminal_model::{self, PasteCheck};
@@ -60,24 +61,27 @@ impl TerminalView {
                 cx.notify();
             }
             PasteCheck::Lines { lines } => {
+                let refusal_sequence = self.refusal_sequence;
                 let pasted = match self.session.paste_if_bracketed(text.clone()) {
-                    Ok(pasted) => {
-                        self.input_sent(Ok(()), true);
-                        pasted
-                    }
+                    Ok(pasted) => pasted,
                     Err(refused) => {
                         self.input_sent(Err(refused), true);
                         cx.notify();
                         return;
                     }
                 };
-                cx.spawn_in(window, async move |this, cx| {
-                    if pasted.await {
-                        return;
+                cx.spawn_in(window, async move |this, cx| match pasted.await {
+                    BracketedPaste::Pasted => {
+                        let _ = this.update(cx, |view, cx| {
+                            view.paste_sent(refusal_sequence, cx);
+                        });
                     }
-                    let _ = this.update_in(cx, |view, window, cx| {
-                        view.ask_to_paste(text, lines, window, cx)
-                    });
+                    BracketedPaste::Unbracketed(attempt) => {
+                        let _ = this.update_in(cx, |view, window, cx| {
+                            view.ask_to_paste(text, lines, attempt, window, cx);
+                        });
+                    }
+                    BracketedPaste::Discarded => {}
                 })
                 .detach();
             }
@@ -89,6 +93,7 @@ impl TerminalView {
         &mut self,
         text: String,
         lines: usize,
+        attempt: ShellAttempt,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -108,14 +113,48 @@ impl TerminalView {
         confirm::open(window, cx, dialog, move |_, cx| {
             let text = text.clone();
             let _ = view.update(cx, |view, cx| {
-                // The shell may have ended while the question was open.
-                if view.is_live() {
-                    let sent = view.session.paste(text);
-                    view.input_sent(sent, true);
-                    cx.notify();
-                }
+                view.paste_confirmed(text, attempt, cx);
             });
         });
+    }
+
+    fn paste_confirmed(&mut self, text: String, attempt: ShellAttempt, cx: &mut Context<Self>) {
+        if !self.is_live() {
+            return;
+        }
+        let refusal_sequence = self.refusal_sequence;
+        let pasted = match self.session.paste_confirmed(text, attempt) {
+            Ok(pasted) => pasted,
+            Err(refused) => {
+                self.input_sent(Err(refused), true);
+                cx.notify();
+                return;
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let result = pasted.await;
+            let _ = this.update(cx, |view, cx| match result {
+                ConfirmedPaste::Pasted => view.paste_sent(refusal_sequence, cx),
+                ConfirmedPaste::Discarded
+                    if view.is_live() && !view.session.peek().state.is_finished() =>
+                {
+                    view.set_shell_input_note(
+                        NoteKind::PasteDiscarded,
+                        "The shell changed and your paste was not sent. Paste it again.".into(),
+                    );
+                    cx.notify();
+                }
+                ConfirmedPaste::Discarded => {}
+            });
+        })
+        .detach();
+    }
+
+    fn paste_sent(&mut self, refusal_sequence: u64, cx: &mut Context<Self>) {
+        if self.refusal_sequence == refusal_sequence {
+            self.clear_input_refusal();
+            cx.notify();
+        }
     }
 
     /// Pastes the clipboard's text, if any, while the shell runs ([`TerminalView::paste`]).
