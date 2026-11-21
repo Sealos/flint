@@ -46,24 +46,28 @@ impl ResourceList {
         }
     }
 
-    /// [`SortBy`] takes a column drawn now: by its `key` ([`flint_core::Column::key`]) when
-    /// given, else by its header.
+    /// [`SortBy`] takes a column drawn now that is not masked: by its `key`
+    /// ([`flint_core::Column::key`]) when given, else by its header.
     pub(in crate::ui) fn check_sort(&self, action: &SortBy) -> Result<(), ActionError> {
         if self.sort_key(action).is_some() {
             Ok(())
         } else {
             Err(ActionError::rejected::<SortBy>(format!(
-                "no column {} is drawn",
+                "no sortable column {} is drawn",
                 action.key.as_deref().unwrap_or(&action.column)
             )))
         }
     }
 
-    /// The key of the drawn column `action` names: the one with its `key` when given, else the
-    /// first one headed `column`.
+    /// The key of the drawn, unmasked column `action` names: the one with its `key` when given,
+    /// else the first one headed `column`.
     pub(in crate::ui) fn sort_key(&self, action: &SortBy) -> Option<String> {
         let columns = &self.shown.columns;
-        let mut drawn = self.drawn.iter().map(|&(col, _)| &columns[col]);
+        let mut drawn = self
+            .drawn
+            .iter()
+            .map(|&(col, _)| &columns[col])
+            .filter(|c| !self.is_masked(c));
         let found = match &action.key {
             Some(key) => drawn.find(|c| c.key() == *key),
             None => drawn.find(|c| *c.name == *action.column),
@@ -71,11 +75,13 @@ impl ResourceList {
         found.map(|c| c.key())
     }
 
-    /// The names of the columns drawn, left to right: what [`SortBy`] takes.
+    /// The names of the unmasked columns drawn, left to right: what [`SortBy`] takes.
     pub(in crate::ui) fn drawn_column_names(&self) -> Vec<String> {
         self.drawn
             .iter()
-            .map(|&(col, _)| self.shown.columns[col].name.to_string())
+            .map(|&(col, _)| &self.shown.columns[col])
+            .filter(|c| !self.is_masked(c))
+            .map(|c| c.name.to_string())
             .collect()
     }
 

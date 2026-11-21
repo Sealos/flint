@@ -1,7 +1,7 @@
 //! The resource list's part of the visible view tree ([`crate::ui::view_state`]).
 // module-tests: list_tests.rs
 
-use flint_core::redact::is_safe_secret_column;
+use flint_core::redact::{is_masked_column, is_secret_list};
 use flint_core::table::unix_now;
 use flint_core::{Feed, ListFormat, SyncState};
 
@@ -30,7 +30,7 @@ impl ResourceList {
         } else {
             self.drawn.iter().map(|&(col, _)| col).collect()
         };
-        let secrets = self.kind.as_str() == "secrets";
+        let secrets = is_secret_list(self.kind.as_str());
         let selected = self.selected.as_ref().map(|s| &*s.uid);
         let now = unix_now();
         let rows = self
@@ -42,7 +42,7 @@ impl ResourceList {
                 let cells: Vec<String> = columns
                     .iter()
                     .map(|&col| {
-                        if secrets && !is_safe_secret_column(&snapshot.columns[col].name) {
+                        if is_masked_column(secrets, &snapshot.columns[col].name) {
                             MASK.to_owned()
                         } else {
                             cell_text(row, col, now).to_string()

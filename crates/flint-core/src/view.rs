@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 
+use crate::redact::{is_masked_column, is_secret_list};
 use crate::store::KindSnapshot;
 use crate::table::{Cell, Row};
 
@@ -12,6 +13,7 @@ pub struct ViewQuery {
     /// kinds.
     pub namespaces: Vec<String>,
     /// Case-insensitive substring of the name, namespace, any cell text, or a `key=value` label.
+    /// A Secret's masked columns are not searched.
     pub text: String,
     pub sort: Option<SortBy>,
 }
@@ -26,7 +28,8 @@ pub struct SortBy {
 }
 
 /// Indexes into `snapshot.rows` of the rows that pass `query`, in display order. Rows that tie
-/// on the sort column keep snapshot order (namespace, then name). `now` is Unix seconds.
+/// on the sort column keep snapshot order (namespace, then name). `now` is Unix seconds. A
+/// Secret's masked columns affect neither: sorting on one keeps snapshot order.
 pub fn compute(snapshot: &KindSnapshot, query: &ViewQuery, now: i64) -> Vec<u32> {
     let mut picked: Vec<u32> = if query.namespaces.is_empty() || !snapshot.namespaced {
         (0..snapshot.rows.len() as u32).collect()
@@ -40,11 +43,23 @@ pub fn compute(snapshot: &KindSnapshot, query: &ViewQuery, now: i64) -> Vec<u32>
         ranges.dedup();
         ranges.into_iter().flatten().map(|i| i as u32).collect()
     };
+    let secret = is_secret_list(snapshot.kind.as_str());
+    // A cell with no declared column has no name to allow, so a Secret's stays hidden.
+    let masked = |column: usize| {
+        secret
+            && snapshot
+                .columns
+                .get(column)
+                .is_none_or(|c| is_masked_column(secret, &c.name))
+    };
     let needle = query.text.trim().to_ascii_lowercase();
     if !needle.is_empty() {
-        picked.retain(|&i| matches_text(&snapshot.rows[i as usize], &needle, now));
+        picked.retain(|&i| matches_text(&snapshot.rows[i as usize], &needle, now, masked));
     }
-    if let Some(sort) = query.sort.filter(|s| s.column < snapshot.columns.len()) {
+    if let Some(sort) = query
+        .sort
+        .filter(|s| s.column < snapshot.columns.len() && !masked(s.column))
+    {
         picked.sort_by(|&a, &b| {
             let ord = compare_cells(
                 &snapshot.rows[a as usize],
@@ -58,7 +73,7 @@ pub fn compute(snapshot: &KindSnapshot, query: &ViewQuery, now: i64) -> Vec<u32>
     picked
 }
 
-fn matches_text(row: &Row, needle: &str, now: i64) -> bool {
+fn matches_text(row: &Row, needle: &str, now: i64, masked: impl Fn(usize) -> bool) -> bool {
     if contains_ignore_case(&row.name, needle)
         || row
             .namespace
@@ -68,6 +83,9 @@ fn matches_text(row: &Row, needle: &str, now: i64) -> bool {
         return true;
     }
     for (i, cell) in row.cells.iter().enumerate() {
+        if masked(i) {
+            continue;
+        }
         let hit = match cell {
             Cell::Text(s) => contains_ignore_case(s, needle),
             Cell::Int(_) | Cell::Float(_) | Cell::Bool(_) => {
@@ -228,6 +246,112 @@ mod tests {
         idx.iter()
             .map(|&i| s.rows[i as usize].name.to_string())
             .collect()
+    }
+
+    /// A list of `kind` with a `Token` printer column holding `values`, one row each, plus a cell
+    /// past the declared columns.
+    fn with_tokens(kind: crate::KindId, values: [&str; 3]) -> KindSnapshot {
+        let col = |n: &str, role| Column {
+            name: n.into(),
+            ty: ColumnType::String,
+            format: "".into(),
+            description: "".into(),
+            priority: 0,
+            role,
+        };
+        let rows = ["a", "b", "c"]
+            .into_iter()
+            .zip(values)
+            .map(|(name, value)| {
+                Arc::new(Row {
+                    uid: name.into(),
+                    name: name.into(),
+                    namespace: Some("ns".into()),
+                    resource_version: "1".into(),
+                    generation: None,
+                    created: Some(0),
+                    labels: Box::new([]),
+                    cells: vec![
+                        Cell::Name,
+                        Cell::Text("Opaque".into()),
+                        Cell::Text(value.into()),
+                        Cell::Text(format!("extra-{value}").into()),
+                    ]
+                    .into(),
+                })
+            })
+            .collect();
+        KindSnapshot {
+            kind,
+            namespaced: true,
+            columns: vec![
+                col("Name", ColumnRole::Name),
+                col("Type", ColumnRole::Value),
+                col("Token", ColumnRole::Value),
+            ]
+            .into(),
+            rows,
+            ..Default::default()
+        }
+    }
+
+    fn secrets(values: [&str; 3]) -> KindSnapshot {
+        with_tokens(crate::KindId::new("", "secrets"), values)
+    }
+
+    fn text(s: &KindSnapshot, needle: &str) -> Vec<String> {
+        let query = ViewQuery {
+            text: needle.into(),
+            ..Default::default()
+        };
+        names(s, &compute(s, &query, 0))
+    }
+
+    fn sorted(s: &KindSnapshot, column: usize, descending: bool) -> Vec<String> {
+        let query = ViewQuery {
+            sort: Some(SortBy { column, descending }),
+            ..Default::default()
+        };
+        names(s, &compute(s, &query, 0))
+    }
+
+    // covers UP-21: filtering must not reveal a masked Secret value one character at a time.
+    #[test]
+    fn a_text_filter_never_matches_a_masked_secret_value() {
+        let s = secrets(["hunter2", "swordfish", "letmein"]);
+        for needle in ["h", "hunter", "hunter2", "extra-hunter2"] {
+            assert!(text(&s, needle).is_empty(), "{needle} matched");
+        }
+        // What the list shows still matches.
+        assert_eq!(text(&s, "b"), ["b"]);
+        assert_eq!(text(&s, "opaque"), ["a", "b", "c"]);
+    }
+
+    // covers UP-21
+    #[test]
+    fn sorting_on_a_masked_secret_column_ignores_its_values() {
+        let ascending = secrets(["a-value", "b-value", "c-value"]);
+        let reversed = secrets(["c-value", "b-value", "a-value"]);
+        for descending in [false, true] {
+            assert_eq!(sorted(&ascending, 2, descending), ["a", "b", "c"]);
+            assert_eq!(sorted(&reversed, 2, descending), ["a", "b", "c"]);
+        }
+        // A shown column still sorts.
+        assert_eq!(sorted(&ascending, 0, true), ["c", "b", "a"]);
+    }
+
+    // covers UP-21: only the core Secret kind is masked.
+    #[test]
+    fn other_kinds_filter_and_sort_on_the_same_column() {
+        for kind in [
+            crate::KindId::pods(),
+            crate::KindId::new("example.com", "secrets"),
+        ] {
+            let s = with_tokens(kind, ["c-value", "b-value", "a-value"]);
+            assert_eq!(text(&s, "b-value"), ["b"]);
+            assert_eq!(text(&s, "extra-a-value"), ["c"]);
+            assert_eq!(sorted(&s, 2, false), ["c", "b", "a"]);
+        }
     }
 
     // covers UP-21
