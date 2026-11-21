@@ -47,8 +47,9 @@ pub type RowMenu = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) ->
 /// long context name and all that is said about it: reasons wrap ([`say`]).
 const MAX_REASON: usize = 200;
 
-/// How wide a reason is before it wraps: inside the menu's default width and padding.
-const REASON_WIDTH: Pixels = px(460.);
+/// How wide a reason is before it wraps: inside the menu's default 31.25 rem, at Flint's 15 px
+/// rem, less its padding.
+const REASON_WIDTH: Pixels = px(440.);
 
 /// The element holding a note's text ([`say`]), inside its menu item.
 pub(in crate::ui) const MENU_NOTE: &str = "row-menu-note";
