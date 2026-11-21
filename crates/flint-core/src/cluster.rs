@@ -567,6 +567,10 @@ fn http_connector() -> hyper_util::client::legacy::connect::HttpConnector {
 /// builder in [`connect`], before any exec plugin runs, which reports that proxies are not
 /// supported, as before. `token` is the refreshing
 /// token of an exec auth plugin ([`crate::auth_plugin::resolve`]), set after kube's auth layer.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the one place that assembles a client"
+)]
 fn build_client(
     config: &kube::Config,
     token: Option<crate::auth_plugin::TokenLayer>,
