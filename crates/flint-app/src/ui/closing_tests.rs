@@ -443,3 +443,42 @@ fn the_dialog_names_the_sessions_that_end() {
         "Enter cancels both"
     );
 }
+
+// The Window menu holds Minimize and Zoom above the closing items. The test window implements
+// neither, so this checks their place and does not dispatch them.
+#[gpui_kit::test]
+async fn the_window_and_help_menus_hold_the_standard_items(cx: &mut TestAppContext) {
+    use gpui_kit::OwnedMenuItem;
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(cx, dir.path()).await;
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let names = |menu: &str| -> Vec<String> {
+        let menu = menus.iter().find(|m| m.name == menu).unwrap();
+        menu.items
+            .iter()
+            .filter_map(|item| match item {
+                OwnedMenuItem::Action { action, .. } => Some(action.name().to_owned()),
+                OwnedMenuItem::SystemMenu(menu) => Some(menu.name.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        names("Window"),
+        [
+            "flint::MinimizeWindow",
+            "flint::ZoomWindow",
+            "dock::CloseActiveTab",
+            "flint::CloseWindow"
+        ]
+    );
+    assert_eq!(names("Help"), ["flint::OpenHelp"]);
+    assert!(names("Flint").contains(&"Services".to_owned()));
+
+    t.dispatch(cx, "flint::OpenHelp", Value::Null).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some(env!("CARGO_PKG_REPOSITORY"))
+    );
+}

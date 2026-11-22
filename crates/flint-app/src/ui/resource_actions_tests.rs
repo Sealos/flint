@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flint_core::{ConnectionState, Event, KindId, ObjectDetail, SyncState};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::input::InputEvent;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
@@ -289,6 +291,11 @@ struct Control {
     fail_pods: AtomicBool,
     /// Set by that cordon.
     pods_down: AtomicBool,
+    /// The body of each PATCH request.
+    patch_bodies: Mutex<Vec<Value>>,
+    /// Each PUT of `web`: whether it was a dry run, and the object sent. Answered with that
+    /// object, so a YAML edit has a change to review.
+    puts: Mutex<Vec<(bool, Value)>>,
 }
 
 #[derive(Default)]
@@ -388,7 +395,7 @@ fn serve(stream: TcpStream, control: &Control) {
             serve_watch(&mut stream, reader, query, control);
             return;
         }
-        let (status, answer) = answer(method, path, query, control);
+        let (status, answer) = answer(method, path, query, &body, control);
         let text = answer.to_string();
         let head = format!(
             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -428,7 +435,7 @@ fn serve_watch(
     control.watches.lock().unwrap().streams.remove(&peer);
 }
 
-fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Value) {
+fn answer(method: &str, path: &str, query: &str, body: &[u8], control: &Control) -> (u16, Value) {
     let resource = |name: &str, kind: &str, namespaced: bool| {
         json!({"name": name, "singularName": kind.to_lowercase(), "namespaced": namespaced,
                "kind": kind, "verbs": ["get", "list", "watch", "patch", "delete"]})
@@ -476,7 +483,21 @@ fn answer(method: &str, path: &str, query: &str, control: &Control) -> (u16, Val
                        "reason": "InternalError", "code": 500, "message": "pods unavailable"}),
             )
         }
+        ("PUT", WEB) => {
+            let sent: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let dry_run = query.contains("dryRun");
+            control.puts.lock().unwrap().push((dry_run, sent.clone()));
+            while control.hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (200, sent)
+        }
         ("PATCH", WEB | WEB_SCALE | NODE) => {
+            control
+                .patch_bodies
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(body).unwrap_or(Value::Null));
             control.patches.fetch_add(1, Ordering::SeqCst);
             if path == NODE && control.fail_pods.load(Ordering::SeqCst) {
                 control.pods_down.store(true, Ordering::SeqCst);
@@ -621,6 +642,176 @@ async fn a_conflict_opens_a_new_review(cx: &mut TestAppContext) {
     .await;
     draw(cx, &t);
     assert!(!t.has_dialog(cx));
+}
+
+/// The text field that has focus.
+fn focused_text(cx: &mut TestAppContext, t: &TestWorkspace) -> String {
+    cx.update_window(t.window, |_, window, cx| {
+        window.focused_input(cx).map(|input| input.value(cx))
+    })
+    .unwrap()
+    .expect("a focused text field")
+    .to_string()
+}
+
+fn edit_phase(cx: &mut TestAppContext, t: &TestWorkspace) -> Option<&'static str> {
+    let detail = t.detail(cx).unwrap();
+    detail.read_with(cx, |d, _| d.view_state().edit)
+}
+
+// Undo and redo in the scale dialog: the review, and the write it confirms, carry the count the
+// field held when Continue was pressed. Undo with the review open changes neither.
+#[gpui_kit::test]
+async fn undo_and_redo_in_the_scale_dialog_match_what_is_sent(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_deployments(cx, &t).await;
+    select_loaded(cx, &t, "web").await;
+    t.dispatch(cx, "workspace::ScaleObject", Value::Null)
+        .unwrap();
+    t.wait_for_element(cx, "scale-input").await;
+    draw(cx, &t);
+
+    t.press(cx, "secondary-a");
+    t.type_text(cx, "5");
+    assert_eq!(focused_text(cx, &t), "5");
+    t.press_key_of(cx, "input::Undo");
+    assert_eq!(focused_text(cx, &t), "2");
+    t.press_key_of(cx, "input::Redo");
+    assert_eq!(focused_text(cx, &t), "5");
+
+    t.click(cx, "ok");
+    wait_for_confirmation(cx, &t, "Replicas: 2 to 5.").await;
+    wait_for_one_ok(cx, &t).await;
+    t.press_key_of(cx, "input::Undo");
+    wait_for_confirmation(cx, &t, "Replicas: 2 to 5.").await;
+    assert_eq!(api.patches(), 0, "nothing ran yet");
+
+    t.click(cx, "ok");
+    let control = api.control.clone();
+    cx.wait_for(t.window, WAIT, move |_, _| {
+        control.patches.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    draw(cx, &t);
+    let bodies = api.control.patch_bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        bodies[0][1],
+        json!({"op": "test", "path": "/spec/replicas", "value": 2})
+    );
+    assert_eq!(
+        bodies[0][2],
+        json!({"op": "replace", "path": "/spec/replicas", "value": 5})
+    );
+}
+
+// Undo and redo work while editing and report the change. Once Review has the text, undo cannot
+// change the editor, and nothing done to the editor later changes what Apply sends.
+#[gpui_kit::test]
+async fn undo_cannot_change_a_reviewed_yaml_edit(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = LocalApi::start(&[]);
+    let t = connected(cx, dir.path(), &api).await;
+    open_deployments(cx, &t).await;
+    select_loaded(cx, &t, "web").await;
+    t.dispatch(cx, "detail::EditYaml", Value::Null).unwrap();
+    draw(cx, &t);
+    let editor = cx
+        .update_window(t.window, |_, window, cx| window.focused_input(cx))
+        .unwrap()
+        .and_then(|input| input.as_editor().cloned())
+        .expect("the YAML editor has focus");
+    let changes = Arc::new(AtomicUsize::new(0));
+    let counted = changes.clone();
+    cx.update(|cx| {
+        cx.subscribe(&editor, move |_, event: &InputEvent, _| {
+            if matches!(event, InputEvent::Change) {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .detach();
+    });
+
+    let original = editor.read_with(cx, |e, _| e.value().to_string());
+    let reviewed = original.replace("replicas: 2", "replicas: 5");
+    assert_ne!(reviewed, original);
+    let text = reviewed.clone();
+    cx.update_window(t.window, |_, window, cx| {
+        editor.update(cx, |e, cx| e.replace_all(text, window, cx));
+    })
+    .unwrap();
+    draw(cx, &t);
+
+    let before = changes.load(Ordering::SeqCst);
+    t.press_key_of(cx, "input::Undo");
+    assert_eq!(editor.read_with(cx, |e, _| e.value().to_string()), original);
+    assert_eq!(
+        changes.load(Ordering::SeqCst),
+        before + 1,
+        "undo reports it"
+    );
+    t.press_key_of(cx, "input::Redo");
+    assert_eq!(editor.read_with(cx, |e, _| e.value().to_string()), reviewed);
+    assert_eq!(
+        changes.load(Ordering::SeqCst),
+        before + 2,
+        "redo reports it"
+    );
+
+    // Reviewing: the drawn editor is read-only, so undo has no effect.
+    api.hold(true);
+    t.dispatch(cx, "detail::ReviewYamlEdit", Value::Null)
+        .unwrap();
+    draw(cx, &t);
+    assert_eq!(edit_phase(cx, &t), Some("reviewing"));
+    assert!(!editor.read_with(cx, |e, _| e.is_editable()));
+    t.press_key_of(cx, "input::Undo");
+    // A read-only field has no undo handler, so the menu and the palette cannot reach it either.
+    assert_eq!(
+        t.dispatch(cx, "input::Undo", Value::Null),
+        Err(registry::ActionError::NotAvailable("input::Undo".into()))
+    );
+    assert_eq!(
+        t.dispatch(cx, "input::Redo", Value::Null),
+        Err(registry::ActionError::NotAvailable("input::Redo".into()))
+    );
+    assert_eq!(editor.read_with(cx, |e, _| e.value().to_string()), reviewed);
+    api.hold(false);
+
+    let detail = t.detail(cx).unwrap();
+    cx.wait_for(t.window, WAIT, move |_, cx| {
+        detail.read(cx).view_state().edit == Some("reviewed")
+    })
+    .await;
+    draw(cx, &t);
+
+    // Reviewed: whatever happens to the editor now, Apply sends what the review showed.
+    t.press(cx, "secondary-z");
+    let later = original.replace("replicas: 2", "replicas: 9");
+    cx.update_window(t.window, |_, window, cx| {
+        editor.update(cx, |e, cx| e.set_value(later, window, cx));
+    })
+    .unwrap();
+    draw(cx, &t);
+    assert_eq!(edit_phase(cx, &t), Some("reviewed"));
+
+    t.dispatch(cx, "detail::ApplyYamlEdit", Value::Null)
+        .unwrap();
+    wait_for_one_ok(cx, &t).await;
+    t.click(cx, "ok");
+    let control = api.control.clone();
+    cx.wait_for(t.window, WAIT, move |_, _| {
+        control.puts.lock().unwrap().len() == 2
+    })
+    .await;
+    draw(cx, &t);
+    let puts = api.control.puts.lock().unwrap().clone();
+    assert!(puts[0].0, "the review is a dry run");
+    assert!(!puts[1].0, "the apply is the write");
+    assert_eq!(puts[1].1.pointer("/spec/replicas"), Some(&json!(5)));
+    assert_eq!(puts[0].1, puts[1].1, "the write is the object reviewed");
 }
 
 fn web_key() -> WriteKey {
