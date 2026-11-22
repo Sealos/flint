@@ -77,6 +77,7 @@ impl Inner {
     /// path, waiting at most [`RECORD_WAIT`]. A record that could not be written in time, or at
     /// all, is logged.
     async fn record(&self, record: activity::ActivityRecord, reached: activity::Reached) {
+        let record = names_only(record, &reached);
         let dir = self.config_dir.clone();
         let write =
             tokio::task::spawn_blocking(move || activity::append_call(&dir, &record, &reached));
@@ -87,6 +88,30 @@ impl Inner {
             Err(_) => tracing::warn!("the agent activity log was not written in time"),
         }
     }
+}
+
+/// `record` with each value the call named kept only if it is a name of its sort, and otherwise
+/// by its size. A context in the kubeconfig keeps its name, whatever its characters, for its key
+/// ([`activity::append_call`]); another cluster may still be a path-like context name.
+fn names_only(
+    mut record: activity::ActivityRecord,
+    reached: &activity::Reached,
+) -> activity::ActivityRecord {
+    let keep = |value: &mut Option<String>, valid: &dyn Fn(&str) -> bool| {
+        if let Some(text) = value.as_mut().filter(|text| !valid(text)) {
+            *text = activity::size_only(text);
+        }
+    };
+    if !reached.context && reached.server.is_none() {
+        keep(&mut record.cluster, &|name| {
+            name.split('/').all(policy::is_object_name)
+        });
+    }
+    keep(&mut record.kind, &policy::is_object_name);
+    keep(&mut record.namespace, &policy::is_label_name);
+    keep(&mut record.name, &policy::is_object_name);
+    keep(&mut record.container, &policy::is_label_name);
+    record
 }
 
 /// Discovery results for one cluster.

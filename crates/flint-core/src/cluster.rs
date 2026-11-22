@@ -263,13 +263,13 @@ impl ClusterError {
     }
 
     /// What an AI agent reads (the MCP server): like [`ClusterError::summary`], but text from
-    /// the server or kube keeps its quoted values (an agent needs the names to act) and is cut
-    /// to one line of at most 300 characters, so a server cannot hand it a long, multi-line
-    /// message.
+    /// the server or kube keeps its quoted values (an agent needs the names to act). It is
+    /// redacted whole and only then cut to one line of at most 300 characters, so a server
+    /// cannot hand it a long, multi-line message.
     pub fn for_agent(&self) -> String {
         match self {
             ClusterError::Kube(_) | ClusterError::Api(_) | ClusterError::Config { .. } => {
-                redact::first_line(&self.to_string(), AGENT_CHARS)
+                agent_line(&redact::redact_credentials(&self.to_string()).text)
             }
             other => other.to_string(),
         }
@@ -327,6 +327,28 @@ impl ClusterError {
 /// How much of a server's or kube's text the app shows, and an agent reads.
 const SHOWN_CHARS: usize = 200;
 const AGENT_CHARS: usize = 300;
+
+/// The first line of redacted `text`, cut to [`AGENT_CHARS`] (with `…`). A `[REDACTED:<kind>]`
+/// marker across the cut goes whole.
+fn agent_line(text: &str) -> String {
+    let line = redact::first_line(text, usize::MAX);
+    let Some((mut cut, _)) = line.char_indices().nth(AGENT_CHARS) else {
+        return line;
+    };
+    let last_marker = line
+        .match_indices("[REDACTED:")
+        .map(|(start, _)| start)
+        .take_while(|start| *start < cut)
+        .last();
+    if let Some(start) = last_marker
+        && line[start..]
+            .find(']')
+            .is_some_and(|end| start + end >= cut)
+    {
+        cut = start;
+    }
+    format!("{}…", &line[..cut])
+}
 
 /// Error text that is safe to show in the window, in logs and in the automation state. Only
 /// flint-core builds it ([`ClusterError::summary`]), so nothing unsanitized can be rendered as
@@ -916,6 +938,46 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_text_is_tidied_before_it_is_cut() {
+        for pad in 230..=300 {
+            let message = format!(
+                "{} postgres://admin:example-value-123@db.internal:5432/app",
+                "x".repeat(pad)
+            );
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(!shown.contains("exam"), "pad {pad}: {shown}");
+            assert!(
+                shown.chars().count() <= AGENT_CHARS + 1,
+                "pad {pad}: {shown}"
+            );
+            // A marker is whole, or not there at all.
+            if let Some(at) = shown.find("[R") {
+                assert!(shown[at..].contains(']'), "pad {pad}: {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_marker_across_the_agent_cut_goes_whole() {
+        let marker = "[REDACTED:password]";
+        for inside in 1..marker.len() {
+            let line = format!("{}{marker} rest", "x".repeat(AGENT_CHARS - inside));
+            assert_eq!(
+                agent_line(&line),
+                format!("{}…", "x".repeat(AGENT_CHARS - inside))
+            );
+        }
+        let whole = format!("{}{marker}{}", "x".repeat(10), "y".repeat(AGENT_CHARS));
+        assert!(agent_line(&whole).contains(marker));
+    }
+
+    #[test]
+    fn agent_text_is_one_line_of_a_tidied_block() {
+        let message = "denied\n-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----";
+        assert_eq!(ClusterError::Kube(message.into()).for_agent(), "denied");
+    }
 
     // covers UP-04, UP-10
     #[test]

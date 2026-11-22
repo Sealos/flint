@@ -484,7 +484,7 @@ fn is_unnamed(c: char) -> bool {
 /// [`is_unnamed`] is no name, and one already holding a `[REDACTED:<kind>]` marker is not read
 /// again: of any of these, only the size is kept.
 fn redacted(text: &str) -> String {
-    let size = || format!("…(+{} bytes)", text.len());
+    let size = || size_only(text);
     if text.len() > MAX_READ_BYTES || text.contains("[REDACTED:") || text.chars().any(is_unnamed) {
         return size();
     }
@@ -493,6 +493,11 @@ fn redacted(text: &str) -> String {
         return replaced.text.into_owned();
     }
     through_first_marker(&replaced.text).map_or_else(size, str::to_owned)
+}
+
+/// What a record holds of a value it does not keep: its size.
+pub fn size_only(text: &str) -> String {
+    format!("…(+{} bytes)", text.len())
 }
 
 /// `text` up to and including its first `[REDACTED:<kind>]` marker.
