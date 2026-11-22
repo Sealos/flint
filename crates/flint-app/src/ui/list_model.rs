@@ -886,23 +886,35 @@ pub mod combined {
         Loading,
         NoRows,
         NoMatch,
+        /// A chosen cluster holds no rows and is not current, so its contents are unknown.
+        Unresolved,
     }
 
-    /// `None` while any row passes. Each member's own problem stays on its note.
-    pub fn empty_state(source: &CombinedSource, view: &CombinedView) -> Option<EmptyState> {
+    /// `None` while any row passes. Judged over the clusters `chosen` (empty: all); each
+    /// member's own problem stays on its note.
+    pub fn empty_state(
+        source: &CombinedSource,
+        view: &CombinedView,
+        chosen: &[ClusterId],
+    ) -> Option<EmptyState> {
         if view.matched() > 0 {
             return None;
         }
-        if source.total_rows() > 0 {
-            return Some(EmptyState::NoMatch);
-        }
-        let loading = source
+        let members: Vec<_> = source
             .list
             .members()
             .iter()
-            .any(|m| matches!(m.state(), SyncState::Idle | SyncState::Loading));
-        Some(if loading {
+            .filter(|m| chosen.is_empty() || chosen.iter().any(|c| c == m.cluster()))
+            .collect();
+        Some(if members.iter().any(|m| m.row_count() > 0) {
+            EmptyState::NoMatch
+        } else if members
+            .iter()
+            .any(|m| matches!(m.state(), SyncState::Idle | SyncState::Loading))
+        {
             EmptyState::Loading
+        } else if members.iter().any(|m| !m.state().is_current()) {
+            EmptyState::Unresolved
         } else {
             EmptyState::NoRows
         })

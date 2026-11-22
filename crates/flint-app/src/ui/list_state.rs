@@ -56,7 +56,14 @@ impl CombinedResourceList {
                     namespace: info.namespace.map(str::to_owned),
                     name: info.name.to_owned(),
                     selected: self.selected.as_ref() == Some(&id),
-                    cells_by_column: names.iter().cloned().zip(cells.iter().cloned()).collect(),
+                    // Reversed so the first of two equal headers wins: Flint's Cluster column
+                    // over a server column also named Cluster.
+                    cells_by_column: names
+                        .iter()
+                        .cloned()
+                        .zip(cells.iter().cloned())
+                        .rev()
+                        .collect(),
                     cells,
                 })
             })
@@ -111,12 +118,16 @@ impl CombinedResourceList {
                 })
             }),
             wide: self.show_wide,
-            placeholder: list_model::combined::empty_state(&self.shown, &self.view).map(|empty| {
-                match empty {
-                    list_model::combined::EmptyState::Loading => "loading",
-                    list_model::combined::EmptyState::NoRows => "empty",
-                    list_model::combined::EmptyState::NoMatch => "no_match",
-                }
+            placeholder: list_model::combined::empty_state(
+                &self.shown,
+                &self.view,
+                &self.query.clusters,
+            )
+            .map(|empty| match empty {
+                list_model::combined::EmptyState::Loading => "loading",
+                list_model::combined::EmptyState::NoRows => "empty",
+                list_model::combined::EmptyState::NoMatch => "no_match",
+                list_model::combined::EmptyState::Unresolved => "failed",
             }),
             banners,
         }

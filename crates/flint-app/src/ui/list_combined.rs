@@ -794,7 +794,7 @@ impl CombinedResourceList {
 
     fn placeholder(&self, theme: &Theme) -> Option<AnyElement> {
         let label = &self.label;
-        let empty = model::empty_state(&self.shown, &self.view)?;
+        let empty = model::empty_state(&self.shown, &self.view, &self.query.clusters)?;
         let base = h_flex()
             .id("list-placeholder")
             .size_full()
@@ -810,6 +810,9 @@ impl CombinedResourceList {
                     .child(format!("Loading {label}…")),
                 EmptyState::NoRows => base.child(format!("No {label}")),
                 EmptyState::NoMatch => base.child(format!("No {label} match the filters")),
+                EmptyState::Unresolved => base.child(format!(
+                    "Could not list {label} on every cluster. Each cluster's note says why."
+                )),
             }
             .test_support()
             .into_any_element(),

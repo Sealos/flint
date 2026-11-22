@@ -388,6 +388,55 @@ async fn a_namespace_filter_with_no_rows_says_so(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn an_unknown_cluster_is_not_called_empty(cx: &mut TestAppContext) {
+    let failed = || SyncState::Reconnecting { error: None };
+    let source = |prod: &[(&str, &str)], other: SyncState| {
+        CombinedSource::new(vec![
+            member(
+                snapshot("ctx-prod", "Status", prod, SyncState::Synced),
+                "prod",
+                None,
+            ),
+            member(snapshot("ctx-staging", "Node", &[], other), "staging", None),
+        ])
+        .unwrap()
+    };
+    let (_window, list) = open(cx, source(&[], failed()));
+    assert_eq!(state(cx, &list).placeholder, Some("failed"));
+
+    list.update(cx, |list, cx| {
+        list.set_source(source(&[], SyncState::Synced), cx)
+    });
+    assert_eq!(state(cx, &list).placeholder, Some("empty"));
+
+    // Filtered to a loading cluster while another holds rows: still loading, not "no match".
+    list.update(cx, |list, cx| {
+        list.set_source(source(&[("api", "Running")], SyncState::Loading), cx);
+        list.toggle_cluster_filter("ctx-staging", cx);
+    });
+    assert_eq!(state(cx, &list).placeholder, Some("loading"));
+}
+
+#[gpui_kit::test]
+async fn a_server_column_named_cluster_keeps_the_row_identity(cx: &mut TestAppContext) {
+    let source = CombinedSource::new(vec![member(
+        snapshot(
+            "ctx-prod",
+            "Cluster",
+            &[("api", "workload-a")],
+            SyncState::Synced,
+        ),
+        "prod",
+        None,
+    )])
+    .unwrap();
+    let (_window, list) = open(cx, source);
+    let shown = state(cx, &list);
+    assert_eq!(shown.rows[0].cells_by_column["Cluster"], "prod");
+    assert!(shown.rows[0].cells.contains(&"workload-a".to_owned()));
+}
+
+#[gpui_kit::test]
 async fn a_member_that_is_not_current_gets_a_note(cx: &mut TestAppContext) {
     let (_window, list) = open(cx, fixture());
     let shown = state(cx, &list);
