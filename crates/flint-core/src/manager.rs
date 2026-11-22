@@ -297,6 +297,8 @@ enum Internal {
     },
     NamespacesListed {
         cluster: ClusterId,
+        /// The slot whose watch listed them ([`Cluster::generation`]).
+        generation: u64,
         names: Vec<String>,
     },
     /// A follower stopped: forget its hub unless a watch still feeds it.
@@ -829,7 +831,10 @@ impl ClusterManager {
         }
         if follow && slot.namespaces_task.is_none() {
             let follower = Follower::new(&hubs, id, KindId::namespaces(), &internal);
-            slot.namespaces_task = Some(tokio::spawn(follow_namespaces(follower, internal)));
+            let generation = slot.generation;
+            slot.namespaces_task = Some(tokio::spawn(follow_namespaces(
+                follower, generation, internal,
+            )));
         }
     }
 
@@ -1341,10 +1346,19 @@ impl ClusterManager {
                     self.start_discovery(&cluster);
                 }
             }
-            Internal::NamespacesListed { cluster, names } => {
-                if let Some(slot) = self.cluster_mut(&cluster) {
-                    slot.listed_namespaces = names;
-                }
+            Internal::NamespacesListed {
+                cluster,
+                generation,
+                names,
+            } => {
+                // Queued by a slot since replaced: those names are another server's.
+                let Some(slot) = self
+                    .cluster_mut(&cluster)
+                    .filter(|slot| slot.generation == generation)
+                else {
+                    return;
+                };
+                slot.listed_namespaces = names;
                 self.apply_scope(&cluster);
             }
             Internal::ReleaseHub { cluster, kind } => {
@@ -1479,14 +1493,21 @@ impl ClusterManager {
         }
         let pin = self.session_pin(cluster);
         self.write_gate(cluster)?;
-        // A same-URL fallback keeps its pin, but it may carry another file's credentials. Before
-        // the client: a paused context has none, and this is the reason it is refused.
-        if self.contexts.provisional(cluster) {
+        let provisional = self.contexts.provisional(cluster);
+        // Before the client: a paused context may have none, and this is why it is refused.
+        if provisional && self.paused(cluster) {
             return Err(WriteRefusal::Unsettled {
                 cluster: cluster.to_owned(),
             });
         }
-        Ok((self.write_client(cluster)?, pin))
+        let client = self.write_client(cluster)?;
+        // A same-URL fallback keeps its pin, but it may carry another file's credentials.
+        if provisional {
+            return Err(WriteRefusal::Unsettled {
+                cluster: cluster.to_owned(),
+            });
+        }
+        Ok((client, pin))
     }
 
     /// [`Self::shell_client`] for one request of a reviewed write, with the credential of the
@@ -1971,8 +1992,15 @@ impl ClusterManager {
     }
 
     /// Catches up a cluster whose pause just ended on the same definition: the discovery and
-    /// watches that waited start now.
+    /// watches that waited start now. A watch that kept running publishes its rows once more, so
+    /// a view refused during the pause tries again even if the kind stays quiet. A slot replaced
+    /// by a changed definition runs no watch yet, so it publishes nothing here.
     fn resume(&mut self, id: &str) {
+        if let Some(slot) = self.cluster(id) {
+            for kind in slot.watches.running().into_keys() {
+                self.hubs.get_or_create(id, &kind).wake.notify_one();
+            }
+        }
         let active = self.active.as_deref() == Some(id);
         if self.cluster(id).is_some_and(|slot| {
             slot.client.is_some()
@@ -2528,7 +2556,11 @@ async fn follow_crds(mut follower: Follower, out: mpsc::UnboundedSender<Internal
 
 /// Follows the namespaces the user can list on an active cluster, for namespace-limited lists.
 /// Ends when aborted or the hub goes away.
-async fn follow_namespaces(mut follower: Follower, out: mpsc::UnboundedSender<Internal>) {
+async fn follow_namespaces(
+    mut follower: Follower,
+    generation: u64,
+    out: mpsc::UnboundedSender<Internal>,
+) {
     let mut last: Option<Vec<String>> = None;
     while let Some(snapshot) = follower.next_synced(Duration::ZERO).await {
         let names: Vec<String> = snapshot.names().into_iter().map(str::to_owned).collect();
@@ -2538,6 +2570,7 @@ async fn follow_namespaces(mut follower: Follower, out: mpsc::UnboundedSender<In
         last = Some(names.clone());
         let msg = Internal::NamespacesListed {
             cluster: follower.cluster.clone(),
+            generation,
             names,
         };
         if out.send(msg).is_err() {
@@ -5112,6 +5145,71 @@ mod tests {
             Some(WriteRefusal::Unsettled {
                 cluster: "dev".to_owned(),
             })
+        );
+    }
+
+    // A provisional context showing its confirmed definition with no connection is refused as
+    // not connected: nothing about it changed. A paused one says it is uncertain.
+    #[tokio::test]
+    async fn an_unchanged_provisional_context_without_a_client_is_not_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = kubeconfig_with("https://127.0.0.1:1");
+        let (mut manager, _, first) = pausable(dir.path(), &yaml).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && !manager.paused("dev"));
+        manager.unlocks.unlock("dev", "https://127.0.0.1:1");
+        let not_connected = WriteRefusal::NotConnected {
+            cluster: "dev".to_owned(),
+        };
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(not_connected.clone())
+        );
+        assert!(matches!(
+            manager.bound_write_client("dev", None).err(),
+            Some(WriteError::Refused(WriteRefusal::NotConnected { .. }))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let [other, _] = pauses();
+        let (mut manager, _, first) = pausable(dir.path(), &other).await;
+        rewrite_file(&mut manager, &first, UNREADABLE).await;
+        assert!(manager.contexts.provisional("dev") && manager.paused("dev"));
+        manager.unlocks.unlock("dev", "https://127.0.0.1:3");
+        assert_eq!(
+            manager.shell_client("dev", None).err(),
+            Some(WriteRefusal::Unsettled {
+                cluster: "dev".to_owned(),
+            })
+        );
+        assert!(matches!(
+            manager.bound_write_client("dev", None).err(),
+            Some(WriteError::KubeconfigUnreadable)
+        ));
+    }
+
+    // A namespace list from an earlier slot of the context says nothing about this one.
+    #[tokio::test]
+    async fn a_late_namespace_list_of_an_old_slot_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, _, first) = pausable(dir.path(), NO_CONTEXTS).await;
+        let old = manager.cluster("dev").unwrap().generation;
+        rewrite_file(&mut manager, &first, &kubeconfig_with("https://127.0.0.1:2")).await;
+        let current = manager.cluster("dev").unwrap().generation;
+        assert_ne!(old, current);
+        let listed = |generation, name: &str| Internal::NamespacesListed {
+            cluster: "dev".into(),
+            generation,
+            names: vec![name.to_owned()],
+        };
+
+        manager.handle_internal(listed(old, "from-a")).await;
+        assert!(manager.cluster("dev").unwrap().listed_namespaces.is_empty());
+
+        manager.handle_internal(listed(current, "from-b")).await;
+        assert_eq!(
+            manager.cluster("dev").unwrap().listed_namespaces,
+            ["from-b"]
         );
     }
 

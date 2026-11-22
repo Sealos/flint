@@ -2395,3 +2395,100 @@ async fn a_protected_paused_context_is_refused_as_protected() {
     );
     assert_eq!(puts(&server), (0, 0), "nothing was sent");
 }
+
+/// Writes `yaml` to `file` and waits for the load that finds no broken file.
+async fn restore_kubeconfig(core: &Core, file: &Path, yaml: &str) {
+    let events = core.handle.events();
+    std::fs::write(file, yaml).unwrap();
+    core.handle.send(Command::ReloadKubeconfig);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Event::ClustersChanged(snapshot) = events.recv().await.unwrap()
+                && snapshot.errors.is_empty()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the load finds the file readable");
+}
+
+// covers UP-06: a quiet watch tells its subscribers once when a pause ends on the same
+// definition, so a pane that failed during the pause fetches again. Nothing is told while the
+// pause lasts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_ending_on_the_same_definition_tells_a_quiet_watch() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.add_pod(FakePod::new("demo", "web", &["app"]));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kubeconfig");
+    let yaml = kubeconfig_with_user(&server, CONTEXT, serde_json::json!({ "token": "a" }));
+    std::fs::write(&file, &yaml).unwrap();
+    let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
+    let mut pods = core.handle.subscribe(CONTEXT, &KindId::pods());
+    let synced = until(&mut pods, "synced", |s| s.state == SyncState::Synced).await;
+    let kind = KindId::pods();
+    let fetch = || core.handle.fetch_object(CONTEXT, &kind, Some("demo"), "web");
+    fetch().await.expect("connected");
+
+    break_kubeconfig(&core, &file).await;
+    let refused = fetch().await.unwrap_err();
+    assert!(refused.contains("not connected"), "{refused}");
+    pods.latest();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), pods.changed())
+            .await
+            .is_err(),
+        "nothing is published while paused"
+    );
+
+    restore_kubeconfig(&core, &file, &yaml).await;
+    tokio::time::timeout(WAIT, pods.changed())
+        .await
+        .expect("the end of the pause is published");
+    let told = pods.latest();
+    assert_eq!(told.revision, synced.revision, "the same rows");
+    assert_eq!(told.state, SyncState::Synced);
+    assert!(told.version > synced.version);
+    fetch().await.expect("reads work again");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), pods.changed())
+            .await
+            .is_err(),
+        "told once"
+    );
+}
+
+// covers UP-06: a pause ending on another definition reuses nothing: what the subscribers see
+// next is a new list, never the old rows published again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_ending_on_a_changed_definition_republishes_nothing() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.add_pod(FakePod::new("demo", "web", &["app"]));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kubeconfig");
+    let token = |t: &str| serde_json::json!({ "token": t });
+    let yaml = kubeconfig_with_user(&server, CONTEXT, token("a"));
+    std::fs::write(&file, &yaml).unwrap();
+    let core = Core::start_on(dir, vec![file.clone()], Settings::default()).await;
+    let mut pods = core.handle.subscribe(CONTEXT, &KindId::pods());
+    let synced = until(&mut pods, "synced", |s| s.state == SyncState::Synced).await;
+
+    break_kubeconfig(&core, &file).await;
+    pods.latest();
+    let changed = kubeconfig_with_user(&server, CONTEXT, token("b"));
+    restore_kubeconfig(&core, &file, &changed).await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            assert!(pods.changed().await, "core running");
+            let snapshot = pods.latest();
+            assert_ne!(snapshot.revision, synced.revision, "the old rows came back");
+            if snapshot.state == SyncState::Synced {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the new definition lists again");
+}

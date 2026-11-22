@@ -648,7 +648,8 @@ opens in a tab in the bottom dock.
     the pause is dropped after its attempt id is checked. What already runs goes on. A provisional context that shows
     its confirmed definition is not paused, and neither is one no load has confirmed yet (first seen while an earlier
     file is broken): both connect. When the pause ends on the same definition, connection, discovery and watches
-    resume; a changed definition gets a fresh slot and reuses nothing. Pausing only decides what starts: writes on
+    resume, and a watch that kept running publishes its rows once more, so a detail pane refused during the pause
+    tries again; a changed definition gets a fresh slot and reuses nothing. Pausing only decides what starts: writes on
     any provisional or changed definition stay refused.
   - **Checks.** While the session connects or runs, it asks the manager every 30 s (`recheck::RECHECK_EVERY`,
     shared with log sessions, which are pinned the same way) whether the context changed since, never the server.
