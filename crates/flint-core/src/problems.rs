@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Node, Pod};
+use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Node, Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
@@ -46,6 +46,13 @@ pub const CRASH_LOOP_MIN_RESTARTS: i32 = 3;
 /// shorter run keeps the problem open between restarts; a longer previous run means the latest
 /// exit was a one-off, however many restarts have added up over the container's life.
 pub const CRASH_LOOP_STABLE_AFTER: SignedDuration = SignedDuration::from_secs(10 * 60);
+
+/// The longest gap between one exit and the next start that still counts as the same crash loop.
+///
+/// The kubelet's restart back-off tops out at five minutes. The extra minute covers its sync
+/// delay and a routine image check, so a loop at full back-off stays one problem, while a start
+/// after a long outage such as an image pull failure does not continue an old loop.
+pub const CRASH_LOOP_MAX_RESTART_GAP: SignedDuration = SignedDuration::from_secs(6 * 60);
 
 /// How long after an OOM kill it is still reported.
 ///
@@ -159,7 +166,7 @@ impl ProblemReason {
 /// The object a problem concerns. UIDs are optional only because the API types make them so.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProblemSubject {
-    /// One container of a pod, including init and sidecar containers.
+    /// One container of a pod, including init, sidecar and ephemeral containers.
     Container {
         namespace: String,
         pod: String,
@@ -269,7 +276,8 @@ impl Classifier {
     /// Appends the problems of one pod, at most one per container.
     ///
     /// A deleting or succeeded pod has none. A failed pod will not restart, so it can only report
-    /// an OOM kill that ended its final run.
+    /// an OOM kill that ended its final run. The same holds for ephemeral containers, which are
+    /// never restarted.
     pub fn pod(&self, pod: &Pod, out: &mut Vec<Problem>) {
         let meta = &pod.metadata;
         let (Some(name), Some(status), None) = (&meta.name, &pod.status, &meta.deletion_timestamp)
@@ -282,8 +290,18 @@ impl Classifier {
         }
         let finished = phase == Some("Failed");
         let init = status.init_container_statuses.iter().flatten();
-        for container in init.chain(status.container_statuses.iter().flatten()) {
-            let Some((kind, reason, since)) = self.container(container, finished) else {
+        let restartable = init
+            .chain(status.container_statuses.iter().flatten())
+            .map(|container| (container, finished));
+        let ephemeral = status
+            .ephemeral_container_statuses
+            .iter()
+            .flatten()
+            .map(|container| (container, true));
+        for (container, final_run) in restartable.chain(ephemeral) {
+            let Some((kind, reason, since)) =
+                self.container(container, pod.spec.as_ref(), final_run)
+            else {
                 continue;
             };
             let subject = ProblemSubject::Container {
@@ -354,10 +372,13 @@ impl Classifier {
     }
 
     /// A crash loop takes precedence over an OOM kill, so one failure is not counted twice.
+    ///
+    /// `final_run` means the container will not run again, so only its current state counts.
     fn container(
         &self,
         status: &ContainerStatus,
-        pod_finished: bool,
+        spec: Option<&PodSpec>,
+        final_run: bool,
     ) -> Option<(ProblemKind, Option<ProblemReason>, Option<Timestamp>)> {
         let current = status.state.as_ref().and_then(|s| s.terminated.as_ref());
         let previous = status
@@ -365,7 +386,7 @@ impl Classifier {
             .as_ref()
             .and_then(|s| s.terminated.as_ref());
         let latest = current.or(previous);
-        if !pod_finished && self.is_crash_looping(status, current, previous) {
+        if !final_run && self.is_crash_looping(status, spec, current, previous) {
             let reason = if latest.is_some_and(is_oom) {
                 ProblemReason::OomKilled
             } else {
@@ -374,8 +395,8 @@ impl Classifier {
             let since = latest.and_then(|t| time(&t.finished_at));
             return Some((ProblemKind::CrashLoop, Some(reason), since));
         }
-        // The last state of a finished pod is an earlier attempt, not what ended it.
-        let last_run = if pod_finished { current } else { latest };
+        // The last state of a final run is an earlier attempt, not what ended it.
+        let last_run = if final_run { current } else { latest };
         let oom = last_run.filter(|t| is_oom(t))?;
         let since = time(&oom.finished_at).filter(|t| self.within(*t, OOM_RECENT_WINDOW))?;
         Some((
@@ -388,6 +409,7 @@ impl Classifier {
     fn is_crash_looping(
         &self,
         status: &ContainerStatus,
+        spec: Option<&PodSpec>,
         current: Option<&ContainerStateTerminated>,
         previous: Option<&ContainerStateTerminated>,
     ) -> bool {
@@ -403,13 +425,22 @@ impl Classifier {
                 && !previous.is_some_and(|t| ran_for(t).is_some_and(is_stable));
         }
         if let Some(running) = &state.running {
-            // Between back-offs: still looping until this run outlasts the stable period.
-            return time(&running.started_at)
-                .is_some_and(|started| self.within(started, CRASH_LOOP_STABLE_AFTER))
-                && previous.is_some_and(|t| ran_for(t).is_some_and(|d| !is_stable(d)));
+            // Between back-offs: still looping until this run outlasts the stable period, as
+            // long as it follows directly from a short run.
+            let Some(started) = time(&running.started_at) else {
+                return false;
+            };
+            return self.within(started, CRASH_LOOP_STABLE_AFTER)
+                && previous.is_some_and(|t| {
+                    ran_for(t).is_some_and(|d| !is_stable(d)) && follows_directly(t, started)
+                });
         }
-        // Just exited, before the kubelet reports the back-off.
-        current.is_some_and(|t| t.exit_code != 0 && ran_for(t).is_some_and(|d| !is_stable(d)))
+        // Just exited, before the kubelet reports the back-off. Only a loop if it will restart.
+        current.is_some_and(|t| {
+            t.exit_code != 0
+                && ran_for(t).is_some_and(|d| !is_stable(d))
+                && spec.is_some_and(|spec| restarts_on_failure(spec, &status.name, t.exit_code))
+        })
     }
 
     fn problem(
@@ -445,6 +476,45 @@ fn is_oom(terminated: &ContainerStateTerminated) -> bool {
 
 fn is_stable(ran: SignedDuration) -> bool {
     ran >= CRASH_LOOP_STABLE_AFTER
+}
+
+/// Whether a start at `started` is the next attempt after `previous`, not a later recovery.
+fn follows_directly(previous: &ContainerStateTerminated, started: Timestamp) -> bool {
+    time(&previous.finished_at)
+        .is_some_and(|finished| started.duration_since(finished) <= CRASH_LOOP_MAX_RESTART_GAP)
+}
+
+/// Whether the kubelet will restart container `name` after it exits with non-zero `exit_code`.
+///
+/// Rules apply in order and the first match decides; with none, the container's policy applies,
+/// then the pod's, which defaults to `Always`. Anything unrecognised counts as no restart, so a
+/// value from a newer API cannot raise a false alarm. Container names are unique within a pod,
+/// and the search runs only for a container that has just failed.
+fn restarts_on_failure(spec: &PodSpec, name: &str, exit_code: i32) -> bool {
+    let init = spec.init_containers.iter().flatten();
+    let Some(container) = spec.containers.iter().chain(init).find(|c| c.name == name) else {
+        return false;
+    };
+    for rule in container.restart_policy_rules.iter().flatten() {
+        let Some(codes) = &rule.exit_codes else {
+            return false;
+        };
+        let listed = codes.values.iter().flatten().any(|code| *code == exit_code);
+        let matched = match codes.operator.as_str() {
+            "In" => listed,
+            "NotIn" => !listed,
+            _ => return false,
+        };
+        if matched {
+            return rule.action == "Restart";
+        }
+    }
+    let policy = container
+        .restart_policy
+        .as_deref()
+        .or(spec.restart_policy.as_deref())
+        .unwrap_or("Always");
+    matches!(policy, "Always" | "OnFailure")
 }
 
 /// How long a finished run lasted, when both ends are known.

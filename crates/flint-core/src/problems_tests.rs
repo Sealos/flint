@@ -25,8 +25,13 @@ fn pod_with(phase: &str, init: Value, containers: Value, extra_meta: Value) -> P
     if let Value::Object(extra) = extra_meta {
         metadata.as_object_mut().unwrap().extend(extra);
     }
+    let spec = json!({
+        "initContainers": spec_containers(&init),
+        "containers": spec_containers(&containers),
+    });
     serde_json::from_value(json!({
         "metadata": metadata,
+        "spec": spec,
         "status": {
             "phase": phase,
             "initContainerStatuses": init,
@@ -34,6 +39,15 @@ fn pod_with(phase: &str, init: Value, containers: Value, extra_meta: Value) -> P
         },
     }))
     .unwrap()
+}
+
+/// Spec entries, with no restart settings of their own, for a list of container statuses.
+fn spec_containers(statuses: &Value) -> Vec<Value> {
+    let statuses = statuses.as_array().unwrap();
+    statuses
+        .iter()
+        .map(|s| json!({"name": s["name"]}))
+        .collect()
 }
 
 fn status(restarts: i32, state: Value, last: Value) -> Value {
@@ -130,6 +144,24 @@ fn containers_are_classified() {
             "restart after a long run is not a loop",
             "Running",
             status(40, running(1), ended("Error", 1, 9000, 2)),
+            None,
+        ),
+        (
+            "start long after the last exit is not the same loop",
+            "Running",
+            status(6, running(1), ended("Error", 1, 180, 179)),
+            None,
+        ),
+        (
+            "start at the longest restart gap stays a loop",
+            "Running",
+            status(6, running(1), ended("Error", 1, 8, 7)),
+            looping,
+        ),
+        (
+            "start just past the longest restart gap is not a loop",
+            "Running",
+            status(6, running(1), ended("Error", 1, 9, 8)),
             None,
         ),
         (
@@ -251,6 +283,209 @@ fn init_containers_are_only_problems_when_they_fail() {
         let main = status(0, main_state, none());
         let pod = pod_with("Pending", json!([init]), json!([main]), none());
         assert_eq!(pod_problems(&pod).len(), expected, "{name}");
+    }
+}
+
+/// A running pod whose container `c` has just exited with `code` after earlier restarts.
+fn exited_pod(pod_policy: Option<&str>, container: Value, code: i32) -> Pod {
+    let exited = status(6, ended("Error", code, 2, 0), ended("Error", 42, 5, 4));
+    let mut pod = pod_with("Running", json!([]), json!([exited]), none());
+    let mut spec = json!({"containers": [container]});
+    if let Some(policy) = pod_policy {
+        spec["restartPolicy"] = json!(policy);
+    }
+    pod.spec = Some(serde_json::from_value(spec).unwrap());
+    pod
+}
+
+fn exit_rule(action: &str, operator: &str, values: &[i32]) -> Value {
+    json!({"action": action, "exitCodes": {"operator": operator, "values": values}})
+}
+
+#[test]
+fn a_just_exited_container_is_a_loop_only_if_it_will_restart() {
+    let plain = json!({"name": "c"});
+    let with_policy = |policy: &str| json!({"name": "c", "restartPolicy": policy});
+    let with_rules = |policy: &str, rules: Vec<Value>| json!({"name": "c", "restartPolicy": policy, "restartPolicyRules": rules});
+    let restart_on_42 = || vec![exit_rule("Restart", "In", &[42])];
+    let cases = [
+        ("pod default restarts", None, plain.clone(), 1, true),
+        ("pod Always", Some("Always"), plain.clone(), 1, true),
+        ("pod OnFailure", Some("OnFailure"), plain.clone(), 1, true),
+        ("pod Never", Some("Never"), plain.clone(), 1, false),
+        (
+            "container Never overrides the pod",
+            Some("Always"),
+            with_policy("Never"),
+            1,
+            false,
+        ),
+        (
+            "container Always overrides the pod",
+            Some("Never"),
+            with_policy("Always"),
+            1,
+            true,
+        ),
+        (
+            "matching rule restarts",
+            Some("Never"),
+            with_rules("Never", restart_on_42()),
+            42,
+            true,
+        ),
+        (
+            "unmatched rule falls back to Never",
+            Some("Never"),
+            with_rules("Never", restart_on_42()),
+            1,
+            false,
+        ),
+        (
+            "unmatched rule falls back to OnFailure",
+            Some("Never"),
+            with_rules("OnFailure", restart_on_42()),
+            1,
+            true,
+        ),
+        (
+            "NotIn matches other codes",
+            Some("Never"),
+            with_rules("Never", vec![exit_rule("Restart", "NotIn", &[42])]),
+            1,
+            true,
+        ),
+        (
+            "NotIn does not match a listed code",
+            Some("Never"),
+            with_rules("Never", vec![exit_rule("Restart", "NotIn", &[1])]),
+            1,
+            false,
+        ),
+        (
+            "first matching rule wins",
+            Some("Always"),
+            with_rules(
+                "Always",
+                vec![
+                    exit_rule("Unknown", "In", &[1]),
+                    exit_rule("Restart", "In", &[1]),
+                ],
+            ),
+            1,
+            false,
+        ),
+        (
+            "unknown operator is not a clear restart",
+            Some("Always"),
+            with_rules("Always", vec![exit_rule("Restart", "Unknown", &[1])]),
+            1,
+            false,
+        ),
+        (
+            "rule without exit codes is not a clear restart",
+            Some("Always"),
+            with_rules("Always", vec![json!({"action": "Restart"})]),
+            1,
+            false,
+        ),
+        (
+            "unknown policy is not a clear restart",
+            None,
+            with_policy("Sometimes"),
+            1,
+            false,
+        ),
+        (
+            "container missing from the spec",
+            Some("Always"),
+            json!({"name": "other"}),
+            1,
+            false,
+        ),
+    ];
+    for (name, pod_policy, container, code, expected) in cases {
+        let pod = exited_pod(pod_policy, container, code);
+        let looping = pod_problems(&pod)
+            .iter()
+            .any(|p| p.kind() == ProblemKind::CrashLoop);
+        assert_eq!(looping, expected, "{name}");
+    }
+}
+
+#[test]
+fn a_just_exited_container_without_a_spec_is_not_a_loop() {
+    let mut pod = exited_pod(Some("Always"), json!({"name": "c"}), 1);
+    pod.spec = None;
+    assert!(pod_problems(&pod).is_empty());
+}
+
+#[test]
+fn a_restartable_init_container_uses_its_own_policy() {
+    let exited = status(6, ended("Error", 1, 2, 0), ended("Error", 1, 5, 4));
+    let main = json!({"name": "main", "image": "i", "imageID": "", "ready": true,
+        "restartCount": 0, "state": running(30)});
+    let mut pod = pod_with("Running", json!([exited]), json!([main]), none());
+    pod.spec = Some(
+        serde_json::from_value(json!({
+            "restartPolicy": "Never",
+            "initContainers": [{"name": "c", "restartPolicy": "Always"}],
+            "containers": [{"name": "main"}],
+        }))
+        .unwrap(),
+    );
+    let problems = pod_problems(&pod);
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].kind(), ProblemKind::CrashLoop);
+}
+
+#[test]
+fn ephemeral_containers_report_only_their_own_oom_kill() {
+    let cases = [
+        (
+            "recent OOM kill",
+            status(0, ended("OOMKilled", 137, 9, 8), none()),
+            Some(ProblemKind::OomKilled),
+        ),
+        (
+            "old OOM kill",
+            status(0, ended("OOMKilled", 137, 90, 61), none()),
+            None,
+        ),
+        (
+            "a failure is never a crash loop",
+            status(6, ended("Error", 1, 2, 0), ended("Error", 1, 5, 4)),
+            None,
+        ),
+        (
+            "a back-off is never a crash loop",
+            status(6, waiting("CrashLoopBackOff"), ended("Error", 1, 3, 2)),
+            None,
+        ),
+        (
+            "only the current state counts",
+            status(1, running(1), ended("OOMKilled", 137, 9, 8)),
+            None,
+        ),
+    ];
+    for (name, mut ephemeral, expected) in cases {
+        ephemeral["name"] = json!("debug");
+        let main = status(0, running(30), none());
+        let mut pod = pod_with("Running", json!([]), json!([main]), none());
+        pod.status.as_mut().unwrap().ephemeral_container_statuses =
+            Some(vec![serde_json::from_value(ephemeral).unwrap()]);
+        let problems = pod_problems(&pod);
+        assert_eq!(
+            problems.iter().map(Problem::kind).next(),
+            expected,
+            "{name}"
+        );
+        if expected.is_some() {
+            let ProblemSubject::Container { container, .. } = &problems[0].id.subject else {
+                panic!("{name}: not a container");
+            };
+            assert_eq!(container, "debug", "{name}");
+        }
     }
 }
 
