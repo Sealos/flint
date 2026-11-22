@@ -1142,7 +1142,8 @@ impl ResourceList {
                 .into_any_element()
         };
         if snapshot.rows.is_empty()
-            && let Some(title) = access_title(&snapshot.state, label)
+            && let Some(title) =
+                access_title(&snapshot.state, label, snapshot.limited_to.as_deref())
         {
             let detail = match &snapshot.state {
                 // Nothing to fall back to: the error says how to pick namespaces.
@@ -1378,12 +1379,25 @@ impl ResourceList {
 }
 
 /// What the list is titled while an account's access is the question. `None` for anything that
-/// is not a denial: a missing API must not read as a permissions problem.
-fn access_title(state: &SyncState, label: &str) -> Option<String> {
+/// is not a denial: a missing API must not read as a permissions problem. A settled denial of
+/// a namespace-limited list names the namespaces tried.
+fn access_title(
+    state: &SyncState,
+    label: &str,
+    limit: Option<&flint_core::NamespaceLimit>,
+) -> Option<String> {
     if state.is_checking_access() {
         Some(format!("Checking access to {label}…"))
     } else if state.is_no_access() {
-        Some(format!("No access to {label}"))
+        Some(
+            match limit.map(|l| (l.listed.as_slice(), l.denied.as_slice())) {
+                Some(([], [namespace])) => format!("No access to {label} in {namespace}"),
+                Some(([], denied)) if !denied.is_empty() => {
+                    format!("No access to {label} in {} namespaces", denied.len())
+                }
+                _ => format!("No access to {label}"),
+            },
+        )
     } else {
         None
     }
@@ -1409,8 +1423,12 @@ pub fn limited_text(label: &str, limit: &flint_core::NamespaceLimit) -> String {
     let mut text = format!(
         "Showing {label} in {count} only ({names}): you may not list {label} in all namespaces."
     );
+    // A lane fails on a 403 or a 404, and the limit does not say which: claim neither.
     if !limit.denied.is_empty() {
-        text.push_str(&format!(" Not allowed in: {}.", limit.denied.join(", ")));
+        text.push_str(&format!(
+            " Could not list {label} in: {}.",
+            limit.denied.join(", ")
+        ));
     }
     text
 }
