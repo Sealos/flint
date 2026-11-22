@@ -222,7 +222,7 @@ impl Engine {
         Engine {
             cluster,
             id: kind.id(),
-            store: Store::new(kind.namespaced),
+            store: Store::new(kind.namespaced).with_kind(&kind),
             kind,
             namespace: None,
             scope: None,
@@ -545,7 +545,7 @@ impl Engine {
                     if !self.run_namespaced(reason, RefusalCause::Denied).await {
                         return;
                     }
-                    self.store = Store::new(self.kind.namespaced);
+                    self.store = Store::new(self.kind.namespaced).with_kind(&self.kind);
                     self.denials = 0;
                     // The merged rows go with the lanes; the full list loads afresh.
                     self.set_state(SyncState::Loading);
@@ -861,7 +861,7 @@ impl Engine {
         tracing::info!(cluster = %self.cluster, kind = %self.id,
             "not allowed in all namespaces; listing namespace by namespace");
         let reason = sync_error_text(&reason);
-        self.store = Store::new(true);
+        self.store = Store::new(true).with_kind(&self.kind);
         let changed = Arc::new(Notify::new());
         let mut lanes: BTreeMap<String, Lane> = BTreeMap::new();
         let mut published: Option<Instant> = None;

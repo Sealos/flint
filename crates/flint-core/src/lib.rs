@@ -11,6 +11,7 @@ mod auth_plugin;
 pub mod bootstrap;
 pub mod cache;
 pub mod cluster;
+mod connection;
 mod credential;
 pub mod discovery;
 pub mod display;
@@ -23,6 +24,7 @@ pub mod kubeconfig;
 mod logging;
 pub mod logs;
 mod manager;
+pub mod metrics;
 pub mod paging;
 pub mod protection;
 pub mod read;
@@ -55,6 +57,7 @@ pub use logs::{
     PodSet, PodSetStatus, SearchQuery, Severity, StreamStatus, WorkloadKind, WorkloadPod,
     WorkloadTarget,
 };
+pub use metrics::{MetricsError, MetricsList, MetricsPoll, NodeMetrics, PodMetrics};
 pub use protection::{Protection, SessionUnlocks, WriteRefusal};
 pub use read::{KindId, KindInfo, ObjectDetail};
 pub use settings::{Appearance, Settings, WatchMode};

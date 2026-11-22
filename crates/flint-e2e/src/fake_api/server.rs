@@ -919,6 +919,10 @@ async fn handle(
             tokio::time::sleep(delay).await;
             answer(&inner, call, upgrade, &route, verb, &query, &accept)
         }
+        Some(Effect::Hold(point)) => {
+            point.wait().await;
+            answer(&inner, call, upgrade, &route, verb, &query, &accept)
+        }
         Some(Effect::StripUpgrade) => answer(&inner, call, false, &route, verb, &query, &accept),
         None => answer(&inner, call, upgrade, &route, verb, &query, &accept),
     };
