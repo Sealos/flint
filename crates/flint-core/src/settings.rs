@@ -1109,14 +1109,7 @@ fn edit_settings(
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let mut table: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-            path: path.clone(),
-            source,
-        })?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => toml::Table::new(),
-        Err(source) => return Err(SettingsError::Read { path, source }),
-    };
+    let mut table: toml::Table = load_toml(&path)?;
     edit(&mut table, &path)?;
     let text = toml::to_string_pretty(&table)?;
     let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
@@ -1170,7 +1163,18 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), SettingsError> {
         std::fs::create_dir_all(parent).map_err(err)?;
     }
     // Write through a symlink (for example a dotfiles checkout) instead of replacing the link.
-    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    // Only a path with nothing at it is new: a link that leads nowhere must stay a link.
+    let path = &match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_)
+            if path
+                .symlink_metadata()
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            path.to_owned()
+        }
+        Err(source) => return Err(err(source)),
+    };
     let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
     std::fs::write(&tmp, text).map_err(err)?;
     std::fs::rename(&tmp, path).map_err(err)
@@ -2368,6 +2372,50 @@ server = "https://staging.example:6443"
         assert_eq!(loaded.log_buffer_lines, u32::MAX);
         assert_eq!(loaded.log_buffer_mib, u32::MAX);
         assert_eq!(loaded.log_total_mib, u32::MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_dangling_symlink_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles.toml");
+        let link = dir.path().join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        for (setter, failed) in setter_results(dir.path()) {
+            assert!(failed, "{setter}");
+            assert_eq!(std::fs::read_link(&link).unwrap(), target, "{setter}");
+            assert!(!target.exists(), "{setter}");
+        }
+        // The target can vanish after the file was read, too.
+        assert!(matches!(
+            write_atomic(&link, "appearance = \"light\"\n"),
+            Err(SettingsError::Write { .. })
+        ));
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the link remains");
+
+        // Once the target is back, the link still leads to it and saves go through it.
+        std::fs::write(&target, "protect_local_clusters = true\n").unwrap();
+        assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
+        set_appearance(dir.path(), Appearance::Light).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let saved: Settings = toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(saved.protect_local_clusters);
+        assert_eq!(saved.appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn a_save_creates_a_missing_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("not-yet").join("config");
+        set_appearance(&config, Appearance::Light).unwrap();
+        assert_eq!(
+            load_settings(&config).unwrap().appearance,
+            Appearance::Light
+        );
     }
 
     #[test]
