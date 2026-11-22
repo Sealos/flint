@@ -110,7 +110,9 @@ impl ResourceList {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.query.text == text {
+        // The field can already hold the text while the rows drawn are still another text's.
+        let field_matches = self.query.text == text;
+        if field_matches && (self.restoring_filter || self.rows_text == text) {
             return;
         }
         self.query.text = text.to_owned();
@@ -118,8 +120,10 @@ impl ResourceList {
         self.restoring_filter = true;
         self.rows = std::sync::Arc::from(Vec::new());
         self.selected_ix = None;
-        self.filter
-            .update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        if !field_matches {
+            self.filter
+                .update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        }
         self.recompute(cx);
         cx.notify();
     }
