@@ -27,6 +27,7 @@ mod logging;
 pub mod logs;
 mod manager;
 pub mod metrics;
+pub mod metrics_trend;
 pub mod paging;
 pub mod problems;
 pub mod protection;

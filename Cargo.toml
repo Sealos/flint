@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/flint-core", "crates/flint-mcp", "crates/flint-app", "crates/flint-e2e"]
 
 [workspace.package]
-version = "0.4.0" # x-release-please-version
+version = "0.5.0" # x-release-please-version
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"

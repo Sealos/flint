@@ -9,8 +9,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::thresholds::{self, ThresholdMetric, ThresholdSettings, Thresholds};
 
 pub const SETTINGS_FILE: &str = "settings.toml";
 pub const STATE_FILE: &str = "state.toml";
@@ -349,6 +352,11 @@ pub struct Settings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub cluster_tags: Vec<TaggedCluster>,
+    /// Dashboard warning thresholds (ADR-0017): global values and overrides per context and
+    /// server. Read them through [`Settings::thresholds_for`]. A value this version cannot use
+    /// falls back on its own and is logged when the file loads.
+    #[serde(skip_serializing_if = "ThresholdSettings::is_empty")]
+    pub thresholds: ThresholdSettings,
     /// Lines each log session keeps; older lines are dropped. Applies to sessions opened after
     /// a change. Read it through [`Settings::log_buffer_limit`].
     pub log_buffer_lines: u32,
@@ -376,6 +384,7 @@ impl Default for Settings {
             cluster_watch_mode: BTreeMap::new(),
             cluster_names: BTreeMap::new(),
             cluster_tags: Vec::new(),
+            thresholds: ThresholdSettings::default(),
             log_buffer_lines: DEFAULT_LOG_BUFFER_LINES,
             log_buffer_mib: DEFAULT_LOG_BUFFER_MIB,
             log_total_mib: DEFAULT_LOG_TOTAL_MIB,
@@ -469,6 +478,12 @@ impl Settings {
             .iter()
             .find(|e| e.context == context && same_server(&e.server, server))
             .map(|e| e.tag)
+    }
+
+    /// The dashboard thresholds in force for `context` at `server`. A context with no server gets
+    /// the global values.
+    pub fn thresholds_for(&self, context: &str, server: Option<&str>) -> Thresholds {
+        self.thresholds.for_cluster(context, server)
     }
 
     /// What applies while `settings.toml` cannot be read, keeping the harmless parts of `self`
@@ -610,17 +625,20 @@ fn config_dir_from(
 
 pub fn load_settings(dir: &Path) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let settings = load_toml(&path)?;
-    validate(&settings, &path)?;
+    let Some(text) = read_settings_text(&path)? else {
+        return Ok(Settings::default());
+    };
+    let (settings, table) = parse_settings(&text, &path)?;
     // Unknown keys are ignored, so a newer file still loads; a misspelling of a known key
     // (`protect_local_cluster`) would then fail open without a word. Say so in the log.
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(table) = toml::from_str::<toml::Table>(&text)
-    {
-        for (unknown, known) in misspelled_keys(&table) {
-            tracing::warn!(
-                "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
-            );
+    for (unknown, known) in misspelled_keys(&table) {
+        tracing::warn!(
+            "settings.toml: unknown key `{unknown}` is ignored; did you mean `{known}`?"
+        );
+    }
+    if let Some(section) = table.get(thresholds::SECTION_KEY) {
+        for issue in ThresholdSettings::from_toml(section).1 {
+            tracing::warn!("settings.toml: {issue}");
         }
     }
     Ok(settings)
@@ -679,6 +697,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "cluster_watch_mode",
     "cluster_names",
     "cluster_tags",
+    thresholds::SECTION_KEY,
     "log_buffer_lines",
     "log_buffer_mib",
     "log_total_mib",
@@ -777,7 +796,11 @@ pub fn load_state(dir: &Path) -> Result<State, SettingsError> {
 }
 
 pub fn save_state(dir: &Path, state: &State) -> Result<(), SettingsError> {
-    write_atomic(&dir.join(STATE_FILE), &toml::to_string_pretty(state)?)
+    write_atomic(
+        &dir.join(STATE_FILE),
+        &toml::to_string_pretty(state)?,
+        DanglingLink::Replace,
+    )
 }
 
 /// Server URLs compare equal when they differ only by a trailing slash.
@@ -1070,6 +1093,36 @@ pub fn set_cluster_tag(
     })
 }
 
+/// Sets one dashboard threshold, globally (`cluster` is `None`) or for a context at one server,
+/// and writes `settings.toml`. `value` `None` clears it, so it follows the next level down;
+/// clearing what is not set writes nothing. A value out of range, or a `thresholds` section of
+/// the wrong shape, is an error and leaves the file as it is. Returns the settings as written.
+pub fn set_threshold(
+    dir: &Path,
+    cluster: Option<&ClusterPin>,
+    metric: ThresholdMetric,
+    value: Option<u32>,
+) -> Result<Settings, SettingsError> {
+    let path = dir.join(SETTINGS_FILE);
+    let invalid = |path: &Path, error: thresholds::ThresholdWriteError| SettingsError::Invalid {
+        path: path.to_owned(),
+        reason: error.to_string(),
+    };
+    if value.is_none() {
+        let mut table: toml::Table = load_toml(&path)?;
+        let changed = thresholds::write_value(&mut table, cluster, metric, None)
+            .map_err(|e| invalid(&path, e))?;
+        if !changed {
+            return load_settings(dir);
+        }
+    }
+    edit_settings(dir, |table, path| {
+        thresholds::write_value(table, cluster, metric, value)
+            .map(drop)
+            .map_err(|e| invalid(path, e))
+    })
+}
+
 /// Sets the appearance and writes `settings.toml`. Returns the settings as written.
 pub fn set_appearance(dir: &Path, appearance: Appearance) -> Result<Settings, SettingsError> {
     edit_settings(dir, |table, _| {
@@ -1099,44 +1152,246 @@ pub fn set_log_buffer_mib(dir: &Path, mib: u32) -> Result<Settings, SettingsErro
     })
 }
 
-/// Reads `settings.toml` as a TOML table, lets `edit` change it, checks the result still parses
-/// as [`Settings`], and writes it. Keys this version does not know survive; comments and
-/// formatting are not preserved.
+/// Reads `settings.toml`, lets `edit` change it as a TOML table, checks the result still parses
+/// as [`Settings`], and writes it. A file that does not load today is left as it is, so an edit
+/// cannot bring its other values into effect. Keys this version does not know survive; comments
+/// and formatting are not preserved.
+///
+/// The read, the edit and the write happen under [`SaveLock`], so saves from several Flint
+/// processes apply one after another, each to what the last one wrote. This can wait up to
+/// [`SAVE_LOCK_WAIT`]: call it off the UI thread and off async workers.
 fn edit_settings(
     dir: &Path,
     edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
 ) -> Result<Settings, SettingsError> {
     let path = dir.join(SETTINGS_FILE);
-    let mut table: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-            path: path.clone(),
-            source,
-        })?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => toml::Table::new(),
-        Err(source) => return Err(SettingsError::Read { path, source }),
+    let lock = lock_for_save(&path, try_flock)?;
+    edit_locked(&path, &lock, edit)
+}
+
+/// The read, edit and write of [`edit_settings`], all on the file `lock` was taken for. If
+/// `path` has come to lead elsewhere by the time of the write, nothing is written.
+fn edit_locked(
+    path: &Path,
+    lock: &SaveLock,
+    edit: impl FnOnce(&mut toml::Table, &Path) -> Result<(), SettingsError>,
+) -> Result<Settings, SettingsError> {
+    let mut table = match read_settings_text(&lock.target)? {
+        Some(text) => parse_settings(&text, path)?.1,
+        None => toml::Table::new(),
     };
-    edit(&mut table, &path)?;
+    edit(&mut table, path)?;
     let text = toml::to_string_pretty(&table)?;
     let settings: Settings = toml::from_str(&text).map_err(|source| SettingsError::Parse {
-        path: path.clone(),
+        path: path.to_owned(),
         source,
     })?;
-    validate(&settings, &path)?;
-    write_atomic(&path, &text)?;
+    validate(&settings, path)?;
+    let write_error = |source| SettingsError::Write {
+        path: path.to_owned(),
+        source,
+    };
+    if !lock.is_current(path).map_err(write_error)? {
+        return Err(write_error(io::Error::other(
+            "the settings file was moved during the save; try again",
+        )));
+    }
+    write_atomic(&lock.target, &text, DanglingLink::Keep)?;
     Ok(settings)
 }
 
-fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, SettingsError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
+/// How long a save waits for another process's save before it fails.
+const SAVE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// An exclusive `flock` serializing saves of one settings file. It is on a separate file, because
+/// a save replaces the settings file and with it any lock held on it. The OS releases it when the
+/// holder exits, however that happens.
+struct SaveLock {
+    /// Closing it releases the lock. `None` on a filesystem without file locks, where the save
+    /// goes ahead unserialized: refusing it would make a revocation impossible there.
+    file: Option<std::fs::File>,
+    /// The file this lock is for: what the save reads and replaces.
+    target: PathBuf,
+}
+
+/// One non-blocking attempt at the lock on an open file.
+type TryLock = fn(&std::fs::File) -> io::Result<()>;
+
+fn try_flock(file: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: flock on a descriptor `file` owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+impl SaveLock {
+    /// Takes the lock for the settings file at `settings`, trying for up to `wait`.
+    #[cfg(test)]
+    fn take(settings: &Path, wait: Duration) -> io::Result<Self> {
+        Self::take_with(settings, wait, try_flock)
+    }
+
+    /// Takes the lock on the lock file that belongs to `settings` once it is held: a link may be
+    /// pointed elsewhere, or the lock file replaced, during the wait, so both are checked again
+    /// and a stale lock is dropped for the current one, all within `wait`.
+    fn take_with(settings: &Path, wait: Duration, try_lock: TryLock) -> io::Result<Self> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let file = open_save_lock(&save_lock_path(&save_target(settings)))?;
+            match wait_for_lock(&file, deadline, try_lock) {
+                Ok(()) => {}
+                Err(error) if locks_unsupported(&error) => {
+                    tracing::warn!("saving settings without a lock: file locks are unsupported");
+                    return Ok(SaveLock {
+                        file: None,
+                        target: save_target(settings),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+            let target = save_target(settings);
+            if names_open_file(&save_lock_path(&target), &file)? {
+                return Ok(SaveLock {
+                    file: Some(file),
+                    target,
+                });
+            }
+            drop(file);
+            if Instant::now() >= deadline {
+                return Err(save_lock_timeout());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Whether `settings` still leads to the file this lock is for.
+    fn is_current(&self, settings: &Path) -> io::Result<bool> {
+        let target = save_target(settings);
+        match &self.file {
+            Some(file) => names_open_file(&save_lock_path(&target), file),
+            None => Ok(target == self.target),
+        }
+    }
+}
+
+/// Opens (creating it if needed) the lock file at `path`.
+fn open_save_lock(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Non-blocking, so that something other than a regular file here cannot hang the open.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the settings lock is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Tries `try_lock` until it succeeds or `deadline` passes.
+fn wait_for_lock(file: &std::fs::File, deadline: Instant, try_lock: TryLock) -> io::Result<()> {
+    loop {
+        let error = match try_lock(file) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(save_lock_timeout());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn save_lock_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "another Flint is still saving settings; try again",
+    )
+}
+
+/// Whether `error` says this filesystem has no file locks, as opposed to a lock that failed.
+fn locks_unsupported(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| [libc::ENOLCK, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code))
+}
+
+/// Whether `path` is the open `file` (false when it is gone or replaced).
+fn names_open_file(path: &Path, file: &std::fs::File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let open = file.metadata()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(current) => Ok(open.dev() == current.dev() && open.ino() == current.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The file a save of `settings` really replaces: through any symlink, or `settings` itself
+/// if it does not exist yet.
+fn save_target(settings: &Path) -> PathBuf {
+    std::fs::canonicalize(settings).unwrap_or_else(|_| settings.to_owned())
+}
+
+/// The lock file beside `target` (see [`save_target`]), so paths that link to one settings file
+/// share one lock, and a directory a save can write to is also one that can hold the lock.
+fn save_lock_path(target: &Path) -> PathBuf {
+    let mut path = target.as_os_str().to_owned();
+    path.push(".lock");
+    path.into()
+}
+
+/// [`SaveLock::take_with`] for a save. A dangling link fails as unreadable before anything is
+/// created beside it. If the lock cannot be set up, a settings file that cannot be read is
+/// reported as that. A timeout reads nothing: the holder may be stuck on that same read.
+fn lock_for_save(path: &Path, try_lock: TryLock) -> Result<SaveLock, SettingsError> {
+    if behind_dangling_link(path) {
+        read_settings_text(path)?;
+    }
+    SaveLock::take_with(path, SAVE_LOCK_WAIT, try_lock).or_else(|source| {
+        if source.kind() != io::ErrorKind::TimedOut {
+            read_settings_text(path)?;
+        }
+        Err(SettingsError::Write {
             path: path.to_owned(),
             source,
-        }),
+        })
+    })
+}
+
+fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, SettingsError> {
+    match read_toml(path)? {
+        Some(text) => parse_toml(&text, path),
+        None => Ok(T::default()),
+    }
+}
+
+/// The text of the file at `path`, or `None` if there is no file.
+fn read_toml(path: &Path) -> Result<Option<String>, SettingsError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
         // A missing file is a fresh install. A symlink whose target is missing is not: the
         // user keeps the file elsewhere, and it may have said something (such as
         // `protect_local_clusters`) that defaults would quietly undo.
         Err(e) if e.kind() == io::ErrorKind::NotFound && path.symlink_metadata().is_err() => {
-            Ok(T::default())
+            Ok(None)
         }
         Err(source) => Err(SettingsError::Read {
             path: path.to_owned(),
@@ -1145,9 +1400,99 @@ fn load_toml<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, S
     }
 }
 
+/// The text of `settings.toml`, or `None` on a first run. A config directory reached through a
+/// link that leads nowhere is not a first run: the file may be there once the link resolves.
+fn read_settings_text(path: &Path) -> Result<Option<String>, SettingsError> {
+    let text = read_toml(path)?;
+    if text.is_none() && behind_dangling_link(path) {
+        return Err(SettingsError::Read {
+            path: path.to_owned(),
+            source: io::ErrorKind::NotFound.into(),
+        });
+    }
+    Ok(text)
+}
+
+/// Whether the deepest part of `path` that exists is a link that cannot be followed.
+fn behind_dangling_link(path: &Path) -> bool {
+    path.ancestors()
+        .find(|p| {
+            !p.symlink_metadata()
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        })
+        .is_some_and(|p| std::fs::metadata(p).is_err())
+}
+
+/// `text` as [`Settings`] and as a table, both from this one text, checked with [`validate`].
+/// The table is what an edit changes, so a text only one of the two accepts is refused.
+fn parse_settings(text: &str, path: &Path) -> Result<(Settings, toml::Table), SettingsError> {
+    let settings: Settings = parse_toml(text, path)?;
+    let table: toml::Table = parse_toml(text, path)?;
+    validate(&settings, path)?;
+    check_saves_faithfully(text, &table, path)?;
+    Ok((settings, table))
+}
+
+/// The key the TOML parser uses internally to carry a date. Written by hand, it turns the table
+/// around it into a date and drops that table's other keys.
+const TOML_DATETIME_KEY: &str = "$__toml_private_datetime";
+
+/// Refuses a text an edit could not write back as it reads: one holding [`TOML_DATETIME_KEY`],
+/// or one whose table renders to TOML that does not parse (keys nested too deep for a header).
+fn check_saves_faithfully(
+    text: &str,
+    table: &toml::Table,
+    path: &Path,
+) -> Result<(), SettingsError> {
+    let invalid = |reason: &str| SettingsError::Invalid {
+        path: path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let parsed = toml::de::DeTable::parse(text).map_err(|_| invalid("it cannot be parsed"))?;
+    if table_has_datetime_key(parsed.get_ref()) {
+        return Err(invalid("it uses a key reserved by the TOML parser"));
+    }
+    let nested_too_deep = || invalid("its keys are nested too deeply to save");
+    let rendered = toml::to_string_pretty(table).map_err(|_| nested_too_deep())?;
+    toml::from_str::<toml::Table>(&rendered).map_err(|_| nested_too_deep())?;
+    Ok(())
+}
+
+fn table_has_datetime_key(table: &toml::de::DeTable<'_>) -> bool {
+    table.iter().any(|(key, value)| {
+        key.get_ref().as_ref() == TOML_DATETIME_KEY || value_has_datetime_key(value.get_ref())
+    })
+}
+
+fn value_has_datetime_key(value: &toml::de::DeValue<'_>) -> bool {
+    match value {
+        toml::de::DeValue::Table(table) => table_has_datetime_key(table),
+        toml::de::DeValue::Array(items) => items
+            .iter()
+            .any(|item| value_has_datetime_key(item.get_ref())),
+        _ => false,
+    }
+}
+
+fn parse_toml<T: for<'de> Deserialize<'de>>(text: &str, path: &Path) -> Result<T, SettingsError> {
+    toml::from_str(text).map_err(|source| SettingsError::Parse {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// What a save does when the file is a symlink whose target is missing.
+#[derive(Clone, Copy, PartialEq)]
+enum DanglingLink {
+    /// Fail and leave the link, which still says where the file lives.
+    Keep,
+    /// Put a regular file in its place: losing the link costs less than losing the save.
+    Replace,
+}
+
 /// Writes through a temporary file and a rename, so a reader (the MCP server re-reads settings on
 /// every call) never sees a half-written file.
-fn write_atomic(path: &Path, text: &str) -> Result<(), SettingsError> {
+fn write_atomic(path: &Path, text: &str, dangling: DanglingLink) -> Result<(), SettingsError> {
     let err = |source| SettingsError::Write {
         path: path.to_owned(),
         source,
@@ -1156,7 +1501,18 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), SettingsError> {
         std::fs::create_dir_all(parent).map_err(err)?;
     }
     // Write through a symlink (for example a dotfiles checkout) instead of replacing the link.
-    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let path = &match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_)
+            if dangling == DanglingLink::Replace
+                || path
+                    .symlink_metadata()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            path.to_owned()
+        }
+        Err(source) => return Err(err(source)),
+    };
     let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
     std::fs::write(&tmp, text).map_err(err)?;
     std::fs::rename(&tmp, path).map_err(err)
@@ -1166,6 +1522,261 @@ pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     match (path.strip_prefix("~"), home) {
         (Ok(rest), Some(home)) => home.join(rest),
         _ => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod save_lock_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+
+    const CHILD_DIR: &str = "FLINT_TEST_SAVE_LOCK_DIR";
+    const CHILD_ROLE: &str = "FLINT_TEST_SAVE_LOCK_ROLE";
+    const EDITS: usize = 30;
+    const HELD_MARKER: &str = "held";
+
+    /// Not a test of its own: what [`spawn_child`] runs in another process.
+    #[test]
+    fn child_process() {
+        let (Some(dir), Ok(role)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_ROLE)) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        if role == "hold" {
+            let _lock = SaveLock::take(&dir.join(SETTINGS_FILE), Duration::from_secs(10)).unwrap();
+            std::fs::write(dir.join(HELD_MARKER), "").unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+        } else {
+            for i in 0..EDITS {
+                let name = format!("{role}{i}");
+                set_cluster_name(&dir, &name, Some(&name)).unwrap();
+            }
+        }
+    }
+
+    fn spawn_child(dir: &Path, role: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "settings::save_lock_tests::child_process"])
+            .env(CHILD_DIR, dir)
+            .env(CHILD_ROLE, role)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn two_processes_saving_at_once_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let children = ["a", "b"].map(|role| spawn_child(dir.path(), role));
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let saved = load_settings(dir.path()).unwrap();
+        for role in ["a", "b"] {
+            for i in 0..EDITS {
+                let name = format!("{role}{i}");
+                assert_eq!(saved.cluster_names.get(&name), Some(&name));
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_save_does_not_undo_a_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        set_trusted(path, "dev", Some("https://dev")).unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            // Dropped if an assertion below fails, so the stale save cannot wait forever.
+            let finish_tx = finish_tx;
+            let stale = scope.spawn(move || {
+                edit_settings(path, move |table, _| {
+                    read_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    table.insert("appearance".into(), "dark".into());
+                    Ok(())
+                })
+            });
+            read_rx.recv().unwrap();
+            let revoke = scope.spawn(move || set_trusted(path, "dev", None));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!revoke.is_finished(), "the revocation waits for the save");
+            finish_tx.send(()).unwrap();
+            stale.join().unwrap().unwrap();
+            revoke.join().unwrap().unwrap();
+        });
+        let saved = load_settings(path).unwrap();
+        assert!(saved.trusted_clusters.is_empty(), "still revoked");
+        assert_eq!(saved.appearance, Appearance::Dark, "both edits kept");
+    }
+
+    #[test]
+    fn a_held_lock_fails_the_save_within_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(&path, "appearance = \"light\"\n").unwrap();
+        let held = SaveLock::take(&path, Duration::ZERO).unwrap();
+
+        let started = Instant::now();
+        let error = set_appearance(dir.path(), Appearance::Dark).unwrap_err();
+        let waited = started.elapsed();
+        assert!(waited >= SAVE_LOCK_WAIT && waited < SAVE_LOCK_WAIT * 5);
+        let SettingsError::Write { source, .. } = &error else {
+            panic!("expected a write error, got {error:?}");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("another Flint"));
+        assert_eq!(
+            load_settings(dir.path()).unwrap().appearance,
+            Appearance::Light
+        );
+
+        drop(held);
+        set_appearance(dir.path(), Appearance::Dark).unwrap();
+    }
+
+    #[test]
+    fn a_crashed_holder_does_not_block_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut holder = spawn_child(dir.path(), "hold");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dir.path().join(HELD_MARKER).exists() {
+            assert!(Instant::now() < deadline, "the holder never took the lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let path = dir.path().join(SETTINGS_FILE);
+        assert!(SaveLock::take(&path, Duration::ZERO).is_err(), "it is held");
+
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        set_appearance(dir.path(), Appearance::Dark).unwrap();
+    }
+
+    #[test]
+    fn a_lock_path_that_is_not_a_file_fails_without_hanging() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let fifo = std::ffi::CString::new(save_lock_path(&path).as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            set_appearance(dir.path(), Appearance::Dark),
+            Err(SettingsError::Write { .. })
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_lock_file_replaced_during_the_wait_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let held = SaveLock::take(&path, Duration::ZERO).unwrap();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| SaveLock::take(&path, Duration::from_secs(10)));
+            std::thread::sleep(Duration::from_millis(100));
+            let sidecar = save_lock_path(&save_target(&path));
+            std::fs::remove_file(&sidecar).unwrap();
+            std::fs::write(&sidecar, "").unwrap();
+            drop(held);
+            let lock = waiter.join().unwrap().unwrap();
+            assert!(lock.is_current(&path).unwrap(), "on the new lock file");
+            assert!(SaveLock::take(&path, Duration::ZERO).is_err(), "held");
+        });
+    }
+
+    #[test]
+    fn a_link_retargeted_during_the_wait_locks_the_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (old, new) = (root.join("old.toml"), root.join("new.toml"));
+        std::fs::write(&old, "appearance = \"light\"\n").unwrap();
+        std::fs::write(&new, "appearance = \"dark\"\n").unwrap();
+        let link = root.join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let held = SaveLock::take(&link, Duration::ZERO).unwrap();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| SaveLock::take(&link, Duration::from_secs(10)));
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&new, &link).unwrap();
+            drop(held);
+            assert_eq!(waiter.join().unwrap().unwrap().target, new);
+        });
+    }
+
+    #[test]
+    fn a_link_retargeted_under_the_lock_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (old, new) = (root.join("old.toml"), root.join("new.toml"));
+        let (old_text, new_text) = ("appearance = \"light\"\n", "appearance = \"system\"\n");
+        std::fs::write(&old, old_text).unwrap();
+        std::fs::write(&new, new_text).unwrap();
+        let link = root.join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let lock = lock_for_save(&link, try_flock).unwrap();
+        let result = edit_locked(&link, &lock, |table, _| {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&new, &link).unwrap();
+            table.insert("appearance".into(), "dark".into());
+            Ok(())
+        });
+        assert!(matches!(result, Err(SettingsError::Write { .. })));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), new_text);
+    }
+
+    #[test]
+    fn a_filesystem_without_locks_still_saves_a_revocation() {
+        fn unsupported(code: i32) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(code))
+        }
+        let attempts: [TryLock; 3] = [
+            |_| unsupported(libc::ENOLCK),
+            |_| unsupported(libc::ENOTSUP),
+            |_| unsupported(libc::EOPNOTSUPP),
+        ];
+        for try_lock in attempts {
+            let dir = tempfile::tempdir().unwrap();
+            set_trusted(dir.path(), "dev", Some("https://dev")).unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            let lock = lock_for_save(&path, try_lock).unwrap();
+            assert!(lock.file.is_none());
+            edit_locked(&path, &lock, |table, _| {
+                table.remove("trusted_clusters");
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                load_settings(dir.path())
+                    .unwrap()
+                    .trusted_clusters
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_lock_error_fails_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let failed = lock_for_save(&path, |_| Err(io::Error::from_raw_os_error(libc::EIO)));
+        assert!(matches!(failed, Err(SettingsError::Write { .. })));
+    }
+
+    #[test]
+    fn a_dangling_config_dir_stays_a_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
+        assert!(matches!(
+            set_appearance(&link, Appearance::Dark),
+            Err(SettingsError::Read { .. })
+        ));
+        assert!(!dir.path().join("gone").exists());
     }
 }
 
@@ -1309,6 +1920,339 @@ mod cluster_tag_tests {
     fn cluster_tags_is_a_known_key() {
         let table: toml::Table = toml::from_str("cluster_tags = []").unwrap();
         assert!(misspelled_keys(&table).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod threshold_settings_tests {
+    use super::*;
+    use crate::thresholds::ThresholdMetric::{CpuPercent, MemoryPercent, RestartsLastHour};
+
+    const A: &str = "https://a.example:6443";
+    const B: &str = "https://b.example:6443";
+
+    fn write(dir: &Path, text: &str) {
+        std::fs::write(dir.join(SETTINGS_FILE), text).unwrap();
+    }
+
+    fn read(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap()
+    }
+
+    // covers UP-67: a file from before thresholds loads with the defaults, and an unrelated save
+    // adds no thresholds key and keeps what it held.
+    #[test]
+    fn a_file_without_thresholds_loads_and_saves_unchanged_in_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+            appearance = "dark"
+            protect_local_clusters = true
+            watch_mode = "on_view"
+            future_key = 1
+            [cluster_watch_mode]
+            prod = "all"
+            [[trusted_clusters]]
+            context = "prod"
+            server = "https://a.example:6443"
+        "#;
+        write(dir.path(), text);
+        let before = load_settings(dir.path()).unwrap();
+        assert_eq!(before.thresholds, ThresholdSettings::default());
+        assert_eq!(
+            before.thresholds_for("prod", Some(A)),
+            Thresholds::default()
+        );
+
+        let saved = set_appearance(dir.path(), Appearance::Dark).unwrap();
+        assert_eq!(saved, before);
+        let written = read(dir.path());
+        assert!(!written.contains("thresholds"), "{written}");
+        assert!(written.contains("future_key"), "{written}");
+        assert_eq!(load_settings(dir.path()).unwrap(), before);
+    }
+
+    // covers UP-67: an override replaces only what it sets, and stays with its server.
+    #[test]
+    fn an_override_is_bound_to_the_context_and_server() {
+        let dir = tempfile::tempdir().unwrap();
+        set_threshold(dir.path(), None, CpuPercent, Some(80)).unwrap();
+        let pin = ClusterPin::new("ctx", A);
+        let settings = set_threshold(dir.path(), Some(&pin), MemoryPercent, Some(60)).unwrap();
+
+        let here = settings.thresholds_for("ctx", Some("https://a.example:6443/"));
+        assert_eq!(here.get(MemoryPercent), 60);
+        assert_eq!(here.get(CpuPercent), 80, "from the global value");
+        assert_eq!(here.get(RestartsLastHour), 5, "from the default");
+        for (context, server) in [("ctx", Some(B)), ("ctx", None), ("other", Some(A))] {
+            let elsewhere = settings.thresholds_for(context, server);
+            assert_eq!(elsewhere.get(MemoryPercent), 90, "{context} {server:?}");
+            assert_eq!(elsewhere.get(CpuPercent), 80, "{context} {server:?}");
+        }
+        assert_eq!(load_settings(dir.path()).unwrap(), settings);
+    }
+
+    // covers UP-67: a bad section loses only itself, is reported, and survives an unrelated save.
+    #[test]
+    fn invalid_thresholds_fall_back_and_keep_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for section in [
+            "thresholds = 3",
+            "[thresholds]\ncpu_percent = 500",
+            "[thresholds]\nclusters = 3",
+            "[thresholds.clusters.prod]\ncpu_percent = 50",
+            "[[thresholds.clusters]]\ncontext = \"no-server\"\ncpu_percent = 50",
+        ] {
+            write(
+                dir.path(),
+                &format!("appearance = \"dark\"\nprotect_local_clusters = true\n{section}\n"),
+            );
+            let settings = load_settings(dir.path()).unwrap();
+            assert_eq!(settings.appearance, Appearance::Dark, "{section}");
+            assert!(settings.protect_local_clusters, "{section}");
+            assert_eq!(
+                settings.thresholds_for("no-server", Some(A)),
+                Thresholds::default(),
+                "{section}"
+            );
+            set_appearance(dir.path(), Appearance::Light).unwrap();
+            let kept: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+            let original: toml::Table = toml::from_str(&format!("{section}\n")).unwrap();
+            assert_eq!(
+                kept.get("thresholds"),
+                original.get("thresholds"),
+                "{section}"
+            );
+        }
+    }
+
+    // covers UP-67: a refused write changes nothing, and a section of the wrong shape is not
+    // replaced.
+    #[test]
+    fn a_refused_write_leaves_the_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = ClusterPin::new("ctx", A);
+        for (text, cluster, value) in [
+            ("appearance = \"dark\"\n", None, Some(101)),
+            ("thresholds = 3\n", None, Some(80)),
+            ("[thresholds]\nclusters = 3\n", Some(&pin), Some(80)),
+            ("[thresholds]\nclusters = 3\n", Some(&pin), None),
+        ] {
+            write(dir.path(), text);
+            let error = set_threshold(dir.path(), cluster, CpuPercent, value).unwrap_err();
+            assert!(matches!(error, SettingsError::Invalid { .. }), "{text}");
+            assert_eq!(read(dir.path()), text);
+        }
+        let blank = ClusterPin::new("ctx", " ");
+        write(dir.path(), "appearance = \"dark\"\n");
+        assert!(set_threshold(dir.path(), Some(&blank), CpuPercent, Some(80)).is_err());
+    }
+
+    // covers UP-67: clearing leaves no empty section, keeps a newer version's keys, and a
+    // repeated entry cannot bring the value back.
+    #[test]
+    fn clearing_removes_only_what_it_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = ClusterPin::new("ctx", A);
+        set_threshold(dir.path(), Some(&pin), CpuPercent, Some(50)).unwrap();
+        set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        assert!(!read(dir.path()).contains("thresholds"));
+
+        write(
+            dir.path(),
+            r#"
+            [thresholds]
+            future_metric = 1
+            [[thresholds.clusters]]
+            context = "ctx"
+            server = "https://a.example:6443"
+            cpu_percent = 50
+            future_field = 2
+            [[thresholds.clusters]]
+            context = "ctx"
+            server = "https://a.example:6443/"
+            cpu_percent = 40
+            "#,
+        );
+        let settings = set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        assert_eq!(settings.thresholds_for("ctx", Some(A)).get(CpuPercent), 90);
+        let written = read(dir.path());
+        assert!(written.contains("future_metric"), "{written}");
+        assert!(written.contains("future_field"), "{written}");
+    }
+
+    // covers UP-67
+    #[test]
+    fn clearing_what_is_not_set_does_not_touch_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let pin = ClusterPin::new("ctx", A);
+        set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        assert!(!path.exists(), "no file is created");
+
+        let text = "# kept by hand\n[thresholds]\ncpu_percent = 80\n";
+        write(dir.path(), text);
+        set_threshold(dir.path(), Some(&pin), CpuPercent, None).unwrap();
+        set_threshold(dir.path(), None, MemoryPercent, None).unwrap();
+        assert_eq!(read(dir.path()), text);
+    }
+
+    #[test]
+    fn thresholds_is_a_known_key() {
+        let table: toml::Table = toml::from_str("threshold = 3").unwrap();
+        assert_eq!(
+            misspelled_keys(&table),
+            [("threshold".to_owned(), thresholds::SECTION_KEY)],
+        );
+        let table: toml::Table = toml::from_str("thresholds = 3").unwrap();
+        assert!(misspelled_keys(&table).is_empty());
+    }
+
+    // covers UP-67
+    #[test]
+    fn a_threshold_value_a_table_refuses_makes_the_file_unreadable_for_load_and_edit() {
+        let pins = format!(
+            "protect_local_clusters = false\n\
+             trusted_clusters = [{{ context = \"t\", server = \"{A}\" }}]\n\
+             [[ai_exposed_clusters]]\ncontext = \"x\"\nserver = \"{A}\"\n"
+        );
+        let entry = format!("context = \"prod\"\nserver = \"{A}\"\n");
+        for section in [
+            "[thresholds]\ncpu_percent = 9223372036854775808\n".to_owned(),
+            format!("[[thresholds.clusters]]\n{entry}cpu_percent = 18446744073709551615\n"),
+            "[thresholds]\n\"$__toml_private_datetime\" = 1\n".to_owned(),
+            format!("[[thresholds.clusters]]\n\"$__toml_private_datetime\" = 1\n{entry}"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = format!("{pins}{section}");
+            write(dir.path(), &text);
+
+            assert!(
+                matches!(load_settings(dir.path()), Err(SettingsError::Parse { .. })),
+                "{section}"
+            );
+            let (loaded, reason) = load_settings_or_fallback(dir.path());
+            assert!(reason.is_some(), "{section}");
+            assert!(loaded.ai_exposed_clusters.is_empty());
+            assert!(loaded.trusted_clusters.is_empty());
+            assert!(loaded.protect_local_clusters);
+
+            let scope = AiScope::default();
+            assert!(set_ai_exposed(dir.path(), "x", None, &scope).is_err());
+            assert!(set_ai_exposed(dir.path(), "new", Some(B), &scope).is_err());
+            assert!(set_trusted(dir.path(), "t", None).is_err());
+            assert!(set_trusted(dir.path(), "new", Some(B)).is_err());
+            assert_eq!(read(dir.path()), text, "the file is left as it is");
+        }
+    }
+
+    // covers UP-67: a file that loads but could not be written back, or that a save would
+    // rewrite into something else, takes the unreadable path with its pins out of effect.
+    #[test]
+    fn a_file_a_save_cannot_reproduce_is_unreadable() {
+        let pins = format!(
+            "protect_local_clusters = false\n\
+             trusted_clusters = [{{ context = \"t\", server = \"{A}\" }}]\n\
+             [[ai_exposed_clusters]]\ncontext = \"x\"\nserver = \"{A}\"\n"
+        );
+        let deep = format!("cpu_percent{} = {{}}", ".a".repeat(79));
+        for section in [
+            format!("[thresholds]\n{deep}\n"),
+            "[thresholds]\ncpu_percent = 80\n\"$__toml_private_datetime\" = \"2026-11-22\"\n"
+                .to_owned(),
+            "[future]\nkept = 1\n\"\\u0024__toml_private_datetime\" = \"2026-11-22\"\n".to_owned(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = format!("{pins}{section}");
+            write(dir.path(), &text);
+
+            let (loaded, reason) = load_settings_or_fallback(dir.path());
+            assert!(reason.is_some(), "{section}");
+            assert!(loaded.ai_exposed_clusters.is_empty(), "{section}");
+            assert!(loaded.trusted_clusters.is_empty(), "{section}");
+            assert!(loaded.protect_local_clusters, "{section}");
+            assert!(set_appearance(dir.path(), Appearance::Dark).is_err());
+            assert_eq!(read(dir.path()), text, "the file is left as it is");
+        }
+    }
+
+    // covers UP-67: a binding must be a string; a date is not the context of that name.
+    #[test]
+    fn a_date_is_not_a_cluster_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        for binding in [
+            format!("context = 2026-11-22\nserver = \"{A}\""),
+            "context = \"2026-11-22\"\nserver = 2026-11-22".to_owned(),
+        ] {
+            write(
+                dir.path(),
+                &format!("[[thresholds.clusters]]\n{binding}\ncpu_percent = 50\n"),
+            );
+            let settings = load_settings(dir.path()).unwrap();
+            assert!(settings.thresholds.clusters.is_empty(), "{binding}");
+            for server in [A, "2026-11-22"] {
+                let found = settings.thresholds_for("2026-11-22", Some(server));
+                assert_eq!(found.get(CpuPercent), 90, "{binding}");
+            }
+        }
+    }
+
+    // covers UP-67: a value that is ignored is reported in the log, by key and without its value.
+    #[test]
+    fn an_ignored_threshold_is_logged() {
+        #[derive(Clone, Default)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[thresholds]\ncpu_percent = 500\n");
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || load_settings(dir.path()).unwrap());
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("cpu_percent"), "{logged}");
+        assert!(!logged.contains("500"), "{logged}");
+    }
+
+    // covers UP-67: saving and clearing a threshold keeps trust, exposure and protection.
+    #[test]
+    fn a_threshold_edit_keeps_trust_and_exposure() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            &format!(
+                "protect_local_clusters = false\n\
+                 trusted_clusters = [{{ context = \"t\", server = \"{A}\" }}]\n\
+                 [[ai_exposed_clusters]]\ncontext = \"x\"\nserver = \"{A}\"\n\
+                 namespaces = [\"apps\"]\n"
+            ),
+        );
+        let before = load_settings(dir.path()).unwrap();
+        assert_eq!(before.ai_exposed_clusters.len(), 1);
+        assert_eq!(before.trusted_clusters.len(), 1);
+        let pin = ClusterPin::new("x", A);
+        for (cluster, value) in [
+            (None, Some(80)),
+            (Some(&pin), Some(60)),
+            (Some(&pin), None),
+            (None, None),
+        ] {
+            let saved = set_threshold(dir.path(), cluster, CpuPercent, value).unwrap();
+            assert_eq!(saved.ai_exposed_clusters, before.ai_exposed_clusters);
+            assert_eq!(saved.trusted_clusters, before.trusted_clusters);
+            assert_eq!(saved.protect_local_clusters, before.protect_local_clusters);
+            assert_eq!(load_settings(dir.path()).unwrap(), saved);
+        }
     }
 }
 
@@ -2217,6 +3161,313 @@ mod tests {
         .unwrap();
         let loaded = load_state(dir.path()).unwrap();
         assert!(!loaded.list_sorts["a"]["pods"].descending);
+    }
+
+    /// Pins that would be in effect if the file were taken at its word, followed by `tail`.
+    fn pinned_file(tail: &str) -> String {
+        format!(
+            r#"protect_local_clusters = false
+appearance = "dark"
+
+[[ai_exposed_clusters]]
+context = "staging"
+server = "https://staging.example:6443"
+
+[[trusted_clusters]]
+context = "staging"
+server = "https://staging.example:6443"
+
+{tail}
+"#
+        )
+    }
+
+    /// Every setter, each returning whether it failed.
+    fn setter_results(dir: &Path) -> Vec<(&'static str, bool)> {
+        let server = "https://staging.example:6443";
+        let scope = AiScope::default();
+        vec![
+            // Before `set_ai_exposed`, which hides the cluster this needs exposed.
+            (
+                "set_ai_scope",
+                set_ai_scope(dir, "staging", server, &scope, &scope).is_err(),
+            ),
+            (
+                "set_ai_exposed",
+                set_ai_exposed(dir, "staging", None, &scope).is_err(),
+            ),
+            ("set_trusted", set_trusted(dir, "staging", None).is_err()),
+            (
+                "set_watch_mode",
+                set_watch_mode(dir, None, Some(WatchMode::All)).is_err(),
+            ),
+            (
+                "set_cluster_name",
+                set_cluster_name(dir, "staging", Some("name")).is_err(),
+            ),
+            (
+                "set_cluster_tag",
+                set_cluster_tag(dir, "staging", server, Some(ClusterTag::Blue)).is_err(),
+            ),
+            (
+                "set_appearance",
+                set_appearance(dir, Appearance::Light).is_err(),
+            ),
+            (
+                "set_log_buffer_lines",
+                set_log_buffer_lines(dir, 5000).is_err(),
+            ),
+            ("set_log_buffer_mib", set_log_buffer_mib(dir, 8).is_err()),
+        ]
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_edited_is_unreadable() {
+        for tail in [
+            "future = 9223372036854775808",
+            "[future]\nnested = 9223372036854775808",
+            "[future.deeper]\nlist = [1, 9223372036854775808]",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            let text = pinned_file(tail);
+            std::fs::write(&path, &text).unwrap();
+            assert!(toml::from_str::<toml::Table>(&text).is_err(), "{tail}");
+
+            assert!(
+                matches!(load_settings(dir.path()), Err(SettingsError::Parse { .. })),
+                "{tail}"
+            );
+            let (settings, reason) = load_settings_or_fallback(dir.path());
+            assert_eq!(settings, Settings::default().unreadable_fallback());
+            assert!(settings.ai_exposed_clusters.is_empty());
+            assert!(settings.trusted_clusters.is_empty());
+            assert!(settings.protect_local_clusters);
+            let reason = reason.expect("the reason is shown");
+            assert!(!reason.contains("9223372036854775808"), "{reason}");
+
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(failed, "{setter} on {tail}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    text.as_bytes(),
+                    "{setter} on {tail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn files_readable_both_ways_load_unchanged() {
+        let largest = i64::MAX;
+        for tail in [
+            String::new(),
+            "future = 1".to_owned(),
+            format!("future = {largest}\nbelow = {}", i64::MIN),
+            "created = 2026-11-22T10:30:00Z\nday = 2026-11-22\nat = 10:30:00\nlocal = 2026-11-22T10:30:00.5".to_owned(),
+            "[future.deeper.still]\nratio = 1.5\non = true\nlist = [1, 2, 3]".to_owned(),
+            "[[future]]\nname = \"a\"\n[[future]]\nname = \"b\"\n[future.inner]\nn = 2".to_owned(),
+            "[cluster_names]\nstaging = \"Staging\"\n[cluster_watch_mode]\nstaging = \"all\"".to_owned(),
+            "[[cluster_tags]]\ncontext = \"staging\"\nserver = \"https://staging.example:6443\"\ntag = \"blue\"\nfuture = 2026-11-22".to_owned(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = pinned_file(&tail);
+            std::fs::write(dir.path().join(SETTINGS_FILE), &text).unwrap();
+            toml::from_str::<toml::Table>(&text).unwrap();
+            let typed: Settings = toml::from_str(&text).unwrap();
+
+            let loaded = load_settings(dir.path()).unwrap();
+            assert_eq!(loaded, typed, "{tail}");
+            assert_eq!(loaded.ai_exposed_clusters.len(), 1, "{tail}");
+            assert_eq!(loaded.trusted_clusters.len(), 1, "{tail}");
+            assert!(!loaded.protect_local_clusters, "{tail}");
+            assert_eq!(load_settings_or_fallback(dir.path()), (typed, None));
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(!failed, "{setter} on {tail}");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "log_buffer_lines = {max}\nlog_buffer_mib = {max}\nlog_total_mib = {max}\n",
+            max = u32::MAX
+        );
+        std::fs::write(dir.path().join(SETTINGS_FILE), &text).unwrap();
+        let loaded = load_settings(dir.path()).unwrap();
+        assert_eq!(loaded, toml::from_str::<Settings>(&text).unwrap());
+        assert_eq!(loaded.log_buffer_lines, u32::MAX);
+        assert_eq!(loaded.log_buffer_mib, u32::MAX);
+        assert_eq!(loaded.log_total_mib, u32::MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_dangling_symlink_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles.toml");
+        let link = dir.path().join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        for (setter, failed) in setter_results(dir.path()) {
+            assert!(failed, "{setter}");
+            assert_eq!(std::fs::read_link(&link).unwrap(), target, "{setter}");
+            assert!(!target.exists(), "{setter}");
+        }
+        // The target can vanish after the file was read, too.
+        assert!(matches!(
+            write_atomic(&link, "appearance = \"light\"\n", DanglingLink::Keep),
+            Err(SettingsError::Write { .. })
+        ));
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the link remains");
+
+        // Once the target is back, the link still leads to it and saves go through it.
+        std::fs::write(&target, "protect_local_clusters = true\n").unwrap();
+        assert!(load_settings(dir.path()).unwrap().protect_local_clusters);
+        set_appearance(dir.path(), Appearance::Light).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let saved: Settings = toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(saved.protect_local_clusters);
+        assert_eq!(saved.appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn a_save_creates_a_missing_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("not-yet").join("config");
+        set_appearance(&config, Appearance::Light).unwrap();
+        assert_eq!(
+            load_settings(&config).unwrap().appearance,
+            Appearance::Light
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_dir_behind_a_dangling_link_is_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("gone");
+        let link = root.path().join("config");
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+        let chained = root.path().join("chained");
+        std::os::unix::fs::symlink(&link, &chained).unwrap();
+
+        for dir in [link.clone(), chained, link.join("nested").join("flint")] {
+            assert!(
+                matches!(load_settings(&dir), Err(SettingsError::Read { .. })),
+                "{}",
+                dir.display()
+            );
+            let (settings, reason) = load_settings_or_fallback(&dir);
+            assert_eq!(settings, Settings::default().unreadable_fallback());
+            assert!(reason.is_some(), "{}", dir.display());
+            for (setter, failed) in setter_results(&dir) {
+                assert!(failed, "{setter} on {}", dir.display());
+            }
+            assert_eq!(std::fs::read_link(&link).unwrap(), gone);
+            assert!(!gone.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_config_dir_or_file_is_a_first_run() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-yet").join("flint");
+        assert_eq!(
+            load_settings_or_fallback(&missing),
+            (Settings::default(), None)
+        );
+
+        // A link to a directory that exists, with no settings file in it yet.
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.path().join("config");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            load_settings_or_fallback(&link),
+            (Settings::default(), None)
+        );
+        assert_eq!(
+            load_settings_or_fallback(&link.join("not-yet")),
+            (Settings::default(), None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_save_replaces_a_dangling_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("gone-state.toml");
+        let link = dir.path().join(STATE_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut state = State::default();
+        state
+            .namespace_filters
+            .insert("kind-dev".into(), vec!["demo".into()]);
+        save_state(dir.path(), &state).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_file());
+        assert!(!target.exists());
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+    }
+
+    #[test]
+    fn a_file_that_does_not_load_is_not_edited() {
+        let pinned = pinned_file("");
+        for text in [
+            pinned.replace("appearance = \"dark\"", "appearance = 'purple'"),
+            format!("watch_mode = 'sometimes'\n{pinned}"),
+            format!("log_buffer_lines = -1\n{pinned}"),
+            pinned.replace(
+                "[[trusted_clusters]]",
+                "namespaces = [\" \"]\n\n[[trusted_clusters]]",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(SETTINGS_FILE);
+            std::fs::write(&path, &text).unwrap();
+            assert!(load_settings(dir.path()).is_err(), "{text}");
+
+            for (setter, failed) in setter_results(dir.path()) {
+                assert!(failed, "{setter} on {text}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    text.as_bytes(),
+                    "{setter} on {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_and_table_parsing_use_the_given_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            "appearance = \"light\"\nfuture = 9223372036854775808\n",
+        )
+        .unwrap();
+
+        let (settings, table) =
+            parse_settings("appearance = \"dark\"\nfuture = 1\n", &path).unwrap();
+        assert_eq!(settings.appearance, Appearance::Dark);
+        assert_eq!(table["appearance"].as_str(), Some("dark"));
+        assert_eq!(table["future"].as_integer(), Some(1));
+
+        // The text alone decides: what is on disk, valid or not, plays no part.
+        std::fs::write(&path, "appearance = \"light\"\n").unwrap();
+        assert!(matches!(
+            parse_settings("future = 9223372036854775808\n", &path),
+            Err(SettingsError::Parse { .. })
+        ));
+        std::fs::remove_file(&path).unwrap();
+        let (settings, _) = parse_settings("appearance = \"dark\"\n", &path).unwrap();
+        assert_eq!(settings.appearance, Appearance::Dark);
     }
 
     #[test]

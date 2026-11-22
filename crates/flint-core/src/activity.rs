@@ -70,7 +70,7 @@ pub struct ActivityRecord {
     pub at_ms: i64,
     /// The tool's name, as the agent called it.
     pub tool: String,
-    /// The context the call named; none for a tool that names no cluster (`list_clusters`).
+    /// The context the call named, or its input size if it was unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
     /// The API server the cluster was exposed with, when it is exposed.
@@ -94,9 +94,8 @@ pub struct ActivityRecord {
     #[serde(default)]
     pub truncated: bool,
     pub outcome: Outcome,
-    /// [`cluster_key`] of the full `cluster`, set by [`append`]: what the app matches a context
-    /// by, since `cluster` may be cut or redacted. Of the context's own name only for a call that
-    /// named a context in the kubeconfig ([`append_call`]); otherwise of the redacted text.
+    /// What the app matches a context by, since `cluster` may be cut or redacted.
+    /// [`append_call`] keys known contexts by their full name and leaves unknown contexts unkeyed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_key: Option<String>,
     /// [`ServerKeys::server_key`] of the server the cluster is exposed with, as the kubeconfig
@@ -352,13 +351,23 @@ pub fn append_call(
     reached: &Reached,
 ) -> std::io::Result<()> {
     let keys = ServerKeys::open(config_dir);
+    let known = reached.context || reached.server.is_some();
     let record = ActivityRecord {
         // The name of a context in the kubeconfig, so its tab lists the call even when the name
         // itself is redacted.
-        cluster_key: record.cluster_key.clone().or_else(|| {
-            (reached.context || reached.server.is_some()).then_some(())?;
-            record.cluster.as_deref().map(cluster_key)
-        }),
+        cluster_key: if known {
+            record
+                .cluster_key
+                .clone()
+                .or_else(|| record.cluster.as_deref().map(cluster_key))
+        } else {
+            None
+        },
+        cluster: if known {
+            record.cluster.clone()
+        } else {
+            record.cluster.as_deref().map(size_only)
+        },
         server_key: reached.server.as_deref().and_then(|s| keys.server_key(s)),
         probed: reached
             .probed
@@ -484,7 +493,7 @@ fn is_unnamed(c: char) -> bool {
 /// [`is_unnamed`] is no name, and one already holding a `[REDACTED:<kind>]` marker is not read
 /// again: of any of these, only the size is kept.
 fn redacted(text: &str) -> String {
-    let size = || format!("…(+{} bytes)", text.len());
+    let size = || size_only(text);
     if text.len() > MAX_READ_BYTES || text.contains("[REDACTED:") || text.chars().any(is_unnamed) {
         return size();
     }
@@ -493,6 +502,19 @@ fn redacted(text: &str) -> String {
         return replaced.text.into_owned();
     }
     through_first_marker(&replaced.text).map_or_else(size, str::to_owned)
+}
+
+/// What a record holds of a value it does not keep: its size.
+pub fn size_only(text: &str) -> String {
+    format!("…(+{} bytes)", text.len())
+}
+
+fn shown_cluster_key(text: &str) -> Option<String> {
+    let has_only_size = text
+        .strip_prefix("…(+")
+        .and_then(|size| size.strip_suffix(" bytes)"))
+        .is_some_and(|size| !size.is_empty() && size.bytes().all(|b| b.is_ascii_digit()));
+    (!has_only_size).then(|| cluster_key(text))
 }
 
 /// `text` up to and including its first `[REDACTED:<kind>]` marker.
@@ -521,7 +543,7 @@ fn capped(record: &ActivityRecord) -> ActivityRecord {
         cluster_key: record
             .cluster_key
             .clone()
-            .or_else(|| Some(cluster_key(&redacted(record.cluster.as_deref()?)))),
+            .or_else(|| shown_cluster_key(&redacted(record.cluster.as_deref()?))),
         probed: record.probed.iter().take(MAX_PROBED).cloned().collect(),
         probed_more: record.probed_more + record.probed.len().saturating_sub(MAX_PROBED) as u64,
         tool: cap(&record.tool),
@@ -641,13 +663,13 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// `record` with its cluster key, computed from its context when it has none. Its server key is
+/// `record` with its cluster key, recovered from the name in an older record. Its server key is
 /// never guessed from the shown server, which can drop the query or hide the server behind a
 /// placeholder: a record written without the key file has none, and its tab lists it as
 /// [`Attribution::Unverified`].
 fn keyed(mut record: ActivityRecord) -> ActivityRecord {
     if record.cluster_key.is_none() {
-        record.cluster_key = record.cluster.as_deref().map(cluster_key);
+        record.cluster_key = record.cluster.as_deref().and_then(shown_cluster_key);
     }
     record
 }
@@ -905,7 +927,7 @@ mod tests {
     // or not, and two such contexts keep two keys. Any other value is not keyed as written.
     #[test]
     fn only_a_context_in_the_kubeconfig_is_keyed_by_its_name() {
-        let key_of = |context: &str, reached: &Reached| {
+        let recorded = |context: &str, reached: &Reached| {
             let dir = tempfile::tempdir().unwrap();
             let call = ActivityRecord {
                 cluster: Some(context.into()),
@@ -915,37 +937,34 @@ mod tests {
                 ..record(1)
             };
             append_call(dir.path(), &call, reached).unwrap();
-            read(dir.path()).remove(0).cluster_key.unwrap()
+            read(dir.path()).remove(0)
         };
         let known = Reached {
             context: true,
             ..Reached::default()
         };
         let (prod, staging) = (
-            key_of("token:prod", &known),
-            key_of("token:staging", &known),
+            recorded("token:prod", &known).cluster_key,
+            recorded("token:staging", &known).cluster_key,
         );
-        assert_eq!(prod, cluster_key("token:prod"));
-        assert_eq!(staging, cluster_key("token:staging"));
+        assert_eq!(prod, Some(cluster_key("token:prod")));
+        assert_eq!(staging, Some(cluster_key("token:staging")));
         assert_ne!(prod, staging);
 
         let unknown = Reached::default();
-        assert_ne!(
-            key_of("token:prod", &unknown),
-            cluster_key("token:prod"),
-            "a value that matches no context is not keyed as written"
-        );
-
         for text in [
+            "team/gone",
+            "token:prod",
             "password=[REDACTED:x] correct horse battery",
             "token: [REDACTED:y] aaa bbb",
             r#"{"password":"[REDACTED:x] correct horse"}"#,
             "https://u:[REDACTED:p]x@host/a b",
         ] {
             let size = format!("…(+{} bytes)", text.len());
-            assert_eq!(recorded_name(text), size);
-            assert_eq!(key_of(text, &unknown), cluster_key(&size));
-            assert_eq!(key_of(text, &known), cluster_key(text));
+            let unrecognized = recorded(text, &unknown);
+            assert_eq!(unrecognized.cluster, Some(size));
+            assert_eq!(unrecognized.cluster_key, None);
+            assert_eq!(recorded(text, &known).cluster_key, Some(cluster_key(text)));
         }
     }
 

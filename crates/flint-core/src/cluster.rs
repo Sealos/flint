@@ -262,15 +262,12 @@ impl ClusterError {
         })
     }
 
-    /// What an AI agent reads (the MCP server): like [`ClusterError::summary`], but text from
-    /// the server or kube keeps its quoted values (an agent needs the names to act) and is cut
-    /// to one line of at most 300 characters, so a server cannot hand it a long, multi-line
-    /// message.
+    /// Error text for MCP replies. Bounded messages keep quoted names and have credentials
+    /// redacted before the first line is shortened.
     pub fn for_agent(&self) -> String {
         match self {
-            ClusterError::Kube(_) | ClusterError::Api(_) | ClusterError::Config { .. } => {
-                redact::first_line(&self.to_string(), AGENT_CHARS)
-            }
+            ClusterError::Kube(message) | ClusterError::Api(message) => agent_error_text(message),
+            ClusterError::Config { .. } => agent_error_text(&self.to_string()),
             other => other.to_string(),
         }
     }
@@ -327,6 +324,66 @@ impl ClusterError {
 /// How much of a server's or kube's text the app shows, and an agent reads.
 const SHOWN_CHARS: usize = 200;
 const AGENT_CHARS: usize = 300;
+const AGENT_BYTES: usize = 4 * 1024;
+/// Extra redaction passes over an error before it is cut.
+const REDACT_PASSES: usize = 3;
+/// How far the cut may move back so that the `…` is not taken for a value.
+const CUT_BACKOFF: usize = 64;
+
+fn agent_error_text(message: &str) -> String {
+    // A clipped credential can lose the suffix that identifies it, and redaction can bring
+    // the exposed prefix into the visible line, so a longer message is not clipped and shown.
+    if message.len() > AGENT_BYTES {
+        return "Error details omitted because the message is too long".to_owned();
+    }
+    // A masked value can itself be recognised by a later pass (a header whose value was
+    // masked), so the text is redacted until it is stable, before it is cut.
+    let mut text = redact::redact_credentials(message).text.into_owned();
+    for _ in 0..REDACT_PASSES {
+        let next = redact::redact_credentials(&text).text.into_owned();
+        if next == text {
+            break;
+        }
+        text = next;
+    }
+    agent_line(&text)
+}
+
+/// The first line of redacted `text`, cut to [`AGENT_CHARS`] (with `…`). A `[REDACTED:<kind>]`
+/// marker across the cut goes whole. The cut text must survive a second redaction unchanged
+/// (a later pass can take the `…` after `Cookie: ` for a value), so the cut moves back until it
+/// does, and the `…` stays.
+fn agent_line(text: &str) -> String {
+    let line = redact::first_line(text, usize::MAX);
+    for limit in (AGENT_CHARS.saturating_sub(CUT_BACKOFF)..=AGENT_CHARS).rev() {
+        let Some(shorter) = cut_line(&line, limit) else {
+            return line;
+        };
+        if redact::redact_credentials(&shorter).text == shorter {
+            return shorter;
+        }
+    }
+    // Nothing near the cap is stable: drop the line down to its stable start.
+    "…".to_owned()
+}
+
+/// `line` cut to `limit` chars with a trailing `…`, or `None` when it already fits.
+fn cut_line(line: &str, limit: usize) -> Option<String> {
+    let (mut cut, _) = line.char_indices().nth(limit)?;
+    let last_marker = line
+        .match_indices("[REDACTED:")
+        .map(|(start, _)| start)
+        .take_while(|start| *start < cut)
+        .last();
+    if let Some(start) = last_marker
+        && line[start..]
+            .find(']')
+            .is_some_and(|end| start + end >= cut)
+    {
+        cut = start;
+    }
+    Some(format!("{}…", &line[..cut]))
+}
 
 /// Error text that is safe to show in the window, in logs and in the automation state. Only
 /// flint-core builds it ([`ClusterError::summary`]), so nothing unsanitized can be rendered as
@@ -916,6 +973,116 @@ fn auth_error_message(err: &kube::client::AuthError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_text_is_tidied_before_it_is_cut() {
+        for pad in 230..=300 {
+            let message = format!(
+                "{} postgres://admin:example-value-123@db.internal:5432/app",
+                "x".repeat(pad)
+            );
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(!shown.contains("exam"), "pad {pad}: {shown}");
+            assert!(
+                shown.chars().count() <= AGENT_CHARS + 1,
+                "pad {pad}: {shown}"
+            );
+            // A marker is whole, or not there at all.
+            if let Some(at) = shown.find("[R") {
+                assert!(shown[at..].contains(']'), "pad {pad}: {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn agent_text_keeps_its_cap_when_a_cut_ends_in_a_cookie_header() {
+        for pad in 280..=300 {
+            let message = format!("{} Cookie: abcdef", "x".repeat(pad));
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(
+                shown.chars().count() <= AGENT_CHARS + 1,
+                "pad {pad}: {shown}"
+            );
+            assert!(shown.ends_with('…'), "pad {pad}: {shown}");
+            assert_eq!(redact::redact_credentials(&shown).text, shown, "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn agent_text_keeps_diagnostics_after_a_masked_header_value() {
+        let message = format!(
+            "Authorization: password=abc {} then the real cause: connection refused",
+            "y ".repeat(20)
+        );
+        let shown = ClusterError::Api(message).for_agent();
+        assert!(shown.contains("connection refused"), "{shown}");
+        assert!(!shown.contains("abc"), "{shown}");
+        let long = format!("Authorization: password=abc {}", "z".repeat(400));
+        let shown = ClusterError::Api(long).for_agent();
+        assert!(shown.chars().count() <= AGENT_CHARS + 1, "{shown}");
+        assert!(shown.ends_with('…'), "{shown}");
+        assert!(shown.contains("zzzz"), "{shown}");
+    }
+
+    #[test]
+    fn a_marker_across_the_agent_cut_goes_whole() {
+        let marker = "[REDACTED:password]";
+        for inside in 1..marker.len() {
+            let line = format!("{}{marker} rest", "x".repeat(AGENT_CHARS - inside));
+            assert_eq!(
+                agent_line(&line),
+                format!("{}…", "x".repeat(AGENT_CHARS - inside))
+            );
+        }
+        let whole = format!("{}{marker}{}", "x".repeat(10), "y".repeat(AGENT_CHARS));
+        assert!(agent_line(&whole).contains(marker));
+    }
+
+    #[test]
+    fn agent_text_is_one_line_of_a_tidied_block() {
+        let message = "YWJjZGVmZ2hpamtsbW5vcA==\n-----END PRIVATE KEY-----\ndenied";
+        assert_eq!(
+            ClusterError::Kube(message.into()).for_agent(),
+            "[REDACTED:private-key]"
+        );
+    }
+
+    #[test]
+    fn agent_text_hides_credentials_across_the_byte_bound() {
+        let url = "postgres://admin:";
+        let credential = "qéwerty-example-value";
+        for offset in [1, 2, 3, 8, 17] {
+            let pad = AGENT_BYTES - offset - url.len() - "password= ".len();
+            let start = format!("password={} ", "x".repeat(pad));
+            let short = redact::redact_credentials(&start);
+            assert!(short.text.chars().count() + url.len() + offset < AGENT_CHARS);
+            assert_eq!(start.len() + url.len() + offset, AGENT_BYTES);
+            let message = format!("{start}{url}{credential}@db.internal/app");
+            let shown = ClusterError::Api(message).for_agent();
+            assert!(!shown.contains('q'), "offset {offset}: {shown}");
+        }
+    }
+
+    #[test]
+    fn agent_text_limits_work_on_a_malformed_cookie_list() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut body = String::from("Cookie: [");
+            const MARKER: &str = "[REDACTED:";
+            const BODY_BYTES: usize = 1024 * 1024;
+            body.push_str(&MARKER.repeat((BODY_BYTES - body.len()).div_ceil(MARKER.len())));
+            body.truncate(BODY_BYTES);
+            let bounded = ClusterError::Api(body[..AGENT_BYTES].to_owned()).for_agent();
+            let oversized = ClusterError::Api(body).for_agent();
+            tx.send((bounded, oversized)).unwrap();
+        });
+        let (bounded, oversized) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(bounded.chars().count() <= AGENT_CHARS + 1);
+        assert_eq!(
+            oversized,
+            "Error details omitted because the message is too long"
+        );
+    }
 
     // covers UP-04, UP-10
     #[test]

@@ -1829,17 +1829,24 @@ impl Render for DetailView {
                 .into_any_element(),
             (Fetch::Failed(error), _) => v_flex()
                 .flex_1()
+                .min_h_0()
                 .p_4()
                 .gap_1()
                 .items_start()
                 .child(
                     div()
+                        .flex_none()
                         .text_sm()
                         .text_color(theme.danger)
                         .child("Could not fetch this object"),
                 )
                 .child(
                     div()
+                        .id("detail-fetch-error")
+                        .flex_initial()
+                        .min_h_0()
+                        .self_stretch()
+                        .overflow_y_scroll()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(error.clone()),

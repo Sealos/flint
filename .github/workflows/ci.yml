@@ -126,7 +126,7 @@ jobs:
       - run: cargo clippy -p flint-core -p flint-mcp -p flint-e2e --all-targets --locked -- -D warnings
 
   # One job per crate, so a failure points at the module that broke. flint-app's tests run in
-  # the macOS job below.
+  # the macOS jobs below.
   test:
     name: test (${{ matrix.crate }})
     needs: changes
@@ -332,23 +332,67 @@ jobs:
       - name: MCP e2e in a clean Ubuntu 22.04
         run: scripts/test-mcp-linux.sh x86_64 "$ARCHIVE"
 
-  # Everything that needs macOS, in one job so one VM is paid for: the app's clippy, view tests
-  # and docs (also with the test-only automation channel), and a release build that catches
-  # profile-only problems (LTO, strip) before release-please does, and proves the automation
-  # channel is not in it.
-  # Also runs the app e2e tests (docs/TESTING.md, "Running app e2e"): macOS runners are costly,
-  # so they share this job's build instead of getting their own. Read-only; the PR comment that
-  # links the screenshots is posted by the Linux job below.
-  # Not on PRs by default: it takes about 15 minutes on a runner that costs ten times a Linux
-  # one, and linux (flint-app) already runs the app's clippy and tests. It runs on every push to
-  # master, so a macOS-only break shows up there before a release is cut. Add the run-macos
-  # label to a PR to run it before merging (for example, macOS-only code or packaging changes);
-  # the label counts from the next push, so add it before pushing (labelling alone does not
-  # start CI, which would rerun every other job too). On a labelled PR it runs whatever the
+  # The app's macOS checks, in two parallel jobs so a failure shows early and a slow stage can be
+  # rerun alone: macos-build (clippy, docs, release build) and macos-tests (view tests, app e2e).
+  # `macos (flint-app)` below is their result. Two jobs rather than one per stage because macOS
+  # runners are scarce and cost about ten times a Linux one.
+  # Not on PRs by default: linux (flint-app) already runs the app's clippy and tests. They run on
+  # every push to master, so a macOS-only break shows up there before a release is cut. Add the
+  # run-macos label to a PR to run them before merging (for example, macOS-only code or packaging
+  # changes); the label counts from the next push, so add it before pushing (labelling alone does
+  # not start CI, which would rerun every other job too). On a labelled PR they run whatever the
   # paths are.
-  macos:
-    name: macos (flint-app)
+  #
+  # Each job is the only writer of its own cache key, because a key is written once and the two
+  # build different output: `macos` holds check and release artifacts (macos-app.yml restores
+  # it), `macos-tests` the debug test build (memory.yml restores it). rust-cache hashes RUST*
+  # variables into the key, so RUSTDOCFLAGS stays on both jobs to match those workflows.
+  macos-build:
+    name: macos build (flint-app)
     needs: changes
+    # Same condition as macos-tests. If they ever differ, `macos (flint-app)` fails.
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'pull_request'
+      && (contains(github.event.pull_request.labels.*.name, 'run-macos')
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.full == 'true' && needs.changes.outputs.macos == 'true')
+      || github.event_name != 'pull_request'
+      && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true')) }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+      # The only writer of this key, on master.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Clippy
+        run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
+      - name: Clippy (automation channel)
+        run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
+      - name: Docs
+        run: cargo doc -p flint-app --no-deps --document-private-items --locked
+      # Catches profile-only problems (LTO, strip) before release-please does.
+      - name: Release build
+        run: cargo build --release --locked -p flint-app
+      - run: ./target/release/flint --help
+      # The automation channel is test-only (docs/TESTING.md): it must not be in what ships.
+      - name: Release binary has no automation channel
+        run: scripts/check-no-automation.sh ./target/release/flint
+
+  # The view tests and app e2e (docs/TESTING.md, "Running app e2e") share one job because e2e
+  # drives the debug binary the tests build. Read-only; the PR comment that links the screenshots
+  # is posted by the Linux job below.
+  macos-tests:
+    name: macos tests (flint-app)
+    needs: changes
+    # Same condition as macos-build. If they ever differ, `macos (flint-app)` fails.
     if: >-
       ${{ !cancelled() && (github.event_name == 'pull_request'
       && (contains(github.event.pull_request.labels.*.name, 'run-macos')
@@ -366,18 +410,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          components: clippy
+      # The only writer of this key, on master.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: macos
+          shared-key: macos-tests
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Clippy
-        run: cargo clippy -p flint-app --all-targets --locked -- -D warnings
-      - name: Clippy (automation channel)
-        run: cargo clippy -p flint-app --all-targets --features automation --locked -- -D warnings
       # One test run: the automation build compiles every test, the channel's too. The plain
-      # build is still checked by clippy above. With GPUI's leak detector, as on Linux: the
+      # build is checked by clippy in macos-build. With GPUI's leak detector, as on Linux: the
       # channel's task lives as long as the app and must not keep the workspace alive.
       - name: Tests (with the automation channel)
         env:
@@ -393,18 +432,9 @@ jobs:
           fi
           # What GPUI renders with here, for diagnosing a screenshot or window failure.
           system_profiler SPDisplaysDataType || true
-      - name: Docs
-        run: cargo doc -p flint-app --no-deps --document-private-items --locked
-      - name: Release build
-        run: cargo build --release --locked -p flint-app
-      - run: ./target/release/flint --help
-      # The automation channel is test-only (docs/TESTING.md): it must not be in what ships.
-      - name: Release binary has no automation channel
-        run: scripts/check-no-automation.sh ./target/release/flint
       # The real app, driven over its automation socket, one test per user path, against the
-      # fake API server. Failures fail the job; the screenshots are only uploaded. Last, so a
-      # failure here does not hide the docs and release checks above. It needs only
-      # target/debug/flint, which the release build does not touch.
+      # fake API server. Failures fail the job; the screenshots are only uploaded. It needs only
+      # target/debug/flint, built above.
       - name: App e2e
         id: e2e
         # A hung window or socket wait must not hold the runner for the job's full hour.
@@ -427,18 +457,37 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # The check name that release steps and merge tooling look for. Succeeds only if both macOS
+  # jobs did. Skipped only when both were skipped, so an unselected PR still shows no macOS pass;
+  # a failed, cancelled or lone skipped job fails it. `always()` so a cancelled job cannot leave
+  # this check looking merely skipped.
+  macos:
+    name: macos (flint-app)
+    needs: [macos-build, macos-tests]
+    if: ${{ always() && (needs.macos-build.result != 'skipped' || needs.macos-tests.result != 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Both macOS jobs passed
+        env:
+          BUILD: ${{ needs.macos-build.result }}
+          TESTS: ${{ needs.macos-tests.result }}
+        run: |
+          echo "macos build: $BUILD, macos tests: $TESTS"
+          [ "$BUILD" = success ] && [ "$TESTS" = success ]
+
   # Posts (or updates) one comment on the PR linking the app e2e screenshots. A cheap Linux job,
-  # so the macOS job keeps read-only permissions. Same-repo PRs only: a fork's token cannot
+  # so the macOS jobs keep read-only permissions. Same-repo PRs only: a fork's token cannot
   # write, and its screenshots need no comment to be found on the run page.
   app-e2e-comment:
     name: app e2e screenshots comment
-    needs: macos
+    needs: macos-tests
     # Also when an earlier macOS step failed (the comment then says e2e did not run, so it never
     # shows an older result). Not for Dependabot: its runs get a read-only token.
     if: >-
       !cancelled() && github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]' && needs.macos.result != 'skipped'
+      github.actor != 'dependabot[bot]' && needs.macos-tests.result != 'skipped'
     # One comment writer per PR at a time, so two pushes cannot both post. Queued, not cancelled.
     concurrency:
       group: app-e2e-comment-${{ github.event.pull_request.number }}
@@ -454,8 +503,8 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
-          URL: ${{ needs.macos.outputs.screenshots-url }}
-          OUTCOME: ${{ needs.macos.outputs.e2e }}
+          URL: ${{ needs.macos-tests.outputs.screenshots-url }}
+          OUTCOME: ${{ needs.macos-tests.outputs.e2e }}
           RUN_ID: ${{ github.run_id }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -470,7 +519,7 @@ jobs:
           # The job outputs come from a job that ran PR code; accept only the expected shapes.
           case "$OUTCOME" in
             success|failure|cancelled) result="\`$OUTCOME\`" ;;
-            *) result="not run (an earlier step of \`macos (flint-app)\` failed)" ;;
+            *) result="not run (an earlier step of \`macos tests (flint-app)\` failed)" ;;
           esac
           if [[ "$URL" =~ ^https://github\.com/${REPO}/actions/runs/${RUN_ID}/artifacts/[0-9]+$ ]]; then
             link="[Download the screenshots]($URL) (light and dark, one per key view)."
