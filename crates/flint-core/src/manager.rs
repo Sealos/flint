@@ -1493,7 +1493,7 @@ impl ClusterManager {
         cluster: &str,
         server: Option<Option<String>>,
     ) -> Result<crate::handle::BoundWriteClient, WriteError> {
-        if self.held(cluster) {
+        if self.paused(cluster) {
             return Err(WriteError::KubeconfigUnreadable);
         }
         let (client, pin) =

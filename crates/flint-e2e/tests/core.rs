@@ -1496,6 +1496,43 @@ async fn a_write_through_a_fallback_definition_is_refused() {
     assert_eq!(puts(&fallback), (0, 0));
 }
 
+// A connected cluster that does not serve a kind says so, and nothing is sent for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_cluster_without_the_kind_reports_it_not_served() {
+    let server = FakeApiServer::start().await.unwrap();
+    server.set_object(&deployments(), editable("5000", serde_json::json!({})));
+    let core = Core::start(&server, Some("demo")).await;
+    tokio::time::timeout(WAIT, async {
+        while core.handle.discovery(CONTEXT).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the context is discovered");
+    core.handle
+        .review_write(write_target(&server), three_replicas())
+        .await
+        .expect("the gate is open for a kind the cluster serves");
+    assert_eq!(puts(&server), (1, 0));
+
+    let missing = KindId::new("example.com", "widgets");
+    let target = WriteTarget {
+        kind: missing.clone(),
+        ..write_target(&server)
+    };
+    let review = core.handle.review_write(target, three_replicas()).await;
+    assert_eq!(review.unwrap_err(), WriteError::NotServed(missing));
+    assert_eq!(
+        puts(&server),
+        (1, 0),
+        "nothing was sent for the missing kind"
+    );
+    assert!(
+        !server.requests().iter().any(|r| r.path.contains("widgets")),
+        "the missing kind was not read"
+    );
+}
+
 // covers UP-54, UP-55: the core refuses a shell on a protected cluster before anything reaches
 // the API server; an unlock pinned to the server lets it through until Lock Again, and so
 // does trust, written to settings.toml. (The fake server is a known local cluster, which starts

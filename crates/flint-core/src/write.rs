@@ -426,10 +426,27 @@ impl CoreHandle {
 }
 
 async fn kind_of(core: &CoreHandle, target: &WriteTarget) -> Result<KindInfo, WriteError> {
-    core.discovery(&target.cluster)
+    let found = core
+        .discovery(&target.cluster)
         .await
-        .and_then(|d| d.kind(&target.kind).cloned())
-        .ok_or_else(|| WriteError::NotServed(target.kind.clone()))
+        .and_then(|d| d.kind(&target.kind).cloned());
+    if let Some(kind) = found {
+        return Ok(kind);
+    }
+    // Refused either way: a paused context has no discovery, so this only picks the words.
+    match core.bound_write_client(&target.cluster, None).await {
+        Err(WriteError::KubeconfigUnreadable) => {
+            // A target on a server the context no longer shows has moved, whatever else holds.
+            match core
+                .write_client(&target.cluster, Some(target.server.clone()))
+                .await
+            {
+                Err(moved @ WriteRefusal::Moved { .. }) => Err(moved.into()),
+                _ => Err(WriteError::KubeconfigUnreadable),
+            }
+        }
+        _ => Err(WriteError::NotServed(target.kind.clone())),
+    }
 }
 
 pub(crate) async fn read_live(
