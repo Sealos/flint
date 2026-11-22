@@ -4,6 +4,7 @@
 //! through [`CoreHandle`] (ADR-0002); one-shot callers such as the MCP server use the functions
 //! in [`cluster`] and [`read`] directly on their own tokio runtime.
 
+pub mod access;
 pub mod activity;
 pub mod alerts;
 pub mod api_error;
@@ -36,6 +37,7 @@ pub mod settings;
 pub mod store;
 pub mod table;
 pub mod terminal;
+pub mod thresholds;
 pub mod view;
 mod watch;
 pub mod write;
@@ -72,4 +74,8 @@ pub use settings::{Appearance, Settings, WatchMode};
 pub use store::{Feed, KindSnapshot, NamespaceLimit, RefusalCause, SyncState};
 pub use table::{Cell, Column, ColumnRole, ColumnType, ListFormat, Row};
 pub use terminal::{TerminalSize, TerminalSnapshot};
+pub use thresholds::{
+    ThresholdError, ThresholdIssue, ThresholdLevel, ThresholdMetric, ThresholdOverrides,
+    ThresholdSettings, Thresholds,
+};
 pub use view::{SortBy, ViewQuery};

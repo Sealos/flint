@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -304,6 +304,16 @@ struct Parts {
     guarded: Option<GuardedProvider>,
 }
 
+/// Which connection's credential something was learned with. Holds none of it: the credential
+/// is dropped with its connection, and an id never matches a later one.
+pub(crate) struct CredentialId(Weak<Parts>);
+
+impl CredentialId {
+    pub(crate) fn is(&self, other: &CredentialId) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
 /// A client for one request, and what its credential was when checked.
 pub(crate) struct Presented {
     pub(crate) client: Client,
@@ -348,6 +358,10 @@ impl WriteCredential {
             grant,
             guarded,
         }))
+    }
+
+    pub(crate) fn id(&self) -> CredentialId {
+        CredentialId(Arc::downgrade(&self.0))
     }
 
     /// Reads the credential for one request, and returns `client` set to send exactly that.
