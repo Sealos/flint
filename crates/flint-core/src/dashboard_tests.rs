@@ -399,3 +399,89 @@ fn counts_pending_claims_that_are_not_deleting() {
     ];
     assert_eq!(count_pending_claims(&claims), 1);
 }
+
+/// Counts with `known` in the first category, the next `unknown` categories unreadable and the
+/// rest read as zero.
+fn ranked(known: u32, unknown: usize) -> ProblemCounts {
+    let mut counts = [Some(0); ProblemCategory::ALL.len()];
+    counts[0] = Some(known);
+    for count in counts.iter_mut().skip(1).take(unknown) {
+        *count = None;
+    }
+    ProblemCounts { counts }
+}
+
+fn unreadable() -> ProblemCounts {
+    ProblemCounts {
+        counts: [None; ProblemCategory::ALL.len()],
+    }
+}
+
+#[test]
+fn more_known_problems_sort_first() {
+    assert!(ranked(5, 0).attention_rank() < ranked(2, 0).attention_rank());
+}
+
+#[test]
+fn unknown_categories_sort_ahead_of_a_healthy_cluster() {
+    assert!(ranked(0, 1).attention_rank() < ranked(0, 0).attention_rank());
+}
+
+#[test]
+fn unreadable_cluster_sorts_ahead_of_a_healthy_cluster() {
+    assert_eq!(unreadable().known_total(), 0);
+    assert!(unreadable().attention_rank() < ranked(0, 0).attention_rank());
+}
+
+#[test]
+fn known_problems_outrank_unknown_categories() {
+    assert!(ranked(1, 0).attention_rank() < unreadable().attention_rank());
+    assert!(ranked(2, 0).attention_rank() < ranked(1, 4).attention_rank());
+}
+
+#[test]
+fn equal_known_problems_sort_by_unknown_categories() {
+    assert!(ranked(3, 2).attention_rank() < ranked(3, 1).attention_rank());
+}
+
+#[test]
+fn same_counts_in_different_categories_rank_equal() {
+    let mut other = ranked(0, 0);
+    other.counts[3] = Some(4);
+    other.counts[5] = None;
+    assert_eq!(other.attention_rank(), ranked(4, 1).attention_rank());
+}
+
+#[test]
+fn sorting_by_rank_is_worst_first_from_any_input_order() {
+    let worst_first = [
+        ranked(u32::MAX, 1),
+        ranked(u32::MAX, 0),
+        ranked(7, 0),
+        ranked(1, 5),
+        ranked(1, 0),
+        unreadable(),
+        ranked(0, 2),
+        ranked(0, 0),
+    ];
+    for rotation in 0..worst_first.len() {
+        let mut clusters = worst_first;
+        clusters.rotate_left(rotation);
+        clusters.reverse();
+        clusters.sort_by_key(ProblemCounts::attention_rank);
+        assert_eq!(clusters, worst_first);
+    }
+}
+
+#[test]
+fn saturated_counts_rank_without_wrapping() {
+    let saturated = ProblemCounts {
+        counts: [Some(u32::MAX); ProblemCategory::ALL.len()],
+    };
+    assert_eq!(saturated.known_total(), u32::MAX);
+    assert!(saturated.attention_rank() < ranked(u32::MAX - 1, 0).attention_rank());
+    assert_eq!(
+        saturated.attention_rank(),
+        ranked(u32::MAX, 0).attention_rank()
+    );
+}
